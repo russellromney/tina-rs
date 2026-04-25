@@ -1,0 +1,11 @@
+[package]
+name = "tina"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Trait crate for the tina-rs isolate/effect discipline"
+repository = "https://github.com/pmbanugo/tina-rs"
+
+[lib]
+path = "src/lib.rs"
