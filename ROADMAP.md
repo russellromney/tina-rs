@@ -2,7 +2,7 @@
 
 A staged plan for porting Tina's discipline to Rust, structured to deliver value at each phase rather than waiting for a big-bang release.
 
-Phase names follow the cinch-cloud convention (named, not numbered, so we can insert phases without renumbering). Names are space missions, ordered roughly chronologically by mission complexity.
+Phases are named (not numbered) so we can insert phases later without renumbering. Names are space missions, ordered roughly chronologically by mission complexity.
 
 ---
 
@@ -115,9 +115,9 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 - `tina-runtime-tokio-bridge`: adapter that lets a tina isolate run inside an existing Tokio app. **The whole point.** Codebases on Tokio adopt the discipline incrementally, one isolate at a time, without a runtime swap.
 - Benchmark suite: SPSC throughput, mailbox latency p50/p99, per-core scheduling overhead, isolate spawn cost.
 - Memory profile: pre-allocated arenas per isolate, zero per-message allocation in the hot path.
-- One real-world consumer migration. Candidate: cinch-cloud's per-tenant SQL execution as an isolate-per-tenant — replace `Arc<Mutex<rusqlite::Connection>>` with an isolate that owns the connection and processes a mailbox of `SqlRequest`. Validates the bridge path and produces a public case study.
+- One real-world consumer migration as a case study. Pick a multi-tenant Rust service that currently uses `Arc<Mutex<Connection>>` per tenant (a common pattern for embedded SQLite/Kuzu/etc.); replace that with a per-tenant isolate that owns the connection and processes a typed mailbox. The migration validates the bridge path and produces a public benchmark write-up.
 
-**Done when:** a Tokio codebase compiles and runs with at least one tina isolate inside it; the bench suite is documented and green vs comparable Tokio code; one production migration ships and reports its win/loss honestly.
+**Done when:** a Tokio codebase compiles and runs with at least one tina isolate inside it; the bench suite is documented and green vs comparable Tokio code; the case study migration ships and reports its win/loss honestly.
 
 ---
 
