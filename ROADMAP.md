@@ -22,7 +22,7 @@ The deliverable is a small set of crates (`tina`, `tina-runtime-*`, `tina-sim`) 
 
 Following the abstraction-vs-implementation rule (capability traits live in their own crate; backends are siblings):
 
-- `tina` — trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, `Supervisor`. **No impls.**
+- `tina` — trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, plus any small policy types that truly belong at the abstraction boundary. **No impls.**
 - `tina-mailbox-spsc` — SPSC ring buffer impl
 - `tina-mailbox-mpsc` — MPSC fallback impl
 - `tina-supervisor` — supervision tree mechanism
@@ -44,6 +44,13 @@ We should prove the discipline in layers, matching the abstraction-vs-implementa
 
 Live examples matter, but they are smoke tests, not the proof. Every runnable example should be backed by black-box assertions in the crate that owns the implementation being exercised.
 
+## Immediate prerequisites
+
+These should be resolved before we go deeper than Sputnik:
+
+- **Coordinate with Banugo early.** If the upstream author wants to maintain a Rust port, collaborate on design, or avoid ecosystem confusion, the project shape changes. This is not an "eventually" question.
+- **Commit to the hot-path allocation story early.** If "zero per-message allocation after warm-up on the hot SPSC path" is a real invariant, Pioneer and Mariner must be designed around it. If that is too strong, narrow the claim before the runtime crates ship.
+
 ---
 
 ## Phase Sputnik
@@ -62,36 +69,37 @@ Trait crate with the core abstractions and nothing else.
 ---
 
 ## Phase Pioneer
-> Pioneering deeper. SPSC mailbox + supervision trees.
+> Pioneering deeper. SPSC mailbox + supervision policy.
 
 > After: Phase Sputnik · Before: Phase Mariner
 
 - `tina-mailbox-spsc`: lock-free single-producer/single-consumer ring buffer. Bounded. `try_send` with explicit `Full` error. Drop-on-full is the consumer's policy choice, not the mailbox's.
-- `tina-supervisor`: supervision tree mechanism. Parent isolates spawn children, observe panics, apply restart policies (`one-for-one`, `one-for-all`, `rest-for-one`) with restart budgets.
+- Policy types for supervision (`RestartPolicy`, `RestartBudget`, child restart classification) land at the correct crate boundary. Mechanism does not ship yet.
 - Property tests via [loom](https://github.com/tokio-rs/loom) for the SPSC ring under contention.
-- `tina-mailbox-mpsc` sibling impl for cases where SPSC isn't enough (cross-shard fan-in). Default is SPSC; consumers opt into MPSC.
-- Keep the abstraction boundary strict: `tina` owns traits and policy types only; mailbox crates own buffer layout, atomics, and queue semantics.
+- Keep the abstraction boundary strict: `tina` owns traits and any consensus policy types only; mailbox crates own buffer layout, atomics, and queue semantics.
+- Lock in the allocation story here: the SPSC API and message path should support zero per-message allocation after warm-up on the hot path, or the roadmap must narrow that claim explicitly.
 
 **Proof plan:**
 
 - Unit + integration tests for a real SPSC implementation cover FIFO order, bounded capacity, `TrySendError::Full`, `TrySendError::Closed`, and no hidden fallback queue.
 - Loom tests cover concurrent producer/consumer interleavings for the SPSC ring.
-- Supervisor tests prove restart policy behavior with runnable toy isolates: `one-for-one`, `one-for-all`, `rest-for-one`, and restart-budget exhaustion.
-- A runnable example demonstrates crash/restart behavior, but the assertions live in tests, not just in stdout.
+- Policy tests prove restart accounting behavior without pretending a runtime exists yet: `one-for-one`, `one-for-all`, `rest-for-one`, and restart-budget exhaustion.
 
-**Done when:** mailbox passes loom under contention; mailbox tests prove FIFO/boundedness/error behavior; supervision tree restarts a panicking isolate without bringing down its siblings; restart budgets actually halt restart loops.
+**Done when:** mailbox passes loom under contention; mailbox tests prove FIFO/boundedness/error behavior; supervision policy tests prove restart accounting and budget exhaustion; the hot-path allocation target is either preserved in the design or explicitly narrowed before Mariner starts.
 
 ---
 
 ## Phase Mariner
-> First single-thread runtime. Effect dispatcher + scheduler.
+> First single-thread runtime. Effect dispatcher + supervision mechanism.
 
 > After: Phase Pioneer · Before: Phase Voyager
 
 - `tina-runtime-current`: single-shard runtime backed by `tokio::runtime::Builder::new_current_thread`. Pin to one core. Run a poll loop: drain mailboxes → run handlers → dispatch effects.
+- `tina-supervisor`: actual supervision mechanism, now that there is a runtime capable of catching failures, restarting children, and applying policy.
 - The effect dispatcher is the **only** place real I/O happens. Handlers return effects; the dispatcher executes them. This is the property that makes deterministic simulation possible later.
 - A working TCP echo server isolate (mirroring Tina-Odin's example) — proves the API end-to-end.
 - Keep the abstraction boundary strict: `tina-runtime-current` owns scheduling, polling, and effect execution; `tina` must not grow runtime helpers just to make tests easier.
+- Runtime tests should inject a deterministic test mailbox through `Mailbox<T>` where possible. Benchmarks and smoke examples can use the real SPSC crate, but correctness tests should avoid coupling two fresh implementations unless that coupling is the point of the test.
 
 **Proof plan:**
 
@@ -101,72 +109,120 @@ Trait crate with the core abstractions and nothing else.
   - `Stop` prevents later delivery to the stopped isolate
   - rejected sends are observable and not silently buffered
   - `Reply`, `Spawn`, and `RestartChildren` are executed only by the dispatcher
+- Black-box supervisor tests prove actual runtime behavior:
+  - a panicking child is restarted according to policy
+  - sibling survival matches `one-for-one`, `one-for-all`, and `rest-for-one`
+  - restart-budget exhaustion halts restart loops predictably
 - A trace-oriented integration test records handler invocations and proves that two identical seeded runs on the single-shard runtime produce the same event sequence.
 - A runnable echo example is used as an end-to-end smoke test and benchmark surface, not as the only evidence of correctness.
 
-**Done when:** runtime tests prove single-shard delivery semantics; a seeded trace test is deterministic on repeated runs; echo server handles 100k connections on a single shard with stable memory and zero work-stealing; hot-path allocations are zero per message after warm-up.
+**Done when:** runtime tests prove single-shard delivery semantics; supervisor tests prove actual restart behavior on the single-shard runtime; a seeded trace test is deterministic on repeated runs; echo server handles 100k connections on a single shard with stable memory; hot-path allocations are zero per message after warm-up on the SPSC single-shard path, or the claim is explicitly revised before publish.
 
 ---
 
 ## Phase Voyager
-> Long-duration deep-space mission. Deterministic simulation.
+> Long-duration deep-space mission. Deterministic simulation for the single-shard runtime.
 
-> After: Phase Mariner · Before: Phase Galileo
+> After: Phase Mariner · Before: Phase Gemini
 
-- `tina-sim`: deterministic simulator. Time is virtual, I/O is intercepted, mailbox arrival order is reproducible from a seed.
+- `tina-sim`: deterministic simulator for the single-shard runtime. Time is virtual, I/O is intercepted, mailbox arrival order is reproducible from a seed.
 - Failure injection: drop messages, partition shards, simulate crashes, inject slow disk.
 - Replay: every test failure produces a seed that reproduces the failure exactly.
-- Property tests via [shuttle](https://github.com/awslabs/shuttle) for the runtime; fuzz tests for the mailbox.
 - Keep the abstraction boundary strict: runtime crates expose enough hooks for simulation, but the simulator owns virtual time, trace capture, and failure injection.
+- Voyager runs before Gemini deliberately: building the simulator first surfaces which runtime hooks the simulator actually needs, so Gemini can stabilize an API that already accommodates them.
 
 **Proof plan:**
 
-- Seeded simulator tests prove reproducible delivery traces across repeated runs.
-- Failure-injection tests prove behavior under dropped messages, partitions, crashes, and slow resources without relying on wall-clock timing.
-- Shuttle/property tests explore interleavings that live examples and runtime integration tests cannot cover exhaustively.
+- Seeded simulator tests prove reproducible delivery traces across repeated runs of the single-shard runtime.
+- Failure-injection tests prove behavior under dropped messages, crashes, and slow resources without relying on wall-clock timing.
+- Replay tests prove that a saved seed reproduces a prior failure exactly.
 
-**Done when:** a multi-shard supervision tree under simulated chaos converges to a known good state every run; replay from a saved seed reproduces failures exactly; the simulator catches a deliberately-injected race that production tests miss.
+**Done when:** single-shard simulated workloads converge to a known good state every run; replay from a saved seed reproduces failures exactly; the simulator catches a deliberately-injected single-shard race that production tests miss.
 
 This is the highest-leverage phase. Deterministic simulation is what makes Tina's discipline pay off — failures become reproducible artifacts, not phantoms.
 
 ---
 
-## Phase Galileo
-> Jupiter mission. Multi-shard runtime + cross-shard mailboxes.
+## Phase Gemini
+> First crewed flight. Stabilize and publish the single-shard story.
 
-> After: Phase Voyager · Before: Phase Cassini
+> After: Phase Voyager · Before: Phase Galileo
+
+- Publish a coherent `0.1.0` story for `tina`, `tina-mailbox-spsc`, `tina-supervisor`, `tina-runtime-current`, and `tina-sim`, or explicitly decide that the APIs are still private and not ready for semver promises. By this point Voyager has surfaced which runtime hooks the simulator needs to be part of the stable surface and which can stay private.
+- Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, and at least one example beyond TCP echo.
+- Document the supported invariants for the single-shard runtime: delivery semantics, mailbox guarantees, supervision behavior, replayability, and the current allocation story.
+
+**Done when:** there is either a published `0.1.0` with semver intent or an explicit decision not to publish yet; the single-shard crates have user-facing guides covering both runtime and simulator usage; a developer outside the project can build a non-trivial isolate from the docs alone.
+
+---
+
+## Phase Galileo
+> Jupiter mission. Multi-shard runtime + cross-shard semantics.
+
+> After: Phase Gemini · Before: Phase Apollo
 
 - `tina-runtime-monoio`: thread-per-core backed by [monoio](https://github.com/bytedance/monoio) (io_uring on Linux). One shard per core, pinned. No work-stealing.
 - Cross-shard messaging: when isolate A on shard 0 sends to isolate B on shard 3, the mailbox crosses cores via a separate cross-shard SPSC channel. Per-pair, not global.
+- Cross-shard SPSC has different concerns from within-shard SPSC: cross-core memory ordering, cache-line ping-pong, NUMA effects. Decide whether the cross-shard channel reuses `tina-mailbox-spsc` or ships as a sibling impl crate, and document the choice before benchmarks are written.
 - Workload placement: a hash-based router decides which shard owns which isolate. Stable under shard add/remove (consistent hashing).
+- Extend `tina-sim` to cover the newly-defined cross-shard semantics rather than inventing them ahead of the runtime.
 - A two-shard echo benchmark: half the connections on shard 0, half on shard 1, no migration.
 
-**Done when:** monoio runtime matches `tina-runtime-current` on single-shard echo; sharded workload of 1M small mailbox messages outperforms equivalent Tokio multi-thread code by a measurable margin (target: ≥30% lower p99 from the cache-locality win).
+**Proof plan:**
+
+- Multi-shard runtime tests prove cross-shard delivery, ownership, and routing semantics against the actual runtime.
+- Extended simulator tests prove reproducible cross-shard traces now that the semantics exist.
+- Benchmarks measure the monoio runtime honestly against the single-shard runtime and comparable Tokio baselines, with documentation about where each approach wins or loses.
+
+**Done when:** monoio runtime matches `tina-runtime-current` on single-shard echo; multi-shard tests prove cross-shard delivery and routing semantics; simulator coverage includes the defined cross-shard model; benchmark results are documented honestly rather than tied to a speculative numeric target.
+
+---
+
+## Phase Apollo
+> Moonshot. Tokio bridge design and implementation.
+
+> After: Phase Galileo · Before: Phase Cassini
+
+- `tina-runtime-tokio-bridge`: adapter for adopting tina inside an existing Tokio app.
+- Write the bridge design down before treating it as an implementation task:
+  - where the isolate actually runs
+  - where effect dispatch happens
+  - which thread owns I/O
+  - what guarantees the bridge preserves and which ones it necessarily weakens
+- Start with the narrowest bridge that is still useful, rather than trying to make every Tokio pattern look like native tina.
+
+**Proof plan:**
+
+- Bridge integration tests prove that a Tokio application can host at least one tina isolate without changing the isolate trait surface.
+- Tests document preserved semantics versus weakened semantics, especially around thread affinity, delivery, and backpressure.
+- A small reference example demonstrates incremental adoption inside a Tokio app, backed by assertions rather than logs.
+
+**Done when:** a tina isolate runs inside a reference Tokio HTTP server example (axum or similar) without modifications to the isolate trait surface; preserved-vs-weakened semantics around thread affinity, delivery, and backpressure are documented in tests and prose.
 
 ---
 
 ## Phase Cassini
-> Long mission, sustained operations. Tokio-bridge + production hardening.
+> Long mission, sustained operations. Production hardening, docs, and optional fallback primitives.
 
-> After: Phase Galileo
+> After: Phase Apollo
 
-- `tina-runtime-tokio-bridge`: adapter that lets a tina isolate run inside an existing Tokio app. **The whole point.** Codebases on Tokio adopt the discipline incrementally, one isolate at a time, without a runtime swap.
+- `tina-mailbox-mpsc`: optional fallback for workloads where SPSC is not enough and the tradeoffs are acceptable.
 - Benchmark suite: SPSC throughput, mailbox latency p50/p99, per-core scheduling overhead, isolate spawn cost.
-- Memory profile: pre-allocated arenas per isolate, zero per-message allocation in the hot path.
-- One real-world consumer migration as a case study. Pick a multi-tenant Rust service that currently uses `Arc<Mutex<Connection>>` per tenant (a common pattern for embedded SQLite/Kuzu/etc.); replace that with a per-tenant isolate that owns the connection and processes a typed mailbox. The migration validates the bridge path and produces a public benchmark write-up.
+- User-facing docs set: architecture guide, runtime selection guide, simulation guide, and multiple worked examples.
+- Memory profile and benchmark documentation: report where the current design allocates, where it does not, and what remains to improve.
 
-**Done when:** a Tokio codebase compiles and runs with at least one tina isolate inside it; the bench suite is documented and green vs comparable Tokio code; the case study migration ships and reports its win/loss honestly.
+**Done when:** the optional MPSC fallback is either shipped with clear tradeoffs or explicitly deferred; the bench suite is documented; at least one developer outside the project successfully ships a non-trivial isolate using only the published docs and reports their experience back; hardening work reports wins and losses honestly without requiring a case-study migration to another codebase.
 
 ---
 
 ## Open questions
 
-These don't block Phase Sputnik, but they need answers as we go.
+These still need answers, but a couple now have an explicit phase boundary.
 
 1. **`Effect` shape.** Resolved in Sputnik: use a closed enum with per-isolate associated payload types for `Reply`, `Send`, and `Spawn`. This keeps the dispatcher contract uniform without erasing the types carried by each isolate.
 2. **Cross-shard ownership.** Tina-Odin's mailboxes are SPSC; cross-shard requires copy-or-move. Investigate whether we can use ownership transfer (move + atomic pointer swap) for zero-copy. If not, accept the copy.
-3. **Supervisor split.** How much lives in `tina` (policy types: `RestartPolicy`, `RestartBudget`) vs `tina-supervisor` (mechanism: the actual tree, the watcher loop)?
-4. **Coordination with Banugo.** File an issue on tina-odin asking if a Rust port is welcome before publishing crates. Polite + may produce useful design feedback.
+3. **Supervisor split.** Current plan: policy types may live in `tina` if they are truly shared abstractions; mechanism lives in `tina-supervisor` and does not ship before Mariner.
+4. **Coordination with Banugo.** Resolve before Pioneer implementation goes much further.
 5. **MSRV.** Pick a Rust version that supports the io_uring story without nightly. Currently this is stable Rust 1.85+ via monoio.
 6. **License.** Resolved in Sputnik: dual-license under MIT or Apache-2.0 to match Rust ecosystem norms.
 
