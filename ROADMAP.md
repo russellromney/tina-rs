@@ -33,6 +33,17 @@ Following the abstraction-vs-implementation rule (capability traits live in thei
 
 End consumers depend on `tina` plus one runtime crate. Dependencies flow concrete → abstract; runtime crates depend on `tina`, never on each other.
 
+## Testing and proof strategy
+
+We should prove the discipline in layers, matching the abstraction-vs-implementation split:
+
+- **Trait crate (`tina`)** proves API shape and compile-time guarantees only. This is where doc tests, compile-fail tests, and downstream-style integration tests belong.
+- **Mailbox crates** prove concrete queue semantics. This is where FIFO, boundedness, `Full`/`Closed`, and no hidden buffering get tested against real implementations and under loom.
+- **Runtime crates** prove delivery semantics. This is where we can assert that accepted sends become handler invocations, that `Stop` actually stops delivery, and that effect dispatch is the only place side effects happen.
+- **Simulator** proves interleavings and replay. This is where we stop trusting timing-sensitive live tests and start proving seeded, reproducible traces.
+
+Live examples matter, but they are smoke tests, not the proof. Every runnable example should be backed by black-box assertions in the crate that owns the implementation being exercised.
+
 ---
 
 ## Phase Sputnik
@@ -59,8 +70,16 @@ Trait crate with the core abstractions and nothing else.
 - `tina-supervisor`: supervision tree mechanism. Parent isolates spawn children, observe panics, apply restart policies (`one-for-one`, `one-for-all`, `rest-for-one`) with restart budgets.
 - Property tests via [loom](https://github.com/tokio-rs/loom) for the SPSC ring under contention.
 - `tina-mailbox-mpsc` sibling impl for cases where SPSC isn't enough (cross-shard fan-in). Default is SPSC; consumers opt into MPSC.
+- Keep the abstraction boundary strict: `tina` owns traits and policy types only; mailbox crates own buffer layout, atomics, and queue semantics.
 
-**Done when:** mailbox passes loom under contention; supervision tree restarts a panicking isolate without bringing down its siblings; restart budgets actually halt restart loops.
+**Proof plan:**
+
+- Unit + integration tests for a real SPSC implementation cover FIFO order, bounded capacity, `TrySendError::Full`, `TrySendError::Closed`, and no hidden fallback queue.
+- Loom tests cover concurrent producer/consumer interleavings for the SPSC ring.
+- Supervisor tests prove restart policy behavior with runnable toy isolates: `one-for-one`, `one-for-all`, `rest-for-one`, and restart-budget exhaustion.
+- A runnable example demonstrates crash/restart behavior, but the assertions live in tests, not just in stdout.
+
+**Done when:** mailbox passes loom under contention; mailbox tests prove FIFO/boundedness/error behavior; supervision tree restarts a panicking isolate without bringing down its siblings; restart budgets actually halt restart loops.
 
 ---
 
@@ -72,8 +91,20 @@ Trait crate with the core abstractions and nothing else.
 - `tina-runtime-current`: single-shard runtime backed by `tokio::runtime::Builder::new_current_thread`. Pin to one core. Run a poll loop: drain mailboxes → run handlers → dispatch effects.
 - The effect dispatcher is the **only** place real I/O happens. Handlers return effects; the dispatcher executes them. This is the property that makes deterministic simulation possible later.
 - A working TCP echo server isolate (mirroring Tina-Odin's example) — proves the API end-to-end.
+- Keep the abstraction boundary strict: `tina-runtime-current` owns scheduling, polling, and effect execution; `tina` must not grow runtime helpers just to make tests easier.
 
-**Done when:** echo server handles 100k connections on a single shard with stable memory and zero work-stealing. Hot-path allocations: zero per message after warm-up.
+**Proof plan:**
+
+- Black-box runtime tests prove delivery semantics on one shard:
+  - accepted `Send` becomes exactly one handler invocation
+  - mailbox FIFO order is preserved by the dispatcher
+  - `Stop` prevents later delivery to the stopped isolate
+  - rejected sends are observable and not silently buffered
+  - `Reply`, `Spawn`, and `RestartChildren` are executed only by the dispatcher
+- A trace-oriented integration test records handler invocations and proves that two identical seeded runs on the single-shard runtime produce the same event sequence.
+- A runnable echo example is used as an end-to-end smoke test and benchmark surface, not as the only evidence of correctness.
+
+**Done when:** runtime tests prove single-shard delivery semantics; a seeded trace test is deterministic on repeated runs; echo server handles 100k connections on a single shard with stable memory and zero work-stealing; hot-path allocations are zero per message after warm-up.
 
 ---
 
@@ -86,8 +117,15 @@ Trait crate with the core abstractions and nothing else.
 - Failure injection: drop messages, partition shards, simulate crashes, inject slow disk.
 - Replay: every test failure produces a seed that reproduces the failure exactly.
 - Property tests via [shuttle](https://github.com/awslabs/shuttle) for the runtime; fuzz tests for the mailbox.
+- Keep the abstraction boundary strict: runtime crates expose enough hooks for simulation, but the simulator owns virtual time, trace capture, and failure injection.
 
-**Done when:** a multi-shard supervision tree under simulated chaos converges to a known good state every run; the simulator catches a deliberately-injected race that production tests miss.
+**Proof plan:**
+
+- Seeded simulator tests prove reproducible delivery traces across repeated runs.
+- Failure-injection tests prove behavior under dropped messages, partitions, crashes, and slow resources without relying on wall-clock timing.
+- Shuttle/property tests explore interleavings that live examples and runtime integration tests cannot cover exhaustively.
+
+**Done when:** a multi-shard supervision tree under simulated chaos converges to a known good state every run; replay from a saved seed reproduces failures exactly; the simulator catches a deliberately-injected race that production tests miss.
 
 This is the highest-leverage phase. Deterministic simulation is what makes Tina's discipline pay off — failures become reproducible artifacts, not phantoms.
 

@@ -42,6 +42,14 @@ So tina-rs is opinionated glue: the trait crate names the capability; runtime im
 - [monoio](https://github.com/bytedance/monoio) — likely runtime backend
 - [shuttle](https://github.com/awslabs/shuttle) — concurrency model checking, useful for the simulator phase
 
+## Development
+
+- `make fmt` — format the workspace
+- `make test` — run tests, including doc tests
+- `make doc` — build crate documentation
+- `make clippy` — run clippy with warnings denied
+- `make verify` — run the full local verification suite
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.

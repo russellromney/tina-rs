@@ -139,7 +139,8 @@ pub trait Isolate: Sized {
 /// The enum is closed so later runtime crates can implement a single effect
 /// dispatcher. The payloads remain isolate-specific through the associated
 /// types on [`Isolate`].
-#[derive(Debug, PartialEq, Eq)]
+#[must_use = "handlers communicate with the runtime by returning an Effect"]
+#[derive(Debug)]
 pub enum Effect<I>
 where
     I: Isolate,
@@ -168,6 +169,10 @@ where
 ///
 /// Sputnik only names the capability. Concrete mailbox implementations arrive
 /// in Phase Pioneer.
+///
+/// `recv` takes `&self` because real SPSC implementations rely on interior
+/// mutability (atomics over a ring buffer). Phase Pioneer may revisit this
+/// with a `Sender`/`Receiver` split — see ROADMAP "Open questions".
 pub trait Mailbox<T> {
     /// Returns the maximum number of messages the mailbox can hold without
     /// applying backpressure or shedding load.
@@ -178,6 +183,11 @@ pub trait Mailbox<T> {
 
     /// Attempts to dequeue the next message without blocking.
     fn recv(&self) -> Option<T>;
+
+    /// Closes the mailbox so subsequent `try_send` calls return
+    /// [`TrySendError::Closed`]. Idempotent. Already-buffered messages
+    /// remain visible to `recv` until drained.
+    fn close(&self);
 }
 
 /// Error returned by [`Mailbox::try_send`] when a bounded mailbox cannot accept
@@ -267,11 +277,19 @@ where
 /// The message type parameter makes invalid sends unrepresentable at the call
 /// site: an `Address<HttpMsg>` cannot be used where `Address<AuditMsg>` is
 /// required.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address<M> {
     shard: ShardId,
     isolate: IsolateId,
     marker: PhantomData<fn(M) -> M>,
+}
+
+impl<M> Copy for Address<M> {}
+
+impl<M> Clone for Address<M> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<M> Address<M> {
@@ -295,8 +313,27 @@ impl<M> Address<M> {
     }
 }
 
+/// ```compile_fail
+/// use tina::{Address, IsolateId, SendMessage, ShardId};
+///
+/// enum HttpMsg {
+///     Request,
+/// }
+///
+/// enum AuditMsg {
+///     Event,
+/// }
+///
+/// let http_only = Address::<HttpMsg>::new(ShardId::new(0), IsolateId::new(7));
+/// let _invalid = SendMessage::new(http_only, AuditMsg::Event);
+/// ```
 /// A typed outbound send request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `SendMessage` is intentionally not `Clone`/`PartialEq`. Real message
+/// types are often non-`Clone` (`Bytes`, file handles, large buffers), and
+/// a send request is meant to be moved into the runtime, not duplicated.
+#[must_use = "a send request has no effect until a runtime executes it"]
+#[derive(Debug)]
 pub struct SendMessage<M> {
     destination: Address<M>,
     message: M,
@@ -312,10 +349,7 @@ impl<M> SendMessage<M> {
     }
 
     /// Returns the destination address.
-    pub const fn destination(&self) -> Address<M>
-    where
-        M: Copy,
-    {
+    pub const fn destination(&self) -> Address<M> {
         self.destination
     }
 
@@ -334,6 +368,7 @@ impl<M> SendMessage<M> {
 ///
 /// The runtime owns what "spawn" means operationally. This type only carries
 /// the state machine to construct and the requested mailbox capacity.
+#[must_use = "a spawn request has no effect until a runtime executes it"]
 #[derive(Debug)]
 pub struct SpawnSpec<I>
 where
