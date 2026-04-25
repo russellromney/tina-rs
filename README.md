@@ -4,11 +4,12 @@
 
 It's a port of [Peter Banugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) — read that first. This README assumes you have.
 
-This repo is a Cargo workspace. Today it has one crate:
+This repo is a Cargo workspace. Today it has two crates:
 
 - **`tina`** — Trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`, `SendMessage`, `SpawnSpec`. No impls.
+- **`tina-mailbox-spsc`** — Bounded single-producer/single-consumer mailbox crate implementing `tina::Mailbox`.
 
-The runtime, mailbox, supervisor, and simulator crates come later. See [ROADMAP.md](ROADMAP.md).
+The runtime, supervisor, and simulator crates come later. See [ROADMAP.md](ROADMAP.md).
 
 > tina-rs is **experimental**. The vocabulary is here; the runtime isn't yet. The API will change.
 
@@ -99,9 +100,9 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 ## Status
 
-What works today: the trait crate. You can write isolates against it and they'll compile, but nothing runs them yet.
+What works today: the trait crate and the bounded SPSC mailbox crate. You can write isolates against the API and exercise real mailbox semantics, but nothing runs handlers yet.
 
-What's coming, in order: an SPSC mailbox impl and a supervisor; a single-shard runtime backed by current-thread Tokio with a working TCP echo server; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
+What's coming, in order: a supervision mechanism; a single-shard runtime backed by current-thread Tokio with a working TCP echo server; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 

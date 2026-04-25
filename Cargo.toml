@@ -1,9 +1,8 @@
 [workspace]
-members = ["tina"]
+members = ["tina", "tina-mailbox-spsc"]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-
