@@ -201,6 +201,185 @@ pub enum TrySendError<T> {
     Closed(T),
 }
 
+/// Supervision restart policy for a parent isolate's children.
+///
+/// These policies describe *which* children participate in a restart once the
+/// runtime detects a failure. They do not imply how failures are detected or
+/// how restarts are executed; that mechanism belongs to later runtime crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartPolicy {
+    /// Restart only the child that failed.
+    OneForOne,
+
+    /// Restart the failed child and every sibling in the group.
+    OneForAll,
+
+    /// Restart the failed child plus any children started after it.
+    RestForOne,
+}
+
+impl RestartPolicy {
+    /// Returns the restart decision for a child with the given relation to the
+    /// child that failed.
+    pub const fn decision(self, relation: ChildRelation) -> RestartDecision {
+        match (self, relation) {
+            (Self::OneForOne, ChildRelation::Failed) => RestartDecision::Restart,
+            (Self::OneForOne, ChildRelation::BeforeFailed) => RestartDecision::KeepRunning,
+            (Self::OneForOne, ChildRelation::AfterFailed) => RestartDecision::KeepRunning,
+            (Self::OneForAll, _) => RestartDecision::Restart,
+            (Self::RestForOne, ChildRelation::BeforeFailed) => RestartDecision::KeepRunning,
+            (Self::RestForOne, ChildRelation::Failed) => RestartDecision::Restart,
+            (Self::RestForOne, ChildRelation::AfterFailed) => RestartDecision::Restart,
+        }
+    }
+
+    /// Returns whether this policy restarts a child with the given relation to
+    /// the child that failed.
+    pub const fn restarts(self, relation: ChildRelation) -> bool {
+        matches!(self.decision(relation), RestartDecision::Restart)
+    }
+}
+
+/// Relative position of a child with respect to the child that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChildRelation {
+    /// The child was started before the child that failed.
+    BeforeFailed,
+
+    /// The child is the one that failed.
+    Failed,
+
+    /// The child was started after the child that failed.
+    AfterFailed,
+}
+
+impl ChildRelation {
+    /// Classifies a child by ordinal position relative to the child that
+    /// failed.
+    pub const fn from_ordinals(child_ordinal: usize, failed_ordinal: usize) -> Self {
+        if child_ordinal < failed_ordinal {
+            Self::BeforeFailed
+        } else if child_ordinal == failed_ordinal {
+            Self::Failed
+        } else {
+            Self::AfterFailed
+        }
+    }
+}
+
+/// Whether a child should be restarted under a [`RestartPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartDecision {
+    /// The runtime should restart the child.
+    Restart,
+
+    /// The runtime should leave the child running.
+    KeepRunning,
+}
+
+/// Fixed restart allowance for one contiguous budget window.
+///
+/// `tina` only models the accounting boundary. Later runtime crates decide
+/// what starts or resets a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RestartBudget {
+    max_restarts: u32,
+}
+
+impl RestartBudget {
+    /// Creates a restart budget with a fixed number of allowed restarts.
+    pub const fn new(max_restarts: u32) -> Self {
+        Self { max_restarts }
+    }
+
+    /// Returns the maximum number of restarts allowed in this budget window.
+    pub const fn max_restarts(self) -> u32 {
+        self.max_restarts
+    }
+
+    /// Starts restart accounting at zero consumed restarts.
+    pub const fn tracker(self) -> RestartBudgetState {
+        RestartBudgetState {
+            budget: self,
+            restarts_used: 0,
+        }
+    }
+}
+
+/// Restart accounting state for a specific [`RestartBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RestartBudgetState {
+    budget: RestartBudget,
+    restarts_used: u32,
+}
+
+impl RestartBudgetState {
+    /// Returns the configured restart budget.
+    pub const fn budget(self) -> RestartBudget {
+        self.budget
+    }
+
+    /// Returns the number of restarts already consumed.
+    pub const fn restarts_used(self) -> u32 {
+        self.restarts_used
+    }
+
+    /// Returns how many restarts remain before the budget is exhausted.
+    pub const fn restarts_remaining(self) -> u32 {
+        self.budget.max_restarts.saturating_sub(self.restarts_used)
+    }
+
+    /// Returns whether the budget is exhausted.
+    pub const fn is_exhausted(self) -> bool {
+        self.restarts_used >= self.budget.max_restarts
+    }
+
+    /// Records one restart attempt.
+    ///
+    /// Returns the updated accounting state when the restart is still allowed,
+    /// or [`RestartBudgetExceeded`] once the budget has been exhausted.
+    pub fn record_restart(self) -> Result<Self, RestartBudgetExceeded> {
+        if self.is_exhausted() {
+            return Err(RestartBudgetExceeded {
+                attempted_restart: self.restarts_used.saturating_add(1),
+                max_restarts: self.budget.max_restarts,
+            });
+        }
+
+        Ok(Self {
+            budget: self.budget,
+            restarts_used: self.restarts_used + 1,
+        })
+    }
+
+    /// Resets the consumed restart count to zero.
+    pub const fn reset(self) -> Self {
+        Self {
+            budget: self.budget,
+            restarts_used: 0,
+        }
+    }
+}
+
+/// Error returned when a restart would exceed the configured budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RestartBudgetExceeded {
+    attempted_restart: u32,
+    max_restarts: u32,
+}
+
+impl RestartBudgetExceeded {
+    /// Returns the restart ordinal that was rejected.
+    pub const fn attempted_restart(self) -> u32 {
+        self.attempted_restart
+    }
+
+    /// Returns the configured maximum number of allowed restarts.
+    pub const fn max_restarts(self) -> u32 {
+        self.max_restarts
+    }
+}
+
 /// Executor-per-core abstraction.
 ///
 /// Runtime crates will implement this trait for their shard type. Sputnik keeps
