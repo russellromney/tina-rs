@@ -4,6 +4,8 @@ A staged plan for porting Tina's discipline to Rust, structured to deliver value
 
 Phases are named (not numbered) so we can insert phases later without renumbering. Names are space missions, ordered roughly chronologically by mission complexity.
 
+Completed work moves to `CHANGELOG.md`. `ROADMAP.md` is for active and future work.
+
 ---
 
 ## Vision
@@ -53,46 +55,10 @@ These should be resolved early enough to avoid rework, but they do not all block
 
 ---
 
-## Phase Sputnik
-> First in orbit. Minimum viable types — no executor.
-
-Trait crate with the core abstractions and nothing else.
-
-- `Isolate` trait: typed state machine. `fn handle(&mut self, msg: Self::Message, ctx: &mut Context) -> Effect<Self>`.
-- `Effect` enum (closed enum with per-isolate associated payload types): `Noop`, `Reply`, `Send`, `Spawn`, `Stop`, `RestartChildren`.
-- `Mailbox<T>` trait: typed bounded inbox. `try_send`, `recv`.
-- `Shard` trait: executor-per-core abstraction.
-- A handful of small example isolates compile-tested only.
-
-**Done when:** `cargo doc` produces a coherent API surface; nothing runs yet; consumers can write isolates against the traits.
-
----
-
-## Phase Pioneer
-> Pioneering deeper. SPSC mailbox + supervision policy.
-
-> After: Phase Sputnik · Before: Phase Mariner
-
-- `tina-mailbox-spsc`: lock-free single-producer/single-consumer ring buffer. Bounded. `try_send` with explicit `Full` error. Drop-on-full is the consumer's policy choice, not the mailbox's.
-- Policy types for supervision (`RestartPolicy`, `RestartBudget`, child restart classification) land at the correct crate boundary. Mechanism does not ship yet.
-- Property tests via [loom](https://github.com/tokio-rs/loom) for the SPSC ring under contention.
-- Keep the abstraction boundary strict: `tina` owns traits and any consensus policy types only; mailbox crates own buffer layout, atomics, and queue semantics.
-- Lock in the allocation story here: the SPSC API and message path should support zero per-message allocation after warm-up on the hot path, or the roadmap must narrow that claim explicitly.
-
-**Proof plan:**
-
-- Unit + integration tests for a real SPSC implementation cover FIFO order, bounded capacity, `TrySendError::Full`, `TrySendError::Closed`, and no hidden fallback queue.
-- Loom tests cover concurrent producer/consumer interleavings for the SPSC ring.
-- Policy tests prove restart accounting behavior without pretending a runtime exists yet: `one-for-one`, `one-for-all`, `rest-for-one`, and restart-budget exhaustion.
-
-**Done when:** mailbox passes loom under contention; mailbox tests prove FIFO/boundedness/error behavior; supervision policy tests prove restart accounting and budget exhaustion; the hot-path allocation target is either preserved in the design or explicitly narrowed before Mariner starts.
-
----
-
 ## Phase Mariner
 > First single-thread runtime. Effect dispatcher + supervision mechanism.
 
-> After: Phase Pioneer · Before: Phase Voyager
+> After: Completed Sputnik and Pioneer work · Before: Phase Voyager
 
 - `tina-runtime-current`: single-shard runtime backed by `tokio::runtime::Builder::new_current_thread`. Pin to one core. Run a poll loop: drain mailboxes → run handlers → dispatch effects.
 - `tina-supervisor`: actual supervision mechanism, now that there is a runtime capable of catching failures, restarting children, and applying policy.

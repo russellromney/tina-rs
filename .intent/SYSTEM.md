@@ -1,0 +1,107 @@
+# tina-rs SYSTEM
+
+This file says what `tina-rs` is supposed to be.
+
+It is here to protect the shape of the system while the code changes fast. If a
+change breaks one of these ideas, we should notice and decide on purpose, not
+by accident.
+
+## What tina-rs is
+
+`tina-rs` is a way to build servers out of many small state machines.
+
+The big ideas are:
+
+- each isolate is one small state machine with its own state
+- handlers are synchronous and return effects instead of doing I/O themselves
+- mailboxes are bounded, and backpressure is visible
+- runtimes do the scheduling and run the effects
+- replay and simulation matter from the start, not as an afterthought
+
+`tina-rs` is not a new scheduler. It is not trying to replace Tokio or
+monoio. It is a small set of crates that sit on top of existing runtimes.
+
+## Where this came from
+
+`tina-rs` is a Rust port of Peter Mbanugo's Tina project in Odin.
+
+The original Tina repo is:
+
+- [pmbanugo/tina](https://github.com/pmbanugo/tina)
+
+The main blog post behind the project is:
+
+- [The Tokio/Rayon Trap and Why Async/Await Fails Concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency)
+
+We are trying to carry over the shape and discipline of Tina, not copy every
+detail one-for-one.
+
+## Current shipped surface
+
+Today the repo ships `tina` and `tina-mailbox-spsc`.
+
+`tina` provides the shared words and types, including supervision policy types.
+
+There is not yet a runtime, simulator, or Tokio bridge.
+
+## Crate boundaries that must not drift
+
+- `tina` owns the shared words of the system and small shared policy types.
+- `tina` should not quietly grow runtime helpers, scheduler helpers, or queue
+  internals.
+- mailbox behavior belongs in mailbox crates such as `tina-mailbox-spsc`.
+- runtime scheduling, polling, effect execution, and runtime event traces
+  belong in runtime crates.
+- supervision policy types may live in `tina`, but the actual supervision
+  mechanism does not ship before there is a runtime to host it.
+- the simulator must use the real runtime event model. It must not make up a
+  second visible model with different rules.
+
+## Isolate and effect model
+
+- an isolate handles one message at a time
+- handlers change local state and return an `Effect`
+- the effect language is intentionally closed at the trait boundary
+- the dispatcher is the only place real I/O happens
+- if runtime code quietly moves I/O into handlers, helper traits, or test-only
+  shims, that is a design break
+
+## Mailbox model
+
+- mailboxes are bounded
+- backpressure is explicit through `Full` and `Closed`
+- mailboxes do not hide overflow in a secret fallback queue
+- the SPSC mailbox has a one-producer, one-consumer contract
+- if code breaks that SPSC contract, it may panic; it must not silently turn
+  into MPSC or MPMC behavior
+- the hot SPSC path is meant to avoid per-message allocation after warm-up for
+  fixed-size payloads
+- claims about allocation behavior must stay narrow and be backed by evidence
+- dynamically sized payloads, if supported, travel behind owning pointers; the
+  ring stores fixed-size slot values, not inline DST payloads
+
+## Committed future constraints
+
+- the first runtime introduces the deterministic runtime event trace with
+  causal links
+- that trace is part of the design, not optional test decoration
+- the simulator uses the runtime trace vocabulary as its meaning model
+- the Tokio bridge is for small, gradual adoption inside existing Tokio apps
+- the Tokio bridge is not the main runtime story, and it is not a reason to
+  copy every Tokio pattern into tina
+- cross-shard rules must be written down before multi-shard runtime work starts
+- cross-shard behavior must not be guessed from code after the fact
+
+## Things that should feel wrong
+
+These are warning signs:
+
+- `tina` grows helper APIs only to make runtime tests easier
+- runtime code depends on simulator-only ideas
+- the simulator adds events the runtime does not emit
+- proof claims get bigger than the evidence
+- examples become the only proof that something works
+- the bridge starts being treated like the main runtime story
+
+If a change needs one of those moves, the intent should change first and the
+code should change second.
