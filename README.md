@@ -8,9 +8,9 @@ This repo is a Cargo workspace. Today it has one crate:
 
 - **`tina`** — Trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`, `SendMessage`, `SpawnSpec`. No impls.
 
-The runtime, mailbox, supervisor, and simulator crates land in later phases. See [ROADMAP.md](ROADMAP.md).
+The runtime, mailbox, supervisor, and simulator crates come later. See [ROADMAP.md](ROADMAP.md).
 
-> tina-rs is **experimental**. Phase Sputnik ships only the vocabulary; nothing runs yet. The API will change.
+> tina-rs is **experimental**. The vocabulary is here; the runtime isn't yet. The API will change.
 
 ## Why this exists
 
@@ -39,7 +39,7 @@ If you want to contribute or find bugs, please open a PR or issue.
 
 ## At a glance
 
-Phase Sputnik lets you define isolates against the API surface even though no runtime exists yet. Handlers describe what to do; they don't do it.
+Today the trait crate lets you define isolates against the API even though no runtime exists yet. Handlers describe what to do; they don't do it.
 
 ```rust
 use std::convert::Infallible;
@@ -80,7 +80,7 @@ impl Isolate for Counter {
 }
 ```
 
-`Effect` is a closed enum (`Noop`, `Reply`, `Send`, `Spawn`, `Stop`, `RestartChildren`) with per-isolate associated payload types. The runtime — when it arrives in Phase Mariner — is the only place real I/O happens.
+`Effect` is a closed enum (`Noop`, `Reply`, `Send`, `Spawn`, `Stop`, `RestartChildren`) with per-isolate associated payload types. When the runtime lands, it will be the only place real I/O happens.
 
 ## Design
 
@@ -99,16 +99,11 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 ## Status
 
-Phases land in order. Each one is proved out by tests against the abstraction, not just by a runnable example:
+What works today: the trait crate. You can write isolates against it and they'll compile, but nothing runs them yet.
 
-- **Sputnik** — trait crate (`tina`) ✅
-- **Pioneer** — SPSC mailbox + supervision trees, loom-tested
-- **Mariner** — single-shard runtime on `tokio::runtime::Builder::new_current_thread` + working TCP echo
-- **Voyager** — deterministic simulator
-- **Galileo** — multi-shard runtime on monoio (io_uring)
-- **Cassini** — Tokio-bridge for incremental adoption + production hardening
+What's coming, in order: an SPSC mailbox impl and a supervisor; a single-shard runtime backed by current-thread Tokio with a working TCP echo server; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
 
-See [ROADMAP.md](ROADMAP.md) for what each phase delivers and how it gets proven.
+See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 
 ## Non-goals
 
@@ -131,7 +126,7 @@ Individual targets: `make fmt`, `make check`, `make test`, `make doc`, `make cli
 - [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) — the framing
 - [Seastar](https://seastar.io/) — C++ thread-per-core framework, ScyllaDB's foundation
 - [monoio](https://github.com/bytedance/monoio) — likely runtime backend
-- [shuttle](https://github.com/awslabs/shuttle) — concurrency model checking, useful for the simulator phase
+- [shuttle](https://github.com/awslabs/shuttle) — concurrency model checking, useful when the simulator lands
 - [loom](https://github.com/tokio-rs/loom) — concurrency permutation testing for unsafe primitives
 
 ## License
