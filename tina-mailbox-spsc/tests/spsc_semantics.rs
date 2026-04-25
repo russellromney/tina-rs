@@ -52,6 +52,15 @@ fn close_rejects_future_sends_but_drains_buffered_messages() {
 }
 
 #[test]
+fn mailbox_accepts_dst_backed_payloads_via_owning_pointers() {
+    let mailbox: SpscMailbox<Box<str>> = SpscMailbox::new(2);
+
+    assert_eq!(mailbox.try_send("hello tina".into()), Ok(()));
+    assert_eq!(mailbox.recv().as_deref(), Some("hello tina"));
+    assert_eq!(mailbox.recv(), None);
+}
+
+#[test]
 fn single_producer_and_consumer_exchange_fifo_stream() {
     let mailbox = Arc::new(SpscMailbox::new(8));
     let producer_mailbox = Arc::clone(&mailbox);

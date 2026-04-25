@@ -1,8 +1,10 @@
 # tina-rs
 
+![tina-rs hero](tina.png)
+
 `tina-rs` is a Rust library for building servers out of independent state machines. Each tenant, connection, room, or session is its own struct with its own message queue, and they never share memory. Handlers process one message at a time and return a value describing what to do next — `Send this`, `Spawn that`, `Reply with X`, `Stop`. The runtime is the only thing that actually does I/O. Because handlers are descriptions of work rather than the work itself, the whole system can be driven deterministically in tests: every failure becomes a seed you can replay.
 
-It's a port of [Peter Banugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) — read that first. This README assumes you have.
+It's a port of [Peter Banugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) which you should read first, then check out the Odin reference impl, then come back here.
 
 This repo is a Cargo workspace. Today it has two crates:
 
@@ -22,7 +24,7 @@ The default async tools in Rust make it easy to write a server that works fine o
 - **A blocking call on a Tokio worker stalls everything that worker was juggling.** One slow SQLite query or one cgo call can pause unrelated tasks for hundreds of milliseconds.
 - **`Arc<Mutex<…>>` is a graveyard.** Once you reach for it, you've accepted that several units are sharing state, and the lock is going to be where every weird latency spike comes from.
 
-`tina-rs` enforces a different shape:
+`tina-rs` enforces a different set of ideas:
 
 - **One state machine per unit.** Each tenant or connection is a typed struct (an `Isolate`) with one message type and one queue.
 - **Handlers are synchronous and return descriptions of work.** `fn handle(msg) -> Effect`. The handler never does I/O; it returns a value like "send this message" or "spawn this child" or "stop me." The runtime executes the description.
@@ -30,11 +32,11 @@ The default async tools in Rust make it easy to write a server that works fine o
 - **One OS thread per core, pinned, no stealing.** Each shard owns a fixed set of isolates. Work doesn't move between cores. Cache stays warm.
 - **The whole runtime is replayable.** Because handlers are descriptions and the runtime is the only thing that touches I/O or time, a test harness can drive the system from a seed and reproduce any failure.
 
-None of this is new — Erlang, Akka, and [Seastar](https://seastar.io/) all do versions of it. `tina-rs` is these patterns expressed as Rust traits and a small set of impl crates.
+None of this is new: Erlang, Akka, and [Seastar](https://seastar.io/) all do versions of it. `tina-rs` is these patterns expressed as Rust traits and a small set of impl crates.
 
-## Why not write a new runtime
+## Why not write a new runtime?
 
-Because thread-per-core runtimes for Rust already exist. [monoio](https://github.com/bytedance/monoio) is io_uring-based and actively maintained. [glommio](https://github.com/DataDog/glommio) is the Datadog version. `tokio::runtime::Builder::new_current_thread` gives you the same single-threaded shape inside the existing async ecosystem. The hard part isn't building a scheduler — it's the discipline above, and that layer is portable across runtimes. `tina-rs` is the discipline; the scheduler is whatever you pick.
+Thread-per-core runtimes for Rust already exist. [monoio](https://github.com/bytedance/monoio) is io_uring-based and actively maintained. [glommio](https://github.com/DataDog/glommio) is the Datadog version. `tokio::runtime::Builder::new_current_thread` gives you the same single-threaded idea inside the existing async ecosystem. The challenge lies in the discipline above rather than the scheduler, and that layer is portable across runtimes. `tina-rs` is the discipline; the scheduler is whatever you pick.
 
 If you want to contribute or find bugs, please open a PR or issue.
 
@@ -116,10 +118,11 @@ See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 ## Development
 
 ```bash
-make verify   # fmt + check + test + doc + clippy
+make verify   # fmt + check + test + loom + doc + clippy
 ```
 
 Individual targets: `make fmt`, `make check`, `make test`, `make doc`, `make clippy`.
+Concurrency model checking: `make loom`.
 
 ## Prior art and references
 

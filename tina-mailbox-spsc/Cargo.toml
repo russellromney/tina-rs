@@ -10,5 +10,9 @@ repository = "https://github.com/russellromney/tina-rs"
 [lib]
 path = "src/lib.rs"
 
+[features]
+loom = ["dep:loom"]
+
 [dependencies]
 tina = { path = "../tina" }
+loom = { version = "0.7.2", optional = true }

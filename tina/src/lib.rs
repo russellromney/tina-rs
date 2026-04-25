@@ -173,6 +173,11 @@ where
 /// `recv` takes `&self` because real SPSC implementations rely on interior
 /// mutability (atomics over a ring buffer). Phase Pioneer may revisit this
 /// with a `Sender`/`Receiver` split — see ROADMAP "Open questions".
+///
+/// Concrete implementations may enforce concurrency contracts at runtime rather
+/// than in the type system. For example, an SPSC mailbox may panic if more than
+/// one producer or more than one consumer enters concurrently even though the
+/// trait surface uses shared references.
 pub trait Mailbox<T> {
     /// Returns the maximum number of messages the mailbox can hold without
     /// applying backpressure or shedding load.
