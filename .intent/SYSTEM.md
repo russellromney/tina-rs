@@ -38,11 +38,15 @@ detail one-for-one.
 
 ## Current shipped surface
 
-Today the repo ships `tina` and `tina-mailbox-spsc`.
+Today the repo ships `tina`, `tina-mailbox-spsc`, and `tina-runtime-current`.
 
 `tina` provides the shared words and types, including supervision policy types.
 
-There is not yet a runtime, simulator, or Tokio bridge.
+`tina-runtime-current` is still a small, in-progress runtime. Today it has
+deterministic runtime events, a single-shard stepping model, and local
+same-shard send dispatch.
+
+There is not yet a simulator or Tokio bridge.
 
 ## Crate boundaries that must not drift
 

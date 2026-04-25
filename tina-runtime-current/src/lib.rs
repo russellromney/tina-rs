@@ -2,20 +2,28 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-//! Small single-isolate runtime core for `tina-rs`.
+//! Small current-thread runtime core for `tina-rs`.
 //!
-//! This crate starts Mariner with the narrowest useful surface:
+//! This crate starts Mariner with the narrowest useful runtime surface:
 //!
 //! - deterministic runtime event IDs
 //! - causal links between runtime events
-//! - a one-step single-isolate runner
+//! - a legacy one-step single-isolate runner
+//! - a tiny single-shard runtime that can host more than one isolate
 //!
-//! The first runner executes one handler at a time from an injected mailbox and
-//! records a trace of what happened. In this slice it only applies one effect
-//! state transition itself: `Effect::Stop` marks the isolate as stopped. Other
-//! effects are observed and traced, but not executed.
+//! The multi-isolate runtime still stays narrow on purpose. It can register
+//! isolates, step them in deterministic order, and execute local same-shard
+//! [`Effect::Send`] requests that use [`tina::SendMessage`]. Other effects are
+//! still traced before they are executed in later slices.
 
-use tina::{Context, Effect, Isolate, IsolateId, Mailbox, Shard, ShardId};
+use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
+
+use tina::{
+    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId,
+    TrySendError,
+};
 
 /// Stable identifier for one runtime event in a deterministic trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -77,10 +85,20 @@ pub enum EffectKind {
     RestartChildren,
 }
 
+/// Why a local send could not be enqueued into the target mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SendRejectedReason {
+    /// The target mailbox was full.
+    Full,
+
+    /// The target mailbox was closed.
+    Closed,
+}
+
 /// Kind of one runtime event emitted by the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeEventKind {
-    /// The runner accepted one message from the mailbox for delivery.
+    /// The runner accepted one message from a mailbox for delivery.
     MailboxAccepted,
 
     /// The runner began one handler invocation.
@@ -96,6 +114,37 @@ pub enum RuntimeEventKind {
     EffectObserved {
         /// The effect kind that was observed.
         effect: EffectKind,
+    },
+
+    /// The runtime tried to route a local send to another isolate on the same
+    /// shard.
+    SendDispatchAttempted {
+        /// The destination shard.
+        target_shard: ShardId,
+
+        /// The destination isolate on that shard.
+        target_isolate: IsolateId,
+    },
+
+    /// The runtime accepted a local send into the target mailbox.
+    SendAccepted {
+        /// The destination shard.
+        target_shard: ShardId,
+
+        /// The destination isolate on that shard.
+        target_isolate: IsolateId,
+    },
+
+    /// The runtime rejected a local send.
+    SendRejected {
+        /// The destination shard.
+        target_shard: ShardId,
+
+        /// The destination isolate on that shard.
+        target_isolate: IsolateId,
+
+        /// Why the target mailbox rejected the send.
+        reason: SendRejectedReason,
     },
 
     /// The runner applied the stopped state after observing [`Effect::Stop`].
@@ -236,8 +285,19 @@ where
             return StepOutcome::Idle;
         };
 
-        let mailbox_accepted = self.push_event(None, RuntimeEventKind::MailboxAccepted);
-        let handler_started = self.push_event(
+        let mailbox_accepted = push_event(
+            &mut self.next_event_id,
+            &mut self.trace,
+            self.shard.id(),
+            self.isolate_id,
+            None,
+            RuntimeEventKind::MailboxAccepted,
+        );
+        let handler_started = push_event(
+            &mut self.next_event_id,
+            &mut self.trace,
+            self.shard.id(),
+            self.isolate_id,
             Some(mailbox_accepted.into()),
             RuntimeEventKind::HandlerStarted,
         );
@@ -248,7 +308,11 @@ where
         };
 
         let effect_kind = effect_kind(&effect);
-        let handler_finished = self.push_event(
+        let handler_finished = push_event(
+            &mut self.next_event_id,
+            &mut self.trace,
+            self.shard.id(),
+            self.isolate_id,
             Some(handler_started.into()),
             RuntimeEventKind::HandlerFinished {
                 effect: effect_kind,
@@ -258,7 +322,11 @@ where
         match effect {
             Effect::Stop => {
                 self.stopped = true;
-                self.push_event(
+                push_event(
+                    &mut self.next_event_id,
+                    &mut self.trace,
+                    self.shard.id(),
+                    self.isolate_id,
                     Some(handler_finished.into()),
                     RuntimeEventKind::IsolateStopped,
                 );
@@ -268,7 +336,11 @@ where
             | Effect::Send(_)
             | Effect::Spawn(_)
             | Effect::RestartChildren => {
-                self.push_event(
+                push_event(
+                    &mut self.next_event_id,
+                    &mut self.trace,
+                    self.shard.id(),
+                    self.isolate_id,
                     Some(handler_finished.into()),
                     RuntimeEventKind::EffectObserved {
                         effect: effect_kind,
@@ -279,19 +351,250 @@ where
 
         StepOutcome::Delivered
     }
+}
 
-    fn push_event(&mut self, cause: Option<CauseId>, kind: RuntimeEventKind) -> EventId {
-        let id = EventId::new(self.next_event_id);
-        self.next_event_id += 1;
-        self.trace.push(RuntimeEvent::new(
-            id,
-            cause,
-            self.shard.id(),
-            self.isolate_id,
-            kind,
-        ));
-        id
+/// Small deterministic single-shard runtime for the second Mariner slice.
+///
+/// The runtime owns one shard value plus a private registry of isolates and
+/// mailboxes. [`step`](Self::step) walks registered isolates in registration
+/// order and gives each isolate at most one delivery chance per round.
+pub struct CurrentRuntime<S>
+where
+    S: Shard,
+{
+    shard: S,
+    entries: Vec<RegisteredEntry<S>>,
+    next_isolate_id: u64,
+    next_event_id: u64,
+    trace: Vec<RuntimeEvent>,
+}
+
+impl<S> CurrentRuntime<S>
+where
+    S: Shard,
+{
+    /// Creates a new runtime for one shard.
+    pub fn new(shard: S) -> Self {
+        Self {
+            shard,
+            entries: Vec::new(),
+            next_isolate_id: 1,
+            next_event_id: 1,
+            trace: Vec::new(),
+        }
     }
+
+    /// Returns a shared reference to the shard.
+    pub const fn shard(&self) -> &S {
+        &self.shard
+    }
+
+    /// Returns the accumulated runtime trace.
+    pub fn trace(&self) -> &[RuntimeEvent] {
+        &self.trace
+    }
+
+    /// Registers one isolate and returns its typed address.
+    ///
+    /// Isolate identifiers are assigned in registration order, starting at `1`.
+    pub fn register<I, M, Outbound>(&mut self, isolate: I, mailbox: M) -> Address<I::Message>
+    where
+        I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+        I::Message: 'static,
+        Outbound: 'static,
+        M: Mailbox<I::Message> + 'static,
+    {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
+
+        self.entries.push(RegisteredEntry {
+            id: isolate_id,
+            stopped: Cell::new(false),
+            mailbox: Box::new(MailboxAdapter::<M, I::Message> {
+                mailbox,
+                marker: PhantomData,
+            }),
+            handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
+                isolate,
+                marker: PhantomData,
+            })),
+        });
+
+        self.shard.address(isolate_id)
+    }
+
+    /// Runs one deterministic round over all registered isolates.
+    ///
+    /// The return value is the number of handlers that ran in this round.
+    pub fn step(&mut self) -> usize {
+        let round_messages: Vec<Option<Box<dyn Any>>> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                if entry.stopped.get() {
+                    None
+                } else {
+                    entry.mailbox.recv_boxed()
+                }
+            })
+            .collect();
+
+        let mut delivered = 0;
+
+        for (index, maybe_message) in round_messages.into_iter().enumerate() {
+            let Some(message) = maybe_message else {
+                continue;
+            };
+
+            delivered += 1;
+
+            let isolate_id = self.entries[index].id;
+            let mailbox_accepted =
+                self.push_event(isolate_id, None, RuntimeEventKind::MailboxAccepted);
+            let handler_started = self.push_event(
+                isolate_id,
+                Some(mailbox_accepted.into()),
+                RuntimeEventKind::HandlerStarted,
+            );
+
+            let effect = self.entries[index].handler.borrow_mut().handle_boxed(
+                message,
+                &mut self.shard,
+                isolate_id,
+            );
+
+            let effect_kind = effect.kind();
+            let handler_finished = self.push_event(
+                isolate_id,
+                Some(handler_started.into()),
+                RuntimeEventKind::HandlerFinished {
+                    effect: effect_kind,
+                },
+            );
+
+            match effect {
+                ErasedEffect::Stop => {
+                    self.entries[index].stopped.set(true);
+                    self.entries[index].mailbox.close();
+                    self.push_event(
+                        isolate_id,
+                        Some(handler_finished.into()),
+                        RuntimeEventKind::IsolateStopped,
+                    );
+                }
+                ErasedEffect::Send(send) => {
+                    let target_shard = send.target_shard;
+                    let target_isolate = send.target_isolate;
+                    let attempted = self.push_event(
+                        isolate_id,
+                        Some(handler_finished.into()),
+                        RuntimeEventKind::SendDispatchAttempted {
+                            target_shard,
+                            target_isolate,
+                        },
+                    );
+
+                    match self.dispatch_local_send(send) {
+                        Ok(()) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendAccepted {
+                                    target_shard,
+                                    target_isolate,
+                                },
+                            );
+                        }
+                        Err((target_shard, target_isolate, reason)) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendRejected {
+                                    target_shard,
+                                    target_isolate,
+                                    reason,
+                                },
+                            );
+                        }
+                    }
+                }
+                ErasedEffect::Noop
+                | ErasedEffect::Reply
+                | ErasedEffect::Spawn
+                | ErasedEffect::RestartChildren => {
+                    self.push_event(
+                        isolate_id,
+                        Some(handler_finished.into()),
+                        RuntimeEventKind::EffectObserved {
+                            effect: effect_kind,
+                        },
+                    );
+                }
+            }
+        }
+
+        delivered
+    }
+
+    fn push_event(
+        &mut self,
+        isolate: IsolateId,
+        cause: Option<CauseId>,
+        kind: RuntimeEventKind,
+    ) -> EventId {
+        push_event(
+            &mut self.next_event_id,
+            &mut self.trace,
+            self.shard.id(),
+            isolate,
+            cause,
+            kind,
+        )
+    }
+
+    fn dispatch_local_send(
+        &self,
+        send: ErasedSend,
+    ) -> Result<(), (ShardId, IsolateId, SendRejectedReason)> {
+        if send.target_shard != self.shard.id() {
+            panic!(
+                "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",
+                send.target_shard.get(),
+                self.shard.id().get(),
+            );
+        }
+
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == send.target_isolate)
+        else {
+            panic!(
+                "send targeted unknown isolate {} on shard {}",
+                send.target_isolate.get(),
+                send.target_shard.get(),
+            );
+        };
+
+        entry
+            .mailbox
+            .try_send_boxed(send.message)
+            .map_err(|reason| (send.target_shard, send.target_isolate, reason))
+    }
+}
+
+fn push_event(
+    next_event_id: &mut u64,
+    trace: &mut Vec<RuntimeEvent>,
+    shard: ShardId,
+    isolate: IsolateId,
+    cause: Option<CauseId>,
+    kind: RuntimeEventKind,
+) -> EventId {
+    let id = EventId::new(*next_event_id);
+    *next_event_id += 1;
+    trace.push(RuntimeEvent::new(id, cause, shard, isolate, kind));
+    id
 }
 
 fn effect_kind<I>(effect: &Effect<I>) -> EffectKind
@@ -306,4 +609,144 @@ where
         Effect::Stop => EffectKind::Stop,
         Effect::RestartChildren => EffectKind::RestartChildren,
     }
+}
+
+trait ErasedMailbox {
+    fn recv_boxed(&self) -> Option<Box<dyn Any>>;
+    fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), SendRejectedReason>;
+    fn close(&self);
+}
+
+struct MailboxAdapter<M, Msg>
+where
+    M: Mailbox<Msg>,
+{
+    mailbox: M,
+    marker: PhantomData<fn(Msg) -> Msg>,
+}
+
+impl<M, Msg> ErasedMailbox for MailboxAdapter<M, Msg>
+where
+    M: Mailbox<Msg>,
+    Msg: 'static,
+{
+    fn recv_boxed(&self) -> Option<Box<dyn Any>> {
+        self.mailbox
+            .recv()
+            .map(|message| Box::new(message) as Box<dyn Any>)
+    }
+
+    fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), SendRejectedReason> {
+        let message = message.downcast::<Msg>().unwrap_or_else(|_| {
+            panic!("runtime attempted to deliver a message to a mailbox with the wrong type")
+        });
+
+        match self.mailbox.try_send(*message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SendRejectedReason::Full),
+            Err(TrySendError::Closed(_)) => Err(SendRejectedReason::Closed),
+        }
+    }
+
+    fn close(&self) {
+        self.mailbox.close();
+    }
+}
+
+trait ErasedHandler<S>
+where
+    S: Shard,
+{
+    fn handle_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+    ) -> ErasedEffect;
+}
+
+struct HandlerAdapter<I, Outbound>
+where
+    I: Isolate,
+{
+    isolate: I,
+    marker: PhantomData<fn(Outbound) -> Outbound>,
+}
+
+impl<I, S, Outbound> ErasedHandler<S> for HandlerAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>>,
+    I::Message: 'static,
+    Outbound: 'static,
+    S: Shard,
+{
+    fn handle_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+    ) -> ErasedEffect {
+        let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
+            panic!("runtime attempted to deliver a handler message with the wrong type")
+        });
+
+        let effect = {
+            let mut ctx = Context::new(shard, isolate_id);
+            self.isolate.handle(*message, &mut ctx)
+        };
+
+        match effect {
+            Effect::Noop => ErasedEffect::Noop,
+            Effect::Reply(_) => ErasedEffect::Reply,
+            Effect::Send(send) => {
+                let (destination, message) = send.into_parts();
+                ErasedEffect::Send(ErasedSend {
+                    target_shard: destination.shard(),
+                    target_isolate: destination.isolate(),
+                    message: Box::new(message),
+                })
+            }
+            Effect::Spawn(_) => ErasedEffect::Spawn,
+            Effect::Stop => ErasedEffect::Stop,
+            Effect::RestartChildren => ErasedEffect::RestartChildren,
+        }
+    }
+}
+
+struct RegisteredEntry<S>
+where
+    S: Shard,
+{
+    id: IsolateId,
+    stopped: Cell<bool>,
+    mailbox: Box<dyn ErasedMailbox>,
+    handler: RefCell<Box<dyn ErasedHandler<S>>>,
+}
+
+enum ErasedEffect {
+    Noop,
+    Reply,
+    Send(ErasedSend),
+    Spawn,
+    Stop,
+    RestartChildren,
+}
+
+impl ErasedEffect {
+    fn kind(&self) -> EffectKind {
+        match self {
+            Self::Noop => EffectKind::Noop,
+            Self::Reply => EffectKind::Reply,
+            Self::Send(_) => EffectKind::Send,
+            Self::Spawn => EffectKind::Spawn,
+            Self::Stop => EffectKind::Stop,
+            Self::RestartChildren => EffectKind::RestartChildren,
+        }
+    }
+}
+
+struct ErasedSend {
+    target_shard: ShardId,
+    target_isolate: IsolateId,
+    message: Box<dyn Any>,
 }
