@@ -41,7 +41,7 @@ End consumers depend on `tina` plus one runtime crate. Dependencies flow concret
 Trait crate with the core abstractions and nothing else.
 
 - `Isolate` trait: typed state machine. `fn handle(&mut self, msg: Self::Message, ctx: &mut Context) -> Effect<Self>`.
-- `Effect` enum (associated type per isolate, or closed enum — see Open Questions): `Noop`, `Reply(Bytes)`, `Send(MailboxRef, Msg)`, `Spawn(IsolateBuilder)`, `Stop`, `RestartChildren`.
+- `Effect` enum (closed enum with per-isolate associated payload types): `Noop`, `Reply`, `Send`, `Spawn`, `Stop`, `RestartChildren`.
 - `Mailbox<T>` trait: typed bounded inbox. `try_send`, `recv`.
 - `Shard` trait: executor-per-core abstraction.
 - A handful of small example isolates compile-tested only.
@@ -125,12 +125,12 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 
 These don't block Phase Sputnik, but they need answers as we go.
 
-1. **`Effect` shape.** Associated-type generic per isolate (typed but harder to compose) vs. closed enum (simpler, less honest)? Prototype both in Sputnik; decide before Pioneer.
+1. **`Effect` shape.** Resolved in Sputnik: use a closed enum with per-isolate associated payload types for `Reply`, `Send`, and `Spawn`. This keeps the dispatcher contract uniform without erasing the types carried by each isolate.
 2. **Cross-shard ownership.** Tina-Odin's mailboxes are SPSC; cross-shard requires copy-or-move. Investigate whether we can use ownership transfer (move + atomic pointer swap) for zero-copy. If not, accept the copy.
 3. **Supervisor split.** How much lives in `tina` (policy types: `RestartPolicy`, `RestartBudget`) vs `tina-supervisor` (mechanism: the actual tree, the watcher loop)?
 4. **Coordination with Banugo.** File an issue on tina-odin asking if a Rust port is welcome before publishing crates. Polite + may produce useful design feedback.
 5. **MSRV.** Pick a Rust version that supports the io_uring story without nightly. Currently this is stable Rust 1.85+ via monoio.
-6. **License.** MIT or Apache-2.0 — match Rust ecosystem norms. Decide at Phase Sputnik publish time.
+6. **License.** Resolved in Sputnik: dual-license under MIT or Apache-2.0 to match Rust ecosystem norms.
 
 ---
 
