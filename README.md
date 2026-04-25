@@ -1,6 +1,8 @@
 # tina-rs
 
-`tina-rs` is a Rust port of the discipline behind [Tina](https://github.com/pmbanugo/tina) — thread-per-core, isolate-per-entity, synchronous handlers returning effects, bounded mailboxes everywhere. It rides on top of existing thread-per-core runtimes (monoio, current-thread Tokio) rather than shipping a new one.
+`tina-rs` is a Rust library for building servers out of independent state machines. Each tenant, connection, room, or session is its own struct with its own message queue, and they never share memory. Handlers process one message at a time and return a value describing what to do next — `Send this`, `Spawn that`, `Reply with X`, `Stop`. The runtime is the only thing that actually does I/O. Because handlers are descriptions of work rather than the work itself, the whole system can be driven deterministically in tests: every failure becomes a seed you can replay.
+
+It's a port of [Peter Banugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) — read that first. This README assumes you have.
 
 This repo is a Cargo workspace. Today it has one crate:
 
@@ -10,9 +12,28 @@ The runtime, mailbox, supervisor, and simulator crates land in later phases. See
 
 > tina-rs is **experimental**. Phase Sputnik ships only the vocabulary; nothing runs yet. The API will change.
 
-The async/await ecosystem in Rust has known structural issues for sharded workloads: work-stealing destroys cache locality, async coloring spreads through code, `mpsc::unbounded_channel` and bare `tokio::spawn` defaults turn traffic spikes into OOMs, and CPU work mixed with I/O on the same scheduler stalls multiplexing. Peter Banugo's [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) frames the case, and his [Tina](https://github.com/pmbanugo/tina) (Odin) is the reference implementation. `tina-rs` is the same patterns in Rust.
+## Why this exists
 
-Why not write a new runtime? Because the runtimes already exist. [monoio](https://github.com/bytedance/monoio) is io_uring-based, thread-per-core, and actively maintained. [glommio](https://github.com/DataDog/glommio) is the Datadog version. `tokio::runtime::Builder::new_current_thread` gives you the same shape inside the existing ecosystem. The hard part isn't scheduling — it's the discipline: isolate-per-entity, effect-returning handlers, bounded mailboxes, supervision trees, deterministic simulation. That layer is portable across runtimes, and that's what `tina-rs` is.
+The default async tools in Rust make it easy to write a server that works fine on a laptop and falls over under real load. Banugo's article walks through the reasons; the short version:
+
+- **The Tokio scheduler moves tasks between cores ("work-stealing").** Every time a task moves, the cache lines it was using on the old core are useless. For servers where each connection or tenant has its own state, that movement is pure waste.
+- **`mpsc::unbounded_channel` turns traffic spikes into out-of-memory crashes.** A producer that briefly outpaces a consumer fills memory until the process dies.
+- **A blocking call on a Tokio worker stalls everything that worker was juggling.** One slow SQLite query or one cgo call can pause unrelated tasks for hundreds of milliseconds.
+- **`Arc<Mutex<…>>` is a graveyard.** Once you reach for it, you've accepted that several units are sharing state, and the lock is going to be where every weird latency spike comes from.
+
+`tina-rs` enforces a different shape:
+
+- **One state machine per unit.** Each tenant or connection is a typed struct (an `Isolate`) with one message type and one queue.
+- **Handlers are synchronous and return descriptions of work.** `fn handle(msg) -> Effect`. The handler never does I/O; it returns a value like "send this message" or "spawn this child" or "stop me." The runtime executes the description.
+- **Queues are bounded with explicit `Full` and `Closed` errors.** Backpressure is something the application sees and handles, not a leak that builds quietly.
+- **One OS thread per core, pinned, no stealing.** Each shard owns a fixed set of isolates. Work doesn't move between cores. Cache stays warm.
+- **The whole runtime is replayable.** Because handlers are descriptions and the runtime is the only thing that touches I/O or time, a test harness can drive the system from a seed and reproduce any failure.
+
+None of this is new — Erlang, Akka, and [Seastar](https://seastar.io/) all do versions of it. `tina-rs` is these patterns expressed as Rust traits and a small set of impl crates.
+
+## Why not write a new runtime
+
+Because thread-per-core runtimes for Rust already exist. [monoio](https://github.com/bytedance/monoio) is io_uring-based and actively maintained. [glommio](https://github.com/DataDog/glommio) is the Datadog version. `tokio::runtime::Builder::new_current_thread` gives you the same single-threaded shape inside the existing async ecosystem. The hard part isn't building a scheduler — it's the discipline above, and that layer is portable across runtimes. `tina-rs` is the discipline; the scheduler is whatever you pick.
 
 If you want to contribute or find bugs, please open a PR or issue.
 
