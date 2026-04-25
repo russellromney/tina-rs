@@ -44,4 +44,4 @@ So tina-rs is opinionated glue: the trait crate names the capability; runtime im
 
 ## License
 
-TBD. Likely MIT or Apache-2.0 to match the wider Rust ecosystem.
+Dual-licensed under MIT or Apache-2.0, at your option.
