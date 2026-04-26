@@ -35,5 +35,10 @@ This file records completed work.
   registration order.
 - Added stop-and-abandon semantics: when an isolate stops, buffered messages are
   drained in FIFO order, dropped, and traced as `MessageAbandoned`.
+- Added panic-capture semantics: an unwinding handler panic becomes
+  `HandlerPanicked`, then `IsolateStopped`, and the runtime continues the rest
+  of the round deterministically.
 - Added runtime tests for trace-core behavior, local send dispatch, and
   stop-and-abandon determinism.
+- Added runtime tests for panic capture, post-panic abandonment, preserved
+  programmer-error panics, and same-round continuation after panic.
