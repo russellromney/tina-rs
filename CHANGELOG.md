@@ -26,3 +26,14 @@ This file records completed work.
 - Added drop-accounting and allocation-accounting tests to keep mailbox claims
   narrow and evidence-backed.
 - Documented the DST boundary and the runtime-enforced SPSC contract.
+
+### Phase Mariner
+
+- Added `tina-runtime-current`, a small in-progress runtime with a deterministic
+  event trace and causal links.
+- Added single-shard stepping and local same-shard `Send` dispatch in
+  registration order.
+- Added stop-and-abandon semantics: when an isolate stops, buffered messages are
+  drained in FIFO order, dropped, and traced as `MessageAbandoned`.
+- Added runtime tests for trace-core behavior, local send dispatch, and
+  stop-and-abandon determinism.
