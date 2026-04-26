@@ -64,6 +64,7 @@ These should be resolved early enough to avoid rework, but they do not all block
 - `tina-supervisor`: actual supervision mechanism, now that there is a runtime capable of catching failures, restarting children, and applying policy.
 - The effect dispatcher is the **only** place real I/O happens. Handlers return effects; the dispatcher executes them. This is the property that makes deterministic simulation possible later.
 - Introduce a deterministic runtime event trace for tests and later simulation handoff. The trace records mailbox accept/reject, handler invocation start/end, effect dispatch, stop, spawn, and restart events, with causal linkage so tests and replay can reason about provenance rather than only timeline order.
+- Defer runtime-owned parent-child bookkeeping until the first Mariner slice that makes `RestartChildren` or child restart execution real. By that point the bookkeeping becomes externally testable instead of speculative internal state. The follow-up slice must prove at least: root-registered isolates have no parent, spawned children are linked to the isolate that spawned them, and restart execution consumes that recorded lineage rather than reconstructing it ad hoc.
 - A working TCP echo server isolate (mirroring Tina-Odin's example) — proves the API end-to-end.
 - Keep the abstraction boundary strict: `tina-runtime-current` owns scheduling, polling, and effect execution; `tina` must not grow runtime helpers just to make tests easier.
 - Runtime tests should inject a deterministic test mailbox through `Mailbox<T>` where possible. Benchmarks and smoke examples can use the real SPSC crate, but correctness tests should avoid coupling two fresh implementations unless that coupling is the point of the test.
@@ -80,6 +81,10 @@ These should be resolved early enough to avoid rework, but they do not all block
   - a panicking child is restarted according to policy
   - sibling survival matches `one-for-one`, `one-for-all`, and `rest-for-one`
   - restart-budget exhaustion halts restart loops predictably
+- Before those restart tests land, a dedicated Mariner follow-up slice proves parent-child lineage in the runtime itself:
+  - root-registered isolates have no parent
+  - spawned children retain the parent that created them
+  - restart execution reads that stored lineage rather than inferring it from trace order
 - Trace-oriented integration tests assert on the runtime event trace and prove that two identical seeded runs on the single-shard runtime produce the same event sequence with the same causal chains.
 - A runnable echo example is used as an end-to-end smoke test and benchmark surface, not as the only evidence of correctness.
 
