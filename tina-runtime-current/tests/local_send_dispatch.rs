@@ -47,11 +47,20 @@ impl Shard for TestShard {
     }
 }
 
-#[derive(Clone)]
 struct TestMailbox<T> {
     capacity: usize,
     queue: Rc<RefCell<VecDeque<T>>>,
     closed: Rc<Cell<bool>>,
+}
+
+impl<T> Clone for TestMailbox<T> {
+    fn clone(&self) -> Self {
+        Self {
+            capacity: self.capacity,
+            queue: Rc::clone(&self.queue),
+            closed: Rc::clone(&self.closed),
+        }
+    }
 }
 
 impl<T> TestMailbox<T> {

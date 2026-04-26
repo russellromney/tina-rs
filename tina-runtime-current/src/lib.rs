@@ -15,6 +15,10 @@
 //! isolates, step them in deterministic order, and execute local same-shard
 //! [`Effect::Send`] requests that use [`tina::SendMessage`]. Other effects are
 //! still traced before they are executed in later slices.
+//!
+//! `Effect::Stop` stays immediate, but `CurrentRuntime` now also drains and
+//! traces any already-buffered messages that become abandoned when an isolate
+//! stops.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -149,6 +153,10 @@ pub enum RuntimeEventKind {
 
     /// The runner applied the stopped state after observing [`Effect::Stop`].
     IsolateStopped,
+
+    /// The runtime drained one already-buffered message from a stopped
+    /// isolate's mailbox without delivering it to the handler.
+    MessageAbandoned,
 }
 
 /// One deterministic runtime event with a causal link to an earlier event.
@@ -476,11 +484,18 @@ where
                 ErasedEffect::Stop => {
                     self.entries[index].stopped.set(true);
                     self.entries[index].mailbox.close();
-                    self.push_event(
+                    let stopped = self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
                         RuntimeEventKind::IsolateStopped,
                     );
+                    while self.entries[index].mailbox.recv_boxed().is_some() {
+                        self.push_event(
+                            isolate_id,
+                            Some(stopped.into()),
+                            RuntimeEventKind::MessageAbandoned,
+                        );
+                    }
                 }
                 ErasedEffect::Send(send) => {
                     let target_shard = send.target_shard;
