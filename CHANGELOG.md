@@ -33,6 +33,10 @@ This file records completed work.
   event trace and causal links.
 - Added single-shard stepping and local same-shard `Send` dispatch in
   registration order.
+- Added local same-shard `Spawn` dispatch with runtime-owned mailbox creation,
+  deterministic child IDs, and later-round child execution.
+- Added a typed runtime ingress API so external code can send to registered and
+  spawned isolates without holding raw mailboxes.
 - Added stop-and-abandon semantics: when an isolate stops, buffered messages are
   drained in FIFO order, dropped, and traced as `MessageAbandoned`.
 - Added panic-capture semantics: an unwinding handler panic becomes
@@ -42,3 +46,5 @@ This file records completed work.
   stop-and-abandon determinism.
 - Added runtime tests for panic capture, post-panic abandonment, preserved
   programmer-error panics, and same-round continuation after panic.
+- Added runtime tests for spawn dispatch, typed ingress backpressure, cross-shard
+  ingress panics, and zero-capacity spawn rejection.
