@@ -50,6 +50,10 @@ In `tina-runtime-current`, an accepted message does not disappear silently. It
 is either handled by an isolate or recorded in the trace as abandoned if the
 isolate stops first.
 
+If a handler unwinds with a panic in `tina-runtime-current`, that panic becomes
+a runtime event. The isolate is stopped and traced instead of tearing down the
+whole round.
+
 There is not yet a simulator or Tokio bridge.
 
 ## Crate boundaries that must not drift
