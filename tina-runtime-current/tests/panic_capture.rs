@@ -9,7 +9,8 @@ use tina::{
     TrySendError,
 };
 use tina_runtime_current::{
-    CauseId, CurrentRuntime, EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
+    CauseId, CurrentRuntime, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
+    SendRejectedReason,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +114,15 @@ impl<T> Mailbox<T> for TestMailbox<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TestMailboxFactory;
+
+impl MailboxFactory for TestMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(TestMailbox::new(capacity))
+    }
+}
+
 #[derive(Debug)]
 struct PanicIsolate {
     handled: Rc<RefCell<Vec<u8>>>,
@@ -182,7 +192,7 @@ impl Isolate for OrderIsolate {
 
 #[test]
 fn panicking_handler_becomes_runtime_event_and_stops_isolate() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(
@@ -235,7 +245,7 @@ fn panicking_handler_becomes_runtime_event_and_stops_isolate() {
 
 #[test]
 fn panic_abandons_buffered_messages_in_fifo_order() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
     let dropped = Rc::new(RefCell::new(Vec::new()));
     let mailbox = TestMailbox::new(8);
@@ -313,7 +323,7 @@ fn panic_abandons_buffered_messages_in_fifo_order() {
 
 #[test]
 fn later_isolates_still_run_after_panic_in_same_round() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
     let dropped = Rc::new(RefCell::new(Vec::new()));
     let panic_mailbox = TestMailbox::new(8);
@@ -375,7 +385,7 @@ fn later_isolates_still_run_after_panic_in_same_round() {
 
 #[test]
 fn two_panics_in_one_round_interleave_abandonment_by_registration_order() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let first_handled = Rc::new(RefCell::new(Vec::new()));
     let second_handled = Rc::new(RefCell::new(Vec::new()));
     let dropped = Rc::new(RefCell::new(Vec::new()));
@@ -491,7 +501,7 @@ fn two_panics_in_one_round_interleave_abandonment_by_registration_order() {
 
 #[test]
 fn sends_after_panic_still_become_closed() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
 
     let target_mailbox = TestMailbox::new(8);
@@ -535,7 +545,7 @@ fn sends_after_panic_still_become_closed() {
 
 #[test]
 fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let sender_mailbox = TestMailbox::new(8);
     let sender_address = runtime.register(
         PanicSender {
@@ -597,7 +607,7 @@ fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
 #[test]
 fn repeated_runs_with_panic_events_produce_identical_traces() {
     fn run_once() -> Vec<RuntimeEvent> {
-        let mut runtime = CurrentRuntime::new(TestShard);
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
         let handled = Rc::new(RefCell::new(Vec::new()));
         let dropped = Rc::new(RefCell::new(Vec::new()));
 

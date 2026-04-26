@@ -8,7 +8,7 @@ use tina::{
     TrySendError,
 };
 use tina_runtime_current::{
-    CauseId, CurrentRuntime, EffectKind, EventId, RuntimeEvent, RuntimeEventKind,
+    CauseId, CurrentRuntime, EffectKind, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +117,15 @@ impl<T> Mailbox<T> for TestMailbox<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TestMailboxFactory;
+
+impl MailboxFactory for TestMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(TestMailbox::new(capacity))
+    }
+}
+
 #[derive(Debug)]
 struct OrderIsolate {
     name: &'static str,
@@ -206,7 +215,7 @@ impl Isolate for StopSender {
 
 #[test]
 fn stop_abandons_buffered_messages_in_fifo_order_and_empties_the_mailbox() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let drops = Rc::new(Cell::new(0));
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(StopIsolate::default(), mailbox.clone());
@@ -279,7 +288,7 @@ fn stop_abandons_buffered_messages_in_fifo_order_and_empties_the_mailbox() {
 
 #[test]
 fn stop_with_empty_mailbox_produces_no_message_abandoned_events() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(StopIsolate::default(), mailbox.clone());
 
@@ -325,7 +334,7 @@ fn stop_with_empty_mailbox_produces_no_message_abandoned_events() {
 
 #[test]
 fn abandonment_happens_before_later_isolate_handlers_in_the_same_round() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let drops = Rc::new(Cell::new(0));
 
     let first_mailbox = TestMailbox::new(8);
@@ -375,7 +384,7 @@ fn abandonment_happens_before_later_isolate_handlers_in_the_same_round() {
 
 #[test]
 fn two_stops_in_one_round_interleave_abandonment_by_registration_order() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let first_drops = Rc::new(Cell::new(0));
     let second_drops = Rc::new(Cell::new(0));
 
@@ -488,7 +497,7 @@ fn two_stops_in_one_round_interleave_abandonment_by_registration_order() {
 
 #[test]
 fn accepted_send_can_become_message_abandoned_when_target_stops_in_the_same_round() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let target_seen = Rc::new(RefCell::new(Vec::new()));
 
     let sender_mailbox = TestMailbox::new(8);
@@ -602,7 +611,7 @@ fn accepted_send_can_become_message_abandoned_when_target_stops_in_the_same_roun
 
 #[test]
 fn sends_after_stop_still_become_closed() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let target_seen = Rc::new(RefCell::new(Vec::new()));
 
     let target_mailbox = TestMailbox::new(8);
@@ -646,7 +655,7 @@ fn sends_after_stop_still_become_closed() {
 #[test]
 fn repeated_runs_with_abandonment_produce_identical_traces() {
     fn run_once() -> Vec<RuntimeEvent> {
-        let mut runtime = CurrentRuntime::new(TestShard);
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
         let drops = Rc::new(Cell::new(0));
         let mailbox = TestMailbox::new(8);
         runtime.register(StopIsolate::default(), mailbox.clone());

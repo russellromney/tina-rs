@@ -159,6 +159,12 @@ pub enum RuntimeEventKind {
         reason: SendRejectedReason,
     },
 
+    /// The runtime created one local child isolate from a spawn effect.
+    Spawned {
+        /// The isolate identifier assigned to the new child.
+        child_isolate: IsolateId,
+    },
+
     /// The runner applied the stopped state after observing [`Effect::Stop`].
     IsolateStopped,
 
@@ -230,6 +236,15 @@ pub enum StepOutcome {
 
     /// One message was delivered and traced.
     Delivered,
+}
+
+/// Runtime-owned mailbox factory for spawned children.
+///
+/// The factory lives in `tina-runtime-current`, not in `tina`, because child
+/// mailbox allocation is a runtime concern rather than a trait-crate concern.
+pub trait MailboxFactory {
+    /// Creates one typed mailbox with the requested capacity.
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>>;
 }
 
 /// Tiny single-isolate runtime runner for the first Mariner slice.
@@ -374,25 +389,30 @@ where
 /// The runtime owns one shard value plus a private registry of isolates and
 /// mailboxes. [`step`](Self::step) walks registered isolates in registration
 /// order and gives each isolate at most one delivery chance per round.
-pub struct CurrentRuntime<S>
+pub struct CurrentRuntime<S, F>
 where
     S: Shard,
+    F: MailboxFactory,
 {
     shard: S,
-    entries: Vec<RegisteredEntry<S>>,
+    mailbox_factory: F,
+    entries: Vec<RegisteredEntry<S, F>>,
     next_isolate_id: u64,
     next_event_id: u64,
     trace: Vec<RuntimeEvent>,
 }
 
-impl<S> CurrentRuntime<S>
+impl<S, F> CurrentRuntime<S, F>
 where
     S: Shard,
+    F: MailboxFactory,
 {
-    /// Creates a new runtime for one shard.
-    pub fn new(shard: S) -> Self {
+    /// Creates a new runtime for one shard plus one runtime-owned mailbox
+    /// factory for future spawned children.
+    pub fn new(shard: S, mailbox_factory: F) -> Self {
         Self {
             shard,
+            mailbox_factory,
             entries: Vec::new(),
             next_isolate_id: 1,
             next_event_id: 1,
@@ -413,30 +433,69 @@ where
     /// Registers one isolate and returns its typed address.
     ///
     /// Isolate identifiers are assigned in registration order, starting at `1`.
+    #[allow(private_bounds)]
     pub fn register<I, M, Outbound>(&mut self, isolate: I, mailbox: M) -> Address<I::Message>
     where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
-        let isolate_id = IsolateId::new(self.next_isolate_id);
-        self.next_isolate_id += 1;
-
-        self.entries.push(RegisteredEntry {
-            id: isolate_id,
-            stopped: Cell::new(false),
-            mailbox: Box::new(MailboxAdapter::<M, I::Message> {
+        let isolate_id = self.register_entry::<I, Outbound>(
+            isolate,
+            Box::new(MailboxAdapter::<M, I::Message> {
                 mailbox,
                 marker: PhantomData,
             }),
-            handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
-                isolate,
-                marker: PhantomData,
-            })),
-        });
+        );
 
         self.shard.address(isolate_id)
+    }
+
+    /// Attempts to enqueue a typed message into one registered isolate.
+    ///
+    /// This is the runtime-side ingress surface for tests and later drivers.
+    /// It preserves the mailbox's typed `Full` and `Closed` outcomes, while
+    /// still treating unknown isolate IDs as programmer error.
+    pub fn try_send<M: 'static>(
+        &self,
+        address: Address<M>,
+        message: M,
+    ) -> Result<(), TrySendError<M>> {
+        if address.shard() != self.shard.id() {
+            panic!(
+                "cross-shard runtime ingress is out of scope in this slice: target shard {} != runtime shard {}",
+                address.shard().get(),
+                self.shard.id().get(),
+            );
+        }
+
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == address.isolate())
+        else {
+            panic!(
+                "runtime ingress targeted unknown isolate {} on shard {}",
+                address.isolate().get(),
+                address.shard().get(),
+            );
+        };
+
+        match entry.mailbox.try_send_boxed(Box::new(message)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(message)) => Err(TrySendError::Full(
+                *message.downcast::<M>().unwrap_or_else(|_| {
+                    panic!("runtime ingress attempted to deliver a message to a mailbox with the wrong type")
+                }),
+            )),
+            Err(TrySendError::Closed(message)) => Err(TrySendError::Closed(
+                *message.downcast::<M>().unwrap_or_else(|_| {
+                    panic!("runtime ingress attempted to deliver a message to a mailbox with the wrong type")
+                }),
+            )),
+        }
     }
 
     /// Runs one deterministic round over all registered isolates.
@@ -542,10 +601,15 @@ where
                         }
                     }
                 }
-                ErasedEffect::Noop
-                | ErasedEffect::Reply
-                | ErasedEffect::Spawn
-                | ErasedEffect::RestartChildren => {
+                ErasedEffect::Spawn(spawn) => {
+                    let child_isolate = spawn.spawn(self);
+                    self.push_event(
+                        isolate_id,
+                        Some(handler_finished.into()),
+                        RuntimeEventKind::Spawned { child_isolate },
+                    );
+                }
+                ErasedEffect::Noop | ErasedEffect::Reply | ErasedEffect::RestartChildren => {
                     self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
@@ -617,7 +681,65 @@ where
         entry
             .mailbox
             .try_send_boxed(send.message)
-            .map_err(|reason| (send.target_shard, send.target_isolate, reason))
+            .map_err(|reason| match reason {
+                TrySendError::Full(_) => (
+                    send.target_shard,
+                    send.target_isolate,
+                    SendRejectedReason::Full,
+                ),
+                TrySendError::Closed(_) => (
+                    send.target_shard,
+                    send.target_isolate,
+                    SendRejectedReason::Closed,
+                ),
+            })
+    }
+
+    fn register_entry<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox: Box<dyn ErasedMailbox>,
+    ) -> IsolateId
+    where
+        I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        Outbound: 'static,
+    {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
+
+        self.entries.push(RegisteredEntry {
+            id: isolate_id,
+            stopped: Cell::new(false),
+            mailbox,
+            handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
+                isolate,
+                marker: PhantomData,
+            })),
+        });
+
+        isolate_id
+    }
+
+    fn spawn_isolate<I, Outbound>(&mut self, isolate: I, mailbox_capacity: usize) -> IsolateId
+    where
+        I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        Outbound: 'static,
+    {
+        if mailbox_capacity == 0 {
+            panic!("spawn requested mailbox capacity 0, which is out of scope for this slice");
+        }
+
+        self.register_entry::<I, Outbound>(
+            isolate,
+            Box::new(DynMailboxAdapter::<I::Message> {
+                mailbox: self.mailbox_factory.create::<I::Message>(mailbox_capacity),
+                marker: PhantomData,
+            }),
+        )
     }
 }
 
@@ -651,7 +773,7 @@ where
 
 trait ErasedMailbox {
     fn recv_boxed(&self) -> Option<Box<dyn Any>>;
-    fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), SendRejectedReason>;
+    fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>>;
     fn close(&self);
 }
 
@@ -674,15 +796,19 @@ where
             .map(|message| Box::new(message) as Box<dyn Any>)
     }
 
-    fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), SendRejectedReason> {
+    fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>> {
         let message = message.downcast::<Msg>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a message to a mailbox with the wrong type")
         });
 
         match self.mailbox.try_send(*message) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SendRejectedReason::Full),
-            Err(TrySendError::Closed(_)) => Err(SendRejectedReason::Closed),
+            Err(TrySendError::Full(message)) => {
+                Err(TrySendError::Full(Box::new(message) as Box<dyn Any>))
+            }
+            Err(TrySendError::Closed(message)) => {
+                Err(TrySendError::Closed(Box::new(message) as Box<dyn Any>))
+            }
         }
     }
 
@@ -691,16 +817,69 @@ where
     }
 }
 
-trait ErasedHandler<S>
+struct DynMailboxAdapter<Msg> {
+    mailbox: Box<dyn Mailbox<Msg>>,
+    marker: PhantomData<fn(Msg) -> Msg>,
+}
+
+impl<Msg> ErasedMailbox for DynMailboxAdapter<Msg>
+where
+    Msg: 'static,
+{
+    fn recv_boxed(&self) -> Option<Box<dyn Any>> {
+        self.mailbox
+            .recv()
+            .map(|message| Box::new(message) as Box<dyn Any>)
+    }
+
+    fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>> {
+        let message = message.downcast::<Msg>().unwrap_or_else(|_| {
+            panic!("runtime attempted to deliver a message to a mailbox with the wrong type")
+        });
+
+        match self.mailbox.try_send(*message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(message)) => {
+                Err(TrySendError::Full(Box::new(message) as Box<dyn Any>))
+            }
+            Err(TrySendError::Closed(message)) => {
+                Err(TrySendError::Closed(Box::new(message) as Box<dyn Any>))
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.mailbox.close();
+    }
+}
+
+trait ErasedHandler<S, F>
 where
     S: Shard,
+    F: MailboxFactory,
 {
     fn handle_boxed(
         &mut self,
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
-    ) -> ErasedEffect;
+    ) -> ErasedEffect<S, F>;
+}
+
+trait ErasedSpawn<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>) -> IsolateId;
+}
+
+trait IntoErasedSpawn<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>>;
 }
 
 struct HandlerAdapter<I, Outbound>
@@ -711,19 +890,21 @@ where
     marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
-impl<I, S, Outbound> ErasedHandler<S> for HandlerAdapter<I, Outbound>
+impl<I, S, F, Outbound> ErasedHandler<S, F> for HandlerAdapter<I, Outbound>
 where
     I: Isolate<Shard = S, Send = SendMessage<Outbound>>,
     I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
     Outbound: 'static,
     S: Shard,
+    F: MailboxFactory,
 {
     fn handle_boxed(
         &mut self,
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
-    ) -> ErasedEffect {
+    ) -> ErasedEffect<S, F> {
         let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a handler message with the wrong type")
         });
@@ -744,39 +925,48 @@ where
                     message: Box::new(message),
                 })
             }
-            Effect::Spawn(_) => ErasedEffect::Spawn,
+            Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
             Effect::Stop => ErasedEffect::Stop,
             Effect::RestartChildren => ErasedEffect::RestartChildren,
         }
     }
 }
 
-struct RegisteredEntry<S>
+struct RegisteredEntry<S, F>
 where
     S: Shard,
+    F: MailboxFactory,
 {
     id: IsolateId,
     stopped: Cell<bool>,
     mailbox: Box<dyn ErasedMailbox>,
-    handler: RefCell<Box<dyn ErasedHandler<S>>>,
+    handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
 }
 
-enum ErasedEffect {
+enum ErasedEffect<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
     Noop,
     Reply,
     Send(ErasedSend),
-    Spawn,
+    Spawn(Box<dyn ErasedSpawn<S, F>>),
     Stop,
     RestartChildren,
 }
 
-impl ErasedEffect {
+impl<S, F> ErasedEffect<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
     fn kind(&self) -> EffectKind {
         match self {
             Self::Noop => EffectKind::Noop,
             Self::Reply => EffectKind::Reply,
             Self::Send(_) => EffectKind::Send,
-            Self::Spawn => EffectKind::Spawn,
+            Self::Spawn(_) => EffectKind::Spawn,
             Self::Stop => EffectKind::Stop,
             Self::RestartChildren => EffectKind::RestartChildren,
         }
@@ -787,4 +977,56 @@ struct ErasedSend {
     target_shard: ShardId,
     target_isolate: IsolateId,
     message: Box<dyn Any>,
+}
+
+impl<S, F> IntoErasedSpawn<S, F> for std::convert::Infallible
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>> {
+        match self {}
+    }
+}
+
+struct SpawnAdapter<I, Outbound>
+where
+    I: Isolate,
+{
+    isolate: I,
+    mailbox_capacity: usize,
+    marker: PhantomData<fn(Outbound) -> Outbound>,
+}
+
+impl<I, S, F, Outbound> ErasedSpawn<S, F> for SpawnAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    Outbound: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>) -> IsolateId {
+        runtime.spawn_isolate::<I, Outbound>(self.isolate, self.mailbox_capacity)
+    }
+}
+
+impl<I, S, F, Outbound> IntoErasedSpawn<S, F> for tina::SpawnSpec<I>
+where
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    Outbound: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>> {
+        let (isolate, mailbox_capacity) = self.into_parts();
+        Box::new(SpawnAdapter::<I, Outbound> {
+            isolate,
+            mailbox_capacity,
+            marker: PhantomData,
+        })
+    }
 }

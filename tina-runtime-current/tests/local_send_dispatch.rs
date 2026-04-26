@@ -5,11 +5,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId, SpawnSpec,
+    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId,
     TrySendError,
 };
 use tina_runtime_current::{
-    CauseId, CurrentRuntime, EffectKind, EventId, RuntimeEvent, RuntimeEventKind,
+    CauseId, CurrentRuntime, EffectKind, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason,
 };
 
@@ -34,7 +34,6 @@ enum AuditMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservedMsg {
     Reply,
-    Spawn,
     Restart,
 }
 
@@ -101,6 +100,15 @@ impl<T> Mailbox<T> for TestMailbox<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TestMailboxFactory;
+
+impl MailboxFactory for TestMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(TestMailbox::new(capacity))
+    }
+}
+
 #[derive(Debug)]
 struct OrderIsolate {
     name: &'static str,
@@ -163,34 +171,18 @@ impl Isolate for Audit {
 }
 
 #[derive(Debug)]
-struct Worker;
-
-impl Isolate for Worker {
-    type Message = ();
-    type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
-    type Spawn = Infallible;
-    type Shard = TestShard;
-
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        Effect::Noop
-    }
-}
-
-#[derive(Debug)]
 struct ObservedIsolate;
 
 impl Isolate for ObservedIsolate {
     type Message = ObservedMsg;
     type Reply = u8;
     type Send = SendMessage<NeverOutbound>;
-    type Spawn = SpawnSpec<Worker>;
+    type Spawn = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             ObservedMsg::Reply => Effect::Reply(7),
-            ObservedMsg::Spawn => Effect::Spawn(SpawnSpec::new(Worker, 2)),
             ObservedMsg::Restart => Effect::RestartChildren,
         }
     }
@@ -198,7 +190,7 @@ impl Isolate for ObservedIsolate {
 
 #[test]
 fn registration_returns_typed_addresses_and_step_uses_registration_order() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let log = Rc::new(RefCell::new(Vec::new()));
 
     let alpha_mailbox = TestMailbox::new(8);
@@ -246,7 +238,7 @@ fn registration_returns_typed_addresses_and_step_uses_registration_order() {
 
 #[test]
 fn accepted_local_send_runs_target_on_a_later_step_and_records_trace() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let driver_handled = Rc::new(RefCell::new(Vec::new()));
     let audit_seen = Rc::new(RefCell::new(Vec::new()));
 
@@ -360,7 +352,7 @@ fn accepted_local_send_runs_target_on_a_later_step_and_records_trace() {
 
 #[test]
 fn rejected_local_send_is_traced_and_not_silently_buffered() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let audit_seen = Rc::new(RefCell::new(Vec::new()));
 
     let audit_mailbox = TestMailbox::new(1);
@@ -416,7 +408,7 @@ fn rejected_local_send_is_traced_and_not_silently_buffered() {
 
 #[test]
 fn send_to_unknown_isolate_panics() {
-    let mut runtime = CurrentRuntime::new(TestShard);
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let driver_mailbox = TestMailbox::new(8);
 
     runtime.register(
@@ -434,15 +426,14 @@ fn send_to_unknown_isolate_panics() {
 }
 
 #[test]
-fn reply_spawn_and_restart_children_remain_observed_and_not_executed() {
+fn reply_and_restart_children_remain_observed_and_not_executed() {
     let cases = [
         (ObservedMsg::Reply, EffectKind::Reply),
-        (ObservedMsg::Spawn, EffectKind::Spawn),
         (ObservedMsg::Restart, EffectKind::RestartChildren),
     ];
 
     for (message, expected_effect) in cases {
-        let mut runtime = CurrentRuntime::new(TestShard);
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
         let mailbox = TestMailbox::new(8);
         let address = runtime.register(ObservedIsolate, mailbox.clone());
 
@@ -492,7 +483,7 @@ fn reply_spawn_and_restart_children_remain_observed_and_not_executed() {
 #[test]
 fn identical_runs_produce_identical_event_sequences_and_causal_links() {
     fn run_once() -> Vec<RuntimeEvent> {
-        let mut runtime = CurrentRuntime::new(TestShard);
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
         let audit_mailbox = TestMailbox::new(8);
         let audit_address = runtime.register(
             Audit {
