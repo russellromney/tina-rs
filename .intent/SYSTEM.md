@@ -46,6 +46,10 @@ Today the repo ships `tina`, `tina-mailbox-spsc`, and `tina-runtime-current`.
 deterministic runtime events, a single-shard stepping model, and local
 same-shard send dispatch.
 
+In `tina-runtime-current`, an accepted message does not disappear silently. It
+is either handled by an isolate or recorded in the trace as abandoned if the
+isolate stops first.
+
 There is not yet a simulator or Tokio bridge.
 
 ## Crate boundaries that must not drift
