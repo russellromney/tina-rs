@@ -43,8 +43,9 @@ Today the repo ships `tina`, `tina-mailbox-spsc`, and `tina-runtime-current`.
 `tina` provides the shared words and types, including supervision policy types.
 
 `tina-runtime-current` is still a small, in-progress runtime. Today it has
-deterministic runtime events, a single-shard stepping model, and local
-same-shard send dispatch.
+deterministic runtime events, a single-shard stepping model, local
+same-shard send dispatch, local same-shard spawn dispatch, and a typed runtime
+ingress path for sending to registered isolates.
 
 In `tina-runtime-current`, an accepted message does not disappear silently. It
 is either handled by an isolate or recorded in the trace as abandoned if the
