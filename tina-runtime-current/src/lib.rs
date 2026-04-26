@@ -19,10 +19,15 @@
 //! `Effect::Stop` stays immediate, but `CurrentRuntime` now also drains and
 //! traces any already-buffered messages that become abandoned when an isolate
 //! stops.
+//!
+//! `CurrentRuntime` also captures unwinding panics from handler calls and turns
+//! them into deterministic runtime events. Binaries built with `panic = "abort"`
+//! remain out of scope for this crate.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use tina::{
     Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId,
@@ -107,6 +112,9 @@ pub enum RuntimeEventKind {
 
     /// The runner began one handler invocation.
     HandlerStarted,
+
+    /// The handler unwound with a panic instead of returning an effect.
+    HandlerPanicked,
 
     /// The handler returned, including the effect kind it produced.
     HandlerFinished {
@@ -465,11 +473,25 @@ where
                 RuntimeEventKind::HandlerStarted,
             );
 
-            let effect = self.entries[index].handler.borrow_mut().handle_boxed(
-                message,
-                &mut self.shard,
-                isolate_id,
-            );
+            let effect = {
+                let mut handler = self.entries[index].handler.borrow_mut();
+                catch_unwind(AssertUnwindSafe(|| {
+                    handler.handle_boxed(message, &mut self.shard, isolate_id)
+                }))
+            };
+
+            let effect = match effect {
+                Ok(effect) => effect,
+                Err(_) => {
+                    let handler_panicked = self.push_event(
+                        isolate_id,
+                        Some(handler_started.into()),
+                        RuntimeEventKind::HandlerPanicked,
+                    );
+                    self.stop_entry(index, isolate_id, handler_panicked.into());
+                    continue;
+                }
+            };
 
             let effect_kind = effect.kind();
             let handler_finished = self.push_event(
@@ -482,20 +504,7 @@ where
 
             match effect {
                 ErasedEffect::Stop => {
-                    self.entries[index].stopped.set(true);
-                    self.entries[index].mailbox.close();
-                    let stopped = self.push_event(
-                        isolate_id,
-                        Some(handler_finished.into()),
-                        RuntimeEventKind::IsolateStopped,
-                    );
-                    while self.entries[index].mailbox.recv_boxed().is_some() {
-                        self.push_event(
-                            isolate_id,
-                            Some(stopped.into()),
-                            RuntimeEventKind::MessageAbandoned,
-                        );
-                    }
+                    self.stop_entry(index, isolate_id, handler_finished.into());
                 }
                 ErasedEffect::Send(send) => {
                     let target_shard = send.target_shard;
@@ -549,6 +558,20 @@ where
         }
 
         delivered
+    }
+
+    fn stop_entry(&mut self, index: usize, isolate_id: IsolateId, cause: CauseId) -> EventId {
+        self.entries[index].stopped.set(true);
+        self.entries[index].mailbox.close();
+        let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
+        while self.entries[index].mailbox.recv_boxed().is_some() {
+            self.push_event(
+                isolate_id,
+                Some(stopped.into()),
+                RuntimeEventKind::MessageAbandoned,
+            );
+        }
+        stopped
     }
 
     fn push_event(
