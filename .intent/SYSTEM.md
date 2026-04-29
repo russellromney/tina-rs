@@ -44,8 +44,9 @@ Today the repo ships `tina`, `tina-mailbox-spsc`, and `tina-runtime-current`.
 
 `tina-runtime-current` is still a small, in-progress runtime. Today it has
 deterministic runtime events, a single-shard stepping model, local
-same-shard send dispatch, local same-shard spawn dispatch, and a typed runtime
-ingress path for sending to registered isolates.
+same-shard send dispatch, local same-shard spawn dispatch, typed runtime
+ingress for sending to registered isolates, and stored direct parent-child
+lineage for spawned children.
 
 In `tina-runtime-current`, an accepted message does not disappear silently. It
 is either handled by an isolate or recorded in the trace as abandoned if the
@@ -54,6 +55,9 @@ isolate stops first.
 If a handler unwinds with a panic in `tina-runtime-current`, that panic becomes
 a runtime event. The isolate is stopped and traced instead of tearing down the
 whole round.
+
+Some runtime proofs live in crate-local unit tests when the thing being proved
+is internal runtime state that should not become public API yet.
 
 There is not yet a simulator or Tokio bridge.
 
