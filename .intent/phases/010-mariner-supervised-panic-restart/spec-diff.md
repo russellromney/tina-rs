@@ -28,8 +28,17 @@ make replacement addresses public.
 - Add a `SupervisorConfig` type that combines:
   - `RestartPolicy`
   - `RestartBudget`
+- In this slice, `tina-supervisor` intentionally ships config vocabulary only.
+  The runtime mechanism remains in `tina-runtime-current`; later runtime-
+  agnostic supervisor mechanisms may grow in `tina-supervisor`.
 - Add a `CurrentRuntime::supervise(...)` API that marks one registered isolate
   as the supervisor for its direct children.
+- `supervise(...)` is a setup-time API. Unknown, stale, or cross-shard parent
+  addresses panic as programmer errors.
+- Calling `supervise(...)` before the parent has children is valid; the config
+  applies to children that fail later.
+- Calling `supervise(...)` again for the same parent replaces the config and
+  resets the runtime-lifetime budget tracker.
 - Store supervisor runtime state privately in `CurrentRuntime`.
 - When a child handler panics:
   - keep the existing panic-capture behavior
@@ -52,7 +61,11 @@ make replacement addresses public.
   automatic reset yet.
 - Budget accounting counts one supervised failure response, not one replacement
   child. A one-for-all restart caused by one failed child consumes one budget
-  unit.
+  unit. This matches the OTP-style meaning: the budget limits how frequently a
+  supervised subtree fails, not how much work a policy performs after one
+  failure.
+- Budget exhaustion is permanent for the runtime lifetime in this slice.
+  Time-windowed budget resets are a future slice.
 - If the budget is exhausted, the runtime emits a visible rejection event and
   does not restart any selected child.
 - If the supervisor parent is already stopped, the runtime emits a visible
@@ -65,6 +78,14 @@ make replacement addresses public.
 - Existing restart child events remain the child-level trace vocabulary:
   `RestartChildAttempted`, `RestartChildSkipped`, and
   `RestartChildCompleted`.
+- Policy-excluded siblings are silent. Replay tools can derive policy exclusion
+  from the trigger event's policy, failed child ordinal, and stored sibling
+  lineage/child records instead of reading a trace event per untouched child.
+- `SupervisorRestartTriggered` is caused by `HandlerPanicked`, not
+  `IsolateStopped`, because the panic causes both the stop and the supervised
+  response as sibling consequences.
+- Supervised restart can deepen the runtime trace tree arbitrarily under a
+  panic event. Each event still has at most one cause.
 
 ## What Does Not Change
 
@@ -83,6 +104,8 @@ make replacement addresses public.
 - Restart factory panics still propagate as runtime construction errors and are
   not caught as handler panics.
 - The runtime does not reconstruct supervision state from the trace.
+- Supervision configuration is expected between `step()` calls. There is no
+  concurrent or in-handler configuration surface.
 
 ## How We Will Verify It
 

@@ -68,8 +68,8 @@ Likely methods:
 ```rust
 impl SupervisorConfig {
     pub const fn new(policy: RestartPolicy, budget: RestartBudget) -> Self;
-    pub const fn policy(self) -> RestartPolicy;
-    pub const fn budget(self) -> RestartBudget;
+    pub const fn policy(&self) -> RestartPolicy;
+    pub const fn budget(&self) -> RestartBudget;
 }
 ```
 
@@ -99,6 +99,15 @@ Handlers still do not mutate supervision tables directly.
 - Manual `Effect::RestartChildren` keeps slice 009 semantics and does not
   consult supervisor policy or budget.
 - A supervisor is configured by runtime API before the failure occurs.
+- `supervise(...)` panics for unknown, stale, or cross-shard parent addresses.
+  These are setup-time programmer errors, matching existing runtime API
+  precedent.
+- Calling `supervise(...)` before children exist is valid; the config applies
+  to later child failures.
+- Reconfiguring the same supervisor parent resets the budget tracker. A new
+  config represents a new supervisory relationship.
+- `supervise(...)` is called between `step()` invocations; no in-handler or
+  concurrent configuration surface exists.
 - Supervision applies only to direct child records of the configured parent.
 - Root isolate panics do not restart because they have no parent child record.
 - If a child has a parent but that parent has no supervisor config, current
@@ -106,20 +115,26 @@ Handlers still do not mutate supervision tables directly.
 - If a supervisor parent is already stopped, the runtime traces a supervised
   restart rejection and creates no replacements.
 - Budget windows last for the runtime lifetime in this slice. No time/reset
-  behavior yet.
+  behavior yet, and exhaustion is permanent within that runtime lifetime.
 - Budget accounting counts one supervised failure response, not one replacement
-  child.
+  child. This matches OTP-style restart intensity: the budget limits failure
+  frequency, not the amount of restart work caused by one failure.
 - Policy-excluded siblings are not traced individually. The supervised trigger
   event records the policy and failed child ordinal; child-level restart events
-  are emitted only for selected records.
+  are emitted only for selected records. Replay tools derive exclusions from
+  policy, failed ordinal, and stored child-record order.
 - Selected non-restartable children emit existing `RestartChildSkipped` with
   `RestartSkippedReason::NotRestartable`.
 - Replacement children get fresh isolate identities through the existing
   register/spawn path.
 - Child records mutate in place and preserve stable ordinals.
+- Supervisor records persist after the supervisor parent stops, like other
+  runtime-owned records. Later child failures can still find the config and
+  produce a `SupervisorStopped` rejection.
 - The trace remains a deterministic causal tree. A supervised trigger may cause
   multiple child restart attempts and may share the panic event as a sibling of
-  `IsolateStopped`.
+  `IsolateStopped`. Supervised restart can make the tree arbitrary depth; trace
+  consumers must walk causes recursively.
 
 ## Trace Vocabulary
 
@@ -169,15 +184,17 @@ Unsupervised child panics emit no supervised restart trigger/rejection event.
 ## Proposed Implementation Approach
 
 1. Add `tina-supervisor` crate with `SupervisorConfig` and tests.
+   This slice intentionally ships config vocabulary only; runtime mechanism
+   remains in `tina-runtime-current`.
 2. Extend `CurrentRuntime` with:
    - `supervisors: Vec<SupervisorRecord>`
    - `SupervisorRecord { parent, config, budget_state }`
 3. Add `CurrentRuntime::supervise`.
    - panic on cross-shard parent
    - panic on unknown parent
-   - return or panic on stale generation: plan should pin during review
-   - replacing an existing supervisor config for the same parent should reset
-     the budget tracker unless review chooses otherwise
+   - panic on stale generation
+   - replacing an existing supervisor config for the same parent resets the
+     budget tracker
 4. Add helpers:
    - find child record index by child address identity
    - find supervisor record by parent identity
@@ -251,18 +268,14 @@ Unsupervised child panics emit no supervised restart trigger/rejection event.
 - simulator/Voyager code
 - README/ROADMAP unless review finds a stale statement or real contradiction
 
-## Open Questions For Review
+## Review Decisions
 
-1. Should `CurrentRuntime::supervise` return a typed `Result` for stale or
-   unknown parent addresses, or panic like current unknown runtime-ingress
-   programmer errors?
-2. Should replacing a supervisor config reset the budget tracker or preserve
-   consumed budget?
-3. Should budget accounting count one supervised failure response or each
-   replacement child? This plan picks one response.
-4. Should policy-excluded children be silent under the trigger event, or should
-   they get a distinct `RestartChildSkipped { PolicyExcluded }` event? This plan
-   keeps them silent to avoid noisy traces.
-5. Should `SupervisorRestartTriggered` be caused by `HandlerPanicked` or by the
-   failed child's `IsolateStopped` event? This plan uses `HandlerPanicked` so the
-   trigger and stop are sibling consequences of the failure.
+1. `CurrentRuntime::supervise` panics for stale, unknown, or cross-shard parent
+   addresses.
+2. Reconfiguring a supervisor resets its budget tracker.
+3. Budget accounting is per supervised failure response, not per replacement
+   child.
+4. Policy-excluded children are silent in the trace; replay derives exclusion
+   from policy plus child-record order.
+5. `SupervisorRestartTriggered` is caused by `HandlerPanicked`, so the failed
+   child stop and supervised response are sibling consequences of the panic.

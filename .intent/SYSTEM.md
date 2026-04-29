@@ -38,16 +38,21 @@ detail one-for-one.
 
 ## Current shipped surface
 
-Today the repo ships `tina`, `tina-mailbox-spsc`, and `tina-runtime-current`.
+Today the repo ships `tina`, `tina-mailbox-spsc`, `tina-supervisor`, and
+`tina-runtime-current`.
 
 `tina` provides the shared words and types, including supervision policy types.
+
+`tina-supervisor` provides supervisor configuration vocabulary. Runtime-owned
+supervision state and restart execution stay in runtime crates.
 
 `tina-runtime-current` is still a small, in-progress runtime. Today it has
 deterministic runtime events, a single-shard stepping model, local
 same-shard send dispatch, local same-shard spawn dispatch, typed runtime
 ingress for sending to registered isolates, stored direct parent-child lineage
 for spawned children, restartable child records, and direct-child
-`RestartChildren` execution.
+`RestartChildren` execution. It can also apply configured supervisor policy and
+runtime-lifetime budget state when a direct child handler panics.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may be the direct cause of many later events.

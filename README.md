@@ -6,15 +6,16 @@
 
 It's an independent Rust port inspired by [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) which you should read first, then check out the Odin reference impl, then come back here.
 
-This repo is a Cargo workspace. Today it has three crates:
+This repo is a Cargo workspace. Today it has four crates:
 
 - **`tina`** — Trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`, `SendMessage`, `SpawnSpec`. No impls.
 - **`tina-mailbox-spsc`** — Bounded single-producer/single-consumer mailbox crate implementing `tina::Mailbox`.
-- **`tina-runtime-current`** — In-progress deterministic single-shard runtime core with trace events, local send/spawn dispatch, typed ingress, stop-and-abandon behavior, panic capture, parent-child lineage, and direct-child restart execution.
+- **`tina-supervisor`** — Small supervisor configuration crate. Today it provides `SupervisorConfig`; the runtime still owns mutable supervision state.
+- **`tina-runtime-current`** — In-progress deterministic single-shard runtime core with trace events, local send/spawn dispatch, typed ingress, stop-and-abandon behavior, panic capture, parent-child lineage, direct-child restart execution, and supervised panic restart.
 
-The supervisor, simulator, I/O driver, multi-shard runtime, and Tokio bridge come later. See [ROADMAP.md](ROADMAP.md).
+The simulator, I/O driver, multi-shard runtime, and Tokio bridge come later. See [ROADMAP.md](ROADMAP.md).
 
-> tina-rs is **experimental**. The vocabulary, bounded SPSC mailbox, and first runtime core are here; the supervisor, simulator, and production runtime story are not yet. The API will change.
+> tina-rs is **experimental**. The vocabulary, bounded SPSC mailbox, supervisor config, and first runtime core are here; the simulator and production runtime story are not yet. The API will change.
 
 ## Why this exists
 
@@ -103,9 +104,9 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 ## Status
 
-What works today: the trait crate, the bounded SPSC mailbox crate, and an in-progress deterministic single-shard runtime core. You can write isolates against the API, exercise real mailbox semantics, and run handlers through `tina-runtime-current` for local send/spawn/stop/panic-capture/restart scenarios.
+What works today: the trait crate, the bounded SPSC mailbox crate, supervisor configuration, and an in-progress deterministic single-shard runtime core. You can write isolates against the API, exercise real mailbox semantics, and run handlers through `tina-runtime-current` for local send/spawn/stop/panic-capture/restart/supervised-panic scenarios.
 
-What's coming, in order: real supervision and the task-dispatcher proof example; a current-thread Tokio driver plus runtime-owned I/O/timer effects and TCP echo; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
+What's coming, in order: broader supervision hardening and the task-dispatcher proof example; a current-thread Tokio driver plus runtime-owned I/O/timer effects and TCP echo; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 

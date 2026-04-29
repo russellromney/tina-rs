@@ -52,8 +52,7 @@ This file records completed work.
 - Added runtime tests for spawn dispatch, typed ingress backpressure, cross-shard
   ingress panics, and zero-capacity spawn rejection.
 - Added runtime unit tests for direct parent-child lineage, nested spawn edges,
-  lineage survival across stop/panic, and the continued observed-only behavior
-  of `RestartChildren`.
+  and lineage survival across stop/panic.
 - Added address-liveness semantics: `Address<M>` now includes a generation,
   runtime send traces include target generation, and stale known generations
   fail visibly as `Closed` instead of targeting a current incarnation.
@@ -64,6 +63,10 @@ This file records completed work.
   children are replaced with fresh isolate incarnations, non-restartable
   children are skipped visibly, and restart traces now support deterministic
   causal tree branching.
+- Added `tina-supervisor` with `SupervisorConfig`.
+- Added supervised panic restart in `tina-runtime-current`: configured parents
+  apply `RestartPolicy` and runtime-lifetime `RestartBudget` state when direct
+  children panic.
 - Added generated-history runtime property tests for deterministic traces,
   causal-link validity, visible send outcomes, and no accidental handling after
   stop.

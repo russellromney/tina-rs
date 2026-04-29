@@ -45,7 +45,7 @@ start from an honest baseline rather than from stale roadmap wording.
 |---|---|---|
 | Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `SendMessage`, `SpawnSpec`, and supervision policy types with doc/compile-fail/downstream-style tests. | Request/reply ergonomics and I/O/timer/call effect vocabulary are not designed yet. |
 | Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. | This is not a full formal proof for every capacity/interleaving/refactor. Cross-shard channel semantics and any future MPSC fallback are not implemented. |
-| Single-shard runtime delivery | `tina-runtime-current` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, and generated-history property tests. | No actual supervisor policy mechanism exists yet. Restart strategies, restart budgets, dispatcher proof examples, and user-facing supervision docs are still missing. The generated-history model is bounded and does not prove arbitrary user programs. |
+| Single-shard runtime delivery | `tina-runtime-current` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, supervised panic restart with policy/budget config, and generated-history property tests. | Supervision is still narrow: panic-triggered only, runtime-lifetime budget only, no task-dispatcher proof example, no user-facing supervision guide, and no timed budget windows. The generated-history model is bounded and does not prove arbitrary user programs. |
 | Failure isolation | Unwinding handler panics become runtime events; the panicking isolate stops and the same round continues deterministically. | This is not Tina-Odin's OS trap boundary. Rust segfault isolation, shard quarantine, and `panic = "abort"` behavior are out of scope unless a later phase explicitly designs them. |
 | Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories. | There is no seed-driven simulator, virtual time, fault injection, structural checker, or replay artifact yet. |
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. | The runtime currently uses boxed erasure and per-round collection; no broad runtime allocation claim is supported yet. |
@@ -104,7 +104,7 @@ phases.
 
 | Next phase package | Scope |
 |---|---|
-| **Mariner supervision and dispatcher proof** | Planning bucket covering restartable child records, address liveness/stale-handle semantics, real `RestartChildren`, `tina-supervisor`, restart strategies, restart budgets, and a Rust task-dispatcher proof example with trace assertions. Expected to split into multiple IDD slices. |
+| **Mariner supervision and dispatcher proof** | Planning bucket covering supervised restart hardening, timed or explicitly deferred restart-budget windows, and a Rust task-dispatcher proof example with trace assertions. Expected to split into multiple IDD slices. |
 | **Mariner I/O, current runtime, and echo** | Planning bucket covering Rust I/O/timer/call effect contract, current-thread Tokio driver, runtime allocation audit or narrowed claims, and TCP echo smoke/benchmark backed by assertions. Expected to split at least into contract, driver, and echo proof slices. |
 | **Voyager deterministic simulation** | Planning bucket covering `tina-sim` with virtual time, domain-isolated PRNG, integer-ratio faults, test-driver isolates, structural/user checkers, failure injection, replay artifacts, and injected-bug proof. Expected to split into multiple IDD slices. |
 | **Gemini single-shard release story** | Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, and a clear single-shard adoption story. |
@@ -141,10 +141,10 @@ These should be resolved early enough to avoid rework, but they do not all block
 > After: Completed Sputnik and Pioneer work · Before: Phase Voyager
 
 - `tina-runtime-current`: single-shard runtime backed by `tokio::runtime::Builder::new_current_thread`. Pin to one core. Run a poll loop: drain mailboxes → run handlers → dispatch effects.
-- `tina-supervisor`: actual supervision mechanism, now that there is a runtime capable of catching failures, restarting children, and applying policy.
+- `tina-supervisor`: supervisor configuration vocabulary exists; broader reusable supervision mechanism should grow only when multiple runtime crates need it.
 - The effect dispatcher is the **only** place real I/O happens. Handlers return effects; the dispatcher executes them. This is the property that makes deterministic simulation possible later.
 - Continue using the deterministic runtime event trace as the semantic proof surface. The trace records mailbox accept/reject, handler invocation start/end, effect dispatch, stop, spawn, panic, abandonment, and restart events with causal linkage so tests and replay can reason about provenance rather than only timeline order.
-- Build supervision on stored runtime state, not trace reconstruction. Parent-child lineage, restartable child records, address liveness, and direct-child restart execution already exist; the remaining supervision work needs policy/budget application and proof examples.
+- Build supervision on stored runtime state, not trace reconstruction. Parent-child lineage, restartable child records, address liveness, direct-child restart execution, and supervised panic restart already exist; the remaining supervision work needs hardening and proof examples.
 - A task-dispatcher proof example should land before TCP echo. It mirrors Tina-Odin's "dead worker is not a dead system" example without needing runtime-owned network I/O first.
 - A working TCP echo server isolate (mirroring Tina-Odin's example) lands after the Rust I/O/timer effect contract and current-thread driver exist.
 - Keep the abstraction boundary strict: `tina-runtime-current` owns scheduling, polling, and effect execution; `tina` must not grow runtime helpers just to make tests easier.
@@ -281,14 +281,18 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 These still need answers, but a couple now have an explicit phase boundary.
 
 1. **`Effect` shape.** Resolved in Sputnik for the current verbs: use a closed enum with per-isolate associated payload types for `Reply`, `Send`, and `Spawn`. The next design question is how I/O, timers, calls, yields, and crash/restart requests should enter that closed vocabulary without turning handlers into async functions.
-2. **Supervisor execution semantics.** Direct `RestartChildren` execution now
-   exists, including non-restartable skip behavior and stable child ordinals.
-   The next supervision design question is how policy, budgets, and child
-   failure detection enter the runtime without making handlers async or
-   reconstructing supervision state from the trace.
+2. **Supervisor execution semantics.** Direct `RestartChildren` execution and
+   panic-triggered supervised restart now exist. The next supervision design
+   question is how far runtime-lifetime budgets can go before timed windows or
+   explicit deferral are required, and how to prove the task-dispatcher example
+   without reconstructing supervision state from the trace.
 3. **Runtime allocation boundary.** The SPSC mailbox hot path is proven narrowly. The runtime itself still needs an allocation audit before the project repeats "no hidden allocations" as a runtime-level claim.
 4. **Cross-shard ownership.** Tina-Odin's mailboxes are SPSC; cross-shard requires copy-or-move. Investigate whether we can use ownership transfer (move + atomic pointer swap) for zero-copy. If not, accept the copy.
-5. **Supervisor split.** Current plan: policy types may live in `tina` if they are truly shared abstractions; mechanism lives in `tina-supervisor` and does not ship before Mariner.
+5. **Supervisor split.** Resolved for the current shape: policy types live in
+   `tina`, supervisor configuration lives in `tina-supervisor`, and mutable
+   runtime supervision state/execution lives in runtime crates. Future reusable
+   supervisor mechanisms can move into `tina-supervisor` once multiple runtime
+   crates need them.
 6. **Peter Mbanugo / Tina-Odin public positioning.** Resolve before public positioning or publish (Gemini at the latest). Local design exploration is not blocked on this.
 7. **MSRV.** Pick a Rust version that supports the io_uring story without nightly. Currently this is stable Rust 1.85+ via monoio.
 8. **License.** Resolved in Sputnik: dual-license under MIT or Apache-2.0 to match Rust ecosystem norms.

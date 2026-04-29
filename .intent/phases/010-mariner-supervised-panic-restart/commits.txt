@@ -1,0 +1,1 @@
+99ba92829569fc5fc9753bdf8273fb81c62a6474 feat(runtime): restart supervised children after panic
