@@ -60,6 +60,10 @@ This file records completed work.
 - Added restartable child records: `RestartableSpawnSpec<I>` records a
   factory-backed restart recipe, and `CurrentRuntime` stores private child
   metadata for future `RestartChildren` execution.
+- Added `RestartChildren` execution for direct child records: restartable
+  children are replaced with fresh isolate incarnations, non-restartable
+  children are skipped visibly, and restart traces now support deterministic
+  causal tree branching.
 - Added generated-history runtime property tests for deterministic traces,
   causal-link validity, visible send outcomes, and no accidental handling after
   stop.

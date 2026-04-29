@@ -17,6 +17,13 @@ policies, budgets, or sibling selection rules yet.
 This keeps the behavior honest and visible. A restart request is no longer a
 generic observed effect, but it also does not pretend to be a full supervisor.
 
+This slice also makes the trace's tree shape explicit. The runtime trace is a
+deterministically ordered causal tree: each event has at most one cause, and
+one event may be the cause of many direct consequences. For restart,
+`RestartChildAttempted` may cause both `IsolateStopped` for the old running
+child and `RestartChildCompleted` for the replacement. This represents real
+causality more honestly than forcing an artificial linear chain.
+
 ## What changes
 
 - `Effect::RestartChildren` is executed by `CurrentRuntime` for the current
@@ -41,9 +48,16 @@ generic observed effect, but it also does not pretend to be a full supervisor.
   snapshots in this slice.
 - Non-restartable direct children are skipped with a trace event. They are not
   silently ignored and they do not make the restart request panic.
+- `RestartChildren` on a parent with no direct children emits no restart events
+  beyond the handler's normal `HandlerFinished { effect: RestartChildren }`.
+- Restart walks all current child records for the parent, including children
+  created in an earlier step whose first handler step has not run yet.
 - Runtime trace events are extended with explicit restart-attempt, restart-skip,
   and restart-complete events carrying child ordinal and old/new address
   identity.
+- Runtime registry growth now scales with total spawned children plus total
+  replacements created by restart. This slice keeps the no-id-reuse model and
+  does not add compaction.
 - Repeated identical runs produce the same restart trace, lineage snapshot, and
   child-record snapshot.
 
@@ -81,6 +95,9 @@ generic observed effect, but it also does not pretend to be a full supervisor.
   order.
 - A parent with non-restartable children records skip events and does not
   panic.
+- A parent with no direct children records no restart event subtree.
+- A parent can restart a current child record before that child has ever handled
+  a message.
 - Restart execution drains and traces abandoned messages from running old
   child mailboxes before replacement.
 - Restart execution does not restart grandchildren.
@@ -88,6 +105,8 @@ generic observed effect, but it also does not pretend to be a full supervisor.
   child-record snapshots.
 - Generated-history property tests are extended so restart attempts have
   visible outcomes and causal links remain well formed.
+  This includes accepting a causal tree where one event causes more than one
+  direct downstream event.
 
 ## Autonomy note
 

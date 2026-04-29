@@ -66,6 +66,15 @@ This slice turns that effect into runtime behavior:
   `IsolateStopped`.
 - Restarted children are registered during the current round but only run on a
   later `step`, preserving the existing spawn scheduling rule.
+- `RestartChildren` on a parent with no direct children emits no restart events
+  beyond the normal handler-finished event.
+- Restart walks all current child records for the parent, including children
+  created in an earlier step whose first handler step has not run yet.
+- Runtime registry growth scales with initial spawn count plus restart
+  replacement count in this no-id-reuse model.
+- Restart makes the trace's tree shape explicit. The runtime trace is a
+  deterministically ordered causal tree: each event has at most one cause, and
+  one event may cause multiple direct consequences.
 
 ## Trace vocabulary
 
@@ -104,6 +113,9 @@ Cause chain:
   `RestartChildCompleted`.
 - If the old child is stopped by restart, `RestartChildAttempted` causes
   `IsolateStopped`, and `IsolateStopped` causes any `MessageAbandoned` events.
+- In the running-old-child case, `RestartChildAttempted` also causes
+  `RestartChildCompleted`. Replay and property tests must allow multiple direct
+  children for one cause event.
 
 ## Proposed implementation approach
 
@@ -116,12 +128,21 @@ Cause chain:
    - execute restart for one child-record index
    - execute restart for all direct children of a parent
 3. Adjust child-record storage enough to update a record after replacement.
+   The existing `ChildRecord` is mutated in place; its `Vec` index, parent, and
+   child ordinal are preserved.
 4. Change the `ErasedEffect::RestartChildren` arm to call restart execution
    instead of emitting `EffectObserved`.
 5. Extend crate-private child record snapshots to expose current replacement
    address identity for tests.
 6. Update generated-history property tests so restart attempts have visible
    outcomes once restart events exist.
+
+Restart-recipe ownership: store restart recipes as
+`Rc<dyn ErasedRestartRecipe<S, F>>`, call them through `&self`, and keep the
+same private restart recipe handle alive across restarts. `Rc` is sufficient
+for this current-thread runtime; cross-shard work will need to revisit `Arc` or
+an equivalent cross-thread recipe handle. The recipe is the source of fresh
+child state and must not be consumed by the first restart.
 
 ## Acceptance
 
@@ -138,6 +159,9 @@ Cause chain:
 - Multiple restartable direct children restart in child-ordinal order.
 - Non-restartable direct children emit `RestartChildSkipped` with
   `NotRestartable` and do not panic.
+- Parents with no direct children emit no restart event subtree.
+- Current child records whose children have not handled a message yet are still
+  included in the restart walk.
 - Grandchildren are not restarted by a grandparent's `RestartChildren`.
 - Restarted children do not run until a later `step`.
 - Repeated identical runs produce identical trace, lineage snapshot, and
@@ -147,8 +171,9 @@ Cause chain:
 ## Tests and evidence
 
 - Unit tests in `tina-runtime-current/src/lib.rs` for private child-record
-  updates and replacement addresses.
-- Integration tests for trace shape where possible.
+  updates, replacement addresses, trace shape, and edge cases. This follows the
+  slice 006/008 pattern because the load-bearing evidence depends on private
+  child-record snapshots.
 - Extend `runtime_properties.rs` so restart attempts have visible outcomes and
   causal links stay well formed over generated histories.
 - Existing tests for stop-and-abandon, panic capture, spawn scheduling, address
@@ -168,13 +193,14 @@ Cause chain:
 - Do not run replacement children in the same round they are created.
 - Do not catch restart factory panics as handler panics.
 - Do not reconstruct parent-child state from trace events.
+- Do not assume trace cause graphs are linear.
+- Do not model slice 009 traces as DAGs with multi-cause events; every event
+  still has at most one cause.
 
 ## Files likely to change
 
 - `tina-runtime-current/src/lib.rs`
 - `tina-runtime-current/tests/runtime_properties.rs`
-- maybe a new `tina-runtime-current/tests/restart_children.rs` if black-box
-  trace tests can cover enough without private snapshots
 
 ## Areas that should not be touched
 

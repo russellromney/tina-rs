@@ -1,0 +1,1 @@
+7e572f9 feat(runtime): execute RestartChildren for direct children
