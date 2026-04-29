@@ -429,58 +429,90 @@ fn send_to_unknown_isolate_panics() {
 }
 
 #[test]
-fn reply_and_restart_children_remain_observed_and_not_executed() {
-    let cases = [
-        (ObservedMsg::Reply, EffectKind::Reply),
-        (ObservedMsg::Restart, EffectKind::RestartChildren),
-    ];
+fn reply_remains_observed_and_not_executed() {
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mailbox = TestMailbox::new(8);
+    let address = runtime.register(ObservedIsolate, mailbox.clone());
 
-    for (message, expected_effect) in cases {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
-        let mailbox = TestMailbox::new(8);
-        let address = runtime.register(ObservedIsolate, mailbox.clone());
+    assert_eq!(mailbox.try_send(ObservedMsg::Reply), Ok(()));
 
-        assert_eq!(mailbox.try_send(message), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(
+        runtime.trace(),
+        [
+            RuntimeEvent::new(
+                EventId::new(1),
+                None,
+                ShardId::new(3),
+                address.isolate(),
+                RuntimeEventKind::MailboxAccepted,
+            ),
+            RuntimeEvent::new(
+                EventId::new(2),
+                Some(CauseId::new(EventId::new(1))),
+                ShardId::new(3),
+                address.isolate(),
+                RuntimeEventKind::HandlerStarted,
+            ),
+            RuntimeEvent::new(
+                EventId::new(3),
+                Some(CauseId::new(EventId::new(2))),
+                ShardId::new(3),
+                address.isolate(),
+                RuntimeEventKind::HandlerFinished {
+                    effect: EffectKind::Reply,
+                },
+            ),
+            RuntimeEvent::new(
+                EventId::new(4),
+                Some(CauseId::new(EventId::new(3))),
+                ShardId::new(3),
+                address.isolate(),
+                RuntimeEventKind::EffectObserved {
+                    effect: EffectKind::Reply,
+                },
+            ),
+        ]
+    );
+}
 
-        assert_eq!(runtime.step(), 1);
-        assert_eq!(
-            runtime.trace(),
-            [
-                RuntimeEvent::new(
-                    EventId::new(1),
-                    None,
-                    ShardId::new(3),
-                    address.isolate(),
-                    RuntimeEventKind::MailboxAccepted,
-                ),
-                RuntimeEvent::new(
-                    EventId::new(2),
-                    Some(CauseId::new(EventId::new(1))),
-                    ShardId::new(3),
-                    address.isolate(),
-                    RuntimeEventKind::HandlerStarted,
-                ),
-                RuntimeEvent::new(
-                    EventId::new(3),
-                    Some(CauseId::new(EventId::new(2))),
-                    ShardId::new(3),
-                    address.isolate(),
-                    RuntimeEventKind::HandlerFinished {
-                        effect: expected_effect,
-                    },
-                ),
-                RuntimeEvent::new(
-                    EventId::new(4),
-                    Some(CauseId::new(EventId::new(3))),
-                    ShardId::new(3),
-                    address.isolate(),
-                    RuntimeEventKind::EffectObserved {
-                        effect: expected_effect,
-                    },
-                ),
-            ]
-        );
-    }
+#[test]
+fn restart_children_with_no_children_emits_no_restart_subtree() {
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mailbox = TestMailbox::new(8);
+    let address = runtime.register(ObservedIsolate, mailbox.clone());
+
+    assert_eq!(mailbox.try_send(ObservedMsg::Restart), Ok(()));
+
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(
+        runtime.trace(),
+        [
+            RuntimeEvent::new(
+                EventId::new(1),
+                None,
+                ShardId::new(3),
+                address.isolate(),
+                RuntimeEventKind::MailboxAccepted,
+            ),
+            RuntimeEvent::new(
+                EventId::new(2),
+                Some(CauseId::new(EventId::new(1))),
+                ShardId::new(3),
+                address.isolate(),
+                RuntimeEventKind::HandlerStarted,
+            ),
+            RuntimeEvent::new(
+                EventId::new(3),
+                Some(CauseId::new(EventId::new(2))),
+                ShardId::new(3),
+                address.isolate(),
+                RuntimeEventKind::HandlerFinished {
+                    effect: EffectKind::RestartChildren,
+                },
+            ),
+        ]
+    );
 }
 
 #[test]

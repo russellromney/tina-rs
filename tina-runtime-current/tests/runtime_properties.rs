@@ -22,6 +22,12 @@ enum DriverMsg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentMsg {
+    Spawn,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TestShard;
 
 impl Shard for TestShard {
@@ -116,6 +122,12 @@ struct Driver {
     target: Address<TargetMsg>,
 }
 
+#[derive(Debug)]
+struct RestartParent;
+
+#[derive(Debug)]
+struct RestartChild;
+
 impl Isolate for Driver {
     type Message = DriverMsg;
     type Reply = Infallible;
@@ -136,11 +148,50 @@ impl Isolate for Driver {
     }
 }
 
+impl Isolate for RestartParent {
+    type Message = ParentMsg;
+    type Reply = Infallible;
+    type Send = SendMessage<TargetMsg>;
+    type Spawn = tina::RestartableSpawnSpec<RestartChild>;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        message: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard>,
+    ) -> Effect<Self> {
+        match message {
+            ParentMsg::Spawn => Effect::Spawn(tina::RestartableSpawnSpec::new(|| RestartChild, 3)),
+            ParentMsg::Restart => Effect::RestartChildren,
+        }
+    }
+}
+
+impl Isolate for RestartChild {
+    type Message = TargetMsg;
+    type Reply = Infallible;
+    type Send = SendMessage<TargetMsg>;
+    type Spawn = Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        message: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard>,
+    ) -> Effect<Self> {
+        match message {
+            TargetMsg::Data(_) => Effect::Noop,
+            TargetMsg::Stop => Effect::Stop,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Operation {
     EnqueueTargetData(u8),
     EnqueueTargetStop,
     EnqueueDriverSend(u8),
+    EnqueueParentRestart,
     Step,
 }
 
@@ -163,6 +214,7 @@ fn operation_strategy() -> impl Strategy<Value = Operation> {
         (0_u8..8).prop_map(Operation::EnqueueTargetData),
         Just(Operation::EnqueueTargetStop),
         (0_u8..8).prop_map(Operation::EnqueueDriverSend),
+        Just(Operation::EnqueueParentRestart),
         Just(Operation::Step),
     ]
 }
@@ -171,6 +223,12 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
     let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let target = runtime.register(Target, TestMailbox::new(3));
     let driver = runtime.register(Driver { target }, TestMailbox::new(3));
+    let parent = runtime.register(RestartParent, TestMailbox::new(3));
+
+    runtime
+        .try_send(parent, ParentMsg::Spawn)
+        .expect("initial restartable child spawn should enqueue");
+    assert_eq!(runtime.step(), 1);
 
     let mut ingress = Vec::new();
     let mut steps = Vec::new();
@@ -185,6 +243,9 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
             }
             Operation::EnqueueDriverSend(value) => {
                 ingress.push(outcome(runtime.try_send(driver, DriverMsg::Send(value))));
+            }
+            Operation::EnqueueParentRestart => {
+                ingress.push(outcome(runtime.try_send(parent, ParentMsg::Restart)));
             }
             Operation::Step => {
                 steps.push(runtime.step());
@@ -275,6 +336,50 @@ fn assert_send_attempts_have_visible_outcomes(trace: &[RuntimeEvent]) {
     }
 }
 
+fn assert_restart_attempts_have_visible_outcomes(trace: &[RuntimeEvent]) {
+    for event in trace {
+        let RuntimeEventKind::RestartChildAttempted {
+            child_ordinal,
+            old_isolate,
+            old_generation,
+        } = event.kind()
+        else {
+            continue;
+        };
+
+        assert!(
+            trace.iter().any(|candidate| {
+                candidate.cause() == Some(CauseId::new(event.id()))
+                    && matches!(
+                        candidate.kind(),
+                        RuntimeEventKind::RestartChildSkipped {
+                            child_ordinal: skipped_ordinal,
+                            old_isolate: skipped_isolate,
+                            old_generation: skipped_generation,
+                            ..
+                        } if skipped_ordinal == child_ordinal
+                            && skipped_isolate == old_isolate
+                            && skipped_generation == old_generation
+                    )
+                    || candidate.cause() == Some(CauseId::new(event.id()))
+                        && matches!(
+                            candidate.kind(),
+                            RuntimeEventKind::RestartChildCompleted {
+                                child_ordinal: completed_ordinal,
+                                old_isolate: completed_old_isolate,
+                                old_generation: completed_old_generation,
+                                ..
+                            } if completed_ordinal == child_ordinal
+                                && completed_old_isolate == old_isolate
+                                && completed_old_generation == old_generation
+                        )
+            }),
+            "restart attempt {:?} must have a visible skipped/completed outcome",
+            event.id()
+        );
+    }
+}
+
 fn assert_stopped_isolates_do_not_start_again(trace: &[RuntimeEvent]) {
     let mut stopped = BTreeSet::new();
 
@@ -309,6 +414,12 @@ proptest! {
     fn generated_histories_give_every_send_attempt_a_visible_outcome(operations in prop::collection::vec(operation_strategy(), 0..40)) {
         let result = run_history(&operations);
         assert_send_attempts_have_visible_outcomes(&result.trace);
+    }
+
+    #[test]
+    fn generated_histories_give_every_restart_attempt_a_visible_outcome(operations in prop::collection::vec(operation_strategy(), 0..40)) {
+        let result = run_history(&operations);
+        assert_restart_attempts_have_visible_outcomes(&result.trace);
     }
 
     #[test]

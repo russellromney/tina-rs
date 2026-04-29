@@ -12,9 +12,10 @@
 //! - a tiny single-shard runtime that can host more than one isolate
 //!
 //! The multi-isolate runtime still stays narrow on purpose. It can register
-//! isolates, step them in deterministic order, and execute local same-shard
-//! [`Effect::Send`] requests that use [`tina::SendMessage`]. Other effects are
-//! still traced before they are executed in later slices.
+//! isolates, step them in deterministic order, execute local same-shard
+//! [`Effect::Send`] requests that use [`tina::SendMessage`], spawn local
+//! children, and restart direct restartable children. Reply effects are still
+//! traced without execution until a later slice gives them runtime semantics.
 //!
 //! `Effect::Stop` stays immediate, but `CurrentRuntime` now also drains and
 //! traces any already-buffered messages that become abandoned when an isolate
@@ -28,6 +29,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
 
 use tina::{
     Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard,
@@ -104,6 +106,14 @@ pub enum SendRejectedReason {
     Closed,
 }
 
+/// Why a child was not restarted after a restart attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartSkippedReason {
+    /// The child was spawned from a one-shot [`tina::SpawnSpec`] and has no
+    /// restart recipe.
+    NotRestartable,
+}
+
 /// Kind of one runtime event emitted by the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeEventKind {
@@ -172,6 +182,52 @@ pub enum RuntimeEventKind {
     Spawned {
         /// The isolate identifier assigned to the new child.
         child_isolate: IsolateId,
+    },
+
+    /// The runtime began processing one child record for a restart request.
+    RestartChildAttempted {
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+
+        /// The child incarnation being replaced or skipped.
+        old_isolate: IsolateId,
+
+        /// The generation of the child incarnation being replaced or skipped.
+        old_generation: AddressGeneration,
+    },
+
+    /// The runtime skipped one child during restart execution.
+    RestartChildSkipped {
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+
+        /// The child incarnation that was skipped.
+        old_isolate: IsolateId,
+
+        /// The generation of the child incarnation that was skipped.
+        old_generation: AddressGeneration,
+
+        /// Why the child was skipped.
+        reason: RestartSkippedReason,
+    },
+
+    /// The runtime created a replacement child for one restartable child
+    /// record.
+    RestartChildCompleted {
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+
+        /// The child incarnation that was replaced.
+        old_isolate: IsolateId,
+
+        /// The generation of the child incarnation that was replaced.
+        old_generation: AddressGeneration,
+
+        /// The fresh replacement isolate.
+        new_isolate: IsolateId,
+
+        /// The generation of the fresh replacement isolate.
+        new_generation: AddressGeneration,
     },
 
     /// The runner applied the stopped state after observing [`Effect::Stop`].
@@ -518,7 +574,7 @@ where
     ///
     /// The return value is the number of handlers that ran in this round.
     pub fn step(&mut self) -> usize {
-        let round_messages: Vec<Option<Box<dyn Any>>> = self
+        let mut round_messages: Vec<Option<Box<dyn Any>>> = self
             .entries
             .iter()
             .map(|entry| {
@@ -532,10 +588,21 @@ where
 
         let mut delivered = 0;
 
-        for (index, maybe_message) in round_messages.into_iter().enumerate() {
-            let Some(message) = maybe_message else {
+        for index in 0..round_messages.len() {
+            let Some(message) = round_messages[index].take() else {
                 continue;
             };
+
+            if self.entries[index].stopped.get() {
+                if let Some(stopped) = self.entries[index].stopped_event.get() {
+                    self.push_event(
+                        self.entries[index].id,
+                        Some(stopped.into()),
+                        RuntimeEventKind::MessageAbandoned,
+                    );
+                }
+                continue;
+            }
 
             delivered += 1;
 
@@ -631,7 +698,10 @@ where
                         RuntimeEventKind::Spawned { child_isolate },
                     );
                 }
-                ErasedEffect::Noop | ErasedEffect::Reply | ErasedEffect::RestartChildren => {
+                ErasedEffect::RestartChildren => {
+                    self.restart_children(isolate_id, handler_finished.into(), &mut round_messages);
+                }
+                ErasedEffect::Noop | ErasedEffect::Reply => {
                     self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
@@ -647,9 +717,42 @@ where
     }
 
     fn stop_entry(&mut self, index: usize, isolate_id: IsolateId, cause: CauseId) -> EventId {
+        self.stop_entry_with_precollected(index, isolate_id, cause, None)
+    }
+
+    fn stop_entry_with_precollected(
+        &mut self,
+        index: usize,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        precollected: Option<Box<dyn Any>>,
+    ) -> EventId {
+        if self.entries[index].stopped.get() {
+            let stopped = self.entries[index]
+                .stopped_event
+                .get()
+                .unwrap_or_else(|| panic!("stopped isolate has no stopped event"));
+            if precollected.is_some() {
+                self.push_event(
+                    isolate_id,
+                    Some(stopped.into()),
+                    RuntimeEventKind::MessageAbandoned,
+                );
+            }
+            return stopped;
+        }
+
         self.entries[index].stopped.set(true);
         self.entries[index].mailbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
+        self.entries[index].stopped_event.set(Some(stopped));
+        if precollected.is_some() {
+            self.push_event(
+                isolate_id,
+                Some(stopped.into()),
+                RuntimeEventKind::MessageAbandoned,
+            );
+        }
         while self.entries[index].mailbox.recv_boxed().is_some() {
             self.push_event(
                 isolate_id,
@@ -658,6 +761,97 @@ where
             );
         }
         stopped
+    }
+
+    fn restart_children(
+        &mut self,
+        parent: IsolateId,
+        cause: CauseId,
+        round_messages: &mut [Option<Box<dyn Any>>],
+    ) {
+        let child_record_indices: Vec<usize> = self
+            .child_records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| (record.parent == parent).then_some(index))
+            .collect();
+
+        for child_record_index in child_record_indices {
+            self.restart_child_record(parent, child_record_index, cause, round_messages);
+        }
+    }
+
+    fn restart_child_record(
+        &mut self,
+        parent: IsolateId,
+        child_record_index: usize,
+        cause: CauseId,
+        round_messages: &mut [Option<Box<dyn Any>>],
+    ) {
+        let child_ordinal = self.child_records[child_record_index].child_ordinal;
+        let old_child = self.child_records[child_record_index].child;
+        let attempted = self.push_event(
+            parent,
+            Some(cause),
+            RuntimeEventKind::RestartChildAttempted {
+                child_ordinal,
+                old_isolate: old_child.isolate,
+                old_generation: old_child.generation,
+            },
+        );
+
+        // Preserve the recipe across restarts while calling back into the
+        // runtime mutably to construct the replacement child.
+        let Some(recipe) = self.child_records[child_record_index]
+            .restart_recipe
+            .clone()
+        else {
+            self.push_event(
+                parent,
+                Some(attempted.into()),
+                RuntimeEventKind::RestartChildSkipped {
+                    child_ordinal,
+                    old_isolate: old_child.isolate,
+                    old_generation: old_child.generation,
+                    reason: RestartSkippedReason::NotRestartable,
+                },
+            );
+            return;
+        };
+
+        if let Some(old_entry_index) = self.entry_index(old_child) {
+            if !self.entries[old_entry_index].stopped.get() {
+                let precollected = round_messages
+                    .get_mut(old_entry_index)
+                    .and_then(Option::take);
+                self.stop_entry_with_precollected(
+                    old_entry_index,
+                    old_child.isolate,
+                    attempted.into(),
+                    precollected,
+                );
+            }
+        }
+
+        let outcome = recipe.create(self, parent);
+        let new_child = outcome.child;
+        self.child_records[child_record_index].child = new_child;
+        self.child_records[child_record_index].mailbox_capacity = outcome.mailbox_capacity;
+        // Rebind the same restart recipe so this child slot remains
+        // restartable after the first replacement.
+        self.child_records[child_record_index].restart_recipe = Some(recipe);
+
+        self.push_event(
+            parent,
+            Some(attempted.into()),
+            RuntimeEventKind::RestartChildCompleted {
+                child_ordinal,
+                old_isolate: old_child.isolate,
+                old_generation: old_child.generation,
+                new_isolate: new_child.isolate,
+                new_generation: new_child.generation,
+            },
+        );
     }
 
     fn push_event(
@@ -728,6 +922,12 @@ where
             })
     }
 
+    fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.id == address.isolate && entry.generation == address.generation)
+    }
+
     fn register_entry<I, Outbound>(
         &mut self,
         isolate: I,
@@ -749,6 +949,7 @@ where
             generation,
             parent,
             stopped: Cell::new(false),
+            stopped_event: Cell::new(None),
             mailbox,
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
@@ -962,7 +1163,7 @@ where
 {
     child: RegisteredAddress,
     mailbox_capacity: usize,
-    restart_recipe: Option<Box<dyn ErasedRestartRecipe<S, F>>>,
+    restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -975,7 +1176,7 @@ where
     child: RegisteredAddress,
     child_ordinal: usize,
     mailbox_capacity: usize,
-    restart_recipe: Option<Box<dyn ErasedRestartRecipe<S, F>>>,
+    restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
 }
 
 #[cfg(test)]
@@ -1015,7 +1216,6 @@ where
     ) -> SpawnOutcome<S, F>;
 }
 
-#[allow(dead_code)]
 trait ErasedRestartRecipe<S, F>
 where
     S: Shard,
@@ -1093,6 +1293,7 @@ where
     #[cfg_attr(not(test), allow(dead_code))]
     parent: Option<IsolateId>,
     stopped: Cell<bool>,
+    stopped_event: Cell<Option<EventId>>,
     mailbox: Box<dyn ErasedMailbox>,
     handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
 }
@@ -1213,10 +1414,11 @@ where
         runtime: &mut CurrentRuntime<S, F>,
         parent: IsolateId,
     ) -> SpawnOutcome<S, F> {
-        let isolate = (self.factory)();
-        let mut outcome =
-            runtime.spawn_isolate::<I, Outbound>(parent, isolate, self.mailbox_capacity);
-        outcome.restart_recipe = Some(self);
+        let adapter = Rc::new(*self);
+        let isolate = (adapter.factory)();
+        let mailbox_capacity = adapter.mailbox_capacity;
+        let mut outcome = runtime.spawn_isolate::<I, Outbound>(parent, isolate, mailbox_capacity);
+        outcome.restart_recipe = Some(adapter);
         outcome
     }
 }
@@ -1522,15 +1724,63 @@ mod tests {
         mailbox_capacity: usize,
         restartable: bool,
     ) -> ChildRecordSnapshot {
+        child_record_with_generation(
+            parent,
+            child_isolate,
+            AddressGeneration::new(0),
+            child_ordinal,
+            mailbox_capacity,
+            restartable,
+        )
+    }
+
+    fn child_record_with_generation(
+        parent: IsolateId,
+        child_isolate: IsolateId,
+        child_generation: AddressGeneration,
+        child_ordinal: usize,
+        mailbox_capacity: usize,
+        restartable: bool,
+    ) -> ChildRecordSnapshot {
         ChildRecordSnapshot {
             parent,
             child_shard: ShardId::new(3),
             child_isolate,
-            child_generation: AddressGeneration::new(0),
+            child_generation,
             child_ordinal,
             mailbox_capacity,
             restartable,
         }
+    }
+
+    fn replacement_address(record: &ChildRecordSnapshot) -> Address<LineageMsg> {
+        Address::new_with_generation(
+            record.child_shard,
+            record.child_isolate,
+            record.child_generation,
+        )
+    }
+
+    fn count_events(
+        trace: &[RuntimeEvent],
+        matches_event: impl Fn(RuntimeEventKind) -> bool,
+    ) -> usize {
+        trace
+            .iter()
+            .filter(|event| matches_event(event.kind()))
+            .count()
+    }
+
+    fn restart_child_events(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
+        trace
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::RestartChildAttempted { .. }
+                | RuntimeEventKind::RestartChildSkipped { .. }
+                | RuntimeEventKind::RestartChildCompleted { .. } => Some(event.kind()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -1709,23 +1959,268 @@ mod tests {
     }
 
     #[test]
-    fn restart_children_remains_observed_only_after_lineage_lands() {
+    fn restart_children_with_no_direct_children_emits_no_restart_subtree() {
         let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
         let root = runtime.register(new_root(), root_mailbox());
 
         assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
         assert_eq!(runtime.step(), 1);
         assert_eq!(runtime.lineage_snapshot(), vec![(root.isolate(), None)]);
-        assert!(matches!(
-            runtime.trace().last().map(|event| event.kind()),
-            Some(RuntimeEventKind::EffectObserved {
-                effect: EffectKind::RestartChildren,
-            })
-        ));
+        assert_eq!(restart_child_events(runtime.trace()), Vec::new());
+        assert!(runtime.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::HandlerFinished {
+                    effect: EffectKind::RestartChildren,
+                }
+            )
+        }));
     }
 
     #[test]
-    fn restart_children_does_not_consult_child_records_or_call_restart_factories_yet() {
+    fn restart_children_replaces_restartable_child_and_preserves_ordinal() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let old_child = last_spawned_child(runtime.trace());
+        assert_eq!(factory_calls.get(), 1);
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let records = runtime.child_record_snapshot();
+        let replacement = records[0].child_isolate;
+
+        assert_ne!(replacement, old_child);
+        assert_eq!(factory_calls.get(), 2);
+        assert_eq!(
+            records,
+            vec![child_record(root.isolate(), replacement, 0, 3, true)]
+        );
+        assert!(matches!(
+            runtime.try_send(lineage_address(old_child), LineageMsg::SpawnChild),
+            Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        ));
+        assert_eq!(
+            runtime.try_send(replacement_address(&records[0]), LineageMsg::SpawnChild),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        let restart_events = restart_child_events(runtime.trace());
+        assert_eq!(restart_events.len(), 2);
+        assert!(matches!(
+            restart_events[0],
+            RuntimeEventKind::RestartChildAttempted {
+                child_ordinal: 0,
+                old_isolate,
+                old_generation,
+            } if old_isolate == old_child && old_generation == AddressGeneration::new(0)
+        ));
+        assert!(matches!(
+            restart_events[1],
+            RuntimeEventKind::RestartChildCompleted {
+                child_ordinal: 0,
+                old_isolate,
+                old_generation,
+                new_isolate,
+                new_generation,
+            } if old_isolate == old_child
+                && old_generation == AddressGeneration::new(0)
+                && new_isolate == replacement
+                && new_generation == AddressGeneration::new(0)
+        ));
+
+        let attempt_id = runtime
+            .trace()
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::RestartChildAttempted {
+                        old_isolate,
+                        ..
+                    } if old_isolate == old_child
+                )
+            })
+            .expect("expected restart attempt")
+            .id();
+        let direct_consequences: Vec<_> = runtime
+            .trace()
+            .iter()
+            .filter(|event| event.cause() == Some(CauseId::new(attempt_id)))
+            .map(|event| event.kind())
+            .collect();
+        assert!(
+            direct_consequences
+                .iter()
+                .any(|kind| matches!(kind, RuntimeEventKind::IsolateStopped))
+        );
+        assert!(
+            direct_consequences
+                .iter()
+                .any(|kind| matches!(kind, RuntimeEventKind::RestartChildCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn restart_children_abandons_precollected_old_child_message() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let old_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(
+            runtime.try_send(lineage_address(old_child), LineageMsg::SpawnGrandchild),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(
+            count_events(runtime.trace(), |kind| matches!(
+                kind,
+                RuntimeEventKind::MessageAbandoned
+            )),
+            1
+        );
+        assert_eq!(
+            count_events(runtime.trace(), |kind| matches!(
+                kind,
+                RuntimeEventKind::RestartChildCompleted {
+                    old_isolate,
+                    ..
+                } if old_isolate == old_child
+            )),
+            1
+        );
+        assert_eq!(runtime.child_record_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn restart_children_restarts_already_stopped_or_panicked_children_without_duplicate_stop() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let stopped_child = last_spawned_child(runtime.trace());
+        assert_eq!(
+            runtime.try_send(lineage_address(stopped_child), LineageMsg::Stop),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let panicked_child = last_spawned_child(runtime.trace());
+        assert_eq!(
+            runtime.try_send(lineage_address(panicked_child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(
+            count_events(runtime.trace(), |kind| matches!(
+                kind,
+                RuntimeEventKind::IsolateStopped
+            )),
+            2
+        );
+        assert_eq!(factory_calls.get(), 4);
+        let records = runtime.child_record_snapshot();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].child_ordinal, 0);
+        assert_eq!(records[1].child_ordinal, 1);
+        assert_ne!(records[0].child_isolate, stopped_child);
+        assert_ne!(records[1].child_isolate, panicked_child);
+    }
+
+    #[test]
+    fn restart_children_visits_multiple_children_in_child_ordinal_order() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let first_old = last_spawned_child(runtime.trace());
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let second_old = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(runtime.step(), 1);
+
+        let attempted: Vec<_> = runtime
+            .trace()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::RestartChildAttempted {
+                    child_ordinal,
+                    old_isolate,
+                    ..
+                } => Some((child_ordinal, old_isolate)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(attempted, vec![(0, first_old), (1, second_old)]);
+        assert_eq!(factory_calls.get(), 4);
+    }
+
+    #[test]
+    fn restart_children_skips_non_restartable_children_with_trace() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 2, false)]
+        );
+        assert!(restart_child_events(runtime.trace()).iter().any(|kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::RestartChildSkipped {
+                    child_ordinal: 0,
+                    old_isolate,
+                    old_generation,
+                    reason: RestartSkippedReason::NotRestartable,
+                } if *old_isolate == child && *old_generation == AddressGeneration::new(0)
+            )
+        }));
+    }
+
+    #[test]
+    fn restart_children_does_not_restart_grandchildren() {
         let factory_calls = Rc::new(Cell::new(0));
         let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
         let root = runtime.register(
@@ -1736,22 +2231,51 @@ mod tests {
         assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
         assert_eq!(runtime.step(), 1);
         let child = last_spawned_child(runtime.trace());
-        assert_eq!(factory_calls.get(), 1);
+        assert_eq!(
+            runtime.try_send(lineage_address(child), LineageMsg::SpawnGrandchild),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+        let grandchild = last_spawned_child(runtime.trace());
 
         assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
         assert_eq!(runtime.step(), 1);
 
-        assert_eq!(factory_calls.get(), 1);
+        let records = runtime.child_record_snapshot();
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].child_isolate, child);
+        assert_eq!(records[0].child_ordinal, 0);
+        assert_eq!(records[1], child_record(child, grandchild, 0, 3, false));
         assert_eq!(
-            runtime.child_record_snapshot(),
-            vec![child_record(root.isolate(), child, 0, 3, true)]
+            runtime.try_send(lineage_address(grandchild), LineageMsg::SpawnChild),
+            Ok(())
         );
-        assert!(matches!(
-            runtime.trace().last().map(|event| event.kind()),
-            Some(RuntimeEventKind::EffectObserved {
-                effect: EffectKind::RestartChildren,
-            })
-        ));
+    }
+
+    #[test]
+    fn restart_children_can_restart_child_before_its_first_turn() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let old_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(
+            count_events(runtime.trace(), |kind| matches!(
+                kind,
+                RuntimeEventKind::HandlerStarted
+            )),
+            2
+        );
+        assert_ne!(runtime.child_record_snapshot()[0].child_isolate, old_child);
     }
 
     #[test]
