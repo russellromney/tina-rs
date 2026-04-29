@@ -35,6 +35,9 @@ This file records completed work.
   registration order.
 - Added local same-shard `Spawn` dispatch with runtime-owned mailbox creation,
   deterministic child IDs, and later-round child execution.
+- Added runtime-owned direct parent-child lineage for root registrations and
+  spawned children, with crate-private proof support for restart-oriented
+  follow-up slices.
 - Added a typed runtime ingress API so external code can send to registered and
   spawned isolates without holding raw mailboxes.
 - Added stop-and-abandon semantics: when an isolate stops, buffered messages are
@@ -48,3 +51,6 @@ This file records completed work.
   programmer-error panics, and same-round continuation after panic.
 - Added runtime tests for spawn dispatch, typed ingress backpressure, cross-shard
   ingress panics, and zero-capacity spawn rejection.
+- Added runtime unit tests for direct parent-child lineage, nested spawn edges,
+  lineage survival across stop/panic, and the continued observed-only behavior
+  of `RestartChildren`.
