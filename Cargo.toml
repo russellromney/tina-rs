@@ -1,5 +1,10 @@
 [workspace]
-members = ["tina", "tina-mailbox-spsc", "tina-runtime-current"]
+members = [
+    "tina",
+    "tina-mailbox-spsc",
+    "tina-runtime-current",
+    "tina-supervisor",
+]
 resolver = "2"
 
 [workspace.package]

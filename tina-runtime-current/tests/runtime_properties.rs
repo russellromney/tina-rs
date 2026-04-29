@@ -4,16 +4,21 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use proptest::prelude::*;
-use tina::{Address, Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId, TrySendError};
+use tina::{
+    Address, Context, Effect, Isolate, Mailbox, RestartBudget, RestartPolicy, SendMessage, Shard,
+    ShardId, TrySendError,
+};
 use tina_runtime_current::{
     CauseId, CurrentRuntime, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason,
 };
+use tina_supervisor::SupervisorConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetMsg {
     Data(u8),
     Stop,
+    Panic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +118,7 @@ impl Isolate for Target {
         match message {
             TargetMsg::Data(_) => Effect::Noop,
             TargetMsg::Stop => Effect::Stop,
+            TargetMsg::Panic => panic!("target panic"),
         }
     }
 }
@@ -182,6 +188,7 @@ impl Isolate for RestartChild {
         match message {
             TargetMsg::Data(_) => Effect::Noop,
             TargetMsg::Stop => Effect::Stop,
+            TargetMsg::Panic => panic!("restart child panic"),
         }
     }
 }
@@ -192,6 +199,7 @@ enum Operation {
     EnqueueTargetStop,
     EnqueueDriverSend(u8),
     EnqueueParentRestart,
+    EnqueueChildPanic,
     Step,
 }
 
@@ -215,6 +223,7 @@ fn operation_strategy() -> impl Strategy<Value = Operation> {
         Just(Operation::EnqueueTargetStop),
         (0_u8..8).prop_map(Operation::EnqueueDriverSend),
         Just(Operation::EnqueueParentRestart),
+        Just(Operation::EnqueueChildPanic),
         Just(Operation::Step),
     ]
 }
@@ -224,11 +233,17 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
     let target = runtime.register(Target, TestMailbox::new(3));
     let driver = runtime.register(Driver { target }, TestMailbox::new(3));
     let parent = runtime.register(RestartParent, TestMailbox::new(3));
+    runtime.supervise(
+        parent,
+        SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(100)),
+    );
 
     runtime
         .try_send(parent, ParentMsg::Spawn)
         .expect("initial restartable child spawn should enqueue");
     assert_eq!(runtime.step(), 1);
+    let mut current_child = latest_restart_child_address(runtime.trace())
+        .expect("initial restartable child should have spawned");
 
     let mut ingress = Vec::new();
     let mut steps = Vec::new();
@@ -247,8 +262,14 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
             Operation::EnqueueParentRestart => {
                 ingress.push(outcome(runtime.try_send(parent, ParentMsg::Restart)));
             }
+            Operation::EnqueueChildPanic => {
+                ingress.push(outcome(runtime.try_send(current_child, TargetMsg::Panic)));
+            }
             Operation::Step => {
                 steps.push(runtime.step());
+                if let Some(replacement) = latest_restart_child_address(runtime.trace()) {
+                    current_child = replacement;
+                }
             }
         }
     }
@@ -258,6 +279,24 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
         steps,
         trace: runtime.trace().to_vec(),
     }
+}
+
+fn latest_restart_child_address(trace: &[RuntimeEvent]) -> Option<Address<TargetMsg>> {
+    trace.iter().rev().find_map(|event| match event.kind() {
+        RuntimeEventKind::RestartChildCompleted {
+            new_isolate,
+            new_generation,
+            ..
+        } => Some(Address::new_with_generation(
+            event.shard(),
+            new_isolate,
+            new_generation,
+        )),
+        RuntimeEventKind::Spawned { child_isolate } => {
+            Some(Address::new(event.shard(), child_isolate))
+        }
+        _ => None,
+    })
 }
 
 fn outcome<T>(result: Result<(), TrySendError<T>>) -> IngressOutcome {
@@ -380,6 +419,26 @@ fn assert_restart_attempts_have_visible_outcomes(trace: &[RuntimeEvent]) {
     }
 }
 
+fn assert_supervisor_triggers_have_child_attempts(trace: &[RuntimeEvent]) {
+    for event in trace {
+        let RuntimeEventKind::SupervisorRestartTriggered { .. } = event.kind() else {
+            continue;
+        };
+
+        assert!(
+            trace.iter().any(|candidate| {
+                candidate.cause() == Some(CauseId::new(event.id()))
+                    && matches!(
+                        candidate.kind(),
+                        RuntimeEventKind::RestartChildAttempted { .. }
+                    )
+            }),
+            "supervisor trigger {:?} must cause at least one child restart attempt",
+            event.id()
+        );
+    }
+}
+
 fn assert_stopped_isolates_do_not_start_again(trace: &[RuntimeEvent]) {
     let mut stopped = BTreeSet::new();
 
@@ -420,6 +479,12 @@ proptest! {
     fn generated_histories_give_every_restart_attempt_a_visible_outcome(operations in prop::collection::vec(operation_strategy(), 0..40)) {
         let result = run_history(&operations);
         assert_restart_attempts_have_visible_outcomes(&result.trace);
+    }
+
+    #[test]
+    fn generated_histories_give_every_supervisor_trigger_child_attempts(operations in prop::collection::vec(operation_strategy(), 0..40)) {
+        let result = run_history(&operations);
+        assert_supervisor_triggers_have_child_attempts(&result.trace);
     }
 
     #[test]

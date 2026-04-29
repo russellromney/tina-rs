@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tina = { path = "../tina" }
+tina-supervisor = { path = "../tina-supervisor" }
 
 [dev-dependencies]
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }

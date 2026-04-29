@@ -32,9 +32,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard,
-    ShardId, TrySendError,
+    Address, AddressGeneration, ChildRelation, Context, Effect, Isolate, IsolateId, Mailbox,
+    RestartBudgetState, RestartPolicy, SendMessage, Shard, ShardId, TrySendError,
 };
+use tina_supervisor::SupervisorConfig;
 
 /// Stable identifier for one runtime event in a deterministic trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -114,6 +115,23 @@ pub enum RestartSkippedReason {
     NotRestartable,
 }
 
+/// Why a supervised restart response did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SupervisionRejectedReason {
+    /// The restart budget was already exhausted.
+    BudgetExceeded {
+        /// The restart ordinal that was rejected.
+        attempted_restart: u32,
+
+        /// The configured maximum number of restarts for this runtime-lifetime
+        /// budget window.
+        max_restarts: u32,
+    },
+
+    /// The configured supervisor parent had already stopped.
+    SupervisorStopped,
+}
+
 /// Kind of one runtime event emitted by the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeEventKind {
@@ -182,6 +200,30 @@ pub enum RuntimeEventKind {
     Spawned {
         /// The isolate identifier assigned to the new child.
         child_isolate: IsolateId,
+    },
+
+    /// The runtime began a supervised restart response to a child panic.
+    SupervisorRestartTriggered {
+        /// The policy that selected child restart records.
+        policy: RestartPolicy,
+
+        /// The child whose panic triggered the supervised response.
+        failed_child: IsolateId,
+
+        /// The stable per-parent ordinal of the failed child record.
+        failed_ordinal: usize,
+    },
+
+    /// The runtime rejected a supervised restart response.
+    SupervisorRestartRejected {
+        /// The child whose panic would have triggered the supervised response.
+        failed_child: IsolateId,
+
+        /// The stable per-parent ordinal of the failed child record.
+        failed_ordinal: usize,
+
+        /// Why the supervised response was rejected.
+        reason: SupervisionRejectedReason,
     },
 
     /// The runtime began processing one child record for a restart request.
@@ -463,6 +505,7 @@ where
     mailbox_factory: F,
     entries: Vec<RegisteredEntry<S, F>>,
     child_records: Vec<ChildRecord<S, F>>,
+    supervisors: Vec<SupervisorRecord>,
     next_isolate_id: u64,
     next_event_id: u64,
     trace: Vec<RuntimeEvent>,
@@ -481,6 +524,7 @@ where
             mailbox_factory,
             entries: Vec::new(),
             child_records: Vec::new(),
+            supervisors: Vec::new(),
             next_isolate_id: 1,
             next_event_id: 1,
             trace: Vec::new(),
@@ -570,6 +614,32 @@ where
         }
     }
 
+    /// Configures a registered isolate as supervisor for its direct children.
+    ///
+    /// This is a setup-time runtime API. Unknown, stale, or cross-shard parent
+    /// addresses are programmer errors and panic. Reconfiguring the same parent
+    /// replaces the config and resets the runtime-lifetime budget tracker.
+    pub fn supervise<M: 'static>(&mut self, parent: Address<M>, config: SupervisorConfig) {
+        let parent = self.checked_registered_address(parent, "supervise");
+        let budget_state = config.budget().tracker();
+
+        if let Some(record) = self
+            .supervisors
+            .iter_mut()
+            .find(|record| record.parent == parent)
+        {
+            record.config = config;
+            record.budget_state = budget_state;
+            return;
+        }
+
+        self.supervisors.push(SupervisorRecord {
+            parent,
+            config,
+            budget_state,
+        });
+    }
+
     /// Runs one deterministic round over all registered isolates.
     ///
     /// The return value is the number of handlers that ran in this round.
@@ -631,6 +701,15 @@ where
                         RuntimeEventKind::HandlerPanicked,
                     );
                     self.stop_entry(index, isolate_id, handler_panicked.into());
+                    self.supervise_panic(
+                        RegisteredAddress {
+                            shard: self.shard.id(),
+                            isolate: isolate_id,
+                            generation: self.entries[index].generation,
+                        },
+                        handler_panicked.into(),
+                        &mut round_messages,
+                    );
                     continue;
                 }
             };
@@ -781,6 +860,90 @@ where
         }
     }
 
+    fn supervise_panic(
+        &mut self,
+        failed_child: RegisteredAddress,
+        cause: CauseId,
+        round_messages: &mut [Option<Box<dyn Any>>],
+    ) {
+        let Some(failed_record_index) = self.child_record_index_by_child(failed_child) else {
+            return;
+        };
+
+        let parent = self.child_records[failed_record_index].parent;
+        let failed_ordinal = self.child_records[failed_record_index].child_ordinal;
+        let Some(supervisor_index) = self.supervisor_index(parent) else {
+            return;
+        };
+
+        if self
+            .entry_by_isolate(parent)
+            .is_some_and(|entry| entry.stopped.get())
+        {
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::SupervisorRestartRejected {
+                    failed_child: failed_child.isolate,
+                    failed_ordinal,
+                    reason: SupervisionRejectedReason::SupervisorStopped,
+                },
+            );
+            return;
+        }
+
+        let config = self.supervisors[supervisor_index].config;
+        let policy = config.policy();
+        let budget_state = self.supervisors[supervisor_index].budget_state;
+        let budget_state = match budget_state.record_restart() {
+            Ok(next) => next,
+            Err(error) => {
+                self.push_event(
+                    parent,
+                    Some(cause),
+                    RuntimeEventKind::SupervisorRestartRejected {
+                        failed_child: failed_child.isolate,
+                        failed_ordinal,
+                        reason: SupervisionRejectedReason::BudgetExceeded {
+                            attempted_restart: error.attempted_restart(),
+                            max_restarts: error.max_restarts(),
+                        },
+                    },
+                );
+                return;
+            }
+        };
+        self.supervisors[supervisor_index].budget_state = budget_state;
+
+        let triggered = self.push_event(
+            parent,
+            Some(cause),
+            RuntimeEventKind::SupervisorRestartTriggered {
+                policy,
+                failed_child: failed_child.isolate,
+                failed_ordinal,
+            },
+        );
+
+        let selected: Vec<usize> = self
+            .child_records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                if record.parent != parent {
+                    return None;
+                }
+
+                let relation = ChildRelation::from_ordinals(record.child_ordinal, failed_ordinal);
+                policy.restarts(relation).then_some(index)
+            })
+            .collect();
+
+        for child_record_index in selected {
+            self.restart_child_record(parent, child_record_index, triggered.into(), round_messages);
+        }
+    }
+
     fn restart_child_record(
         &mut self,
         parent: IsolateId,
@@ -928,6 +1091,63 @@ where
             .position(|entry| entry.id == address.isolate && entry.generation == address.generation)
     }
 
+    fn entry_by_isolate(&self, isolate: IsolateId) -> Option<&RegisteredEntry<S, F>> {
+        self.entries.iter().find(|entry| entry.id == isolate)
+    }
+
+    fn child_record_index_by_child(&self, child: RegisteredAddress) -> Option<usize> {
+        self.child_records
+            .iter()
+            .position(|record| record.child == child)
+    }
+
+    fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {
+        self.supervisors
+            .iter()
+            .position(|record| record.parent.isolate == parent)
+    }
+
+    fn checked_registered_address<M: 'static>(
+        &self,
+        address: Address<M>,
+        operation: &str,
+    ) -> RegisteredAddress {
+        if address.shard() != self.shard.id() {
+            panic!(
+                "{operation} targeted a parent on another shard: target shard {} != runtime shard {}",
+                address.shard().get(),
+                self.shard.id().get(),
+            );
+        }
+
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == address.isolate())
+        else {
+            panic!(
+                "{operation} targeted unknown parent isolate {} on shard {}",
+                address.isolate().get(),
+                address.shard().get(),
+            );
+        };
+
+        if entry.generation != address.generation() {
+            panic!(
+                "{operation} targeted stale parent isolate {} generation {} on shard {}",
+                address.isolate().get(),
+                address.generation().get(),
+                address.shard().get(),
+            );
+        }
+
+        RegisteredAddress {
+            shard: address.shard(),
+            isolate: address.isolate(),
+            generation: address.generation(),
+        }
+    }
+
     fn register_entry<I, Outbound>(
         &mut self,
         isolate: I,
@@ -1034,6 +1254,19 @@ where
                 child_ordinal: record.child_ordinal,
                 mailbox_capacity: record.mailbox_capacity,
                 restartable: record.restart_recipe.is_some(),
+            })
+            .collect()
+    }
+
+    /// Returns the stored supervisor records in configuration order.
+    #[cfg(test)]
+    pub(crate) fn supervisor_snapshot(&self) -> Vec<SupervisorRecordSnapshot> {
+        self.supervisors
+            .iter()
+            .map(|record| SupervisorRecordSnapshot {
+                parent: record.parent,
+                config: record.config,
+                budget_state: record.budget_state,
             })
             .collect()
     }
@@ -1179,6 +1412,12 @@ where
     restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
 }
 
+struct SupervisorRecord {
+    parent: RegisteredAddress,
+    config: SupervisorConfig,
+    budget_state: RestartBudgetState,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChildRecordSnapshot {
@@ -1189,6 +1428,14 @@ pub(crate) struct ChildRecordSnapshot {
     child_ordinal: usize,
     mailbox_capacity: usize,
     restartable: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupervisorRecordSnapshot {
+    parent: RegisteredAddress,
+    config: SupervisorConfig,
+    budget_state: RestartBudgetState,
 }
 
 trait ErasedHandler<S, F>
@@ -1783,6 +2030,17 @@ mod tests {
             .collect()
     }
 
+    fn supervisor_events(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
+        trace
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::SupervisorRestartTriggered { .. }
+                | RuntimeEventKind::SupervisorRestartRejected { .. } => Some(event.kind()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn root_registered_isolates_have_no_parent() {
         let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
@@ -2276,6 +2534,378 @@ mod tests {
             2
         );
         assert_ne!(runtime.child_record_snapshot()[0].child_isolate, old_child);
+    }
+
+    #[test]
+    fn supervised_one_for_one_restarts_only_failed_child() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let first_child = last_spawned_child(runtime.trace());
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let second_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.try_send(lineage_address(first_child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        let records = runtime.child_record_snapshot();
+        assert_ne!(records[0].child_isolate, first_child);
+        assert_eq!(records[0].child_ordinal, 0);
+        assert_eq!(
+            records[1],
+            child_record(root.isolate(), second_child, 1, 3, true)
+        );
+        assert_eq!(factory_calls.get(), 3);
+        assert_eq!(
+            runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+            Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        );
+        assert!(
+            supervisor_events(runtime.trace())
+                .iter()
+                .any(|kind| matches!(
+                    kind,
+                    RuntimeEventKind::SupervisorRestartTriggered {
+                        policy: RestartPolicy::OneForOne,
+                        failed_child,
+                        failed_ordinal: 0,
+                    } if *failed_child == first_child
+                ))
+        );
+
+        let panic_id = runtime
+            .trace()
+            .iter()
+            .find(|event| {
+                event.isolate() == first_child
+                    && matches!(event.kind(), RuntimeEventKind::HandlerPanicked)
+            })
+            .expect("expected child panic event")
+            .id();
+        let direct_consequences: Vec<_> = runtime
+            .trace()
+            .iter()
+            .filter(|event| event.cause() == Some(CauseId::new(panic_id)))
+            .map(|event| event.kind())
+            .collect();
+        assert!(
+            direct_consequences
+                .iter()
+                .any(|kind| matches!(kind, RuntimeEventKind::IsolateStopped))
+        );
+        assert!(direct_consequences.iter().any(|kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::SupervisorRestartTriggered {
+                    failed_child,
+                    ..
+                } if *failed_child == first_child
+            )
+        }));
+    }
+
+    #[test]
+    fn supervised_one_for_all_restarts_every_direct_restartable_child() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::OneForAll, tina::RestartBudget::new(3)),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let first_child = last_spawned_child(runtime.trace());
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let second_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.try_send(lineage_address(first_child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        let records = runtime.child_record_snapshot();
+        assert_ne!(records[0].child_isolate, first_child);
+        assert_ne!(records[1].child_isolate, second_child);
+        assert_eq!(records[0].child_ordinal, 0);
+        assert_eq!(records[1].child_ordinal, 1);
+        assert_eq!(factory_calls.get(), 4);
+    }
+
+    #[test]
+    fn supervised_rest_for_one_restarts_failed_and_younger_children_only() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::RestForOne, tina::RestartBudget::new(3)),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let first_child = last_spawned_child(runtime.trace());
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let second_child = last_spawned_child(runtime.trace());
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let third_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.try_send(lineage_address(second_child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        let records = runtime.child_record_snapshot();
+        assert_eq!(
+            records[0],
+            child_record(root.isolate(), first_child, 0, 3, true)
+        );
+        assert_ne!(records[1].child_isolate, second_child);
+        assert_ne!(records[2].child_isolate, third_child);
+        assert_eq!(records[1].child_ordinal, 1);
+        assert_eq!(records[2].child_ordinal, 2);
+        assert_eq!(factory_calls.get(), 5);
+    }
+
+    #[test]
+    fn supervised_restart_skips_selected_non_restartable_child() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.try_send(lineage_address(child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 2, false)]
+        );
+        assert!(
+            restart_child_events(runtime.trace())
+                .iter()
+                .any(|kind| matches!(
+                    kind,
+                    RuntimeEventKind::RestartChildSkipped {
+                        old_isolate,
+                        reason: RestartSkippedReason::NotRestartable,
+                        ..
+                    } if *old_isolate == child
+                ))
+        );
+    }
+
+    #[test]
+    fn supervised_restart_budget_exhaustion_is_visible_and_creates_no_replacement() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(0)),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+        assert_eq!(
+            runtime.try_send(lineage_address(child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 3, true)]
+        );
+        assert_eq!(factory_calls.get(), 1);
+        assert!(
+            supervisor_events(runtime.trace())
+                .iter()
+                .any(|kind| matches!(
+                    kind,
+                    RuntimeEventKind::SupervisorRestartRejected {
+                        failed_child,
+                        failed_ordinal: 0,
+                        reason: SupervisionRejectedReason::BudgetExceeded {
+                            attempted_restart: 1,
+                            max_restarts: 0,
+                        },
+                    } if *failed_child == child
+                ))
+        );
+    }
+
+    #[test]
+    fn stopped_supervisor_rejects_later_child_failure_without_replacement() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+        assert_eq!(runtime.try_send(root, LineageMsg::Stop), Ok(()));
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(
+            runtime.try_send(lineage_address(child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(factory_calls.get(), 1);
+        assert!(
+            supervisor_events(runtime.trace())
+                .iter()
+                .any(|kind| matches!(
+                    kind,
+                    RuntimeEventKind::SupervisorRestartRejected {
+                        failed_child,
+                        failed_ordinal: 0,
+                        reason: SupervisionRejectedReason::SupervisorStopped,
+                    } if *failed_child == child
+                ))
+        );
+    }
+
+    #[test]
+    fn unsupervised_child_panic_and_normal_child_stop_do_not_trigger_supervision() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let panicking_child = last_spawned_child(runtime.trace());
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let stopping_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.try_send(lineage_address(panicking_child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(
+            runtime.try_send(lineage_address(stopping_child), LineageMsg::Stop),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 2);
+
+        assert_eq!(factory_calls.get(), 2);
+        assert_eq!(supervisor_events(runtime.trace()), Vec::new());
+    }
+
+    #[test]
+    fn supervise_before_children_and_reconfigure_reset_budget_are_supported() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(1)),
+        );
+        assert_eq!(runtime.supervisor_snapshot().len(), 1);
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+        assert_eq!(
+            runtime.try_send(lineage_address(child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+        let replacement = runtime.child_record_snapshot()[0].child_isolate;
+
+        runtime.supervise(
+            root,
+            SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(1)),
+        );
+        assert_eq!(
+            runtime.try_send(lineage_address(replacement), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(factory_calls.get(), 3);
+        assert_eq!(runtime.supervisor_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn supervise_panics_for_unknown_stale_or_cross_shard_parent_addresses() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+        let config = SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(1));
+
+        let unknown = Address::<LineageMsg>::new(ShardId::new(3), IsolateId::new(99));
+        assert!(catch_unwind(AssertUnwindSafe(|| runtime.supervise(unknown, config))).is_err());
+
+        let stale = Address::<LineageMsg>::new_with_generation(
+            root.shard(),
+            root.isolate(),
+            AddressGeneration::new(99),
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| runtime.supervise(stale, config))).is_err());
+
+        let cross_shard = Address::<LineageMsg>::new(ShardId::new(99), root.isolate());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                runtime.supervise(cross_shard, config)
+            }))
+            .is_err()
+        );
     }
 
     #[test]
