@@ -4,20 +4,21 @@
 
 `tina-rs` is a Rust library for building servers out of independent state machines. Each tenant, connection, room, or session is its own struct with its own message queue, and they never share memory. Handlers process one message at a time and return a value describing what to do next — `Send this`, `Spawn that`, `Reply with X`, `Stop`. The runtime is the only thing that actually does I/O. Because handlers are descriptions of work rather than the work itself, the whole system can be driven deterministically in tests: every failure becomes a seed you can replay.
 
-It's a port of [Peter Banugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) which you should read first, then check out the Odin reference impl, then come back here.
+It's an independent Rust port inspired by [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) which you should read first, then check out the Odin reference impl, then come back here.
 
-This repo is a Cargo workspace. Today it has two crates:
+This repo is a Cargo workspace. Today it has three crates:
 
 - **`tina`** — Trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`, `SendMessage`, `SpawnSpec`. No impls.
 - **`tina-mailbox-spsc`** — Bounded single-producer/single-consumer mailbox crate implementing `tina::Mailbox`.
+- **`tina-runtime-current`** — In-progress deterministic single-shard runtime core with trace events, local send/spawn dispatch, typed ingress, stop-and-abandon behavior, panic capture, and parent-child lineage.
 
-The runtime, supervisor, and simulator crates come later. See [ROADMAP.md](ROADMAP.md).
+The supervisor, simulator, I/O driver, multi-shard runtime, and Tokio bridge come later. See [ROADMAP.md](ROADMAP.md).
 
-> tina-rs is **experimental**. The vocabulary is here; the runtime isn't yet. The API will change.
+> tina-rs is **experimental**. The vocabulary, bounded SPSC mailbox, and first runtime core are here; the supervisor, simulator, and production runtime story are not yet. The API will change.
 
 ## Why this exists
 
-The default async tools in Rust make it easy to write a server that works fine on a laptop and falls over under real load. Banugo's article walks through the reasons; the short version:
+The default async tools in Rust make it easy to write a server that works fine on a laptop and falls over under real load. Mbanugo's article walks through the reasons; the short version:
 
 - **The Tokio scheduler moves tasks between cores ("work-stealing").** Every time a task moves, the cache lines it was using on the old core are useless. For servers where each connection or tenant has its own state, that movement is pure waste.
 - **`mpsc::unbounded_channel` turns traffic spikes into out-of-memory crashes.** A producer that briefly outpaces a consumer fills memory until the process dies.
@@ -42,7 +43,7 @@ If you want to contribute or find bugs, please open a PR or issue.
 
 ## At a glance
 
-Today the trait crate lets you define isolates against the API even though no runtime exists yet. Handlers describe what to do; they don't do it.
+Today the trait crate lets you define isolates against the API, and the current-thread runtime core can drive simple single-shard workloads deterministically. Handlers describe what to do; they don't do I/O themselves.
 
 ```rust
 use std::convert::Infallible;
@@ -83,7 +84,7 @@ impl Isolate for Counter {
 }
 ```
 
-`Effect` is a closed enum (`Noop`, `Reply`, `Send`, `Spawn`, `Stop`, `RestartChildren`) with per-isolate associated payload types. When the runtime lands, it will be the only place real I/O happens.
+`Effect` is a closed enum (`Noop`, `Reply`, `Send`, `Spawn`, `Stop`, `RestartChildren`) with per-isolate associated payload types. The current runtime core executes some of those effects already; future I/O/timer effects must preserve the rule that real I/O happens in the runtime, not in handlers.
 
 ## Design
 
@@ -102,9 +103,9 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 ## Status
 
-What works today: the trait crate and the bounded SPSC mailbox crate. You can write isolates against the API and exercise real mailbox semantics, but nothing runs handlers yet.
+What works today: the trait crate, the bounded SPSC mailbox crate, and an in-progress deterministic single-shard runtime core. You can write isolates against the API, exercise real mailbox semantics, and run handlers through `tina-runtime-current` for local send/spawn/stop/panic-capture scenarios.
 
-What's coming, in order: a supervision mechanism; a single-shard runtime backed by current-thread Tokio with a working TCP echo server; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
+What's coming, in order: real supervision and the task-dispatcher proof example; a current-thread Tokio driver plus runtime-owned I/O/timer effects and TCP echo; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 
@@ -119,19 +120,22 @@ See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 
 ```bash
 make verify   # fmt + check + test + loom + doc + clippy
+make miri     # focused unsafe-memory checks for tina-mailbox-spsc
 ```
 
 Individual targets: `make fmt`, `make check`, `make test`, `make doc`, `make clippy`.
-Concurrency model checking: `make loom`.
+Concurrency model checking: `make loom`. Unsafe-memory checking for the SPSC
+mailbox: `make miri`.
 
 ## Prior art and references
 
-- [Tina](https://github.com/pmbanugo/tina) — Banugo's reference implementation in Odin
+- [Tina](https://github.com/pmbanugo/tina) — Mbanugo's reference implementation in Odin
 - [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) — the framing
 - [Seastar](https://seastar.io/) — C++ thread-per-core framework, ScyllaDB's foundation
 - [monoio](https://github.com/bytedance/monoio) — likely runtime backend
 - [shuttle](https://github.com/awslabs/shuttle) — concurrency model checking, useful when the simulator lands
 - [loom](https://github.com/tokio-rs/loom) — concurrency permutation testing for unsafe primitives
+- [Miri](https://github.com/rust-lang/miri) — interpreter for catching undefined behavior in unsafe Rust
 
 ## License
 

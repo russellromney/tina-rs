@@ -57,3 +57,11 @@ This file records completed work.
 - Added address-liveness semantics: `Address<M>` now includes a generation,
   runtime send traces include target generation, and stale known generations
   fail visibly as `Closed` instead of targeting a current incarnation.
+- Added restartable child records: `RestartableSpawnSpec<I>` records a
+  factory-backed restart recipe, and `CurrentRuntime` stores private child
+  metadata for future `RestartChildren` execution.
+- Added generated-history runtime property tests for deterministic traces,
+  causal-link validity, visible send outcomes, and no accidental handling after
+  stop.
+- Added focused Miri coverage for the SPSC mailbox unsafe slot paths and a
+  `make miri` target.
