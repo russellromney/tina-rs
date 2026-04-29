@@ -45,8 +45,12 @@ Today the repo ships `tina`, `tina-mailbox-spsc`, and `tina-runtime-current`.
 `tina-runtime-current` is still a small, in-progress runtime. Today it has
 deterministic runtime events, a single-shard stepping model, local
 same-shard send dispatch, local same-shard spawn dispatch, typed runtime
-ingress for sending to registered isolates, and stored direct parent-child
-lineage for spawned children.
+ingress for sending to registered isolates, stored direct parent-child lineage
+for spawned children, restartable child records, and direct-child
+`RestartChildren` execution.
+
+The runtime trace is a deterministically ordered causal tree. Each event has at
+most one cause, but one event may be the direct cause of many later events.
 
 `Address<M>` names one isolate incarnation, not a logical service name. Its
 identity includes shard id, isolate id, and generation. Runtime sends and
@@ -107,6 +111,8 @@ There is not yet a simulator or Tokio bridge.
 - the first runtime introduces the deterministic runtime event trace with
   causal links
 - that trace is part of the design, not optional test decoration
+- trace consumers must not assume the trace is a linear chain; restart execution
+  can produce multiple direct consequences from one cause
 - the simulator uses the runtime trace vocabulary as its meaning model
 - the Tokio bridge is for small, gradual adoption inside existing Tokio apps
 - the Tokio bridge is not the main runtime story, and it is not a reason to
