@@ -1,0 +1,1 @@
+809233e feat(runtime): record restartable child metadata at spawn time
