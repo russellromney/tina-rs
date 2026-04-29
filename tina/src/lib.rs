@@ -123,8 +123,9 @@ pub trait Isolate: Sized {
 
     /// The payload produced by [`Effect::Spawn`].
     ///
-    /// [`SpawnSpec`] is the simplest choice in Sputnik. Later phases can layer
-    /// richer supervision and boot metadata on top.
+    /// [`SpawnSpec`] is the simplest one-shot spawn payload.
+    /// [`RestartableSpawnSpec`] adds a repeatable factory for children that a
+    /// runtime may restart later.
     type Spawn;
 
     /// The shard abstraction available through [`Context`].
@@ -611,6 +612,62 @@ where
     /// Consumes the request and returns its parts.
     pub fn into_parts(self) -> (I, usize) {
         (self.isolate, self.mailbox_capacity)
+    }
+}
+
+/// A restartable spawn request backed by a repeatable isolate factory.
+///
+/// Use [`SpawnSpec`] when a child only needs to be created once. Use
+/// `RestartableSpawnSpec` when the runtime must keep a recipe for creating
+/// fresh replacement isolate state later. The factory may capture immutable
+/// configuration with normal Rust closure captures, for example
+/// `move || Worker::new(tenant_id)`. The factory is `Fn`, not `FnMut`; mutable
+/// state shared across restarts must use interior mutability.
+#[must_use = "a spawn request has no effect until a runtime executes it"]
+pub struct RestartableSpawnSpec<I>
+where
+    I: Isolate,
+{
+    factory: Box<dyn Fn() -> I>,
+    mailbox_capacity: usize,
+}
+
+impl<I> std::fmt::Debug for RestartableSpawnSpec<I>
+where
+    I: Isolate,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestartableSpawnSpec")
+            .field("mailbox_capacity", &self.mailbox_capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I> RestartableSpawnSpec<I>
+where
+    I: Isolate,
+{
+    /// Creates a new restartable spawn request.
+    pub fn new<F>(factory: F, mailbox_capacity: usize) -> Self
+    where
+        F: Fn() -> I + 'static,
+    {
+        Self {
+            factory: Box::new(factory),
+            mailbox_capacity,
+        }
+    }
+
+    /// Returns the requested mailbox capacity for the spawned isolate.
+    pub const fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity
+    }
+
+    /// Consumes the request and returns its repeatable factory plus mailbox
+    /// capacity.
+    pub fn into_parts(self) -> (Box<dyn Fn() -> I>, usize) {
+        (self.factory, self.mailbox_capacity)
     }
 }
 

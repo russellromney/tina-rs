@@ -2,8 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId, SpawnSpec,
-    TrySendError,
+    Address, Context, Effect, Isolate, IsolateId, Mailbox, RestartableSpawnSpec, SendMessage,
+    Shard, ShardId, SpawnSpec, TrySendError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,15 @@ struct Session {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Worker;
+struct Worker {
+    tenant_id: u64,
+}
+
+impl Worker {
+    fn new(tenant_id: u64) -> Self {
+        Self { tenant_id }
+    }
+}
 
 #[derive(Debug, Default)]
 struct InlineShard;
@@ -72,7 +80,7 @@ impl Isolate for Session {
                 Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(note)))
             }
             SessionMsg::Read => Effect::Reply(self.notes.clone()),
-            SessionMsg::SpawnWorker => Effect::Spawn(SpawnSpec::new(Worker, 8)),
+            SessionMsg::SpawnWorker => Effect::Spawn(SpawnSpec::new(Worker::new(0), 8)),
             SessionMsg::Stop => Effect::Stop,
             SessionMsg::RestartWorkers => Effect::RestartChildren,
             SessionMsg::Ignore => Effect::Noop,
@@ -190,12 +198,24 @@ fn context_builds_typed_addresses_for_current_and_remote_isolates() {
 fn downstream_worker_isolate_can_compile_and_run_through_the_same_surface() {
     let mut shard = InlineShard;
     let mut ctx = Context::new(&mut shard, IsolateId::new(88));
-    let mut worker = Worker;
+    let mut worker = Worker::new(0);
 
     assert!(matches!(
         worker.handle(WorkerMsg::Start, &mut ctx),
         Effect::Noop
     ));
+}
+
+#[test]
+fn restartable_spawn_spec_is_available_as_a_distinct_public_payload() {
+    let tenant_id = 9_u64;
+    let spec = RestartableSpawnSpec::new(move || Worker::new(tenant_id), 13);
+
+    assert_eq!(spec.mailbox_capacity(), 13);
+
+    let (factory, mailbox_capacity) = spec.into_parts();
+    assert_eq!(mailbox_capacity, 13);
+    assert_eq!(factory(), Worker::new(tenant_id));
 }
 
 #[test]

@@ -406,6 +406,7 @@ where
     shard: S,
     mailbox_factory: F,
     entries: Vec<RegisteredEntry<S, F>>,
+    child_records: Vec<ChildRecord<S, F>>,
     next_isolate_id: u64,
     next_event_id: u64,
     trace: Vec<RuntimeEvent>,
@@ -423,6 +424,7 @@ where
             shard,
             mailbox_factory,
             entries: Vec::new(),
+            child_records: Vec::new(),
             next_isolate_id: 1,
             next_event_id: 1,
             trace: Vec::new(),
@@ -460,7 +462,7 @@ where
             }),
         );
 
-        Address::new_with_generation(self.shard.id(), address.isolate, address.generation)
+        Address::new_with_generation(address.shard, address.isolate, address.generation)
     }
 
     /// Attempts to enqueue a typed message into one registered isolate.
@@ -620,13 +622,13 @@ where
                     }
                 }
                 ErasedEffect::Spawn(spawn) => {
-                    let child_address = spawn.spawn(self, isolate_id);
+                    let outcome = spawn.spawn(self, isolate_id);
+                    let child_isolate = outcome.child.isolate;
+                    self.record_child(isolate_id, outcome);
                     self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
-                        RuntimeEventKind::Spawned {
-                            child_isolate: child_address.isolate,
-                        },
+                        RuntimeEventKind::Spawned { child_isolate },
                     );
                 }
                 ErasedEffect::Noop | ErasedEffect::Reply | ErasedEffect::RestartChildren => {
@@ -755,6 +757,7 @@ where
         });
 
         RegisteredAddress {
+            shard: self.shard.id(),
             isolate: isolate_id,
             generation,
         }
@@ -765,7 +768,7 @@ where
         parent: IsolateId,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> RegisteredAddress
+    ) -> SpawnOutcome<S, F>
     where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
@@ -776,14 +779,36 @@ where
             panic!("spawn requested mailbox capacity 0, which is out of scope for this slice");
         }
 
-        self.register_entry::<I, Outbound>(
+        let child = self.register_entry::<I, Outbound>(
             isolate,
             Some(parent),
             Box::new(DynMailboxAdapter::<I::Message> {
                 mailbox: self.mailbox_factory.create::<I::Message>(mailbox_capacity),
                 marker: PhantomData,
             }),
-        )
+        );
+
+        SpawnOutcome {
+            child,
+            mailbox_capacity,
+            restart_recipe: None,
+        }
+    }
+
+    fn record_child(&mut self, parent: IsolateId, outcome: SpawnOutcome<S, F>) {
+        let child_ordinal = self
+            .child_records
+            .iter()
+            .filter(|record| record.parent == parent)
+            .count();
+
+        self.child_records.push(ChildRecord {
+            parent,
+            child: outcome.child,
+            child_ordinal,
+            mailbox_capacity: outcome.mailbox_capacity,
+            restart_recipe: outcome.restart_recipe,
+        });
     }
 
     /// Returns the stored direct-parent lineage in registration order.
@@ -792,6 +817,23 @@ where
         self.entries
             .iter()
             .map(|entry| (entry.id, entry.parent))
+            .collect()
+    }
+
+    /// Returns the stored child records in spawn order.
+    #[cfg(test)]
+    pub(crate) fn child_record_snapshot(&self) -> Vec<ChildRecordSnapshot> {
+        self.child_records
+            .iter()
+            .map(|record| ChildRecordSnapshot {
+                parent: record.parent,
+                child_shard: record.child.shard,
+                child_isolate: record.child.isolate,
+                child_generation: record.child.generation,
+                child_ordinal: record.child_ordinal,
+                mailbox_capacity: record.mailbox_capacity,
+                restartable: record.restart_recipe.is_some(),
+            })
             .collect()
     }
 }
@@ -908,8 +950,44 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RegisteredAddress {
+    shard: ShardId,
     isolate: IsolateId,
     generation: AddressGeneration,
+}
+
+struct SpawnOutcome<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    child: RegisteredAddress,
+    mailbox_capacity: usize,
+    restart_recipe: Option<Box<dyn ErasedRestartRecipe<S, F>>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct ChildRecord<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    parent: IsolateId,
+    child: RegisteredAddress,
+    child_ordinal: usize,
+    mailbox_capacity: usize,
+    restart_recipe: Option<Box<dyn ErasedRestartRecipe<S, F>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildRecordSnapshot {
+    parent: IsolateId,
+    child_shard: ShardId,
+    child_isolate: IsolateId,
+    child_generation: AddressGeneration,
+    child_ordinal: usize,
+    mailbox_capacity: usize,
+    restartable: bool,
 }
 
 trait ErasedHandler<S, F>
@@ -934,7 +1012,16 @@ where
         self: Box<Self>,
         runtime: &mut CurrentRuntime<S, F>,
         parent: IsolateId,
-    ) -> RegisteredAddress;
+    ) -> SpawnOutcome<S, F>;
+}
+
+#[allow(dead_code)]
+trait ErasedRestartRecipe<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn create(&self, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F>;
 }
 
 trait IntoErasedSpawn<S, F>
@@ -1079,7 +1166,7 @@ where
         self: Box<Self>,
         runtime: &mut CurrentRuntime<S, F>,
         parent: IsolateId,
-    ) -> RegisteredAddress {
+    ) -> SpawnOutcome<S, F> {
         runtime.spawn_isolate::<I, Outbound>(parent, self.isolate, self.mailbox_capacity)
     }
 }
@@ -1097,6 +1184,71 @@ where
         let (isolate, mailbox_capacity) = self.into_parts();
         Box::new(SpawnAdapter::<I, Outbound> {
             isolate,
+            mailbox_capacity,
+            marker: PhantomData,
+        })
+    }
+}
+
+struct RestartableSpawnAdapter<I, Outbound>
+where
+    I: Isolate,
+{
+    factory: Box<dyn Fn() -> I>,
+    mailbox_capacity: usize,
+    marker: PhantomData<fn(Outbound) -> Outbound>,
+}
+
+impl<I, S, F, Outbound> ErasedSpawn<S, F> for RestartableSpawnAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    Outbound: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn(
+        self: Box<Self>,
+        runtime: &mut CurrentRuntime<S, F>,
+        parent: IsolateId,
+    ) -> SpawnOutcome<S, F> {
+        let isolate = (self.factory)();
+        let mut outcome =
+            runtime.spawn_isolate::<I, Outbound>(parent, isolate, self.mailbox_capacity);
+        outcome.restart_recipe = Some(self);
+        outcome
+    }
+}
+
+impl<I, S, F, Outbound> ErasedRestartRecipe<S, F> for RestartableSpawnAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    Outbound: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn create(&self, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F> {
+        let isolate = (self.factory)();
+        runtime.spawn_isolate::<I, Outbound>(parent, isolate, self.mailbox_capacity)
+    }
+}
+
+impl<I, S, F, Outbound> IntoErasedSpawn<S, F> for tina::RestartableSpawnSpec<I>
+where
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    Outbound: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>> {
+        let (factory, mailbox_capacity) = self.into_parts();
+        Box::new(RestartableSpawnAdapter::<I, Outbound> {
+            factory,
             mailbox_capacity,
             marker: PhantomData,
         })
@@ -1121,6 +1273,12 @@ mod tests {
         Panic,
         Restart,
     }
+
+    type RunEvidence = (
+        Vec<RuntimeEvent>,
+        Vec<(IsolateId, Option<IsolateId>)>,
+        Vec<ChildRecordSnapshot>,
+    );
 
     #[derive(Debug, Default)]
     struct TestShard;
@@ -1190,6 +1348,12 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct RestartableRootIsolate {
+        child_capacity: usize,
+        factory_calls: Rc<Cell<usize>>,
+    }
+
+    #[derive(Debug)]
     struct ChildIsolate {
         leaf_capacity: usize,
     }
@@ -1219,6 +1383,40 @@ mod tests {
                 LineageMsg::Stop => Effect::Stop,
                 LineageMsg::Panic => panic!("panic inside root lineage isolate"),
                 LineageMsg::Restart => Effect::RestartChildren,
+                LineageMsg::SpawnGrandchild => Effect::Noop,
+            }
+        }
+    }
+
+    impl Isolate for RestartableRootIsolate {
+        type Message = LineageMsg;
+        type Reply = ();
+        type Send = SendMessage<NeverOutbound>;
+        type Spawn = tina::RestartableSpawnSpec<ChildIsolate>;
+        type Shard = TestShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                LineageMsg::SpawnChild => {
+                    let child_capacity = self.child_capacity;
+                    let factory_calls = Rc::clone(&self.factory_calls);
+                    Effect::Spawn(tina::RestartableSpawnSpec::new(
+                        move || {
+                            factory_calls.set(factory_calls.get() + 1);
+                            ChildIsolate {
+                                leaf_capacity: child_capacity,
+                            }
+                        },
+                        child_capacity,
+                    ))
+                }
+                LineageMsg::Restart => Effect::RestartChildren,
+                LineageMsg::Stop => Effect::Stop,
+                LineageMsg::Panic => panic!("panic inside restartable root isolate"),
                 LineageMsg::SpawnGrandchild => Effect::Noop,
             }
         }
@@ -1268,6 +1466,13 @@ mod tests {
         RootIsolate { child_capacity: 2 }
     }
 
+    fn new_restartable_root(factory_calls: Rc<Cell<usize>>) -> RestartableRootIsolate {
+        RestartableRootIsolate {
+            child_capacity: 3,
+            factory_calls,
+        }
+    }
+
     fn root_mailbox() -> TestMailbox<LineageMsg> {
         TestMailbox::new(8)
     }
@@ -1310,6 +1515,24 @@ mod tests {
         }
     }
 
+    fn child_record(
+        parent: IsolateId,
+        child_isolate: IsolateId,
+        child_ordinal: usize,
+        mailbox_capacity: usize,
+        restartable: bool,
+    ) -> ChildRecordSnapshot {
+        ChildRecordSnapshot {
+            parent,
+            child_shard: ShardId::new(3),
+            child_isolate,
+            child_generation: AddressGeneration::new(0),
+            child_ordinal,
+            mailbox_capacity,
+            restartable,
+        }
+    }
+
     #[test]
     fn root_registered_isolates_have_no_parent() {
         let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
@@ -1320,6 +1543,64 @@ mod tests {
         assert_eq!(
             runtime.lineage_snapshot(),
             vec![(first.isolate(), None), (second.isolate(), None)]
+        );
+        assert_eq!(runtime.child_record_snapshot(), Vec::new());
+    }
+
+    #[test]
+    fn one_shot_spawn_records_non_restartable_child_metadata() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 2, false)]
+        );
+    }
+
+    #[test]
+    fn restartable_spawn_records_restartable_child_metadata_and_calls_factory_once() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_eq!(factory_calls.get(), 1);
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 3, true)]
+        );
+    }
+
+    #[test]
+    fn per_parent_child_ordinals_increment_by_direct_spawn_order() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let first_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let second_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![
+                child_record(root.isolate(), first_child, 0, 2, false),
+                child_record(root.isolate(), second_child, 1, 2, false),
+            ]
         );
     }
 
@@ -1342,6 +1623,13 @@ mod tests {
         let grandchild = last_spawned_child(runtime.trace());
 
         assert_root_child_grandchild_lineage(&runtime, root, child, grandchild);
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![
+                child_record(root.isolate(), child, 0, 2, false),
+                child_record(child, grandchild, 0, 2, false),
+            ]
+        );
     }
 
     #[test]
@@ -1357,6 +1645,10 @@ mod tests {
         assert_eq!(runtime.step(), 1);
 
         assert_root_and_child_lineage(&runtime, root, child);
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 2, false)]
+        );
     }
 
     #[test]
@@ -1378,6 +1670,42 @@ mod tests {
         );
 
         assert_root_and_child_lineage(&runtime, root, child);
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 2, false)]
+        );
+    }
+
+    #[test]
+    fn child_record_survives_when_child_stops_or_panics() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let stopping_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let panicking_child = last_spawned_child(runtime.trace());
+
+        assert_eq!(
+            runtime.try_send(lineage_address(stopping_child), LineageMsg::Stop),
+            Ok(())
+        );
+        assert_eq!(
+            runtime.try_send(lineage_address(panicking_child), LineageMsg::Panic),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 2);
+
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![
+                child_record(root.isolate(), stopping_child, 0, 2, false),
+                child_record(root.isolate(), panicking_child, 1, 2, false),
+            ]
+        );
     }
 
     #[test]
@@ -1397,8 +1725,38 @@ mod tests {
     }
 
     #[test]
+    fn restart_children_does_not_consult_child_records_or_call_restart_factories_yet() {
+        let factory_calls = Rc::new(Cell::new(0));
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(
+            new_restartable_root(Rc::clone(&factory_calls)),
+            root_mailbox(),
+        );
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+        assert_eq!(factory_calls.get(), 1);
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(runtime.step(), 1);
+
+        assert_eq!(factory_calls.get(), 1);
+        assert_eq!(
+            runtime.child_record_snapshot(),
+            vec![child_record(root.isolate(), child, 0, 3, true)]
+        );
+        assert!(matches!(
+            runtime.trace().last().map(|event| event.kind()),
+            Some(RuntimeEventKind::EffectObserved {
+                effect: EffectKind::RestartChildren,
+            })
+        ));
+    }
+
+    #[test]
     fn identical_runs_produce_identical_trace_and_lineage() {
-        fn run_once() -> (Vec<RuntimeEvent>, Vec<(IsolateId, Option<IsolateId>)>) {
+        fn run_once() -> RunEvidence {
             let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
             let root = runtime.register(new_root(), root_mailbox());
 
@@ -1415,7 +1773,11 @@ mod tests {
 
             assert_root_child_grandchild_lineage(&runtime, root, child, grandchild);
 
-            (runtime.trace().to_vec(), runtime.lineage_snapshot())
+            (
+                runtime.trace().to_vec(),
+                runtime.lineage_snapshot(),
+                runtime.child_record_snapshot(),
+            )
         }
 
         assert_eq!(run_once(), run_once());
