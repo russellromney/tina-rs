@@ -5,8 +5,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId,
-    TrySendError,
+    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard,
+    ShardId, TrySendError,
 };
 use tina_runtime_current::{
     CauseId, CurrentRuntime, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
@@ -537,6 +537,7 @@ fn sends_after_panic_still_become_closed() {
             RuntimeEventKind::SendRejected {
                 target_shard: ShardId::new(3),
                 target_isolate: target_address.isolate(),
+                target_generation: target_address.generation(),
                 reason: SendRejectedReason::Closed,
             },
         ))
@@ -598,6 +599,7 @@ fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
                 RuntimeEventKind::SendDispatchAttempted {
                     target_shard: ShardId::new(3),
                     target_isolate: IsolateId::new(99),
+                    target_generation: AddressGeneration::new(0),
                 },
             ),
         ]

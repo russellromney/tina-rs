@@ -556,6 +556,7 @@ fn accepted_send_can_become_message_abandoned_when_target_stops_in_the_same_roun
                 RuntimeEventKind::SendDispatchAttempted {
                     target_shard: ShardId::new(3),
                     target_isolate: target_address.isolate(),
+                    target_generation: target_address.generation(),
                 },
             ),
             RuntimeEvent::new(
@@ -566,6 +567,7 @@ fn accepted_send_can_become_message_abandoned_when_target_stops_in_the_same_roun
                 RuntimeEventKind::SendAccepted {
                     target_shard: ShardId::new(3),
                     target_isolate: target_address.isolate(),
+                    target_generation: target_address.generation(),
                 },
             ),
             RuntimeEvent::new(
@@ -646,6 +648,7 @@ fn sends_after_stop_still_become_closed() {
             RuntimeEventKind::SendRejected {
                 target_shard: ShardId::new(3),
                 target_isolate: target_address.isolate(),
+                target_generation: target_address.generation(),
                 reason: tina_runtime_current::SendRejectedReason::Closed,
             },
         ))

@@ -30,8 +30,8 @@ use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId,
-    TrySendError,
+    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard,
+    ShardId, TrySendError,
 };
 
 /// Stable identifier for one runtime event in a deterministic trace.
@@ -136,6 +136,9 @@ pub enum RuntimeEventKind {
 
         /// The destination isolate on that shard.
         target_isolate: IsolateId,
+
+        /// The destination generation for that isolate.
+        target_generation: AddressGeneration,
     },
 
     /// The runtime accepted a local send into the target mailbox.
@@ -145,6 +148,9 @@ pub enum RuntimeEventKind {
 
         /// The destination isolate on that shard.
         target_isolate: IsolateId,
+
+        /// The destination generation for that isolate.
+        target_generation: AddressGeneration,
     },
 
     /// The runtime rejected a local send.
@@ -154,6 +160,9 @@ pub enum RuntimeEventKind {
 
         /// The destination isolate on that shard.
         target_isolate: IsolateId,
+
+        /// The destination generation for that isolate.
+        target_generation: AddressGeneration,
 
         /// Why the target mailbox rejected the send.
         reason: SendRejectedReason,
@@ -442,7 +451,7 @@ where
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
-        let isolate_id = self.register_entry::<I, Outbound>(
+        let address = self.register_entry::<I, Outbound>(
             isolate,
             None,
             Box::new(MailboxAdapter::<M, I::Message> {
@@ -451,7 +460,7 @@ where
             }),
         );
 
-        self.shard.address(isolate_id)
+        Address::new_with_generation(self.shard.id(), address.isolate, address.generation)
     }
 
     /// Attempts to enqueue a typed message into one registered isolate.
@@ -483,6 +492,10 @@ where
                 address.shard().get(),
             );
         };
+
+        if entry.generation != address.generation() {
+            return Err(TrySendError::Closed(message));
+        }
 
         match entry.mailbox.try_send_boxed(Box::new(message)) {
             Ok(()) => Ok(()),
@@ -569,12 +582,14 @@ where
                 ErasedEffect::Send(send) => {
                     let target_shard = send.target_shard;
                     let target_isolate = send.target_isolate;
+                    let target_generation = send.target_generation;
                     let attempted = self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
                         RuntimeEventKind::SendDispatchAttempted {
                             target_shard,
                             target_isolate,
+                            target_generation,
                         },
                     );
 
@@ -586,16 +601,18 @@ where
                                 RuntimeEventKind::SendAccepted {
                                     target_shard,
                                     target_isolate,
+                                    target_generation,
                                 },
                             );
                         }
-                        Err((target_shard, target_isolate, reason)) => {
+                        Err((target_shard, target_isolate, target_generation, reason)) => {
                             self.push_event(
                                 isolate_id,
                                 Some(attempted.into()),
                                 RuntimeEventKind::SendRejected {
                                     target_shard,
                                     target_isolate,
+                                    target_generation,
                                     reason,
                                 },
                             );
@@ -603,11 +620,13 @@ where
                     }
                 }
                 ErasedEffect::Spawn(spawn) => {
-                    let child_isolate = spawn.spawn(self, isolate_id);
+                    let child_address = spawn.spawn(self, isolate_id);
                     self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
-                        RuntimeEventKind::Spawned { child_isolate },
+                        RuntimeEventKind::Spawned {
+                            child_isolate: child_address.isolate,
+                        },
                     );
                 }
                 ErasedEffect::Noop | ErasedEffect::Reply | ErasedEffect::RestartChildren => {
@@ -658,7 +677,7 @@ where
     fn dispatch_local_send(
         &self,
         send: ErasedSend,
-    ) -> Result<(), (ShardId, IsolateId, SendRejectedReason)> {
+    ) -> Result<(), (ShardId, IsolateId, AddressGeneration, SendRejectedReason)> {
         if send.target_shard != self.shard.id() {
             panic!(
                 "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",
@@ -679,6 +698,15 @@ where
             );
         };
 
+        if entry.generation != send.target_generation {
+            return Err((
+                send.target_shard,
+                send.target_isolate,
+                send.target_generation,
+                SendRejectedReason::Closed,
+            ));
+        }
+
         entry
             .mailbox
             .try_send_boxed(send.message)
@@ -686,11 +714,13 @@ where
                 TrySendError::Full(_) => (
                     send.target_shard,
                     send.target_isolate,
+                    send.target_generation,
                     SendRejectedReason::Full,
                 ),
                 TrySendError::Closed(_) => (
                     send.target_shard,
                     send.target_isolate,
+                    send.target_generation,
                     SendRejectedReason::Closed,
                 ),
             })
@@ -701,7 +731,7 @@ where
         isolate: I,
         parent: Option<IsolateId>,
         mailbox: Box<dyn ErasedMailbox>,
-    ) -> IsolateId
+    ) -> RegisteredAddress
     where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
@@ -710,9 +740,11 @@ where
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
         self.next_isolate_id += 1;
+        let generation = AddressGeneration::new(0);
 
         self.entries.push(RegisteredEntry {
             id: isolate_id,
+            generation,
             parent,
             stopped: Cell::new(false),
             mailbox,
@@ -722,7 +754,10 @@ where
             })),
         });
 
-        isolate_id
+        RegisteredAddress {
+            isolate: isolate_id,
+            generation,
+        }
     }
 
     fn spawn_isolate<I, Outbound>(
@@ -730,7 +765,7 @@ where
         parent: IsolateId,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> IsolateId
+    ) -> RegisteredAddress
     where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
@@ -871,6 +906,12 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegisteredAddress {
+    isolate: IsolateId,
+    generation: AddressGeneration,
+}
+
 trait ErasedHandler<S, F>
 where
     S: Shard,
@@ -889,7 +930,11 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> IsolateId;
+    fn spawn(
+        self: Box<Self>,
+        runtime: &mut CurrentRuntime<S, F>,
+        parent: IsolateId,
+    ) -> RegisteredAddress;
 }
 
 trait IntoErasedSpawn<S, F>
@@ -940,6 +985,7 @@ where
                 ErasedEffect::Send(ErasedSend {
                     target_shard: destination.shard(),
                     target_isolate: destination.isolate(),
+                    target_generation: destination.generation(),
                     message: Box::new(message),
                 })
             }
@@ -956,6 +1002,7 @@ where
     F: MailboxFactory,
 {
     id: IsolateId,
+    generation: AddressGeneration,
     #[cfg_attr(not(test), allow(dead_code))]
     parent: Option<IsolateId>,
     stopped: Cell<bool>,
@@ -996,6 +1043,7 @@ where
 struct ErasedSend {
     target_shard: ShardId,
     target_isolate: IsolateId,
+    target_generation: AddressGeneration,
     message: Box<dyn Any>,
 }
 
@@ -1027,7 +1075,11 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> IsolateId {
+    fn spawn(
+        self: Box<Self>,
+        runtime: &mut CurrentRuntime<S, F>,
+        parent: IsolateId,
+    ) -> RegisteredAddress {
         runtime.spawn_isolate::<I, Outbound>(parent, self.isolate, self.mailbox_capacity)
     }
 }

@@ -302,6 +302,7 @@ fn accepted_local_send_runs_target_on_a_later_step_and_records_trace() {
                 RuntimeEventKind::SendDispatchAttempted {
                     target_shard: ShardId::new(3),
                     target_isolate: audit_address.isolate(),
+                    target_generation: audit_address.generation(),
                 },
             ),
             RuntimeEvent::new(
@@ -312,6 +313,7 @@ fn accepted_local_send_runs_target_on_a_later_step_and_records_trace() {
                 RuntimeEventKind::SendAccepted {
                     target_shard: ShardId::new(3),
                     target_isolate: audit_address.isolate(),
+                    target_generation: audit_address.generation(),
                 },
             ),
             RuntimeEvent::new(
@@ -395,6 +397,7 @@ fn rejected_local_send_is_traced_and_not_silently_buffered() {
             RuntimeEventKind::SendRejected {
                 target_shard: ShardId::new(3),
                 target_isolate: audit_address.isolate(),
+                target_generation: audit_address.generation(),
                 reason: SendRejectedReason::Full,
             },
         ))

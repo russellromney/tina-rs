@@ -456,15 +456,21 @@ where
     }
 }
 
-/// Typed address for an isolate mailbox.
+/// Typed address for one isolate mailbox incarnation.
 ///
 /// The message type parameter makes invalid sends unrepresentable at the call
 /// site: an `Address<HttpMsg>` cannot be used where `Address<AuditMsg>` is
 /// required.
+///
+/// An address identifies one incarnation of an isolate: shard id, isolate id,
+/// and generation. Runtime-issued addresses should be preferred for real
+/// delivery. Manually constructed addresses are useful in tests and examples,
+/// but may be stale or unknown to a runtime.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address<M> {
     shard: ShardId,
     isolate: IsolateId,
+    generation: AddressGeneration,
     marker: PhantomData<fn(M) -> M>,
 }
 
@@ -477,11 +483,21 @@ impl<M> Clone for Address<M> {
 }
 
 impl<M> Address<M> {
-    /// Creates a new typed address from a shard and isolate identifier.
+    /// Creates a new typed address for the initial generation.
     pub const fn new(shard: ShardId, isolate: IsolateId) -> Self {
+        Self::new_with_generation(shard, isolate, AddressGeneration::new(0))
+    }
+
+    /// Creates a new typed address from shard, isolate, and generation.
+    pub const fn new_with_generation(
+        shard: ShardId,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+    ) -> Self {
         Self {
             shard,
             isolate,
+            generation,
             marker: PhantomData,
         }
     }
@@ -494,6 +510,11 @@ impl<M> Address<M> {
     /// Returns the isolate identifier on the owning shard.
     pub const fn isolate(self) -> IsolateId {
         self.isolate
+    }
+
+    /// Returns the isolate generation this address targets.
+    pub const fn generation(self) -> AddressGeneration {
+        self.generation
     }
 }
 
@@ -620,6 +641,26 @@ impl IsolateId {
     }
 
     /// Returns the raw isolate identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Generation for one isolate identifier.
+///
+/// The initial generation is `AddressGeneration::new(0)`. Runtime crates can
+/// use later generations to reject stale addresses if an isolate identifier is
+/// ever reused for a replacement incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressGeneration(u64);
+
+impl AddressGeneration {
+    /// Creates an address generation from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw generation identifier.
     pub const fn get(self) -> u64 {
         self.0
     }
