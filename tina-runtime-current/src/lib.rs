@@ -444,6 +444,7 @@ where
     {
         let isolate_id = self.register_entry::<I, Outbound>(
             isolate,
+            None,
             Box::new(MailboxAdapter::<M, I::Message> {
                 mailbox,
                 marker: PhantomData,
@@ -602,7 +603,7 @@ where
                     }
                 }
                 ErasedEffect::Spawn(spawn) => {
-                    let child_isolate = spawn.spawn(self);
+                    let child_isolate = spawn.spawn(self, isolate_id);
                     self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
@@ -698,6 +699,7 @@ where
     fn register_entry<I, Outbound>(
         &mut self,
         isolate: I,
+        parent: Option<IsolateId>,
         mailbox: Box<dyn ErasedMailbox>,
     ) -> IsolateId
     where
@@ -711,6 +713,7 @@ where
 
         self.entries.push(RegisteredEntry {
             id: isolate_id,
+            parent,
             stopped: Cell::new(false),
             mailbox,
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
@@ -722,7 +725,12 @@ where
         isolate_id
     }
 
-    fn spawn_isolate<I, Outbound>(&mut self, isolate: I, mailbox_capacity: usize) -> IsolateId
+    fn spawn_isolate<I, Outbound>(
+        &mut self,
+        parent: IsolateId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> IsolateId
     where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
@@ -735,11 +743,21 @@ where
 
         self.register_entry::<I, Outbound>(
             isolate,
+            Some(parent),
             Box::new(DynMailboxAdapter::<I::Message> {
                 mailbox: self.mailbox_factory.create::<I::Message>(mailbox_capacity),
                 marker: PhantomData,
             }),
         )
+    }
+
+    /// Returns the stored direct-parent lineage in registration order.
+    #[cfg(test)]
+    pub(crate) fn lineage_snapshot(&self) -> Vec<(IsolateId, Option<IsolateId>)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.id, entry.parent))
+            .collect()
     }
 }
 
@@ -871,7 +889,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>) -> IsolateId;
+    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> IsolateId;
 }
 
 trait IntoErasedSpawn<S, F>
@@ -938,6 +956,8 @@ where
     F: MailboxFactory,
 {
     id: IsolateId,
+    #[cfg_attr(not(test), allow(dead_code))]
+    parent: Option<IsolateId>,
     stopped: Cell<bool>,
     mailbox: Box<dyn ErasedMailbox>,
     handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
@@ -1007,8 +1027,8 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>) -> IsolateId {
-        runtime.spawn_isolate::<I, Outbound>(self.isolate, self.mailbox_capacity)
+    fn spawn(self: Box<Self>, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> IsolateId {
+        runtime.spawn_isolate::<I, Outbound>(parent, self.isolate, self.mailbox_capacity)
     }
 }
 
@@ -1028,5 +1048,324 @@ where
             mailbox_capacity,
             marker: PhantomData,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NeverOutbound {}
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LineageMsg {
+        SpawnChild,
+        SpawnGrandchild,
+        Stop,
+        Panic,
+        Restart,
+    }
+
+    #[derive(Debug, Default)]
+    struct TestShard;
+
+    impl Shard for TestShard {
+        fn id(&self) -> ShardId {
+            ShardId::new(3)
+        }
+    }
+
+    struct TestMailbox<T> {
+        capacity: usize,
+        queue: Rc<RefCell<VecDeque<T>>>,
+        closed: Rc<Cell<bool>>,
+    }
+
+    impl<T> TestMailbox<T> {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                queue: Rc::new(RefCell::new(VecDeque::new())),
+                closed: Rc::new(Cell::new(false)),
+            }
+        }
+    }
+
+    impl<T> Mailbox<T> for TestMailbox<T> {
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+            if self.closed.get() {
+                return Err(TrySendError::Closed(message));
+            }
+
+            let mut queue = self.queue.borrow_mut();
+            if queue.len() >= self.capacity {
+                return Err(TrySendError::Full(message));
+            }
+
+            queue.push_back(message);
+            Ok(())
+        }
+
+        fn recv(&self) -> Option<T> {
+            self.queue.borrow_mut().pop_front()
+        }
+
+        fn close(&self) {
+            self.closed.set(true);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestMailboxFactory;
+
+    impl MailboxFactory for TestMailboxFactory {
+        fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+            Box::new(TestMailbox::new(capacity))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RootIsolate {
+        child_capacity: usize,
+    }
+
+    #[derive(Debug)]
+    struct ChildIsolate {
+        leaf_capacity: usize,
+    }
+
+    #[derive(Debug)]
+    struct LeafIsolate;
+
+    impl Isolate for RootIsolate {
+        type Message = LineageMsg;
+        type Reply = ();
+        type Send = SendMessage<NeverOutbound>;
+        type Spawn = tina::SpawnSpec<ChildIsolate>;
+        type Shard = TestShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                LineageMsg::SpawnChild => Effect::Spawn(tina::SpawnSpec::new(
+                    ChildIsolate {
+                        leaf_capacity: self.child_capacity,
+                    },
+                    self.child_capacity,
+                )),
+                LineageMsg::Stop => Effect::Stop,
+                LineageMsg::Panic => panic!("panic inside root lineage isolate"),
+                LineageMsg::Restart => Effect::RestartChildren,
+                LineageMsg::SpawnGrandchild => Effect::Noop,
+            }
+        }
+    }
+
+    impl Isolate for ChildIsolate {
+        type Message = LineageMsg;
+        type Reply = ();
+        type Send = SendMessage<NeverOutbound>;
+        type Spawn = tina::SpawnSpec<LeafIsolate>;
+        type Shard = TestShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                LineageMsg::SpawnGrandchild => {
+                    Effect::Spawn(tina::SpawnSpec::new(LeafIsolate, self.leaf_capacity))
+                }
+                LineageMsg::Stop => Effect::Stop,
+                LineageMsg::Panic => panic!("panic inside child lineage isolate"),
+                LineageMsg::Restart => Effect::RestartChildren,
+                LineageMsg::SpawnChild => Effect::Noop,
+            }
+        }
+    }
+
+    impl Isolate for LeafIsolate {
+        type Message = LineageMsg;
+        type Reply = ();
+        type Send = SendMessage<NeverOutbound>;
+        type Spawn = std::convert::Infallible;
+        type Shard = TestShard;
+
+        fn handle(
+            &mut self,
+            _msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            Effect::Noop
+        }
+    }
+
+    fn new_root() -> RootIsolate {
+        RootIsolate { child_capacity: 2 }
+    }
+
+    fn root_mailbox() -> TestMailbox<LineageMsg> {
+        TestMailbox::new(8)
+    }
+
+    fn assert_root_and_child_lineage(
+        runtime: &CurrentRuntime<TestShard, TestMailboxFactory>,
+        root: Address<LineageMsg>,
+        child: IsolateId,
+    ) {
+        assert_eq!(
+            runtime.lineage_snapshot(),
+            vec![(root.isolate(), None), (child, Some(root.isolate()))]
+        );
+    }
+
+    fn assert_root_child_grandchild_lineage(
+        runtime: &CurrentRuntime<TestShard, TestMailboxFactory>,
+        root: Address<LineageMsg>,
+        child: IsolateId,
+        grandchild: IsolateId,
+    ) {
+        assert_eq!(
+            runtime.lineage_snapshot(),
+            vec![
+                (root.isolate(), None),
+                (child, Some(root.isolate())),
+                (grandchild, Some(child)),
+            ]
+        );
+    }
+
+    fn lineage_address(isolate: IsolateId) -> Address<LineageMsg> {
+        Address::new(ShardId::new(3), isolate)
+    }
+
+    fn last_spawned_child(trace: &[RuntimeEvent]) -> IsolateId {
+        match trace.last().expect("expected spawn event").kind() {
+            RuntimeEventKind::Spawned { child_isolate } => child_isolate,
+            other => panic!("expected Spawned event, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_registered_isolates_have_no_parent() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+
+        let first = runtime.register(new_root(), root_mailbox());
+        let second = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(
+            runtime.lineage_snapshot(),
+            vec![(first.isolate(), None), (second.isolate(), None)]
+        );
+    }
+
+    #[test]
+    fn nested_spawns_record_direct_parent_edges() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_root_and_child_lineage(&runtime, root, child);
+
+        assert_eq!(
+            runtime.try_send(lineage_address(child), LineageMsg::SpawnGrandchild),
+            Ok(())
+        );
+        assert_eq!(runtime.step(), 1);
+        let grandchild = last_spawned_child(runtime.trace());
+
+        assert_root_child_grandchild_lineage(&runtime, root, child, grandchild);
+    }
+
+    #[test]
+    fn child_lineage_survives_when_parent_stops() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Stop), Ok(()));
+        assert_eq!(runtime.step(), 1);
+
+        assert_root_and_child_lineage(&runtime, root, child);
+    }
+
+    #[test]
+    fn child_lineage_survives_when_parent_panics() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Panic), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        assert!(
+            runtime
+                .trace()
+                .iter()
+                .any(|event| matches!(event.kind(), RuntimeEventKind::HandlerPanicked))
+        );
+
+        assert_root_and_child_lineage(&runtime, root, child);
+    }
+
+    #[test]
+    fn restart_children_remains_observed_only_after_lineage_lands() {
+        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let root = runtime.register(new_root(), root_mailbox());
+
+        assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(runtime.lineage_snapshot(), vec![(root.isolate(), None)]);
+        assert!(matches!(
+            runtime.trace().last().map(|event| event.kind()),
+            Some(RuntimeEventKind::EffectObserved {
+                effect: EffectKind::RestartChildren,
+            })
+        ));
+    }
+
+    #[test]
+    fn identical_runs_produce_identical_trace_and_lineage() {
+        fn run_once() -> (Vec<RuntimeEvent>, Vec<(IsolateId, Option<IsolateId>)>) {
+            let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+            let root = runtime.register(new_root(), root_mailbox());
+
+            assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+            assert_eq!(runtime.step(), 1);
+            let child = last_spawned_child(runtime.trace());
+
+            assert_eq!(
+                runtime.try_send(lineage_address(child), LineageMsg::SpawnGrandchild),
+                Ok(())
+            );
+            assert_eq!(runtime.step(), 1);
+            let grandchild = last_spawned_child(runtime.trace());
+
+            assert_root_child_grandchild_lineage(&runtime, root, child, grandchild);
+
+            (runtime.trace().to_vec(), runtime.lineage_snapshot())
+        }
+
+        assert_eq!(run_once(), run_once());
     }
 }
