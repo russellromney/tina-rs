@@ -48,6 +48,11 @@ same-shard send dispatch, local same-shard spawn dispatch, typed runtime
 ingress for sending to registered isolates, and stored direct parent-child
 lineage for spawned children.
 
+`Address<M>` names one isolate incarnation, not a logical service name. Its
+identity includes shard id, isolate id, and generation. Runtime sends and
+runtime ingress reject stale known generations as closed instead of silently
+delivering to a current incarnation.
+
 In `tina-runtime-current`, an accepted message does not disappear silently. It
 is either handled by an isolate or recorded in the trace as abandoned if the
 isolate stops first.

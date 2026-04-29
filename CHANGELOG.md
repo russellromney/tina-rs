@@ -54,3 +54,6 @@ This file records completed work.
 - Added runtime unit tests for direct parent-child lineage, nested spawn edges,
   lineage survival across stop/panic, and the continued observed-only behavior
   of `RestartChildren`.
+- Added address-liveness semantics: `Address<M>` now includes a generation,
+  runtime send traces include target generation, and stale known generations
+  fail visibly as `Closed` instead of targeting a current incarnation.
