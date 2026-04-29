@@ -10,7 +10,7 @@ This repo is a Cargo workspace. Today it has three crates:
 
 - **`tina`** — Trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`, `SendMessage`, `SpawnSpec`. No impls.
 - **`tina-mailbox-spsc`** — Bounded single-producer/single-consumer mailbox crate implementing `tina::Mailbox`.
-- **`tina-runtime-current`** — In-progress deterministic single-shard runtime core with trace events, local send/spawn dispatch, typed ingress, stop-and-abandon behavior, panic capture, and parent-child lineage.
+- **`tina-runtime-current`** — In-progress deterministic single-shard runtime core with trace events, local send/spawn dispatch, typed ingress, stop-and-abandon behavior, panic capture, parent-child lineage, and direct-child restart execution.
 
 The supervisor, simulator, I/O driver, multi-shard runtime, and Tokio bridge come later. See [ROADMAP.md](ROADMAP.md).
 
@@ -103,7 +103,7 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 ## Status
 
-What works today: the trait crate, the bounded SPSC mailbox crate, and an in-progress deterministic single-shard runtime core. You can write isolates against the API, exercise real mailbox semantics, and run handlers through `tina-runtime-current` for local send/spawn/stop/panic-capture scenarios.
+What works today: the trait crate, the bounded SPSC mailbox crate, and an in-progress deterministic single-shard runtime core. You can write isolates against the API, exercise real mailbox semantics, and run handlers through `tina-runtime-current` for local send/spawn/stop/panic-capture/restart scenarios.
 
 What's coming, in order: real supervision and the task-dispatcher proof example; a current-thread Tokio driver plus runtime-owned I/O/timer effects and TCP echo; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
 

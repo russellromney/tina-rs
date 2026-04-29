@@ -281,10 +281,11 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 These still need answers, but a couple now have an explicit phase boundary.
 
 1. **`Effect` shape.** Resolved in Sputnik for the current verbs: use a closed enum with per-isolate associated payload types for `Reply`, `Send`, and `Spawn`. The next design question is how I/O, timers, calls, yields, and crash/restart requests should enter that closed vocabulary without turning handlers into async functions.
-2. **Restart execution semantics.** Address liveness and restartable child
-   records now exist, but `RestartChildren` still needs actual runtime
-   execution semantics, including what happens to non-restartable children and
-   whether child ordinals stay stable across restart.
+2. **Supervisor execution semantics.** Direct `RestartChildren` execution now
+   exists, including non-restartable skip behavior and stable child ordinals.
+   The next supervision design question is how policy, budgets, and child
+   failure detection enter the runtime without making handlers async or
+   reconstructing supervision state from the trace.
 3. **Runtime allocation boundary.** The SPSC mailbox hot path is proven narrowly. The runtime itself still needs an allocation audit before the project repeats "no hidden allocations" as a runtime-level claim.
 4. **Cross-shard ownership.** Tina-Odin's mailboxes are SPSC; cross-shard requires copy-or-move. Investigate whether we can use ownership transfer (move + atomic pointer swap) for zero-copy. If not, accept the copy.
 5. **Supervisor split.** Current plan: policy types may live in `tina` if they are truly shared abstractions; mechanism lives in `tina-supervisor` and does not ship before Mariner.
