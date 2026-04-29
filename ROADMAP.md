@@ -42,6 +42,9 @@ We should prove the discipline in layers, matching the abstraction-vs-implementa
 - **Trait crate (`tina`)** proves API shape and compile-time guarantees only. This is where doc tests, compile-fail tests, and downstream-style integration tests belong.
 - **Mailbox crates** prove concrete queue semantics. This is where FIFO, boundedness, `Full`/`Closed`, and no hidden buffering get tested against real implementations and under loom.
 - **Runtime crates** prove delivery semantics. This is where we can assert that accepted sends become handler invocations, that `Stop` actually stops delivery, and that effect dispatch is the only place side effects happen.
+- Most runtime proofs should stay black-box integration tests, but when a slice
+  proves crate-private runtime state that should not become public API, those
+  proofs may live in `src/lib.rs` unit tests instead of `tests/*.rs`.
 - **Simulator** proves interleavings and replay. This is where we stop trusting timing-sensitive live tests and start proving seeded, reproducible traces.
 
 Live examples matter, but they are smoke tests, not the proof. Every runnable example should be backed by black-box assertions in the crate that owns the implementation being exercised.
