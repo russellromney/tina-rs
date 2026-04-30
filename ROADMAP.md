@@ -18,7 +18,8 @@ The deliverable is a small set of crates (`tina`, `tina-runtime-*`, `tina-sim`) 
 
 - A new runtime competing with Tokio/monoio. Use what exists.
 - Full feature parity with Tina-Odin. We port the *shape*, not every primitive.
-- "Replacing Tokio." This is a discipline layer that rides on top of any thread-per-core runtime.
+- "Replacing Tokio." Tokio may still matter as a bridge or comparison point,
+  but it should not define Tina's core programming model.
 
 ## Crate layout (target shape)
 
@@ -28,7 +29,9 @@ Following the abstraction-vs-implementation rule (capability traits live in thei
 - `tina-mailbox-spsc` — SPSC ring buffer impl
 - `tina-mailbox-mpsc` — MPSC fallback impl
 - `tina-supervisor` — supervision tree mechanism
-- `tina-runtime-current` — single-shard runtime on `tokio::runtime::Builder::new_current_thread`
+- `tina-runtime-current` — single-shard runtime proving Tina semantics on an
+  explicit-step backend, with completion-driven I/O as the intended Mariner
+  direction
 - `tina-runtime-monoio` — multi-shard runtime on monoio (io_uring)
 - `tina-runtime-tokio-bridge` — adapter for adopting tina inside an existing Tokio app
 - `tina-sim` — deterministic simulator
@@ -43,13 +46,14 @@ start from an honest baseline rather than from stale roadmap wording.
 
 | Claim | Current evidence | Still missing |
 |---|---|---|
-| Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `SendMessage`, `SpawnSpec`, and supervision policy types with doc/compile-fail/downstream-style tests. | Request/reply ergonomics and I/O/timer/call effect vocabulary are not designed yet. |
+| Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `SendMessage`, `SpawnSpec`, and supervision policy types with doc/compile-fail/downstream-style tests. | Request/reply ergonomics and the final runtime-owned I/O/timer/call contract are not done yet. |
 | Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. | This is not a full formal proof for every capacity/interleaving/refactor. Cross-shard channel semantics and any future MPSC fallback are not implemented. |
 | Single-shard runtime delivery | `tina-runtime-current` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, supervised panic restart with policy/budget config, an assertion-backed task-dispatcher proof package, and generated-history property tests. | Supervision is still narrow: panic-triggered only, runtime-lifetime budget only, no user-facing supervision guide, and no timed budget windows. The generated-history model is bounded and does not prove arbitrary user programs. |
 | Failure isolation | Unwinding handler panics become runtime events; the panicking isolate stops and the same round continues deterministically. | This is not Tina-Odin's OS trap boundary. Rust segfault isolation, shard quarantine, and `panic = "abort"` behavior are out of scope unless a later phase explicitly designs them. |
 | Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories and small generated dispatcher workloads. Trace replay proofs can reconstruct worker completions and restart outcomes from the runtime event model alone. | There is no seed-driven simulator, virtual time, fault injection, structural checker, or replay artifact yet. |
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. | The runtime currently uses boxed erasure and per-round collection; no broad runtime allocation claim is supported yet. |
-| Reference examples | A Rust task-dispatcher proof package and matching runnable example now exist, backed by assertions rather than logs alone. | The TCP echo example still needs a Rust equivalent backed by assertions. |
+| Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof drives one client connection end-to-end through a Betelgeuse-backed runtime on nightly Rust. | The TCP echo proof drives one client connection; multi-connection workloads still need an ingress-driven re-arm shape. |
+| Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`). `tina-runtime-current` executes the first TCP call family — bind, accept, read, write, close — through Betelgeuse on nightly Rust, with caller-owned typed completion slots, runtime-assigned opaque resource ids, and runtime-controlled completion translation back into ordinary `Message` values. | Runtime-owned ephemeral-port discovery is not implemented (Betelgeuse's `IOSocket` does not expose `local_addr()` on this rev; port-0 binds are rejected as `Unsupported`, and the echo proof/example use concrete high loopback ports). `peer_addr` is omitted from `CallResult::TcpAccepted` for the same reason. Runtime-owned sleep / timer wake is not in this slice; it follows once the call contract grows a verb whose completion the runtime can drive on demand. Multi-connection accept re-arm and the 100k-connection benchmark also remain future work. |
 
 ## Testing and proof strategy
 
@@ -105,7 +109,7 @@ phases.
 | Next phase package | Scope |
 |---|---|
 | **Mariner supervision and dispatcher proof** | Planning bucket covering supervised restart hardening, timed or explicitly deferred restart-budget windows, and a Rust task-dispatcher proof example with trace assertions. Expected to split into multiple IDD slices. |
-| **Mariner I/O, current runtime, and echo** | Planning bucket covering Rust I/O/timer/call effect contract, current-thread Tokio driver, runtime allocation audit or narrowed claims, and TCP echo smoke/benchmark backed by assertions. Expected to split at least into contract, driver, and echo proof slices. |
+| ~~**Mariner I/O, current runtime, and echo**~~ | Delivered as one reviewed package with autonomous internal slices (`.intent/phases/012-mariner-io-current-runtime-and-echo/`). Shipped: runtime-owned call effect family at the `tina` boundary, runtime-owned child bootstrap message on `SpawnSpec` / `RestartableSpawnSpec`, Betelgeuse-backed TCP call family in `tina-runtime-current`, focused call-dispatch tests, assertion-backed TCP echo integration test (with partial-write retry coverage) and runnable `tcp_echo` example. Substrate is Betelgeuse on nightly Rust per the human-anchored plan; runtime-owned sleep / timer wake follows in a later slice once the call contract has a verb whose completion the runtime can drive on demand. |
 | **Voyager deterministic simulation** | Planning bucket covering `tina-sim` with virtual time, domain-isolated PRNG, integer-ratio faults, test-driver isolates, structural/user checkers, failure injection, replay artifacts, and injected-bug proof. Expected to split into multiple IDD slices. |
 | **Gemini single-shard release story** | Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, and a clear single-shard adoption story. |
 | **Galileo multi-shard runtime** | Cross-shard semantics, cross-shard channel, routing/placement, monoio runtime, multi-shard simulation coverage, and honest benchmarks. |
@@ -140,13 +144,19 @@ These should be resolved early enough to avoid rework, but they do not all block
 
 > After: Completed Sputnik and Pioneer work · Before: Phase Voyager
 
-- `tina-runtime-current`: single-shard runtime backed by `tokio::runtime::Builder::new_current_thread`. Pin to one core. Run a poll loop: drain mailboxes → run handlers → dispatch effects.
+- `tina-runtime-current`: single-shard runtime with explicit-step execution.
+  Mariner should prefer a completion-driven backend that keeps progression
+  visible and DST-compatible rather than quietly centering a futures executor.
+  Pin to one core. Run a poll loop: drain mailboxes → run handlers → dispatch
+  effects.
 - `tina-supervisor`: supervisor configuration vocabulary exists; broader reusable supervision mechanism should grow only when multiple runtime crates need it.
 - The effect dispatcher is the **only** place real I/O happens. Handlers return effects; the dispatcher executes them. This is the property that makes deterministic simulation possible later.
 - Continue using the deterministic runtime event trace as the semantic proof surface. The trace records mailbox accept/reject, handler invocation start/end, effect dispatch, stop, spawn, panic, abandonment, and restart events with causal linkage so tests and replay can reason about provenance rather than only timeline order.
 - Build supervision on stored runtime state, not trace reconstruction. Parent-child lineage, restartable child records, address liveness, direct-child restart execution, and supervised panic restart already exist; the remaining supervision work needs hardening and proof examples.
 - A task-dispatcher proof example should land before TCP echo. It mirrors Tina-Odin's "dead worker is not a dead system" example without needing runtime-owned network I/O first.
-- A working TCP echo server isolate (mirroring Tina-Odin's example) lands after the Rust I/O/timer effect contract and current-thread driver exist.
+- A working TCP echo server isolate (mirroring Tina-Odin's example) lands after
+  the Rust I/O/timer effect contract and completion-driven current-thread
+  driver exist.
 - Keep the abstraction boundary strict: `tina-runtime-current` owns scheduling, polling, and effect execution; `tina` must not grow runtime helpers just to make tests easier.
 - Runtime tests should inject a deterministic test mailbox through `Mailbox<T>` where possible. Benchmarks and smoke examples can use the real SPSC crate, but correctness tests should avoid coupling two fresh implementations unless that coupling is the point of the test.
 
@@ -301,7 +311,10 @@ These still need answers, but a couple now have an explicit phase boundary.
 
 ## What we're explicitly *not* doing
 
-- **No new scheduler.** Every phase delegates execution to monoio or current-thread Tokio. The scheduler is solved; we're not solving it again.
+- **No new scheduler.** Tina should ride on existing substrates where
+  practical, but the core programming model should stay explicit-step and
+  completion-driven where that best preserves the design. We are not building a
+  new general-purpose async ecosystem.
 - **No async/await replacement.** Handlers are synchronous functions returning effects. If you want await, you're in the wrong layer.
 - **No global allocator games.** Pre-allocated arenas per isolate, but no `#[global_allocator]` requirements imposed on consumers.
 - **No FFI to Tina-Odin.** Two runtimes fighting for cores would be the worst of both worlds.

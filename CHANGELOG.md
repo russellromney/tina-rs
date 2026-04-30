@@ -81,3 +81,40 @@ This file records completed work.
   replacements from the runtime trace alone.
 - Added focused Miri coverage for the SPSC mailbox unsafe slot paths and a
   `make miri` target.
+- Added a runtime-owned call effect family at the `tina` boundary:
+  `Isolate::Call` associated type and `Effect::Call(I::Call)` variant.
+  Trait surface stays substrate-neutral; concrete request/result
+  vocabulary lives in runtime crates.
+- Added runtime-owned child bootstrap on `SpawnSpec` and
+  `RestartableSpawnSpec` via `with_bootstrap`. The runtime delivers the
+  bootstrap message to the new child immediately after spawn (and after
+  each restart, for restartable specs), so a parent can hand a child its
+  initial kick without test-harness trace introspection.
+- Added `tina-runtime-current`'s first TCP call family on Betelgeuse
+  (nightly Rust): `CurrentCall<M>` carrying a translator from `CallResult`
+  back to `I::Message`, plus `CallRequest` covering TCP listener bind,
+  accept, stream read, stream write, listener close, and stream close.
+  Resources are runtime-assigned opaque ids; raw sockets never escape
+  into isolate state.
+- Added a Betelgeuse-backed I/O backend in `tina-runtime-current`:
+  caller-owned typed completion slots, synchronous Betelgeuse ops
+  (bind / close) finish during dispatch, async ops (accept / recv / send)
+  stay in a pending list until their slot has a result, all driven from
+  `CurrentRuntime::step()` synchronously.
+- Pinned tina-rs to nightly Rust via `rust-toolchain.toml` so the Betelgeuse
+  substrate's `allocator_api` feature is available; the gate is scoped to
+  `tina-runtime-current` via a crate-level `#![feature(allocator_api)]`.
+- Added new runtime trace event kinds for call dispatch attempt, call
+  completion, call failure, and rejected-on-stop completion delivery.
+- Added focused tests for the call effect path covering invalid resource
+  ids and call-id monotonicity, plus a "no call effect" compile-only smoke
+  test that shows existing isolates remain ergonomic with
+  `type Call = Infallible`.
+- Added an assertion-backed live `tcp_echo` integration test: listener
+  isolate supervises a restartable connection-handler child spawned via
+  `RestartableSpawnSpec::with_bootstrap`; bytes round-trip end-to-end on
+  a concrete high loopback port; trace evidence is asserted per call kind.
+  A separate unit test proves the connection isolate's partial-write retry
+  logic.
+- Added a runnable `tcp_echo` example mirroring the tested workload with
+  inline assertions on echoed payloads.

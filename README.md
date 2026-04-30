@@ -106,7 +106,12 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 What works today: the trait crate, the bounded SPSC mailbox crate, supervisor configuration, and an in-progress deterministic single-shard runtime core. You can write isolates against the API, exercise real mailbox semantics, and run handlers through `tina-runtime-current` for local send/spawn/stop/panic-capture/restart/supervised-panic scenarios.
 
-What's coming, in order: broader supervision hardening and the task-dispatcher proof example; a current-thread Tokio driver plus runtime-owned I/O/timer effects and TCP echo; a deterministic simulator; a multi-shard runtime backed by monoio; and finally an adapter that lets a tina isolate run inside an existing Tokio app, so codebases can adopt the discipline incrementally.
+What's coming, in order: runtime-owned I/O on a Betelgeuse-backed explicit
+completion-driven current-thread backend, backed by a TCP echo proof; then
+runtime-owned timers; then a deterministic simulator; then a multi-shard
+runtime; and finally an adapter that lets a tina isolate run inside an
+existing Tokio app, so codebases can adopt the discipline incrementally
+without making Tokio the core model.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 

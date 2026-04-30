@@ -54,11 +54,51 @@ for spawned children, restartable child records, and direct-child
 `RestartChildren` execution. It can also apply configured supervisor policy and
 runtime-lifetime budget state when a direct child handler panics.
 
+`tina` now also names a runtime-owned call effect family
+(`Effect::Call(I::Call)` plus the `Isolate::Call` associated type). The trait
+crate stays substrate-neutral: concrete request and result vocabulary live
+in runtime crates. Completion is delivered as an ordinary later `Message`
+via a translator carried inside the call payload, never as a second public
+handler entry point.
+
+`tina-runtime-current` ships the first TCP call family on Betelgeuse
+(nightly Rust): TCP listener bind, accept, stream read, stream write,
+listener and stream close. Resources are runtime-owned opaque ids; raw
+sockets never escape into isolate state. `step()` stays synchronous: the
+runtime drives the Betelgeuse loop forward at the start of each step,
+harvests completed operations from caller-owned typed completion slots,
+runs the per-call translator, and enqueues the resulting `Message` in the
+requesting isolate's mailbox. Synchronous Betelgeuse ops (bind, close)
+complete inline during dispatch; async ops (accept, recv, send) stay in a
+pending list until their slot has a result.
+
+Runtime-owned sleep/timer wake remains a goal for the broader project but
+is not in the first TCP-first call family; it will arrive once the call
+contract grows a verb whose completion the runtime can drive on demand.
+
+`SpawnSpec` and `RestartableSpawnSpec` now carry an optional bootstrap
+message that the runtime delivers to the new child immediately after spawn
+(and after each restart, for restartable specs). This is what lets a
+listener isolate spawn a connection-handler child with its initial
+`Start` kick without forcing the test harness to peek at trace events.
+
 The repo now also has an assertion-backed task-dispatcher proof workload and a
 matching runnable example. They show the current reference shape for supervised
 work: clients send tasks to a dispatcher isolate, the dispatcher asks a small
 registry isolate for the current worker address, and later work can continue
 through replacement workers after a panic.
+
+A live TCP echo proof and matching runnable example exist for the call
+effect path: a listener isolate is the supervised parent that issues bind
+and accept calls, and each accepted connection becomes a restartable
+connection-handler child that issues read / write / close calls. The
+listener spawns the connection child via
+`RestartableSpawnSpec::with_bootstrap`, so the connection's first read
+fires through the normal handler pipeline rather than via test-harness
+trace introspection. The proof binds to a concrete high loopback port and
+asserts on echoed bytes plus call-path trace evidence for every call kind
+on the path. The connection isolate honors partial writes through a small
+pending-buffer + drain pattern, exercised by a separate unit test.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may be the direct cause of many later events.
@@ -84,7 +124,10 @@ Those tests do not just run live histories twice; they also replay the runtime
 trace and prove the trace can recover the same worker completions and restart
 outcomes that the live workload observed.
 
-There is not yet a simulator or Tokio bridge.
+There is not yet a simulator or Tokio bridge. The runtime-owned call
+contract is substrate-neutral by design so a future deterministic
+simulator (Voyager) can implement the same vocabulary against virtual
+time and controllable completion ordering without redefining `tina`.
 
 ## Crate boundaries that must not drift
 
