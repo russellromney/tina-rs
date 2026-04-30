@@ -113,9 +113,9 @@ This file records completed work.
 - Added an assertion-backed live `tcp_echo` integration test: listener
   isolate supervises a restartable connection-handler child spawned via
   `RestartableSpawnSpec::with_bootstrap`; bytes round-trip end-to-end on
-  a test-selected concrete loopback port; trace evidence is asserted per
+  `127.0.0.1:0` with the runtime reporting the actual bound address; trace evidence is asserted per
   call kind. Separate unit tests prove the connection isolate's
   partial-write retry logic and the `CallCompletionRejected{RequesterClosed}`
-  path for a pending `TcpAccept`.
+  path for a pending `TcpAccept`, plus accepted-stream `peer_addr` reporting.
 - Added a runnable `tcp_echo` example mirroring the tested workload with
   inline assertions on echoed payloads.
