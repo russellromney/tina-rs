@@ -38,8 +38,8 @@ detail one-for-one.
 
 ## Current shipped surface
 
-Today the repo ships `tina`, `tina-mailbox-spsc`, `tina-supervisor`, and
-`tina-runtime-current`.
+Today the repo ships `tina`, `tina-mailbox-spsc`, `tina-supervisor`,
+`tina-runtime-current`, and `tina-sim`.
 
 `tina` provides the shared words and types, including supervision policy types.
 
@@ -143,9 +143,17 @@ trace and prove the trace can recover the same worker completions and restart
 outcomes that the live workload observed.
 
 There is not yet a simulator or Tokio bridge. The runtime-owned call
-contract is substrate-neutral by design so a future deterministic
-simulator (Voyager) can implement the same vocabulary against virtual
-time and controllable completion ordering without redefining `tina`.
+contract is substrate-neutral by design so the first deterministic
+simulator slice (`tina-sim`) can implement the same vocabulary against
+virtual time and replay without redefining `tina`.
+
+`tina-sim` is intentionally still narrower than the live runtime. Today
+it is a single-shard virtual-time simulator for the shipped
+`Sleep { after }` / `TimerFired` call contract. It reuses the live
+runtime event vocabulary, captures replay artifacts containing
+config/event-record/final-virtual-time, and proves a timer-driven
+retry/backoff workload under virtual time. It does not simulate TCP,
+spawn, supervision, faults, or multi-shard semantics yet.
 
 ## Crate boundaries that must not drift
 

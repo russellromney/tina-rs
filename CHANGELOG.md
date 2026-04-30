@@ -150,3 +150,21 @@ This file records completed work.
   retried attempt.
 - Added a public-path integration test for the same retry/backoff shape, using
   the shipped monotonic clock rather than the crate-private manual clock seam.
+
+### Phase Voyager
+
+- Added `tina-sim`, the first Voyager simulator crate.
+- Added a single-shard virtual-time execution model with deterministic
+  event recording against the shipped `tina-runtime-current` event
+  vocabulary.
+- Added simulator support for the shipped timer call family:
+  `CallRequest::Sleep { after }` and `CallResult::TimerFired`.
+- Added replay artifacts containing simulator config, final virtual time,
+  and the reproducible event record for one run.
+- Added timer-semantics proofs in `tina-sim` covering no-early-wake,
+  one-shot wake, different-deadline ordering, equal-deadline request-order
+  tie-break, stopped-requester completion rejection, and repeated
+  same-config event-record reproduction.
+- Added a simulator-backed retry/backoff proof workload and a replay test
+  proving that rerunning from the saved config reproduces the same event
+  record exactly.
