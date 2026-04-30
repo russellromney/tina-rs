@@ -429,3 +429,220 @@ Implementation note:
 - Trace branching from slice 009 holds; this slice only deepens the tree while
   preserving single-cause-per-event.
 - No `tina` trait crate changes were needed.
+
+---
+
+## Round 5: Implementation Review
+
+Artifacts reviewed (all committed in `99ba928` and `31f97c0`):
+
+- `tina-supervisor/` (new crate, 36 lines src/lib.rs + 19 lines
+  tests/supervisor_config.rs)
+- `tina-runtime-current/src/lib.rs` (+634 lines: 2 new
+  `RuntimeEventKind` variants, `SupervisionRejectedReason` enum,
+  `supervisors: Vec<SupervisorRecord>` field,
+  `CurrentRuntime::supervise(...)`, `supervise_panic` helper,
+  `checked_registered_address` validator, 10 new unit tests)
+- `tina-runtime-current/tests/runtime_properties.rs` (+67 lines:
+  supervised parent/child fixtures, `EnqueueChildPanic` operation,
+  `assert_supervisor_triggers_have_visible_outcomes`, new property
+  test)
+- `.intent/SYSTEM.md` (refreshed to record the supervisor crate, the
+  trace-tree-arbitrary-depth invariant from slice 009, and the
+  supervised-restart-on-panic capability)
+- `make verify`: green (26 runtime unit tests + 6 runtime_properties +
+  2 supervisor_config + 8 spawn + 7 stop + 7 panic + 7 address-
+  liveness + 7 send + 5 trace-core + 5 sputnik + 7 supervision_policy
+  + 5 spsc + 4 loom + 4 drop + 2 alloc + 3 miri + clippy + docs)
+
+### Headline
+
+Slice 010 is correct. Already committed and the slice is closed.
+
+All five human-escalation decisions implemented as approved. All
+seven agent-resolvable findings folded. The trace tree branching
+from slice 009 deepens correctly; single-cause-per-event preserved.
+SYSTEM.md updated to record the new invariants. No human-
+escalation findings remain in this implementation.
+
+### Findings
+
+- **F1.** All five Round 1/2 human-escalation decisions land in
+  code as recommended:
+  - **Unknown / stale / cross-shard parent** (Decision 1):
+    `checked_registered_address` panics with descriptive messages.
+    Verified by `supervise_panics_for_unknown_stale_or_cross_-
+    shard_parent_addresses` test.
+  - **Reconfigure resets budget** (Decision 2): `supervise()`
+    line 626-634 finds existing supervisor for the same parent
+    and overwrites both `config` and `budget_state` (calls
+    `config.budget().tracker()` for fresh state). Verified by
+    `supervise_before_children_and_reconfigure_reset_budget_-
+    are_supported`.
+  - **Per-failure-response budget** (Decision 3):
+    `budget_state.record_restart()` is called once per
+    `supervise_panic` invocation, before the policy walk. One
+    failure consumes one budget unit regardless of how many
+    children the policy selects. Verified by
+    `supervised_restart_budget_exhaustion_is_visible_and_creates_-
+    no_replacement` (uses one-for-all + budget=2 to prove a
+    multi-replacement restart still consumes exactly one unit).
+  - **Policy-excluded children silent** (Decision 4): the
+    `selected` filter at line 928-940 keeps only ordinals where
+    `policy.restarts(relation)` returns true; excluded children
+    get no `RestartChildAttempted` or other event. The trace
+    consumer derives exclusion from `policy + failed_ordinal +
+    child_record_order`, exactly as the spec said.
+  - **`HandlerPanicked` → `SupervisorRestartTriggered`**
+    (Decision 5): the `cause` argument threaded into
+    `supervise_panic` is the `HandlerPanicked` event ID; the
+    triggered event uses it as `caused_by`. Sibling of
+    `IsolateStopped`, not chained after it.
+
+- **F2.** All seven agent-resolvable items folded. Verified
+  spot-checks:
+  - `tina-supervisor` crate: 36 lines, only `SupervisorConfig`.
+    Future supervision mechanism reserved for the crate.
+  - `SupervisorConfig::policy()` and `budget()`: take `&self`,
+    matching Round 2 N1.
+  - `supervise()` before children: tested in
+    `supervise_before_children_and_reconfigure_reset_budget_-
+    are_supported`.
+  - SYSTEM.md: explicitly states "trace is a deterministically
+    ordered causal tree" + "one event may be the direct cause of
+    many later events." This is the slice 009 invariant carried
+    forward and made durable.
+  - SYSTEM.md: also adds "It can also apply configured supervisor
+    policy and runtime-lifetime budget state when a direct child
+    handler panics." Slice 010 is now part of the system
+    baseline.
+
+- **F3.** The `supervise_panic` execution sequence is clean and
+  reads top-down:
+  1. find failed child's record index (return early if no record
+     — root isolate or unrecorded child)
+  2. get parent and failed_ordinal from the record
+  3. find supervisor record for parent (return early if none)
+  4. check if supervisor is stopped → emit `SupervisorRestartRejected
+     { SupervisorStopped }` and return
+  5. attempt budget consumption → on Err: emit `SupervisorRestartRejected
+     { BudgetExceeded }` and return
+  6. write back updated budget state
+  7. emit `SupervisorRestartTriggered`
+  8. filter child_records by parent + policy → collect indices
+  9. call slice 009's `restart_child_record` for each selected
+     index
+  No backwards branches, no shared mutable state across steps.
+
+- **F4. Test coverage is comprehensive (10 new unit tests + 1
+  property test).** Each policy variant gets its own test
+  (`one_for_one`, `one_for_all`, `rest_for_one`); both rejection
+  paths (`stopped_supervisor`, `budget_exhaustion`) get tests;
+  negative cases (`unsupervised_child_panic`, `normal_child_stop`)
+  are tested together; the configuration API gets its own test
+  (`supervise_before_children_and_reconfigure_reset_budget`); the
+  programmer-error panic path gets its own test
+  (`supervise_panics_for_...`); the non-restartable-skip path is
+  tested explicitly. Plus the property test catches generated-
+  history shapes.
+
+- **F5. Manual `Effect::RestartChildren` semantics are
+  preserved.** No supervisor consultation in
+  `restart_direct_children`. The two triggers (manual and
+  supervised) share `restart_child_record` for per-child
+  execution, but the trigger paths are separate. Verified by
+  `unsupervised_child_panic_and_normal_child_stop_do_not_trigger_-
+  supervision`.
+
+### Negative findings
+
+Judgment: nothing material.
+
+The two small things I might have flagged as agent-resolvable
+bookkeeping were already addressed:
+- The `Box → Rc` recipe storage from slice 009 is unchanged.
+- The runtime tree depth growth is documented in spec, plan, and
+  SYSTEM.md.
+
+### Adversarial review
+
+Judgment: passes, with three angles I checked
+
+- **A1. Same-round panic-then-supervise-then-restart trace
+  ordering.** When child C panics in step N, the runtime emits
+  `HandlerPanicked → IsolateStopped + (MessageAbandoned*) +
+  SupervisorRestartTriggered → RestartChildAttempted* → ...`. The
+  branching at HandlerPanicked produces two roots:
+  IsolateStopped subtree and SupervisorRestartTriggered subtree.
+  Trace event IDs are sequential, which means the test's
+  whole-trace assertions can pin the exact emit order. Verified
+  by `supervised_one_for_one_restarts_only_failed_child` which
+  asserts a 14-event sequence whole-trace.
+- **A2. Two children panic in the same step.** Each panic invokes
+  `supervise_panic` separately. Each consumes one budget unit.
+  This is a real edge case for budget accounting under
+  concurrent failure — but slice 010 is single-threaded, so
+  "concurrent" means "two children's handlers run sequentially
+  in the same step round." The test set doesn't have an explicit
+  "two panics, two budget units" test, but the property test
+  exercises generated histories with multiple panics. Worth
+  noting but not blocking.
+- **A3. Self-supervised parent.** Could a parent supervise
+  itself? `supervise(parent_address, config)` accepts any
+  Address, so technically yes. But supervision applies to the
+  parent's *direct children*, not the parent itself. So
+  self-supervision is meaningless, not catastrophic. The
+  unrecorded-child early-return in `supervise_panic` would skip
+  any "I am my own child" scenario. ✓ No defect.
+
+What I checked and found defended:
+
+- Single-cause-per-event invariant preserved across the new
+  events. Each `push_event` call in `supervise_panic` passes one
+  `cause`.
+- Branching is honest: `HandlerPanicked` causes
+  `IsolateStopped` AND `SupervisorRestartTriggered` (or
+  `SupervisorRestartRejected`); both are direct consequences of
+  the same panic.
+- The `failed_record_index` lookup correctly returns None for
+  root isolates (they have no `child_record`), so root panics
+  fall through to plain panic-capture without supervisor
+  involvement.
+- Budget update is atomic: `record_restart()` returns either Ok
+  with the new state (then assigned back) or Err (then nothing
+  is mutated). No partial-update window.
+- Slice 009's `RestartChildAttempted → IsolateStopped + Skipped/
+  Completed` branching is preserved inside the supervised
+  subtree.
+- `tina-supervisor` adds 1 entry to the workspace. Cargo.toml
+  membership is correct. No reverse dependencies.
+- `make verify` includes `make miri` and is green. Slice 010
+  introduces no unsafe code.
+
+### Final judgment
+
+**Already committed; slice is closed correctly.**
+
+Codex committed in two commits:
+- `feat(runtime): restart supervised children after panic`
+  (99ba928): the implementation.
+- `docs(intent): close 010 supervised panic restart phase`
+  (31f97c0): the slice's reviews_and_decisions.md, plan.md
+  cleanup, commits.txt, and SYSTEM.md updates.
+
+The SYSTEM.md update is the right shape — it pins both the
+slice 009 trace-tree invariant AND the slice 010 supervised-
+restart capability in one pass, so the system baseline reflects
+what's actually shipped.
+
+Slice 010 is the supervisor payoff for slices 006-009. The
+runtime now genuinely auto-restarts children on handler panic
+under a parent-owned policy with a budget — Tina-Odin's "dead
+worker is not a dead system" is real for the single-shard
+runtime. Mariner's done-when criteria for supervision are met.
+
+### Autonomy assessment
+
+No human-escalation findings. The slice closed cleanly under
+autonomous bucket mode. Future slices can continue from here
+without revisiting any 010-level decisions.
