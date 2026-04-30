@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::convert::Infallible;
 
 use tina::{
     Address, Context, Effect, Isolate, IsolateId, Mailbox, RestartableSpawnSpec, SendMessage,
@@ -14,6 +15,41 @@ enum SessionMsg {
     Stop,
     RestartWorkers,
     Ignore,
+    StartIo(SessionCallRequest),
+    IoCompleted(SessionCallResult),
+}
+
+/// A handler-defined description of an external operation the runtime should
+/// perform. Substrate-neutral by design: a downstream isolate states what it
+/// wants in its own vocabulary without knowing how the runtime executes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionCallRequest {
+    Greet(String),
+}
+
+/// What the runtime hands back when the call finishes. Mirrors what real
+/// runtime crates would do: typed result that the call payload's translator
+/// turns into one ordinary `Message` for the isolate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionCallResult {
+    Greeted(String),
+}
+
+/// Backend-shape Call type a downstream consumer might define inside a runtime
+/// crate. The trait crate only requires `Isolate::Call` to exist; the shape
+/// here exercises the "translator inside the call payload" design.
+struct SessionCall {
+    request: SessionCallRequest,
+    translator: Box<dyn FnOnce(SessionCallResult) -> SessionMsg>,
+}
+
+impl std::fmt::Debug for SessionCall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionCall")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +93,7 @@ impl Isolate for Worker {
     type Reply = ();
     type Send = SendMessage<WorkerMsg>;
     type Spawn = SpawnSpec<Self>;
+    type Call = Infallible;
     type Shard = InlineShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -71,6 +108,7 @@ impl Isolate for Session {
     type Reply = Vec<String>;
     type Send = SendMessage<AuditMsg>;
     type Spawn = SpawnSpec<Worker>;
+    type Call = SessionCall;
     type Shard = InlineShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -84,6 +122,14 @@ impl Isolate for Session {
             SessionMsg::Stop => Effect::Stop,
             SessionMsg::RestartWorkers => Effect::RestartChildren,
             SessionMsg::Ignore => Effect::Noop,
+            SessionMsg::StartIo(request) => Effect::Call(SessionCall {
+                request,
+                translator: Box::new(SessionMsg::IoCompleted),
+            }),
+            SessionMsg::IoCompleted(SessionCallResult::Greeted(text)) => {
+                self.notes.push(text.clone());
+                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(text)))
+            }
         }
     }
 }
@@ -158,8 +204,9 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
     match session.handle(SessionMsg::SpawnWorker, &mut ctx) {
         Effect::Spawn(spec) => {
             assert_eq!(spec.mailbox_capacity(), 8);
-            let (_worker, mailbox_capacity) = spec.into_parts();
+            let (_worker, mailbox_capacity, bootstrap) = spec.into_parts();
             assert_eq!(mailbox_capacity, 8);
+            assert!(bootstrap.is_none());
         }
         other => panic!("expected spawn effect, got {other:?}"),
     }
@@ -176,6 +223,24 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
         session.handle(SessionMsg::Ignore, &mut ctx),
         Effect::Noop
     ));
+
+    // Call effect: handler returns a runtime-owned call description that
+    // bundles a translator. Invoking the translator with a runtime-shaped
+    // result must yield exactly one ordinary `SessionMsg` value the handler
+    // would receive on a later turn — proving the "completion as ordinary
+    // message" design without making the handler async.
+    let call_request = SessionCallRequest::Greet("hello".to_owned());
+    match session.handle(SessionMsg::StartIo(call_request.clone()), &mut ctx) {
+        Effect::Call(call) => {
+            assert_eq!(call.request, call_request);
+            let later = (call.translator)(SessionCallResult::Greeted("hello back".to_owned()));
+            assert_eq!(
+                later,
+                SessionMsg::IoCompleted(SessionCallResult::Greeted("hello back".to_owned()))
+            );
+        }
+        other => panic!("expected call effect, got {other:?}"),
+    }
 }
 
 #[test]
@@ -213,9 +278,10 @@ fn restartable_spawn_spec_is_available_as_a_distinct_public_payload() {
 
     assert_eq!(spec.mailbox_capacity(), 13);
 
-    let (factory, mailbox_capacity) = spec.into_parts();
+    let (factory, mailbox_capacity, bootstrap) = spec.into_parts();
     assert_eq!(mailbox_capacity, 13);
     assert_eq!(factory(), Worker::new(tenant_id));
+    assert!(bootstrap.is_none());
 }
 
 #[test]

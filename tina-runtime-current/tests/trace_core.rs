@@ -37,6 +37,7 @@ impl Isolate for Worker {
     type Reply = ();
     type Send = SendMessage<Infallible>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -55,6 +56,7 @@ impl Isolate for Session {
     type Reply = usize;
     type Send = SendMessage<Infallible>;
     type Spawn = SpawnSpec<Worker>;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

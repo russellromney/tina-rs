@@ -151,6 +151,7 @@ impl Isolate for Worker {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = DemoShard;
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -175,6 +176,7 @@ impl Isolate for Dispatcher {
     type Reply = ();
     type Send = SendMessage<RegistryMsg>;
     type Spawn = RestartableSpawnSpec<Worker>;
+    type Call = Infallible;
     type Shard = DemoShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -206,6 +208,7 @@ impl Isolate for Registry {
     type Reply = ();
     type Send = SendMessage<WorkerMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = DemoShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

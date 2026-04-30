@@ -1,5 +1,7 @@
 use tina::{AddressGeneration, IsolateId, RestartPolicy, ShardId};
 
+pub use crate::call::{CallFailureReason, CallId};
+
 /// Stable identifier for one runtime event in a deterministic trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(u64);
@@ -58,6 +60,48 @@ pub enum EffectKind {
 
     /// The handler returned [`tina::Effect::RestartChildren`].
     RestartChildren,
+
+    /// The handler returned [`tina::Effect::Call`].
+    Call,
+}
+
+/// Trace-level kind of a runtime-owned call.
+///
+/// `tina-runtime-current`'s call vocabulary lives in
+/// [`crate::call::CallRequest`]; this enum exists so the trace can name the
+/// shape of a call without surfacing the full request payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallKind {
+    /// A TCP listener bind.
+    TcpBind,
+
+    /// A TCP listener accept.
+    TcpAccept,
+
+    /// A TCP stream read.
+    TcpRead,
+
+    /// A TCP stream write.
+    TcpWrite,
+
+    /// A TCP listener close.
+    TcpListenerClose,
+
+    /// A TCP stream close.
+    TcpStreamClose,
+}
+
+/// Why a runtime-owned call's completion could not be delivered to the
+/// requesting isolate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallCompletionRejectedReason {
+    /// The requesting isolate's mailbox was full when the runtime tried to
+    /// enqueue the completion.
+    MailboxFull,
+
+    /// The requesting isolate had stopped (or its incarnation was
+    /// replaced) by the time the completion arrived.
+    RequesterClosed,
 }
 
 /// Why a local send could not be enqueued into the target mailbox.
@@ -241,6 +285,59 @@ pub enum RuntimeEventKind {
     /// The runtime drained one already-buffered message from a stopped
     /// isolate's mailbox without delivering it to the handler.
     MessageAbandoned,
+
+    /// The runtime accepted a runtime-owned call request from an isolate.
+    CallDispatchAttempted {
+        /// The runtime-assigned identifier for the call.
+        call_id: CallId,
+
+        /// The trace-level kind of the call.
+        call_kind: CallKind,
+    },
+
+    /// The runtime delivered a successful call completion back to the
+    /// requesting isolate as an ordinary later-turn message.
+    ///
+    /// This event fires only when the underlying
+    /// [`crate::CallResult`] is a success. Failed results are
+    /// recorded by `CallFailed`; if a failed result's translated
+    /// message also could not reach the requester's mailbox a
+    /// `CallCompletionRejected` event captures that, and
+    /// `CallCompleted` is *not* emitted in either case.
+    CallCompleted {
+        /// The runtime-assigned identifier for the call.
+        call_id: CallId,
+
+        /// The trace-level kind of the call.
+        call_kind: CallKind,
+    },
+
+    /// The runtime observed a failure outcome for a runtime-owned call.
+    /// The translated failure result was still delivered to the
+    /// requesting isolate; this event records the reason.
+    CallFailed {
+        /// The runtime-assigned identifier for the call.
+        call_id: CallId,
+
+        /// The trace-level kind of the call.
+        call_kind: CallKind,
+
+        /// Why the call failed.
+        reason: CallFailureReason,
+    },
+
+    /// The runtime could not deliver a completion to the requesting
+    /// isolate.
+    CallCompletionRejected {
+        /// The runtime-assigned identifier for the call.
+        call_id: CallId,
+
+        /// The trace-level kind of the call.
+        call_kind: CallKind,
+
+        /// Why the completion could not be delivered.
+        reason: CallCompletionRejectedReason,
+    },
 }
 
 /// One deterministic runtime event with a causal link to an earlier event.

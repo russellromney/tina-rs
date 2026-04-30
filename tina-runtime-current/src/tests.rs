@@ -107,6 +107,7 @@ impl Isolate for RootIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = tina::SpawnSpec<ChildIsolate>;
+    type Call = std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -130,6 +131,7 @@ impl Isolate for RestartableRootIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = tina::RestartableSpawnSpec<ChildIsolate>;
+    type Call = std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -160,6 +162,7 @@ impl Isolate for ChildIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = tina::SpawnSpec<LeafIsolate>;
+    type Call = std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -180,6 +183,7 @@ impl Isolate for LeafIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = std::convert::Infallible;
+    type Call = std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

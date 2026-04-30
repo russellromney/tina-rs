@@ -13,6 +13,13 @@ path = "src/lib.rs"
 [dependencies]
 tina = { path = "../tina" }
 tina-supervisor = { path = "../tina-supervisor" }
+# Phase Mariner 012 substrate target. Betelgeuse is a completion-based,
+# no-runtime, no-hidden-tasks I/O library that matches Tina's explicit
+# stepping model; it requires nightly Rust (see ../rust-toolchain.toml).
+# Pinned to a specific commit so reproducible builds are not at the mercy
+# of upstream churn; bumping the rev is an explicit decision, not a
+# silent side effect of `cargo update`.
+betelgeuse = { git = "https://github.com/penberg/betelgeuse", rev = "3118eeefac9eaf938683004e281881be1bfa7688" }
 
 [dev-dependencies]
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }

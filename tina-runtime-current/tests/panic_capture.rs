@@ -133,6 +133,7 @@ impl Isolate for PanicIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -160,6 +161,7 @@ impl Isolate for PanicSender {
     type Reply = ();
     type Send = SendMessage<PanicMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -182,6 +184,7 @@ impl Isolate for OrderIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

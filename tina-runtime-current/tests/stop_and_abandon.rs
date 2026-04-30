@@ -137,6 +137,7 @@ impl Isolate for OrderIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -155,6 +156,7 @@ impl Isolate for StopIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -179,6 +181,7 @@ impl Isolate for StopAndAudit {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -202,6 +205,7 @@ impl Isolate for StopSender {
     type Reply = ();
     type Send = SendMessage<StopAuditMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

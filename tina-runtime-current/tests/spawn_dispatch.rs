@@ -114,6 +114,7 @@ impl Isolate for Child {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -140,6 +141,7 @@ impl Isolate for Parent {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = SpawnSpec<Child>;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -166,6 +168,7 @@ impl Isolate for OrderIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

@@ -92,6 +92,7 @@ impl Isolate for Target {
     type Reply = Infallible;
     type Send = SendMessage<DriverMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -116,6 +117,7 @@ impl Isolate for Driver {
     type Reply = Infallible;
     type Send = SendMessage<TargetMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(

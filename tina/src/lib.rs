@@ -14,10 +14,10 @@
 //! **closed** [`Effect`] enum rather than a per-isolate associated effect type.
 //!
 //! This keeps the dispatcher contract small and uniform: every isolate can only
-//! ask for the same handful of verbs (`Reply`, `Send`, `Spawn`, `Stop`, and
-//! `RestartChildren`). That simplicity matters for the runtime crates we add in
-//! later phases, because they can switch on one shared enum instead of handling
-//! an open-ended effect language for every isolate.
+//! ask for the same handful of verbs (`Reply`, `Send`, `Spawn`, `Stop`,
+//! `RestartChildren`, and `Call`). That simplicity matters for the runtime
+//! crates we add in later phases, because they can switch on one shared enum
+//! instead of handling an open-ended effect language for every isolate.
 //!
 //! The tradeoff is that the effect *payloads* stay per-isolate via associated
 //! types on [`Isolate`]. An isolate decides what a reply looks like, how it
@@ -66,6 +66,7 @@
 //!     type Reply = u64;
 //!     type Send = SendMessage<AuditMsg>;
 //!     type Spawn = Infallible;
+//!     type Call = Infallible;
 //!     type Shard = InlineShard;
 //!
 //!     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -128,6 +129,19 @@ pub trait Isolate: Sized {
     /// runtime may restart later.
     type Spawn;
 
+    /// The payload produced by [`Effect::Call`].
+    ///
+    /// A call describes one runtime-owned external operation (TCP I/O,
+    /// timers, future file I/O, child-process spawn, etc.) plus the
+    /// information needed to turn the runtime's later result back into one
+    /// ordinary [`Self::Message`] for this isolate. The trait crate stays
+    /// substrate-neutral here: concrete request and result vocabularies
+    /// belong to runtime crates, not to `tina`.
+    ///
+    /// Use [`std::convert::Infallible`] when an isolate never issues call
+    /// effects.
+    type Call;
+
     /// The shard abstraction available through [`Context`].
     type Shard: Shard + ?Sized;
 
@@ -164,6 +178,17 @@ where
     /// Restart this isolate's children according to the runtime's supervision
     /// policy.
     RestartChildren,
+
+    /// Ask the runtime to perform one external operation on the isolate's
+    /// behalf and deliver the result back later as an ordinary
+    /// [`Isolate::Message`] value.
+    ///
+    /// The handler stays synchronous. The runtime owns the resource (TCP
+    /// listener, stream, timer, etc.) and assigns deterministic ids; the
+    /// isolate only ever sees opaque ids inside its own message vocabulary.
+    /// Completion is delivered as a regular later-turn `Message`, never as
+    /// a second handler entry point.
+    Call(I::Call),
 }
 
 /// A bounded, typed inbox.
@@ -582,6 +607,7 @@ where
 {
     isolate: I,
     mailbox_capacity: usize,
+    bootstrap_message: Option<I::Message>,
 }
 
 impl<I> SpawnSpec<I>
@@ -596,7 +622,15 @@ where
         Self {
             isolate,
             mailbox_capacity,
+            bootstrap_message: None,
         }
+    }
+
+    /// Adds one initial child message that the runtime should enqueue after
+    /// the child is created.
+    pub fn with_bootstrap(mut self, message: I::Message) -> Self {
+        self.bootstrap_message = Some(message);
+        self
     }
 
     /// Returns the requested mailbox capacity for the spawned isolate.
@@ -610,8 +644,8 @@ where
     }
 
     /// Consumes the request and returns its parts.
-    pub fn into_parts(self) -> (I, usize) {
-        (self.isolate, self.mailbox_capacity)
+    pub fn into_parts(self) -> (I, usize, Option<I::Message>) {
+        (self.isolate, self.mailbox_capacity, self.bootstrap_message)
     }
 }
 
@@ -630,6 +664,7 @@ where
 {
     factory: Box<dyn Fn() -> I>,
     mailbox_capacity: usize,
+    bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
 }
 
 impl<I> std::fmt::Debug for RestartableSpawnSpec<I>
@@ -656,7 +691,18 @@ where
         Self {
             factory: Box::new(factory),
             mailbox_capacity,
+            bootstrap_factory: None,
         }
+    }
+
+    /// Adds one initial child message that the runtime should enqueue after
+    /// each child incarnation is created, including restarts.
+    pub fn with_bootstrap<F>(mut self, bootstrap: F) -> Self
+    where
+        F: Fn() -> I::Message + 'static,
+    {
+        self.bootstrap_factory = Some(Box::new(bootstrap));
+        self
     }
 
     /// Returns the requested mailbox capacity for the spawned isolate.
@@ -666,10 +712,20 @@ where
 
     /// Consumes the request and returns its repeatable factory plus mailbox
     /// capacity.
-    pub fn into_parts(self) -> (Box<dyn Fn() -> I>, usize) {
-        (self.factory, self.mailbox_capacity)
+    pub fn into_parts(self) -> RestartableSpawnParts<I> {
+        (self.factory, self.mailbox_capacity, self.bootstrap_factory)
     }
 }
+
+/// Tuple shape returned by [`RestartableSpawnSpec::into_parts`].
+///
+/// Spelled out as a type alias purely so the runtime crate can name it
+/// without tripping clippy's `type_complexity` lint.
+pub type RestartableSpawnParts<I> = (
+    Box<dyn Fn() -> I>,
+    usize,
+    Option<Box<dyn Fn() -> <I as Isolate>::Message>>,
+);
 
 /// Logical identifier for a shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -108,6 +108,7 @@ impl Isolate for Target {
     type Reply = Infallible;
     type Send = SendMessage<DriverMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -139,6 +140,7 @@ impl Isolate for Driver {
     type Reply = Infallible;
     type Send = SendMessage<TargetMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -159,6 +161,7 @@ impl Isolate for RestartParent {
     type Reply = Infallible;
     type Send = SendMessage<TargetMsg>;
     type Spawn = tina::RestartableSpawnSpec<RestartChild>;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -178,6 +181,7 @@ impl Isolate for RestartChild {
     type Reply = Infallible;
     type Send = SendMessage<TargetMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -507,6 +511,7 @@ impl Isolate for DispatcherWorker {
     type Reply = Infallible;
     type Send = SendMessage<DriverMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -529,6 +534,7 @@ impl Isolate for DispatcherParent {
     type Reply = Infallible;
     type Send = SendMessage<RegistryMsg>;
     type Spawn = tina::RestartableSpawnSpec<DispatcherWorker>;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -559,6 +565,7 @@ impl Isolate for DispatcherRegistry {
     type Reply = Infallible;
     type Send = SendMessage<DispatcherWorkerMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(

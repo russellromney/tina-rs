@@ -120,6 +120,7 @@ impl Isolate for OrderIsolate {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -139,6 +140,7 @@ impl Isolate for Driver {
     type Reply = ();
     type Send = SendMessage<AuditMsg>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -161,6 +163,7 @@ impl Isolate for Audit {
     type Reply = ();
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -178,6 +181,7 @@ impl Isolate for ObservedIsolate {
     type Reply = u8;
     type Send = SendMessage<NeverOutbound>;
     type Spawn = Infallible;
+    type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

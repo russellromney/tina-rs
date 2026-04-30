@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
+// Phase Mariner 012 substrate is Betelgeuse, which exposes its
+// `IOLoopHandle<A: Allocator>` over the unstable `allocator_api`. We
+// commit to nightly Rust for `tina-runtime-current` per the reopened
+// 012 plan; the feature gate is scoped to this crate.
+#![feature(allocator_api)]
 
 //! Small current-thread runtime core for `tina-rs`.
 //!
@@ -36,11 +41,20 @@ use tina::{
 };
 use tina_supervisor::SupervisorConfig;
 
+mod call;
+mod io_backend;
 mod trace;
-pub use trace::{
-    CauseId, EffectKind, EventId, RestartSkippedReason, RuntimeEvent, RuntimeEventKind,
-    SendRejectedReason, SupervisionRejectedReason,
+
+pub use call::{
+    CallFailureReason, CallId, CallRequest, CallResult, CurrentCall, ErasedCall, IntoErasedCall,
+    ListenerId, StreamId,
 };
+pub use trace::{
+    CallCompletionRejectedReason, CallKind, CauseId, EffectKind, EventId, RestartSkippedReason,
+    RuntimeEvent, RuntimeEventKind, SendRejectedReason, SupervisionRejectedReason,
+};
+
+use io_backend::IoBackend;
 
 /// Runtime-owned mailbox factory for spawned children.
 ///
@@ -68,7 +82,35 @@ where
     supervisors: Vec<SupervisorRecord>,
     next_isolate_id: u64,
     next_event_id: u64,
+    next_call_id: u64,
     trace: Vec<RuntimeEvent>,
+    io_backend: IoBackend,
+    in_flight_calls: Vec<InFlightCall>,
+    translators: Vec<StoredTranslator>,
+}
+
+#[derive(Debug)]
+struct InFlightCall {
+    call_id: CallId,
+    call_kind: CallKind,
+    requester: RegisteredAddress,
+    cause: CauseId,
+}
+
+type ErasedTranslator = Box<dyn FnOnce(CallResult) -> Box<dyn Any>>;
+
+struct StoredTranslator {
+    call_id: CallId,
+    translator: Option<ErasedTranslator>,
+}
+
+impl std::fmt::Debug for StoredTranslator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredTranslator")
+            .field("call_id", &self.call_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S, F> CurrentRuntime<S, F>
@@ -87,8 +129,19 @@ where
             supervisors: Vec::new(),
             next_isolate_id: 1,
             next_event_id: 1,
+            next_call_id: 1,
             trace: Vec::new(),
+            io_backend: IoBackend::new(),
+            in_flight_calls: Vec::new(),
+            translators: Vec::new(),
         }
+    }
+
+    /// Returns whether the runtime has any in-flight calls that have not
+    /// yet been delivered. Tests use this to know when stepping further
+    /// can produce more I/O completions.
+    pub fn has_in_flight_calls(&self) -> bool {
+        !self.in_flight_calls.is_empty() || self.io_backend.has_pending()
     }
 
     /// Returns a shared reference to the shard.
@@ -110,6 +163,7 @@ where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
@@ -202,8 +256,15 @@ where
 
     /// Runs one deterministic round over all registered isolates.
     ///
+    /// The runtime first advances its I/O backend so any pending
+    /// runtime-owned calls that finished since the previous step can be
+    /// delivered as ordinary later-turn messages. Then each registered
+    /// isolate gets at most one delivery chance, in registration order.
+    ///
     /// The return value is the number of handlers that ran in this round.
     pub fn step(&mut self) -> usize {
+        self.advance_io_backend();
+
         let mut round_messages: Vec<Option<Box<dyn Any>>> = self
             .entries
             .iter()
@@ -328,17 +389,30 @@ where
                     }
                 }
                 ErasedEffect::Spawn(spawn) => {
-                    let outcome = spawn.spawn(self, isolate_id);
+                    let mut outcome = spawn.spawn(self, isolate_id);
                     let child_isolate = outcome.child.isolate;
+                    let child = outcome.child;
+                    let bootstrap_message = outcome.bootstrap_message.take();
                     self.record_child(isolate_id, outcome);
-                    self.push_event(
+                    let spawned = self.push_event(
                         isolate_id,
                         Some(handler_finished.into()),
                         RuntimeEventKind::Spawned { child_isolate },
                     );
+                    if let Some(message) = bootstrap_message {
+                        self.enqueue_bootstrap_message(child, message, spawned.into());
+                    }
                 }
                 ErasedEffect::RestartChildren => {
                     self.restart_children(isolate_id, handler_finished.into(), &mut round_messages);
+                }
+                ErasedEffect::Call(call) => {
+                    let requester = RegisteredAddress {
+                        shard: self.shard.id(),
+                        isolate: isolate_id,
+                        generation: self.entries[index].generation,
+                    };
+                    self.dispatch_call(call, requester, handler_finished.into());
                 }
                 ErasedEffect::Noop | ErasedEffect::Reply => {
                     self.push_event(
@@ -353,6 +427,192 @@ where
         }
 
         delivered
+    }
+
+    fn dispatch_call(&mut self, call: ErasedCall, requester: RegisteredAddress, cause: CauseId) {
+        let call_id = CallId::new(self.next_call_id);
+        self.next_call_id += 1;
+        let call_kind = call.request.kind();
+
+        self.push_event(
+            requester.isolate,
+            Some(cause),
+            RuntimeEventKind::CallDispatchAttempted { call_id, call_kind },
+        );
+
+        let ErasedCall {
+            request,
+            translator,
+        } = call;
+
+        // Register the translator and in-flight tracking before submission
+        // so a synchronous completion (bind / close on Betelgeuse) can be
+        // delivered through the same path as async completions.
+        self.in_flight_calls.push(InFlightCall {
+            call_id,
+            call_kind,
+            requester,
+            cause,
+        });
+        self.translators.push(StoredTranslator {
+            call_id,
+            translator: Some(translator),
+        });
+
+        if let Some(immediate) = self.io_backend.submit(call_id, request) {
+            self.deliver_completion(immediate.call_id, immediate.result);
+        }
+    }
+
+    fn advance_io_backend(&mut self) {
+        let completed = self.io_backend.advance();
+        for op in completed {
+            self.deliver_completion(op.call_id, op.result);
+        }
+    }
+
+    fn deliver_completion(&mut self, call_id: CallId, result: CallResult) {
+        let in_flight_index = self
+            .in_flight_calls
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+            .unwrap_or_else(|| {
+                panic!("io backend produced completion for unknown call {call_id:?}")
+            });
+        let in_flight = self.in_flight_calls.remove(in_flight_index);
+
+        let translator_index = self
+            .translators
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+            .unwrap_or_else(|| panic!("missing translator for call {call_id:?}"));
+        let mut stored = self.translators.remove(translator_index);
+        let translator = stored
+            .translator
+            .take()
+            .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
+
+        // Trace semantics: `CallFailed` records that the runtime
+        // observed a failure result for this call. `CallCompleted`
+        // records that a *successful* result's translated message
+        // reached the requester's mailbox. `CallCompletionRejected`
+        // records that the translator's message could not reach the
+        // mailbox (regardless of whether the underlying result was a
+        // success or a failure). A failed call therefore emits at most
+        // `CallFailed` plus, if delivery also fails, one
+        // `CallCompletionRejected` — never `CallCompleted`.
+        let failure_reason = match &result {
+            CallResult::Failed(reason) => Some(*reason),
+            _ => None,
+        };
+        if let Some(reason) = failure_reason {
+            self.push_event(
+                in_flight.requester.isolate,
+                Some(in_flight.cause),
+                RuntimeEventKind::CallFailed {
+                    call_id,
+                    call_kind: in_flight.call_kind,
+                    reason,
+                },
+            );
+        }
+
+        let message = translator(result);
+
+        let entry_index = self.entries.iter().position(|entry| {
+            entry.id == in_flight.requester.isolate
+                && entry.generation == in_flight.requester.generation
+        });
+        let Some(entry_index) = entry_index else {
+            self.push_event(
+                in_flight.requester.isolate,
+                Some(in_flight.cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: in_flight.call_kind,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        };
+
+        if self.entries[entry_index].stopped.get() {
+            self.push_event(
+                in_flight.requester.isolate,
+                Some(in_flight.cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: in_flight.call_kind,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        }
+
+        match self.entries[entry_index].mailbox.try_send_boxed(message) {
+            Ok(()) => {
+                if failure_reason.is_none() {
+                    self.push_event(
+                        in_flight.requester.isolate,
+                        Some(in_flight.cause),
+                        RuntimeEventKind::CallCompleted {
+                            call_id,
+                            call_kind: in_flight.call_kind,
+                        },
+                    );
+                }
+                // For failed results we already emitted `CallFailed`
+                // above; the translator's message reaching the mailbox
+                // is the expected behavior and does not need a second
+                // event.
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind: in_flight.call_kind,
+                        reason: CallCompletionRejectedReason::MailboxFull,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind: in_flight.call_kind,
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                    },
+                );
+            }
+        }
+    }
+
+    fn enqueue_bootstrap_message(
+        &mut self,
+        child: RegisteredAddress,
+        message: Box<dyn Any>,
+        cause: CauseId,
+    ) {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == child.isolate && entry.generation == child.generation)
+            .unwrap_or_else(|| panic!("bootstrap referenced unknown child {:?}", child.isolate));
+        entry.mailbox.try_send_boxed(message).unwrap_or_else(|_| {
+            panic!(
+                "runtime failed to enqueue bootstrap message for child {:?}",
+                child.isolate
+            )
+        });
+        self.push_event(
+            child.isolate,
+            Some(cause),
+            RuntimeEventKind::MailboxAccepted,
+        );
     }
 
     fn stop_entry(&mut self, index: usize, isolate_id: IsolateId, cause: CauseId) -> EventId {
@@ -558,13 +818,14 @@ where
 
         let outcome = recipe.create(self, parent);
         let new_child = outcome.child;
+        let bootstrap_message = outcome.bootstrap_message;
         self.child_records[child_record_index].child = new_child;
         self.child_records[child_record_index].mailbox_capacity = outcome.mailbox_capacity;
         // Rebind the same restart recipe so this child slot remains
         // restartable after the first replacement.
         self.child_records[child_record_index].restart_recipe = Some(recipe);
 
-        self.push_event(
+        let restarted = self.push_event(
             parent,
             Some(attempted.into()),
             RuntimeEventKind::RestartChildCompleted {
@@ -575,6 +836,9 @@ where
                 new_generation: new_child.generation,
             },
         );
+        if let Some(message) = bootstrap_message {
+            self.enqueue_bootstrap_message(new_child, message, restarted.into());
+        }
     }
 
     fn push_event(
@@ -718,6 +982,7 @@ where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
@@ -749,11 +1014,13 @@ where
         parent: IsolateId,
         isolate: I,
         mailbox_capacity: usize,
+        bootstrap_message: Option<I::Message>,
     ) -> SpawnOutcome<S, F>
     where
         I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
         if mailbox_capacity == 0 {
@@ -773,6 +1040,7 @@ where
             child,
             mailbox_capacity,
             restart_recipe: None,
+            bootstrap_message: bootstrap_message.map(|message| Box::new(message) as Box<dyn Any>),
         }
     }
 
@@ -943,6 +1211,7 @@ where
     child: RegisteredAddress,
     mailbox_capacity: usize,
     restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
+    bootstrap_message: Option<Box<dyn Any>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1038,6 +1307,7 @@ where
     I: Isolate<Shard = S, Send = SendMessage<Outbound>>,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -1072,6 +1342,7 @@ where
             Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
             Effect::Stop => ErasedEffect::Stop,
             Effect::RestartChildren => ErasedEffect::RestartChildren,
+            Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
         }
     }
 }
@@ -1102,6 +1373,7 @@ where
     Spawn(Box<dyn ErasedSpawn<S, F>>),
     Stop,
     RestartChildren,
+    Call(ErasedCall),
 }
 
 impl<S, F> ErasedEffect<S, F>
@@ -1117,6 +1389,7 @@ where
             Self::Spawn(_) => EffectKind::Spawn,
             Self::Stop => EffectKind::Stop,
             Self::RestartChildren => EffectKind::RestartChildren,
+            Self::Call(_) => EffectKind::Call,
         }
     }
 }
@@ -1144,6 +1417,7 @@ where
 {
     isolate: I,
     mailbox_capacity: usize,
+    bootstrap_message: Option<I::Message>,
     marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
@@ -1152,6 +1426,7 @@ where
     I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -1161,7 +1436,12 @@ where
         runtime: &mut CurrentRuntime<S, F>,
         parent: IsolateId,
     ) -> SpawnOutcome<S, F> {
-        runtime.spawn_isolate::<I, Outbound>(parent, self.isolate, self.mailbox_capacity)
+        runtime.spawn_isolate::<I, Outbound>(
+            parent,
+            self.isolate,
+            self.mailbox_capacity,
+            self.bootstrap_message,
+        )
     }
 }
 
@@ -1170,15 +1450,17 @@ where
     I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
 {
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>> {
-        let (isolate, mailbox_capacity) = self.into_parts();
+        let (isolate, mailbox_capacity, bootstrap_message) = self.into_parts();
         Box::new(SpawnAdapter::<I, Outbound> {
             isolate,
             mailbox_capacity,
+            bootstrap_message,
             marker: PhantomData,
         })
     }
@@ -1190,6 +1472,7 @@ where
 {
     factory: Box<dyn Fn() -> I>,
     mailbox_capacity: usize,
+    bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
     marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
@@ -1198,6 +1481,7 @@ where
     I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -1210,7 +1494,13 @@ where
         let adapter = Rc::new(*self);
         let isolate = (adapter.factory)();
         let mailbox_capacity = adapter.mailbox_capacity;
-        let mut outcome = runtime.spawn_isolate::<I, Outbound>(parent, isolate, mailbox_capacity);
+        let bootstrap_message = adapter.bootstrap_factory.as_ref().map(|f| f());
+        let mut outcome = runtime.spawn_isolate::<I, Outbound>(
+            parent,
+            isolate,
+            mailbox_capacity,
+            bootstrap_message,
+        );
         outcome.restart_recipe = Some(adapter);
         outcome
     }
@@ -1221,13 +1511,20 @@ where
     I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
 {
     fn create(&self, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F> {
         let isolate = (self.factory)();
-        runtime.spawn_isolate::<I, Outbound>(parent, isolate, self.mailbox_capacity)
+        let bootstrap_message = self.bootstrap_factory.as_ref().map(|f| f());
+        runtime.spawn_isolate::<I, Outbound>(
+            parent,
+            isolate,
+            self.mailbox_capacity,
+            bootstrap_message,
+        )
     }
 }
 
@@ -1236,15 +1533,17 @@ where
     I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
 {
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>> {
-        let (factory, mailbox_capacity) = self.into_parts();
+        let (factory, mailbox_capacity, bootstrap_factory) = self.into_parts();
         Box::new(RestartableSpawnAdapter::<I, Outbound> {
             factory,
             mailbox_capacity,
+            bootstrap_factory,
             marker: PhantomData,
         })
     }
