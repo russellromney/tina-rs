@@ -61,6 +61,12 @@ in runtime crates. Completion is delivered as an ordinary later `Message`
 via a translator carried inside the call payload, never as a second public
 handler entry point.
 
+`tina` also ships an ordered batch effect,
+`Effect::Batch(Vec<Effect<I>>)`, for sequencing existing effects
+left-to-right without opening up a new callback or effect language. In
+`tina-runtime-current`, later effects in the batch still run after earlier
+non-terminal effects, and `Stop` short-circuits the rest of the batch.
+
 `tina-runtime-current` ships the first TCP call family on Betelgeuse
 (nightly Rust): TCP listener bind, accept, stream read, stream write,
 listener and stream close. Resources are runtime-owned opaque ids; raw
@@ -89,17 +95,21 @@ registry isolate for the current worker address, and later work can continue
 through replacement workers after a panic.
 
 A live TCP echo proof and matching runnable example exist for the call
-effect path: a listener isolate is the supervised parent that issues bind
-and accept calls, and each accepted connection becomes a restartable
-connection-handler child that issues read / write / close calls. The
-listener spawns the connection child via
+effect path: a listener isolate is the supervised parent that issues bind,
+accept, and listener-close calls, and each accepted connection becomes a
+restartable connection-handler child that issues read / write / close
+calls. The listener captures its own typed address, uses
+`Effect::Batch(Vec<Effect<I>>)` to sequence "spawn child, then send self a
+re-arm or close message," and spawns the connection child via
 `RestartableSpawnSpec::with_bootstrap`, so the connection's first read
 fires through the normal handler pipeline rather than via test-harness
 trace introspection. The proof binds to `127.0.0.1:0`, relies on the
-runtime to report the actual bound address, and asserts on echoed bytes
-plus call-path trace evidence for every call kind on the path. The
-connection isolate honors partial writes through a small pending-buffer +
-drain pattern, exercised by a separate unit test.
+runtime to report the actual bound address, and now covers one-client
+smoke, sequential multi-client handling, bounded overlap, graceful
+listener close, and listener stop. The connection isolate honors partial
+writes through a small pending-buffer + drain pattern, exercised by a
+separate unit test, and crate-local runtime tests directly prove that two
+accepted stream reads can be pending in `IoBackend` at the same time.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may be the direct cause of many later events.

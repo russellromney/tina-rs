@@ -119,3 +119,17 @@ This file records completed work.
   path for a pending `TcpAccept`, plus accepted-stream `peer_addr` reporting.
 - Added a runnable `tcp_echo` example mirroring the tested workload with
   inline assertions on echoed payloads.
+- Added ordered `Effect::Batch(Vec<Effect<I>>)` at the `tina` boundary and
+  runtime support in `tina-runtime-current` for deterministic left-to-right
+  execution with `Stop` short-circuiting later batched effects.
+- Added direct batch-semantics tests in `tina-runtime-current` proving
+  left-to-right execution, spawn-plus-send sequencing, and `Stop`
+  short-circuit behavior.
+- Expanded the live `tcp_echo` proof and runnable example from a one-client
+  demo into a small server-shaped workload: listener self-address capture,
+  re-armed `TcpAccept`, sequential multi-client handling, bounded overlap,
+  graceful listener close/stop, and retained one-client smoke coverage.
+- Added a crate-local runtime proof that two accepted stream reads can be
+  pending in `IoBackend` at the same time, so the bounded-overlap TCP claim
+  is backed by direct runtime evidence rather than only by client-thread
+  interleaving.
