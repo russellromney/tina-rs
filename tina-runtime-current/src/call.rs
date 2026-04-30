@@ -87,22 +87,12 @@ impl StreamId {
 pub enum CallRequest {
     /// Bind a TCP listener to `addr`.
     ///
-    /// Uses [`SocketAddr`] rather than a logical name. The caller picks the
-    /// port; the runtime does not perform ephemeral-port discovery on this
-    /// Betelgeuse rev (see the io-backend module docs for the honest
-    /// scope). The runtime echoes the requested address back through
-    /// [`CallResult::TcpBound::local_addr`] because, without an
-    /// upstream `IOSocket::local_addr`, that is the only address it can
-    /// honestly know.
-    ///
-    /// A request with `addr.port() == 0` is rejected with
-    /// [`CallResult::Failed`]([`CallFailureReason::Unsupported`]). The
-    /// kernel could pick a port, but the runtime has no honest way to
-    /// tell the caller which one, so we fail loudly rather than return
-    /// a dishonest `local_addr`.
+    /// Uses [`SocketAddr`] rather than a logical name. The runtime reports the
+    /// actual bound address back through [`CallResult::TcpBound::local_addr`],
+    /// including when the caller requests port `0` and lets the kernel pick a
+    /// free ephemeral port.
     TcpBind {
-        /// The concrete address the listener should bind to. Port `0` is
-        /// rejected with `CallFailureReason::Unsupported`.
+        /// The address the listener should bind to.
         addr: SocketAddr,
     },
 
@@ -172,11 +162,7 @@ pub enum CallResult {
         /// The runtime-assigned listener identifier.
         listener: ListenerId,
 
-        /// The bound address. On this Betelgeuse rev the runtime cannot
-        /// query the kernel for the actual bound address, so this echoes
-        /// the address the caller passed into [`CallRequest::TcpBind`].
-        /// Once an upstream `IOSocket::local_addr()` lands the runtime
-        /// can replace this with the kernel-confirmed value.
+        /// The actual bound address reported by the runtime's I/O substrate.
         local_addr: SocketAddr,
     },
 
@@ -184,6 +170,9 @@ pub enum CallResult {
     TcpAccepted {
         /// The runtime-assigned stream identifier for the new connection.
         stream: StreamId,
+
+        /// The remote peer address of the accepted stream.
+        peer_addr: SocketAddr,
     },
 
     /// A read returned `bytes`. An empty `bytes` vector means end of stream.
@@ -227,13 +216,9 @@ pub enum CallFailureReason {
     /// The runtime cannot honestly perform the requested operation on
     /// this substrate revision.
     ///
-    /// Used today by [`CallRequest::TcpBind`] when the requested port
-    /// is `0`: this Betelgeuse rev does not expose
-    /// `IOSocket::local_addr`, so a port-0 bind would succeed at the
-    /// kernel but the runtime would have no honest address to report
-    /// back. Rejecting loudly is the right answer until the upstream
-    /// surface lands. Future capability gaps are expected to surface
-    /// here too rather than as silent fallbacks.
+    /// Reserved for capability gaps the runtime cannot honestly
+    /// perform on the current substrate revision. Future gaps should
+    /// surface here rather than through silent fallbacks.
     Unsupported,
 }
 

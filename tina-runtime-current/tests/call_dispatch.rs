@@ -18,7 +18,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -97,8 +97,6 @@ enum ProbeMsg {
     StartInvalidAccept,
     StartInvalidRead,
     InvalidResourceObserved,
-    StartPortZeroBind,
-    UnsupportedObserved,
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +112,7 @@ enum BinderMsg {
 enum WaiterMsg {
     StartAccept,
     StopNow,
-    AcceptedObserved,
+    AcceptedObserved(SocketAddr),
     FailedObserved,
 }
 
@@ -159,21 +157,6 @@ impl Isolate for Probe {
                 self.log
                     .borrow_mut()
                     .push(ProbeMsg::InvalidResourceObserved);
-                Effect::Noop
-            }
-            ProbeMsg::StartPortZeroBind => Effect::Call(CurrentCall::new(
-                CallRequest::TcpBind {
-                    addr: "127.0.0.1:0".parse().expect("loopback parse"),
-                },
-                |result| match result {
-                    CallResult::Failed(tina_runtime_current::CallFailureReason::Unsupported) => {
-                        ProbeMsg::UnsupportedObserved
-                    }
-                    other => panic!("expected Unsupported failure, got {other:?}"),
-                },
-            )),
-            ProbeMsg::UnsupportedObserved => {
-                self.log.borrow_mut().push(ProbeMsg::UnsupportedObserved);
                 Effect::Noop
             }
         }
@@ -226,6 +209,7 @@ impl Isolate for Binder {
 struct Waiter {
     listener: ListenerId,
     log: Rc<RefCell<Vec<WaiterMsg>>>,
+    peer_slot: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl Isolate for Waiter {
@@ -243,14 +227,19 @@ impl Isolate for Waiter {
                     listener: self.listener,
                 },
                 |result| match result {
-                    CallResult::TcpAccepted { .. } => WaiterMsg::AcceptedObserved,
+                    CallResult::TcpAccepted { peer_addr, .. } => {
+                        WaiterMsg::AcceptedObserved(peer_addr)
+                    }
                     CallResult::Failed(_) => WaiterMsg::FailedObserved,
                     other => panic!("unexpected accept result {other:?}"),
                 },
             )),
             WaiterMsg::StopNow => Effect::Stop,
-            WaiterMsg::AcceptedObserved => {
-                self.log.borrow_mut().push(WaiterMsg::AcceptedObserved);
+            WaiterMsg::AcceptedObserved(peer_addr) => {
+                *self.peer_slot.lock().expect("peer mutex") = Some(peer_addr);
+                self.log
+                    .borrow_mut()
+                    .push(WaiterMsg::AcceptedObserved(peer_addr));
                 Effect::Noop
             }
             WaiterMsg::FailedObserved => {
@@ -259,13 +248,6 @@ impl Isolate for Waiter {
             }
         }
     }
-}
-
-fn choose_loopback_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("choose free loopback port")
-        .port()
 }
 
 fn call_event_kinds(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
@@ -353,52 +335,58 @@ fn invalid_stream_id_surfaces_failure_to_isolate_and_trace() {
 }
 
 #[test]
-fn port_zero_bind_is_rejected_as_unsupported_with_visible_trace() {
-    // The runtime cannot honestly tell the caller which port the kernel
-    // chose for a port-0 bind (Betelgeuse's `IOSocket` does not expose
-    // `local_addr`). Rather than echo back a dishonest `local_addr`, the
-    // backend rejects port-0 binds explicitly with
-    // `CallFailureReason::Unsupported`. This test pins that contract.
-    let log = Rc::new(RefCell::new(Vec::new()));
+fn port_zero_bind_returns_real_local_addr_with_visible_trace() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
     let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
-    let probe = runtime.register(
-        Probe {
-            log: Rc::clone(&log),
+    let binder = runtime.register(
+        Binder {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
         },
         TestMailbox::new(8),
     );
 
     runtime
-        .try_send(probe, ProbeMsg::StartPortZeroBind)
-        .expect("ingress accepts StartPortZeroBind");
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
 
     runtime.step();
     runtime.step();
 
-    assert_eq!(*log.borrow(), vec![ProbeMsg::UnsupportedObserved]);
+    let _listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    assert_eq!(local_addr.ip().to_string(), "127.0.0.1");
+    assert_ne!(local_addr.port(), 0, "kernel must choose a real port");
 
     let kinds = call_event_kinds(runtime.trace());
     assert!(
         kinds.iter().any(|k| matches!(
-            k,
-            RuntimeEventKind::CallFailed {
-                call_kind: CallKind::TcpBind,
-                reason: tina_runtime_current::CallFailureReason::Unsupported,
-                ..
-            }
-        )),
-        "trace must record CallFailed{{Unsupported}} for a port-0 bind: {kinds:?}"
-    );
-    // No CallCompleted event for this call: the runtime did not bind.
-    assert!(
-        !kinds.iter().any(|k| matches!(
             k,
             RuntimeEventKind::CallCompleted {
                 call_kind: CallKind::TcpBind,
                 ..
             }
         )),
-        "rejected bind must not produce CallCompleted: {kinds:?}"
+        "trace must record CallCompleted for a successful port-0 bind: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TcpBind,
+                ..
+            }
+        )),
+        "successful port-0 bind must not produce CallFailed: {kinds:?}"
     );
 }
 
@@ -407,9 +395,8 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
     let listener_slot = Arc::new(Mutex::new(None));
     let addr_slot = Arc::new(Mutex::new(None));
     let waiter_log = Rc::new(RefCell::new(Vec::new()));
-    let bind_addr: SocketAddr = format!("127.0.0.1:{}", choose_loopback_port())
-        .parse()
-        .expect("loopback parse");
+    let peer_slot = Arc::new(Mutex::new(None));
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
 
     let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
     let binder = runtime.register(
@@ -440,6 +427,7 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
         Waiter {
             listener,
             log: Rc::clone(&waiter_log),
+            peer_slot: Arc::clone(&peer_slot),
         },
         TestMailbox::new(8),
     );
@@ -472,6 +460,10 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
         waiter_log.borrow().is_empty(),
         "stopped requester must not observe translated completion messages"
     );
+    assert!(
+        peer_slot.lock().expect("peer mutex").is_none(),
+        "stopped requester must not publish a peer address"
+    );
 
     let kinds = call_event_kinds(runtime.trace());
     assert!(
@@ -495,6 +487,92 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
         )),
         "rejected completion must not produce CallCompleted: {kinds:?}"
     );
+}
+
+#[test]
+fn accepted_stream_reports_real_peer_addr() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
+    let waiter_log = Rc::new(RefCell::new(Vec::new()));
+    let peer_slot = Arc::new(Mutex::new(None));
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let binder = runtime.register(
+        Binder {
+            bind_addr,
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
+    runtime.step();
+    runtime.step();
+
+    let listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    let waiter = runtime.register(
+        Waiter {
+            listener,
+            log: Rc::clone(&waiter_log),
+            peer_slot: Arc::clone(&peer_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(waiter, WaiterMsg::StartAccept)
+        .expect("ingress accepts StartAccept");
+    runtime.step();
+
+    let client = TcpStream::connect(local_addr).expect("connect to listener");
+    let client_local_addr = client.local_addr().expect("client local_addr");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while peer_slot.lock().expect("peer mutex").is_none() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for accepted peer address; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    assert_eq!(
+        *peer_slot.lock().expect("peer mutex"),
+        Some(client_local_addr),
+        "accepted peer_addr must match the connecting client's local address"
+    );
+    assert_eq!(
+        waiter_log.borrow().as_slice(),
+        &[WaiterMsg::AcceptedObserved(client_local_addr)],
+    );
+
+    let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpAccept,
+                ..
+            }
+        )),
+        "trace must record CallCompleted for accept: {kinds:?}"
+    );
+
+    drop(client);
 }
 
 #[test]

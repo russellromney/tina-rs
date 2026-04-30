@@ -20,22 +20,15 @@
 //!
 //! ## Honest scope on this Betelgeuse rev
 //!
-//! Betelgeuse's [`IOSocket`] trait does not expose `local_addr()` or
-//! `peer_addr()`. The runtime therefore narrows its claim instead of
-//! faking a capability:
+//! The vendored Betelgeuse copy in this repo exposes `IOSocket::local_addr()`
+//! and `IOSocket::peer_addr()`. That is enough for honest:
 //!
-//! - The runtime does **not** support runtime-owned ephemeral-port
-//!   discovery. A bind request must carry a concrete port that the
-//!   caller is willing to use; the runtime returns that same address as
-//!   the bound `local_addr` because that is the only address it can
-//!   honestly know. Port-0 binds are **explicitly rejected**: `do_bind`
-//!   returns `CallResult::Failed(CallFailureReason::Unsupported)`
-//!   instead of letting the kernel assign a port the runtime could
-//!   not name. The branch can come out once Betelgeuse exposes
-//!   `IOSocket::local_addr() -> io::Result<SocketAddr>` upstream (or
-//!   an equivalent surface).
-//! - `peer_addr` is dropped from [`CallResult::TcpAccepted`] for the
-//!   same reason: we do not fill the field with a placeholder.
+//! - runtime-owned ephemeral-port discovery on `TcpBind { addr: ...:0 }`
+//! - reporting the real accepted stream peer address
+//!
+//! The `tina` boundary still stays substrate-neutral; only
+//! `tina-runtime-current` and the vendored backend know about these socket
+//! introspection hooks.
 
 use std::alloc::Global;
 use std::net::SocketAddr;
@@ -206,13 +199,20 @@ impl IoBackend {
                     .expect("accept completion advertised a result");
                 match result {
                     Ok(socket) => {
+                        let peer_addr = match socket.peer_addr() {
+                            Ok(addr) => addr,
+                            Err(_) => return Some(CallResult::Failed(CallFailureReason::Io)),
+                        };
                         let stream_id = StreamId::new(self.next_stream_id);
                         self.next_stream_id += 1;
                         self.streams.push(StreamEntry {
                             id: stream_id,
                             socket,
                         });
-                        Some(CallResult::TcpAccepted { stream: stream_id })
+                        Some(CallResult::TcpAccepted {
+                            stream: stream_id,
+                            peer_addr,
+                        })
                     }
                     Err(_) => Some(CallResult::Failed(CallFailureReason::Io)),
                 }
@@ -245,20 +245,6 @@ impl IoBackend {
     }
 
     fn do_bind(&mut self, addr: SocketAddr) -> CallResult {
-        // Reject port-0 binds explicitly. This Betelgeuse rev does not
-        // expose `IOSocket::local_addr`, so the runtime cannot tell the
-        // caller which port the kernel chose, and silently echoing
-        // `127.0.0.1:0` back as `local_addr` would be a dishonest
-        // success. We surface the gap as an `Unsupported` failure
-        // instead, which the trace records as `CallFailed` with the
-        // same reason. Once `IOSocket::local_addr()` lands upstream
-        // (or an equivalent capability), this branch can come out and
-        // port-0 binds will start working honestly through the same
-        // call path.
-        if addr.port() == 0 {
-            return CallResult::Failed(CallFailureReason::Unsupported);
-        }
-
         let socket = match self.io_loop.socket() {
             Ok(socket) => socket,
             Err(_) => return CallResult::Failed(CallFailureReason::Io),
@@ -266,13 +252,17 @@ impl IoBackend {
         if socket.bind(addr).is_err() {
             return CallResult::Failed(CallFailureReason::Io);
         }
+        let local_addr = match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(_) => return CallResult::Failed(CallFailureReason::Io),
+        };
 
         let id = ListenerId::new(self.next_listener_id);
         self.next_listener_id += 1;
         self.listeners.push(ListenerEntry { id, socket });
         CallResult::TcpBound {
             listener: id,
-            local_addr: addr,
+            local_addr,
         }
     }
 

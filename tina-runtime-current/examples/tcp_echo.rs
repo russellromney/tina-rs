@@ -14,20 +14,16 @@
 //! cargo run -p tina-runtime-current --example tcp_echo
 //! ```
 //!
-//! Binds to a test-selected concrete loopback port (the runtime does not
-//! perform ephemeral-port discovery on this Betelgeuse rev — see
-//! `io_backend.rs` "Honest scope") and drives one client connection
-//! through the live runtime in the same process. The example harness
-//! chooses a free loopback port up front and then asks the runtime to
-//! bind that exact address. If the host races and steals the port
-//! before the runtime binds it, the example fails loudly through the
-//! runtime's `TcpBind` failure path.
+//! Binds to `127.0.0.1:0` and relies on the runtime to report the actual
+//! bound address through `CallResult::TcpBound { local_addr }`, then
+//! drives one client connection through the live runtime in the same
+//! process.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -302,17 +298,8 @@ fn assert_call_path_completed(trace: &[RuntimeEvent], kind: CallKind) {
     assert!(completed, "expected completion for {kind:?}");
 }
 
-fn choose_loopback_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("choose free loopback port")
-        .port()
-}
-
 fn main() {
-    let bind_addr: SocketAddr = format!("127.0.0.1:{}", choose_loopback_port())
-        .parse()
-        .expect("loopback parse");
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
     let bound: BoundAddr = Arc::new(Mutex::new(None));
 
     let mut runtime = CurrentRuntime::new(ExampleShard, ExampleMailboxFactory);
