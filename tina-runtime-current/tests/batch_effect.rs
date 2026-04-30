@@ -1,13 +1,17 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::rc::Rc;
 
 use tina::{
     Address, Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId, SpawnSpec,
     TrySendError,
 };
-use tina_runtime_current::{CurrentRuntime, EffectKind, MailboxFactory, RuntimeEventKind};
+use tina_runtime_current::{
+    CallKind, CallRequest, CallResult, CurrentCall, CurrentRuntime, EffectKind, MailboxFactory,
+    RuntimeEventKind, StreamId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -22,6 +26,10 @@ enum DriverMsg {
     SendTwice,
     SpawnAndSend,
     StopThenSend,
+    SendThenBind,
+    BindObserved,
+    FailReadThenSend,
+    ReadFailureObserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +153,7 @@ impl Isolate for Driver {
     type Reply = ();
     type Send = SendMessage<AuditMsg>;
     type Spawn = SpawnSpec<Worker>;
-    type Call = Infallible;
+    type Call = CurrentCall<DriverMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -162,6 +170,37 @@ impl Isolate for Driver {
                 Effect::Stop,
                 Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(7))),
             ]),
+            DriverMsg::SendThenBind => Effect::Batch(vec![
+                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(3))),
+                Effect::Call(CurrentCall::new(
+                    CallRequest::TcpBind {
+                        addr: "127.0.0.1:0".parse::<SocketAddr>().expect("loopback parse"),
+                    },
+                    |result| match result {
+                        CallResult::TcpBound { .. } => DriverMsg::BindObserved,
+                        other => panic!("expected successful bind result, got {other:?}"),
+                    },
+                )),
+            ]),
+            DriverMsg::BindObserved => {
+                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(4)))
+            }
+            DriverMsg::FailReadThenSend => Effect::Batch(vec![
+                Effect::Call(CurrentCall::new(
+                    CallRequest::TcpRead {
+                        stream: StreamId::new(9999),
+                        max_len: 8,
+                    },
+                    |result| match result {
+                        CallResult::Failed(_) => DriverMsg::ReadFailureObserved,
+                        other => panic!("expected invalid read failure, got {other:?}"),
+                    },
+                )),
+                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(5))),
+            ]),
+            DriverMsg::ReadFailureObserved => {
+                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(6)))
+            }
         }
     }
 }
@@ -202,6 +241,16 @@ fn count_events(
         .iter()
         .filter(|event| predicate(&event.kind()))
         .count()
+}
+
+fn first_event_index(
+    trace: &[tina_runtime_current::RuntimeEvent],
+    predicate: impl Fn(&RuntimeEventKind) -> bool,
+) -> usize {
+    trace
+        .iter()
+        .position(|event| predicate(&event.kind()))
+        .expect("expected matching trace event")
 }
 
 #[test]
@@ -321,4 +370,98 @@ fn stop_short_circuits_later_effects_in_the_same_batch() {
         )),
         0
     );
+}
+
+#[test]
+fn batch_send_then_synchronous_call_keeps_left_to_right_order() {
+    let mut harness = Harness::new();
+    harness
+        .runtime
+        .try_send(harness.driver, DriverMsg::SendThenBind)
+        .expect("ingress accepts SendThenBind");
+
+    harness.runtime.step();
+
+    let trace = harness.runtime.trace();
+    let send_attempt = first_event_index(trace, |kind| {
+        matches!(kind, RuntimeEventKind::SendDispatchAttempted { .. })
+    });
+    let send_accepted = first_event_index(trace, |kind| {
+        matches!(kind, RuntimeEventKind::SendAccepted { .. })
+    });
+    let call_attempt = first_event_index(trace, |kind| {
+        matches!(
+            kind,
+            RuntimeEventKind::CallDispatchAttempted {
+                call_kind: CallKind::TcpBind,
+                ..
+            }
+        )
+    });
+    let call_completed = first_event_index(trace, |kind| {
+        matches!(
+            kind,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpBind,
+                ..
+            }
+        )
+    });
+
+    assert!(send_attempt < send_accepted);
+    assert!(send_accepted < call_attempt);
+    assert!(call_attempt < call_completed);
+
+    harness.runtime.step();
+    assert_eq!(*harness.seen.borrow(), vec![3]);
+
+    harness.runtime.step();
+    assert_eq!(*harness.seen.borrow(), vec![3, 4]);
+}
+
+#[test]
+fn batch_failing_call_still_runs_later_effects() {
+    let mut harness = Harness::new();
+    harness
+        .runtime
+        .try_send(harness.driver, DriverMsg::FailReadThenSend)
+        .expect("ingress accepts FailReadThenSend");
+
+    harness.runtime.step();
+
+    let trace = harness.runtime.trace();
+    let call_attempt = first_event_index(trace, |kind| {
+        matches!(
+            kind,
+            RuntimeEventKind::CallDispatchAttempted {
+                call_kind: CallKind::TcpRead,
+                ..
+            }
+        )
+    });
+    let call_failed = first_event_index(trace, |kind| {
+        matches!(
+            kind,
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TcpRead,
+                ..
+            }
+        )
+    });
+    let send_attempt = first_event_index(trace, |kind| {
+        matches!(kind, RuntimeEventKind::SendDispatchAttempted { .. })
+    });
+    let send_accepted = first_event_index(trace, |kind| {
+        matches!(kind, RuntimeEventKind::SendAccepted { .. })
+    });
+
+    assert!(call_attempt < call_failed);
+    assert!(call_failed < send_attempt);
+    assert!(send_attempt < send_accepted);
+
+    harness.runtime.step();
+    assert_eq!(*harness.seen.borrow(), vec![5]);
+
+    harness.runtime.step();
+    assert_eq!(*harness.seen.borrow(), vec![5, 6]);
 }
