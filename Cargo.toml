@@ -3,6 +3,7 @@ members = [
     "tina",
     "tina-mailbox-spsc",
     "tina-runtime-current",
+    "tina-sim",
     "tina-supervisor",
 ]
 resolver = "2"
