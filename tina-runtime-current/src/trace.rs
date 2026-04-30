@@ -92,6 +92,9 @@ pub enum CallKind {
 
     /// A TCP stream close.
     TcpStreamClose,
+
+    /// A one-shot relative sleep timer.
+    Sleep,
 }
 
 /// Why a runtime-owned call's completion could not be delivered to the

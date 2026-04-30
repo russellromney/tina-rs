@@ -7,20 +7,22 @@
 //! deterministic simulator, …) can implement the same `Effect::Call`
 //! slot with its own request/result vocabulary without touching `tina`.
 //!
-//! Phase 012 ships a TCP-only first call family backed by Betelgeuse on
-//! nightly Rust. Runtime-owned sleep/timer wake is part of the broader
-//! project direction but is intentionally not in this slice; adding a
-//! new verb later means extending [`CallRequest`] / [`CallResult`] in
-//! this crate, not redefining the `tina` boundary.
+//! The first shipped call family is backed by Betelgeuse on nightly Rust and
+//! now covers both:
+//!
+//! - TCP bind / accept / read / write / close
+//! - one-shot relative sleep / timer wake
+//!
+//! Future verbs still extend [`CallRequest`] / [`CallResult`] in this crate,
+//! not the `tina` trait boundary.
 //!
 //! ## Design constraints honored here
 //!
 //! - Resource ids ([`ListenerId`], [`StreamId`], [`CallId`]) are
 //!   runtime-assigned monotonic counters. The runtime, not the OS, owns
 //!   identity.
-//! - No wall-clock time leaks into the call payload. The TCP-only call
-//!   family does not name an `Instant` anywhere; a future timer verb
-//!   should follow the relative-duration shape so a deterministic
+//! - No wall-clock time leaks into the call payload. The call family
+//!   names relative timer duration, not `Instant`, so a deterministic
 //!   simulator can implement virtual time without renegotiating the
 //!   contract.
 //! - Raw socket handles never escape the runtime. Isolate code only sees
@@ -28,6 +30,7 @@
 
 use std::any::Any;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 /// Stable identifier for one runtime-issued call.
 ///
@@ -138,6 +141,17 @@ pub enum CallRequest {
         /// The stream to close.
         stream: StreamId,
     },
+
+    /// Sleep for a relative duration.
+    ///
+    /// Completion fires no earlier than `armed_at + after` on a future
+    /// step. The runtime samples its monotonic clock once per step;
+    /// timers due at or before that sampled instant become eligible in
+    /// that step.
+    Sleep {
+        /// The duration to wait before waking.
+        after: Duration,
+    },
 }
 
 impl CallRequest {
@@ -150,6 +164,7 @@ impl CallRequest {
             Self::TcpWrite { .. } => crate::trace::CallKind::TcpWrite,
             Self::TcpListenerClose { .. } => crate::trace::CallKind::TcpListenerClose,
             Self::TcpStreamClose { .. } => crate::trace::CallKind::TcpStreamClose,
+            Self::Sleep { .. } => crate::trace::CallKind::Sleep,
         }
     }
 }
@@ -194,6 +209,9 @@ pub enum CallResult {
 
     /// A stream was closed and its resources released.
     TcpStreamClosed,
+
+    /// A timer sleep completed and the isolate should wake.
+    TimerFired,
 
     /// The runtime could not complete the call. The trace already records
     /// the failure with a richer reason; this variant is what the issuing

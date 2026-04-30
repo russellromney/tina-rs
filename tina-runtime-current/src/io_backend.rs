@@ -149,6 +149,10 @@ impl IoBackend {
                 }
                 Err(result) => Some(CompletedOp { call_id, result }),
             },
+            CallRequest::Sleep { .. } => Some(CompletedOp {
+                call_id,
+                result: CallResult::Failed(CallFailureReason::Unsupported),
+            }),
         }
     }
 

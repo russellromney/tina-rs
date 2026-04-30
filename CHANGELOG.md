@@ -133,3 +133,20 @@ This file records completed work.
   pending in `IoBackend` at the same time, so the bounded-overlap TCP claim
   is backed by direct runtime evidence rather than only by client-thread
   interleaving.
+- Added the first runtime-owned time call verb: `CallRequest::Sleep { after }`
+  with `CallResult::TimerFired`, plus `CallKind::Sleep` in the trace vocabulary.
+  The runtime samples a monotonic clock once per `step()` and harvests due
+  timers against that sampled instant. Equal-deadline timers wake in
+  deterministic request order.
+- Added a crate-private `ManualClock` seam so timer tests can drive time
+  deterministically without brittle wall-clock sleeps, while production
+  `CurrentRuntime` still uses a real monotonic clock.
+- Added focused timer semantics unit tests: single timer wake, no early fire,
+  fires exactly once, different-deadline ordering, equal-deadline request-order
+  tie-break, and late-completion rejection after requester stop.
+- Added a retry/backoff proof workload test: first attempt fails, a
+  runtime-owned timer delays a real second attempt, later retry succeeds,
+  and the trace proves the backoff `Sleep` completion occurred before the
+  retried attempt.
+- Added a public-path integration test for the same retry/backoff shape, using
+  the shipped monotonic clock rather than the crate-private manual clock seam.

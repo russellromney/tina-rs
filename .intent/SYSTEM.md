@@ -78,9 +78,16 @@ requesting isolate's mailbox. Synchronous Betelgeuse ops (bind, close)
 complete inline during dispatch; async ops (accept, recv, send) stay in a
 pending list until their slot has a result.
 
-Runtime-owned sleep/timer wake remains a goal for the broader project but
-is not in the first TCP-first call family; it will arrive once the call
-contract grows a verb whose completion the runtime can drive on demand.
+`tina-runtime-current` now also ships the first runtime-owned time call
+verb: `CallRequest::Sleep { after }` with `CallResult::TimerFired`. The
+runtime owns a monotonic clock and samples it once at the start of each
+`step()`; timers due at or before that sampled instant are harvested and
+delivered as ordinary later `Message` values through the same call
+translator path. Equal-deadline timers wake in deterministic request
+order. A crate-private manual clock seam lets tests prove timer semantics
+directly without brittle wall-clock sleeps. A separate assertion-backed
+integration test drives the public runtime path with the shipped monotonic
+clock and proves a real "fail, back off, retry, succeed" workload.
 
 `SpawnSpec` and `RestartableSpawnSpec` now carry an optional bootstrap
 message that the runtime delivers to the new child immediately after spawn

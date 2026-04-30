@@ -34,6 +34,9 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use tina::{
     Address, AddressGeneration, ChildRelation, Context, Effect, Isolate, IsolateId, Mailbox,
@@ -65,6 +68,66 @@ pub trait MailboxFactory {
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>>;
 }
 
+/// Runtime-owned clock abstraction.
+///
+/// Production uses a monotonic wall-clock. Tests may inject a manual clock
+/// so timer behavior can be driven deterministically without real sleeps.
+trait Clock: std::fmt::Debug {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug)]
+struct MonotonicClock;
+
+impl Clock for MonotonicClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ManualClock {
+    base: Instant,
+    offset: Cell<Duration>,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            offset: Cell::new(Duration::ZERO),
+        }
+    }
+
+    fn advance(&self, by: Duration) {
+        self.offset.set(self.offset.get() + by);
+    }
+}
+
+#[cfg(test)]
+impl Clock for ManualClock {
+    fn now(&self) -> Instant {
+        self.base + self.offset.get()
+    }
+}
+
+#[cfg(test)]
+impl Clock for Rc<ManualClock> {
+    fn now(&self) -> Instant {
+        self.base + self.offset.get()
+    }
+}
+
+/// One pending timer tracked by the runtime.
+#[derive(Debug)]
+struct TimerEntry {
+    call_id: CallId,
+    deadline: Instant,
+    insertion_order: u64,
+}
+
 /// Small deterministic single-shard runtime for the second Mariner slice.
 ///
 /// The runtime owns one shard value plus a private registry of isolates and
@@ -87,6 +150,9 @@ where
     io_backend: IoBackend,
     in_flight_calls: Vec<InFlightCall>,
     translators: Vec<StoredTranslator>,
+    clock: Box<dyn Clock>,
+    timers: Vec<TimerEntry>,
+    next_timer_ordinal: u64,
 }
 
 #[derive(Debug)]
@@ -121,6 +187,10 @@ where
     /// Creates a new runtime for one shard plus one runtime-owned mailbox
     /// factory for future spawned children.
     pub fn new(shard: S, mailbox_factory: F) -> Self {
+        Self::with_clock(shard, mailbox_factory, Box::new(MonotonicClock))
+    }
+
+    fn with_clock(shard: S, mailbox_factory: F, clock: Box<dyn Clock>) -> Self {
         Self {
             shard,
             mailbox_factory,
@@ -134,6 +204,9 @@ where
             io_backend: IoBackend::new(),
             in_flight_calls: Vec::new(),
             translators: Vec::new(),
+            clock,
+            timers: Vec::new(),
+            next_timer_ordinal: 0,
         }
     }
 
@@ -141,7 +214,7 @@ where
     /// yet been delivered. Tests use this to know when stepping further
     /// can produce more I/O completions.
     pub fn has_in_flight_calls(&self) -> bool {
-        !self.in_flight_calls.is_empty() || self.io_backend.has_pending()
+        !self.in_flight_calls.is_empty() || self.io_backend.has_pending() || !self.timers.is_empty()
     }
 
     #[cfg(test)]
@@ -268,7 +341,9 @@ where
     ///
     /// The return value is the number of handlers that ran in this round.
     pub fn step(&mut self) -> usize {
+        let now = self.clock.now();
         self.advance_io_backend();
+        self.harvest_timers(now);
 
         let mut round_messages: Vec<Option<Box<dyn Any>>> = self
             .entries
@@ -505,8 +580,22 @@ where
             translator: Some(translator),
         });
 
-        if let Some(immediate) = self.io_backend.submit(call_id, request) {
-            self.deliver_completion(immediate.call_id, immediate.result);
+        match request {
+            CallRequest::Sleep { after } => {
+                let deadline = self.clock.now() + after;
+                let insertion_order = self.next_timer_ordinal;
+                self.next_timer_ordinal += 1;
+                self.timers.push(TimerEntry {
+                    call_id,
+                    deadline,
+                    insertion_order,
+                });
+            }
+            other => {
+                if let Some(immediate) = self.io_backend.submit(call_id, other) {
+                    self.deliver_completion(immediate.call_id, immediate.result);
+                }
+            }
         }
     }
 
@@ -514,6 +603,27 @@ where
         let completed = self.io_backend.advance();
         for op in completed {
             self.deliver_completion(op.call_id, op.result);
+        }
+    }
+
+    fn harvest_timers(&mut self, now: Instant) {
+        let mut due = Vec::new();
+        let mut still_pending = Vec::new();
+        for entry in std::mem::take(&mut self.timers) {
+            if entry.deadline <= now {
+                due.push(entry);
+            } else {
+                still_pending.push(entry);
+            }
+        }
+        self.timers = still_pending;
+        due.sort_by(|a, b| {
+            a.deadline
+                .cmp(&b.deadline)
+                .then_with(|| a.insertion_order.cmp(&b.insertion_order))
+        });
+        for entry in due {
+            self.deliver_completion(entry.call_id, CallResult::TimerFired);
         }
     }
 

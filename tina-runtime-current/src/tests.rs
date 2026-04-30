@@ -1049,3 +1049,443 @@ fn two_stream_reads_can_be_pending_in_io_backend_at_once() {
         client.join().expect("client thread");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Timer semantics tests (Phase 015)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerMsg {
+    StartSleep,
+    Fired,
+    StopNow,
+}
+
+#[derive(Debug)]
+struct Sleeper {
+    delay: Duration,
+}
+
+impl Isolate for Sleeper {
+    type Message = TimerMsg;
+    type Reply = ();
+    type Send = SendMessage<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = CurrentCall<TimerMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            TimerMsg::StartSleep => Effect::Call(CurrentCall::new(
+                CallRequest::Sleep { after: self.delay },
+                |result| match result {
+                    CallResult::TimerFired => TimerMsg::Fired,
+                    other => panic!("expected TimerFired, got {other:?}"),
+                },
+            )),
+            TimerMsg::Fired => Effect::Noop,
+            TimerMsg::StopNow => Effect::Stop,
+        }
+    }
+}
+
+fn new_manual_runtime() -> (
+    CurrentRuntime<TestShard, TestMailboxFactory>,
+    Rc<ManualClock>,
+) {
+    let clock = Rc::new(ManualClock::new());
+    let runtime =
+        CurrentRuntime::with_clock(TestShard, TestMailboxFactory, Box::new(Rc::clone(&clock)));
+    (runtime, clock)
+}
+
+#[test]
+fn single_timer_wakes_after_deadline() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let sleeper = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(sleeper, TimerMsg::StartSleep).unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert!(runtime.has_in_flight_calls());
+
+    clock.advance(Duration::from_millis(5));
+    assert_eq!(runtime.step(), 0);
+    assert!(runtime.has_in_flight_calls());
+
+    clock.advance(Duration::from_millis(5));
+    assert_eq!(runtime.step(), 1);
+    assert!(!runtime.has_in_flight_calls());
+
+    let trace = runtime.trace();
+    assert!(
+        trace.iter().any(|e| matches!(
+            e.kind(),
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::Sleep,
+                ..
+            }
+        )),
+        "trace must show CallCompleted for Sleep"
+    );
+}
+
+#[test]
+fn timer_does_not_fire_early() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let sleeper = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(100),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(sleeper, TimerMsg::StartSleep).unwrap();
+    runtime.step();
+
+    for _ in 0..5 {
+        clock.advance(Duration::from_millis(10));
+        runtime.step();
+    }
+
+    assert!(runtime.has_in_flight_calls());
+    let fired_count = runtime
+        .trace()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(fired_count, 0, "timer must not fire before deadline");
+}
+
+#[test]
+fn timer_fires_exactly_once() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let sleeper = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(sleeper, TimerMsg::StartSleep).unwrap();
+    runtime.step();
+
+    clock.advance(Duration::from_millis(10));
+    runtime.step();
+
+    clock.advance(Duration::from_millis(100));
+    runtime.step();
+    runtime.step();
+
+    let fired_count = runtime
+        .trace()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(fired_count, 1, "timer must fire exactly once");
+}
+
+#[test]
+fn multiple_timers_wake_in_due_time_order() {
+    let (mut runtime, clock) = new_manual_runtime();
+
+    let short = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+    let long = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(30),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(short, TimerMsg::StartSleep).unwrap();
+    runtime.try_send(long, TimerMsg::StartSleep).unwrap();
+    runtime.step();
+    runtime.step();
+
+    clock.advance(Duration::from_millis(15));
+    runtime.step();
+
+    let fired_order: Vec<IsolateId> = runtime
+        .trace()
+        .iter()
+        .filter_map(|e| match e.kind() {
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::Sleep,
+                ..
+            } => Some(e.isolate()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(fired_order, vec![short.isolate()]);
+
+    clock.advance(Duration::from_millis(20));
+    runtime.step();
+
+    let fired_order: Vec<IsolateId> = runtime
+        .trace()
+        .iter()
+        .filter_map(|e| match e.kind() {
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::Sleep,
+                ..
+            } => Some(e.isolate()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(fired_order, vec![short.isolate(), long.isolate()]);
+}
+
+#[test]
+fn equal_deadline_timers_wake_in_request_order() {
+    let (mut runtime, clock) = new_manual_runtime();
+
+    let first = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+    let second = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(first, TimerMsg::StartSleep).unwrap();
+    runtime.step();
+    runtime.try_send(second, TimerMsg::StartSleep).unwrap();
+    runtime.step();
+
+    clock.advance(Duration::from_millis(10));
+    runtime.step();
+
+    let fired_order: Vec<IsolateId> = runtime
+        .trace()
+        .iter()
+        .filter_map(|e| match e.kind() {
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::Sleep,
+                ..
+            } => Some(e.isolate()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(fired_order, vec![first.isolate(), second.isolate()]);
+}
+
+#[test]
+fn pending_timer_completion_is_rejected_when_requester_stops() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let sleeper = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(sleeper, TimerMsg::StartSleep).unwrap();
+    runtime.step();
+    runtime.try_send(sleeper, TimerMsg::StopNow).unwrap();
+    runtime.step();
+
+    clock.advance(Duration::from_millis(20));
+    runtime.step();
+
+    let trace = runtime.trace();
+    assert!(
+        trace.iter().any(|e| matches!(
+            e.kind(),
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::Sleep,
+                reason: CallCompletionRejectedReason::RequesterClosed,
+                ..
+            }
+        )),
+        "trace must show CallCompletionRejected for stopped timer requester"
+    );
+    assert!(
+        !trace.iter().any(|e| matches!(
+            e.kind(),
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::Sleep,
+                ..
+            }
+        )),
+        "stopped requester must not observe CallCompleted"
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryMsg {
+    Attempt,
+    RetryNow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryObservation {
+    Attempted(usize),
+    Failed(usize),
+    BackoffElapsed,
+    Succeeded(usize),
+}
+
+#[derive(Debug)]
+struct RetryWorker {
+    backoff: Duration,
+    attempts: usize,
+    observations: Rc<RefCell<Vec<RetryObservation>>>,
+}
+
+impl Isolate for RetryWorker {
+    type Message = RetryMsg;
+    type Reply = ();
+    type Send = SendMessage<RetryMsg>;
+    type Spawn = Infallible;
+    type Call = CurrentCall<RetryMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            RetryMsg::Attempt => {
+                self.attempts += 1;
+                self.observations
+                    .borrow_mut()
+                    .push(RetryObservation::Attempted(self.attempts));
+                if self.attempts == 1 {
+                    self.observations
+                        .borrow_mut()
+                        .push(RetryObservation::Failed(self.attempts));
+                    Effect::Call(CurrentCall::new(
+                        CallRequest::Sleep {
+                            after: self.backoff,
+                        },
+                        |_| RetryMsg::RetryNow,
+                    ))
+                } else {
+                    self.observations
+                        .borrow_mut()
+                        .push(RetryObservation::Succeeded(self.attempts));
+                    Effect::Noop
+                }
+            }
+            RetryMsg::RetryNow => {
+                self.observations
+                    .borrow_mut()
+                    .push(RetryObservation::BackoffElapsed);
+                Effect::Send(SendMessage::new(
+                    ctx.current_address::<RetryMsg>(),
+                    RetryMsg::Attempt,
+                ))
+            }
+        }
+    }
+}
+
+#[test]
+fn retry_backoff_workload_uses_timer_path() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let observations = Rc::new(RefCell::new(Vec::new()));
+    let worker = runtime.register(
+        RetryWorker {
+            backoff: Duration::from_millis(50),
+            attempts: 0,
+            observations: Rc::clone(&observations),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(worker, RetryMsg::Attempt).unwrap();
+
+    // Step 1: first attempt fails and arms one backoff timer.
+    assert_eq!(runtime.step(), 1);
+    assert!(runtime.has_in_flight_calls());
+    assert_eq!(
+        observations.borrow().as_slice(),
+        [RetryObservation::Attempted(1), RetryObservation::Failed(1),]
+    );
+
+    // Not enough time elapsed
+    clock.advance(Duration::from_millis(10));
+    assert_eq!(runtime.step(), 0);
+    assert!(runtime.has_in_flight_calls());
+    assert_eq!(
+        observations.borrow().as_slice(),
+        [RetryObservation::Attempted(1), RetryObservation::Failed(1),]
+    );
+
+    // Now the timer fires; the translated RetryNow message is handled and
+    // enqueues the real retry attempt for the next step.
+    clock.advance(Duration::from_millis(40));
+    assert_eq!(runtime.step(), 1);
+    assert!(!runtime.has_in_flight_calls());
+    assert_eq!(
+        observations.borrow().as_slice(),
+        [
+            RetryObservation::Attempted(1),
+            RetryObservation::Failed(1),
+            RetryObservation::BackoffElapsed,
+        ]
+    );
+
+    // Next step performs the real second attempt, which now succeeds.
+    assert_eq!(runtime.step(), 1);
+    assert!(!runtime.has_in_flight_calls());
+    assert_eq!(
+        observations.borrow().as_slice(),
+        [
+            RetryObservation::Attempted(1),
+            RetryObservation::Failed(1),
+            RetryObservation::BackoffElapsed,
+            RetryObservation::Attempted(2),
+            RetryObservation::Succeeded(2),
+        ]
+    );
+
+    let trace = runtime.trace();
+    let sleep_completions: Vec<_> = trace
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        sleep_completions.len(),
+        1,
+        "trace must show exactly one Sleep completion for the backoff timer"
+    );
+}
