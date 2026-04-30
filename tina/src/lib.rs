@@ -15,9 +15,10 @@
 //!
 //! This keeps the dispatcher contract small and uniform: every isolate can only
 //! ask for the same handful of verbs (`Reply`, `Send`, `Spawn`, `Stop`,
-//! `RestartChildren`, and `Call`). That simplicity matters for the runtime
-//! crates we add in later phases, because they can switch on one shared enum
-//! instead of handling an open-ended effect language for every isolate.
+//! `RestartChildren`, `Call`, and ordered `Batch`). That simplicity matters
+//! for the runtime crates we add in later phases, because they can switch on
+//! one shared enum instead of handling an open-ended effect language for every
+//! isolate.
 //!
 //! The tradeoff is that the effect *payloads* stay per-isolate via associated
 //! types on [`Isolate`]. An isolate decides what a reply looks like, how it
@@ -189,6 +190,17 @@ where
     /// Completion is delivered as a regular later-turn `Message`, never as
     /// a second handler entry point.
     Call(I::Call),
+
+    /// Execute several existing effects in deterministic left-to-right order.
+    ///
+    /// This keeps the effect set closed while letting one handler turn express
+    /// small explicit workflows such as "spawn child, then re-arm accept" or
+    /// "send audit record, then send follow-up". A runtime should execute the
+    /// contained effects in source order. If a [`Stop`](Self::Stop) appears in
+    /// the batch, later effects in the same batch are not executed.
+    ///
+    /// An empty batch is equivalent to [`Noop`](Self::Noop).
+    Batch(Vec<Effect<I>>),
 }
 
 /// A bounded, typed inbox.

@@ -1,7 +1,16 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::convert::Infallible;
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -842,4 +851,201 @@ fn identical_runs_produce_identical_trace_and_lineage() {
     }
 
     assert_eq!(run_once(), run_once());
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverlapAcceptorMsg {
+    Bootstrap,
+    Bound {
+        listener: ListenerId,
+        addr: SocketAddr,
+    },
+    Accepted {
+        stream: StreamId,
+    },
+    Failed,
+}
+
+#[derive(Debug)]
+struct OverlapAcceptor {
+    bind_addr: SocketAddr,
+    bound_addr_slot: Arc<Mutex<Option<SocketAddr>>>,
+    accepted_streams: Arc<Mutex<Vec<StreamId>>>,
+    listener: Option<ListenerId>,
+}
+
+impl Isolate for OverlapAcceptor {
+    type Message = OverlapAcceptorMsg;
+    type Reply = ();
+    type Send = SendMessage<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = CurrentCall<OverlapAcceptorMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            OverlapAcceptorMsg::Bootstrap => {
+                let addr = self.bind_addr;
+                Effect::Call(CurrentCall::new(
+                    CallRequest::TcpBind { addr },
+                    move |result| match result {
+                        CallResult::TcpBound {
+                            listener,
+                            local_addr,
+                        } => OverlapAcceptorMsg::Bound {
+                            listener,
+                            addr: local_addr,
+                        },
+                        CallResult::Failed(_) => OverlapAcceptorMsg::Failed,
+                        other => panic!("unexpected bind result {other:?}"),
+                    },
+                ))
+            }
+            OverlapAcceptorMsg::Bound { listener, addr } => {
+                self.listener = Some(listener);
+                *self.bound_addr_slot.lock().expect("bound addr mutex") = Some(addr);
+                Effect::Call(CurrentCall::new(
+                    CallRequest::TcpAccept { listener },
+                    |result| match result {
+                        CallResult::TcpAccepted { stream, .. } => {
+                            OverlapAcceptorMsg::Accepted { stream }
+                        }
+                        CallResult::Failed(_) => OverlapAcceptorMsg::Failed,
+                        other => panic!("unexpected accept result {other:?}"),
+                    },
+                ))
+            }
+            OverlapAcceptorMsg::Accepted { stream } => {
+                let mut accepted = self.accepted_streams.lock().expect("accepted mutex");
+                accepted.push(stream);
+                if accepted.len() < 2 {
+                    let listener = self.listener.expect("listener stored before re-arm");
+                    Effect::Call(CurrentCall::new(
+                        CallRequest::TcpAccept { listener },
+                        |result| match result {
+                            CallResult::TcpAccepted { stream, .. } => {
+                                OverlapAcceptorMsg::Accepted { stream }
+                            }
+                            CallResult::Failed(_) => OverlapAcceptorMsg::Failed,
+                            other => panic!("unexpected accept result {other:?}"),
+                        },
+                    ))
+                } else {
+                    Effect::Noop
+                }
+            }
+            OverlapAcceptorMsg::Failed => Effect::Stop,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderMsg {
+    Start,
+    ReadCompleted,
+    Failed,
+}
+
+#[derive(Debug)]
+struct Reader {
+    stream: StreamId,
+}
+
+impl Isolate for Reader {
+    type Message = ReaderMsg;
+    type Reply = ();
+    type Send = SendMessage<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = CurrentCall<ReaderMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ReaderMsg::Start => Effect::Call(CurrentCall::new(
+                CallRequest::TcpRead {
+                    stream: self.stream,
+                    max_len: 16,
+                },
+                |result| match result {
+                    CallResult::TcpRead { .. } => ReaderMsg::ReadCompleted,
+                    CallResult::Failed(_) => ReaderMsg::Failed,
+                    other => panic!("unexpected read result {other:?}"),
+                },
+            )),
+            ReaderMsg::ReadCompleted | ReaderMsg::Failed => Effect::Stop,
+        }
+    }
+}
+
+#[test]
+fn two_stream_reads_can_be_pending_in_io_backend_at_once() {
+    let bound_addr = Arc::new(Mutex::new(None));
+    let accepted_streams = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let acceptor = runtime.register(
+        OverlapAcceptor {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+            bound_addr_slot: Arc::clone(&bound_addr),
+            accepted_streams: Arc::clone(&accepted_streams),
+            listener: None,
+        },
+        TestMailbox::new(8),
+    );
+
+    assert_eq!(
+        runtime.try_send(acceptor, OverlapAcceptorMsg::Bootstrap),
+        Ok(())
+    );
+
+    let bind_deadline = Instant::now() + Duration::from_secs(2);
+    while bound_addr.lock().expect("bound addr mutex").is_none() {
+        assert!(
+            Instant::now() <= bind_deadline,
+            "timed out waiting for bind"
+        );
+        runtime.step();
+        thread::sleep(Duration::from_millis(2));
+    }
+    let local_addr = bound_addr
+        .lock()
+        .expect("bound addr mutex")
+        .expect("listener published address");
+
+    let release_clients = Arc::new(AtomicBool::new(false));
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let release_clients = Arc::clone(&release_clients);
+        clients.push(thread::spawn(move || {
+            let mut stream = TcpStream::connect(local_addr).expect("connect");
+            stream.set_nodelay(true).ok();
+            while !release_clients.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            let _ = stream.write_all(b"done");
+        }));
+    }
+
+    let accept_deadline = Instant::now() + Duration::from_secs(2);
+    while accepted_streams.lock().expect("accepted mutex").len() < 2 {
+        assert!(
+            Instant::now() <= accept_deadline,
+            "timed out waiting for two accepted streams"
+        );
+        runtime.step();
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let streams = accepted_streams.lock().expect("accepted mutex").clone();
+    for stream in streams {
+        let reader = runtime.register(Reader { stream }, TestMailbox::new(8));
+        assert_eq!(runtime.try_send(reader, ReaderMsg::Start), Ok(()));
+    }
+
+    assert_eq!(runtime.step(), 2);
+    assert_eq!(runtime.io_pending_count(), 2);
+
+    release_clients.store(true, Ordering::SeqCst);
+    for client in clients {
+        client.join().expect("client thread");
+    }
 }

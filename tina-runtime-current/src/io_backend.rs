@@ -188,6 +188,11 @@ impl IoBackend {
         !self.pending.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
     fn try_complete(&mut self, op: &mut PendingOperation) -> Option<CallResult> {
         match &mut op.kind {
             PendingKind::Accept(completion) => {

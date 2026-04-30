@@ -63,6 +63,9 @@ pub enum EffectKind {
 
     /// The handler returned [`tina::Effect::Call`].
     Call,
+
+    /// The handler returned [`tina::Effect::Batch`].
+    Batch,
 }
 
 /// Trace-level kind of a runtime-owned call.

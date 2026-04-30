@@ -12,11 +12,10 @@
 //! - bind to `127.0.0.1:0` and rely on the runtime to report the actual
 //!   bound address through `CallResult::TcpBound { local_addr }`
 //! - assertions cover both observed network behavior (echoed bytes) and
-//!   trace evidence (each call kind on the path appears with a
-//!   `CallCompleted` event)
-//! - one client connection only; multi-connection workloads would need
-//!   an ingress-driven re-arm and are out of scope for the first echo
-//!   proof per the package plan
+//!   trace evidence (call completions, child spawns, batch effects,
+//!   listener close/stop)
+//! - keep assertions per-stream and on event multiplicity; do not claim
+//!   cross-stream ordering the runtime never promised
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -24,12 +23,12 @@ use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tina::{
-    Context, Effect, Isolate, IsolateId, Mailbox, RestartBudget, RestartPolicy,
+    Address, Context, Effect, Isolate, IsolateId, Mailbox, RestartBudget, RestartPolicy,
     RestartableSpawnSpec, SendMessage, Shard, ShardId, TrySendError,
 };
 use tina_runtime_current::{
@@ -203,6 +202,9 @@ enum ListenerMsg {
         listener: ListenerId,
         addr: SocketAddr,
     },
+    ReArmAccept,
+    CloseListener,
+    ListenerClosed,
     Accepted {
         stream: StreamId,
     },
@@ -214,19 +216,24 @@ struct Listener {
     bind_addr: SocketAddr,
     bound_addr_slot: BoundAddr,
     max_chunk: usize,
+    target_accepts: usize,
+    accepted_count: usize,
+    self_addr: Option<Address<ListenerMsg>>,
+    listener: Option<ListenerId>,
 }
 
 impl Isolate for Listener {
     type Message = ListenerMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = SendMessage<ListenerMsg>;
     type Spawn = RestartableSpawnSpec<Connection>;
     type Call = CurrentCall<ListenerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             ListenerMsg::Bootstrap => {
+                self.self_addr = Some(ctx.current_address::<ListenerMsg>());
                 let addr = self.bind_addr;
                 Effect::Call(CurrentCall::new(
                     CallRequest::TcpBind { addr },
@@ -244,6 +251,7 @@ impl Isolate for Listener {
                 ))
             }
             ListenerMsg::Bound { listener, addr } => {
+                self.listener = Some(listener);
                 *self
                     .bound_addr_slot
                     .lock()
@@ -257,9 +265,21 @@ impl Isolate for Listener {
                     },
                 ))
             }
+            ListenerMsg::ReArmAccept => {
+                let listener = self.listener.expect("listener stored before re-arm");
+                Effect::Call(CurrentCall::new(
+                    CallRequest::TcpAccept { listener },
+                    |result| match result {
+                        CallResult::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
+                        CallResult::Failed(_) => ListenerMsg::Failed,
+                        other => panic!("unexpected accept result {other:?}"),
+                    },
+                ))
+            }
             ListenerMsg::Accepted { stream } => {
+                self.accepted_count += 1;
                 let max_chunk = self.max_chunk;
-                Effect::Spawn(
+                let spawn = Effect::Spawn(
                     RestartableSpawnSpec::new(
                         move || Connection {
                             stream,
@@ -269,8 +289,30 @@ impl Isolate for Listener {
                         8,
                     )
                     .with_bootstrap(|| ConnectionMsg::Start),
-                )
+                );
+                let self_addr = self.self_addr.expect("listener captured its own address");
+                let follow_up = if self.accepted_count < self.target_accepts {
+                    ListenerMsg::ReArmAccept
+                } else {
+                    ListenerMsg::CloseListener
+                };
+                Effect::Batch(vec![
+                    spawn,
+                    Effect::Send(SendMessage::new(self_addr, follow_up)),
+                ])
             }
+            ListenerMsg::CloseListener => {
+                let listener = self.listener.expect("listener stored before close");
+                Effect::Call(CurrentCall::new(
+                    CallRequest::TcpListenerClose { listener },
+                    |result| match result {
+                        CallResult::TcpListenerClosed => ListenerMsg::ListenerClosed,
+                        CallResult::Failed(_) => ListenerMsg::Failed,
+                        other => panic!("unexpected listener close result {other:?}"),
+                    },
+                ))
+            }
+            ListenerMsg::ListenerClosed => Effect::Stop,
             ListenerMsg::Failed => Effect::Stop,
         }
     }
@@ -301,20 +343,22 @@ fn step_until<F>(
     }
 }
 
-fn pump_runtime(
+fn pump_runtime_until<F>(
     runtime: &mut CurrentRuntime<TestShard, TestMailboxFactory>,
-    flag: &Arc<Mutex<bool>>,
     timeout: Duration,
-) {
+    predicate: F,
+) where
+    F: Fn() -> bool,
+{
     let deadline = Instant::now() + timeout;
     loop {
         runtime.step();
-        if *flag.lock().expect("flag mutex never poisoned") {
+        if predicate() {
             return;
         }
         if Instant::now() > deadline {
             panic!(
-                "pump_runtime timed out waiting for client thread; trace = {:#?}",
+                "pump_runtime_until timed out waiting for condition; trace = {:#?}",
                 runtime.trace()
             );
         }
@@ -322,77 +366,63 @@ fn pump_runtime(
     }
 }
 
-fn assert_call_path_completed(trace: &[RuntimeEvent], kind: CallKind) {
-    let dispatched = trace.iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::CallDispatchAttempted { call_kind, .. } if call_kind == kind
-        )
-    });
-    assert!(
-        dispatched,
-        "expected CallDispatchAttempted({kind:?}) in trace"
-    );
-    let completed = trace.iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == kind
-        )
-    });
-    assert!(completed, "expected CallCompleted({kind:?}) in trace");
+fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == kind
+            )
+        })
+        .count()
 }
 
-// ---------------------------------------------------------------------------
-// Main echo test.
-// ---------------------------------------------------------------------------
+fn count_spawned(trace: &[RuntimeEvent]) -> usize {
+    trace
+        .iter()
+        .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        .count()
+}
 
-#[test]
-fn tcp_echo_round_trips_one_client_payload() {
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
-    let bound: BoundAddr = Arc::new(Mutex::new(None));
+fn count_handler_finished(
+    trace: &[RuntimeEvent],
+    effect: tina_runtime_current::EffectKind,
+) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::HandlerFinished { effect: actual } if actual == effect
+            )
+        })
+        .count()
+}
 
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+struct ClientRun {
+    done: Arc<Mutex<bool>>,
+    echoed: Arc<Mutex<Vec<u8>>>,
+    handle: JoinHandle<()>,
+}
 
-    let listener_addr = runtime.register(
-        Listener {
-            bind_addr,
-            bound_addr_slot: Arc::clone(&bound),
-            max_chunk: 256,
-        },
-        TestMailbox::new(8),
-    );
-
-    runtime.supervise(
-        listener_addr,
-        SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
-    );
-
-    runtime
-        .try_send(listener_addr, ListenerMsg::Bootstrap)
-        .expect("bootstrap accepts");
-
-    // Drive the runtime until the listener has published the bound addr.
-    step_until(&mut runtime, Duration::from_secs(2), "bind", |_| {
-        bound.lock().expect("mutex").is_some()
-    });
-
-    let local_addr = bound
-        .lock()
-        .expect("mutex")
-        .expect("listener published address");
-
-    // Client thread: connect, write, half-close, read echoed bytes.
-    let payload: Vec<u8> = b"hello from a tina-rs echo client".to_vec();
-    let payload_for_client = payload.clone();
+fn spawn_client(
+    local_addr: SocketAddr,
+    payload: Vec<u8>,
+    barrier: Option<Arc<Barrier>>,
+) -> ClientRun {
     let done = Arc::new(Mutex::new(false));
     let echoed: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let echoed_for_client = Arc::clone(&echoed);
     let done_for_client = Arc::clone(&done);
+    let echoed_for_client = Arc::clone(&echoed);
 
-    let client: JoinHandle<()> = thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let mut stream = TcpStream::connect(local_addr).expect("connect");
         stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
-        stream.write_all(&payload_for_client).expect("write");
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+        stream.write_all(&payload).expect("write");
         stream
             .shutdown(std::net::Shutdown::Write)
             .expect("write shutdown");
@@ -411,30 +441,184 @@ fn tcp_echo_round_trips_one_client_payload() {
         *done_for_client.lock().expect("mutex") = true;
     });
 
-    // Pump the runtime until the client thread reports completion.
-    pump_runtime(&mut runtime, &done, Duration::from_secs(5));
+    ClientRun {
+        done,
+        echoed,
+        handle,
+    }
+}
 
-    // Pump any stragglers so the trace is settled before we read it.
-    let drain_deadline = Instant::now() + Duration::from_millis(500);
-    while runtime.has_in_flight_calls() {
-        runtime.step();
-        if Instant::now() > drain_deadline {
-            break;
+fn run_echo_scenario(
+    payloads: Vec<Vec<u8>>,
+    overlap: bool,
+    timeout: Duration,
+) -> (Vec<Vec<u8>>, Vec<RuntimeEvent>, IsolateId) {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+    let bound: BoundAddr = Arc::new(Mutex::new(None));
+
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+
+    let listener_addr = runtime.register(
+        Listener {
+            bind_addr,
+            bound_addr_slot: Arc::clone(&bound),
+            max_chunk: 256,
+            target_accepts: payloads.len(),
+            accepted_count: 0,
+            self_addr: None,
+            listener: None,
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime.supervise(
+        listener_addr,
+        SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
+    );
+
+    runtime
+        .try_send(listener_addr, ListenerMsg::Bootstrap)
+        .expect("bootstrap accepts");
+
+    step_until(&mut runtime, Duration::from_secs(2), "bind", |_| {
+        bound.lock().expect("mutex").is_some()
+    });
+
+    let local_addr = bound
+        .lock()
+        .expect("mutex")
+        .expect("listener published address");
+
+    let clients = if overlap {
+        let barrier = Arc::new(Barrier::new(payloads.len()));
+        payloads
+            .into_iter()
+            .map(|payload| spawn_client(local_addr, payload, Some(Arc::clone(&barrier))))
+            .collect::<Vec<_>>()
+    } else {
+        let mut clients = Vec::new();
+        for payload in payloads {
+            let client = spawn_client(local_addr, payload, None);
+            pump_runtime_until(&mut runtime, timeout, || {
+                *client.done.lock().expect("flag mutex")
+            });
+            clients.push(client);
         }
-        thread::sleep(Duration::from_millis(2));
+        clients
+    };
+
+    if overlap {
+        pump_runtime_until(&mut runtime, timeout, || {
+            clients
+                .iter()
+                .all(|client| *client.done.lock().expect("flag mutex"))
+        });
     }
 
-    client.join().expect("client thread");
+    step_until(&mut runtime, timeout, "listener stop", |runtime| {
+        !runtime.has_in_flight_calls()
+            && runtime.trace().iter().any(|event| {
+                event.isolate() == listener_addr.isolate()
+                    && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+            })
+    });
 
-    let received = echoed.lock().expect("mutex").clone();
-    assert_eq!(received, payload, "echoed bytes must match");
+    let mut echoed = Vec::new();
+    for client in clients {
+        client.handle.join().expect("client thread");
+        echoed.push(client.echoed.lock().expect("mutex").clone());
+    }
 
-    let trace = runtime.trace();
-    assert_call_path_completed(trace, CallKind::TcpBind);
-    assert_call_path_completed(trace, CallKind::TcpAccept);
-    assert_call_path_completed(trace, CallKind::TcpRead);
-    assert_call_path_completed(trace, CallKind::TcpWrite);
-    assert_call_path_completed(trace, CallKind::TcpStreamClose);
+    (echoed, runtime.trace().to_vec(), listener_addr.isolate())
+}
+
+// ---------------------------------------------------------------------------
+// Main echo test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tcp_echo_round_trips_one_client_payload() {
+    let payload = b"hello from a tina-rs echo client".to_vec();
+    let (echoed, trace, listener_isolate) =
+        run_echo_scenario(vec![payload.clone()], false, Duration::from_secs(10));
+
+    assert_eq!(echoed, vec![payload]);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpBind), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpAccept), 1);
+    assert!(count_call_completed(&trace, CallKind::TcpRead) >= 2);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpWrite), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpStreamClose), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpListenerClose), 1);
+    assert_eq!(count_spawned(&trace), 1);
+    assert_eq!(
+        count_handler_finished(&trace, tina_runtime_current::EffectKind::Batch),
+        1
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| {
+                event.isolate() == listener_isolate
+                    && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn tcp_echo_serves_multiple_sequential_clients_without_rebinding_listener() {
+    let payloads = vec![
+        b"first sequential payload".to_vec(),
+        b"second sequential payload".to_vec(),
+        b"third sequential payload".to_vec(),
+    ];
+    let (echoed, trace, listener_isolate) =
+        run_echo_scenario(payloads.clone(), false, Duration::from_secs(10));
+
+    assert_eq!(echoed, payloads);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpBind), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpAccept), 3);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpStreamClose), 3);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpListenerClose), 1);
+    assert_eq!(count_spawned(&trace), 3);
+    assert_eq!(
+        count_handler_finished(&trace, tina_runtime_current::EffectKind::Batch),
+        3
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| {
+                event.isolate() == listener_isolate
+                    && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn tcp_echo_handles_two_overlapping_clients_and_rearms_listener() {
+    let payloads = vec![
+        b"first overlapping payload".to_vec(),
+        b"second overlapping payload".to_vec(),
+    ];
+    let (mut echoed, trace, _) = run_echo_scenario(payloads.clone(), true, Duration::from_secs(10));
+
+    echoed.sort();
+    let mut expected = payloads;
+    expected.sort();
+    assert_eq!(echoed, expected);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpBind), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpAccept), 2);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpStreamClose), 2);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpListenerClose), 1);
+    assert_eq!(count_spawned(&trace), 2);
+    assert_eq!(
+        count_handler_finished(&trace, tina_runtime_current::EffectKind::Batch),
+        2
+    );
 }
 
 #[test]

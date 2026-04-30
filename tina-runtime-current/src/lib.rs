@@ -144,6 +144,11 @@ where
         !self.in_flight_calls.is_empty() || self.io_backend.has_pending()
     }
 
+    #[cfg(test)]
+    fn io_pending_count(&self) -> usize {
+        self.io_backend.pending_count()
+    }
+
     /// Returns a shared reference to the shard.
     pub const fn shard(&self) -> &S {
         &self.shard
@@ -344,89 +349,130 @@ where
                 },
             );
 
-            match effect {
-                ErasedEffect::Stop => {
-                    self.stop_entry(index, isolate_id, handler_finished.into());
-                }
-                ErasedEffect::Send(send) => {
-                    let target_shard = send.target_shard;
-                    let target_isolate = send.target_isolate;
-                    let target_generation = send.target_generation;
-                    let attempted = self.push_event(
-                        isolate_id,
-                        Some(handler_finished.into()),
-                        RuntimeEventKind::SendDispatchAttempted {
-                            target_shard,
-                            target_isolate,
-                            target_generation,
-                        },
-                    );
-
-                    match self.dispatch_local_send(send) {
-                        Ok(()) => {
-                            self.push_event(
-                                isolate_id,
-                                Some(attempted.into()),
-                                RuntimeEventKind::SendAccepted {
-                                    target_shard,
-                                    target_isolate,
-                                    target_generation,
-                                },
-                            );
-                        }
-                        Err((target_shard, target_isolate, target_generation, reason)) => {
-                            self.push_event(
-                                isolate_id,
-                                Some(attempted.into()),
-                                RuntimeEventKind::SendRejected {
-                                    target_shard,
-                                    target_isolate,
-                                    target_generation,
-                                    reason,
-                                },
-                            );
-                        }
-                    }
-                }
-                ErasedEffect::Spawn(spawn) => {
-                    let mut outcome = spawn.spawn(self, isolate_id);
-                    let child_isolate = outcome.child.isolate;
-                    let child = outcome.child;
-                    let bootstrap_message = outcome.bootstrap_message.take();
-                    self.record_child(isolate_id, outcome);
-                    let spawned = self.push_event(
-                        isolate_id,
-                        Some(handler_finished.into()),
-                        RuntimeEventKind::Spawned { child_isolate },
-                    );
-                    if let Some(message) = bootstrap_message {
-                        self.enqueue_bootstrap_message(child, message, spawned.into());
-                    }
-                }
-                ErasedEffect::RestartChildren => {
-                    self.restart_children(isolate_id, handler_finished.into(), &mut round_messages);
-                }
-                ErasedEffect::Call(call) => {
-                    let requester = RegisteredAddress {
-                        shard: self.shard.id(),
-                        isolate: isolate_id,
-                        generation: self.entries[index].generation,
-                    };
-                    self.dispatch_call(call, requester, handler_finished.into());
-                }
-                ErasedEffect::Noop | ErasedEffect::Reply => {
-                    self.push_event(
-                        isolate_id,
-                        Some(handler_finished.into()),
-                        RuntimeEventKind::EffectObserved {
-                            effect: effect_kind,
-                        },
-                    );
-                }
-            }
+            self.execute_effect(
+                index,
+                isolate_id,
+                handler_finished.into(),
+                effect,
+                &mut round_messages,
+            );
         }
 
         delivered
+    }
+
+    fn execute_effect(
+        &mut self,
+        index: usize,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        effect: ErasedEffect<S, F>,
+        round_messages: &mut [Option<Box<dyn Any>>],
+    ) -> bool {
+        match effect {
+            ErasedEffect::Stop => {
+                self.stop_entry(index, isolate_id, cause);
+                true
+            }
+            ErasedEffect::Send(send) => {
+                let target_shard = send.target_shard;
+                let target_isolate = send.target_isolate;
+                let target_generation = send.target_generation;
+                let attempted = self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::SendDispatchAttempted {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                    },
+                );
+
+                match self.dispatch_local_send(send) {
+                    Ok(()) => {
+                        self.push_event(
+                            isolate_id,
+                            Some(attempted.into()),
+                            RuntimeEventKind::SendAccepted {
+                                target_shard,
+                                target_isolate,
+                                target_generation,
+                            },
+                        );
+                    }
+                    Err((target_shard, target_isolate, target_generation, reason)) => {
+                        self.push_event(
+                            isolate_id,
+                            Some(attempted.into()),
+                            RuntimeEventKind::SendRejected {
+                                target_shard,
+                                target_isolate,
+                                target_generation,
+                                reason,
+                            },
+                        );
+                    }
+                }
+                false
+            }
+            ErasedEffect::Spawn(spawn) => {
+                let mut outcome = spawn.spawn(self, isolate_id);
+                let child_isolate = outcome.child.isolate;
+                let child = outcome.child;
+                let bootstrap_message = outcome.bootstrap_message.take();
+                self.record_child(isolate_id, outcome);
+                let spawned = self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::Spawned { child_isolate },
+                );
+                if let Some(message) = bootstrap_message {
+                    self.enqueue_bootstrap_message(child, message, spawned.into());
+                }
+                false
+            }
+            ErasedEffect::RestartChildren => {
+                self.restart_children(isolate_id, cause, round_messages);
+                false
+            }
+            ErasedEffect::Call(call) => {
+                let requester = RegisteredAddress {
+                    shard: self.shard.id(),
+                    isolate: isolate_id,
+                    generation: self.entries[index].generation,
+                };
+                self.dispatch_call(call, requester, cause);
+                false
+            }
+            ErasedEffect::Noop => {
+                self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::EffectObserved {
+                        effect: EffectKind::Noop,
+                    },
+                );
+                false
+            }
+            ErasedEffect::Reply => {
+                self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::EffectObserved {
+                        effect: EffectKind::Reply,
+                    },
+                );
+                false
+            }
+            ErasedEffect::Batch(effects) => {
+                for subeffect in effects {
+                    if self.execute_effect(index, isolate_id, cause, subeffect, round_messages) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
     }
 
     fn dispatch_call(&mut self, call: ErasedCall, requester: RegisteredAddress, cause: CauseId) {
@@ -1304,7 +1350,7 @@ where
 
 impl<I, S, F, Outbound> ErasedHandler<S, F> for HandlerAdapter<I, Outbound>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>>,
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1327,23 +1373,42 @@ where
             self.isolate.handle(*message, &mut ctx)
         };
 
-        match effect {
-            Effect::Noop => ErasedEffect::Noop,
-            Effect::Reply(_) => ErasedEffect::Reply,
-            Effect::Send(send) => {
-                let (destination, message) = send.into_parts();
-                ErasedEffect::Send(ErasedSend {
-                    target_shard: destination.shard(),
-                    target_isolate: destination.isolate(),
-                    target_generation: destination.generation(),
-                    message: Box::new(message),
-                })
-            }
-            Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
-            Effect::Stop => ErasedEffect::Stop,
-            Effect::RestartChildren => ErasedEffect::RestartChildren,
-            Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
+        erase_effect::<I, S, F, Outbound>(effect)
+    }
+}
+
+fn erase_effect<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
+where
+    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    Outbound: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    match effect {
+        Effect::Noop => ErasedEffect::Noop,
+        Effect::Reply(_) => ErasedEffect::Reply,
+        Effect::Send(send) => {
+            let (destination, message) = send.into_parts();
+            ErasedEffect::Send(ErasedSend {
+                target_shard: destination.shard(),
+                target_isolate: destination.isolate(),
+                target_generation: destination.generation(),
+                message: Box::new(message),
+            })
         }
+        Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::Stop => ErasedEffect::Stop,
+        Effect::RestartChildren => ErasedEffect::RestartChildren,
+        Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
+        Effect::Batch(effects) => ErasedEffect::Batch(
+            effects
+                .into_iter()
+                .map(erase_effect::<I, S, F, Outbound>)
+                .collect(),
+        ),
     }
 }
 
@@ -1374,6 +1439,7 @@ where
     Stop,
     RestartChildren,
     Call(ErasedCall),
+    Batch(Vec<ErasedEffect<S, F>>),
 }
 
 impl<S, F> ErasedEffect<S, F>
@@ -1390,6 +1456,7 @@ where
             Self::Stop => EffectKind::Stop,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
+            Self::Batch(_) => EffectKind::Batch,
         }
     }
 }

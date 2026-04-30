@@ -12,6 +12,7 @@ enum SessionMsg {
     Note(String),
     Read,
     SpawnWorker,
+    SpawnAndAudit,
     Stop,
     RestartWorkers,
     Ignore,
@@ -119,6 +120,13 @@ impl Isolate for Session {
             }
             SessionMsg::Read => Effect::Reply(self.notes.clone()),
             SessionMsg::SpawnWorker => Effect::Spawn(SpawnSpec::new(Worker::new(0), 8)),
+            SessionMsg::SpawnAndAudit => Effect::Batch(vec![
+                Effect::Spawn(SpawnSpec::new(Worker::new(7), 8)),
+                Effect::Send(SendMessage::new(
+                    self.audit,
+                    AuditMsg::Record("spawned".to_owned()),
+                )),
+            ]),
             SessionMsg::Stop => Effect::Stop,
             SessionMsg::RestartWorkers => Effect::RestartChildren,
             SessionMsg::Ignore => Effect::Noop,
@@ -209,6 +217,30 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
             assert!(bootstrap.is_none());
         }
         other => panic!("expected spawn effect, got {other:?}"),
+    }
+
+    match session.handle(SessionMsg::SpawnAndAudit, &mut ctx) {
+        Effect::Batch(effects) => {
+            assert_eq!(effects.len(), 2);
+            let mut effects = effects.into_iter();
+            match effects.next().expect("first batch effect") {
+                Effect::Spawn(spec) => {
+                    let (worker, mailbox_capacity, bootstrap) = spec.into_parts();
+                    assert_eq!(worker.tenant_id, 7);
+                    assert_eq!(mailbox_capacity, 8);
+                    assert!(bootstrap.is_none());
+                }
+                other => panic!("expected first batched effect to be spawn, got {other:?}"),
+            }
+            match effects.next().expect("second batch effect") {
+                Effect::Send(outbound) => {
+                    assert_eq!(outbound.destination(), audit);
+                    assert_eq!(outbound.message(), &AuditMsg::Record("spawned".to_owned()));
+                }
+                other => panic!("expected second batched effect to be send, got {other:?}"),
+            }
+        }
+        other => panic!("expected batch effect, got {other:?}"),
     }
 
     assert!(matches!(
