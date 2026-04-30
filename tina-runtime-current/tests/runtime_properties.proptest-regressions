@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a62e6839718cf4c47fb2df486dd50dba99a29d451a8c72ef4f9b354621e0fe21 # shrinks to operations = [Submit { slot: 0, task: Poison }, Step, Step, Step, Submit { slot: 0, task: Normal }, RefreshSlot(0)]
+cc 8d0185f5ac72904f8ba32086c3bdb6513cf2f108a3c0e918908badd6ce784500 # shrinks to operations = [Submit { slot: 1, task: Poison }, Step, Step, Step, Submit { slot: 0, task: Normal }, RefreshSlot(1)]

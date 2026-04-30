@@ -54,6 +54,12 @@ for spawned children, restartable child records, and direct-child
 `RestartChildren` execution. It can also apply configured supervisor policy and
 runtime-lifetime budget state when a direct child handler panics.
 
+The repo now also has an assertion-backed task-dispatcher proof workload and a
+matching runnable example. They show the current reference shape for supervised
+work: clients send tasks to a dispatcher isolate, the dispatcher asks a small
+registry isolate for the current worker address, and later work can continue
+through replacement workers after a panic.
+
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may be the direct cause of many later events.
 
@@ -72,6 +78,11 @@ whole round.
 
 Some runtime proofs live in crate-local unit tests when the thing being proved
 is internal runtime state that should not become public API yet.
+
+Generated runtime-property tests also exist for small dispatcher workloads.
+Those tests do not just run live histories twice; they also replay the runtime
+trace and prove the trace can recover the same worker completions and restart
+outcomes that the live workload observed.
 
 There is not yet a simulator or Tokio bridge.
 

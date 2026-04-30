@@ -70,5 +70,14 @@ This file records completed work.
 - Added generated-history runtime property tests for deterministic traces,
   causal-link validity, visible send outcomes, and no accidental handling after
   stop.
+- Added an assertion-backed task-dispatcher proof package for the single-shard
+  runtime, covering `OneForOne`, `OneForAll`, `RestForOne`, budget exhaustion,
+  stale-address closure, and repeated-run determinism.
+- Added a runnable `task_dispatcher` example that mirrors the tested workload:
+  dispatcher-owned task ingress, registry-isolate address resolution, worker
+  panic/restart, and later work continuing through replacement workers.
+- Extended `runtime_properties.rs` with generated dispatcher workloads and a
+  replay-style proof that reconstructs worker completions, panics, stops, and
+  replacements from the runtime trace alone.
 - Added focused Miri coverage for the SPSC mailbox unsafe slot paths and a
   `make miri` target.
