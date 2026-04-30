@@ -1,1 +1,3 @@
 a145859 feat(runtime): complete tcp listener re-arm flow
+3edd0d0 docs(intent): close 014 tcp completeness phase
+6a79778 test(runtime): prove batch call sequencing

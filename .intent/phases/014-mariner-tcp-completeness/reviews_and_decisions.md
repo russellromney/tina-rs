@@ -534,3 +534,36 @@ Implementation note:
   instead of faking server completeness with one-effect-per-turn workarounds.
   That keeps the code aligned with the updated IDD standard: direct proof for
   the claimed server shape, no harness tricks, and no hidden callback path.
+
+---
+
+## Round 5: Proof Tightening After Closeout Review
+
+Post-closeout review caught one real proof gap under the updated IDD
+standard: `Effect::Batch(Vec<Effect<I>>)` is a public boundary change, but
+the direct batch-proof file originally exercised only `Send`, `Spawn`, and
+`Stop`. The TCP listener workload gave surrogate evidence for batched
+`Call`, but not direct proof.
+
+That gap is now closed by adding focused batch+call tests in
+`tina-runtime-current/tests/batch_effect.rs`:
+
+- `batch_send_then_synchronous_call_keeps_left_to_right_order`
+  directly proves left-to-right sequencing when a batched `TcpBind`
+  completes synchronously inside `dispatch_call`.
+- `batch_failing_call_still_runs_later_effects`
+  directly proves that an immediately failing batched `TcpRead`
+  still preserves ordering and does not suppress later effects.
+
+Verification after the proof tightening:
+
+- `cargo +nightly test -p tina-runtime-current --test batch_effect`
+- `cargo +nightly test -p tina-runtime-current --test tcp_echo`
+- `cargo +nightly test -p tina --test sputnik_api`
+- `make verify`
+
+With those tests in place, 014 now has:
+
+- direct proof for the new public batch boundary
+- direct proof for the changed TCP server shape
+- blast-radius proof through the existing runtime and trait-suite coverage
