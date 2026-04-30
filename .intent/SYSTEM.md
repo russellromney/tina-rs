@@ -95,10 +95,11 @@ connection-handler child that issues read / write / close calls. The
 listener spawns the connection child via
 `RestartableSpawnSpec::with_bootstrap`, so the connection's first read
 fires through the normal handler pipeline rather than via test-harness
-trace introspection. The proof binds to a concrete high loopback port and
-asserts on echoed bytes plus call-path trace evidence for every call kind
-on the path. The connection isolate honors partial writes through a small
-pending-buffer + drain pattern, exercised by a separate unit test.
+trace introspection. The proof binds to a test-selected concrete loopback
+port and asserts on echoed bytes plus call-path trace evidence for every
+call kind on the path. The connection isolate honors partial writes
+through a small pending-buffer + drain pattern, exercised by a separate
+unit test.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may be the direct cause of many later events.

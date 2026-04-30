@@ -9,12 +9,13 @@
 //!
 //! Constraints honored:
 //!
-//! - bind to a hardcoded high loopback port. The runtime does not
-//!   support ephemeral-port discovery on this Betelgeuse rev (see
-//!   `io_backend.rs` "Honest scope"), so a port-0 bind would yield a
-//!   dishonest `local_addr`. Tests pick a concrete port instead. If the
-//!   port is already in use on the host, this test fails loudly — that
-//!   is the honest signal.
+//! - bind to a test-selected concrete loopback port. The runtime does
+//!   not support ephemeral-port discovery on this Betelgeuse rev (see
+//!   `io_backend.rs` "Honest scope"), so the harness chooses a free
+//!   loopback port up front and then asks the runtime to bind that
+//!   exact address. If the host races and steals the port before the
+//!   runtime binds it, the test fails loudly — that is the honest
+//!   signal.
 //! - assertions cover both observed network behavior (echoed bytes) and
 //!   trace evidence (each call kind on the path appears with a
 //!   `CallCompleted` event)
@@ -26,7 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -350,18 +351,16 @@ fn assert_call_path_completed(trace: &[RuntimeEvent], kind: CallKind) {
 // Main echo test.
 // ---------------------------------------------------------------------------
 
-/// Hardcoded high loopback port for this integration test. Picked from
-/// the registered range and unlikely to collide with normal services on
-/// a developer machine. If it is already in use on the host the test
-/// fails loudly through the runtime's `TcpBind` failure path, which is
-/// the honest signal — the runtime cannot do ephemeral-port discovery
-/// honestly without an upstream `IOSocket::local_addr` (see
-/// `io_backend.rs`).
-const ECHO_TEST_PORT: u16 = 48721;
+fn choose_loopback_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("choose free loopback port")
+        .port()
+}
 
 #[test]
 fn tcp_echo_round_trips_one_client_payload() {
-    let bind_addr: SocketAddr = format!("127.0.0.1:{ECHO_TEST_PORT}")
+    let bind_addr: SocketAddr = format!("127.0.0.1:{}", choose_loopback_port())
         .parse()
         .expect("loopback parse");
     let bound: BoundAddr = Arc::new(Mutex::new(None));

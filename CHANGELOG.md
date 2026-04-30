@@ -113,8 +113,9 @@ This file records completed work.
 - Added an assertion-backed live `tcp_echo` integration test: listener
   isolate supervises a restartable connection-handler child spawned via
   `RestartableSpawnSpec::with_bootstrap`; bytes round-trip end-to-end on
-  a concrete high loopback port; trace evidence is asserted per call kind.
-  A separate unit test proves the connection isolate's partial-write retry
-  logic.
+  a test-selected concrete loopback port; trace evidence is asserted per
+  call kind. Separate unit tests prove the connection isolate's
+  partial-write retry logic and the `CallCompletionRejected{RequesterClosed}`
+  path for a pending `TcpAccept`.
 - Added a runnable `tcp_echo` example mirroring the tested workload with
   inline assertions on echoed payloads.

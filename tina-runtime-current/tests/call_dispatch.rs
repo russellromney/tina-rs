@@ -18,12 +18,15 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tina::{Address, Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId, TrySendError};
 use tina_runtime_current::{
-    CallId, CallKind, CallRequest, CallResult, CurrentCall, CurrentRuntime, ListenerId,
-    MailboxFactory, RuntimeEvent, RuntimeEventKind, StreamId,
+    CallCompletionRejectedReason, CallId, CallKind, CallRequest, CallResult, CurrentCall,
+    CurrentRuntime, ListenerId, MailboxFactory, RuntimeEvent, RuntimeEventKind, StreamId,
 };
 
 #[derive(Debug, Default)]
@@ -98,6 +101,23 @@ enum ProbeMsg {
     UnsupportedObserved,
 }
 
+#[derive(Debug, Clone)]
+enum BinderMsg {
+    StartBind,
+    Bound {
+        listener: ListenerId,
+        addr: SocketAddr,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaiterMsg {
+    StartAccept,
+    StopNow,
+    AcceptedObserved,
+    FailedObserved,
+}
+
 /// A small isolate that issues TCP call requests against runtime-owned ids
 /// it knows are invalid, so we exercise the call-dispatch path without
 /// depending on real socket behavior.
@@ -158,6 +178,94 @@ impl Isolate for Probe {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct Binder {
+    bind_addr: SocketAddr,
+    listener_slot: Arc<Mutex<Option<ListenerId>>>,
+    addr_slot: Arc<Mutex<Option<SocketAddr>>>,
+}
+
+impl Isolate for Binder {
+    type Message = BinderMsg;
+    type Reply = ();
+    type Send = SendMessage<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = CurrentCall<BinderMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            BinderMsg::StartBind => {
+                let addr = self.bind_addr;
+                Effect::Call(CurrentCall::new(
+                    CallRequest::TcpBind { addr },
+                    move |result| match result {
+                        CallResult::TcpBound {
+                            listener,
+                            local_addr,
+                        } => BinderMsg::Bound {
+                            listener,
+                            addr: local_addr,
+                        },
+                        other => panic!("expected successful bind result, got {other:?}"),
+                    },
+                ))
+            }
+            BinderMsg::Bound { listener, addr } => {
+                *self.listener_slot.lock().expect("listener mutex") = Some(listener);
+                *self.addr_slot.lock().expect("addr mutex") = Some(addr);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Waiter {
+    listener: ListenerId,
+    log: Rc<RefCell<Vec<WaiterMsg>>>,
+}
+
+impl Isolate for Waiter {
+    type Message = WaiterMsg;
+    type Reply = ();
+    type Send = SendMessage<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = CurrentCall<WaiterMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            WaiterMsg::StartAccept => Effect::Call(CurrentCall::new(
+                CallRequest::TcpAccept {
+                    listener: self.listener,
+                },
+                |result| match result {
+                    CallResult::TcpAccepted { .. } => WaiterMsg::AcceptedObserved,
+                    CallResult::Failed(_) => WaiterMsg::FailedObserved,
+                    other => panic!("unexpected accept result {other:?}"),
+                },
+            )),
+            WaiterMsg::StopNow => Effect::Stop,
+            WaiterMsg::AcceptedObserved => {
+                self.log.borrow_mut().push(WaiterMsg::AcceptedObserved);
+                Effect::Noop
+            }
+            WaiterMsg::FailedObserved => {
+                self.log.borrow_mut().push(WaiterMsg::FailedObserved);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+fn choose_loopback_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("choose free loopback port")
+        .port()
 }
 
 fn call_event_kinds(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
@@ -294,17 +402,100 @@ fn port_zero_bind_is_rejected_as_unsupported_with_visible_trace() {
     );
 }
 
-// Note: `CallCompletionRejected{RequesterClosed}` is implemented and traced
-// in the runtime, but it requires an *async* completion that lands after the
-// requester has stopped. That sequence is hard to exercise in a unit test
-// for the TCP-only call family without resorting to real socket activity:
-// invalid-resource failures are synchronous (they fire during the same
-// dispatch as the issuing handler, so the requester is still alive), and a
-// pending TcpAccept against a real listener never completes unless a peer
-// connects. The path is reachable through the integration-level workloads
-// in `tcp_echo.rs` (e.g. when a connection isolate stops while a recv is
-// in flight) and will pick up direct unit-test coverage once the call
-// family grows a verb whose completion the runtime can drive on demand.
+#[test]
+fn pending_accept_completion_is_rejected_when_requester_stops_first() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
+    let waiter_log = Rc::new(RefCell::new(Vec::new()));
+    let bind_addr: SocketAddr = format!("127.0.0.1:{}", choose_loopback_port())
+        .parse()
+        .expect("loopback parse");
+
+    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let binder = runtime.register(
+        Binder {
+            bind_addr,
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
+    runtime.step();
+    runtime.step();
+
+    let listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    let waiter = runtime.register(
+        Waiter {
+            listener,
+            log: Rc::clone(&waiter_log),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(waiter, WaiterMsg::StartAccept)
+        .expect("ingress accepts StartAccept");
+    runtime.step();
+
+    runtime
+        .try_send(waiter, WaiterMsg::StopNow)
+        .expect("ingress accepts StopNow");
+    runtime.step();
+
+    let client = TcpStream::connect(local_addr).expect("connect to listener");
+    drop(client);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.has_in_flight_calls() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for pending accept completion; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    assert!(
+        waiter_log.borrow().is_empty(),
+        "stopped requester must not observe translated completion messages"
+    );
+
+    let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpAccept,
+                reason: CallCompletionRejectedReason::RequesterClosed,
+                ..
+            }
+        )),
+        "trace must record CallCompletionRejected{{RequesterClosed}} for pending accept: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpAccept,
+                ..
+            }
+        )),
+        "rejected completion must not produce CallCompleted: {kinds:?}"
+    );
+}
 
 #[test]
 fn call_id_increments_in_submission_order() {
