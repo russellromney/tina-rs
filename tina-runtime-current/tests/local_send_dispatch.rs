@@ -5,11 +5,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId,
-    TrySendError,
+    Address, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, Shard, ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CauseId, CurrentRuntime, EffectKind, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
+use tina_runtime::{
+    CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason,
 };
 
@@ -118,7 +117,7 @@ struct OrderIsolate {
 impl Isolate for OrderIsolate {
     type Message = OrderMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -138,7 +137,7 @@ struct Driver {
 impl Isolate for Driver {
     type Message = DriverMsg;
     type Reply = ();
-    type Send = SendMessage<AuditMsg>;
+    type Send = Outbound<AuditMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -147,7 +146,7 @@ impl Isolate for Driver {
         match msg {
             DriverMsg::Kick(value) => {
                 self.handled.borrow_mut().push(value);
-                Effect::Send(SendMessage::new(self.target, AuditMsg::Record(value)))
+                Effect::Send(Outbound::new(self.target, AuditMsg::Record(value)))
             }
         }
     }
@@ -161,7 +160,7 @@ struct Audit {
 impl Isolate for Audit {
     type Message = AuditMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -179,7 +178,7 @@ struct ObservedIsolate;
 impl Isolate for ObservedIsolate {
     type Message = ObservedMsg;
     type Reply = u8;
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -194,7 +193,7 @@ impl Isolate for ObservedIsolate {
 
 #[test]
 fn registration_returns_typed_addresses_and_step_uses_registration_order() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let log = Rc::new(RefCell::new(Vec::new()));
 
     let alpha_mailbox = TestMailbox::new(8);
@@ -242,7 +241,7 @@ fn registration_returns_typed_addresses_and_step_uses_registration_order() {
 
 #[test]
 fn accepted_local_send_runs_target_on_a_later_step_and_records_trace() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let driver_handled = Rc::new(RefCell::new(Vec::new()));
     let audit_seen = Rc::new(RefCell::new(Vec::new()));
 
@@ -358,7 +357,7 @@ fn accepted_local_send_runs_target_on_a_later_step_and_records_trace() {
 
 #[test]
 fn rejected_local_send_is_traced_and_not_silently_buffered() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let audit_seen = Rc::new(RefCell::new(Vec::new()));
 
     let audit_mailbox = TestMailbox::new(1);
@@ -415,7 +414,7 @@ fn rejected_local_send_is_traced_and_not_silently_buffered() {
 
 #[test]
 fn send_to_unknown_isolate_panics() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let driver_mailbox = TestMailbox::new(8);
 
     runtime.register(
@@ -434,7 +433,7 @@ fn send_to_unknown_isolate_panics() {
 
 #[test]
 fn reply_remains_observed_and_not_executed() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(ObservedIsolate, mailbox.clone());
 
@@ -482,7 +481,7 @@ fn reply_remains_observed_and_not_executed() {
 
 #[test]
 fn restart_children_with_no_children_emits_no_restart_subtree() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(ObservedIsolate, mailbox.clone());
 
@@ -522,7 +521,7 @@ fn restart_children_with_no_children_emits_no_restart_subtree() {
 #[test]
 fn identical_runs_produce_identical_event_sequences_and_causal_links() {
     fn run_once() -> Vec<RuntimeEvent> {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let audit_mailbox = TestMailbox::new(8);
         let audit_address = runtime.register(
             Audit {

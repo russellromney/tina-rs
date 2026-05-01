@@ -8,10 +8,10 @@ It's an independent Rust port inspired by [Peter Mbanugo's Tina](https://github.
 
 This repo is a Cargo workspace. Today it has four crates:
 
-- **`tina`** — Trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`, `SendMessage`, `SpawnSpec`. No impls.
-- **`tina-mailbox-spsc`** — Bounded single-producer/single-consumer mailbox crate implementing `tina::Mailbox`.
-- **`tina-supervisor`** — Small supervisor configuration crate. Today it provides `SupervisorConfig`; the runtime still owns mutable supervision state.
-- **`tina-runtime-current`** — In-progress deterministic single-shard runtime core with trace events, local send/spawn dispatch, typed ingress, stop-and-abandon behavior, panic capture, parent-child lineage, direct-child restart execution, and supervised panic restart.
+- **`tina`** — trait crate. `Isolate`, `Mailbox`, `Address`, `ChildDefinition`, `Outbound`, and the common helpers in `tina::prelude::*`.
+- **`tina-mailbox-spsc`** — bounded single-producer/single-consumer mailbox implementation.
+- **`tina-supervisor`** — supervisor policy/config vocabulary.
+- **`tina-runtime`** — deterministic single-shard runtime with trace events, local send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, and supervised panic restart.
 
 The simulator, I/O driver, multi-shard runtime, and Tokio bridge come later. See [ROADMAP.md](ROADMAP.md).
 
@@ -42,50 +42,77 @@ Thread-per-core runtimes for Rust already exist. [monoio](https://github.com/byt
 
 If you want to contribute or find bugs, please open a PR or issue.
 
-## At a glance
+## What Tina code looks like
 
-Today the trait crate lets you define isolates against the API, and the current-thread runtime core can drive simple single-shard workloads deterministically. Handlers describe what to do; they don't do I/O themselves.
+The important shape is:
+
+- one struct owns one unit of state
+- one message arrives
+- the handler returns the next thing to do
+
+Use the prelude:
 
 ```rust
-use std::convert::Infallible;
-use tina::{Address, Context, Effect, Isolate, SendMessage, Shard, ShardId};
+use tina::prelude::*;
+```
 
-#[derive(Clone, Copy)]
-enum CounterMsg { Add(u64), Read }
+Normal local state change plus a local send:
 
-#[derive(Clone, Copy)]
-enum AuditMsg { Total(u64) }
-
-struct InlineShard;
-impl Shard for InlineShard {
-    fn id(&self) -> ShardId { ShardId::new(0) }
-}
-
-struct Counter {
-    total: u64,
-    audit: Address<AuditMsg>,
-}
-
-impl Isolate for Counter {
-    type Message = CounterMsg;
-    type Reply = u64;
-    type Send = SendMessage<AuditMsg>;
-    type Spawn = Infallible;
-    type Shard = InlineShard;
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        match msg {
-            CounterMsg::Add(n) => {
-                self.total += n;
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Total(self.total)))
-            }
-            CounterMsg::Read => Effect::Reply(self.total),
-        }
+```rust
+match msg {
+    SessionMsg::Connected(user_id) => {
+        self.users.insert(user_id);
+        send(self.audit, AuditMsg::Joined(user_id))
     }
+    SessionMsg::Snapshot => reply(self.users.clone()),
 }
 ```
 
-`Effect` is a closed enum (`Noop`, `Reply`, `Send`, `Spawn`, `Stop`, `RestartChildren`) with per-isolate associated payload types. The current runtime core executes some of those effects already; future I/O/timer effects must preserve the rule that real I/O happens in the runtime, not in handlers.
+Runtime-owned time:
+
+```rust
+match msg {
+    RetryMsg::Attempt => sleep(self.backoff).reply(RetryMsg::Slept),
+    RetryMsg::Slept(Ok(())) => send(ctx.current_address(), RetryMsg::Attempt),
+    RetryMsg::Slept(Err(_)) => stop(),
+}
+```
+
+Runtime-owned TCP stays explicit about partial writes and later completions:
+
+```rust
+match msg {
+    ConnMsg::Start => tcp_read(self.stream, 1024).reply(ConnMsg::ReadCompleted),
+    ConnMsg::ReadCompleted(Ok(bytes)) if bytes.is_empty() => stop(),
+    ConnMsg::ReadCompleted(Ok(bytes)) => {
+        self.pending_write = bytes.clone();
+        tcp_write(self.stream, bytes).reply(ConnMsg::WriteCompleted)
+    }
+    ConnMsg::WriteCompleted(Ok(count)) if count < self.pending_write.len() => {
+        self.pending_write.drain(..count);
+        tcp_write(self.stream, self.pending_write.clone()).reply(ConnMsg::WriteCompleted)
+    }
+    ConnMsg::WriteCompleted(Ok(_)) => {
+        self.pending_write.clear();
+        tcp_read(self.stream, 1024).reply(ConnMsg::ReadCompleted)
+    }
+    ConnMsg::ReadCompleted(Err(_)) | ConnMsg::WriteCompleted(Err(_)) => stop(),
+}
+```
+
+That is the whole vibe:
+
+- handlers are synchronous
+- local state stays local
+- `send`, `reply`, `spawn`, `stop`, and `batch` are plain returned values
+- time and I/O happen in the runtime
+- completions come back later as ordinary messages
+- the code stays honest about things Tokio usually hides, like partial writes
+
+Full runnable examples live here:
+
+- [`task_dispatcher.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime-current/examples/task_dispatcher.rs)
+- [`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime-current/examples/tcp_echo.rs)
 
 ## Design
 
@@ -104,7 +131,7 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 ## Status
 
-What works today: the trait crate, the bounded SPSC mailbox crate, supervisor configuration, and an in-progress deterministic single-shard runtime core. You can write isolates against the API, exercise real mailbox semantics, and run handlers through `tina-runtime-current` for local send/spawn/stop/panic-capture/restart/supervised-panic scenarios.
+What works today: the trait crate, the bounded SPSC mailbox crate, supervisor configuration, the single-shard runtime, and the simulator. You can write isolates against the preferred public API, exercise real mailbox semantics, run handlers through `tina-runtime`, and replay timer-driven behavior through `tina-sim`.
 
 What's coming, in order: runtime-owned I/O on a Betelgeuse-backed explicit
 completion-driven current-thread backend, backed by a TCP echo proof; then

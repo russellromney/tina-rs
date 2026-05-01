@@ -4,11 +4,11 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId, SpawnSpec,
-    TrySendError,
+    Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, Shard,
+    ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CauseId, CurrentRuntime, EffectKind, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
+use tina_runtime::{
+    CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,7 @@ impl Shard for TestShard {
 impl Isolate for Worker {
     type Message = ();
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -54,8 +54,8 @@ struct Session {
 impl Isolate for Session {
     type Message = SessionMsg;
     type Reply = usize;
-    type Send = SendMessage<Infallible>;
-    type Spawn = SpawnSpec<Worker>;
+    type Send = Outbound<Infallible>;
+    type Spawn = ChildDefinition<Worker>;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -68,7 +68,7 @@ impl Isolate for Session {
                 Effect::Noop
             }
             SessionMsg::Reply => Effect::Reply(*self.handled.borrow()),
-            SessionMsg::Spawn => Effect::Spawn(SpawnSpec::new(Worker, 2)),
+            SessionMsg::Spawn => Effect::Spawn(ChildDefinition::new(Worker, 2)),
             SessionMsg::Restart => Effect::RestartChildren,
             SessionMsg::Stop => Effect::Stop,
         }
@@ -139,7 +139,7 @@ impl MailboxFactory for TestMailboxFactory {
 }
 
 struct RuntimeHarness {
-    runtime: CurrentRuntime<TestShard, TestMailboxFactory>,
+    runtime: Runtime<TestShard, TestMailboxFactory>,
     session: Address<SessionMsg>,
     handled: Rc<RefCell<usize>>,
     seen: Rc<RefCell<Vec<u8>>>,
@@ -147,7 +147,7 @@ struct RuntimeHarness {
 
 impl RuntimeHarness {
     fn new() -> Self {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let handled = Rc::new(RefCell::new(0));
         let seen = Rc::new(RefCell::new(Vec::new()));
         let session = runtime.register(

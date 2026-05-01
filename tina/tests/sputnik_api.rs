@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, RestartableSpawnSpec, SendMessage,
-    Shard, ShardId, SpawnSpec, TrySendError,
+    Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Mailbox, Outbound,
+    RestartableChildDefinition, Shard, ShardId, TrySendError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,8 +92,8 @@ impl Shard for InlineShard {
 impl Isolate for Worker {
     type Message = WorkerMsg;
     type Reply = ();
-    type Send = SendMessage<WorkerMsg>;
-    type Spawn = SpawnSpec<Self>;
+    type Send = Outbound<WorkerMsg>;
+    type Spawn = ChildDefinition<Self>;
     type Call = Infallible;
     type Shard = InlineShard;
 
@@ -107,8 +107,8 @@ impl Isolate for Worker {
 impl Isolate for Session {
     type Message = SessionMsg;
     type Reply = Vec<String>;
-    type Send = SendMessage<AuditMsg>;
-    type Spawn = SpawnSpec<Worker>;
+    type Send = Outbound<AuditMsg>;
+    type Spawn = ChildDefinition<Worker>;
     type Call = SessionCall;
     type Shard = InlineShard;
 
@@ -116,13 +116,13 @@ impl Isolate for Session {
         match msg {
             SessionMsg::Note(note) => {
                 self.notes.push(note.clone());
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(note)))
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(note)))
             }
             SessionMsg::Read => Effect::Reply(self.notes.clone()),
-            SessionMsg::SpawnWorker => Effect::Spawn(SpawnSpec::new(Worker::new(0), 8)),
+            SessionMsg::SpawnWorker => Effect::Spawn(ChildDefinition::new(Worker::new(0), 8)),
             SessionMsg::SpawnAndAudit => Effect::Batch(vec![
-                Effect::Spawn(SpawnSpec::new(Worker::new(7), 8)),
-                Effect::Send(SendMessage::new(
+                Effect::Spawn(ChildDefinition::new(Worker::new(7), 8)),
+                Effect::Send(Outbound::new(
                     self.audit,
                     AuditMsg::Record("spawned".to_owned()),
                 )),
@@ -136,7 +136,7 @@ impl Isolate for Session {
             }),
             SessionMsg::IoCompleted(SessionCallResult::Greeted(text)) => {
                 self.notes.push(text.clone());
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(text)))
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(text)))
             }
         }
     }
@@ -306,7 +306,7 @@ fn downstream_worker_isolate_can_compile_and_run_through_the_same_surface() {
 #[test]
 fn restartable_spawn_spec_is_available_as_a_distinct_public_payload() {
     let tenant_id = 9_u64;
-    let spec = RestartableSpawnSpec::new(move || Worker::new(tenant_id), 13);
+    let spec = RestartableChildDefinition::new(move || Worker::new(tenant_id), 13);
 
     assert_eq!(spec.mailbox_capacity(), 13);
 

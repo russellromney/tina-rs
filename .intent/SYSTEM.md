@@ -39,14 +39,14 @@ detail one-for-one.
 ## Current shipped surface
 
 Today the repo ships `tina`, `tina-mailbox-spsc`, `tina-supervisor`,
-`tina-runtime-current`, and `tina-sim`.
+`tina-runtime`, and `tina-sim`.
 
 `tina` provides the shared words and types, including supervision policy types.
 
 `tina-supervisor` provides supervisor configuration vocabulary. Runtime-owned
 supervision state and restart execution stay in runtime crates.
 
-`tina-runtime-current` is still a small, in-progress runtime. Today it has
+`tina-runtime` is still a small, in-progress runtime. Today it has
 deterministic runtime events, a single-shard stepping model, local
 same-shard send dispatch, local same-shard spawn dispatch, typed runtime
 ingress for sending to registered isolates, stored direct parent-child lineage
@@ -64,10 +64,10 @@ handler entry point.
 `tina` also ships an ordered batch effect,
 `Effect::Batch(Vec<Effect<I>>)`, for sequencing existing effects
 left-to-right without opening up a new callback or effect language. In
-`tina-runtime-current`, later effects in the batch still run after earlier
+`tina-runtime`, later effects in the batch still run after earlier
 non-terminal effects, and `Stop` short-circuits the rest of the batch.
 
-`tina-runtime-current` ships the first TCP call family on Betelgeuse
+`tina-runtime` ships the first TCP call family on Betelgeuse
 (nightly Rust): TCP listener bind, accept, stream read, stream write,
 listener and stream close. Resources are runtime-owned opaque ids; raw
 sockets never escape into isolate state. `step()` stays synchronous: the
@@ -78,8 +78,8 @@ requesting isolate's mailbox. Synchronous Betelgeuse ops (bind, close)
 complete inline during dispatch; async ops (accept, recv, send) stay in a
 pending list until their slot has a result.
 
-`tina-runtime-current` now also ships the first runtime-owned time call
-verb: `CallRequest::Sleep { after }` with `CallResult::TimerFired`. The
+`tina-runtime` now also ships the first runtime-owned time call
+verb: `CallInput::Sleep { after }` with `CallOutput::TimerFired`. The
 runtime owns a monotonic clock and samples it once at the start of each
 `step()`; timers due at or before that sampled instant are harvested and
 delivered as ordinary later `Message` values through the same call
@@ -89,7 +89,7 @@ directly without brittle wall-clock sleeps. A separate assertion-backed
 integration test drives the public runtime path with the shipped monotonic
 clock and proves a real "fail, back off, retry, succeed" workload.
 
-`SpawnSpec` and `RestartableSpawnSpec` now carry an optional bootstrap
+`ChildDefinition` and `RestartableChildDefinition` now carry an optional bootstrap
 message that the runtime delivers to the new child immediately after spawn
 (and after each restart, for restartable specs). This is what lets a
 listener isolate spawn a connection-handler child with its initial
@@ -108,7 +108,7 @@ restartable connection-handler child that issues read / write / close
 calls. The listener captures its own typed address, uses
 `Effect::Batch(Vec<Effect<I>>)` to sequence "spawn child, then send self a
 re-arm or close message," and spawns the connection child via
-`RestartableSpawnSpec::with_bootstrap`, so the connection's first read
+`RestartableChildDefinition::with_initial_message`, so the connection's first read
 fires through the normal handler pipeline rather than via test-harness
 trace introspection. The proof binds to `127.0.0.1:0`, relies on the
 runtime to report the actual bound address, and now covers one-client
@@ -126,11 +126,11 @@ identity includes shard id, isolate id, and generation. Runtime sends and
 runtime ingress reject stale known generations as closed instead of silently
 delivering to a current incarnation.
 
-In `tina-runtime-current`, an accepted message does not disappear silently. It
+In `tina-runtime`, an accepted message does not disappear silently. It
 is either handled by an isolate or recorded in the trace as abandoned if the
 isolate stops first.
 
-If a handler unwinds with a panic in `tina-runtime-current`, that panic becomes
+If a handler unwinds with a panic in `tina-runtime`, that panic becomes
 a runtime event. The isolate is stopped and traced instead of tearing down the
 whole round.
 

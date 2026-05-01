@@ -5,11 +5,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId, SpawnSpec,
-    TrySendError,
+    Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, Shard,
+    ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CauseId, CurrentRuntime, EffectKind, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
+use tina_runtime::{
+    CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,7 @@ struct Child {
 impl Isolate for Child {
     type Message = ChildMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -139,14 +139,14 @@ struct Parent {
 impl Isolate for Parent {
     type Message = ParentMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
-    type Spawn = SpawnSpec<Child>;
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = ChildDefinition<Child>;
     type Call = Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ParentMsg::SpawnChild => Effect::Spawn(SpawnSpec::new(
+            ParentMsg::SpawnChild => Effect::Spawn(ChildDefinition::new(
                 Child {
                     seen: Rc::clone(&self.child_seen),
                     order_log: Rc::clone(&self.order_log),
@@ -166,7 +166,7 @@ struct OrderIsolate {
 impl Isolate for OrderIsolate {
     type Message = OrderMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -194,7 +194,7 @@ fn spawned_child_isolate(trace: &[RuntimeEvent]) -> IsolateId {
 
 #[test]
 fn spawn_creates_child_and_records_trace() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let child_seen = Rc::new(RefCell::new(Vec::new()));
     let order_log = Rc::new(RefCell::new(Vec::new()));
     let parent = runtime.register(
@@ -252,7 +252,7 @@ fn spawn_creates_child_and_records_trace() {
 
 #[test]
 fn spawned_child_runs_only_on_a_later_step_and_runtime_ingress_reaches_it() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let child_seen = Rc::new(RefCell::new(Vec::new()));
     let order_log = Rc::new(RefCell::new(Vec::new()));
     let parent = runtime.register(
@@ -277,7 +277,7 @@ fn spawned_child_runs_only_on_a_later_step_and_runtime_ingress_reaches_it() {
 
 #[test]
 fn spawned_child_appends_to_registration_order() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let child_seen = Rc::new(RefCell::new(Vec::new()));
     let order_log = Rc::new(RefCell::new(Vec::new()));
     let parent = runtime.register(
@@ -310,7 +310,7 @@ fn spawned_child_appends_to_registration_order() {
 
 #[test]
 fn runtime_ingress_returns_typed_full_and_closed_for_spawned_child() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let parent = runtime.register(
         Parent {
             child_seen: Rc::new(RefCell::new(Vec::new())),
@@ -341,7 +341,7 @@ fn runtime_ingress_returns_typed_full_and_closed_for_spawned_child() {
 
 #[test]
 fn runtime_ingress_to_unknown_isolate_still_panics() {
-    let runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let runtime = Runtime::new(TestShard, TestMailboxFactory);
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         let _ = runtime.try_send(child_address(IsolateId::new(99)), ChildMsg::Data(1));
@@ -352,7 +352,7 @@ fn runtime_ingress_to_unknown_isolate_still_panics() {
 
 #[test]
 fn runtime_ingress_to_other_shard_still_panics() {
-    let runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let runtime = Runtime::new(TestShard, TestMailboxFactory);
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         let _ = runtime.try_send(
@@ -366,7 +366,7 @@ fn runtime_ingress_to_other_shard_still_panics() {
 
 #[test]
 fn spawn_with_zero_capacity_panics_instead_of_creating_unreachable_child() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let parent = runtime.register(
         Parent {
             child_seen: Rc::new(RefCell::new(Vec::new())),
@@ -391,7 +391,7 @@ fn spawn_with_zero_capacity_panics_instead_of_creating_unreachable_child() {
 #[test]
 fn identical_runs_produce_identical_spawn_sequences_and_causal_links() {
     fn run_once() -> Vec<RuntimeEvent> {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let parent = runtime.register(
             Parent {
                 child_seen: Rc::new(RefCell::new(Vec::new())),

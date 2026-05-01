@@ -1,10 +1,10 @@
 [package]
-name = "tina-runtime-current"
+name = "tina-runtime"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Single-isolate current-thread runtime core for tina-rs"
+description = "Deterministic single-shard runtime core for tina-rs"
 repository = "https://github.com/russellromney/tina-rs"
 
 [lib]

@@ -1,4 +1,4 @@
-//! End-to-end task-dispatcher proof for `CurrentRuntime`.
+//! End-to-end task-dispatcher proof for `Runtime`.
 //!
 //! This integration test is the user-facing payoff for slices 005-010. It
 //! demonstrates that the single-shard runtime can keep useful work moving
@@ -28,11 +28,11 @@
 //! What this test is not:
 //!
 //! - It is not the deterministic simulator (`tina-sim`); it drives the live
-//!   `CurrentRuntime` and asserts on real runtime state.
+//!   `Runtime` and asserts on real runtime state.
 //! - It is not a production routing pattern; the registry-isolate shape is
 //!   the reference, but real apps may want richer name resolution.
 //! - It is not the only proof of supervision correctness. Focused unit
-//!   tests in `tina-runtime-current/src/lib.rs` and the generated-history
+//!   tests in `tina-runtime/src/lib.rs` and the generated-history
 //!   property tests in `runtime_properties.rs` remain the primary semantic
 //!   surface. This test proves the user story end-to-end.
 
@@ -42,12 +42,9 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use tina::{
-    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, RestartBudget,
-    RestartPolicy, RestartableSpawnSpec, SendMessage, Shard, ShardId, TrySendError,
+    AddressGeneration, IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*,
 };
-use tina_runtime_current::{
-    CurrentRuntime, MailboxFactory, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-};
+use tina_runtime::{MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
 use tina_supervisor::SupervisorConfig;
 
 // ---------------------------------------------------------------------------
@@ -166,7 +163,7 @@ enum RegistryMsg {
 // Worker isolate.
 //
 // Effect contract (per slice 011 plan):
-//   - normal task -> Effect::Noop
+//   - normal task -> noop()
 //   - poison task -> panic
 //   - no Reply, no Send
 // ---------------------------------------------------------------------------
@@ -179,7 +176,7 @@ struct Worker {
 impl Isolate for Worker {
     type Message = WorkerMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -188,7 +185,7 @@ impl Isolate for Worker {
         match msg {
             WorkerMsg::Run(Task::Normal(value)) => {
                 self.completed.borrow_mut().push((ctx.isolate_id(), value));
-                Effect::Noop
+                noop()
             }
             WorkerMsg::Run(Task::Poison) => {
                 panic!("poison task in worker handler");
@@ -215,8 +212,8 @@ struct Dispatcher {
 impl Isolate for Dispatcher {
     type Message = DispatcherMsg;
     type Reply = ();
-    type Send = SendMessage<RegistryMsg>;
-    type Spawn = RestartableSpawnSpec<Worker>;
+    type Send = Outbound<RegistryMsg>;
+    type Spawn = RestartableChildDefinition<Worker>;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -224,17 +221,16 @@ impl Isolate for Dispatcher {
         match msg {
             DispatcherMsg::SpawnWorker => {
                 let completed = Rc::clone(&self.completed);
-                Effect::Spawn(RestartableSpawnSpec::new(
+                spawn(RestartableChildDefinition::new(
                     move || Worker {
                         completed: Rc::clone(&completed),
                     },
                     self.worker_capacity,
                 ))
             }
-            DispatcherMsg::Submit { slot, task } => Effect::Send(SendMessage::new(
-                self.registry,
-                RegistryMsg::Forward { slot, task },
-            )),
+            DispatcherMsg::Submit { slot, task } => {
+                send(self.registry, RegistryMsg::Forward { slot, task })
+            }
         }
     }
 }
@@ -265,7 +261,7 @@ impl Registry {
 impl Isolate for Registry {
     type Message = RegistryMsg;
     type Reply = ();
-    type Send = SendMessage<WorkerMsg>;
+    type Send = Outbound<WorkerMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -274,7 +270,7 @@ impl Isolate for Registry {
         match msg {
             RegistryMsg::Register { slot, address } => {
                 self.addresses.insert(slot, address);
-                Effect::Noop
+                noop()
             }
             RegistryMsg::Forward { slot, task } => {
                 let address = self
@@ -282,7 +278,7 @@ impl Isolate for Registry {
                     .get(&slot)
                     .copied()
                     .unwrap_or_else(|| panic!("registry slot {slot} is not registered"));
-                Effect::Send(SendMessage::new(address, WorkerMsg::Run(task)))
+                send(address, WorkerMsg::Run(task))
             }
         }
     }
@@ -335,7 +331,7 @@ fn event_kinds(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
 // ---------------------------------------------------------------------------
 
 struct Harness {
-    runtime: CurrentRuntime<TestShard, TestMailboxFactory>,
+    runtime: Runtime<TestShard, TestMailboxFactory>,
     completed: Rc<RefCell<Vec<(IsolateId, u32)>>>,
     dispatcher: Address<DispatcherMsg>,
     registry: Address<RegistryMsg>,
@@ -343,7 +339,7 @@ struct Harness {
 
 impl Harness {
     fn new(policy: RestartPolicy, budget: RestartBudget, worker_capacity: usize) -> Self {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let completed = Rc::new(RefCell::new(Vec::new()));
 
         let registry = runtime.register(Registry::new(), TestMailbox::new(8));
@@ -695,7 +691,7 @@ fn budget_exhaustion_emits_visible_rejection_and_creates_no_replacement() {
             assert!(
                 matches!(
                     reason,
-                    tina_runtime_current::SupervisionRejectedReason::BudgetExceeded { .. }
+                    tina_runtime::SupervisionRejectedReason::BudgetExceeded { .. }
                 ),
                 "rejection reason should be BudgetExceeded, got {reason:?}"
             );

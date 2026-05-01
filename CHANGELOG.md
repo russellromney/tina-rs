@@ -8,7 +8,7 @@ This file records completed work.
 
 - Added the `tina` trait crate as the shared vocabulary layer.
 - Added `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`,
-  `SendMessage`, and `SpawnSpec`.
+  `Outbound`, and `ChildDefinition`.
 - Chose a closed `Effect` enum with per-isolate payload types.
 - Added docs, compile-fail tests, and downstream-style integration tests for
   the trait surface.
@@ -29,7 +29,7 @@ This file records completed work.
 
 ### Phase Mariner
 
-- Added `tina-runtime-current`, a small in-progress runtime with a deterministic
+- Added `tina-runtime`, a small in-progress runtime with a deterministic
   event trace and causal links.
 - Added single-shard stepping and local same-shard `Send` dispatch in
   registration order.
@@ -56,15 +56,15 @@ This file records completed work.
 - Added address-liveness semantics: `Address<M>` now includes a generation,
   runtime send traces include target generation, and stale known generations
   fail visibly as `Closed` instead of targeting a current incarnation.
-- Added restartable child records: `RestartableSpawnSpec<I>` records a
-  factory-backed restart recipe, and `CurrentRuntime` stores private child
+- Added restartable child records: `RestartableChildDefinition<I>` records a
+  factory-backed restart recipe, and `Runtime` stores private child
   metadata for future `RestartChildren` execution.
 - Added `RestartChildren` execution for direct child records: restartable
   children are replaced with fresh isolate incarnations, non-restartable
   children are skipped visibly, and restart traces now support deterministic
   causal tree branching.
 - Added `tina-supervisor` with `SupervisorConfig`.
-- Added supervised panic restart in `tina-runtime-current`: configured parents
+- Added supervised panic restart in `tina-runtime`: configured parents
   apply `RestartPolicy` and runtime-lifetime `RestartBudget` state when direct
   children panic.
 - Added generated-history runtime property tests for deterministic traces,
@@ -85,25 +85,25 @@ This file records completed work.
   `Isolate::Call` associated type and `Effect::Call(I::Call)` variant.
   Trait surface stays substrate-neutral; concrete request/result
   vocabulary lives in runtime crates.
-- Added runtime-owned child bootstrap on `SpawnSpec` and
-  `RestartableSpawnSpec` via `with_bootstrap`. The runtime delivers the
+- Added runtime-owned child bootstrap on `ChildDefinition` and
+  `RestartableChildDefinition` via `with_initial_message`. The runtime delivers the
   bootstrap message to the new child immediately after spawn (and after
   each restart, for restartable specs), so a parent can hand a child its
   initial kick without test-harness trace introspection.
-- Added `tina-runtime-current`'s first TCP call family on Betelgeuse
-  (nightly Rust): `CurrentCall<M>` carrying a translator from `CallResult`
-  back to `I::Message`, plus `CallRequest` covering TCP listener bind,
+- Added `tina-runtime`'s first TCP call family on Betelgeuse
+  (nightly Rust): `RuntimeCall<M>` carrying a translator from `CallOutput`
+  back to `I::Message`, plus `CallInput` covering TCP listener bind,
   accept, stream read, stream write, listener close, and stream close.
   Resources are runtime-assigned opaque ids; raw sockets never escape
   into isolate state.
-- Added a Betelgeuse-backed I/O backend in `tina-runtime-current`:
+- Added a Betelgeuse-backed I/O backend in `tina-runtime`:
   caller-owned typed completion slots, synchronous Betelgeuse ops
   (bind / close) finish during dispatch, async ops (accept / recv / send)
   stay in a pending list until their slot has a result, all driven from
-  `CurrentRuntime::step()` synchronously.
+  `Runtime::step()` synchronously.
 - Pinned tina-rs to nightly Rust via `rust-toolchain.toml` so the Betelgeuse
   substrate's `allocator_api` feature is available; the gate is scoped to
-  `tina-runtime-current` via a crate-level `#![feature(allocator_api)]`.
+  `tina-runtime` via a crate-level `#![feature(allocator_api)]`.
 - Added new runtime trace event kinds for call dispatch attempt, call
   completion, call failure, and rejected-on-stop completion delivery.
 - Added focused tests for the call effect path covering invalid resource
@@ -112,7 +112,7 @@ This file records completed work.
   `type Call = Infallible`.
 - Added an assertion-backed live `tcp_echo` integration test: listener
   isolate supervises a restartable connection-handler child spawned via
-  `RestartableSpawnSpec::with_bootstrap`; bytes round-trip end-to-end on
+  `RestartableChildDefinition::with_initial_message`; bytes round-trip end-to-end on
   `127.0.0.1:0` with the runtime reporting the actual bound address; trace evidence is asserted per
   call kind. Separate unit tests prove the connection isolate's
   partial-write retry logic and the `CallCompletionRejected{RequesterClosed}`
@@ -120,9 +120,9 @@ This file records completed work.
 - Added a runnable `tcp_echo` example mirroring the tested workload with
   inline assertions on echoed payloads.
 - Added ordered `Effect::Batch(Vec<Effect<I>>)` at the `tina` boundary and
-  runtime support in `tina-runtime-current` for deterministic left-to-right
+  runtime support in `tina-runtime` for deterministic left-to-right
   execution with `Stop` short-circuiting later batched effects.
-- Added direct batch-semantics tests in `tina-runtime-current` proving
+- Added direct batch-semantics tests in `tina-runtime` proving
   left-to-right execution, spawn-plus-send sequencing, and `Stop`
   short-circuit behavior.
 - Expanded the live `tcp_echo` proof and runnable example from a one-client
@@ -133,14 +133,14 @@ This file records completed work.
   pending in `IoBackend` at the same time, so the bounded-overlap TCP claim
   is backed by direct runtime evidence rather than only by client-thread
   interleaving.
-- Added the first runtime-owned time call verb: `CallRequest::Sleep { after }`
-  with `CallResult::TimerFired`, plus `CallKind::Sleep` in the trace vocabulary.
+- Added the first runtime-owned time call verb: `CallInput::Sleep { after }`
+  with `CallOutput::TimerFired`, plus `CallKind::Sleep` in the trace vocabulary.
   The runtime samples a monotonic clock once per `step()` and harvests due
   timers against that sampled instant. Equal-deadline timers wake in
   deterministic request order.
 - Added a crate-private `ManualClock` seam so timer tests can drive time
   deterministically without brittle wall-clock sleeps, while production
-  `CurrentRuntime` still uses a real monotonic clock.
+  `Runtime` still uses a real monotonic clock.
 - Added focused timer semantics unit tests: single timer wake, no early fire,
   fires exactly once, different-deadline ordering, equal-deadline request-order
   tie-break, and late-completion rejection after requester stop.
@@ -155,10 +155,10 @@ This file records completed work.
 
 - Added `tina-sim`, the first Voyager simulator crate.
 - Added a single-shard virtual-time execution model with deterministic
-  event recording against the shipped `tina-runtime-current` event
+  event recording against the shipped `tina-runtime` event
   vocabulary.
 - Added simulator support for the shipped timer call family:
-  `CallRequest::Sleep { after }` and `CallResult::TimerFired`.
+  `CallInput::Sleep { after }` and `CallOutput::TimerFired`.
 - Added replay artifacts containing simulator config, final virtual time,
   and the reproducible event record for one run.
 - Added timer-semantics proofs in `tina-sim` covering no-early-wake,

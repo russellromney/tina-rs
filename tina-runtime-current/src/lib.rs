@@ -3,11 +3,11 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 // Phase Mariner 012 substrate is Betelgeuse, which exposes its
 // `IOLoopHandle<A: Allocator>` over the unstable `allocator_api`. We
-// commit to nightly Rust for `tina-runtime-current` per the reopened
+// commit to nightly Rust for `tina-runtime` per the reopened
 // 012 plan; the feature gate is scoped to this crate.
 #![feature(allocator_api)]
 
-//! Small current-thread runtime core for `tina-rs`.
+//! Small deterministic single-shard runtime core for `tina-rs`.
 //!
 //! This crate starts Mariner with the narrowest useful runtime surface:
 //!
@@ -17,15 +17,15 @@
 //!
 //! The multi-isolate runtime still stays narrow on purpose. It can register
 //! isolates, step them in deterministic order, execute local same-shard
-//! [`Effect::Send`] requests that use [`tina::SendMessage`], spawn local
+//! [`Effect::Send`] requests that use [`tina::Outbound`], spawn local
 //! children, and restart direct restartable children. Reply effects are still
 //! traced without execution until a later slice gives them runtime semantics.
 //!
-//! `Effect::Stop` stays immediate, but `CurrentRuntime` now also drains and
+//! `Effect::Stop` stays immediate, but `Runtime` also drains and
 //! traces any already-buffered messages that become abandoned when an isolate
 //! stops.
 //!
-//! `CurrentRuntime` also captures unwinding panics from handler calls and turns
+//! `Runtime` also captures unwinding panics from handler calls and turns
 //! them into deterministic runtime events. Binaries built with `panic = "abort"`
 //! remain out of scope for this crate.
 
@@ -40,7 +40,7 @@ use std::time::Instant;
 
 use tina::{
     Address, AddressGeneration, ChildRelation, Context, Effect, Isolate, IsolateId, Mailbox,
-    RestartBudgetState, SendMessage, Shard, ShardId, TrySendError,
+    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, TrySendError,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -49,8 +49,9 @@ mod io_backend;
 mod trace;
 
 pub use call::{
-    CallFailureReason, CallId, CallRequest, CallResult, CurrentCall, ErasedCall, IntoErasedCall,
-    ListenerId, StreamId,
+    CallError, CallId, CallInput, CallOutput, ErasedCall, IntoErasedCall, ListenerId, RuntimeCall,
+    StreamId, TypedCall, sleep, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+    tcp_read, tcp_write,
 };
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CauseId, EffectKind, EventId, RestartSkippedReason,
@@ -61,7 +62,7 @@ use io_backend::IoBackend;
 
 /// Runtime-owned mailbox factory for spawned children.
 ///
-/// The factory lives in `tina-runtime-current`, not in `tina`, because child
+/// The factory lives in `tina-runtime`, not in `tina`, because child
 /// mailbox allocation is a runtime concern rather than a trait-crate concern.
 pub trait MailboxFactory {
     /// Creates one typed mailbox with the requested capacity.
@@ -133,7 +134,7 @@ struct TimerEntry {
 /// The runtime owns one shard value plus a private registry of isolates and
 /// mailboxes. [`step`](Self::step) walks registered isolates in registration
 /// order and gives each isolate at most one delivery chance per round.
-pub struct CurrentRuntime<S, F>
+pub struct Runtime<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -163,7 +164,7 @@ struct InFlightCall {
     cause: CauseId,
 }
 
-type ErasedTranslator = Box<dyn FnOnce(CallResult) -> Box<dyn Any>>;
+type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
 
 struct StoredTranslator {
     call_id: CallId,
@@ -179,7 +180,7 @@ impl std::fmt::Debug for StoredTranslator {
     }
 }
 
-impl<S, F> CurrentRuntime<S, F>
+impl<S, F> Runtime<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -238,7 +239,7 @@ where
     #[allow(private_bounds)]
     pub fn register<I, M, Outbound>(&mut self, isolate: I, mailbox: M) -> Address<I::Message>
     where
-        I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
@@ -250,6 +251,32 @@ where
             None,
             Box::new(MailboxAdapter::<M, I::Message> {
                 mailbox,
+                marker: PhantomData,
+            }),
+        );
+
+        Address::new_with_generation(address.shard, address.isolate, address.generation)
+    }
+
+    /// Registers one isolate and lets the runtime allocate the mailbox.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Address<I::Message>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        let address = self.register_entry::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(MailboxAdapter::<Box<dyn Mailbox<I::Message>>, I::Message> {
+                mailbox: self.mailbox_factory.create::<I::Message>(mailbox_capacity),
                 marker: PhantomData,
             }),
         );
@@ -581,7 +608,7 @@ where
         });
 
         match request {
-            CallRequest::Sleep { after } => {
+            CallInput::Sleep { after } => {
                 let deadline = self.clock.now() + after;
                 let insertion_order = self.next_timer_ordinal;
                 self.next_timer_ordinal += 1;
@@ -623,11 +650,11 @@ where
                 .then_with(|| a.insertion_order.cmp(&b.insertion_order))
         });
         for entry in due {
-            self.deliver_completion(entry.call_id, CallResult::TimerFired);
+            self.deliver_completion(entry.call_id, CallOutput::TimerFired);
         }
     }
 
-    fn deliver_completion(&mut self, call_id: CallId, result: CallResult) {
+    fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
         let in_flight_index = self
             .in_flight_calls
             .iter()
@@ -658,7 +685,7 @@ where
         // `CallFailed` plus, if delivery also fails, one
         // `CallCompletionRejected` — never `CallCompleted`.
         let failure_reason = match &result {
-            CallResult::Failed(reason) => Some(*reason),
+            CallOutput::Failed(reason) => Some(*reason),
             _ => None,
         };
         if let Some(reason) = failure_reason {
@@ -1135,7 +1162,7 @@ where
         mailbox: Box<dyn ErasedMailbox>,
     ) -> RegisteredAddress
     where
-        I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1173,7 +1200,7 @@ where
         bootstrap_message: Option<I::Message>,
     ) -> SpawnOutcome<S, F>
     where
-        I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1427,11 +1454,8 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn spawn(
-        self: Box<Self>,
-        runtime: &mut CurrentRuntime<S, F>,
-        parent: IsolateId,
-    ) -> SpawnOutcome<S, F>;
+    fn spawn(self: Box<Self>, runtime: &mut Runtime<S, F>, parent: IsolateId)
+    -> SpawnOutcome<S, F>;
 }
 
 trait ErasedRestartRecipe<S, F>
@@ -1439,7 +1463,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn create(&self, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F>;
+    fn create(&self, runtime: &mut Runtime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F>;
 }
 
 trait IntoErasedSpawn<S, F>
@@ -1460,7 +1484,7 @@ where
 
 impl<I, S, F, Outbound> ErasedHandler<S, F> for HandlerAdapter<I, Outbound>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1489,7 +1513,7 @@ where
 
 fn erase_effect<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1600,7 +1624,7 @@ where
 
 impl<I, S, F, Outbound> ErasedSpawn<S, F> for SpawnAdapter<I, Outbound>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1610,7 +1634,7 @@ where
 {
     fn spawn(
         self: Box<Self>,
-        runtime: &mut CurrentRuntime<S, F>,
+        runtime: &mut Runtime<S, F>,
         parent: IsolateId,
     ) -> SpawnOutcome<S, F> {
         runtime.spawn_isolate::<I, Outbound>(
@@ -1622,19 +1646,19 @@ where
     }
 }
 
-impl<I, S, F, Outbound> IntoErasedSpawn<S, F> for tina::SpawnSpec<I>
+impl<I, S, F, OutboundMsg> IntoErasedSpawn<S, F> for tina::ChildDefinition<I>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I: Isolate<Shard = S, Send = TinaOutbound<OutboundMsg>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
-    Outbound: 'static,
+    OutboundMsg: 'static,
     S: Shard,
     F: MailboxFactory,
 {
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>> {
         let (isolate, mailbox_capacity, bootstrap_message) = self.into_parts();
-        Box::new(SpawnAdapter::<I, Outbound> {
+        Box::new(SpawnAdapter::<I, OutboundMsg> {
             isolate,
             mailbox_capacity,
             bootstrap_message,
@@ -1655,7 +1679,7 @@ where
 
 impl<I, S, F, Outbound> ErasedSpawn<S, F> for RestartableSpawnAdapter<I, Outbound>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1665,7 +1689,7 @@ where
 {
     fn spawn(
         self: Box<Self>,
-        runtime: &mut CurrentRuntime<S, F>,
+        runtime: &mut Runtime<S, F>,
         parent: IsolateId,
     ) -> SpawnOutcome<S, F> {
         let adapter = Rc::new(*self);
@@ -1685,7 +1709,7 @@ where
 
 impl<I, S, F, Outbound> ErasedRestartRecipe<S, F> for RestartableSpawnAdapter<I, Outbound>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
@@ -1693,7 +1717,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn create(&self, runtime: &mut CurrentRuntime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F> {
+    fn create(&self, runtime: &mut Runtime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F> {
         let isolate = (self.factory)();
         let bootstrap_message = self.bootstrap_factory.as_ref().map(|f| f());
         runtime.spawn_isolate::<I, Outbound>(
@@ -1705,19 +1729,19 @@ where
     }
 }
 
-impl<I, S, F, Outbound> IntoErasedSpawn<S, F> for tina::RestartableSpawnSpec<I>
+impl<I, S, F, OutboundMsg> IntoErasedSpawn<S, F> for tina::RestartableChildDefinition<I>
 where
-    I: Isolate<Shard = S, Send = SendMessage<Outbound>> + 'static,
+    I: Isolate<Shard = S, Send = TinaOutbound<OutboundMsg>> + 'static,
     I::Message: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
-    Outbound: 'static,
+    OutboundMsg: 'static,
     S: Shard,
     F: MailboxFactory,
 {
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>> {
         let (factory, mailbox_capacity, bootstrap_factory) = self.into_parts();
-        Box::new(RestartableSpawnAdapter::<I, Outbound> {
+        Box::new(RestartableSpawnAdapter::<I, OutboundMsg> {
             factory,
             mailbox_capacity,
             bootstrap_factory,

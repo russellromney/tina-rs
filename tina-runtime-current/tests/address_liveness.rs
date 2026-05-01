@@ -5,10 +5,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, AddressGeneration, Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId,
+    Address, AddressGeneration, Context, Effect, Isolate, Mailbox, Outbound, Shard, ShardId,
     TrySendError,
 };
-use tina_runtime_current::{CurrentRuntime, MailboxFactory, RuntimeEventKind, SendRejectedReason};
+use tina_runtime::{MailboxFactory, Runtime, RuntimeEventKind, SendRejectedReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetMsg {
@@ -90,7 +90,7 @@ struct Target;
 impl Isolate for Target {
     type Message = TargetMsg;
     type Reply = Infallible;
-    type Send = SendMessage<DriverMsg>;
+    type Send = Outbound<DriverMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -115,7 +115,7 @@ struct Driver {
 impl Isolate for Driver {
     type Message = DriverMsg;
     type Reply = Infallible;
-    type Send = SendMessage<TargetMsg>;
+    type Send = Outbound<TargetMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -127,14 +127,14 @@ impl Isolate for Driver {
     ) -> Effect<Self> {
         match message {
             DriverMsg::Kick(value) => {
-                Effect::Send(SendMessage::new(self.target, TargetMsg::Data(value)))
+                Effect::Send(Outbound::new(self.target, TargetMsg::Data(value)))
             }
         }
     }
 }
 
-fn runtime() -> CurrentRuntime<TestShard, TestMailboxFactory> {
-    CurrentRuntime::new(TestShard, TestMailboxFactory)
+fn runtime() -> Runtime<TestShard, TestMailboxFactory> {
+    Runtime::new(TestShard, TestMailboxFactory)
 }
 
 #[test]

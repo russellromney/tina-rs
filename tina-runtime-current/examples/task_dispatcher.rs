@@ -13,7 +13,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run -p tina-runtime-current --example task_dispatcher
+//! cargo run -p tina-runtime --example task_dispatcher
 //! ```
 //!
 //! The example asserts its own outcomes so it doubles as a smoke test.
@@ -24,10 +24,9 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use tina::{
-    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, RestartBudget,
-    RestartPolicy, RestartableSpawnSpec, SendMessage, Shard, ShardId, TrySendError,
+    AddressGeneration, IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*,
 };
-use tina_runtime_current::{CurrentRuntime, MailboxFactory, RuntimeEvent, RuntimeEventKind};
+use tina_runtime::{MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind};
 use tina_supervisor::SupervisorConfig;
 
 // ---------------------------------------------------------------------------
@@ -149,7 +148,7 @@ struct Worker {
 impl Isolate for Worker {
     type Message = WorkerMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = DemoShard;
@@ -158,7 +157,7 @@ impl Isolate for Worker {
         match msg {
             WorkerMsg::Run(Task::Normal(value)) => {
                 self.completed.borrow_mut().push((ctx.isolate_id(), value));
-                Effect::Noop
+                noop()
             }
             WorkerMsg::Run(Task::Poison) => panic!("poison task"),
         }
@@ -174,8 +173,8 @@ struct Dispatcher {
 impl Isolate for Dispatcher {
     type Message = DispatcherMsg;
     type Reply = ();
-    type Send = SendMessage<RegistryMsg>;
-    type Spawn = RestartableSpawnSpec<Worker>;
+    type Send = Outbound<RegistryMsg>;
+    type Spawn = RestartableChildDefinition<Worker>;
     type Call = Infallible;
     type Shard = DemoShard;
 
@@ -183,17 +182,16 @@ impl Isolate for Dispatcher {
         match msg {
             DispatcherMsg::SpawnWorker => {
                 let completed = Rc::clone(&self.completed);
-                Effect::Spawn(RestartableSpawnSpec::new(
+                spawn(RestartableChildDefinition::new(
                     move || Worker {
                         completed: Rc::clone(&completed),
                     },
                     4,
                 ))
             }
-            DispatcherMsg::Submit { slot, task } => Effect::Send(SendMessage::new(
-                self.registry,
-                RegistryMsg::Forward { slot, task },
-            )),
+            DispatcherMsg::Submit { slot, task } => {
+                send(self.registry, RegistryMsg::Forward { slot, task })
+            }
         }
     }
 }
@@ -206,7 +204,7 @@ struct Registry {
 impl Isolate for Registry {
     type Message = RegistryMsg;
     type Reply = ();
-    type Send = SendMessage<WorkerMsg>;
+    type Send = Outbound<WorkerMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = DemoShard;
@@ -215,7 +213,7 @@ impl Isolate for Registry {
         match msg {
             RegistryMsg::Register { slot, address } => {
                 self.addresses.insert(slot, address);
-                Effect::Noop
+                noop()
             }
             RegistryMsg::Forward { slot, task } => {
                 let address = self
@@ -223,7 +221,7 @@ impl Isolate for Registry {
                     .get(&slot)
                     .copied()
                     .unwrap_or_else(|| panic!("registry slot {slot} is not registered"));
-                Effect::Send(SendMessage::new(address, WorkerMsg::Run(task)))
+                send(address, WorkerMsg::Run(task))
             }
         }
     }
@@ -261,7 +259,7 @@ fn replacement_address_for(
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let mut runtime = CurrentRuntime::new(DemoShard, DemoMailboxFactory);
+    let mut runtime = Runtime::new(DemoShard, DemoMailboxFactory);
     let completed: Rc<RefCell<Vec<(IsolateId, u32)>>> = Rc::new(RefCell::new(Vec::new()));
 
     let registry = runtime.register(

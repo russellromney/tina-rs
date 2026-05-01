@@ -12,7 +12,7 @@
 //! - deterministic replay artifacts
 //!
 //! `tina-sim` intentionally reuses the live runtime's event vocabulary from
-//! `tina-runtime-current` instead of inventing a second user-visible meaning
+//! `tina-runtime` instead of inventing a second user-visible meaning
 //! model. The simulator is narrower than the live runtime: it supports local
 //! sends, stop, reply/noop observation, ordered `Batch`, and runtime-owned
 //! `Sleep` calls. Spawn, restart, and TCP simulation are deferred to later
@@ -27,12 +27,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use tina::{
-    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, SendMessage, Shard, ShardId,
-    TrySendError,
+    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Outbound as TinaOutbound,
+    Shard, ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CallCompletionRejectedReason, CallFailureReason, CallId, CallKind, CallRequest, CallResult,
-    CurrentCall, EffectKind, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
+use tina_runtime::{
+    CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutput, EffectKind,
+    RuntimeCall, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
 };
 
 /// Deterministic simulator configuration for one run.
@@ -93,10 +93,10 @@ struct InFlightCall {
     call_id: CallId,
     call_kind: CallKind,
     requester: RegisteredAddress,
-    cause: tina_runtime_current::CauseId,
+    cause: tina_runtime::CauseId,
 }
 
-type ErasedTranslator = Box<dyn FnOnce(CallResult) -> Box<dyn Any>>;
+type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
 
 struct StoredTranslator {
     call_id: CallId,
@@ -184,9 +184,9 @@ where
     I: Isolate<
             Message = Msg,
             Shard = S,
-            Send = SendMessage<Outbound>,
+            Send = TinaOutbound<Outbound>,
             Spawn = Infallible,
-            Call = CurrentCall<Msg>,
+            Call = RuntimeCall<Msg>,
         > + 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -216,9 +216,9 @@ where
     I: Isolate<
             Message = Msg,
             Shard = S,
-            Send = SendMessage<Outbound>,
+            Send = TinaOutbound<Outbound>,
             Spawn = Infallible,
-            Call = CurrentCall<Msg>,
+            Call = RuntimeCall<Msg>,
         > + 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -262,7 +262,7 @@ where
     id: IsolateId,
     generation: AddressGeneration,
     stopped: Cell<bool>,
-    stopped_event: Cell<Option<tina_runtime_current::EventId>>,
+    stopped_event: Cell<Option<tina_runtime::EventId>>,
     inbox: LocalInbox,
     handler: RefCell<Box<dyn ErasedHandler<S>>>,
 }
@@ -314,7 +314,7 @@ struct ErasedSend {
 }
 
 struct ErasedCall {
-    request: CallRequest,
+    request: CallInput,
     translator: ErasedTranslator,
 }
 
@@ -383,15 +383,15 @@ where
     /// Registers one isolate and returns its typed address.
     ///
     /// 016 intentionally requires spawnless isolates that use the current
-    /// runtime's timer-aware call vocabulary and local `SendMessage` sends.
+    /// runtime's timer-aware call vocabulary and local `Outbound` sends.
     pub fn register<I, Msg, Outbound>(&mut self, isolate: I) -> Address<Msg>
     where
         I: Isolate<
                 Message = Msg,
                 Shard = S,
-                Send = SendMessage<Outbound>,
+                Send = TinaOutbound<Outbound>,
                 Spawn = Infallible,
-                Call = CurrentCall<Msg>,
+                Call = RuntimeCall<Msg>,
             > + 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -412,6 +412,28 @@ where
         });
 
         Address::new_with_generation(self.shard.id(), isolate_id, generation)
+    }
+
+    /// Registers one isolate through the same ergonomic path as the live
+    /// runtime. The current simulator does not model real mailbox capacities
+    /// yet, so this parameter is accepted for API symmetry and ignored.
+    pub fn register_with_capacity<I, Msg, Outbound>(
+        &mut self,
+        isolate: I,
+        _mailbox_capacity: usize,
+    ) -> Address<Msg>
+    where
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Spawn = Infallible,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+    {
+        self.register(isolate)
     }
 
     /// Attempts to inject one typed message into a registered isolate.
@@ -593,7 +615,7 @@ where
         &mut self,
         index: usize,
         isolate_id: IsolateId,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
         effect: ErasedEffect,
     ) -> bool {
         match effect {
@@ -688,7 +710,7 @@ where
         &mut self,
         call: ErasedCall,
         requester: RegisteredAddress,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
     ) {
         let call_id = CallId::new(self.next_call_id);
         self.next_call_id += 1;
@@ -715,7 +737,7 @@ where
         });
 
         match request {
-            CallRequest::Sleep { after } => {
+            CallInput::Sleep { after } => {
                 let deadline = self.virtual_now + after;
                 let insertion_order = self.next_timer_ordinal;
                 self.next_timer_ordinal += 1;
@@ -725,9 +747,7 @@ where
                     insertion_order,
                 });
             }
-            _ => {
-                self.deliver_completion(call_id, CallResult::Failed(CallFailureReason::Unsupported))
-            }
+            _ => self.deliver_completion(call_id, CallOutput::Failed(CallError::Unsupported)),
         }
     }
 
@@ -748,11 +768,11 @@ where
                 .then_with(|| a.insertion_order.cmp(&b.insertion_order))
         });
         for entry in due {
-            self.deliver_completion(entry.call_id, CallResult::TimerFired);
+            self.deliver_completion(entry.call_id, CallOutput::TimerFired);
         }
     }
 
-    fn deliver_completion(&mut self, call_id: CallId, result: CallResult) {
+    fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
         let in_flight_index = self
             .in_flight_calls
             .iter()
@@ -774,7 +794,7 @@ where
             .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
 
         let failure_reason = match &result {
-            CallResult::Failed(reason) => Some(*reason),
+            CallOutput::Failed(reason) => Some(*reason),
             _ => None,
         };
         if let Some(reason) = failure_reason {
@@ -916,8 +936,8 @@ where
         &mut self,
         index: usize,
         isolate_id: IsolateId,
-        cause: tina_runtime_current::CauseId,
-    ) -> tina_runtime_current::EventId {
+        cause: tina_runtime::CauseId,
+    ) -> tina_runtime::EventId {
         if self.entries[index].stopped.get() {
             return self.entries[index]
                 .stopped_event
@@ -942,10 +962,10 @@ where
     fn push_event(
         &mut self,
         isolate: IsolateId,
-        cause: Option<tina_runtime_current::CauseId>,
+        cause: Option<tina_runtime::CauseId>,
         kind: RuntimeEventKind,
-    ) -> tina_runtime_current::EventId {
-        let id = tina_runtime_current::EventId::new(self.next_event_id);
+    ) -> tina_runtime::EventId {
+        let id = tina_runtime::EventId::new(self.next_event_id);
         self.next_event_id += 1;
         self.trace
             .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
@@ -953,14 +973,14 @@ where
     }
 }
 
-fn call_kind(request: &CallRequest) -> CallKind {
+fn call_kind(request: &CallInput) -> CallKind {
     match request {
-        CallRequest::TcpBind { .. } => CallKind::TcpBind,
-        CallRequest::TcpAccept { .. } => CallKind::TcpAccept,
-        CallRequest::TcpRead { .. } => CallKind::TcpRead,
-        CallRequest::TcpWrite { .. } => CallKind::TcpWrite,
-        CallRequest::TcpListenerClose { .. } => CallKind::TcpListenerClose,
-        CallRequest::TcpStreamClose { .. } => CallKind::TcpStreamClose,
-        CallRequest::Sleep { .. } => CallKind::Sleep,
+        CallInput::TcpBind { .. } => CallKind::TcpBind,
+        CallInput::TcpAccept { .. } => CallKind::TcpAccept,
+        CallInput::TcpRead { .. } => CallKind::TcpRead,
+        CallInput::TcpWrite { .. } => CallKind::TcpWrite,
+        CallInput::TcpListenerClose { .. } => CallKind::TcpListenerClose,
+        CallInput::TcpStreamClose { .. } => CallKind::TcpStreamClose,
+        CallInput::Sleep { .. } => CallKind::Sleep,
     }
 }

@@ -11,11 +11,11 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run -p tina-runtime-current --example tcp_echo
+//! cargo run -p tina-runtime --example tcp_echo
 //! ```
 //!
 //! Binds to `127.0.0.1:0` and relies on the runtime to report the actual
-//! bound address through `CallResult::TcpBound { local_addr }`, then
+//! bound address through `CallOutput::TcpBound { local_addr }`, then
 //! accepts exactly three client connections, closes the listener
 //! cleanly, and exits.
 
@@ -29,13 +29,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tina::{
-    Address, Context, Effect, Isolate, Mailbox, RestartBudget, RestartPolicy, RestartableSpawnSpec,
-    SendMessage, Shard, ShardId, TrySendError,
-};
-use tina_runtime_current::{
-    CallKind, CallRequest, CallResult, CurrentCall, CurrentRuntime, ListenerId, MailboxFactory,
-    RuntimeEvent, RuntimeEventKind, StreamId,
+use tina::{Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
+use tina_runtime::{
+    CallKind, ListenerId, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind,
+    StreamId, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -120,9 +117,9 @@ struct Connection {
 impl Isolate for Connection {
     type Message = ConnectionMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<ConnectionMsg>;
+    type Call = RuntimeCall<ConnectionMsg>;
     type Shard = ExampleShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -145,42 +142,30 @@ impl Isolate for Connection {
                     write_call(self.stream, self.pending_write.clone())
                 }
             }
-            ConnectionMsg::StreamClosed | ConnectionMsg::Failed => Effect::Stop,
+            ConnectionMsg::StreamClosed | ConnectionMsg::Failed => stop(),
         }
     }
 }
 
 fn read_call(stream: StreamId, max_len: usize) -> Effect<Connection> {
-    Effect::Call(CurrentCall::new(
-        CallRequest::TcpRead { stream, max_len },
-        |result| match result {
-            CallResult::TcpRead { bytes } => ConnectionMsg::ReadCompleted(bytes),
-            CallResult::Failed(_) => ConnectionMsg::Failed,
-            other => panic!("unexpected read result {other:?}"),
-        },
-    ))
+    tcp_read(stream, max_len).reply(|result| match result {
+        Ok(bytes) => ConnectionMsg::ReadCompleted(bytes),
+        Err(_) => ConnectionMsg::Failed,
+    })
 }
 
 fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
-    Effect::Call(CurrentCall::new(
-        CallRequest::TcpWrite { stream, bytes },
-        |result| match result {
-            CallResult::TcpWrote { count } => ConnectionMsg::WriteCompleted { count },
-            CallResult::Failed(_) => ConnectionMsg::Failed,
-            other => panic!("unexpected write result {other:?}"),
-        },
-    ))
+    tcp_write(stream, bytes).reply(|result| match result {
+        Ok(count) => ConnectionMsg::WriteCompleted { count },
+        Err(_) => ConnectionMsg::Failed,
+    })
 }
 
 fn close_call(stream: StreamId) -> Effect<Connection> {
-    Effect::Call(CurrentCall::new(
-        CallRequest::TcpStreamClose { stream },
-        |result| match result {
-            CallResult::TcpStreamClosed => ConnectionMsg::StreamClosed,
-            CallResult::Failed(_) => ConnectionMsg::Failed,
-            other => panic!("unexpected close result {other:?}"),
-        },
-    ))
+    tcp_close_stream(stream).reply(|result| match result {
+        Ok(()) => ConnectionMsg::StreamClosed,
+        Err(_) => ConnectionMsg::Failed,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -213,9 +198,9 @@ struct Listener {
 impl Isolate for Listener {
     type Message = ListenerMsg;
     type Reply = ();
-    type Send = SendMessage<ListenerMsg>;
-    type Spawn = RestartableSpawnSpec<Connection>;
-    type Call = CurrentCall<ListenerMsg>;
+    type Send = Outbound<ListenerMsg>;
+    type Spawn = RestartableChildDefinition<Connection>;
+    type Call = RuntimeCall<ListenerMsg>;
     type Shard = ExampleShard;
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -223,20 +208,13 @@ impl Isolate for Listener {
             ListenerMsg::Bootstrap => {
                 self.self_addr = Some(ctx.current_address::<ListenerMsg>());
                 let addr = self.bind_addr;
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpBind { addr },
-                    move |result| match result {
-                        CallResult::TcpBound {
-                            listener,
-                            local_addr,
-                        } => ListenerMsg::Bound {
-                            listener,
-                            addr: local_addr,
-                        },
-                        CallResult::Failed(_) => ListenerMsg::Failed,
-                        other => panic!("unexpected bind result {other:?}"),
+                tcp_bind(addr).reply(move |result| match result {
+                    Ok((listener, local_addr)) => ListenerMsg::Bound {
+                        listener,
+                        addr: local_addr,
                     },
-                ))
+                    Err(_) => ListenerMsg::Failed,
+                })
             }
             ListenerMsg::Bound { listener, addr } => {
                 self.listener = Some(listener);
@@ -244,31 +222,23 @@ impl Isolate for Listener {
                     .bound_addr_slot
                     .lock()
                     .expect("bound addr mutex never poisoned") = Some(addr);
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpAccept { listener },
-                    |result| match result {
-                        CallResult::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
-                        CallResult::Failed(_) => ListenerMsg::Failed,
-                        other => panic!("unexpected accept result {other:?}"),
-                    },
-                ))
+                tcp_accept(listener).reply(|result| match result {
+                    Ok((stream, _peer_addr)) => ListenerMsg::Accepted { stream },
+                    Err(_) => ListenerMsg::Failed,
+                })
             }
             ListenerMsg::ReArmAccept => {
                 let listener = self.listener.expect("listener stored before re-arm");
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpAccept { listener },
-                    |result| match result {
-                        CallResult::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
-                        CallResult::Failed(_) => ListenerMsg::Failed,
-                        other => panic!("unexpected accept result {other:?}"),
-                    },
-                ))
+                tcp_accept(listener).reply(|result| match result {
+                    Ok((stream, _peer_addr)) => ListenerMsg::Accepted { stream },
+                    Err(_) => ListenerMsg::Failed,
+                })
             }
             ListenerMsg::Accepted { stream } => {
                 self.accepted_count += 1;
                 let max_chunk = self.max_chunk;
-                let spawn = Effect::Spawn(
-                    RestartableSpawnSpec::new(
+                let child = spawn(
+                    RestartableChildDefinition::new(
                         move || Connection {
                             stream,
                             max_chunk,
@@ -276,7 +246,7 @@ impl Isolate for Listener {
                         },
                         8,
                     )
-                    .with_bootstrap(|| ConnectionMsg::Start),
+                    .with_initial_message(|| ConnectionMsg::Start),
                 );
                 let self_addr = self.self_addr.expect("listener captured its own address");
                 let follow_up = if self.accepted_count < self.target_accepts {
@@ -284,35 +254,28 @@ impl Isolate for Listener {
                 } else {
                     ListenerMsg::CloseListener
                 };
-                Effect::Batch(vec![
-                    spawn,
-                    Effect::Send(SendMessage::new(self_addr, follow_up)),
-                ])
+                batch([child, send(self_addr, follow_up)])
             }
             ListenerMsg::CloseListener => {
                 let listener = self.listener.expect("listener stored before close");
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpListenerClose { listener },
-                    |result| match result {
-                        CallResult::TcpListenerClosed => ListenerMsg::ListenerClosed,
-                        CallResult::Failed(_) => ListenerMsg::Failed,
-                        other => panic!("unexpected listener close result {other:?}"),
-                    },
-                ))
+                tcp_close_listener(listener).reply(|result| match result {
+                    Ok(()) => ListenerMsg::ListenerClosed,
+                    Err(_) => ListenerMsg::Failed,
+                })
             }
-            ListenerMsg::ListenerClosed => Effect::Stop,
-            ListenerMsg::Failed => Effect::Stop,
+            ListenerMsg::ListenerClosed => stop(),
+            ListenerMsg::Failed => stop(),
         }
     }
 }
 
 fn step_until<F>(
-    runtime: &mut CurrentRuntime<ExampleShard, ExampleMailboxFactory>,
+    runtime: &mut Runtime<ExampleShard, ExampleMailboxFactory>,
     timeout: Duration,
     label: &str,
     predicate: F,
 ) where
-    F: Fn(&CurrentRuntime<ExampleShard, ExampleMailboxFactory>) -> bool,
+    F: Fn(&Runtime<ExampleShard, ExampleMailboxFactory>) -> bool,
 {
     let deadline = Instant::now() + timeout;
     while !predicate(runtime) {
@@ -343,10 +306,7 @@ fn count_spawned(trace: &[RuntimeEvent]) -> usize {
         .count()
 }
 
-fn count_handler_finished(
-    trace: &[RuntimeEvent],
-    effect: tina_runtime_current::EffectKind,
-) -> usize {
+fn count_handler_finished(trace: &[RuntimeEvent], effect: tina_runtime::EffectKind) -> usize {
     trace
         .iter()
         .filter(|event| {
@@ -401,7 +361,7 @@ fn main() {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
     let bound: BoundAddr = Arc::new(Mutex::new(None));
 
-    let mut runtime = CurrentRuntime::new(ExampleShard, ExampleMailboxFactory);
+    let mut runtime = Runtime::new(ExampleShard, ExampleMailboxFactory);
 
     let payloads = vec![
         b"hello from the tina-rs echo example".to_vec(),
@@ -484,7 +444,7 @@ fn main() {
     assert_eq!(count_call_completed(trace, CallKind::TcpListenerClose), 1);
     assert_eq!(count_spawned(trace), 3);
     assert_eq!(
-        count_handler_finished(trace, tina_runtime_current::EffectKind::Batch),
+        count_handler_finished(trace, tina_runtime::EffectKind::Batch),
         3
     );
     assert_eq!(

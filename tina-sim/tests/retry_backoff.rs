@@ -3,8 +3,8 @@ use std::convert::Infallible;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{Context, Effect, Isolate, SendMessage, Shard, ShardId};
-use tina_runtime_current::{CallKind, CallRequest, CurrentCall, RuntimeEvent, RuntimeEventKind};
+use tina::{Shard, ShardId, prelude::*};
+use tina_runtime::{CallKind, RuntimeCall, RuntimeEvent, RuntimeEventKind, sleep};
 use tina_sim::{ReplayArtifact, Simulator, SimulatorConfig};
 
 #[derive(Debug, Default)]
@@ -40,9 +40,9 @@ struct RetryWorker {
 impl Isolate for RetryWorker {
     type Message = RetryMsg;
     type Reply = ();
-    type Send = SendMessage<RetryMsg>;
+    type Send = Outbound<RetryMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<RetryMsg>;
+    type Call = RuntimeCall<RetryMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -56,27 +56,19 @@ impl Isolate for RetryWorker {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Failed(self.attempts));
-                    Effect::Call(CurrentCall::new(
-                        CallRequest::Sleep {
-                            after: self.backoff,
-                        },
-                        |_| RetryMsg::RetryNow,
-                    ))
+                    sleep(self.backoff).reply(|_| RetryMsg::RetryNow)
                 } else {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Succeeded(self.attempts));
-                    Effect::Noop
+                    noop()
                 }
             }
             RetryMsg::RetryNow => {
                 self.observations
                     .borrow_mut()
                     .push(RetryObservation::BackoffElapsed);
-                Effect::Send(SendMessage::new(
-                    ctx.current_address::<RetryMsg>(),
-                    RetryMsg::Attempt,
-                ))
+                send(ctx.current_address::<RetryMsg>(), RetryMsg::Attempt)
             }
         }
     }

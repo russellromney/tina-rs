@@ -5,11 +5,11 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId, SpawnSpec,
+    Address, ChildDefinition, Context, Effect, Isolate, Mailbox, Outbound, Shard, ShardId,
     TrySendError,
 };
-use tina_runtime_current::{
-    CallKind, CallRequest, CallResult, CurrentCall, CurrentRuntime, EffectKind, MailboxFactory,
+use tina_runtime::{
+    CallInput, CallKind, CallOutput, EffectKind, MailboxFactory, Runtime, RuntimeCall,
     RuntimeEventKind, StreamId,
 };
 
@@ -115,7 +115,7 @@ struct Audit {
 impl Isolate for Audit {
     type Message = AuditMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -133,7 +133,7 @@ struct Worker;
 impl Isolate for Worker {
     type Message = WorkerMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -151,69 +151,69 @@ struct Driver {
 impl Isolate for Driver {
     type Message = DriverMsg;
     type Reply = ();
-    type Send = SendMessage<AuditMsg>;
-    type Spawn = SpawnSpec<Worker>;
-    type Call = CurrentCall<DriverMsg>;
+    type Send = Outbound<AuditMsg>;
+    type Spawn = ChildDefinition<Worker>;
+    type Call = RuntimeCall<DriverMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             DriverMsg::SendTwice => Effect::Batch(vec![
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(1))),
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(2))),
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(1))),
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(2))),
             ]),
             DriverMsg::SpawnAndSend => Effect::Batch(vec![
-                Effect::Spawn(SpawnSpec::new(Worker, 4).with_bootstrap(WorkerMsg::Start)),
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(9))),
+                Effect::Spawn(
+                    ChildDefinition::new(Worker, 4).with_initial_message(WorkerMsg::Start),
+                ),
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(9))),
             ]),
             DriverMsg::StopThenSend => Effect::Batch(vec![
                 Effect::Stop,
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(7))),
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(7))),
             ]),
             DriverMsg::SendThenBind => Effect::Batch(vec![
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(3))),
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpBind {
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(3))),
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpBind {
                         addr: "127.0.0.1:0".parse::<SocketAddr>().expect("loopback parse"),
                     },
                     |result| match result {
-                        CallResult::TcpBound { .. } => DriverMsg::BindObserved,
+                        CallOutput::TcpBound { .. } => DriverMsg::BindObserved,
                         other => panic!("expected successful bind result, got {other:?}"),
                     },
                 )),
             ]),
-            DriverMsg::BindObserved => {
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(4)))
-            }
+            DriverMsg::BindObserved => Effect::Send(Outbound::new(self.audit, AuditMsg::Record(4))),
             DriverMsg::FailReadThenSend => Effect::Batch(vec![
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpRead {
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpRead {
                         stream: StreamId::new(9999),
                         max_len: 8,
                     },
                     |result| match result {
-                        CallResult::Failed(_) => DriverMsg::ReadFailureObserved,
+                        CallOutput::Failed(_) => DriverMsg::ReadFailureObserved,
                         other => panic!("expected invalid read failure, got {other:?}"),
                     },
                 )),
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(5))),
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(5))),
             ]),
             DriverMsg::ReadFailureObserved => {
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(6)))
+                Effect::Send(Outbound::new(self.audit, AuditMsg::Record(6)))
             }
         }
     }
 }
 
 struct Harness {
-    runtime: CurrentRuntime<TestShard, TestMailboxFactory>,
+    runtime: Runtime<TestShard, TestMailboxFactory>,
     driver: Address<DriverMsg>,
     seen: Rc<RefCell<Vec<u8>>>,
 }
 
 impl Harness {
     fn new() -> Self {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let seen = Rc::new(RefCell::new(Vec::new()));
         let driver = {
             let audit = runtime.register(
@@ -234,7 +234,7 @@ impl Harness {
 }
 
 fn count_events(
-    trace: &[tina_runtime_current::RuntimeEvent],
+    trace: &[tina_runtime::RuntimeEvent],
     predicate: impl Fn(&RuntimeEventKind) -> bool,
 ) -> usize {
     trace
@@ -244,7 +244,7 @@ fn count_events(
 }
 
 fn first_event_index(
-    trace: &[tina_runtime_current::RuntimeEvent],
+    trace: &[tina_runtime::RuntimeEvent],
     predicate: impl Fn(&RuntimeEventKind) -> bool,
 ) -> usize {
     trace

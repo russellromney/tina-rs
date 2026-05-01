@@ -1,6 +1,6 @@
 use tina::{AddressGeneration, IsolateId, RestartPolicy, ShardId};
 
-pub use crate::call::{CallFailureReason, CallId};
+pub use crate::call::{CallError, CallId};
 
 /// Stable identifier for one runtime event in a deterministic trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -70,8 +70,8 @@ pub enum EffectKind {
 
 /// Trace-level kind of a runtime-owned call.
 ///
-/// `tina-runtime-current`'s call vocabulary lives in
-/// [`crate::call::CallRequest`]; this enum exists so the trace can name the
+/// `tina-runtime`'s call vocabulary lives in
+/// [`crate::call::CallInput`]; this enum exists so the trace can name the
 /// shape of a call without surfacing the full request payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallKind {
@@ -123,7 +123,7 @@ pub enum SendRejectedReason {
 /// Why a child was not restarted after a restart attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RestartSkippedReason {
-    /// The child was spawned from a one-shot [`tina::SpawnSpec`] and has no
+    /// The child was spawned from a one-shot [`tina::ChildDefinition`] and has no
     /// restart recipe.
     NotRestartable,
 }
@@ -305,7 +305,7 @@ pub enum RuntimeEventKind {
     /// requesting isolate as an ordinary later-turn message.
     ///
     /// This event fires only when the underlying
-    /// [`crate::CallResult`] is a success. Failed results are
+    /// [`crate::CallOutput`] is a success. Failed results are
     /// recorded by `CallFailed`; if a failed result's translated
     /// message also could not reach the requester's mailbox a
     /// `CallCompletionRejected` event captures that, and
@@ -329,7 +329,7 @@ pub enum RuntimeEventKind {
         call_kind: CallKind,
 
         /// Why the call failed.
-        reason: CallFailureReason,
+        reason: CallError,
     },
 
     /// The runtime could not deliver a completion to the requesting
