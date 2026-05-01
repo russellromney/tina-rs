@@ -114,7 +114,7 @@ phases.
 | ~~**Mariner runtime-owned time and retry**~~ | Delivered as a reviewed package (`.intent/phases/015-mariner-runtime-owned-time-and-retry/`). Shipped: one-shot relative `Sleep` call verb and `TimerFired` result, runtime-owned monotonic clock sampled once per step with due-timer harvest, deterministic request-order tie-break for equal deadlines, crate-private `ManualClock` seam for deterministic timer tests, focused timer semantics proofs (single wake, no early fire, fires once, different-deadline ordering, equal-deadline tie-break, stopped-requester rejection), and a retry/backoff proof package with both crate-local semantics tests and a public-path integration test for delayed retry. |
 | **Voyager deterministic simulation** | Planning bucket with reviewed slices delivered in `.intent/phases/016-voyager-virtual-time-and-replay/`, `.intent/phases/017-voyager-seeded-faults-and-checkers/`, `.intent/phases/018-voyager-spawn-and-supervision-simulation/`, and `.intent/phases/019-voyager-single-shard-io-simulation/`. Shipped so far: `tina-sim`, a single-shard virtual-time simulator for the shipped `Sleep { after }` / `TimerFired` contract, deterministic replay artifacts, direct timer-semantics proofs, simulator-backed retry/backoff proof, seeded perturbation over timer-wake and local-send behavior, a small checker surface with replayable failure capture, single-shard spawn/supervision replay covering public spawn payloads, restart policies, stale identity, budget exhaustion, and direct-child scope, and scripted single-shard TCP simulation covering the shipped bind/accept/read/write/close call family plus replayed echo workloads and TCP checker replay. Remaining Voyager work still includes broader PRNG policy, richer faults/checkers, and later multi-slice expansion. |
 | **Gemini single-shard release story** | Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, and a clear single-shard adoption story. |
-| **Galileo multi-shard runtime** | Cross-shard semantics, cross-shard channel, routing/placement, monoio runtime, multi-shard simulation coverage, and honest benchmarks. |
+| **Galileo multi-shard semantics and simulation** | A large coherent package: multi-shard explicit-step runtime semantics, cross-shard delivery, routing/placement, deterministic multi-shard traces, simulator parity, and a user-shaped proof workload. Explicitly does **not** include monoio substrate work or benchmark/hardening stories in the same pass. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 
@@ -230,30 +230,82 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 ---
 
 ## Phase Galileo
-> Jupiter mission. Multi-shard runtime + cross-shard semantics.
+> Jupiter mission. Multi-shard semantics become real.
 
 > After: Phase Gemini · Before: Phase Apollo
 
-- `tina-runtime-monoio`: thread-per-core backed by [monoio](https://github.com/bytedance/monoio) (io_uring on Linux). One shard per core, pinned. No work-stealing.
-- Before implementation, ship a cross-shard semantics note as a phase deliverable, not informal scaffolding. It must define:
-  - ordering within one mailbox
-  - ordering for cross-shard messages from one source to one target
-  - interleaving expectations for multiple sources targeting the same destination
-  - causal ordering expectations across request/reply pairs
-  - what is intentionally unspecified
-- Cross-shard messaging: when isolate A on shard 0 sends to isolate B on shard 3, the mailbox crosses cores via a separate cross-shard SPSC channel. Per-pair, not global.
-- Cross-shard SPSC has different concerns from within-shard SPSC: cross-core memory ordering, cache-line ping-pong, NUMA effects. Decide whether the cross-shard channel reuses `tina-mailbox-spsc` or ships as a sibling impl crate, and document the choice before benchmarks are written.
-- Workload placement: a hash-based router decides which shard owns which isolate. Stable under shard add/remove (consistent hashing).
-- Extend `tina-sim` to cover the newly-defined cross-shard semantics rather than inventing them ahead of the runtime.
-- A two-shard echo benchmark: half the connections on shard 0, half on shard 1, no migration.
+Galileo should be a **big semantic package**, but still one coherent story:
+`tina-rs` stops being single-shard. The goal is not "a cross-shard helper"
+or "a monoio prototype"; the goal is that multi-shard ownership, delivery, and
+replay become first-class and reviewable.
+
+Galileo should ship all of the following together:
+
+- a multi-shard explicit-step runtime model
+- shard ownership and registration semantics
+- cross-shard message delivery
+- routing / placement policy honest enough for real workloads
+- defined ordering rules for cross-shard delivery
+- deterministic multi-shard traces
+- `tina-sim` parity for the same multi-shard semantics
+- at least one user-shaped multi-shard workload proving the model end to end
+
+Before implementation, Galileo must pin a real cross-shard semantics note as a
+phase deliverable, not as informal scaffolding. It must define:
+
+- ordering within one mailbox
+- ordering for cross-shard messages from one source to one target
+- interleaving expectations for multiple sources targeting the same destination
+- causal expectations across request/reply pairs
+- stale/closed behavior across shards
+- what is intentionally unspecified
+
+The implementation target for this phase is the **semantic runtime**, not the
+final substrate:
+
+- start from the explicit-step runtime model so the semantics are visible and
+  testable before backend complexity arrives
+- cross-shard messaging should be modeled as explicit shard-to-shard channels,
+  not as "pretend global queue" shortcuts
+- routing / placement may start simple, but must be explicit and tested
+- `tina-sim` must learn the same cross-shard rules rather than inventing a
+  second model
+
+What Galileo explicitly does **not** need to include in this same pass:
+
+- `tina-runtime-monoio`
+- io_uring / reactor substrate engineering
+- performance tuning and benchmark claims
+- NUMA optimization
+- consistent-hashing sophistication or live rebalancing
+- zero-copy experiments for cross-shard ownership transfer
+
+Those belong to the next story, after the contract is real.
 
 **Proof plan:**
 
-- Multi-shard runtime tests prove cross-shard delivery, ownership, and routing semantics against the actual runtime.
-- Extended simulator tests prove reproducible cross-shard traces now that the semantics exist.
-- Benchmarks measure the monoio runtime honestly against the single-shard runtime and comparable Tokio baselines, including both naive Tokio and disciplined bounded-channel Tokio where useful, with documentation about where each approach wins or loses.
+- Multi-shard runtime tests prove:
+  - shard ownership and registration
+  - cross-shard delivery
+  - per-mailbox FIFO
+  - per-source -> per-target ordering
+  - defined multi-source interleaving behavior
+  - stale/closed rejection across shards
+  - deterministic repeated runs with the same event trace and causal structure
+- Extended simulator tests prove reproducible multi-shard traces against the
+  same semantics, not simulator-only rules.
+- At least one user-shaped workload proves the multi-shard model end to end.
+  Good candidates:
+  - a two-shard dispatcher/worker workload
+  - a routed multi-shard tenant/session workload
+  - a two-shard echo/control-plane split
+- Replay tests prove a saved config reproduces a multi-shard failure exactly.
 
-**Done when:** monoio runtime matches `tina-runtime-current` on single-shard echo; multi-shard tests prove cross-shard delivery and routing semantics; simulator coverage includes the defined cross-shard model; benchmark results are documented honestly rather than tied to a speculative numeric target.
+**Done when:** `tina-rs` is honestly multi-shard in both runtime and simulator
+terms; the cross-shard contract is written down and directly proved; a
+user-shaped workload exercises the model end to end; repeated seeded runs are
+deterministic and replayable; and no part of the phase depends on benchmark
+theater or substrate-specific heroics.
 
 ---
 
