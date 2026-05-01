@@ -209,7 +209,7 @@ plumbing).
     user-level send across shards). One clarifying line: "runtime-
     owned call resources (sleep timers, TCP listeners/streams) remain
     owned by their issuing shard. The translator's resulting `Message`
-    can be addressed to any shard via `SendMessage`, which then flows
+    can be addressed to any shard via `Outbound`, which then flows
     through the new cross-shard delivery path."
 
 14. **Unknown isolate id on a remote shard.**
@@ -589,10 +589,10 @@ before implementation:
    imagine a per-shard event record split.
 6. **Where does the multi-shard runtime live?**
    Plan extends "the runtime model" but does not say whether the
-   multi-shard surface lands in `tina-runtime-current` or in a new
+   multi-shard surface lands in `tina-runtime` or in a new
    crate. Plumbing, not semantics, but worth one line. Default reading:
-   stays in `tina-runtime-current` since "current" names the
-   substrate, not the shard count.
+   stays in `tina-runtime` unless Galileo intentionally chooses a new
+   crate boundary.
 7. **How does a workload on shard 0 obtain an `Address<M>` for a
    remote isolate on shard 1?**
    Implicitly via the existing public
@@ -701,3 +701,35 @@ shard surface is guaranteed.
 
 No further plan-review rounds expected. Implementation review is the
 next bar.
+
+## Upstream Alignment Note
+
+After the first implementation slice, I re-checked the upstream Tina/Odin
+material and code to sanity-check the Rust multi-shard story against the
+original model.
+
+The strongest confirmations:
+
+- cross-shard channels are strictly bounded
+- overflow is visible immediately at source-time
+- next-step-only cross-shard visibility is right
+- drain order by source shard is right
+
+The important nuance:
+
+- once a message has already been admitted into the cross-shard transport,
+  upstream Tina treats later destination-side mailbox overflow / stale-target
+  outcomes as destination-local drop facts, not as retroactive synchronous
+  send-result changes for the source
+
+That means `tina-rs` should be explicit about the distinction between:
+
+- **source-time transport admission** (`SendAccepted` / `SendRejected` on the
+  source shard), and
+- **destination-time harvest outcome** (`MailboxAccepted`, or an explicitly
+  traced destination-local drop if we choose to keep that richer trace shape)
+
+Keeping the richer destination-side trace in `tina-rs` is defensible because
+replay/explainability is one of the Rust port's strengths, but it should be
+described as an observability extension rather than presented as "what the
+source send really returned."

@@ -40,6 +40,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::marker::PhantomData;
@@ -656,6 +657,11 @@ struct ErasedSend {
     message: Box<dyn Any>,
 }
 
+struct QueuedRemoteSend {
+    send: ErasedSend,
+    cause: tina_runtime::CauseId,
+}
+
 struct ErasedCall {
     request: CallInput,
     translator: ErasedTranslator,
@@ -689,6 +695,33 @@ struct SupervisorRecord {
     budget_state: RestartBudgetState,
 }
 
+#[derive(Debug, Clone)]
+struct IdSource {
+    next_event_id: Rc<Cell<u64>>,
+    next_call_id: Rc<Cell<u64>>,
+}
+
+impl IdSource {
+    fn new() -> Self {
+        Self {
+            next_event_id: Rc::new(Cell::new(1)),
+            next_call_id: Rc::new(Cell::new(1)),
+        }
+    }
+
+    fn next_event_id(&self) -> tina_runtime::EventId {
+        let raw = self.next_event_id.get();
+        self.next_event_id.set(raw + 1);
+        tina_runtime::EventId::new(raw)
+    }
+
+    fn next_call_id(&self) -> CallId {
+        let raw = self.next_call_id.get();
+        self.next_call_id.set(raw + 1);
+        CallId::new(raw)
+    }
+}
+
 /// Narrow single-shard simulator for timer-driven `tina-rs` workloads.
 pub struct Simulator<S>
 where
@@ -702,8 +735,7 @@ where
     next_isolate_id: u64,
     next_listener_id: u64,
     next_stream_id: u64,
-    next_event_id: u64,
-    next_call_id: u64,
+    ids: IdSource,
     trace: Vec<RuntimeEvent>,
     virtual_now: Duration,
     step_ordinal: u64,
@@ -726,6 +758,10 @@ where
 {
     /// Creates a new simulator with virtual time starting at zero.
     pub fn new(shard: S, config: SimulatorConfig) -> Self {
+        Self::with_ids(shard, config, IdSource::new())
+    }
+
+    fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
         Self {
             shard,
             config,
@@ -735,8 +771,7 @@ where
             next_isolate_id: 1,
             next_listener_id: 1,
             next_stream_id: 1,
-            next_event_id: 1,
-            next_call_id: 1,
+            ids,
             trace: Vec::new(),
             virtual_now: Duration::ZERO,
             step_ordinal: 0,
@@ -914,6 +949,20 @@ where
     /// harvests due timers, and then gives each registered isolate at most one
     /// delivery chance in registration order.
     pub fn step(&mut self) -> usize {
+        let shard_id = self.shard.id();
+        self.step_with_remote(&mut |_source_shard, send, _cause| {
+            panic!(
+                "cross-shard simulation is out of scope in this slice: target shard {} != simulator shard {}",
+                send.target_shard.get(),
+                shard_id.get(),
+            );
+        })
+    }
+
+    fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
+    where
+        FR: FnMut(ShardId, ErasedSend, tina_runtime::CauseId) -> Result<(), SendRejectedReason>,
+    {
         self.step_ordinal += 1;
         let now = self.virtual_now;
         self.harvest_timers(now);
@@ -1003,6 +1052,7 @@ where
                 handler_finished.into(),
                 effect,
                 &mut round_messages,
+                route_remote,
             );
         }
 
@@ -1105,6 +1155,11 @@ where
         cause: tina_runtime::CauseId,
         effect: ErasedEffect<S>,
         round_messages: &mut [Option<Box<dyn Any>>],
+        route_remote: &mut impl FnMut(
+            ShardId,
+            ErasedSend,
+            tina_runtime::CauseId,
+        ) -> Result<(), SendRejectedReason>,
     ) -> bool {
         match effect {
             ErasedEffect::Stop => {
@@ -1124,7 +1179,13 @@ where
                         target_generation,
                     },
                 );
-                match self.dispatch_local_send(send) {
+                let delivery = if target_shard == self.shard.id() {
+                    self.dispatch_local_send(send)
+                } else {
+                    route_remote(self.shard.id(), send, attempted.into())
+                };
+
+                match delivery {
                     Ok(()) => {
                         self.push_event(
                             isolate_id,
@@ -1136,7 +1197,7 @@ where
                             },
                         );
                     }
-                    Err((target_shard, target_isolate, target_generation, reason)) => {
+                    Err(reason) => {
                         self.push_event(
                             isolate_id,
                             Some(attempted.into()),
@@ -1202,7 +1263,14 @@ where
             }
             ErasedEffect::Batch(effects) => {
                 for subeffect in effects {
-                    if self.execute_effect(index, isolate_id, cause, subeffect, round_messages) {
+                    if self.execute_effect(
+                        index,
+                        isolate_id,
+                        cause,
+                        subeffect,
+                        round_messages,
+                        route_remote,
+                    ) {
                         return true;
                     }
                 }
@@ -1571,8 +1639,7 @@ where
         requester: RegisteredAddress,
         cause: tina_runtime::CauseId,
     ) {
-        let call_id = CallId::new(self.next_call_id);
-        self.next_call_id += 1;
+        let call_id = self.ids.next_call_id();
         let call_kind = call_kind(&call.request);
         self.push_event(
             requester.isolate,
@@ -2212,10 +2279,7 @@ where
         }
     }
 
-    fn dispatch_local_send(
-        &mut self,
-        send: ErasedSend,
-    ) -> Result<(), (ShardId, IsolateId, AddressGeneration, SendRejectedReason)> {
+    fn dispatch_local_send(&mut self, send: ErasedSend) -> Result<(), SendRejectedReason> {
         if send.target_shard != self.shard.id() {
             panic!(
                 "cross-shard simulation is out of scope in this slice: target shard {} != simulator shard {}",
@@ -2229,21 +2293,11 @@ where
             .iter()
             .find(|entry| entry.id == send.target_isolate)
         else {
-            return Err((
-                send.target_shard,
-                send.target_isolate,
-                send.target_generation,
-                SendRejectedReason::Closed,
-            ));
+            return Err(SendRejectedReason::Closed);
         };
 
         if entry.generation != send.target_generation || entry.stopped.get() {
-            return Err((
-                send.target_shard,
-                send.target_isolate,
-                send.target_generation,
-                SendRejectedReason::Closed,
-            ));
+            return Err(SendRejectedReason::Closed);
         }
 
         let send_ordinal = self.next_send_ordinal;
@@ -2256,19 +2310,81 @@ where
             .inbox
             .push(send.message, visible_at_step)
             .map_err(|reason| match reason {
-                TrySendError::Full(_) => (
-                    send.target_shard,
-                    send.target_isolate,
-                    send.target_generation,
-                    SendRejectedReason::Full,
-                ),
-                TrySendError::Closed(_) => (
-                    send.target_shard,
-                    send.target_isolate,
-                    send.target_generation,
-                    SendRejectedReason::Closed,
-                ),
+                TrySendError::Full(_) => SendRejectedReason::Full,
+                TrySendError::Closed(_) => SendRejectedReason::Closed,
             })
+    }
+
+    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) {
+        // Cross-shard transport admission already happened on the source shard.
+        // What we record here is destination-local harvest outcome, not a
+        // retroactive change to the source-side send result.
+        let send = queued.send;
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == send.target_isolate)
+        else {
+            self.push_event(
+                send.target_isolate,
+                Some(queued.cause),
+                RuntimeEventKind::SendRejected {
+                    target_shard: send.target_shard,
+                    target_isolate: send.target_isolate,
+                    target_generation: send.target_generation,
+                    reason: SendRejectedReason::Closed,
+                },
+            );
+            return;
+        };
+
+        if entry.generation != send.target_generation || entry.stopped.get() {
+            self.push_event(
+                send.target_isolate,
+                Some(queued.cause),
+                RuntimeEventKind::SendRejected {
+                    target_shard: send.target_shard,
+                    target_isolate: send.target_isolate,
+                    target_generation: send.target_generation,
+                    reason: SendRejectedReason::Closed,
+                },
+            );
+            return;
+        }
+
+        match entry.inbox.push(send.message, self.step_ordinal + 1) {
+            Ok(()) => {
+                self.push_event(
+                    send.target_isolate,
+                    Some(queued.cause),
+                    RuntimeEventKind::MailboxAccepted,
+                );
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    send.target_isolate,
+                    Some(queued.cause),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: send.target_shard,
+                        target_isolate: send.target_isolate,
+                        target_generation: send.target_generation,
+                        reason: SendRejectedReason::Full,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    send.target_isolate,
+                    Some(queued.cause),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: send.target_shard,
+                        target_isolate: send.target_isolate,
+                        target_generation: send.target_generation,
+                        reason: SendRejectedReason::Closed,
+                    },
+                );
+            }
+        }
     }
 
     fn fault_delay(&self, mode: FaultMode, ordinal: u64, tag: u64) -> Duration {
@@ -2360,8 +2476,7 @@ where
         cause: Option<tina_runtime::CauseId>,
         kind: RuntimeEventKind,
     ) -> tina_runtime::EventId {
-        let id = tina_runtime::EventId::new(self.next_event_id);
-        self.next_event_id += 1;
+        let id = self.ids.next_event_id();
         self.trace
             .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
         id
@@ -2542,5 +2657,875 @@ where
             bootstrap_factory,
             marker: PhantomData,
         })
+    }
+}
+
+/// Deterministic explicit-step coordinator over a fixed set of shard simulators.
+///
+/// This additive shell preserves the existing single-shard [`Simulator`] API
+/// while giving Galileo one honest place to define global ingress, global
+/// stepping order, and explicit root placement by shard in virtual time.
+pub struct MultiShardSimulator<S>
+where
+    S: Shard + 'static,
+{
+    simulators: Vec<Simulator<S>>,
+    shard_indexes: BTreeMap<ShardId, usize>,
+    config: MultiShardSimulatorConfig,
+    remote_queues: BTreeMap<(ShardId, ShardId), VecDeque<QueuedRemoteSend>>,
+}
+
+/// Bounded coordinator config for additive multi-shard simulator shells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiShardSimulatorConfig {
+    /// Capacity of each source-shard -> destination-shard queue.
+    pub shard_pair_capacity: usize,
+}
+
+impl Default for MultiShardSimulatorConfig {
+    fn default() -> Self {
+        Self {
+            shard_pair_capacity: 64,
+        }
+    }
+}
+
+impl<S> MultiShardSimulator<S>
+where
+    S: Shard + 'static,
+{
+    /// Creates one additive multi-shard simulator over the provided shards.
+    ///
+    /// Shards are stepped in ascending [`ShardId`] order, regardless of input
+    /// order. Empty shard sets and duplicate shard ids are programmer errors
+    /// and panic.
+    pub fn new<I>(shards: I, config: SimulatorConfig) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::with_config(shards, config, MultiShardSimulatorConfig::default())
+    }
+
+    /// Creates one additive multi-shard simulator with explicit shard-pair
+    /// queue boundedness.
+    pub fn with_config<I>(
+        shards: I,
+        config: SimulatorConfig,
+        multishard: MultiShardSimulatorConfig,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        let mut shards: Vec<S> = shards.into_iter().collect();
+        if shards.is_empty() {
+            panic!("multi-shard simulator requires at least one shard");
+        }
+        if multishard.shard_pair_capacity == 0 {
+            panic!("multi-shard simulator requires shard-pair capacity > 0");
+        }
+
+        shards.sort_by_key(Shard::id);
+        for pair in shards.windows(2) {
+            if pair[0].id() == pair[1].id() {
+                panic!(
+                    "multi-shard simulator received duplicate shard id {}",
+                    pair[0].id().get()
+                );
+            }
+        }
+
+        let ids = IdSource::new();
+        let mut simulators = Vec::with_capacity(shards.len());
+        let mut shard_indexes = BTreeMap::new();
+        for shard in shards {
+            let shard_id = shard.id();
+            shard_indexes.insert(shard_id, simulators.len());
+            simulators.push(Simulator::with_ids(shard, config.clone(), ids.clone()));
+        }
+
+        Self {
+            simulators,
+            shard_indexes,
+            config: multishard,
+            remote_queues: BTreeMap::new(),
+        }
+    }
+
+    /// Returns the shard ids owned by this coordinator in global step order.
+    pub fn shard_ids(&self) -> Vec<ShardId> {
+        self.simulators
+            .iter()
+            .map(|simulator| simulator.shard.id())
+            .collect()
+    }
+
+    /// Returns the current shared virtual time.
+    pub fn now(&self) -> Duration {
+        self.simulators
+            .first()
+            .map(|simulator| simulator.virtual_now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Returns the merged deterministic event record in global event-id order.
+    pub fn trace(&self) -> Vec<RuntimeEvent> {
+        let mut events: Vec<_> = self
+            .simulators
+            .iter()
+            .flat_map(|simulator| simulator.trace().iter().copied())
+            .collect();
+        events.sort_by_key(|event| event.id());
+        events
+    }
+
+    /// Returns whether any owned shard still has pending timers or undelivered
+    /// runtime-owned completions.
+    pub fn has_in_flight_calls(&self) -> bool {
+        self.simulators.iter().any(Simulator::has_in_flight_calls)
+    }
+
+    /// Registers one root isolate on the requested owning shard.
+    #[allow(private_bounds)]
+    pub fn register_on<I, Msg, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+    ) -> Address<Msg>
+    where
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+    {
+        self.simulator_mut(shard).register::<I, Msg, Outbound>(isolate)
+    }
+
+    /// Registers one root isolate on the requested shard with an explicit
+    /// mailbox capacity.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_on<I, Msg, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Address<Msg>
+    where
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+    {
+        self.simulator_mut(shard)
+            .register_with_mailbox_capacity::<I, Msg, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Attempts one typed global ingress send routed strictly by target shard.
+    pub fn try_send<M: 'static>(
+        &self,
+        address: Address<M>,
+        message: M,
+    ) -> Result<(), TrySendError<M>> {
+        self.simulator(address.shard()).try_send(address, message)
+    }
+
+    /// Advances the shared virtual monotonic time by `by`.
+    pub fn advance_time(&mut self, by: Duration) {
+        for simulator in &mut self.simulators {
+            simulator.advance_time(by);
+        }
+    }
+
+    /// Advances shared virtual time to the next due timer on any shard.
+    pub fn advance_to_next_timer(&mut self) -> bool {
+        let Some(next_deadline) = self
+            .simulators
+            .iter()
+            .flat_map(|simulator| simulator.timers.iter().map(|entry| entry.deadline))
+            .min()
+        else {
+            return false;
+        };
+
+        for simulator in &mut self.simulators {
+            if next_deadline > simulator.virtual_now {
+                simulator.virtual_now = next_deadline;
+            }
+        }
+
+        true
+    }
+
+    /// Runs one global deterministic round in ascending shard-id order.
+    pub fn step(&mut self) -> usize {
+        let mut ready = std::mem::take(&mut self.remote_queues);
+        let shard_ids = self.shard_ids();
+        let mut delivered = 0;
+
+        for destination in &shard_ids {
+            self.harvest_for_destination(*destination, &shard_ids, &mut ready);
+            let index = self.checked_shard_index(*destination);
+            let config = self.config;
+            let shard_indexes = self.shard_indexes.clone();
+            let remote_queues = &mut self.remote_queues;
+            delivered += self.simulators[index].step_with_remote(&mut |source_shard, send, cause| {
+                if !shard_indexes.contains_key(&send.target_shard) {
+                    panic!(
+                        "multi-shard simulator targeted unknown destination shard {}",
+                        send.target_shard.get()
+                    );
+                }
+
+                let key = (source_shard, send.target_shard);
+                let queue = remote_queues.entry(key).or_default();
+                if queue.len() >= config.shard_pair_capacity {
+                    return Err(SendRejectedReason::Full);
+                }
+                queue.push_back(QueuedRemoteSend { send, cause });
+                Ok(())
+            });
+        }
+
+        delivered
+    }
+
+    fn simulator(&self, shard: ShardId) -> &Simulator<S> {
+        &self.simulators[self.checked_shard_index(shard)]
+    }
+
+    fn simulator_mut(&mut self, shard: ShardId) -> &mut Simulator<S> {
+        let index = self.checked_shard_index(shard);
+        &mut self.simulators[index]
+    }
+
+    fn checked_shard_index(&self, shard: ShardId) -> usize {
+        self.shard_indexes.get(&shard).copied().unwrap_or_else(|| {
+            panic!(
+                "multi-shard simulator targeted unknown shard {}",
+                shard.get()
+            )
+        })
+    }
+
+    fn harvest_for_destination(
+        &mut self,
+        destination: ShardId,
+        shard_ids: &[ShardId],
+        ready: &mut BTreeMap<(ShardId, ShardId), VecDeque<QueuedRemoteSend>>,
+    ) {
+        let index = self.checked_shard_index(destination);
+        for source in shard_ids {
+            if *source == destination {
+                continue;
+            }
+            let key = (*source, destination);
+            let Some(queue) = ready.get_mut(&key) else {
+                continue;
+            };
+            while let Some(queued) = queue.pop_front() {
+                self.simulators[index].harvest_remote_send(queued);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+    use tina::{Outbound, batch, noop, send, stop};
+
+    #[derive(Debug, Clone, Copy)]
+    struct NumberedShard(u32);
+
+    impl Shard for NumberedShard {
+        fn id(&self) -> ShardId {
+            ShardId::new(self.0)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimTimerMsg {
+        Start,
+        Fired,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimStepEvent {
+        Tick,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimRemoteEvent {
+        Kick,
+        KickTwice,
+        KickThrice,
+        Arrived,
+        StopNow,
+    }
+
+    #[derive(Debug)]
+    struct SimSleeper<S> {
+        delay: Duration,
+        marker: PhantomData<S>,
+    }
+
+    #[derive(Debug)]
+    struct SimRecorder<S> {
+        marker: PhantomData<S>,
+    }
+
+    #[derive(Debug)]
+    struct SimRemoteSender<S> {
+        target: Address<SimRemoteEvent>,
+        marker: PhantomData<S>,
+    }
+
+    #[derive(Debug)]
+    struct SimRemoteSink<S> {
+        marker: PhantomData<S>,
+    }
+
+    impl<S> Isolate for SimSleeper<S>
+    where
+        S: Shard + 'static,
+    {
+        type Message = SimTimerMsg;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type Call = RuntimeCall<SimTimerMsg>;
+        type Shard = S;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                SimTimerMsg::Start => Effect::Call(RuntimeCall::new(
+                    CallInput::Sleep { after: self.delay },
+                    |result| match result {
+                        CallOutput::TimerFired => SimTimerMsg::Fired,
+                        other => panic!("expected TimerFired, got {other:?}"),
+                    },
+                )),
+                SimTimerMsg::Fired => Effect::Noop,
+            }
+        }
+    }
+
+    impl<S> Isolate for SimRecorder<S>
+    where
+        S: Shard + 'static,
+    {
+        type Message = SimStepEvent;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type Call = RuntimeCall<SimStepEvent>;
+        type Shard = S;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                SimStepEvent::Tick => Effect::Noop,
+            }
+        }
+    }
+
+    impl<S> Isolate for SimRemoteSender<S>
+    where
+        S: Shard + 'static,
+    {
+        type Message = SimRemoteEvent;
+        type Reply = ();
+        type Send = Outbound<SimRemoteEvent>;
+        type Spawn = Infallible;
+        type Call = RuntimeCall<SimRemoteEvent>;
+        type Shard = S;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                SimRemoteEvent::Kick => send(self.target, SimRemoteEvent::Arrived),
+                SimRemoteEvent::KickTwice => batch([
+                    send(self.target, SimRemoteEvent::Arrived),
+                    send(self.target, SimRemoteEvent::Arrived),
+                ]),
+                SimRemoteEvent::KickThrice => batch([
+                    send(self.target, SimRemoteEvent::Arrived),
+                    send(self.target, SimRemoteEvent::Arrived),
+                    send(self.target, SimRemoteEvent::Arrived),
+                ]),
+                SimRemoteEvent::Arrived => noop(),
+                SimRemoteEvent::StopNow => stop(),
+            }
+        }
+    }
+
+    impl<S> Isolate for SimRemoteSink<S>
+    where
+        S: Shard + 'static,
+    {
+        type Message = SimRemoteEvent;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type Call = RuntimeCall<SimRemoteEvent>;
+        type Shard = S;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                SimRemoteEvent::Arrived
+                | SimRemoteEvent::Kick
+                | SimRemoteEvent::KickTwice
+                | SimRemoteEvent::KickThrice => noop(),
+                SimRemoteEvent::StopNow => stop(),
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_simulators_can_share_global_event_and_call_id_sources() {
+        let ids = IdSource::new();
+        let mut first =
+            Simulator::with_ids(NumberedShard(11), SimulatorConfig::default(), ids.clone());
+        let mut second = Simulator::with_ids(NumberedShard(22), SimulatorConfig::default(), ids);
+
+        let first_sleeper = first.register(SimSleeper::<NumberedShard> {
+            delay: Duration::from_millis(5),
+            marker: PhantomData,
+        });
+        let second_sleeper = second.register(SimSleeper::<NumberedShard> {
+            delay: Duration::from_millis(7),
+            marker: PhantomData,
+        });
+
+        first.try_send(first_sleeper, SimTimerMsg::Start).unwrap();
+        second.try_send(second_sleeper, SimTimerMsg::Start).unwrap();
+
+        assert_eq!(first.step(), 1);
+        assert_eq!(second.step(), 1);
+
+        let first_event_ids: Vec<_> = first.trace().iter().map(|event| event.id().get()).collect();
+        let second_event_ids: Vec<_> = second
+            .trace()
+            .iter()
+            .map(|event| event.id().get())
+            .collect();
+        assert_eq!(first_event_ids, vec![1, 2, 3, 4]);
+        assert_eq!(second_event_ids, vec![5, 6, 7, 8]);
+
+        let first_call_ids: Vec<_> = first
+            .trace()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::CallDispatchAttempted { call_id, .. } => Some(call_id.get()),
+                _ => None,
+            })
+            .collect();
+        let second_call_ids: Vec<_> = second
+            .trace()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::CallDispatchAttempted { call_id, .. } => Some(call_id.get()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first_call_ids, vec![1]);
+        assert_eq!(second_call_ids, vec![2]);
+    }
+
+    #[test]
+    fn multishard_simulator_routes_ingress_and_steps_in_ascending_shard_order() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(22), NumberedShard(11)],
+            SimulatorConfig::default(),
+        );
+
+        assert_eq!(sim.shard_ids(), vec![ShardId::new(11), ShardId::new(22)]);
+
+        let shard_twenty_two = sim.register_with_capacity_on::<SimRecorder<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRecorder {
+                marker: PhantomData,
+            },
+            4,
+        );
+        let shard_eleven = sim.register_with_capacity_on::<SimRecorder<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRecorder {
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        assert_eq!(shard_twenty_two.shard(), ShardId::new(22));
+        assert_eq!(shard_eleven.shard(), ShardId::new(11));
+
+        sim.try_send(shard_twenty_two, SimStepEvent::Tick).unwrap();
+        sim.try_send(shard_eleven, SimStepEvent::Tick).unwrap();
+
+        assert_eq!(sim.step(), 2);
+
+        let handler_shards: Vec<_> = sim
+            .trace()
+            .into_iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::HandlerStarted => Some(event.shard().get()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handler_shards, vec![11, 22]);
+    }
+
+    #[test]
+    fn cross_shard_simulation_becomes_visible_on_the_next_global_step() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+        );
+
+        let sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            4,
+        );
+        let sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(sender, SimRemoteEvent::Kick).unwrap();
+
+        assert_eq!(sim.step(), 1);
+        let step_one_trace = sim.trace();
+        let step_one_sink_handlers = step_one_trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(22)
+                    && matches!(event.kind(), RuntimeEventKind::HandlerStarted)
+            })
+            .count();
+        assert_eq!(step_one_sink_handlers, 0);
+
+        assert_eq!(sim.step(), 1);
+        let trace = sim.trace();
+        assert!(trace.iter().any(|event| {
+            event.shard() == ShardId::new(11)
+                && matches!(event.kind(), RuntimeEventKind::SendAccepted { .. })
+        }));
+        assert!(trace.iter().any(|event| {
+            event.shard() == ShardId::new(22)
+                && matches!(event.kind(), RuntimeEventKind::MailboxAccepted)
+        }));
+    }
+
+    #[test]
+    fn cross_shard_simulation_queue_overflow_rejects_at_source_time() {
+        let mut sim = MultiShardSimulator::with_config(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+            MultiShardSimulatorConfig {
+                shard_pair_capacity: 1,
+            },
+        );
+
+        let sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            4,
+        );
+        let sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(sender, SimRemoteEvent::KickTwice).unwrap();
+
+        assert_eq!(sim.step(), 1);
+
+        let trace = sim.trace();
+        let full_rejections = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(11)
+                    && matches!(
+                        event.kind(),
+                        RuntimeEventKind::SendRejected {
+                            reason: SendRejectedReason::Full,
+                            ..
+                        }
+                    )
+            })
+            .count();
+        assert_eq!(full_rejections, 1);
+    }
+
+    #[test]
+    fn cross_shard_simulation_closed_target_rejects_on_destination_harvest() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+        );
+
+        let sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            4,
+        );
+        let sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(sender, SimRemoteEvent::Kick).unwrap();
+        sim.try_send(sink, SimRemoteEvent::StopNow).unwrap();
+
+        assert_eq!(sim.step(), 2);
+        assert_eq!(sim.step(), 0);
+
+        let trace = sim.trace();
+        let closed_rejections = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(22)
+                    && matches!(
+                        event.kind(),
+                        RuntimeEventKind::SendRejected {
+                            reason: SendRejectedReason::Closed,
+                            ..
+                        }
+                    )
+            })
+            .count();
+        assert_eq!(closed_rejections, 1);
+    }
+
+    #[test]
+    fn cross_shard_simulation_destination_mailbox_full_rejects_on_harvest() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+        );
+
+        let sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            1,
+        );
+        let remote_sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+        let local_filler = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(remote_sender, SimRemoteEvent::Kick).unwrap();
+        sim.try_send(local_filler, SimRemoteEvent::Kick).unwrap();
+
+        assert_eq!(sim.step(), 2);
+        assert_eq!(sim.step(), 1);
+
+        let trace = sim.trace();
+        let source_accepts = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(11)
+                    && matches!(event.kind(), RuntimeEventKind::SendAccepted { .. })
+            })
+            .count();
+        assert_eq!(source_accepts, 1);
+
+        let destination_full_rejections = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(22)
+                    && matches!(
+                        event.kind(),
+                        RuntimeEventKind::SendRejected {
+                            reason: SendRejectedReason::Full,
+                            ..
+                        }
+                    )
+            })
+            .count();
+        assert_eq!(destination_full_rejections, 1);
+    }
+
+    #[test]
+    fn cross_shard_simulation_preserves_fifo_from_one_source() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+        );
+
+        let sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            8,
+        );
+        let sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(sender, SimRemoteEvent::KickThrice).unwrap();
+
+        assert_eq!(sim.step(), 1);
+        assert_eq!(sim.step(), 1);
+
+        let trace = sim.trace();
+        let source_attempts: Vec<_> = trace
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::SendDispatchAttempted { .. } if event.shard() == ShardId::new(11) => {
+                    Some(event.id().get())
+                }
+                _ => None,
+            })
+            .collect();
+        let destination_causes: Vec<_> = trace
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::MailboxAccepted if event.shard() == ShardId::new(22) => {
+                    event.cause().map(|cause| cause.event().get())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(destination_causes, source_attempts);
+    }
+
+    #[test]
+    fn cross_shard_simulation_harvests_sources_in_ascending_shard_order() {
+        let mut sim = MultiShardSimulator::new(
+            [
+                NumberedShard(33),
+                NumberedShard(22),
+                NumberedShard(11),
+                NumberedShard(44),
+            ],
+            SimulatorConfig::default(),
+        );
+
+        let sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(44),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            8,
+        );
+        let sender11 = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+        let sender22 = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+        let sender33 = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(33),
+            SimRemoteSender {
+                target: sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(sender33, SimRemoteEvent::Kick).unwrap();
+        sim.try_send(sender22, SimRemoteEvent::Kick).unwrap();
+        sim.try_send(sender11, SimRemoteEvent::Kick).unwrap();
+
+        assert_eq!(sim.step(), 3);
+        assert_eq!(sim.step(), 1);
+
+        let trace = sim.trace();
+        let source_order: Vec<_> = trace
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::SendDispatchAttempted { .. }
+                    if matches!(event.shard().get(), 11 | 22 | 33) =>
+                {
+                    Some((event.shard().get(), event.id().get()))
+                }
+                _ => None,
+            })
+            .collect();
+        let destination_causes: Vec<_> = trace
+            .iter()
+            .filter_map(|event| match event.kind() {
+                RuntimeEventKind::MailboxAccepted if event.shard() == ShardId::new(44) => {
+                    event.cause().map(|cause| cause.event().get())
+                }
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<_> = source_order.into_iter().map(|(_, id)| id).collect();
+        assert_eq!(destination_causes, expected);
     }
 }

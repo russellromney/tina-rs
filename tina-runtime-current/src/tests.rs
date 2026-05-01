@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tina::Outbound;
+use tina::{Outbound, batch, noop, send, stop};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -37,6 +37,15 @@ struct TestShard;
 impl Shard for TestShard {
     fn id(&self) -> ShardId {
         ShardId::new(3)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NumberedShard(u32);
+
+impl Shard for NumberedShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(self.0)
     }
 }
 
@@ -1096,6 +1105,149 @@ fn new_manual_runtime() -> (Runtime<TestShard, TestMailboxFactory>, Rc<ManualClo
     (runtime, clock)
 }
 
+#[derive(Debug)]
+struct NumberedSleeper<S> {
+    delay: Duration,
+    marker: PhantomData<S>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepEvent {
+    Tick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteEvent {
+    Kick,
+    KickTwice,
+    KickThrice,
+    Arrived,
+    StopNow,
+}
+
+#[derive(Debug)]
+struct NumberedRecorder<S> {
+    marker: PhantomData<S>,
+}
+
+#[derive(Debug)]
+struct RemoteSender<S> {
+    target: Address<RemoteEvent>,
+    marker: PhantomData<S>,
+}
+
+#[derive(Debug)]
+struct RemoteSink<S> {
+    marker: PhantomData<S>,
+}
+
+impl<S> Isolate for NumberedRecorder<S>
+where
+    S: Shard + 'static,
+{
+    type Message = StepEvent;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = Infallible;
+    type Shard = S;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard>,
+    ) -> Effect<Self> {
+        match msg {
+            StepEvent::Tick => Effect::Noop,
+        }
+    }
+}
+
+impl<S> Isolate for RemoteSender<S>
+where
+    S: Shard + 'static,
+{
+    type Message = RemoteEvent;
+    type Reply = ();
+    type Send = Outbound<RemoteEvent>;
+    type Spawn = Infallible;
+    type Call = Infallible;
+    type Shard = S;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard>,
+    ) -> Effect<Self> {
+        match msg {
+            RemoteEvent::Kick => send(self.target, RemoteEvent::Arrived),
+            RemoteEvent::KickTwice => batch([
+                send(self.target, RemoteEvent::Arrived),
+                send(self.target, RemoteEvent::Arrived),
+            ]),
+            RemoteEvent::KickThrice => batch([
+                send(self.target, RemoteEvent::Arrived),
+                send(self.target, RemoteEvent::Arrived),
+                send(self.target, RemoteEvent::Arrived),
+            ]),
+            RemoteEvent::Arrived => noop(),
+            RemoteEvent::StopNow => stop(),
+        }
+    }
+}
+
+impl<S> Isolate for RemoteSink<S>
+where
+    S: Shard + 'static,
+{
+    type Message = RemoteEvent;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = Infallible;
+    type Shard = S;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard>,
+    ) -> Effect<Self> {
+        match msg {
+            RemoteEvent::Arrived
+            | RemoteEvent::Kick
+            | RemoteEvent::KickTwice
+            | RemoteEvent::KickThrice => noop(),
+            RemoteEvent::StopNow => stop(),
+        }
+    }
+}
+
+impl<S> Isolate for NumberedSleeper<S>
+where
+    S: Shard + 'static,
+{
+    type Message = TimerMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<TimerMsg>;
+    type Shard = S;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            TimerMsg::StartSleep => Effect::Call(RuntimeCall::new(
+                CallInput::Sleep { after: self.delay },
+                |result| match result {
+                    CallOutput::TimerFired => TimerMsg::Fired,
+                    other => panic!("expected TimerFired, got {other:?}"),
+                },
+            )),
+            TimerMsg::Fired => Effect::Noop,
+            TimerMsg::StopNow => Effect::Stop,
+        }
+    }
+}
+
 #[test]
 fn single_timer_wakes_after_deadline() {
     let (mut runtime, clock) = new_manual_runtime();
@@ -1129,6 +1281,451 @@ fn single_timer_wakes_after_deadline() {
         )),
         "trace must show CallCompleted for Sleep"
     );
+}
+
+#[test]
+fn sibling_runtimes_can_share_global_event_and_call_id_sources() {
+    let ids = IdSource::new();
+    let first_clock = Rc::new(ManualClock::new());
+    let second_clock = Rc::new(ManualClock::new());
+    let mut first = Runtime::with_clock_and_ids(
+        NumberedShard(11),
+        TestMailboxFactory,
+        Box::new(Rc::clone(&first_clock)),
+        ids.clone(),
+    );
+    let mut second = Runtime::with_clock_and_ids(
+        NumberedShard(22),
+        TestMailboxFactory,
+        Box::new(Rc::clone(&second_clock)),
+        ids,
+    );
+
+    let first_sleeper = first.register(
+        NumberedSleeper::<NumberedShard> {
+            delay: Duration::from_millis(5),
+            marker: PhantomData,
+        },
+        TestMailbox::new(4),
+    );
+    let second_sleeper = second.register(
+        NumberedSleeper::<NumberedShard> {
+            delay: Duration::from_millis(7),
+            marker: PhantomData,
+        },
+        TestMailbox::new(4),
+    );
+
+    first.try_send(first_sleeper, TimerMsg::StartSleep).unwrap();
+    second
+        .try_send(second_sleeper, TimerMsg::StartSleep)
+        .unwrap();
+
+    assert_eq!(first.step(), 1);
+    assert_eq!(second.step(), 1);
+
+    let first_event_ids: Vec<_> = first.trace().iter().map(|event| event.id().get()).collect();
+    let second_event_ids: Vec<_> = second
+        .trace()
+        .iter()
+        .map(|event| event.id().get())
+        .collect();
+    assert_eq!(first_event_ids, vec![1, 2, 3, 4]);
+    assert_eq!(second_event_ids, vec![5, 6, 7, 8]);
+
+    let first_call_ids: Vec<_> = first
+        .trace()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::CallDispatchAttempted { call_id, .. } => Some(call_id.get()),
+            _ => None,
+        })
+        .collect();
+    let second_call_ids: Vec<_> = second
+        .trace()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::CallDispatchAttempted { call_id, .. } => Some(call_id.get()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(first_call_ids, vec![1]);
+    assert_eq!(second_call_ids, vec![2]);
+}
+
+#[test]
+fn multishard_runtime_routes_ingress_and_steps_in_ascending_shard_order() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(22), NumberedShard(11)], TestMailboxFactory);
+
+    assert_eq!(runtime.shard_ids(), vec![ShardId::new(11), ShardId::new(22)]);
+
+    let shard_twenty_two = runtime.register_with_capacity_on::<NumberedRecorder<NumberedShard>, _>(
+        ShardId::new(22),
+        NumberedRecorder {
+            marker: PhantomData,
+        },
+        4,
+    );
+    let shard_eleven = runtime.register_with_capacity_on::<NumberedRecorder<NumberedShard>, _>(
+        ShardId::new(11),
+        NumberedRecorder {
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    assert_eq!(shard_twenty_two.shard(), ShardId::new(22));
+    assert_eq!(shard_eleven.shard(), ShardId::new(11));
+
+    runtime.try_send(shard_twenty_two, StepEvent::Tick).unwrap();
+    runtime.try_send(shard_eleven, StepEvent::Tick).unwrap();
+
+    assert_eq!(runtime.step(), 2);
+
+    let handler_shards: Vec<_> = runtime
+        .trace()
+        .into_iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::HandlerStarted => Some(event.shard().get()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handler_shards, vec![11, 22]);
+}
+
+#[test]
+fn cross_shard_send_becomes_visible_on_the_next_global_step() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
+
+    let sink = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        4,
+    );
+    let sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(sender, RemoteEvent::Kick).unwrap();
+
+    assert_eq!(runtime.step(), 1);
+    let step_one_trace = runtime.trace();
+    let step_one_sink_handlers = step_one_trace
+        .iter()
+        .filter(|event| {
+            event.shard() == ShardId::new(22)
+                && matches!(event.kind(), RuntimeEventKind::HandlerStarted)
+        })
+        .count();
+    assert_eq!(step_one_sink_handlers, 0);
+
+    assert_eq!(runtime.step(), 1);
+    let trace = runtime.trace();
+
+    let accepted_shard11 = trace.iter().any(|event| {
+        event.shard() == ShardId::new(11)
+            && matches!(event.kind(), RuntimeEventKind::SendAccepted { .. })
+    });
+    assert!(accepted_shard11);
+
+    let harvested_on_22 = trace.iter().any(|event| {
+        event.shard() == ShardId::new(22)
+            && matches!(event.kind(), RuntimeEventKind::MailboxAccepted)
+    });
+    assert!(harvested_on_22);
+
+    let sink_handlers: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::HandlerStarted if event.shard() == ShardId::new(22) => {
+                Some(event.id().get())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sink_handlers.len(), 1);
+}
+
+#[test]
+fn cross_shard_queue_overflow_rejects_at_source_time() {
+    let mut runtime = MultiShardRuntime::with_config(
+        [NumberedShard(11), NumberedShard(22)],
+        TestMailboxFactory,
+        MultiShardRuntimeConfig {
+            shard_pair_capacity: 1,
+        },
+    );
+
+    let sink = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        4,
+    );
+    let sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(sender, RemoteEvent::KickTwice).unwrap();
+
+    assert_eq!(runtime.step(), 1);
+
+    let trace = runtime.trace();
+    let full_rejections: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::SendRejected { reason, .. }
+                if event.shard() == ShardId::new(11) && reason == SendRejectedReason::Full =>
+            {
+                Some(event.id().get())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(full_rejections.len(), 1);
+}
+
+#[test]
+fn cross_shard_closed_target_rejects_on_destination_harvest() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
+
+    let sink = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        4,
+    );
+    let sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(sender, RemoteEvent::Kick).unwrap();
+    runtime.try_send(sink, RemoteEvent::StopNow).unwrap();
+
+    assert_eq!(runtime.step(), 2);
+    assert_eq!(runtime.step(), 0);
+
+    let trace = runtime.trace();
+    let closed_rejections: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::SendRejected { reason, .. }
+                if event.shard() == ShardId::new(22) && reason == SendRejectedReason::Closed =>
+            {
+                Some(event.id().get())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed_rejections.len(), 1);
+}
+
+#[test]
+fn cross_shard_destination_mailbox_full_rejects_on_harvest() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
+
+    let sink = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        1,
+    );
+    let remote_sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+    let local_filler = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(remote_sender, RemoteEvent::Kick).unwrap();
+    runtime.try_send(local_filler, RemoteEvent::Kick).unwrap();
+
+    assert_eq!(runtime.step(), 2);
+    assert_eq!(runtime.step(), 1);
+
+    let trace = runtime.trace();
+    let source_accepts = trace
+        .iter()
+        .filter(|event| {
+            event.shard() == ShardId::new(11)
+                && matches!(event.kind(), RuntimeEventKind::SendAccepted { .. })
+        })
+        .count();
+    assert_eq!(source_accepts, 1);
+
+    let destination_full_rejections = trace
+        .iter()
+        .filter(|event| {
+            event.shard() == ShardId::new(22)
+                && matches!(
+                    event.kind(),
+                    RuntimeEventKind::SendRejected {
+                        reason: SendRejectedReason::Full,
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert_eq!(destination_full_rejections, 1);
+}
+
+#[test]
+fn cross_shard_harvest_preserves_fifo_from_one_source() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
+
+    let sink = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        8,
+    );
+    let sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(sender, RemoteEvent::KickThrice).unwrap();
+
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+
+    let trace = runtime.trace();
+    let source_attempts: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::SendDispatchAttempted { .. } if event.shard() == ShardId::new(11) => {
+                Some(event.id().get())
+            }
+            _ => None,
+        })
+        .collect();
+    let destination_causes: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::MailboxAccepted if event.shard() == ShardId::new(22) => {
+                event.cause().map(|cause| cause.event().get())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(destination_causes, source_attempts);
+}
+
+#[test]
+fn cross_shard_harvest_drains_sources_in_ascending_shard_order() {
+    let mut runtime = MultiShardRuntime::new(
+        [
+            NumberedShard(33),
+            NumberedShard(22),
+            NumberedShard(11),
+            NumberedShard(44),
+        ],
+        TestMailboxFactory,
+    );
+
+    let sink = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(44),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        8,
+    );
+    let sender11 = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+    let sender22 = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+    let sender33 = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(33),
+        RemoteSender {
+            target: sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(sender33, RemoteEvent::Kick).unwrap();
+    runtime.try_send(sender22, RemoteEvent::Kick).unwrap();
+    runtime.try_send(sender11, RemoteEvent::Kick).unwrap();
+
+    assert_eq!(runtime.step(), 3);
+    assert_eq!(runtime.step(), 1);
+
+    let trace = runtime.trace();
+    let source_order: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::SendDispatchAttempted { .. }
+                if matches!(event.shard().get(), 11 | 22 | 33) =>
+            {
+                Some((event.shard().get(), event.id().get()))
+            }
+            _ => None,
+        })
+        .collect();
+    let destination_causes: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::MailboxAccepted if event.shard() == ShardId::new(44) => {
+                event.cause().map(|cause| cause.event().get())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let expected: Vec<_> = source_order.into_iter().map(|(_, id)| id).collect();
+    assert_eq!(destination_causes, expected);
 }
 
 #[test]

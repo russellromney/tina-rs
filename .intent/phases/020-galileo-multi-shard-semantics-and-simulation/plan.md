@@ -95,7 +95,7 @@ engineering, pause and split there. Otherwise keep the package together so
     multi-shard coordinator surfaces rather than breaking current `Simulator<S>`
     workloads
 - Keep current same-shard behavior intact:
-  - same-shard `SendMessage` keeps the existing deterministic local-delivery
+  - same-shard `Outbound` keeps the existing deterministic local-delivery
     story
   - shard-local spawn, call, timer, stop, panic, and supervision behavior
     preserve their current meanings
@@ -105,7 +105,18 @@ engineering, pause and split there. Otherwise keep the package together so
   - shard-pair cross-shard channels are explicitly bounded by config
   - overflow rejects at source-time through the live `SendRejected` /
     `SendRejectedReason::Full` vocabulary
+  - the source-side send result for a cross-shard `Outbound` reflects
+    cross-shard transport admission only; once a message is accepted into a
+    shard-pair queue, the sender has already learned the synchronous outcome
   - Galileo must not hide unbounded buffering between shards
+- Pin post-transport destination semantics honestly:
+  - after a cross-shard send is admitted into a shard-pair queue, destination
+    harvest is a second stage with its own local boundedness checks
+  - destination-side stale, stopped, unknown, or full-mailbox outcomes are not
+    retroactive source-time send failures
+  - `tina-rs` may still record those harvest-time drops explicitly in the
+    destination shard trace for reviewability, but that is an observability
+    extension, not a second synchronous send-result contract
 - Pin the multi-shard ordering contract:
   - within one mailbox, delivery remains FIFO by mailbox acceptance order
   - messages sent from one source isolate to one target isolate preserve send
@@ -132,6 +143,10 @@ engineering, pause and split there. Otherwise keep the package together so
     by `SendAccepted` or `SendRejected` in the source shard's event record
   - accepted cross-shard sends become destination-side `MailboxAccepted` events
     on harvest in the destination shard's event record
+  - when a message was accepted into a shard-pair queue but later rejected
+    during destination harvest, that rejection is understood as a
+    destination-local drop/closure fact rather than a retroactive source-time
+    send failure
   - cross-shard request/reply causality is proved against that source/destination
     event shape rather than only against final workload output
 - Keep event and cause identity global:
@@ -167,12 +182,18 @@ engineering, pause and split there. Otherwise keep the package together so
   - sleep timers and TCP listeners/streams remain owned by the issuing shard
   - completion messages still return to the requesting isolate on that shard
   - any later cross-shard communication triggered by those completion handlers
-    flows through ordinary `SendMessage`
+    flows through ordinary `Outbound`
 - Pin programmer-error misuse up front:
   - attempting cross-shard spawn placement or cross-shard `RestartChildren`
     semantics in 020 is a programmer error and may panic
   - registering a root isolate on a non-existent shard id is a programmer error
     and may panic
+- Keep shard-liveness/quarantine scope honest:
+  - Galileo's first multi-shard slice does not attempt full peer quarantine /
+    shard-restarted broadcast semantics from upstream Tina
+  - this phase's "remote closed" proofs are about destination-address
+    generation/stopped/unknown-target outcomes, not full peer-liveness
+    propagation
 
 ## Build Steps
 
@@ -181,7 +202,7 @@ engineering, pause and split there. Otherwise keep the package together so
 2. Extend the runtime model from one shard to a fixed set of explicit-step
    shards driven by one global `step()`.
 3. Add explicit shard ownership at registration time for root isolates.
-4. Add bounded shard-pair cross-shard queues for `SendMessage` delivery.
+4. Add bounded shard-pair cross-shard queues for `Outbound` delivery.
 5. Implement deterministic inbound harvest on each destination shard:
    - ascending source-shard order
    - FIFO within each shard-pair channel
@@ -196,6 +217,10 @@ engineering, pause and split there. Otherwise keep the package together so
    - stale, stopped, or unknown remote targets discovered on destination
      harvest reject through the live `SendRejected { reason: Closed, .. }`
      vocabulary in the destination shard's event record
+   - destination mailbox full discovered on destination harvest is treated as a
+     destination-local boundedness fact; if kept trace-visible in `tina-rs`, it
+     must be proved as destination-time `SendRejected { reason: Full, .. }`
+     rather than described as a source-time send failure
    - runtime ingress continues to distinguish programmer error from ordinary
      delivery rejection the same way the current runtime does
 9. Add a simple explicit routing / placement story suitable for proof
@@ -228,6 +253,7 @@ engineering, pause and split there. Otherwise keep the package together so
     - N>=3 shard harvest ordering
     - cross-shard stale/closed rejection
     - cross-shard unknown-isolate rejection
+    - destination-mailbox-full rejection or drop visibility on harvest
     - request/reply causality across shards
     - deterministic repeated runs in runtime and simulator
     - replay from saved config in the simulator
@@ -236,6 +262,9 @@ engineering, pause and split there. Otherwise keep the package together so
       cross-shard completions
     - acceptable alternative: routed tenant/session workload with stable owner
       placement
+    - preferred surface should use the 021 vocabulary (`tina::prelude::*`,
+      plain effect helpers, `ctx.me()`, `ctx.send_self(...)`) unless a
+      lower-level shape is the thing being proved
     - the workload must also exercise a visible cross-shard `SendRejected`
       path, not only the green path
     - the workload must name whether that rejected path proves `Full` or
@@ -265,6 +294,8 @@ Direct proof for the changed behavior:
     trace shape
   - destination-side `MailboxAccepted` trace shape on harvest
   - shard-pair queue boundedness and `Full` rejection at source-time
+  - destination-mailbox-full visibility at harvest, if `tina-rs` keeps that
+    outcome trace-visible
   - per-source -> per-target FIFO across shards
   - three-message FIFO on one shard-pair channel
   - deterministic multi-source interleaving to one destination

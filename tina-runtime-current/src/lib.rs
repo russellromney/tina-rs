@@ -31,6 +31,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -129,6 +130,33 @@ struct TimerEntry {
     insertion_order: u64,
 }
 
+#[derive(Debug, Clone)]
+struct IdSource {
+    next_event_id: Rc<Cell<u64>>,
+    next_call_id: Rc<Cell<u64>>,
+}
+
+impl IdSource {
+    fn new() -> Self {
+        Self {
+            next_event_id: Rc::new(Cell::new(1)),
+            next_call_id: Rc::new(Cell::new(1)),
+        }
+    }
+
+    fn next_event_id(&self) -> EventId {
+        let raw = self.next_event_id.get();
+        self.next_event_id.set(raw + 1);
+        EventId::new(raw)
+    }
+
+    fn next_call_id(&self) -> CallId {
+        let raw = self.next_call_id.get();
+        self.next_call_id.set(raw + 1);
+        CallId::new(raw)
+    }
+}
+
 /// Small deterministic single-shard runtime for the second Mariner slice.
 ///
 /// The runtime owns one shard value plus a private registry of isolates and
@@ -145,8 +173,7 @@ where
     child_records: Vec<ChildRecord<S, F>>,
     supervisors: Vec<SupervisorRecord>,
     next_isolate_id: u64,
-    next_event_id: u64,
-    next_call_id: u64,
+    ids: IdSource,
     trace: Vec<RuntimeEvent>,
     io_backend: IoBackend,
     in_flight_calls: Vec<InFlightCall>,
@@ -188,10 +215,25 @@ where
     /// Creates a new runtime for one shard plus one runtime-owned mailbox
     /// factory for future spawned children.
     pub fn new(shard: S, mailbox_factory: F) -> Self {
-        Self::with_clock(shard, mailbox_factory, Box::new(MonotonicClock))
+        Self::with_clock_and_ids(
+            shard,
+            mailbox_factory,
+            Box::new(MonotonicClock),
+            IdSource::new(),
+        )
     }
 
+    #[cfg(test)]
     fn with_clock(shard: S, mailbox_factory: F, clock: Box<dyn Clock>) -> Self {
+        Self::with_clock_and_ids(shard, mailbox_factory, clock, IdSource::new())
+    }
+
+    fn with_clock_and_ids(
+        shard: S,
+        mailbox_factory: F,
+        clock: Box<dyn Clock>,
+        ids: IdSource,
+    ) -> Self {
         Self {
             shard,
             mailbox_factory,
@@ -199,8 +241,7 @@ where
             child_records: Vec::new(),
             supervisors: Vec::new(),
             next_isolate_id: 1,
-            next_event_id: 1,
-            next_call_id: 1,
+            ids,
             trace: Vec::new(),
             io_backend: IoBackend::new(),
             in_flight_calls: Vec::new(),
@@ -368,6 +409,20 @@ where
     ///
     /// The return value is the number of handlers that ran in this round.
     pub fn step(&mut self) -> usize {
+        let shard_id = self.shard.id();
+        self.step_with_remote(&mut |_source_shard, send, _cause| {
+            panic!(
+                "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",
+                send.target_shard.get(),
+                shard_id.get(),
+            );
+        })
+    }
+
+    fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
+    where
+        FR: FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
+    {
         let now = self.clock.now();
         self.advance_io_backend();
         self.harvest_timers(now);
@@ -457,6 +512,7 @@ where
                 handler_finished.into(),
                 effect,
                 &mut round_messages,
+                route_remote,
             );
         }
 
@@ -470,6 +526,7 @@ where
         cause: CauseId,
         effect: ErasedEffect<S, F>,
         round_messages: &mut [Option<Box<dyn Any>>],
+        route_remote: &mut impl FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
     ) -> bool {
         match effect {
             ErasedEffect::Stop => {
@@ -490,7 +547,13 @@ where
                     },
                 );
 
-                match self.dispatch_local_send(send) {
+                let delivery = if target_shard == self.shard.id() {
+                    self.dispatch_local_send(send)
+                } else {
+                    route_remote(self.shard.id(), send, attempted.into())
+                };
+
+                match delivery {
                     Ok(()) => {
                         self.push_event(
                             isolate_id,
@@ -502,7 +565,7 @@ where
                             },
                         );
                     }
-                    Err((target_shard, target_isolate, target_generation, reason)) => {
+                    Err(reason) => {
                         self.push_event(
                             isolate_id,
                             Some(attempted.into()),
@@ -568,7 +631,14 @@ where
             }
             ErasedEffect::Batch(effects) => {
                 for subeffect in effects {
-                    if self.execute_effect(index, isolate_id, cause, subeffect, round_messages) {
+                    if self.execute_effect(
+                        index,
+                        isolate_id,
+                        cause,
+                        subeffect,
+                        round_messages,
+                        route_remote,
+                    ) {
                         return true;
                     }
                 }
@@ -578,8 +648,7 @@ where
     }
 
     fn dispatch_call(&mut self, call: ErasedCall, requester: RegisteredAddress, cause: CauseId) {
-        let call_id = CallId::new(self.next_call_id);
-        self.next_call_id += 1;
+        let call_id = self.ids.next_call_id();
         let call_kind = call.request.kind();
 
         self.push_event(
@@ -1030,20 +1099,13 @@ where
         cause: Option<CauseId>,
         kind: RuntimeEventKind,
     ) -> EventId {
-        push_event(
-            &mut self.next_event_id,
-            &mut self.trace,
-            self.shard.id(),
-            isolate,
-            cause,
-            kind,
-        )
+        let id = self.ids.next_event_id();
+        self.trace
+            .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
+        id
     }
 
-    fn dispatch_local_send(
-        &self,
-        send: ErasedSend,
-    ) -> Result<(), (ShardId, IsolateId, AddressGeneration, SendRejectedReason)> {
+    fn dispatch_local_send(&self, send: ErasedSend) -> Result<(), SendRejectedReason> {
         if send.target_shard != self.shard.id() {
             panic!(
                 "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",
@@ -1065,31 +1127,88 @@ where
         };
 
         if entry.generation != send.target_generation {
-            return Err((
-                send.target_shard,
-                send.target_isolate,
-                send.target_generation,
-                SendRejectedReason::Closed,
-            ));
+            return Err(SendRejectedReason::Closed);
         }
 
         entry
             .mailbox
             .try_send_boxed(send.message)
             .map_err(|reason| match reason {
-                TrySendError::Full(_) => (
-                    send.target_shard,
-                    send.target_isolate,
-                    send.target_generation,
-                    SendRejectedReason::Full,
-                ),
-                TrySendError::Closed(_) => (
-                    send.target_shard,
-                    send.target_isolate,
-                    send.target_generation,
-                    SendRejectedReason::Closed,
-                ),
+                TrySendError::Full(_) => SendRejectedReason::Full,
+                TrySendError::Closed(_) => SendRejectedReason::Closed,
             })
+    }
+
+    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) {
+        // Cross-shard transport admission already happened on the source shard.
+        // What we record here is destination-local harvest outcome, not a
+        // retroactive change to the source-side send result.
+        let send = queued.send;
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == send.target_isolate)
+        else {
+            self.push_event(
+                send.target_isolate,
+                Some(queued.cause),
+                RuntimeEventKind::SendRejected {
+                    target_shard: send.target_shard,
+                    target_isolate: send.target_isolate,
+                    target_generation: send.target_generation,
+                    reason: SendRejectedReason::Closed,
+                },
+            );
+            return;
+        };
+
+        if entry.generation != send.target_generation {
+            self.push_event(
+                send.target_isolate,
+                Some(queued.cause),
+                RuntimeEventKind::SendRejected {
+                    target_shard: send.target_shard,
+                    target_isolate: send.target_isolate,
+                    target_generation: send.target_generation,
+                    reason: SendRejectedReason::Closed,
+                },
+            );
+            return;
+        }
+
+        match entry.mailbox.try_send_boxed(send.message) {
+            Ok(()) => {
+                self.push_event(
+                    send.target_isolate,
+                    Some(queued.cause),
+                    RuntimeEventKind::MailboxAccepted,
+                );
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    send.target_isolate,
+                    Some(queued.cause),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: send.target_shard,
+                        target_isolate: send.target_isolate,
+                        target_generation: send.target_generation,
+                        reason: SendRejectedReason::Full,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    send.target_isolate,
+                    Some(queued.cause),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: send.target_shard,
+                        target_isolate: send.target_isolate,
+                        target_generation: send.target_generation,
+                        reason: SendRejectedReason::Closed,
+                    },
+                );
+            }
+        }
     }
 
     fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
@@ -1283,18 +1402,240 @@ where
     }
 }
 
-fn push_event(
-    next_event_id: &mut u64,
-    trace: &mut Vec<RuntimeEvent>,
-    shard: ShardId,
-    isolate: IsolateId,
-    cause: Option<CauseId>,
-    kind: RuntimeEventKind,
-) -> EventId {
-    let id = EventId::new(*next_event_id);
-    *next_event_id += 1;
-    trace.push(RuntimeEvent::new(id, cause, shard, isolate, kind));
-    id
+/// Deterministic explicit-step coordinator over a fixed set of shard runtimes.
+///
+/// This additive shell preserves the existing single-shard [`Runtime`] API
+/// while giving Galileo one honest place to define global ingress, global
+/// stepping order, and explicit root placement by shard.
+pub struct MultiShardRuntime<S, F>
+where
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
+{
+    runtimes: Vec<Runtime<S, F>>,
+    shard_indexes: BTreeMap<ShardId, usize>,
+    config: MultiShardRuntimeConfig,
+    remote_queues: BTreeMap<(ShardId, ShardId), VecDeque<QueuedRemoteSend>>,
+}
+
+/// Bounded coordinator config for additive multi-shard runtime shells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiShardRuntimeConfig {
+    /// Capacity of each source-shard -> destination-shard queue.
+    pub shard_pair_capacity: usize,
+}
+
+impl Default for MultiShardRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            shard_pair_capacity: 64,
+        }
+    }
+}
+
+impl<S, F> MultiShardRuntime<S, F>
+where
+    S: Shard + 'static,
+    F: MailboxFactory + Clone + 'static,
+{
+    /// Creates one additive multi-shard coordinator over the provided shards.
+    ///
+    /// Shards are stepped in ascending [`ShardId`] order, regardless of input
+    /// order. Empty shard sets and duplicate shard ids are programmer errors
+    /// and panic.
+    pub fn new<I>(shards: I, mailbox_factory: F) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::with_config(shards, mailbox_factory, MultiShardRuntimeConfig::default())
+    }
+
+    /// Creates one additive multi-shard coordinator with explicit shard-pair
+    /// queue boundedness.
+    pub fn with_config<I>(shards: I, mailbox_factory: F, config: MultiShardRuntimeConfig) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        let mut shards: Vec<S> = shards.into_iter().collect();
+        if shards.is_empty() {
+            panic!("multi-shard runtime requires at least one shard");
+        }
+        if config.shard_pair_capacity == 0 {
+            panic!("multi-shard runtime requires shard-pair capacity > 0");
+        }
+
+        shards.sort_by_key(Shard::id);
+        for pair in shards.windows(2) {
+            if pair[0].id() == pair[1].id() {
+                panic!(
+                    "multi-shard runtime received duplicate shard id {}",
+                    pair[0].id().get()
+                );
+            }
+        }
+
+        let ids = IdSource::new();
+        let mut runtimes = Vec::with_capacity(shards.len());
+        let mut shard_indexes = BTreeMap::new();
+        for shard in shards {
+            let shard_id = shard.id();
+            shard_indexes.insert(shard_id, runtimes.len());
+            runtimes.push(Runtime::with_clock_and_ids(
+                shard,
+                mailbox_factory.clone(),
+                Box::new(MonotonicClock),
+                ids.clone(),
+            ));
+        }
+
+        Self {
+            runtimes,
+            shard_indexes,
+            config,
+            remote_queues: BTreeMap::new(),
+        }
+    }
+
+    /// Returns the shard ids owned by this coordinator in global step order.
+    pub fn shard_ids(&self) -> Vec<ShardId> {
+        self.runtimes.iter().map(|runtime| runtime.shard().id()).collect()
+    }
+
+    /// Returns the merged deterministic event record in global event-id order.
+    pub fn trace(&self) -> Vec<RuntimeEvent> {
+        let mut events: Vec<_> = self
+            .runtimes
+            .iter()
+            .flat_map(|runtime| runtime.trace().iter().copied())
+            .collect();
+        events.sort_by_key(|event| event.id());
+        events
+    }
+
+    /// Returns whether any owned shard still has in-flight runtime-owned work.
+    pub fn has_in_flight_calls(&self) -> bool {
+        self.runtimes.iter().any(Runtime::has_in_flight_calls)
+    }
+
+    /// Registers one root isolate on the requested owning shard.
+    #[allow(private_bounds)]
+    pub fn register_on<I, M, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox: M,
+    ) -> Address<I::Message>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+        M: Mailbox<I::Message> + 'static,
+    {
+        self.runtime_mut(shard).register::<I, M, Outbound>(isolate, mailbox)
+    }
+
+    /// Registers one root isolate on the requested shard and lets that shard
+    /// runtime allocate the mailbox.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_on<I, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Address<I::Message>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        self.runtime_mut(shard)
+            .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Attempts one typed global ingress send routed strictly by target shard.
+    pub fn try_send<M: 'static>(
+        &self,
+        address: Address<M>,
+        message: M,
+    ) -> Result<(), TrySendError<M>> {
+        self.runtime(address.shard()).try_send(address, message)
+    }
+
+    /// Runs one global deterministic round in ascending shard-id order.
+    pub fn step(&mut self) -> usize {
+        let mut ready = std::mem::take(&mut self.remote_queues);
+        let shard_ids = self.shard_ids();
+        let mut delivered = 0;
+
+        for destination in &shard_ids {
+            self.harvest_for_destination(*destination, &shard_ids, &mut ready);
+            let index = self.checked_shard_index(*destination);
+            let config = self.config;
+            let shard_indexes = self.shard_indexes.clone();
+            let remote_queues = &mut self.remote_queues;
+            delivered += self.runtimes[index].step_with_remote(&mut |source_shard, send, cause| {
+                if !shard_indexes.contains_key(&send.target_shard) {
+                    panic!(
+                        "multi-shard runtime targeted unknown destination shard {}",
+                        send.target_shard.get()
+                    );
+                }
+
+                let key = (source_shard, send.target_shard);
+                let queue = remote_queues.entry(key).or_default();
+                if queue.len() >= config.shard_pair_capacity {
+                    return Err(SendRejectedReason::Full);
+                }
+                queue.push_back(QueuedRemoteSend { send, cause });
+                Ok(())
+            });
+        }
+
+        delivered
+    }
+
+    fn runtime(&self, shard: ShardId) -> &Runtime<S, F> {
+        &self.runtimes[self.checked_shard_index(shard)]
+    }
+
+    fn runtime_mut(&mut self, shard: ShardId) -> &mut Runtime<S, F> {
+        let index = self.checked_shard_index(shard);
+        &mut self.runtimes[index]
+    }
+
+    fn checked_shard_index(&self, shard: ShardId) -> usize {
+        self.shard_indexes.get(&shard).copied().unwrap_or_else(|| {
+            panic!(
+                "multi-shard runtime targeted unknown shard {}",
+                shard.get()
+            )
+        })
+    }
+
+    fn harvest_for_destination(
+        &mut self,
+        destination: ShardId,
+        shard_ids: &[ShardId],
+        ready: &mut BTreeMap<(ShardId, ShardId), VecDeque<QueuedRemoteSend>>,
+    ) {
+        let index = self.checked_shard_index(destination);
+        for source in shard_ids {
+            if *source == destination {
+                continue;
+            }
+            let key = (*source, destination);
+            let Some(queue) = ready.get_mut(&key) else {
+                continue;
+            };
+            while let Some(queued) = queue.pop_front() {
+                self.runtimes[index].harvest_remote_send(queued);
+            }
+        }
+    }
 }
 
 trait ErasedMailbox {
@@ -1600,6 +1941,11 @@ struct ErasedSend {
     target_isolate: IsolateId,
     target_generation: AddressGeneration,
     message: Box<dyn Any>,
+}
+
+struct QueuedRemoteSend {
+    send: ErasedSend,
+    cause: CauseId,
 }
 
 impl<S, F> IntoErasedSpawn<S, F> for std::convert::Infallible
