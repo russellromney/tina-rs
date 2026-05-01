@@ -1,4 +1,4 @@
-//! Betelgeuse-backed completion-driven I/O backend for `tina-runtime-current`.
+//! Betelgeuse-backed completion-driven I/O backend for `tina-runtime`.
 //!
 //! This is the substrate target named in the reopened phase 012 plan:
 //! Betelgeuse exposes a `step()`-driven, no-runtime, no-hidden-tasks I/O
@@ -7,11 +7,11 @@
 //!
 //! ## Contract with the rest of the runtime
 //!
-//! - one [`submit`](Self::submit) per [`CallRequest`] issued by an isolate.
+//! - one [`submit`](Self::submit) per [`CallInput`] issued by an isolate.
 //!   Synchronous Betelgeuse operations (`bind`, `close`) are completed in
 //!   the same call; async operations (`accept`, `recv`, `send`) push a
 //!   pending entry that holds its own boxed completion slot.
-//! - one [`advance`](Self::advance) per [`crate::CurrentRuntime::step`]
+//! - one [`advance`](Self::advance) per [`crate::Runtime::step`]
 //!   that drives the Betelgeuse loop forward and harvests any pending
 //!   completions whose slots have a result available.
 //! - resource ids ([`ListenerId`], [`StreamId`]) are runtime-assigned
@@ -27,7 +27,7 @@
 //! - reporting the real accepted stream peer address
 //!
 //! The `tina` boundary still stays substrate-neutral; only
-//! `tina-runtime-current` and the vendored backend know about these socket
+//! `tina-runtime` and the vendored backend know about these socket
 //! introspection hooks.
 
 use std::alloc::Global;
@@ -37,7 +37,7 @@ use betelgeuse::{
     AcceptCompletion, IO, IOLoop, IOLoopHandle, IOSocket, RecvCompletion, SendCompletion, io_loop,
 };
 
-use crate::call::{CallFailureReason, CallId, CallRequest, CallResult, ListenerId, StreamId};
+use crate::call::{CallError, CallId, CallInput, CallOutput, ListenerId, StreamId};
 
 /// Runtime-owned I/O backend.
 ///
@@ -85,13 +85,13 @@ enum PendingKind {
 #[derive(Debug)]
 pub(crate) struct CompletedOp {
     pub(crate) call_id: CallId,
-    pub(crate) result: CallResult,
+    pub(crate) result: CallOutput,
 }
 
 impl IoBackend {
     pub(crate) fn new() -> Self {
-        let io_loop = io_loop(Global)
-            .expect("failed to initialise Betelgeuse IO loop for tina-runtime-current");
+        let io_loop =
+            io_loop(Global).expect("failed to initialise Betelgeuse IO loop for tina-runtime");
         Self {
             io_loop,
             next_listener_id: 1,
@@ -105,21 +105,21 @@ impl IoBackend {
     /// Submits one runtime-owned call. Synchronous Betelgeuse ops (bind,
     /// close) finish here and the result is returned inline; async ops
     /// (accept, recv, send) push a pending entry and return [`None`].
-    pub(crate) fn submit(&mut self, call_id: CallId, request: CallRequest) -> Option<CompletedOp> {
+    pub(crate) fn submit(&mut self, call_id: CallId, request: CallInput) -> Option<CompletedOp> {
         match request {
-            CallRequest::TcpBind { addr } => Some(CompletedOp {
+            CallInput::TcpBind { addr } => Some(CompletedOp {
                 call_id,
                 result: self.do_bind(addr),
             }),
-            CallRequest::TcpListenerClose { listener } => Some(CompletedOp {
+            CallInput::TcpListenerClose { listener } => Some(CompletedOp {
                 call_id,
                 result: self.do_listener_close(listener),
             }),
-            CallRequest::TcpStreamClose { stream } => Some(CompletedOp {
+            CallInput::TcpStreamClose { stream } => Some(CompletedOp {
                 call_id,
                 result: self.do_stream_close(stream),
             }),
-            CallRequest::TcpAccept { listener } => match self.arm_accept(listener) {
+            CallInput::TcpAccept { listener } => match self.arm_accept(listener) {
                 Ok(pending) => {
                     self.pending.push(PendingOperation {
                         call_id,
@@ -129,7 +129,7 @@ impl IoBackend {
                 }
                 Err(result) => Some(CompletedOp { call_id, result }),
             },
-            CallRequest::TcpRead { stream, max_len } => match self.arm_read(stream, max_len) {
+            CallInput::TcpRead { stream, max_len } => match self.arm_read(stream, max_len) {
                 Ok(pending) => {
                     self.pending.push(PendingOperation {
                         call_id,
@@ -139,7 +139,7 @@ impl IoBackend {
                 }
                 Err(result) => Some(CompletedOp { call_id, result }),
             },
-            CallRequest::TcpWrite { stream, bytes } => match self.arm_write(stream, bytes) {
+            CallInput::TcpWrite { stream, bytes } => match self.arm_write(stream, bytes) {
                 Ok(pending) => {
                     self.pending.push(PendingOperation {
                         call_id,
@@ -149,9 +149,9 @@ impl IoBackend {
                 }
                 Err(result) => Some(CompletedOp { call_id, result }),
             },
-            CallRequest::Sleep { .. } => Some(CompletedOp {
+            CallInput::Sleep { .. } => Some(CompletedOp {
                 call_id,
-                result: CallResult::Failed(CallFailureReason::Unsupported),
+                result: CallOutput::Failed(CallError::Unsupported),
             }),
         }
     }
@@ -197,7 +197,7 @@ impl IoBackend {
         self.pending.len()
     }
 
-    fn try_complete(&mut self, op: &mut PendingOperation) -> Option<CallResult> {
+    fn try_complete(&mut self, op: &mut PendingOperation) -> Option<CallOutput> {
         match &mut op.kind {
             PendingKind::Accept(completion) => {
                 if !completion.has_result() {
@@ -210,7 +210,7 @@ impl IoBackend {
                     Ok(socket) => {
                         let peer_addr = match socket.peer_addr() {
                             Ok(addr) => addr,
-                            Err(_) => return Some(CallResult::Failed(CallFailureReason::Io)),
+                            Err(_) => return Some(CallOutput::Failed(CallError::Io)),
                         };
                         let stream_id = StreamId::new(self.next_stream_id);
                         self.next_stream_id += 1;
@@ -218,12 +218,12 @@ impl IoBackend {
                             id: stream_id,
                             socket,
                         });
-                        Some(CallResult::TcpAccepted {
+                        Some(CallOutput::TcpAccepted {
                             stream: stream_id,
                             peer_addr,
                         })
                     }
-                    Err(_) => Some(CallResult::Failed(CallFailureReason::Io)),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
             PendingKind::Read(completion) => {
@@ -234,8 +234,8 @@ impl IoBackend {
                     .take_result()
                     .expect("recv completion advertised a result");
                 match result {
-                    Ok(bytes) => Some(CallResult::TcpRead { bytes }),
-                    Err(_) => Some(CallResult::Failed(CallFailureReason::Io)),
+                    Ok(bytes) => Some(CallOutput::TcpRead { bytes }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
             PendingKind::Write(completion) => {
@@ -246,92 +246,92 @@ impl IoBackend {
                     .take_result()
                     .expect("send completion advertised a result");
                 match result {
-                    Ok(count) => Some(CallResult::TcpWrote { count }),
-                    Err(_) => Some(CallResult::Failed(CallFailureReason::Io)),
+                    Ok(count) => Some(CallOutput::TcpWrote { count }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
         }
     }
 
-    fn do_bind(&mut self, addr: SocketAddr) -> CallResult {
+    fn do_bind(&mut self, addr: SocketAddr) -> CallOutput {
         let socket = match self.io_loop.socket() {
             Ok(socket) => socket,
-            Err(_) => return CallResult::Failed(CallFailureReason::Io),
+            Err(_) => return CallOutput::Failed(CallError::Io),
         };
         if socket.bind(addr).is_err() {
-            return CallResult::Failed(CallFailureReason::Io);
+            return CallOutput::Failed(CallError::Io);
         }
         let local_addr = match socket.local_addr() {
             Ok(addr) => addr,
-            Err(_) => return CallResult::Failed(CallFailureReason::Io),
+            Err(_) => return CallOutput::Failed(CallError::Io),
         };
 
         let id = ListenerId::new(self.next_listener_id);
         self.next_listener_id += 1;
         self.listeners.push(ListenerEntry { id, socket });
-        CallResult::TcpBound {
+        CallOutput::TcpBound {
             listener: id,
             local_addr,
         }
     }
 
-    fn do_listener_close(&mut self, listener: ListenerId) -> CallResult {
+    fn do_listener_close(&mut self, listener: ListenerId) -> CallOutput {
         match self.listeners.iter().position(|entry| entry.id == listener) {
             Some(index) => {
                 let entry = self.listeners.remove(index);
                 entry.socket.close();
-                CallResult::TcpListenerClosed
+                CallOutput::TcpListenerClosed
             }
-            None => CallResult::Failed(CallFailureReason::InvalidResource),
+            None => CallOutput::Failed(CallError::InvalidResource),
         }
     }
 
-    fn do_stream_close(&mut self, stream: StreamId) -> CallResult {
+    fn do_stream_close(&mut self, stream: StreamId) -> CallOutput {
         match self.streams.iter().position(|entry| entry.id == stream) {
             Some(index) => {
                 let entry = self.streams.remove(index);
                 entry.socket.close();
-                CallResult::TcpStreamClosed
+                CallOutput::TcpStreamClosed
             }
-            None => CallResult::Failed(CallFailureReason::InvalidResource),
+            None => CallOutput::Failed(CallError::InvalidResource),
         }
     }
 
-    fn arm_accept(&mut self, listener: ListenerId) -> Result<PendingKind, CallResult> {
+    fn arm_accept(&mut self, listener: ListenerId) -> Result<PendingKind, CallOutput> {
         let entry = self
             .listeners
             .iter()
             .find(|entry| entry.id == listener)
-            .ok_or(CallResult::Failed(CallFailureReason::InvalidResource))?;
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
         let mut completion = Box::new(AcceptCompletion::new());
         if entry.socket.accept(&mut completion).is_err() {
-            return Err(CallResult::Failed(CallFailureReason::Io));
+            return Err(CallOutput::Failed(CallError::Io));
         }
         Ok(PendingKind::Accept(completion))
     }
 
-    fn arm_read(&mut self, stream: StreamId, max_len: usize) -> Result<PendingKind, CallResult> {
+    fn arm_read(&mut self, stream: StreamId, max_len: usize) -> Result<PendingKind, CallOutput> {
         let entry = self
             .streams
             .iter()
             .find(|entry| entry.id == stream)
-            .ok_or(CallResult::Failed(CallFailureReason::InvalidResource))?;
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
         let mut completion = Box::new(RecvCompletion::new());
         if entry.socket.recv(&mut completion, max_len).is_err() {
-            return Err(CallResult::Failed(CallFailureReason::Io));
+            return Err(CallOutput::Failed(CallError::Io));
         }
         Ok(PendingKind::Read(completion))
     }
 
-    fn arm_write(&mut self, stream: StreamId, bytes: Vec<u8>) -> Result<PendingKind, CallResult> {
+    fn arm_write(&mut self, stream: StreamId, bytes: Vec<u8>) -> Result<PendingKind, CallOutput> {
         let entry = self
             .streams
             .iter()
             .find(|entry| entry.id == stream)
-            .ok_or(CallResult::Failed(CallFailureReason::InvalidResource))?;
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
         let mut completion = Box::new(SendCompletion::new());
         if entry.socket.send(&mut completion, bytes).is_err() {
-            return Err(CallResult::Failed(CallFailureReason::Io));
+            return Err(CallOutput::Failed(CallError::Io));
         }
         Ok(PendingKind::Write(completion))
     }

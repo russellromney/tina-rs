@@ -11,6 +11,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+use tina::Outbound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -114,14 +115,14 @@ struct LeafIsolate;
 impl Isolate for RootIsolate {
     type Message = LineageMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
-    type Spawn = tina::SpawnSpec<ChildIsolate>;
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = tina::ChildDefinition<ChildIsolate>;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            LineageMsg::SpawnChild => Effect::Spawn(tina::SpawnSpec::new(
+            LineageMsg::SpawnChild => Effect::Spawn(tina::ChildDefinition::new(
                 ChildIsolate {
                     leaf_capacity: self.child_capacity,
                 },
@@ -138,8 +139,8 @@ impl Isolate for RootIsolate {
 impl Isolate for RestartableRootIsolate {
     type Message = LineageMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
-    type Spawn = tina::RestartableSpawnSpec<ChildIsolate>;
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = tina::RestartableChildDefinition<ChildIsolate>;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
@@ -148,7 +149,7 @@ impl Isolate for RestartableRootIsolate {
             LineageMsg::SpawnChild => {
                 let child_capacity = self.child_capacity;
                 let factory_calls = Rc::clone(&self.factory_calls);
-                Effect::Spawn(tina::RestartableSpawnSpec::new(
+                Effect::Spawn(tina::RestartableChildDefinition::new(
                     move || {
                         factory_calls.set(factory_calls.get() + 1);
                         ChildIsolate {
@@ -169,15 +170,15 @@ impl Isolate for RestartableRootIsolate {
 impl Isolate for ChildIsolate {
     type Message = LineageMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
-    type Spawn = tina::SpawnSpec<LeafIsolate>;
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = tina::ChildDefinition<LeafIsolate>;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             LineageMsg::SpawnGrandchild => {
-                Effect::Spawn(tina::SpawnSpec::new(LeafIsolate, self.leaf_capacity))
+                Effect::Spawn(tina::ChildDefinition::new(LeafIsolate, self.leaf_capacity))
             }
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside child lineage isolate"),
@@ -190,7 +191,7 @@ impl Isolate for ChildIsolate {
 impl Isolate for LeafIsolate {
     type Message = LineageMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = std::convert::Infallible;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
@@ -216,7 +217,7 @@ fn root_mailbox() -> TestMailbox<LineageMsg> {
 }
 
 fn assert_root_and_child_lineage(
-    runtime: &CurrentRuntime<TestShard, TestMailboxFactory>,
+    runtime: &Runtime<TestShard, TestMailboxFactory>,
     root: Address<LineageMsg>,
     child: IsolateId,
 ) {
@@ -227,7 +228,7 @@ fn assert_root_and_child_lineage(
 }
 
 fn assert_root_child_grandchild_lineage(
-    runtime: &CurrentRuntime<TestShard, TestMailboxFactory>,
+    runtime: &Runtime<TestShard, TestMailboxFactory>,
     root: Address<LineageMsg>,
     child: IsolateId,
     grandchild: IsolateId,
@@ -329,7 +330,7 @@ fn supervisor_events(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
 
 #[test]
 fn root_registered_isolates_have_no_parent() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
 
     let first = runtime.register(new_root(), root_mailbox());
     let second = runtime.register(new_root(), root_mailbox());
@@ -343,7 +344,7 @@ fn root_registered_isolates_have_no_parent() {
 
 #[test]
 fn one_shot_spawn_records_non_restartable_child_metadata() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -359,7 +360,7 @@ fn one_shot_spawn_records_non_restartable_child_metadata() {
 #[test]
 fn restartable_spawn_records_restartable_child_metadata_and_calls_factory_once() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -378,7 +379,7 @@ fn restartable_spawn_records_restartable_child_metadata_and_calls_factory_once()
 
 #[test]
 fn per_parent_child_ordinals_increment_by_direct_spawn_order() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -400,7 +401,7 @@ fn per_parent_child_ordinals_increment_by_direct_spawn_order() {
 
 #[test]
 fn nested_spawns_record_direct_parent_edges() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -428,7 +429,7 @@ fn nested_spawns_record_direct_parent_edges() {
 
 #[test]
 fn child_lineage_survives_when_parent_stops() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -447,7 +448,7 @@ fn child_lineage_survives_when_parent_stops() {
 
 #[test]
 fn child_lineage_survives_when_parent_panics() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -472,7 +473,7 @@ fn child_lineage_survives_when_parent_panics() {
 
 #[test]
 fn child_record_survives_when_child_stops_or_panics() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -504,7 +505,7 @@ fn child_record_survives_when_child_stops_or_panics() {
 
 #[test]
 fn restart_children_with_no_direct_children_emits_no_restart_subtree() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
@@ -524,7 +525,7 @@ fn restart_children_with_no_direct_children_emits_no_restart_subtree() {
 #[test]
 fn restart_children_replaces_restartable_child_and_preserves_ordinal() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -615,7 +616,7 @@ fn restart_children_replaces_restartable_child_and_preserves_ordinal() {
 #[test]
 fn restart_children_abandons_precollected_old_child_message() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -655,7 +656,7 @@ fn restart_children_abandons_precollected_old_child_message() {
 #[test]
 fn restart_children_restarts_already_stopped_or_panicked_children_without_duplicate_stop() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -701,7 +702,7 @@ fn restart_children_restarts_already_stopped_or_panicked_children_without_duplic
 #[test]
 fn restart_children_visits_multiple_children_in_child_ordinal_order() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -736,7 +737,7 @@ fn restart_children_visits_multiple_children_in_child_ordinal_order() {
 
 #[test]
 fn restart_children_skips_non_restartable_children_with_trace() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
     assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -766,7 +767,7 @@ fn restart_children_skips_non_restartable_children_with_trace() {
 #[test]
 fn restart_children_does_not_restart_grandchildren() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -799,7 +800,7 @@ fn restart_children_does_not_restart_grandchildren() {
 #[test]
 fn restart_children_can_restart_child_before_its_first_turn() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -827,7 +828,7 @@ mod supervision;
 #[test]
 fn identical_runs_produce_identical_trace_and_lineage() {
     fn run_once() -> RunEvidence {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let root = runtime.register(new_root(), root_mailbox());
 
         assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
@@ -877,26 +878,26 @@ struct OverlapAcceptor {
 impl Isolate for OverlapAcceptor {
     type Message = OverlapAcceptorMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
-    type Call = CurrentCall<OverlapAcceptorMsg>;
+    type Call = RuntimeCall<OverlapAcceptorMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             OverlapAcceptorMsg::Bootstrap => {
                 let addr = self.bind_addr;
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpBind { addr },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpBind { addr },
                     move |result| match result {
-                        CallResult::TcpBound {
+                        CallOutput::TcpBound {
                             listener,
                             local_addr,
                         } => OverlapAcceptorMsg::Bound {
                             listener,
                             addr: local_addr,
                         },
-                        CallResult::Failed(_) => OverlapAcceptorMsg::Failed,
+                        CallOutput::Failed(_) => OverlapAcceptorMsg::Failed,
                         other => panic!("unexpected bind result {other:?}"),
                     },
                 ))
@@ -904,13 +905,13 @@ impl Isolate for OverlapAcceptor {
             OverlapAcceptorMsg::Bound { listener, addr } => {
                 self.listener = Some(listener);
                 *self.bound_addr_slot.lock().expect("bound addr mutex") = Some(addr);
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpAccept { listener },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpAccept { listener },
                     |result| match result {
-                        CallResult::TcpAccepted { stream, .. } => {
+                        CallOutput::TcpAccepted { stream, .. } => {
                             OverlapAcceptorMsg::Accepted { stream }
                         }
-                        CallResult::Failed(_) => OverlapAcceptorMsg::Failed,
+                        CallOutput::Failed(_) => OverlapAcceptorMsg::Failed,
                         other => panic!("unexpected accept result {other:?}"),
                     },
                 ))
@@ -920,13 +921,13 @@ impl Isolate for OverlapAcceptor {
                 accepted.push(stream);
                 if accepted.len() < 2 {
                     let listener = self.listener.expect("listener stored before re-arm");
-                    Effect::Call(CurrentCall::new(
-                        CallRequest::TcpAccept { listener },
+                    Effect::Call(RuntimeCall::new(
+                        CallInput::TcpAccept { listener },
                         |result| match result {
-                            CallResult::TcpAccepted { stream, .. } => {
+                            CallOutput::TcpAccepted { stream, .. } => {
                                 OverlapAcceptorMsg::Accepted { stream }
                             }
-                            CallResult::Failed(_) => OverlapAcceptorMsg::Failed,
+                            CallOutput::Failed(_) => OverlapAcceptorMsg::Failed,
                             other => panic!("unexpected accept result {other:?}"),
                         },
                     ))
@@ -954,21 +955,21 @@ struct Reader {
 impl Isolate for Reader {
     type Message = ReaderMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
-    type Call = CurrentCall<ReaderMsg>;
+    type Call = RuntimeCall<ReaderMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ReaderMsg::Start => Effect::Call(CurrentCall::new(
-                CallRequest::TcpRead {
+            ReaderMsg::Start => Effect::Call(RuntimeCall::new(
+                CallInput::TcpRead {
                     stream: self.stream,
                     max_len: 16,
                 },
                 |result| match result {
-                    CallResult::TcpRead { .. } => ReaderMsg::ReadCompleted,
-                    CallResult::Failed(_) => ReaderMsg::Failed,
+                    CallOutput::TcpRead { .. } => ReaderMsg::ReadCompleted,
+                    CallOutput::Failed(_) => ReaderMsg::Failed,
                     other => panic!("unexpected read result {other:?}"),
                 },
             )),
@@ -981,7 +982,7 @@ impl Isolate for Reader {
 fn two_stream_reads_can_be_pending_in_io_backend_at_once() {
     let bound_addr = Arc::new(Mutex::new(None));
     let accepted_streams = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let acceptor = runtime.register(
         OverlapAcceptor {
             bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
@@ -1069,17 +1070,17 @@ struct Sleeper {
 impl Isolate for Sleeper {
     type Message = TimerMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
-    type Call = CurrentCall<TimerMsg>;
+    type Call = RuntimeCall<TimerMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            TimerMsg::StartSleep => Effect::Call(CurrentCall::new(
-                CallRequest::Sleep { after: self.delay },
+            TimerMsg::StartSleep => Effect::Call(RuntimeCall::new(
+                CallInput::Sleep { after: self.delay },
                 |result| match result {
-                    CallResult::TimerFired => TimerMsg::Fired,
+                    CallOutput::TimerFired => TimerMsg::Fired,
                     other => panic!("expected TimerFired, got {other:?}"),
                 },
             )),
@@ -1089,13 +1090,9 @@ impl Isolate for Sleeper {
     }
 }
 
-fn new_manual_runtime() -> (
-    CurrentRuntime<TestShard, TestMailboxFactory>,
-    Rc<ManualClock>,
-) {
+fn new_manual_runtime() -> (Runtime<TestShard, TestMailboxFactory>, Rc<ManualClock>) {
     let clock = Rc::new(ManualClock::new());
-    let runtime =
-        CurrentRuntime::with_clock(TestShard, TestMailboxFactory, Box::new(Rc::clone(&clock)));
+    let runtime = Runtime::with_clock(TestShard, TestMailboxFactory, Box::new(Rc::clone(&clock)));
     (runtime, clock)
 }
 
@@ -1368,9 +1365,9 @@ struct RetryWorker {
 impl Isolate for RetryWorker {
     type Message = RetryMsg;
     type Reply = ();
-    type Send = SendMessage<RetryMsg>;
+    type Send = Outbound<RetryMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<RetryMsg>;
+    type Call = RuntimeCall<RetryMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -1384,8 +1381,8 @@ impl Isolate for RetryWorker {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Failed(self.attempts));
-                    Effect::Call(CurrentCall::new(
-                        CallRequest::Sleep {
+                    Effect::Call(RuntimeCall::new(
+                        CallInput::Sleep {
                             after: self.backoff,
                         },
                         |_| RetryMsg::RetryNow,
@@ -1401,10 +1398,7 @@ impl Isolate for RetryWorker {
                 self.observations
                     .borrow_mut()
                     .push(RetryObservation::BackoffElapsed);
-                Effect::Send(SendMessage::new(
-                    ctx.current_address::<RetryMsg>(),
-                    RetryMsg::Attempt,
-                ))
+                ctx.send_self(RetryMsg::Attempt)
             }
         }
     }

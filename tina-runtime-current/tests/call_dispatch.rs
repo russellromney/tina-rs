@@ -23,10 +23,10 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tina::{Address, Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId, TrySendError};
-use tina_runtime_current::{
-    CallCompletionRejectedReason, CallId, CallKind, CallRequest, CallResult, CurrentCall,
-    CurrentRuntime, ListenerId, MailboxFactory, RuntimeEvent, RuntimeEventKind, StreamId,
+use tina::{Address, Context, Effect, Isolate, Mailbox, Outbound, Shard, ShardId, TrySendError};
+use tina_runtime::{
+    CallCompletionRejectedReason, CallId, CallInput, CallKind, CallOutput, ListenerId,
+    MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
 };
 
 #[derive(Debug, Default)]
@@ -127,29 +127,29 @@ struct Probe {
 impl Isolate for Probe {
     type Message = ProbeMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
-    type Call = CurrentCall<ProbeMsg>;
+    type Call = RuntimeCall<ProbeMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ProbeMsg::StartInvalidAccept => Effect::Call(CurrentCall::new(
-                CallRequest::TcpAccept {
+            ProbeMsg::StartInvalidAccept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
                     listener: ListenerId::new(9999),
                 },
                 |result| match result {
-                    CallResult::Failed(_) => ProbeMsg::InvalidResourceObserved,
+                    CallOutput::Failed(_) => ProbeMsg::InvalidResourceObserved,
                     other => panic!("expected accept failure, got {other:?}"),
                 },
             )),
-            ProbeMsg::StartInvalidRead => Effect::Call(CurrentCall::new(
-                CallRequest::TcpRead {
+            ProbeMsg::StartInvalidRead => Effect::Call(RuntimeCall::new(
+                CallInput::TcpRead {
                     stream: StreamId::new(9999),
                     max_len: 64,
                 },
                 |result| match result {
-                    CallResult::Failed(_) => ProbeMsg::InvalidResourceObserved,
+                    CallOutput::Failed(_) => ProbeMsg::InvalidResourceObserved,
                     other => panic!("expected read failure, got {other:?}"),
                 },
             )),
@@ -173,19 +173,19 @@ struct Binder {
 impl Isolate for Binder {
     type Message = BinderMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
-    type Call = CurrentCall<BinderMsg>;
+    type Call = RuntimeCall<BinderMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             BinderMsg::StartBind => {
                 let addr = self.bind_addr;
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpBind { addr },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpBind { addr },
                     move |result| match result {
-                        CallResult::TcpBound {
+                        CallOutput::TcpBound {
                             listener,
                             local_addr,
                         } => BinderMsg::Bound {
@@ -215,22 +215,22 @@ struct Waiter {
 impl Isolate for Waiter {
     type Message = WaiterMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
-    type Call = CurrentCall<WaiterMsg>;
+    type Call = RuntimeCall<WaiterMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            WaiterMsg::StartAccept => Effect::Call(CurrentCall::new(
-                CallRequest::TcpAccept {
+            WaiterMsg::StartAccept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
                     listener: self.listener,
                 },
                 |result| match result {
-                    CallResult::TcpAccepted { peer_addr, .. } => {
+                    CallOutput::TcpAccepted { peer_addr, .. } => {
                         WaiterMsg::AcceptedObserved(peer_addr)
                     }
-                    CallResult::Failed(_) => WaiterMsg::FailedObserved,
+                    CallOutput::Failed(_) => WaiterMsg::FailedObserved,
                     other => panic!("unexpected accept result {other:?}"),
                 },
             )),
@@ -266,7 +266,7 @@ fn call_event_kinds(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
 #[test]
 fn invalid_listener_id_surfaces_failure_to_isolate_and_trace() {
     let log = Rc::new(RefCell::new(Vec::new()));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let probe = runtime.register(
         Probe {
             log: Rc::clone(&log),
@@ -292,7 +292,7 @@ fn invalid_listener_id_surfaces_failure_to_isolate_and_trace() {
             k,
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpAccept,
-                reason: tina_runtime_current::CallFailureReason::InvalidResource,
+                reason: tina_runtime::CallError::InvalidResource,
                 ..
             }
         )),
@@ -303,7 +303,7 @@ fn invalid_listener_id_surfaces_failure_to_isolate_and_trace() {
 #[test]
 fn invalid_stream_id_surfaces_failure_to_isolate_and_trace() {
     let log = Rc::new(RefCell::new(Vec::new()));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let probe = runtime.register(
         Probe {
             log: Rc::clone(&log),
@@ -326,7 +326,7 @@ fn invalid_stream_id_surfaces_failure_to_isolate_and_trace() {
             k,
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpRead,
-                reason: tina_runtime_current::CallFailureReason::InvalidResource,
+                reason: tina_runtime::CallError::InvalidResource,
                 ..
             }
         )),
@@ -338,7 +338,7 @@ fn invalid_stream_id_surfaces_failure_to_isolate_and_trace() {
 fn port_zero_bind_returns_real_local_addr_with_visible_trace() {
     let listener_slot = Arc::new(Mutex::new(None));
     let addr_slot = Arc::new(Mutex::new(None));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let binder = runtime.register(
         Binder {
             bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
@@ -398,7 +398,7 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
     let peer_slot = Arc::new(Mutex::new(None));
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
 
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let binder = runtime.register(
         Binder {
             bind_addr,
@@ -497,7 +497,7 @@ fn accepted_stream_reports_real_peer_addr() {
     let peer_slot = Arc::new(Mutex::new(None));
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
 
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let binder = runtime.register(
         Binder {
             bind_addr,
@@ -578,7 +578,7 @@ fn accepted_stream_reports_real_peer_addr() {
 #[test]
 fn call_id_increments_in_submission_order() {
     let log = Rc::new(RefCell::new(Vec::new()));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let probe = runtime.register(
         Probe {
             log: Rc::clone(&log),
@@ -628,7 +628,7 @@ fn call_id_increments_in_submission_order() {
 #[test]
 fn isolate_without_call_effects_compiles_with_infallible() {
     // Compile-only smoke: an isolate that never issues call effects keeps
-    // the tina/tina-runtime-current pre-012 ergonomics by setting
+    // the tina/tina-runtime pre-012 ergonomics by setting
     // `type Call = Infallible`.
     #[derive(Debug)]
     struct Quiet;
@@ -636,7 +636,7 @@ fn isolate_without_call_effects_compiles_with_infallible() {
     impl Isolate for Quiet {
         type Message = ();
         type Reply = ();
-        type Send = SendMessage<NeverOutbound>;
+        type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type Call = Infallible;
         type Shard = TestShard;
@@ -646,7 +646,7 @@ fn isolate_without_call_effects_compiles_with_infallible() {
         }
     }
 
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let quiet: Address<()> = runtime.register(Quiet, TestMailbox::new(2));
     runtime.try_send(quiet, ()).expect("send");
     runtime.step();

@@ -19,19 +19,24 @@
 //!
 //! Phase 018 adds single-shard spawn and supervision replay:
 //!
-//! - public `SpawnSpec` / `RestartableSpawnSpec` execution
+//! - public `ChildDefinition` / `RestartableChildDefinition` execution
 //! - runtime-owned direct parent-child lineage and restartable child records
 //! - direct-child `RestartChildren` and supervised panic restart
 //! - bootstrap re-delivery, stale identity rejection, and budget exhaustion
 //!   through the live runtime event vocabulary
 //!
+//! Phase 019 adds scripted single-shard TCP simulation:
+//!
+//! - bind, accept, read, write, listener close, and stream close
+//! - replayable peer-visible output
+//! - checker-backed TCP completion perturbation replay
+//!
 //! `tina-sim` intentionally reuses the live runtime's event vocabulary from
-//! `tina-runtime-current` instead of inventing a second user-visible meaning
-//! model. The simulator is narrower than the live runtime: it supports local
-//! sends, stop, reply/noop observation, ordered `Batch`, and runtime-owned
-//! `Sleep` calls plus narrow seeded perturbation over those surfaces, spawn,
-//! and single-shard supervision. TCP simulation is deferred to a later Voyager
-//! slice.
+//! `tina-runtime` instead of inventing a second user-visible meaning model.
+//! The simulator is still narrower than the live runtime: it supports local
+//! sends, stop, reply/noop observation, ordered `Batch`, runtime-owned
+//! `Sleep`, single-shard spawn/supervision, and scripted single-shard TCP
+//! simulation.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -44,12 +49,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, AddressGeneration, ChildRelation, Context, Effect, Isolate, IsolateId,
-    RestartBudgetState, RestartableSpawnSpec, SendMessage, Shard, ShardId, SpawnSpec, TrySendError,
+    Address, AddressGeneration, ChildDefinition, ChildRelation, Context, Effect, Isolate,
+    IsolateId, Outbound as TinaOutbound, RestartBudgetState, RestartableChildDefinition, Shard,
+    ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CallCompletionRejectedReason, CallFailureReason, CallId, CallKind, CallRequest, CallResult,
-    CurrentCall, EffectKind, ListenerId, RestartSkippedReason, RuntimeEvent, RuntimeEventKind,
+use tina_runtime::{
+    CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutput, EffectKind,
+    ListenerId, RestartSkippedReason, RuntimeCall, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason, SupervisionRejectedReason,
 };
 use tina_supervisor::SupervisorConfig;
@@ -203,10 +209,10 @@ impl Default for ScriptedTcpConfig {
 /// Scripted listener configuration for one bindable address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptedListenerConfig {
-    /// The address isolates request in `CallRequest::TcpBind`.
+    /// The address isolates request in `CallInput::TcpBind`.
     pub bind_addr: SocketAddr,
 
-    /// The local address returned through `CallResult::TcpBound`.
+    /// The local address returned through `CallOutput::TcpBound`.
     pub local_addr: SocketAddr,
 
     /// Maximum number of accepted-but-not-yet-consumed peers that may wait in
@@ -224,7 +230,7 @@ pub struct ScriptedPeerConfig {
     /// pending `TcpAccept`.
     pub accept_after_step: u64,
 
-    /// The remote address returned through `CallResult::TcpAccepted`.
+    /// The remote address returned through `CallOutput::TcpAccepted`.
     pub peer_addr: SocketAddr,
 
     /// Inbound byte chunks the peer will make readable to the isolate.
@@ -286,7 +292,7 @@ pub trait Checker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckerFailure {
     checker_name: &'static str,
-    event_id: tina_runtime_current::EventId,
+    event_id: tina_runtime::EventId,
     reason: String,
 }
 
@@ -297,7 +303,7 @@ impl CheckerFailure {
     }
 
     /// Returns the event that triggered the failure.
-    pub const fn event_id(&self) -> tina_runtime_current::EventId {
+    pub const fn event_id(&self) -> tina_runtime::EventId {
         self.event_id
     }
 
@@ -319,10 +325,10 @@ struct InFlightCall {
     call_id: CallId,
     call_kind: CallKind,
     requester: RegisteredAddress,
-    cause: tina_runtime_current::CauseId,
+    cause: tina_runtime::CauseId,
 }
 
-type ErasedTranslator = Box<dyn FnOnce(CallResult) -> Box<dyn Any>>;
+type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
 
 struct StoredTranslator {
     call_id: CallId,
@@ -348,7 +354,7 @@ struct TimerEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TcpResourceKey {
     Listener(ListenerId),
-    Stream(tina_runtime_current::StreamId),
+    Stream(tina_runtime::StreamId),
 }
 
 #[derive(Debug)]
@@ -357,7 +363,7 @@ struct PendingTcpCompletion {
     ready_at_step: u64,
     insertion_order: u64,
     resource: TcpResourceKey,
-    result: CallResult,
+    result: CallOutput,
 }
 
 #[derive(Debug)]
@@ -391,7 +397,7 @@ struct ListenerState {
 
 #[derive(Debug)]
 struct StreamState {
-    id: tina_runtime_current::StreamId,
+    id: tina_runtime::StreamId,
     peer_addr: SocketAddr,
     inbound_chunks: VecDeque<Vec<u8>>,
     read_chunk_cap: Option<usize>,
@@ -516,7 +522,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedHandler<S> for HandlerAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     Msg: 'static,
@@ -544,7 +550,7 @@ where
 
 fn erase_effect<I, S, Msg, Outbound>(effect: Effect<I>) -> ErasedEffect<S>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     Msg: 'static,
@@ -590,7 +596,7 @@ where
     generation: AddressGeneration,
     parent: Option<IsolateId>,
     stopped: Cell<bool>,
-    stopped_event: Cell<Option<tina_runtime_current::EventId>>,
+    stopped_event: Cell<Option<tina_runtime::EventId>>,
     inbox: LocalInbox,
     handler: RefCell<Box<dyn ErasedHandler<S>>>,
 }
@@ -651,7 +657,7 @@ struct ErasedSend {
 }
 
 struct ErasedCall {
-    request: CallRequest,
+    request: CallInput,
     translator: ErasedTranslator,
 }
 
@@ -775,12 +781,16 @@ where
     /// Registers one isolate and returns its typed address.
     ///
     /// 016 intentionally requires spawnless isolates that use the current
-    /// runtime's timer-aware call vocabulary and local `SendMessage` sends.
+    /// runtime's timer-aware call vocabulary and local `Outbound` sends.
     #[allow(private_bounds)]
     pub fn register<I, Msg, Outbound>(&mut self, isolate: I) -> Address<Msg>
     where
-        I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
-            + 'static,
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -797,8 +807,12 @@ where
         mailbox_capacity: usize,
     ) -> Address<Msg>
     where
-        I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
-            + 'static,
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -809,7 +823,7 @@ where
 
     /// Configures a registered isolate as supervisor for its direct children.
     ///
-    /// The simulator mirrors `tina-runtime-current`: supervision applies to
+    /// The simulator mirrors `tina-runtime`: supervision applies to
     /// direct children only, and reconfiguring a parent resets the
     /// runtime-lifetime restart budget tracker.
     pub fn supervise<M: 'static>(&mut self, parent: Address<M>, config: SupervisorConfig) {
@@ -1088,7 +1102,7 @@ where
         &mut self,
         index: usize,
         isolate_id: IsolateId,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
         effect: ErasedEffect<S>,
         round_messages: &mut [Option<Box<dyn Any>>],
     ) -> bool {
@@ -1204,8 +1218,12 @@ where
         mailbox_capacity: usize,
     ) -> RegisteredAddress
     where
-        I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
-            + 'static,
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -1241,8 +1259,12 @@ where
         bootstrap_message: Option<Msg>,
     ) -> SpawnOutcome<S>
     where
-        I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
-            + 'static,
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -1282,7 +1304,7 @@ where
         &mut self,
         child: RegisteredAddress,
         message: Box<dyn Any>,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
     ) {
         let entry = self
             .entries
@@ -1308,7 +1330,7 @@ where
     fn restart_children(
         &mut self,
         parent: IsolateId,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
         round_messages: &mut [Option<Box<dyn Any>>],
     ) {
         let child_record_indices: Vec<usize> = self
@@ -1326,7 +1348,7 @@ where
     fn supervise_panic(
         &mut self,
         failed_child: RegisteredAddress,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
         round_messages: &mut [Option<Box<dyn Any>>],
     ) {
         let Some(failed_record_index) = self.child_record_index_by_child(failed_child) else {
@@ -1411,7 +1433,7 @@ where
         &mut self,
         parent: IsolateId,
         child_record_index: usize,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
         round_messages: &mut [Option<Box<dyn Any>>],
     ) {
         let child_ordinal = self.child_records[child_record_index].child_ordinal;
@@ -1547,7 +1569,7 @@ where
         &mut self,
         call: ErasedCall,
         requester: RegisteredAddress,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
     ) {
         let call_id = CallId::new(self.next_call_id);
         self.next_call_id += 1;
@@ -1574,7 +1596,7 @@ where
         });
 
         match request {
-            CallRequest::Sleep { after } => {
+            CallInput::Sleep { after } => {
                 let insertion_order = self.next_timer_ordinal;
                 let deadline = self.virtual_now
                     + after
@@ -1586,18 +1608,16 @@ where
                     insertion_order,
                 });
             }
-            CallRequest::TcpBind { addr } => self.handle_tcp_bind(call_id, addr),
-            CallRequest::TcpAccept { listener } => self.handle_tcp_accept(call_id, listener),
-            CallRequest::TcpRead { stream, max_len } => {
+            CallInput::TcpBind { addr } => self.handle_tcp_bind(call_id, addr),
+            CallInput::TcpAccept { listener } => self.handle_tcp_accept(call_id, listener),
+            CallInput::TcpRead { stream, max_len } => {
                 self.handle_tcp_read(call_id, stream, max_len)
             }
-            CallRequest::TcpWrite { stream, bytes } => {
-                self.handle_tcp_write(call_id, stream, bytes)
-            }
-            CallRequest::TcpListenerClose { listener } => {
+            CallInput::TcpWrite { stream, bytes } => self.handle_tcp_write(call_id, stream, bytes),
+            CallInput::TcpListenerClose { listener } => {
                 self.handle_tcp_listener_close(call_id, listener)
             }
-            CallRequest::TcpStreamClose { stream } => self.handle_tcp_stream_close(call_id, stream),
+            CallInput::TcpStreamClose { stream } => self.handle_tcp_stream_close(call_id, stream),
         }
     }
 
@@ -1607,7 +1627,7 @@ where
             .iter()
             .any(|listener| listener.bind_addr == addr && !listener.closed)
         {
-            self.deliver_completion(call_id, CallResult::Failed(CallFailureReason::Io));
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
         }
 
@@ -1619,7 +1639,7 @@ where
             .find(|listener| listener.bind_addr == addr)
             .cloned()
         else {
-            self.deliver_completion(call_id, CallResult::Failed(CallFailureReason::Io));
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
         };
 
@@ -1662,7 +1682,7 @@ where
         self.listeners.push(listener);
         self.deliver_completion(
             call_id,
-            CallResult::TcpBound {
+            CallOutput::TcpBound {
                 listener: listener_id,
                 local_addr,
             },
@@ -1671,18 +1691,12 @@ where
 
     fn handle_tcp_accept(&mut self, call_id: CallId, listener: ListenerId) {
         let Some(listener_index) = self.listener_index(listener) else {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
         if self.listeners[listener_index].closed {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         }
 
@@ -1692,7 +1706,7 @@ where
             self.schedule_tcp_completion(
                 call_id,
                 TcpResourceKey::Listener(listener),
-                CallResult::TcpAccepted { stream, peer_addr },
+                CallOutput::TcpAccepted { stream, peer_addr },
             );
             return;
         }
@@ -1706,25 +1720,14 @@ where
         });
     }
 
-    fn handle_tcp_read(
-        &mut self,
-        call_id: CallId,
-        stream: tina_runtime_current::StreamId,
-        max_len: usize,
-    ) {
+    fn handle_tcp_read(&mut self, call_id: CallId, stream: tina_runtime::StreamId, max_len: usize) {
         let Some(stream_index) = self.stream_index(stream) else {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
         let Some(result) = self.stream_read_result(stream_index, max_len) else {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
@@ -1734,22 +1737,16 @@ where
     fn handle_tcp_write(
         &mut self,
         call_id: CallId,
-        stream: tina_runtime_current::StreamId,
+        stream: tina_runtime::StreamId,
         bytes: Vec<u8>,
     ) {
         let Some(stream_index) = self.stream_index(stream) else {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
         let Some(result) = self.stream_write_result(stream_index, &bytes) else {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
@@ -1758,57 +1755,45 @@ where
 
     fn handle_tcp_listener_close(&mut self, call_id: CallId, listener: ListenerId) {
         let Some(listener_index) = self.listener_index(listener) else {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
         if self.listeners[listener_index].closed {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         }
 
         self.listeners[listener_index].closed = true;
         self.fail_pending_accepts(listener);
         self.fail_pending_tcp_completions(TcpResourceKey::Listener(listener));
-        self.deliver_completion(call_id, CallResult::TcpListenerClosed);
+        self.deliver_completion(call_id, CallOutput::TcpListenerClosed);
     }
 
-    fn handle_tcp_stream_close(&mut self, call_id: CallId, stream: tina_runtime_current::StreamId) {
+    fn handle_tcp_stream_close(&mut self, call_id: CallId, stream: tina_runtime::StreamId) {
         let Some(stream_index) = self.stream_index(stream) else {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
         if self.streams[stream_index].closed {
-            self.deliver_completion(
-                call_id,
-                CallResult::Failed(CallFailureReason::InvalidResource),
-            );
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         }
 
         self.streams[stream_index].closed = true;
         self.fail_pending_tcp_completions(TcpResourceKey::Stream(stream));
-        self.deliver_completion(call_id, CallResult::TcpStreamClosed);
+        self.deliver_completion(call_id, CallOutput::TcpStreamClosed);
     }
 
     fn schedule_tcp_completion(
         &mut self,
         call_id: CallId,
         resource: TcpResourceKey,
-        result: CallResult,
+        result: CallOutput,
     ) {
         if self.pending_tcp_completions.len() >= self.config.tcp.pending_completion_capacity {
-            self.deliver_completion(call_id, CallResult::Failed(CallFailureReason::Io));
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
         }
 
@@ -1837,7 +1822,7 @@ where
         self.listeners.iter().position(|state| state.id == listener)
     }
 
-    fn stream_index(&self, stream: tina_runtime_current::StreamId) -> Option<usize> {
+    fn stream_index(&self, stream: tina_runtime::StreamId) -> Option<usize> {
         self.streams.iter().position(|state| state.id == stream)
     }
 
@@ -1861,8 +1846,8 @@ where
     fn open_stream_from_peer(
         &mut self,
         peer: ScriptedPeerState,
-    ) -> (tina_runtime_current::StreamId, SocketAddr) {
-        let stream = tina_runtime_current::StreamId::new(self.next_stream_id);
+    ) -> (tina_runtime::StreamId, SocketAddr) {
+        let stream = tina_runtime::StreamId::new(self.next_stream_id);
         self.next_stream_id += 1;
         let peer_addr = peer.peer_addr;
         self.streams.push(StreamState {
@@ -1878,7 +1863,7 @@ where
         (stream, peer_addr)
     }
 
-    fn stream_read_result(&mut self, stream_index: usize, max_len: usize) -> Option<CallResult> {
+    fn stream_read_result(&mut self, stream_index: usize, max_len: usize) -> Option<CallOutput> {
         let stream = self.streams.get_mut(stream_index)?;
         if stream.closed {
             return None;
@@ -1888,7 +1873,7 @@ where
         let read_cap = stream.read_chunk_cap.unwrap_or(max_len);
         let target_len = max_len.min(read_cap);
         if target_len == 0 {
-            return Some(CallResult::TcpRead { bytes });
+            return Some(CallOutput::TcpRead { bytes });
         }
 
         while bytes.len() < target_len {
@@ -1905,10 +1890,10 @@ where
             }
         }
 
-        Some(CallResult::TcpRead { bytes })
+        Some(CallOutput::TcpRead { bytes })
     }
 
-    fn stream_write_result(&mut self, stream_index: usize, bytes: &[u8]) -> Option<CallResult> {
+    fn stream_write_result(&mut self, stream_index: usize, bytes: &[u8]) -> Option<CallOutput> {
         let stream = self.streams.get_mut(stream_index)?;
         if stream.closed {
             return None;
@@ -1917,7 +1902,7 @@ where
         let remaining_capacity = stream.output_capacity.saturating_sub(stream.output.len());
         let count = bytes.len().min(stream.write_cap).min(remaining_capacity);
         stream.output.extend_from_slice(&bytes[..count]);
-        Some(CallResult::TcpWrote { count })
+        Some(CallOutput::TcpWrote { count })
     }
 
     fn fail_pending_accepts(&mut self, listener: ListenerId) {
@@ -1926,7 +1911,7 @@ where
             if pending.listener == listener {
                 self.deliver_completion(
                     pending.call_id,
-                    CallResult::Failed(CallFailureReason::InvalidResource),
+                    CallOutput::Failed(CallError::InvalidResource),
                 );
             } else {
                 survivors.push(pending);
@@ -1941,7 +1926,7 @@ where
             if pending.resource == resource {
                 self.deliver_completion(
                     pending.call_id,
-                    CallResult::Failed(CallFailureReason::InvalidResource),
+                    CallOutput::Failed(CallError::InvalidResource),
                 );
             } else {
                 survivors.push(pending);
@@ -1991,14 +1976,14 @@ where
             let Some(listener_index) = self.listener_index(pending_accept.listener) else {
                 self.deliver_completion(
                     pending_accept.call_id,
-                    CallResult::Failed(CallFailureReason::InvalidResource),
+                    CallOutput::Failed(CallError::InvalidResource),
                 );
                 continue;
             };
             if self.listeners[listener_index].closed {
                 self.deliver_completion(
                     pending_accept.call_id,
-                    CallResult::Failed(CallFailureReason::InvalidResource),
+                    CallOutput::Failed(CallError::InvalidResource),
                 );
                 continue;
             }
@@ -2009,7 +1994,7 @@ where
                 self.schedule_tcp_completion(
                     pending_accept.call_id,
                     TcpResourceKey::Listener(pending_accept.listener),
-                    CallResult::TcpAccepted { stream, peer_addr },
+                    CallOutput::TcpAccepted { stream, peer_addr },
                 );
             } else {
                 survivors.push(pending_accept);
@@ -2106,18 +2091,18 @@ where
             }
             self.deliver_completion_at(
                 entry.call_id,
-                CallResult::TimerFired,
+                CallOutput::TimerFired,
                 self.step_ordinal + batch_offset,
             );
             last_registration_index = Some(registration_index);
         }
     }
 
-    fn deliver_completion(&mut self, call_id: CallId, result: CallResult) {
+    fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
         self.deliver_completion_at(call_id, result, self.step_ordinal);
     }
 
-    fn deliver_completion_at(&mut self, call_id: CallId, result: CallResult, visible_at_step: u64) {
+    fn deliver_completion_at(&mut self, call_id: CallId, result: CallOutput, visible_at_step: u64) {
         let in_flight_index = self
             .in_flight_calls
             .iter()
@@ -2139,7 +2124,7 @@ where
             .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
 
         let failure_reason = match &result {
-            CallResult::Failed(reason) => Some(*reason),
+            CallOutput::Failed(reason) => Some(*reason),
             _ => None,
         };
         if let Some(reason) = failure_reason {
@@ -2321,8 +2306,8 @@ where
         &mut self,
         index: usize,
         isolate_id: IsolateId,
-        cause: tina_runtime_current::CauseId,
-    ) -> tina_runtime_current::EventId {
+        cause: tina_runtime::CauseId,
+    ) -> tina_runtime::EventId {
         self.stop_entry_with_precollected(index, isolate_id, cause, None)
     }
 
@@ -2330,9 +2315,9 @@ where
         &mut self,
         index: usize,
         isolate_id: IsolateId,
-        cause: tina_runtime_current::CauseId,
+        cause: tina_runtime::CauseId,
         precollected: Option<Box<dyn Any>>,
-    ) -> tina_runtime_current::EventId {
+    ) -> tina_runtime::EventId {
         if self.entries[index].stopped.get() {
             let stopped = self.entries[index]
                 .stopped_event
@@ -2372,10 +2357,10 @@ where
     fn push_event(
         &mut self,
         isolate: IsolateId,
-        cause: Option<tina_runtime_current::CauseId>,
+        cause: Option<tina_runtime::CauseId>,
         kind: RuntimeEventKind,
-    ) -> tina_runtime_current::EventId {
-        let id = tina_runtime_current::EventId::new(self.next_event_id);
+    ) -> tina_runtime::EventId {
+        let id = tina_runtime::EventId::new(self.next_event_id);
         self.next_event_id += 1;
         self.trace
             .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
@@ -2414,15 +2399,15 @@ where
     }
 }
 
-fn call_kind(request: &CallRequest) -> CallKind {
+fn call_kind(request: &CallInput) -> CallKind {
     match request {
-        CallRequest::TcpBind { .. } => CallKind::TcpBind,
-        CallRequest::TcpAccept { .. } => CallKind::TcpAccept,
-        CallRequest::TcpRead { .. } => CallKind::TcpRead,
-        CallRequest::TcpWrite { .. } => CallKind::TcpWrite,
-        CallRequest::TcpListenerClose { .. } => CallKind::TcpListenerClose,
-        CallRequest::TcpStreamClose { .. } => CallKind::TcpStreamClose,
-        CallRequest::Sleep { .. } => CallKind::Sleep,
+        CallInput::TcpBind { .. } => CallKind::TcpBind,
+        CallInput::TcpAccept { .. } => CallKind::TcpAccept,
+        CallInput::TcpRead { .. } => CallKind::TcpRead,
+        CallInput::TcpWrite { .. } => CallKind::TcpWrite,
+        CallInput::TcpListenerClose { .. } => CallKind::TcpListenerClose,
+        CallInput::TcpStreamClose { .. } => CallKind::TcpStreamClose,
+        CallInput::Sleep { .. } => CallKind::Sleep,
     }
 }
 
@@ -2447,7 +2432,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedSpawn<S> for SpawnAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     Msg: 'static,
@@ -2464,9 +2449,9 @@ where
     }
 }
 
-impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for SpawnSpec<I>
+impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for ChildDefinition<I>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     Msg: 'static,
@@ -2496,7 +2481,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedSpawn<S> for RestartableSpawnAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     Msg: 'static,
@@ -2521,7 +2506,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedRestartRecipe<S> for RestartableSpawnAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     Msg: 'static,
@@ -2540,9 +2525,9 @@ where
     }
 }
 
-impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for RestartableSpawnSpec<I>
+impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for RestartableChildDefinition<I>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = SendMessage<Outbound>, Call = CurrentCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     Msg: 'static,

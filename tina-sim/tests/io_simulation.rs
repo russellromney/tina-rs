@@ -5,12 +5,12 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, RestartBudget, RestartPolicy,
-    RestartableSpawnSpec, SendMessage, Shard, ShardId,
+    Address, Context, Effect, Isolate, IsolateId, Outbound, RestartBudget, RestartPolicy,
+    RestartableChildDefinition, Shard, ShardId,
 };
-use tina_runtime_current::{
-    CallCompletionRejectedReason, CallFailureReason, CallKind, CallRequest, CallResult,
-    CurrentCall, ListenerId, RuntimeEvent, RuntimeEventKind, StreamId,
+use tina_runtime::{
+    CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, ListenerId,
+    RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ScriptedListenerConfig,
@@ -46,9 +46,9 @@ struct Connection {
 impl Isolate for Connection {
     type Message = ConnectionMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<ConnectionMsg>;
+    type Call = RuntimeCall<ConnectionMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -77,33 +77,33 @@ impl Isolate for Connection {
 }
 
 fn read_call(stream: StreamId, max_len: usize) -> Effect<Connection> {
-    Effect::Call(CurrentCall::new(
-        CallRequest::TcpRead { stream, max_len },
+    Effect::Call(RuntimeCall::new(
+        CallInput::TcpRead { stream, max_len },
         |result| match result {
-            CallResult::TcpRead { bytes } => ConnectionMsg::ReadCompleted(bytes),
-            CallResult::Failed(_) => ConnectionMsg::Failed,
+            CallOutput::TcpRead { bytes } => ConnectionMsg::ReadCompleted(bytes),
+            CallOutput::Failed(_) => ConnectionMsg::Failed,
             other => panic!("unexpected read result {other:?}"),
         },
     ))
 }
 
 fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
-    Effect::Call(CurrentCall::new(
-        CallRequest::TcpWrite { stream, bytes },
+    Effect::Call(RuntimeCall::new(
+        CallInput::TcpWrite { stream, bytes },
         |result| match result {
-            CallResult::TcpWrote { count } => ConnectionMsg::WriteCompleted { count },
-            CallResult::Failed(_) => ConnectionMsg::Failed,
+            CallOutput::TcpWrote { count } => ConnectionMsg::WriteCompleted { count },
+            CallOutput::Failed(_) => ConnectionMsg::Failed,
             other => panic!("unexpected write result {other:?}"),
         },
     ))
 }
 
 fn close_call(stream: StreamId) -> Effect<Connection> {
-    Effect::Call(CurrentCall::new(
-        CallRequest::TcpStreamClose { stream },
+    Effect::Call(RuntimeCall::new(
+        CallInput::TcpStreamClose { stream },
         |result| match result {
-            CallResult::TcpStreamClosed => ConnectionMsg::StreamClosed,
-            CallResult::Failed(_) => ConnectionMsg::Failed,
+            CallOutput::TcpStreamClosed => ConnectionMsg::StreamClosed,
+            CallOutput::Failed(_) => ConnectionMsg::Failed,
             other => panic!("unexpected close result {other:?}"),
         },
     ))
@@ -139,27 +139,27 @@ struct Listener {
 impl Isolate for Listener {
     type Message = ListenerMsg;
     type Reply = ();
-    type Send = SendMessage<ListenerMsg>;
-    type Spawn = RestartableSpawnSpec<Connection>;
-    type Call = CurrentCall<ListenerMsg>;
+    type Send = Outbound<ListenerMsg>;
+    type Spawn = RestartableChildDefinition<Connection>;
+    type Call = RuntimeCall<ListenerMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             ListenerMsg::Bootstrap => {
-                self.self_addr = Some(ctx.current_address::<ListenerMsg>());
+                self.self_addr = Some(ctx.me());
                 let addr = self.bind_addr;
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpBind { addr },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpBind { addr },
                     move |result| match result {
-                        CallResult::TcpBound {
+                        CallOutput::TcpBound {
                             listener,
                             local_addr,
                         } => ListenerMsg::Bound {
                             listener,
                             addr: local_addr,
                         },
-                        CallResult::Failed(_) => ListenerMsg::Failed,
+                        CallOutput::Failed(_) => ListenerMsg::Failed,
                         other => panic!("unexpected bind result {other:?}"),
                     },
                 ))
@@ -167,22 +167,22 @@ impl Isolate for Listener {
             ListenerMsg::Bound { listener, addr } => {
                 self.listener = Some(listener);
                 *self.bound_addr_slot.lock().expect("bound addr mutex") = Some(addr);
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpAccept { listener },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpAccept { listener },
                     |result| match result {
-                        CallResult::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
-                        CallResult::Failed(_) => ListenerMsg::Failed,
+                        CallOutput::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
+                        CallOutput::Failed(_) => ListenerMsg::Failed,
                         other => panic!("unexpected accept result {other:?}"),
                     },
                 ))
             }
             ListenerMsg::ReArmAccept => {
                 let listener = self.listener.expect("listener stored before re-arm");
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpAccept { listener },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpAccept { listener },
                     |result| match result {
-                        CallResult::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
-                        CallResult::Failed(_) => ListenerMsg::Failed,
+                        CallOutput::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
+                        CallOutput::Failed(_) => ListenerMsg::Failed,
                         other => panic!("unexpected accept result {other:?}"),
                     },
                 ))
@@ -191,7 +191,7 @@ impl Isolate for Listener {
                 self.accepted_count += 1;
                 let max_chunk = self.max_chunk;
                 let spawn = Effect::Spawn(
-                    RestartableSpawnSpec::new(
+                    RestartableChildDefinition::new(
                         move || Connection {
                             stream,
                             max_chunk,
@@ -199,7 +199,7 @@ impl Isolate for Listener {
                         },
                         8,
                     )
-                    .with_bootstrap(|| ConnectionMsg::Start),
+                    .with_initial_message(|| ConnectionMsg::Start),
                 );
                 let self_addr = self.self_addr.expect("listener captured self address");
                 let follow_up = if self.accepted_count < self.target_accepts {
@@ -209,16 +209,16 @@ impl Isolate for Listener {
                 };
                 Effect::Batch(vec![
                     spawn,
-                    Effect::Send(SendMessage::new(self_addr, follow_up)),
+                    Effect::Send(Outbound::new(self_addr, follow_up)),
                 ])
             }
             ListenerMsg::CloseListener => {
                 let listener = self.listener.expect("listener stored before close");
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpListenerClose { listener },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpListenerClose { listener },
                     |result| match result {
-                        CallResult::TcpListenerClosed => ListenerMsg::ListenerClosed,
-                        CallResult::Failed(_) => ListenerMsg::Failed,
+                        CallOutput::TcpListenerClosed => ListenerMsg::ListenerClosed,
+                        CallOutput::Failed(_) => ListenerMsg::Failed,
                         other => panic!("unexpected listener close result {other:?}"),
                     },
                 ))
@@ -248,19 +248,19 @@ struct Binder {
 impl Isolate for Binder {
     type Message = BinderMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<BinderMsg>;
+    type Call = RuntimeCall<BinderMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             BinderMsg::StartBind => {
                 let addr = self.bind_addr;
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpBind { addr },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpBind { addr },
                     move |result| match result {
-                        CallResult::TcpBound {
+                        CallOutput::TcpBound {
                             listener,
                             local_addr,
                         } => BinderMsg::Bound {
@@ -295,31 +295,31 @@ struct Probe {
 impl Isolate for Probe {
     type Message = ProbeMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<ProbeMsg>;
+    type Call = RuntimeCall<ProbeMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ProbeMsg::StartInvalidAccept => Effect::Call(CurrentCall::new(
-                CallRequest::TcpAccept {
+            ProbeMsg::StartInvalidAccept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
                     listener: ListenerId::new(999),
                 },
                 |result| match result {
-                    CallResult::Failed(CallFailureReason::InvalidResource) => {
+                    CallOutput::Failed(CallError::InvalidResource) => {
                         ProbeMsg::InvalidResourceObserved
                     }
                     other => panic!("expected invalid accept failure, got {other:?}"),
                 },
             )),
-            ProbeMsg::StartInvalidRead => Effect::Call(CurrentCall::new(
-                CallRequest::TcpRead {
+            ProbeMsg::StartInvalidRead => Effect::Call(RuntimeCall::new(
+                CallInput::TcpRead {
                     stream: StreamId::new(999),
                     max_len: 8,
                 },
                 |result| match result {
-                    CallResult::Failed(CallFailureReason::InvalidResource) => {
+                    CallOutput::Failed(CallError::InvalidResource) => {
                         ProbeMsg::InvalidResourceObserved
                     }
                     other => panic!("expected invalid read failure, got {other:?}"),
@@ -353,20 +353,20 @@ struct Waiter {
 impl Isolate for Waiter {
     type Message = WaiterMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<WaiterMsg>;
+    type Call = RuntimeCall<WaiterMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            WaiterMsg::StartAccept => Effect::Call(CurrentCall::new(
-                CallRequest::TcpAccept {
+            WaiterMsg::StartAccept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
                     listener: self.listener,
                 },
                 |result| match result {
-                    CallResult::TcpAccepted { .. } => WaiterMsg::Accepted,
-                    CallResult::Failed(_) => WaiterMsg::Failed,
+                    CallOutput::TcpAccepted { .. } => WaiterMsg::Accepted,
+                    CallOutput::Failed(_) => WaiterMsg::Failed,
                     other => panic!("unexpected accept result {other:?}"),
                 },
             )),
@@ -404,22 +404,22 @@ struct PeerAwareAcceptor {
 impl Isolate for PeerAwareAcceptor {
     type Message = PeerAwareAcceptMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<PeerAwareAcceptMsg>;
+    type Call = RuntimeCall<PeerAwareAcceptMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            PeerAwareAcceptMsg::StartAccept => Effect::Call(CurrentCall::new(
-                CallRequest::TcpAccept {
+            PeerAwareAcceptMsg::StartAccept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
                     listener: self.listener,
                 },
                 |result| match result {
-                    CallResult::TcpAccepted { stream, peer_addr } => {
+                    CallOutput::TcpAccepted { stream, peer_addr } => {
                         PeerAwareAcceptMsg::Accepted { stream, peer_addr }
                     }
-                    CallResult::Failed(_) => PeerAwareAcceptMsg::Failed,
+                    CallOutput::Failed(_) => PeerAwareAcceptMsg::Failed,
                     other => panic!("unexpected accept result {other:?}"),
                 },
             )),
@@ -451,21 +451,21 @@ struct ReadProbe {
 impl Isolate for ReadProbe {
     type Message = ReadProbeMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<ReadProbeMsg>;
+    type Call = RuntimeCall<ReadProbeMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ReadProbeMsg::StartRead => Effect::Call(CurrentCall::new(
-                CallRequest::TcpRead {
+            ReadProbeMsg::StartRead => Effect::Call(RuntimeCall::new(
+                CallInput::TcpRead {
                     stream: self.stream,
                     max_len: self.max_len,
                 },
                 |result| match result {
-                    CallResult::TcpRead { bytes } => ReadProbeMsg::ReadCompleted(bytes),
-                    CallResult::Failed(_) => ReadProbeMsg::Failed,
+                    CallOutput::TcpRead { bytes } => ReadProbeMsg::ReadCompleted(bytes),
+                    CallOutput::Failed(_) => ReadProbeMsg::Failed,
                     other => panic!("unexpected read result {other:?}"),
                 },
             )),
@@ -502,21 +502,21 @@ struct WriteProbe {
 impl Isolate for WriteProbe {
     type Message = WriteProbeMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<WriteProbeMsg>;
+    type Call = RuntimeCall<WriteProbeMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            WriteProbeMsg::StartWrite => Effect::Call(CurrentCall::new(
-                CallRequest::TcpWrite {
+            WriteProbeMsg::StartWrite => Effect::Call(RuntimeCall::new(
+                CallInput::TcpWrite {
                     stream: self.stream,
                     bytes: self.bytes.clone(),
                 },
                 |result| match result {
-                    CallResult::TcpWrote { count } => WriteProbeMsg::Wrote(count),
-                    CallResult::Failed(_) => WriteProbeMsg::Failed,
+                    CallOutput::TcpWrote { count } => WriteProbeMsg::Wrote(count),
+                    CallOutput::Failed(_) => WriteProbeMsg::Failed,
                     other => panic!("unexpected write result {other:?}"),
                 },
             )),
@@ -550,20 +550,20 @@ struct ListenerCloser {
 impl Isolate for ListenerCloser {
     type Message = CloserMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<CloserMsg>;
+    type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            CloserMsg::CloseListener => Effect::Call(CurrentCall::new(
-                CallRequest::TcpListenerClose {
+            CloserMsg::CloseListener => Effect::Call(RuntimeCall::new(
+                CallInput::TcpListenerClose {
                     listener: self.listener,
                 },
                 |result| match result {
-                    CallResult::TcpListenerClosed => CloserMsg::ListenerClosed,
-                    CallResult::Failed(_) => CloserMsg::Failed,
+                    CallOutput::TcpListenerClosed => CloserMsg::ListenerClosed,
+                    CallOutput::Failed(_) => CloserMsg::Failed,
                     other => panic!("unexpected listener close result {other:?}"),
                 },
             )),
@@ -583,20 +583,20 @@ struct StreamCloser {
 impl Isolate for StreamCloser {
     type Message = CloserMsg;
     type Reply = ();
-    type Send = SendMessage<Infallible>;
+    type Send = Outbound<Infallible>;
     type Spawn = Infallible;
-    type Call = CurrentCall<CloserMsg>;
+    type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            CloserMsg::CloseStream => Effect::Call(CurrentCall::new(
-                CallRequest::TcpStreamClose {
+            CloserMsg::CloseStream => Effect::Call(RuntimeCall::new(
+                CallInput::TcpStreamClose {
                     stream: self.stream,
                 },
                 |result| match result {
-                    CallResult::TcpStreamClosed => CloserMsg::StreamClosed,
-                    CallResult::Failed(_) => CloserMsg::Failed,
+                    CallOutput::TcpStreamClosed => CloserMsg::StreamClosed,
+                    CallOutput::Failed(_) => CloserMsg::Failed,
                     other => panic!("unexpected stream close result {other:?}"),
                 },
             )),
@@ -1170,7 +1170,7 @@ fn invalid_tcp_resources_surface_failures() {
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpAccept,
-                reason: CallFailureReason::InvalidResource,
+                reason: CallError::InvalidResource,
                 ..
             }
         )
@@ -1180,7 +1180,7 @@ fn invalid_tcp_resources_surface_failures() {
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpRead,
-                reason: CallFailureReason::InvalidResource,
+                reason: CallError::InvalidResource,
                 ..
             }
         )
@@ -1239,7 +1239,7 @@ fn closed_stream_id_surfaces_invalid_resource() {
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpRead,
-                reason: CallFailureReason::InvalidResource,
+                reason: CallError::InvalidResource,
                 ..
             }
         )
@@ -1308,7 +1308,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpRead,
-                reason: CallFailureReason::Io,
+                reason: CallError::Io,
                 ..
             }
         )
@@ -1381,7 +1381,7 @@ fn listener_close_fails_pending_accept() {
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpAccept,
-                reason: CallFailureReason::InvalidResource,
+                reason: CallError::InvalidResource,
                 ..
             }
         )
@@ -1518,7 +1518,7 @@ fn stream_close_fails_pending_read() {
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpRead,
-                reason: CallFailureReason::InvalidResource,
+                reason: CallError::InvalidResource,
                 ..
             }
         )
@@ -1578,7 +1578,7 @@ fn stream_close_fails_pending_write() {
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpWrite,
-                reason: CallFailureReason::InvalidResource,
+                reason: CallError::InvalidResource,
                 ..
             }
         )

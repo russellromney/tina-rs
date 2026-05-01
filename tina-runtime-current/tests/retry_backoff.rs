@@ -3,7 +3,7 @@
 //! This complements the crate-local timer semantics tests in `src/tests.rs`
 //! with a black-box integration test that drives the shipped runtime surface:
 //!
-//! - an isolate issues `Effect::Call(CurrentCall::new(CallRequest::Sleep { .. }, ..))`
+//! - an isolate issues `sleep(..).reply(..)`
 //! - the runtime delays wake delivery through its normal call-completion path
 //! - the translated wake message causes a real second attempt on a later turn
 //! - the second attempt succeeds
@@ -15,10 +15,9 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId, TrySendError};
-use tina_runtime_current::{
-    CallKind, CallRequest, CurrentCall, CurrentRuntime, MailboxFactory, RuntimeEvent,
-    RuntimeEventKind,
+use tina::{Mailbox, TrySendError, prelude::*};
+use tina_runtime::{
+    CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -82,8 +81,8 @@ impl MailboxFactory for TestMailboxFactory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryMsg {
-    Attempt,
+enum RetryEvent {
+    TryWork,
     RetryNow,
 }
 
@@ -103,16 +102,18 @@ struct RetryWorker {
 }
 
 impl Isolate for RetryWorker {
-    type Message = RetryMsg;
-    type Reply = ();
-    type Send = SendMessage<RetryMsg>;
-    type Spawn = Infallible;
-    type Call = CurrentCall<RetryMsg>;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: RetryEvent,
+        reply: (),
+        send: Outbound<RetryEvent>,
+        spawn: Infallible,
+        call: RuntimeCall<RetryEvent>,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            RetryMsg::Attempt => {
+            RetryEvent::TryWork => {
                 self.attempts += 1;
                 self.observations
                     .borrow_mut()
@@ -121,39 +122,31 @@ impl Isolate for RetryWorker {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Failed(self.attempts));
-                    Effect::Call(CurrentCall::new(
-                        CallRequest::Sleep {
-                            after: self.backoff,
-                        },
-                        |_| RetryMsg::RetryNow,
-                    ))
+                    sleep(self.backoff).reply(|_| RetryEvent::RetryNow)
                 } else {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Succeeded(self.attempts));
-                    Effect::Noop
+                    noop()
                 }
             }
-            RetryMsg::RetryNow => {
+            RetryEvent::RetryNow => {
                 self.observations
                     .borrow_mut()
                     .push(RetryObservation::BackoffElapsed);
-                Effect::Send(SendMessage::new(
-                    ctx.current_address::<RetryMsg>(),
-                    RetryMsg::Attempt,
-                ))
+                ctx.send_self(RetryEvent::TryWork)
             }
         }
     }
 }
 
 fn step_until<F>(
-    runtime: &mut CurrentRuntime<TestShard, TestMailboxFactory>,
+    runtime: &mut Runtime<TestShard, TestMailboxFactory>,
     timeout: Duration,
     label: &str,
     predicate: F,
 ) where
-    F: Fn(&CurrentRuntime<TestShard, TestMailboxFactory>) -> bool,
+    F: Fn(&Runtime<TestShard, TestMailboxFactory>) -> bool,
 {
     let deadline = Instant::now() + timeout;
     while !predicate(runtime) {
@@ -194,7 +187,7 @@ fn count_call_dispatch_attempted(trace: &[RuntimeEvent], kind: CallKind) -> usiz
 
 #[test]
 fn retry_backoff_public_path_retries_after_timer_wake() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let observations = Rc::new(RefCell::new(Vec::new()));
     let worker = runtime.register(
         RetryWorker {
@@ -206,7 +199,7 @@ fn retry_backoff_public_path_retries_after_timer_wake() {
     );
 
     runtime
-        .try_send(worker, RetryMsg::Attempt)
+        .try_send(worker, RetryEvent::TryWork)
         .expect("ingress accepts first attempt");
 
     assert_eq!(runtime.step(), 1);

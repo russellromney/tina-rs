@@ -1,4 +1,4 @@
-//! Runtime-owned external call vocabulary for `tina-runtime-current`.
+//! Runtime-owned external call vocabulary for `tina-runtime`.
 //!
 //! `tina` only owns the [`Effect::Call`](tina::Effect::Call) slot and the
 //! `Isolate::Call` associated type. The concrete request and result types
@@ -13,7 +13,7 @@
 //! - TCP bind / accept / read / write / close
 //! - one-shot relative sleep / timer wake
 //!
-//! Future verbs still extend [`CallRequest`] / [`CallResult`] in this crate,
+//! Future verbs still extend [`CallInput`] / [`CallOutput`] in this crate,
 //! not the `tina` trait boundary.
 //!
 //! ## Design constraints honored here
@@ -82,16 +82,16 @@ impl StreamId {
     }
 }
 
-/// One concrete call shape understood by `tina-runtime-current`.
+/// One concrete call shape understood by `tina-runtime`.
 ///
 /// New verbs are added by extending this enum, not by adding a top-level
 /// [`tina::Effect`] variant per verb.
 #[derive(Debug, Clone)]
-pub enum CallRequest {
+pub enum CallInput {
     /// Bind a TCP listener to `addr`.
     ///
     /// Uses [`SocketAddr`] rather than a logical name. The runtime reports the
-    /// actual bound address back through [`CallResult::TcpBound::local_addr`],
+    /// actual bound address back through [`CallOutput::TcpBound::local_addr`],
     /// including when the caller requests port `0` and lets the kernel pick a
     /// free ephemeral port.
     TcpBind {
@@ -108,7 +108,7 @@ pub enum CallRequest {
     /// Read up to `max_len` bytes from a stream.
     ///
     /// A successful read of zero bytes signals end of stream; the runtime
-    /// surfaces that in [`CallResult::TcpRead`] with an empty `bytes`
+    /// surfaces that in [`CallOutput::TcpRead`] with an empty `bytes`
     /// vector.
     TcpRead {
         /// The stream to read from.
@@ -120,7 +120,7 @@ pub enum CallRequest {
     },
 
     /// Write `bytes` to a stream. Partial writes are surfaced through
-    /// [`CallResult::TcpWrote`] so the issuing isolate can decide whether
+    /// [`CallOutput::TcpWrote`] so the issuing isolate can decide whether
     /// to issue another write for the remaining bytes.
     TcpWrite {
         /// The stream to write to.
@@ -154,7 +154,7 @@ pub enum CallRequest {
     },
 }
 
-impl CallRequest {
+impl CallInput {
     /// Returns the trace-level kind for this request.
     pub(crate) fn kind(&self) -> crate::trace::CallKind {
         match self {
@@ -171,7 +171,7 @@ impl CallRequest {
 
 /// One concrete call completion delivered to the issuing isolate.
 #[derive(Debug, Clone)]
-pub enum CallResult {
+pub enum CallOutput {
     /// A listener was successfully bound and is ready to accept.
     TcpBound {
         /// The runtime-assigned listener identifier.
@@ -216,12 +216,12 @@ pub enum CallResult {
     /// The runtime could not complete the call. The trace already records
     /// the failure with a richer reason; this variant is what the issuing
     /// isolate observes in its own vocabulary.
-    Failed(CallFailureReason),
+    Failed(CallError),
 }
 
 /// Why a runtime-owned call failed before it could complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CallFailureReason {
+pub enum CallError {
     /// The referenced listener or stream id is not registered with the
     /// runtime.
     InvalidResource,
@@ -242,7 +242,7 @@ pub enum CallFailureReason {
 
 /// Backend-neutral runtime-owned call request issued by an isolate.
 ///
-/// The translator turns the runtime's later [`CallResult`] back into one
+/// The translator turns the runtime's later [`CallOutput`] back into one
 /// ordinary [`tina::Isolate::Message`] value. The runtime never invokes a
 /// second public handler entry point — completion always travels through
 /// the isolate's existing [`Isolate::handle`](tina::Isolate::handle).
@@ -251,12 +251,12 @@ pub enum CallFailureReason {
 /// moved into the runtime, not duplicated, and the translator boxes a
 /// non-`Clone` `FnOnce`.
 #[must_use = "a call request has no effect until a runtime executes it"]
-pub struct CurrentCall<M> {
-    request: CallRequest,
-    translator: Box<dyn FnOnce(CallResult) -> M>,
+pub struct RuntimeCall<M> {
+    request: CallInput,
+    translator: Box<dyn FnOnce(CallOutput) -> M>,
 }
 
-impl<M> CurrentCall<M> {
+impl<M> RuntimeCall<M> {
     /// Creates a new runtime-owned call request.
     ///
     /// `translator` runs once, when the runtime delivers the call's
@@ -264,9 +264,9 @@ impl<M> CurrentCall<M> {
     /// `Message` value — this is the load-bearing rule that keeps the
     /// completion path "ordinary later message," not a second handler
     /// entry point.
-    pub fn new<F>(request: CallRequest, translator: F) -> Self
+    pub fn new<F>(request: CallInput, translator: F) -> Self
     where
-        F: FnOnce(CallResult) -> M + 'static,
+        F: FnOnce(CallOutput) -> M + 'static,
     {
         Self {
             request,
@@ -274,21 +274,33 @@ impl<M> CurrentCall<M> {
         }
     }
 
+    /// Creates a call that receives a plain `Result<CallOutput, CallError>`
+    /// instead of matching the failure variant manually.
+    pub fn map_result<F>(request: CallInput, translator: F) -> Self
+    where
+        F: FnOnce(Result<CallOutput, CallError>) -> M + 'static,
+    {
+        Self::new(request, move |output| match output {
+            CallOutput::Failed(error) => translator(Err(error)),
+            other => translator(Ok(other)),
+        })
+    }
+
     /// Returns a shared reference to the underlying request.
-    pub fn request(&self) -> &CallRequest {
+    pub fn request(&self) -> &CallInput {
         &self.request
     }
 
     /// Splits the call into its request and translator.
-    pub fn into_parts(self) -> (CallRequest, Box<dyn FnOnce(CallResult) -> M>) {
+    pub fn into_parts(self) -> (CallInput, Box<dyn FnOnce(CallOutput) -> M>) {
         (self.request, self.translator)
     }
 }
 
-impl<M> std::fmt::Debug for CurrentCall<M> {
+impl<M> std::fmt::Debug for RuntimeCall<M> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("CurrentCall")
+            .debug_struct("RuntimeCall")
             .field("request", &self.request)
             .finish_non_exhaustive()
     }
@@ -297,13 +309,13 @@ impl<M> std::fmt::Debug for CurrentCall<M> {
 /// Erased call shape stored by the runtime once an isolate's
 /// per-`I::Message` translator has been wrapped to a `Box<dyn Any>`.
 ///
-/// `tina-runtime-current` does not expose this type's fields. Downstream
+/// `tina-runtime` does not expose this type's fields. Downstream
 /// crates produce `ErasedCall` only via the [`IntoErasedCall`] conversion
 /// trait. The struct is exposed publicly only to make the trait method
 /// signature visible; it is not constructible from outside this crate.
 pub struct ErasedCall {
-    pub(crate) request: CallRequest,
-    pub(crate) translator: Box<dyn FnOnce(CallResult) -> Box<dyn Any>>,
+    pub(crate) request: CallInput,
+    pub(crate) translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
 }
 
 impl std::fmt::Debug for ErasedCall {
@@ -320,7 +332,7 @@ impl std::fmt::Debug for ErasedCall {
 ///
 /// This mirrors the existing `IntoErasedSpawn` pattern: isolates that never
 /// issue call effects use [`std::convert::Infallible`], and isolates that
-/// do use `CurrentCall<I::Message>`. New runtime crates that want a
+/// do use `RuntimeCall<I::Message>`. New runtime crates that want a
 /// different programming model implement their own conversion trait —
 /// `tina` does not pin the conversion shape.
 pub trait IntoErasedCall<M> {
@@ -334,7 +346,7 @@ impl<M> IntoErasedCall<M> for std::convert::Infallible {
     }
 }
 
-impl<M> IntoErasedCall<M> for CurrentCall<M>
+impl<M> IntoErasedCall<M> for RuntimeCall<M>
 where
     M: 'static,
 {
@@ -345,4 +357,155 @@ where
             translator: Box::new(move |result| Box::new(translator(result)) as Box<dyn Any>),
         }
     }
+}
+
+impl CallOutput {
+    fn panic_wrong_shape(expected: &str, found: &Self) -> ! {
+        panic!("typed runtime call helper expected {expected}, but runtime returned {found:?}");
+    }
+
+    /// Extracts the timer completion payload.
+    pub fn into_timer_fired(self) -> Result<(), CallError> {
+        match self {
+            Self::TimerFired => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TimerFired", &other),
+        }
+    }
+
+    /// Extracts the successful TCP bind result.
+    pub fn into_tcp_bound(self) -> Result<(ListenerId, SocketAddr), CallError> {
+        match self {
+            Self::TcpBound {
+                listener,
+                local_addr,
+            } => Ok((listener, local_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpBound", &other),
+        }
+    }
+
+    /// Extracts the successful TCP accept result.
+    pub fn into_tcp_accepted(self) -> Result<(StreamId, SocketAddr), CallError> {
+        match self {
+            Self::TcpAccepted { stream, peer_addr } => Ok((stream, peer_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpAccepted", &other),
+        }
+    }
+
+    /// Extracts the successful TCP read payload.
+    pub fn into_tcp_read(self) -> Result<Vec<u8>, CallError> {
+        match self {
+            Self::TcpRead { bytes } => Ok(bytes),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpRead", &other),
+        }
+    }
+
+    /// Extracts the successful TCP write payload.
+    pub fn into_tcp_wrote(self) -> Result<usize, CallError> {
+        match self {
+            Self::TcpWrote { count } => Ok(count),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpWrote", &other),
+        }
+    }
+
+    /// Extracts the successful listener close completion.
+    pub fn into_tcp_listener_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::TcpListenerClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpListenerClosed", &other),
+        }
+    }
+
+    /// Extracts the successful stream close completion.
+    pub fn into_tcp_stream_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::TcpStreamClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpStreamClosed", &other),
+        }
+    }
+}
+
+/// Doc-hidden carrier used by typed call helpers like [`sleep`] and
+/// [`tcp_read`].
+#[doc(hidden)]
+pub struct TypedCall<T> {
+    request: CallInput,
+    decode: fn(CallOutput) -> Result<T, CallError>,
+}
+
+impl<T> TypedCall<T> {
+    fn new(request: CallInput, decode: fn(CallOutput) -> Result<T, CallError>) -> Self {
+        Self { request, decode }
+    }
+
+    /// Turns this prepared runtime-owned call into one ordinary later message.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(Result<T, CallError>) -> M + 'static,
+        T: 'static,
+    {
+        let decode = self.decode;
+        tina::Effect::Call(RuntimeCall::new(self.request, move |output| {
+            translator(decode(output))
+        }))
+    }
+}
+
+/// Returns a typed sleep helper that later yields `Result<(), CallError>`.
+pub fn sleep(after: Duration) -> TypedCall<()> {
+    TypedCall::new(CallInput::Sleep { after }, CallOutput::into_timer_fired)
+}
+
+/// Returns a typed TCP bind helper that later yields one listener id and
+/// bound address.
+pub fn tcp_bind(addr: SocketAddr) -> TypedCall<(ListenerId, SocketAddr)> {
+    TypedCall::new(CallInput::TcpBind { addr }, CallOutput::into_tcp_bound)
+}
+
+/// Returns a typed TCP accept helper that later yields one stream id and peer
+/// address.
+pub fn tcp_accept(listener: ListenerId) -> TypedCall<(StreamId, SocketAddr)> {
+    TypedCall::new(
+        CallInput::TcpAccept { listener },
+        CallOutput::into_tcp_accepted,
+    )
+}
+
+/// Returns a typed TCP read helper that later yields the bytes read.
+pub fn tcp_read(stream: StreamId, max_len: usize) -> TypedCall<Vec<u8>> {
+    TypedCall::new(
+        CallInput::TcpRead { stream, max_len },
+        CallOutput::into_tcp_read,
+    )
+}
+
+/// Returns a typed TCP write helper that later yields the accepted byte count.
+pub fn tcp_write(stream: StreamId, bytes: Vec<u8>) -> TypedCall<usize> {
+    TypedCall::new(
+        CallInput::TcpWrite { stream, bytes },
+        CallOutput::into_tcp_wrote,
+    )
+}
+
+/// Returns a typed listener-close helper that later yields `Result<(), CallError>`.
+pub fn tcp_close_listener(listener: ListenerId) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::TcpListenerClose { listener },
+        CallOutput::into_tcp_listener_closed,
+    )
+}
+
+/// Returns a typed stream-close helper that later yields `Result<(), CallError>`.
+pub fn tcp_close_stream(stream: StreamId) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::TcpStreamClose { stream },
+        CallOutput::into_tcp_stream_closed,
+    )
 }

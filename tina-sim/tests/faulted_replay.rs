@@ -1,6 +1,6 @@
 use std::convert::Infallible;
-use tina::{Address, Context, Effect, Isolate, IsolateId, SendMessage, Shard, ShardId};
-use tina_runtime_current::{CurrentCall, EventId, RuntimeEvent, RuntimeEventKind};
+use tina::{Address, Context, Effect, Isolate, IsolateId, Outbound, Shard, ShardId};
+use tina_runtime::{EventId, RuntimeCall, RuntimeEvent, RuntimeEventKind};
 use tina_sim::{
     Checker, CheckerDecision, CheckerFailure, FaultConfig, LocalSendFaultMode, ReplayArtifact,
     Simulator, SimulatorConfig,
@@ -34,16 +34,16 @@ struct Driver {
 impl Isolate for Driver {
     type Message = SimMsg;
     type Reply = ();
-    type Send = SendMessage<SimMsg>;
+    type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<SimMsg>;
+    type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             SimMsg::Start => Effect::Batch(vec![
-                Effect::Send(SendMessage::new(self.protocol, SimMsg::Prepare)),
-                Effect::Send(SendMessage::new(self.trigger, SimMsg::ScheduleCheck)),
+                Effect::Send(Outbound::new(self.protocol, SimMsg::Prepare)),
+                Effect::Send(Outbound::new(self.trigger, SimMsg::ScheduleCheck)),
             ]),
             _ => Effect::Noop,
         }
@@ -58,14 +58,14 @@ struct Protocol {
 impl Isolate for Protocol {
     type Message = SimMsg;
     type Reply = ();
-    type Send = SendMessage<SimMsg>;
+    type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<SimMsg>;
+    type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            SimMsg::Prepare => Effect::Send(SendMessage::new(self.watcher, SimMsg::Ack)),
+            SimMsg::Prepare => Effect::Send(Outbound::new(self.watcher, SimMsg::Ack)),
             _ => Effect::Noop,
         }
     }
@@ -79,14 +79,14 @@ struct Trigger {
 impl Isolate for Trigger {
     type Message = SimMsg;
     type Reply = ();
-    type Send = SendMessage<SimMsg>;
+    type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<SimMsg>;
+    type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            SimMsg::ScheduleCheck => Effect::Send(SendMessage::new(self.watcher, SimMsg::Check)),
+            SimMsg::ScheduleCheck => Effect::Send(Outbound::new(self.watcher, SimMsg::Check)),
             _ => Effect::Noop,
         }
     }
@@ -102,9 +102,9 @@ struct Watcher {
 impl Isolate for Watcher {
     type Message = SimMsg;
     type Reply = ();
-    type Send = SendMessage<SimMsg>;
+    type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<SimMsg>;
+    type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -119,7 +119,7 @@ impl Isolate for Watcher {
                 } else {
                     self.failure
                 };
-                Effect::Send(SendMessage::new(target, SimMsg::Seen))
+                Effect::Send(Outbound::new(target, SimMsg::Seen))
             }
             _ => Effect::Noop,
         }
@@ -132,9 +132,9 @@ struct Sink;
 impl Isolate for Sink {
     type Message = SimMsg;
     type Reply = ();
-    type Send = SendMessage<SimMsg>;
+    type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<SimMsg>;
+    type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {

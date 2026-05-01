@@ -4,11 +4,10 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard, ShardId,
-    TrySendError,
+    Address, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, Shard, ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CauseId, CurrentRuntime, EffectKind, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
+use tina_runtime::{
+    CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +134,7 @@ struct OrderIsolate {
 impl Isolate for OrderIsolate {
     type Message = OrderMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -154,7 +153,7 @@ struct StopIsolate {
 impl Isolate for StopIsolate {
     type Message = StopMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -179,7 +178,7 @@ struct StopAndAudit {
 impl Isolate for StopAndAudit {
     type Message = StopAuditMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -203,7 +202,7 @@ struct StopSender {
 impl Isolate for StopSender {
     type Message = DriverMsg;
     type Reply = ();
-    type Send = SendMessage<StopAuditMsg>;
+    type Send = Outbound<StopAuditMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -211,7 +210,7 @@ impl Isolate for StopSender {
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             DriverMsg::Kick(value) => {
-                Effect::Send(SendMessage::new(self.target, StopAuditMsg::Record(value)))
+                Effect::Send(Outbound::new(self.target, StopAuditMsg::Record(value)))
             }
         }
     }
@@ -219,7 +218,7 @@ impl Isolate for StopSender {
 
 #[test]
 fn stop_abandons_buffered_messages_in_fifo_order_and_empties_the_mailbox() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let drops = Rc::new(Cell::new(0));
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(StopIsolate::default(), mailbox.clone());
@@ -292,7 +291,7 @@ fn stop_abandons_buffered_messages_in_fifo_order_and_empties_the_mailbox() {
 
 #[test]
 fn stop_with_empty_mailbox_produces_no_message_abandoned_events() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(StopIsolate::default(), mailbox.clone());
 
@@ -338,7 +337,7 @@ fn stop_with_empty_mailbox_produces_no_message_abandoned_events() {
 
 #[test]
 fn abandonment_happens_before_later_isolate_handlers_in_the_same_round() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let drops = Rc::new(Cell::new(0));
 
     let first_mailbox = TestMailbox::new(8);
@@ -388,7 +387,7 @@ fn abandonment_happens_before_later_isolate_handlers_in_the_same_round() {
 
 #[test]
 fn two_stops_in_one_round_interleave_abandonment_by_registration_order() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let first_drops = Rc::new(Cell::new(0));
     let second_drops = Rc::new(Cell::new(0));
 
@@ -501,7 +500,7 @@ fn two_stops_in_one_round_interleave_abandonment_by_registration_order() {
 
 #[test]
 fn accepted_send_can_become_message_abandoned_when_target_stops_in_the_same_round() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let target_seen = Rc::new(RefCell::new(Vec::new()));
 
     let sender_mailbox = TestMailbox::new(8);
@@ -617,7 +616,7 @@ fn accepted_send_can_become_message_abandoned_when_target_stops_in_the_same_roun
 
 #[test]
 fn sends_after_stop_still_become_closed() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let target_seen = Rc::new(RefCell::new(Vec::new()));
 
     let target_mailbox = TestMailbox::new(8);
@@ -653,7 +652,7 @@ fn sends_after_stop_still_become_closed() {
                 target_shard: ShardId::new(3),
                 target_isolate: target_address.isolate(),
                 target_generation: target_address.generation(),
-                reason: tina_runtime_current::SendRejectedReason::Closed,
+                reason: tina_runtime::SendRejectedReason::Closed,
             },
         ))
     );
@@ -662,7 +661,7 @@ fn sends_after_stop_still_become_closed() {
 #[test]
 fn repeated_runs_with_abandonment_produce_identical_traces() {
     fn run_once() -> Vec<RuntimeEvent> {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let drops = Rc::new(Cell::new(0));
         let mailbox = TestMailbox::new(8);
         runtime.register(StopIsolate::default(), mailbox.clone());

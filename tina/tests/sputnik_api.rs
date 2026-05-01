@@ -2,13 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 
-use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, RestartableSpawnSpec, SendMessage,
-    Shard, ShardId, SpawnSpec, TrySendError,
-};
+use tina::{Mailbox, TrySendError, prelude::*};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SessionMsg {
+enum SessionEvent {
     Note(String),
     Read,
     SpawnWorker,
@@ -16,15 +13,15 @@ enum SessionMsg {
     Stop,
     RestartWorkers,
     Ignore,
-    StartIo(SessionCallRequest),
-    IoCompleted(SessionCallResult),
+    StartIo(SessionCallInput),
+    IoCompleted(SessionCallOutput),
 }
 
 /// A handler-defined description of an external operation the runtime should
 /// perform. Substrate-neutral by design: a downstream isolate states what it
 /// wants in its own vocabulary without knowing how the runtime executes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SessionCallRequest {
+enum SessionCallInput {
     Greet(String),
 }
 
@@ -32,7 +29,7 @@ enum SessionCallRequest {
 /// runtime crates would do: typed result that the call payload's translator
 /// turns into one ordinary `Message` for the isolate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SessionCallResult {
+enum SessionCallOutput {
     Greeted(String),
 }
 
@@ -40,8 +37,8 @@ enum SessionCallResult {
 /// crate. The trait crate only requires `Isolate::Call` to exist; the shape
 /// here exercises the "translator inside the call payload" design.
 struct SessionCall {
-    request: SessionCallRequest,
-    translator: Box<dyn FnOnce(SessionCallResult) -> SessionMsg>,
+    request: SessionCallInput,
+    translator: Box<dyn FnOnce(SessionCallOutput) -> SessionEvent>,
 }
 
 impl std::fmt::Debug for SessionCall {
@@ -54,19 +51,19 @@ impl std::fmt::Debug for SessionCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AuditMsg {
+enum AuditEvent {
     Record(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerMsg {
+enum WorkerEvent {
     Start,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Session {
     notes: Vec<String>,
-    audit: Address<AuditMsg>,
+    audit: Address<AuditEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,53 +87,54 @@ impl Shard for InlineShard {
 }
 
 impl Isolate for Worker {
-    type Message = WorkerMsg;
-    type Reply = ();
-    type Send = SendMessage<WorkerMsg>;
-    type Spawn = SpawnSpec<Self>;
-    type Call = Infallible;
-    type Shard = InlineShard;
+    tina::isolate_types! {
+        message: WorkerEvent,
+        reply: (),
+        send: Outbound<WorkerEvent>,
+        spawn: ChildDefinition<Self>,
+        call: Infallible,
+        shard: InlineShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            WorkerMsg::Start => Effect::Noop,
+            WorkerEvent::Start => noop(),
         }
     }
 }
 
 impl Isolate for Session {
-    type Message = SessionMsg;
-    type Reply = Vec<String>;
-    type Send = SendMessage<AuditMsg>;
-    type Spawn = SpawnSpec<Worker>;
-    type Call = SessionCall;
-    type Shard = InlineShard;
+    tina::isolate_types! {
+        message: SessionEvent,
+        reply: Vec<String>,
+        send: Outbound<AuditEvent>,
+        spawn: ChildDefinition<Worker>,
+        call: SessionCall,
+        shard: InlineShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            SessionMsg::Note(note) => {
+            SessionEvent::Note(note) => {
                 self.notes.push(note.clone());
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(note)))
+                send(self.audit, AuditEvent::Record(note))
             }
-            SessionMsg::Read => Effect::Reply(self.notes.clone()),
-            SessionMsg::SpawnWorker => Effect::Spawn(SpawnSpec::new(Worker::new(0), 8)),
-            SessionMsg::SpawnAndAudit => Effect::Batch(vec![
-                Effect::Spawn(SpawnSpec::new(Worker::new(7), 8)),
-                Effect::Send(SendMessage::new(
-                    self.audit,
-                    AuditMsg::Record("spawned".to_owned()),
-                )),
+            SessionEvent::Read => reply(self.notes.clone()),
+            SessionEvent::SpawnWorker => spawn(ChildDefinition::new(Worker::new(0), 8)),
+            SessionEvent::SpawnAndAudit => batch([
+                spawn(ChildDefinition::new(Worker::new(7), 8)),
+                send(self.audit, AuditEvent::Record("spawned".to_owned())),
             ]),
-            SessionMsg::Stop => Effect::Stop,
-            SessionMsg::RestartWorkers => Effect::RestartChildren,
-            SessionMsg::Ignore => Effect::Noop,
-            SessionMsg::StartIo(request) => Effect::Call(SessionCall {
+            SessionEvent::Stop => stop(),
+            SessionEvent::RestartWorkers => restart_children(),
+            SessionEvent::Ignore => noop(),
+            SessionEvent::StartIo(request) => Effect::Call(SessionCall {
                 request,
-                translator: Box::new(SessionMsg::IoCompleted),
+                translator: Box::new(SessionEvent::IoCompleted),
             }),
-            SessionMsg::IoCompleted(SessionCallResult::Greeted(text)) => {
+            SessionEvent::IoCompleted(SessionCallOutput::Greeted(text)) => {
                 self.notes.push(text.clone());
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(text)))
+                send(self.audit, AuditEvent::Record(text))
             }
         }
     }
@@ -196,20 +194,20 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
         audit,
     };
 
-    match session.handle(SessionMsg::Note("hello".to_owned()), &mut ctx) {
+    match session.handle(SessionEvent::Note("hello".to_owned()), &mut ctx) {
         Effect::Send(outbound) => {
             assert_eq!(outbound.destination(), audit);
-            assert_eq!(outbound.message(), &AuditMsg::Record("hello".to_owned()));
+            assert_eq!(outbound.message(), &AuditEvent::Record("hello".to_owned()));
         }
         other => panic!("expected send effect, got {other:?}"),
     }
 
     assert!(matches!(
-        session.handle(SessionMsg::Read, &mut ctx),
+        session.handle(SessionEvent::Read, &mut ctx),
         Effect::Reply(ref notes) if notes == &vec!["hello".to_owned()]
     ));
 
-    match session.handle(SessionMsg::SpawnWorker, &mut ctx) {
+    match session.handle(SessionEvent::SpawnWorker, &mut ctx) {
         Effect::Spawn(spec) => {
             assert_eq!(spec.mailbox_capacity(), 8);
             let (_worker, mailbox_capacity, bootstrap) = spec.into_parts();
@@ -219,7 +217,7 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
         other => panic!("expected spawn effect, got {other:?}"),
     }
 
-    match session.handle(SessionMsg::SpawnAndAudit, &mut ctx) {
+    match session.handle(SessionEvent::SpawnAndAudit, &mut ctx) {
         Effect::Batch(effects) => {
             assert_eq!(effects.len(), 2);
             let mut effects = effects.into_iter();
@@ -235,7 +233,10 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
             match effects.next().expect("second batch effect") {
                 Effect::Send(outbound) => {
                     assert_eq!(outbound.destination(), audit);
-                    assert_eq!(outbound.message(), &AuditMsg::Record("spawned".to_owned()));
+                    assert_eq!(
+                        outbound.message(),
+                        &AuditEvent::Record("spawned".to_owned())
+                    );
                 }
                 other => panic!("expected second batched effect to be send, got {other:?}"),
             }
@@ -244,31 +245,31 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
     }
 
     assert!(matches!(
-        session.handle(SessionMsg::Stop, &mut ctx),
+        session.handle(SessionEvent::Stop, &mut ctx),
         Effect::Stop
     ));
     assert!(matches!(
-        session.handle(SessionMsg::RestartWorkers, &mut ctx),
+        session.handle(SessionEvent::RestartWorkers, &mut ctx),
         Effect::RestartChildren
     ));
     assert!(matches!(
-        session.handle(SessionMsg::Ignore, &mut ctx),
+        session.handle(SessionEvent::Ignore, &mut ctx),
         Effect::Noop
     ));
 
     // Call effect: handler returns a runtime-owned call description that
     // bundles a translator. Invoking the translator with a runtime-shaped
-    // result must yield exactly one ordinary `SessionMsg` value the handler
+    // result must yield exactly one ordinary `SessionEvent` value the handler
     // would receive on a later turn — proving the "completion as ordinary
     // message" design without making the handler async.
-    let call_request = SessionCallRequest::Greet("hello".to_owned());
-    match session.handle(SessionMsg::StartIo(call_request.clone()), &mut ctx) {
+    let call_request = SessionCallInput::Greet("hello".to_owned());
+    match session.handle(SessionEvent::StartIo(call_request.clone()), &mut ctx) {
         Effect::Call(call) => {
             assert_eq!(call.request, call_request);
-            let later = (call.translator)(SessionCallResult::Greeted("hello back".to_owned()));
+            let later = (call.translator)(SessionCallOutput::Greeted("hello back".to_owned()));
             assert_eq!(
                 later,
-                SessionMsg::IoCompleted(SessionCallResult::Greeted("hello back".to_owned()))
+                SessionEvent::IoCompleted(SessionCallOutput::Greeted("hello back".to_owned()))
             );
         }
         other => panic!("expected call effect, got {other:?}"),
@@ -280,9 +281,9 @@ fn context_builds_typed_addresses_for_current_and_remote_isolates() {
     let mut shard = InlineShard;
     let ctx = Context::new(&mut shard, IsolateId::new(12));
 
-    let current = ctx.current_address::<SessionMsg>();
-    let local = ctx.local_address::<AuditMsg>(IsolateId::new(19));
-    let remote = ctx.address::<WorkerMsg>(ShardId::new(9), IsolateId::new(23));
+    let current: Address<SessionEvent> = ctx.me();
+    let local = ctx.local_address::<AuditEvent>(IsolateId::new(19));
+    let remote = ctx.address::<WorkerEvent>(ShardId::new(9), IsolateId::new(23));
 
     assert_eq!(ctx.shard_id(), ShardId::new(11));
     assert_eq!(ctx.isolate_id(), IsolateId::new(12));
@@ -298,15 +299,15 @@ fn downstream_worker_isolate_can_compile_and_run_through_the_same_surface() {
     let mut worker = Worker::new(0);
 
     assert!(matches!(
-        worker.handle(WorkerMsg::Start, &mut ctx),
+        worker.handle(WorkerEvent::Start, &mut ctx),
         Effect::Noop
     ));
 }
 
 #[test]
-fn restartable_spawn_spec_is_available_as_a_distinct_public_payload() {
+fn restartable_child_definition_is_available_as_a_distinct_public_payload() {
     let tenant_id = 9_u64;
-    let spec = RestartableSpawnSpec::new(move || Worker::new(tenant_id), 13);
+    let spec = RestartableChildDefinition::new(move || Worker::new(tenant_id), 13);
 
     assert_eq!(spec.mailbox_capacity(), 13);
 

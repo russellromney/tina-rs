@@ -5,12 +5,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, SendMessage, Shard,
+    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, Shard,
     ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CauseId, CurrentRuntime, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
-    SendRejectedReason,
+use tina_runtime::{
+    CauseId, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +130,7 @@ struct PanicIsolate {
 impl Isolate for PanicIsolate {
     type Message = PanicMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -159,7 +158,7 @@ struct PanicSender {
 impl Isolate for PanicSender {
     type Message = DriverMsg;
     type Reply = ();
-    type Send = SendMessage<PanicMsg>;
+    type Send = Outbound<PanicMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -167,7 +166,7 @@ impl Isolate for PanicSender {
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             DriverMsg::Kick(value) => {
-                Effect::Send(SendMessage::new(self.target, PanicMsg::Data(value)))
+                Effect::Send(Outbound::new(self.target, PanicMsg::Data(value)))
             }
         }
     }
@@ -182,7 +181,7 @@ struct OrderIsolate {
 impl Isolate for OrderIsolate {
     type Message = OrderMsg;
     type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
+    type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -195,7 +194,7 @@ impl Isolate for OrderIsolate {
 
 #[test]
 fn panicking_handler_becomes_runtime_event_and_stops_isolate() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
     let mailbox = TestMailbox::new(8);
     let address = runtime.register(
@@ -248,7 +247,7 @@ fn panicking_handler_becomes_runtime_event_and_stops_isolate() {
 
 #[test]
 fn panic_abandons_buffered_messages_in_fifo_order() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
     let dropped = Rc::new(RefCell::new(Vec::new()));
     let mailbox = TestMailbox::new(8);
@@ -326,7 +325,7 @@ fn panic_abandons_buffered_messages_in_fifo_order() {
 
 #[test]
 fn later_isolates_still_run_after_panic_in_same_round() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
     let dropped = Rc::new(RefCell::new(Vec::new()));
     let panic_mailbox = TestMailbox::new(8);
@@ -388,7 +387,7 @@ fn later_isolates_still_run_after_panic_in_same_round() {
 
 #[test]
 fn two_panics_in_one_round_interleave_abandonment_by_registration_order() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let first_handled = Rc::new(RefCell::new(Vec::new()));
     let second_handled = Rc::new(RefCell::new(Vec::new()));
     let dropped = Rc::new(RefCell::new(Vec::new()));
@@ -504,7 +503,7 @@ fn two_panics_in_one_round_interleave_abandonment_by_registration_order() {
 
 #[test]
 fn sends_after_panic_still_become_closed() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let handled = Rc::new(RefCell::new(Vec::new()));
 
     let target_mailbox = TestMailbox::new(8);
@@ -549,7 +548,7 @@ fn sends_after_panic_still_become_closed() {
 
 #[test]
 fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let sender_mailbox = TestMailbox::new(8);
     let sender_address = runtime.register(
         PanicSender {
@@ -591,7 +590,7 @@ fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
                 ShardId::new(3),
                 sender_address.isolate(),
                 RuntimeEventKind::HandlerFinished {
-                    effect: tina_runtime_current::EffectKind::Send,
+                    effect: tina_runtime::EffectKind::Send,
                 },
             ),
             RuntimeEvent::new(
@@ -612,7 +611,7 @@ fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
 #[test]
 fn repeated_runs_with_panic_events_produce_identical_traces() {
     fn run_once() -> Vec<RuntimeEvent> {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let handled = Rc::new(RefCell::new(Vec::new()));
         let dropped = Rc::new(RefCell::new(Vec::new()));
 
@@ -701,7 +700,7 @@ fn repeated_runs_with_panic_events_produce_identical_traces() {
                 ShardId::new(3),
                 follower_address.isolate(),
                 RuntimeEventKind::HandlerFinished {
-                    effect: tina_runtime_current::EffectKind::Noop,
+                    effect: tina_runtime::EffectKind::Noop,
                 },
             ),
             RuntimeEvent::new(
@@ -710,7 +709,7 @@ fn repeated_runs_with_panic_events_produce_identical_traces() {
                 ShardId::new(3),
                 follower_address.isolate(),
                 RuntimeEventKind::EffectObserved {
-                    effect: tina_runtime_current::EffectKind::Noop,
+                    effect: tina_runtime::EffectKind::Noop,
                 },
             ),
         ];

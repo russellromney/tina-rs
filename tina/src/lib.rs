@@ -35,16 +35,18 @@
 //! ```
 //! use std::convert::Infallible;
 //!
-//! use tina::{Address, Context, Effect, Isolate, IsolateId, SendMessage, Shard, ShardId};
+//! use tina::{
+//!     send, reply, Address, Context, Effect, Isolate, IsolateId, Outbound, Shard, ShardId,
+//! };
 //!
 //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-//! enum CounterMsg {
+//! enum Message {
 //!     Add(u64),
 //!     Read,
 //! }
 //!
 //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-//! enum AuditMsg {
+//! enum AuditEvent {
 //!     Total(u64),
 //! }
 //!
@@ -59,24 +61,26 @@
 //! #[derive(Debug)]
 //! struct Counter {
 //!     total: u64,
-//!     audit: Address<AuditMsg>,
+//!     audit: Address<AuditEvent>,
 //! }
 //!
 //! impl Isolate for Counter {
-//!     type Message = CounterMsg;
-//!     type Reply = u64;
-//!     type Send = SendMessage<AuditMsg>;
-//!     type Spawn = Infallible;
-//!     type Call = Infallible;
-//!     type Shard = InlineShard;
+//!     tina::isolate_types! {
+//!         message: Message,
+//!         reply: u64,
+//!         send: Outbound<AuditEvent>,
+//!         spawn: Infallible,
+//!         call: Infallible,
+//!         shard: InlineShard,
+//!     }
 //!
 //!     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
 //!         match msg {
-//!             CounterMsg::Add(delta) => {
+//!             Message::Add(delta) => {
 //!                 self.total += delta;
-//!                 Effect::Send(SendMessage::new(self.audit, AuditMsg::Total(self.total)))
+//!                 send(self.audit, AuditEvent::Total(self.total))
 //!             }
-//!             CounterMsg::Read => Effect::Reply(self.total),
+//!             Message::Read => reply(self.total),
 //!         }
 //!     }
 //! }
@@ -86,22 +90,77 @@
 //! let mut ctx = Context::new(&mut shard, IsolateId::new(1));
 //! let mut counter = Counter { total: 0, audit };
 //!
-//! match counter.handle(CounterMsg::Add(3), &mut ctx) {
+//! match counter.handle(Message::Add(3), &mut ctx) {
 //!     Effect::Send(outbound) => {
 //!         let (destination, message) = outbound.into_parts();
 //!         assert_eq!(destination, audit);
-//!         assert_eq!(message, AuditMsg::Total(3));
+//!         assert_eq!(message, AuditEvent::Total(3));
 //!     }
 //!     _ => panic!("unexpected effect"),
 //! }
 //!
 //! assert!(matches!(
-//!     counter.handle(CounterMsg::Read, &mut ctx),
+//!     counter.handle(Message::Read, &mut ctx),
 //!     Effect::Reply(3)
 //! ));
 //! ```
 
 use std::marker::PhantomData;
+
+/// Declares the associated-type slab for one [`Isolate`] impl.
+///
+/// This macro is intentionally small and boring. It removes repeated type
+/// lines from the common path without hiding Tina's model or inventing a
+/// second way to describe handlers.
+///
+/// ```
+/// struct DemoShard;
+///
+/// impl tina::Shard for DemoShard {
+///     fn id(&self) -> tina::ShardId {
+///         tina::ShardId::new(0)
+///     }
+/// }
+///
+/// struct Worker;
+///
+/// impl tina::Isolate for Worker {
+///     tina::isolate_types! {
+///         message: (),
+///         reply: (),
+///         send: tina::Outbound<std::convert::Infallible>,
+///         spawn: std::convert::Infallible,
+///         call: std::convert::Infallible,
+///         shard: DemoShard,
+///     }
+///
+///     fn handle(
+///         &mut self,
+///         _msg: Self::Message,
+///         _ctx: &mut tina::Context<'_, Self::Shard>,
+///     ) -> tina::Effect<Self> {
+///         tina::stop()
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! isolate_types {
+    (
+        message: $message:ty,
+        reply: $reply:ty,
+        send: $send:ty,
+        spawn: $spawn:ty,
+        call: $call:ty,
+        shard: $shard:ty $(,)?
+    ) => {
+        type Message = $message;
+        type Reply = $reply;
+        type Send = $send;
+        type Spawn = $spawn;
+        type Call = $call;
+        type Shard = $shard;
+    };
+}
 
 /// A typed state machine that consumes one message at a time and returns an
 /// [`Effect`] for the runtime to execute.
@@ -119,15 +178,15 @@ pub trait Isolate: Sized {
 
     /// The payload produced by [`Effect::Send`].
     ///
-    /// A common choice is [`SendMessage`] when an isolate needs to address a
+    /// A common choice is [`Outbound`] when an isolate needs to address a
     /// single typed mailbox.
     type Send;
 
     /// The payload produced by [`Effect::Spawn`].
     ///
-    /// [`SpawnSpec`] is the simplest one-shot spawn payload.
-    /// [`RestartableSpawnSpec`] adds a repeatable factory for children that a
-    /// runtime may restart later.
+    /// [`ChildDefinition`] is the simplest one-shot spawn payload.
+    /// [`RestartableChildDefinition`] adds a repeatable factory for children
+    /// that a runtime may restart later.
     type Spawn;
 
     /// The payload produced by [`Effect::Call`].
@@ -203,6 +262,64 @@ where
     Batch(Vec<Effect<I>>),
 }
 
+/// Returns an effect that asks the runtime to do nothing else this turn.
+pub fn noop<I>() -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Noop
+}
+
+/// Returns an effect that replies to the current caller.
+pub fn reply<I>(value: I::Reply) -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Reply(value)
+}
+
+/// Returns an effect that sends one typed message to another isolate.
+pub fn send<I, M>(destination: Address<M>, message: M) -> Effect<I>
+where
+    I: Isolate<Send = Outbound<M>>,
+{
+    Effect::Send(Outbound::new(destination, message))
+}
+
+/// Returns an effect that asks the runtime to spawn one child.
+pub fn spawn<I>(child: I::Spawn) -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Spawn(child)
+}
+
+/// Returns an effect that stops the current isolate.
+pub fn stop<I>() -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Stop
+}
+
+/// Returns an effect that asks the runtime to restart this isolate's direct
+/// children according to supervision policy.
+pub fn restart_children<I>() -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::RestartChildren
+}
+
+/// Returns an effect that executes several existing effects in source order.
+pub fn batch<I, T>(effects: T) -> Effect<I>
+where
+    I: Isolate,
+    T: IntoIterator<Item = Effect<I>>,
+{
+    Effect::Batch(effects.into_iter().collect())
+}
+
 /// A bounded, typed inbox.
 ///
 /// Sputnik only names the capability. Concrete mailbox implementations arrive
@@ -231,6 +348,24 @@ pub trait Mailbox<T> {
     /// [`TrySendError::Closed`]. Idempotent. Already-buffered messages
     /// remain visible to `recv` until drained.
     fn close(&self);
+}
+
+impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
+    fn capacity(&self) -> usize {
+        (**self).capacity()
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        (**self).try_send(message)
+    }
+
+    fn recv(&self) -> Option<T> {
+        (**self).recv()
+    }
+
+    fn close(&self) {
+        (**self).close()
+    }
 }
 
 /// Error returned by [`Mailbox::try_send`] when a bounded mailbox cannot accept
@@ -489,15 +624,23 @@ where
     }
 
     /// Builds an [`Address`] for the currently executing isolate.
-    pub fn current_address<M>(&self) -> Address<M> {
+    pub fn me<M>(&self) -> Address<M> {
         Address::new(self.shard_id(), self.current_isolate)
+    }
+
+    /// Returns an effect that sends one message back to the current isolate.
+    pub fn send_self<I, M>(&self, message: M) -> Effect<I>
+    where
+        I: Isolate<Shard = S, Message = M, Send = Outbound<M>>,
+    {
+        Effect::Send(Outbound::new(self.me(), message))
     }
 }
 
 /// Typed address for one isolate mailbox incarnation.
 ///
 /// The message type parameter makes invalid sends unrepresentable at the call
-/// site: an `Address<HttpMsg>` cannot be used where `Address<AuditMsg>` is
+/// site: an `Address<HttpMsg>` cannot be used where `Address<AuditEvent>` is
 /// required.
 ///
 /// An address identifies one incarnation of an isolate: shard id, isolate id,
@@ -557,32 +700,32 @@ impl<M> Address<M> {
 }
 
 /// ```compile_fail
-/// use tina::{Address, IsolateId, SendMessage, ShardId};
+/// use tina::{Address, IsolateId, Outbound, ShardId};
 ///
-/// enum HttpMsg {
+/// enum HttpEvent {
 ///     Request,
 /// }
 ///
-/// enum AuditMsg {
+/// enum AuditEvent {
 ///     Event,
 /// }
 ///
-/// let http_only = Address::<HttpMsg>::new(ShardId::new(0), IsolateId::new(7));
-/// let _invalid = SendMessage::new(http_only, AuditMsg::Event);
+/// let http_only = Address::<HttpEvent>::new(ShardId::new(0), IsolateId::new(7));
+/// let _invalid = Outbound::new(http_only, AuditEvent::Event);
 /// ```
 /// A typed outbound send request.
 ///
-/// `SendMessage` is intentionally not `Clone`/`PartialEq`. Real message
+/// `Outbound` is intentionally not `Clone`/`PartialEq`. Real message
 /// types are often non-`Clone` (`Bytes`, file handles, large buffers), and
 /// a send request is meant to be moved into the runtime, not duplicated.
 #[must_use = "a send request has no effect until a runtime executes it"]
 #[derive(Debug)]
-pub struct SendMessage<M> {
+pub struct Outbound<M> {
     destination: Address<M>,
     message: M,
 }
 
-impl<M> SendMessage<M> {
+impl<M> Outbound<M> {
     /// Creates a new outbound send request.
     pub fn new(destination: Address<M>, message: M) -> Self {
         Self {
@@ -613,7 +756,7 @@ impl<M> SendMessage<M> {
 /// the state machine to construct and the requested mailbox capacity.
 #[must_use = "a spawn request has no effect until a runtime executes it"]
 #[derive(Debug)]
-pub struct SpawnSpec<I>
+pub struct ChildDefinition<I>
 where
     I: Isolate,
 {
@@ -622,7 +765,7 @@ where
     bootstrap_message: Option<I::Message>,
 }
 
-impl<I> SpawnSpec<I>
+impl<I> ChildDefinition<I>
 where
     I: Isolate,
 {
@@ -640,7 +783,7 @@ where
 
     /// Adds one initial child message that the runtime should enqueue after
     /// the child is created.
-    pub fn with_bootstrap(mut self, message: I::Message) -> Self {
+    pub fn with_initial_message(mut self, message: I::Message) -> Self {
         self.bootstrap_message = Some(message);
         self
     }
@@ -663,14 +806,14 @@ where
 
 /// A restartable spawn request backed by a repeatable isolate factory.
 ///
-/// Use [`SpawnSpec`] when a child only needs to be created once. Use
-/// `RestartableSpawnSpec` when the runtime must keep a recipe for creating
+/// Use [`ChildDefinition`] when a child only needs to be created once. Use
+/// `RestartableChildDefinition` when the runtime must keep a recipe for creating
 /// fresh replacement isolate state later. The factory may capture immutable
 /// configuration with normal Rust closure captures, for example
 /// `move || Worker::new(tenant_id)`. The factory is `Fn`, not `FnMut`; mutable
 /// state shared across restarts must use interior mutability.
 #[must_use = "a spawn request has no effect until a runtime executes it"]
-pub struct RestartableSpawnSpec<I>
+pub struct RestartableChildDefinition<I>
 where
     I: Isolate,
 {
@@ -679,19 +822,19 @@ where
     bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
 }
 
-impl<I> std::fmt::Debug for RestartableSpawnSpec<I>
+impl<I> std::fmt::Debug for RestartableChildDefinition<I>
 where
     I: Isolate,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RestartableSpawnSpec")
+            .debug_struct("RestartableChildDefinition")
             .field("mailbox_capacity", &self.mailbox_capacity)
             .finish_non_exhaustive()
     }
 }
 
-impl<I> RestartableSpawnSpec<I>
+impl<I> RestartableChildDefinition<I>
 where
     I: Isolate,
 {
@@ -709,7 +852,7 @@ where
 
     /// Adds one initial child message that the runtime should enqueue after
     /// each child incarnation is created, including restarts.
-    pub fn with_bootstrap<F>(mut self, bootstrap: F) -> Self
+    pub fn with_initial_message<F>(mut self, bootstrap: F) -> Self
     where
         F: Fn() -> I::Message + 'static,
     {
@@ -724,16 +867,16 @@ where
 
     /// Consumes the request and returns its repeatable factory plus mailbox
     /// capacity.
-    pub fn into_parts(self) -> RestartableSpawnParts<I> {
+    pub fn into_parts(self) -> RestartableChildParts<I> {
         (self.factory, self.mailbox_capacity, self.bootstrap_factory)
     }
 }
 
-/// Tuple shape returned by [`RestartableSpawnSpec::into_parts`].
+/// Tuple shape returned by [`RestartableChildDefinition::into_parts`].
 ///
 /// Spelled out as a type alias purely so the runtime crate can name it
 /// without tripping clippy's `type_complexity` lint.
-pub type RestartableSpawnParts<I> = (
+pub type RestartableChildParts<I> = (
     Box<dyn Fn() -> I>,
     usize,
     Option<Box<dyn Fn() -> <I as Isolate>::Message>>,
@@ -789,4 +932,13 @@ impl AddressGeneration {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// The preferred first import for ordinary Tina application code.
+pub mod prelude {
+    pub use crate::{
+        Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
+        RestartableChildDefinition, Shard, ShardId, batch, noop, reply, restart_children, send,
+        spawn, stop,
+    };
 }

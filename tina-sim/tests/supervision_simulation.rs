@@ -3,11 +3,11 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use tina::{
-    Address, AddressGeneration, Context, Effect, Isolate, IsolateId, RestartBudget, RestartPolicy,
-    RestartableSpawnSpec, SendMessage, Shard, ShardId, SpawnSpec,
+    Address, AddressGeneration, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
+    RestartBudget, RestartPolicy, RestartableChildDefinition, Shard, ShardId,
 };
-use tina_runtime_current::{
-    CurrentCall, RestartSkippedReason, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
+use tina_runtime::{
+    RestartSkippedReason, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
     SupervisionRejectedReason,
 };
 use tina_sim::{
@@ -48,9 +48,9 @@ struct Worker {
 impl Isolate for Worker {
     type Message = WorkerMsg;
     type Reply = ();
-    type Send = SendMessage<Never>;
+    type Send = Outbound<Never>;
     type Spawn = Infallible;
-    type Call = CurrentCall<WorkerMsg>;
+    type Call = RuntimeCall<WorkerMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -85,24 +85,24 @@ struct RestartableParent {
 }
 
 impl RestartableParent {
-    fn spec(&self) -> RestartableSpawnSpec<Worker> {
+    fn spec(&self) -> RestartableChildDefinition<Worker> {
         let observations = Rc::clone(&self.observations);
-        RestartableSpawnSpec::new(
+        RestartableChildDefinition::new(
             move || Worker {
                 observations: Rc::clone(&observations),
             },
             8,
         )
-        .with_bootstrap(|| WorkerMsg::Boot)
+        .with_initial_message(|| WorkerMsg::Boot)
     }
 }
 
 impl Isolate for RestartableParent {
     type Message = ParentMsg;
     type Reply = ();
-    type Send = SendMessage<Never>;
-    type Spawn = RestartableSpawnSpec<Worker>;
-    type Call = CurrentCall<ParentMsg>;
+    type Send = Outbound<Never>;
+    type Spawn = RestartableChildDefinition<Worker>;
+    type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -125,9 +125,9 @@ struct DynamicBootstrapParent {
 impl Isolate for DynamicBootstrapParent {
     type Message = ParentMsg;
     type Reply = ();
-    type Send = SendMessage<Never>;
-    type Spawn = RestartableSpawnSpec<Worker>;
-    type Call = CurrentCall<ParentMsg>;
+    type Send = Outbound<Never>;
+    type Spawn = RestartableChildDefinition<Worker>;
+    type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -136,13 +136,13 @@ impl Isolate for DynamicBootstrapParent {
                 let observations = Rc::clone(&self.observations);
                 let next_bootstrap = Rc::clone(&self.next_bootstrap);
                 Effect::Spawn(
-                    RestartableSpawnSpec::new(
+                    RestartableChildDefinition::new(
                         move || Worker {
                             observations: Rc::clone(&observations),
                         },
                         8,
                     )
-                    .with_bootstrap(move || {
+                    .with_initial_message(move || {
                         let value = next_bootstrap.get();
                         next_bootstrap.set(value + 1);
                         WorkerMsg::Work(value)
@@ -163,21 +163,21 @@ struct OneShotParent {
 impl Isolate for OneShotParent {
     type Message = ParentMsg;
     type Reply = ();
-    type Send = SendMessage<Never>;
-    type Spawn = SpawnSpec<Worker>;
-    type Call = CurrentCall<ParentMsg>;
+    type Send = Outbound<Never>;
+    type Spawn = ChildDefinition<Worker>;
+    type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             ParentMsg::SpawnOne => Effect::Spawn(
-                SpawnSpec::new(
+                ChildDefinition::new(
                     Worker {
                         observations: Rc::clone(&self.observations),
                     },
                     8,
                 )
-                .with_bootstrap(WorkerMsg::Boot),
+                .with_initial_message(WorkerMsg::Boot),
             ),
             ParentMsg::RestartChildren => Effect::RestartChildren,
             ParentMsg::SpawnTwo => unreachable!("one-shot parent only spawns one child"),
@@ -198,16 +198,14 @@ struct StaleSender {
 impl Isolate for StaleSender {
     type Message = SenderMsg;
     type Reply = ();
-    type Send = SendMessage<WorkerMsg>;
+    type Send = Outbound<WorkerMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<SenderMsg>;
+    type Call = RuntimeCall<SenderMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            SenderMsg::SendToStale => {
-                Effect::Send(SendMessage::new(self.target, WorkerMsg::Work(99)))
-            }
+            SenderMsg::SendToStale => Effect::Send(Outbound::new(self.target, WorkerMsg::Work(99))),
         }
     }
 }
@@ -230,9 +228,9 @@ struct Grandchild {
 impl Isolate for Grandchild {
     type Message = GrandchildMsg;
     type Reply = ();
-    type Send = SendMessage<Never>;
+    type Send = Outbound<Never>;
     type Spawn = Infallible;
-    type Call = CurrentCall<GrandchildMsg>;
+    type Call = RuntimeCall<GrandchildMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -253,9 +251,9 @@ struct ChildSpawner {
 impl Isolate for ChildSpawner {
     type Message = ChildMsg;
     type Reply = ();
-    type Send = SendMessage<Never>;
-    type Spawn = RestartableSpawnSpec<Grandchild>;
-    type Call = CurrentCall<ChildMsg>;
+    type Send = Outbound<Never>;
+    type Spawn = RestartableChildDefinition<Grandchild>;
+    type Call = RuntimeCall<ChildMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -263,13 +261,13 @@ impl Isolate for ChildSpawner {
             ChildMsg::Boot => {
                 let boots = Rc::clone(&self.grandchild_boots);
                 Effect::Spawn(
-                    RestartableSpawnSpec::new(
+                    RestartableChildDefinition::new(
                         move || Grandchild {
                             boots: Rc::clone(&boots),
                         },
                         8,
                     )
-                    .with_bootstrap(|| GrandchildMsg::Boot),
+                    .with_initial_message(|| GrandchildMsg::Boot),
                 )
             }
         }
@@ -284,9 +282,9 @@ struct NestedParent {
 impl Isolate for NestedParent {
     type Message = ParentMsg;
     type Reply = ();
-    type Send = SendMessage<Never>;
-    type Spawn = RestartableSpawnSpec<ChildSpawner>;
-    type Call = CurrentCall<ParentMsg>;
+    type Send = Outbound<Never>;
+    type Spawn = RestartableChildDefinition<ChildSpawner>;
+    type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
@@ -294,13 +292,13 @@ impl Isolate for NestedParent {
             ParentMsg::SpawnOne => {
                 let grandchild_boots = Rc::clone(&self.grandchild_boots);
                 Effect::Spawn(
-                    RestartableSpawnSpec::new(
+                    RestartableChildDefinition::new(
                         move || ChildSpawner {
                             grandchild_boots: Rc::clone(&grandchild_boots),
                         },
                         8,
                     )
-                    .with_bootstrap(|| ChildMsg::Boot),
+                    .with_initial_message(|| ChildMsg::Boot),
                 )
             }
             ParentMsg::RestartChildren => Effect::RestartChildren,

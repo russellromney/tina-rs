@@ -5,11 +5,11 @@ use std::rc::Rc;
 
 use proptest::prelude::*;
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, RestartBudget, RestartPolicy,
-    SendMessage, Shard, ShardId, TrySendError,
+    Address, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, RestartBudget, RestartPolicy,
+    Shard, ShardId, TrySendError,
 };
-use tina_runtime_current::{
-    CauseId, CurrentRuntime, EffectKind, EventId, MailboxFactory, RuntimeEvent, RuntimeEventKind,
+use tina_runtime::{
+    CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason,
 };
 use tina_supervisor::SupervisorConfig;
@@ -106,7 +106,7 @@ struct Target;
 impl Isolate for Target {
     type Message = TargetMsg;
     type Reply = Infallible;
-    type Send = SendMessage<DriverMsg>;
+    type Send = Outbound<DriverMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -138,7 +138,7 @@ struct RestartChild;
 impl Isolate for Driver {
     type Message = DriverMsg;
     type Reply = Infallible;
-    type Send = SendMessage<TargetMsg>;
+    type Send = Outbound<TargetMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -150,7 +150,7 @@ impl Isolate for Driver {
     ) -> Effect<Self> {
         match message {
             DriverMsg::Send(value) => {
-                Effect::Send(SendMessage::new(self.target, TargetMsg::Data(value)))
+                Effect::Send(Outbound::new(self.target, TargetMsg::Data(value)))
             }
         }
     }
@@ -159,8 +159,8 @@ impl Isolate for Driver {
 impl Isolate for RestartParent {
     type Message = ParentMsg;
     type Reply = Infallible;
-    type Send = SendMessage<TargetMsg>;
-    type Spawn = tina::RestartableSpawnSpec<RestartChild>;
+    type Send = Outbound<TargetMsg>;
+    type Spawn = tina::RestartableChildDefinition<RestartChild>;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -170,7 +170,9 @@ impl Isolate for RestartParent {
         _ctx: &mut Context<'_, Self::Shard>,
     ) -> Effect<Self> {
         match message {
-            ParentMsg::Spawn => Effect::Spawn(tina::RestartableSpawnSpec::new(|| RestartChild, 3)),
+            ParentMsg::Spawn => {
+                Effect::Spawn(tina::RestartableChildDefinition::new(|| RestartChild, 3))
+            }
             ParentMsg::Restart => Effect::RestartChildren,
         }
     }
@@ -179,7 +181,7 @@ impl Isolate for RestartParent {
 impl Isolate for RestartChild {
     type Message = TargetMsg;
     type Reply = Infallible;
-    type Send = SendMessage<TargetMsg>;
+    type Send = Outbound<TargetMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -233,7 +235,7 @@ fn operation_strategy() -> impl Strategy<Value = Operation> {
 }
 
 fn run_history(operations: &[Operation]) -> HistoryResult {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let target = runtime.register(Target, TestMailbox::new(3));
     let driver = runtime.register(Driver { target }, TestMailbox::new(3));
     let parent = runtime.register(RestartParent, TestMailbox::new(3));
@@ -509,7 +511,7 @@ struct DispatcherRegistry {
 impl Isolate for DispatcherWorker {
     type Message = DispatcherWorkerMsg;
     type Reply = Infallible;
-    type Send = SendMessage<DriverMsg>;
+    type Send = Outbound<DriverMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -532,8 +534,8 @@ impl Isolate for DispatcherWorker {
 impl Isolate for DispatcherParent {
     type Message = DispatcherMsg;
     type Reply = Infallible;
-    type Send = SendMessage<RegistryMsg>;
-    type Spawn = tina::RestartableSpawnSpec<DispatcherWorker>;
+    type Send = Outbound<RegistryMsg>;
+    type Spawn = tina::RestartableChildDefinition<DispatcherWorker>;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -545,14 +547,14 @@ impl Isolate for DispatcherParent {
         match message {
             DispatcherMsg::SpawnWorker => {
                 let completed = Rc::clone(&self.completed);
-                Effect::Spawn(tina::RestartableSpawnSpec::new(
+                Effect::Spawn(tina::RestartableChildDefinition::new(
                     move || DispatcherWorker {
                         completed: Rc::clone(&completed),
                     },
                     3,
                 ))
             }
-            DispatcherMsg::Submit { slot, task } => Effect::Send(SendMessage::new(
+            DispatcherMsg::Submit { slot, task } => Effect::Send(Outbound::new(
                 self.registry,
                 RegistryMsg::Forward { slot, task },
             )),
@@ -563,7 +565,7 @@ impl Isolate for DispatcherParent {
 impl Isolate for DispatcherRegistry {
     type Message = RegistryMsg;
     type Reply = Infallible;
-    type Send = SendMessage<DispatcherWorkerMsg>;
+    type Send = Outbound<DispatcherWorkerMsg>;
     type Spawn = Infallible;
     type Call = Infallible;
     type Shard = TestShard;
@@ -583,7 +585,7 @@ impl Isolate for DispatcherRegistry {
                     self.addresses.get(&slot).copied().unwrap_or_else(|| {
                         panic!("dispatcher registry slot {slot} is not registered")
                     });
-                Effect::Send(SendMessage::new(address, DispatcherWorkerMsg::Run(task)))
+                Effect::Send(Outbound::new(address, DispatcherWorkerMsg::Run(task)))
             }
         }
     }
@@ -629,7 +631,7 @@ fn dispatcher_operation_strategy() -> impl Strategy<Value = DispatcherOperation>
 }
 
 fn run_dispatcher_history(operations: &[DispatcherOperation]) -> DispatcherHistoryResult {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let completed = Rc::new(RefCell::new(Vec::new()));
 
     let registry = runtime.register(DispatcherRegistry::default(), TestMailbox::new(8));

@@ -4,7 +4,7 @@ use tina::RestartPolicy;
 #[test]
 fn supervised_one_for_one_restarts_only_failed_child() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -86,7 +86,7 @@ fn supervised_one_for_one_restarts_only_failed_child() {
 #[test]
 fn supervised_one_for_all_restarts_every_direct_restartable_child() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -120,7 +120,7 @@ fn supervised_one_for_all_restarts_every_direct_restartable_child() {
 #[test]
 fn supervised_rest_for_one_restarts_failed_and_younger_children_only() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -160,7 +160,7 @@ fn supervised_rest_for_one_restarts_failed_and_younger_children_only() {
 
 #[test]
 fn supervised_restart_skips_selected_non_restartable_child() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
     runtime.supervise(
         root,
@@ -198,7 +198,7 @@ fn supervised_restart_skips_selected_non_restartable_child() {
 #[test]
 fn supervised_restart_budget_exhaustion_is_visible_and_creates_no_replacement() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -242,7 +242,7 @@ fn supervised_restart_budget_exhaustion_is_visible_and_creates_no_replacement() 
 #[test]
 fn stopped_supervisor_rejects_later_child_failure_without_replacement() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -282,7 +282,7 @@ fn stopped_supervisor_rejects_later_child_failure_without_replacement() {
 #[test]
 fn unsupervised_child_panic_and_normal_child_stop_do_not_trigger_supervision() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -312,7 +312,7 @@ fn unsupervised_child_panic_and_normal_child_stop_do_not_trigger_supervision() {
 #[test]
 fn supervise_before_children_and_reconfigure_reset_budget_are_supported() {
     let factory_calls = Rc::new(Cell::new(0));
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(
         new_restartable_root(Rc::clone(&factory_calls)),
         root_mailbox(),
@@ -350,7 +350,7 @@ fn supervise_before_children_and_reconfigure_reset_budget_are_supported() {
 
 #[test]
 fn supervise_panics_for_unknown_stale_or_cross_shard_parent_addresses() {
-    let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
     let config = SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(1));
 

@@ -5,11 +5,10 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, Mailbox, SendMessage, Shard, ShardId, SpawnSpec,
-    TrySendError,
+    Address, ChildDefinition, Isolate, Mailbox, Outbound, Shard, ShardId, TrySendError, prelude::*,
 };
-use tina_runtime_current::{
-    CallKind, CallRequest, CallResult, CurrentCall, CurrentRuntime, EffectKind, MailboxFactory,
+use tina_runtime::{
+    CallInput, CallKind, CallOutput, EffectKind, MailboxFactory, Runtime, RuntimeCall,
     RuntimeEventKind, StreamId,
 };
 
@@ -17,12 +16,12 @@ use tina_runtime_current::{
 enum NeverOutbound {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuditMsg {
+enum AuditEvent {
     Record(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DriverMsg {
+enum DriverEvent {
     SendTwice,
     SpawnAndSend,
     StopThenSend,
@@ -33,8 +32,8 @@ enum DriverMsg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerMsg {
-    Start,
+enum WorkerEvent {
+    Begin,
 }
 
 #[derive(Debug, Default)]
@@ -113,17 +112,19 @@ struct Audit {
 }
 
 impl Isolate for Audit {
-    type Message = AuditMsg;
-    type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: AuditEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        let AuditMsg::Record(value) = msg;
+        let AuditEvent::Record(value) = msg;
         self.seen.borrow_mut().push(value);
-        Effect::Noop
+        noop()
     }
 }
 
@@ -131,89 +132,86 @@ impl Isolate for Audit {
 struct Worker;
 
 impl Isolate for Worker {
-    type Message = WorkerMsg;
-    type Reply = ();
-    type Send = SendMessage<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: WorkerEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        Effect::Noop
+        noop()
     }
 }
 
 #[derive(Debug)]
 struct Driver {
-    audit: Address<AuditMsg>,
+    audit: Address<AuditEvent>,
 }
 
 impl Isolate for Driver {
-    type Message = DriverMsg;
-    type Reply = ();
-    type Send = SendMessage<AuditMsg>;
-    type Spawn = SpawnSpec<Worker>;
-    type Call = CurrentCall<DriverMsg>;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: DriverEvent,
+        reply: (),
+        send: Outbound<AuditEvent>,
+        spawn: ChildDefinition<Worker>,
+        call: RuntimeCall<DriverEvent>,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            DriverMsg::SendTwice => Effect::Batch(vec![
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(1))),
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(2))),
+            DriverEvent::SendTwice => batch([
+                send(self.audit, AuditEvent::Record(1)),
+                send(self.audit, AuditEvent::Record(2)),
             ]),
-            DriverMsg::SpawnAndSend => Effect::Batch(vec![
-                Effect::Spawn(SpawnSpec::new(Worker, 4).with_bootstrap(WorkerMsg::Start)),
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(9))),
+            DriverEvent::SpawnAndSend => batch([
+                spawn(ChildDefinition::new(Worker, 4).with_initial_message(WorkerEvent::Begin)),
+                send(self.audit, AuditEvent::Record(9)),
             ]),
-            DriverMsg::StopThenSend => Effect::Batch(vec![
-                Effect::Stop,
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(7))),
-            ]),
-            DriverMsg::SendThenBind => Effect::Batch(vec![
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(3))),
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpBind {
+            DriverEvent::StopThenSend => batch([stop(), send(self.audit, AuditEvent::Record(7))]),
+            DriverEvent::SendThenBind => batch([
+                send(self.audit, AuditEvent::Record(3)),
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpBind {
                         addr: "127.0.0.1:0".parse::<SocketAddr>().expect("loopback parse"),
                     },
                     |result| match result {
-                        CallResult::TcpBound { .. } => DriverMsg::BindObserved,
+                        CallOutput::TcpBound { .. } => DriverEvent::BindObserved,
                         other => panic!("expected successful bind result, got {other:?}"),
                     },
                 )),
             ]),
-            DriverMsg::BindObserved => {
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(4)))
-            }
-            DriverMsg::FailReadThenSend => Effect::Batch(vec![
-                Effect::Call(CurrentCall::new(
-                    CallRequest::TcpRead {
+            DriverEvent::BindObserved => send(self.audit, AuditEvent::Record(4)),
+            DriverEvent::FailReadThenSend => batch([
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpRead {
                         stream: StreamId::new(9999),
                         max_len: 8,
                     },
                     |result| match result {
-                        CallResult::Failed(_) => DriverMsg::ReadFailureObserved,
+                        CallOutput::Failed(_) => DriverEvent::ReadFailureObserved,
                         other => panic!("expected invalid read failure, got {other:?}"),
                     },
                 )),
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(5))),
+                send(self.audit, AuditEvent::Record(5)),
             ]),
-            DriverMsg::ReadFailureObserved => {
-                Effect::Send(SendMessage::new(self.audit, AuditMsg::Record(6)))
-            }
+            DriverEvent::ReadFailureObserved => send(self.audit, AuditEvent::Record(6)),
         }
     }
 }
 
 struct Harness {
-    runtime: CurrentRuntime<TestShard, TestMailboxFactory>,
-    driver: Address<DriverMsg>,
+    runtime: Runtime<TestShard, TestMailboxFactory>,
+    driver: Address<DriverEvent>,
     seen: Rc<RefCell<Vec<u8>>>,
 }
 
 impl Harness {
     fn new() -> Self {
-        let mut runtime = CurrentRuntime::new(TestShard, TestMailboxFactory);
+        let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
         let seen = Rc::new(RefCell::new(Vec::new()));
         let driver = {
             let audit = runtime.register(
@@ -234,7 +232,7 @@ impl Harness {
 }
 
 fn count_events(
-    trace: &[tina_runtime_current::RuntimeEvent],
+    trace: &[tina_runtime::RuntimeEvent],
     predicate: impl Fn(&RuntimeEventKind) -> bool,
 ) -> usize {
     trace
@@ -244,7 +242,7 @@ fn count_events(
 }
 
 fn first_event_index(
-    trace: &[tina_runtime_current::RuntimeEvent],
+    trace: &[tina_runtime::RuntimeEvent],
     predicate: impl Fn(&RuntimeEventKind) -> bool,
 ) -> usize {
     trace
@@ -258,7 +256,7 @@ fn batch_send_effects_execute_left_to_right_and_deliver_later() {
     let mut harness = Harness::new();
     harness
         .runtime
-        .try_send(harness.driver, DriverMsg::SendTwice)
+        .try_send(harness.driver, DriverEvent::SendTwice)
         .expect("ingress accepts SendTwice");
 
     harness.runtime.step();
@@ -299,7 +297,7 @@ fn batch_can_spawn_then_send_in_one_handler_turn() {
     let mut harness = Harness::new();
     harness
         .runtime
-        .try_send(harness.driver, DriverMsg::SpawnAndSend)
+        .try_send(harness.driver, DriverEvent::SpawnAndSend)
         .expect("ingress accepts SpawnAndSend");
 
     harness.runtime.step();
@@ -338,7 +336,7 @@ fn stop_short_circuits_later_effects_in_the_same_batch() {
     let mut harness = Harness::new();
     harness
         .runtime
-        .try_send(harness.driver, DriverMsg::StopThenSend)
+        .try_send(harness.driver, DriverEvent::StopThenSend)
         .expect("ingress accepts StopThenSend");
 
     harness.runtime.step();
@@ -377,7 +375,7 @@ fn batch_send_then_synchronous_call_keeps_left_to_right_order() {
     let mut harness = Harness::new();
     harness
         .runtime
-        .try_send(harness.driver, DriverMsg::SendThenBind)
+        .try_send(harness.driver, DriverEvent::SendThenBind)
         .expect("ingress accepts SendThenBind");
 
     harness.runtime.step();
@@ -424,7 +422,7 @@ fn batch_failing_call_still_runs_later_effects() {
     let mut harness = Harness::new();
     harness
         .runtime
-        .try_send(harness.driver, DriverMsg::FailReadThenSend)
+        .try_send(harness.driver, DriverEvent::FailReadThenSend)
         .expect("ingress accepts FailReadThenSend");
 
     harness.runtime.step();

@@ -3,9 +3,9 @@ use std::convert::Infallible;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{Context, Effect, Isolate, SendMessage, Shard, ShardId};
-use tina_runtime_current::{
-    CallCompletionRejectedReason, CallKind, CallRequest, CallResult, CurrentCall, RuntimeEvent,
+use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId};
+use tina_runtime::{
+    CallCompletionRejectedReason, CallInput, CallKind, CallOutput, RuntimeCall, RuntimeEvent,
     RuntimeEventKind,
 };
 use tina_sim::{Simulator, SimulatorConfig};
@@ -40,25 +40,25 @@ struct Sleeper {
 impl Isolate for Sleeper {
     type Message = TimerMsg;
     type Reply = ();
-    type Send = SendMessage<TimerMsg>;
+    type Send = Outbound<TimerMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<TimerMsg>;
+    type Call = RuntimeCall<TimerMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            TimerMsg::Start => Effect::Call(CurrentCall::new(
-                CallRequest::Sleep { after: self.delay },
+            TimerMsg::Start => Effect::Call(RuntimeCall::new(
+                CallInput::Sleep { after: self.delay },
                 |result| match result {
-                    CallResult::TimerFired => TimerMsg::Fired,
+                    CallOutput::TimerFired => TimerMsg::Fired,
                     other => panic!("expected TimerFired, got {other:?}"),
                 },
             )),
             TimerMsg::StartAndStop => Effect::Batch(vec![
-                Effect::Call(CurrentCall::new(
-                    CallRequest::Sleep { after: self.delay },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::Sleep { after: self.delay },
                     |result| match result {
-                        CallResult::TimerFired => TimerMsg::Fired,
+                        CallOutput::TimerFired => TimerMsg::Fired,
                         other => panic!("expected TimerFired, got {other:?}"),
                     },
                 )),
@@ -88,17 +88,17 @@ struct OrderingSleeper {
 impl Isolate for OrderingSleeper {
     type Message = OrderingMsg;
     type Reply = ();
-    type Send = SendMessage<OrderingMsg>;
+    type Send = Outbound<OrderingMsg>;
     type Spawn = Infallible;
-    type Call = CurrentCall<OrderingMsg>;
+    type Call = RuntimeCall<OrderingMsg>;
     type Shard = TestShard;
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             OrderingMsg::Start => {
                 let label = self.label;
-                Effect::Call(CurrentCall::new(
-                    CallRequest::Sleep { after: self.delay },
+                Effect::Call(RuntimeCall::new(
+                    CallInput::Sleep { after: self.delay },
                     move |_| OrderingMsg::Fired(label),
                 ))
             }
