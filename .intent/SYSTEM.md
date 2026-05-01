@@ -42,6 +42,15 @@ Today the repo ships `tina`, `tina-mailbox-spsc`, `tina-supervisor`,
 `tina-runtime`, and `tina-sim`.
 
 `tina` provides the shared words and types, including supervision policy types.
+It now also provides the preferred common-path helpers:
+
+- `tina::prelude::*`
+- plain effect helpers like `send`, `reply`, `spawn`, `stop`, `batch`, and
+  `noop`
+- `Context::me()` and `Context::send_self(...)` for self-address and self-loop
+  ergonomics
+- the small `tina::isolate_types! { ... }` macro for the repeated associated
+  type slab in `impl Isolate`
 
 `tina-supervisor` provides supervisor configuration vocabulary. Runtime-owned
 supervision state and restart execution stay in runtime crates.
@@ -88,6 +97,18 @@ order. A crate-private manual clock seam lets tests prove timer semantics
 directly without brittle wall-clock sleeps. A separate assertion-backed
 integration test drives the public runtime path with the shipped monotonic
 clock and proves a real "fail, back off, retry, succeed" workload.
+
+The preferred single-shard authoring path is now intentionally shorter and
+more app-shaped:
+
+- common runtime types are `Runtime`, `RuntimeCall`, `CallInput`,
+  `CallOutput`, and `CallError`
+- typed helper calls read like `sleep(...).reply(...)`,
+  `tcp_read(...).reply(...)`, and `tcp_write(...).reply(...)`
+- self-rearm flows can use `ctx.send_self(...)` instead of spelling
+  `send(ctx.me(), ...)`
+- first-contact docs and examples should explain the message story before
+  showing the handler code
 
 `ChildDefinition` and `RestartableChildDefinition` now carry an optional bootstrap
 message that the runtime delivers to the new child immediately after spawn
@@ -142,10 +163,10 @@ Those tests do not just run live histories twice; they also replay the runtime
 trace and prove the trace can recover the same worker completions and restart
 outcomes that the live workload observed.
 
-There is not yet a simulator or Tokio bridge. The runtime-owned call
-contract is substrate-neutral by design so the first deterministic
-simulator slice (`tina-sim`) can implement the same vocabulary against
-virtual time and replay without redefining `tina`.
+There is not yet a Tokio bridge. The runtime-owned call contract is
+substrate-neutral by design so the first deterministic simulator slice
+(`tina-sim`) can implement the same vocabulary against virtual time and
+replay without redefining `tina`.
 
 `tina-sim` is intentionally still narrower than the live runtime. Today
 it is a single-shard virtual-time simulator for the shipped

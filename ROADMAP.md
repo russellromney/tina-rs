@@ -314,6 +314,21 @@ These still need answers, but a couple now have an explicit phase boundary.
 6. **Peter Mbanugo / Tina-Odin public positioning.** Resolve before public positioning or publish (Gemini at the latest). Local design exploration is not blocked on this.
 7. **MSRV.** Pick a Rust version that supports the io_uring story without nightly. Currently this is stable Rust 1.85+ via monoio.
 8. **License.** Resolved in Sputnik: dual-license under MIT or Apache-2.0 to match Rust ecosystem norms.
+9. **Small post-021 syntax cleanup.** Optional only. If real user code still
+   shows repeated little translator closures around the preferred call helpers,
+   consider one tiny helper family at the very end of the roadmap work rather
+   than during the main semantics push. The bar is narrow:
+   - helpers must stay boring and honest
+   - helpers must not create a second effect DSL
+   - helpers must not hide explicit completion-as-message semantics
+   Candidate shapes worth reevaluating later:
+   - `map_ok(...)`
+   - `map_err(...)`
+   - one compact paired helper such as `ok_err(...)`
+   Tokio does not get its readability from these kinds of helpers; it mostly
+   gets it from `async`/`.await`/`?` and focused I/O helpers like
+   `write_all`. So this cleanup should happen only if Tina still has obvious
+   repeated translator friction after the main roadmap work lands.
 
 ---
 

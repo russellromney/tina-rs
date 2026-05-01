@@ -99,12 +99,12 @@ impl MailboxFactory for ExampleMailboxFactory {
 type BoundAddr = Arc<Mutex<Option<SocketAddr>>>;
 
 #[derive(Debug, Clone)]
-enum ConnectionMsg {
-    Start,
-    ReadCompleted(Vec<u8>),
-    WriteCompleted { count: usize },
-    StreamClosed,
-    Failed,
+enum ConnectionEvent {
+    Begin,
+    Read(Vec<u8>),
+    Wrote(usize),
+    Closed,
+    IoFailed,
 }
 
 #[derive(Debug)]
@@ -115,17 +115,19 @@ struct Connection {
 }
 
 impl Isolate for Connection {
-    type Message = ConnectionMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type Call = RuntimeCall<ConnectionMsg>;
-    type Shard = ExampleShard;
+    tina::isolate_types! {
+        message: ConnectionEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<ConnectionEvent>,
+        shard: ExampleShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ConnectionMsg::Start => read_call(self.stream, self.max_chunk),
-            ConnectionMsg::ReadCompleted(bytes) => {
+            ConnectionEvent::Begin => read_call(self.stream, self.max_chunk),
+            ConnectionEvent::Read(bytes) => {
                 if bytes.is_empty() {
                     close_call(self.stream)
                 } else {
@@ -133,7 +135,7 @@ impl Isolate for Connection {
                     write_call(self.stream, self.pending_write.clone())
                 }
             }
-            ConnectionMsg::WriteCompleted { count } => {
+            ConnectionEvent::Wrote(count) => {
                 if count >= self.pending_write.len() {
                     self.pending_write.clear();
                     read_call(self.stream, self.max_chunk)
@@ -142,46 +144,46 @@ impl Isolate for Connection {
                     write_call(self.stream, self.pending_write.clone())
                 }
             }
-            ConnectionMsg::StreamClosed | ConnectionMsg::Failed => stop(),
+            ConnectionEvent::Closed | ConnectionEvent::IoFailed => stop(),
         }
     }
 }
 
 fn read_call(stream: StreamId, max_len: usize) -> Effect<Connection> {
     tcp_read(stream, max_len).reply(|result| match result {
-        Ok(bytes) => ConnectionMsg::ReadCompleted(bytes),
-        Err(_) => ConnectionMsg::Failed,
+        Ok(bytes) => ConnectionEvent::Read(bytes),
+        Err(_) => ConnectionEvent::IoFailed,
     })
 }
 
 fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
     tcp_write(stream, bytes).reply(|result| match result {
-        Ok(count) => ConnectionMsg::WriteCompleted { count },
-        Err(_) => ConnectionMsg::Failed,
+        Ok(count) => ConnectionEvent::Wrote(count),
+        Err(_) => ConnectionEvent::IoFailed,
     })
 }
 
 fn close_call(stream: StreamId) -> Effect<Connection> {
     tcp_close_stream(stream).reply(|result| match result {
-        Ok(()) => ConnectionMsg::StreamClosed,
-        Err(_) => ConnectionMsg::Failed,
+        Ok(()) => ConnectionEvent::Closed,
+        Err(_) => ConnectionEvent::IoFailed,
     })
 }
 
 #[derive(Debug, Clone)]
-enum ListenerMsg {
-    Bootstrap,
+enum ListenerEvent {
+    Start,
     Bound {
         listener: ListenerId,
         addr: SocketAddr,
     },
-    ReArmAccept,
-    CloseListener,
-    ListenerClosed,
+    AcceptNext,
+    Close,
+    Closed,
     Accepted {
         stream: StreamId,
     },
-    Failed,
+    IoFailed,
 }
 
 #[derive(Debug)]
@@ -191,50 +193,50 @@ struct Listener {
     max_chunk: usize,
     target_accepts: usize,
     accepted_count: usize,
-    self_addr: Option<Address<ListenerMsg>>,
     listener: Option<ListenerId>,
 }
 
 impl Isolate for Listener {
-    type Message = ListenerMsg;
-    type Reply = ();
-    type Send = Outbound<ListenerMsg>;
-    type Spawn = RestartableChildDefinition<Connection>;
-    type Call = RuntimeCall<ListenerMsg>;
-    type Shard = ExampleShard;
+    tina::isolate_types! {
+        message: ListenerEvent,
+        reply: (),
+        send: Outbound<ListenerEvent>,
+        spawn: RestartableChildDefinition<Connection>,
+        call: RuntimeCall<ListenerEvent>,
+        shard: ExampleShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ListenerMsg::Bootstrap => {
-                self.self_addr = Some(ctx.current_address::<ListenerMsg>());
+            ListenerEvent::Start => {
                 let addr = self.bind_addr;
                 tcp_bind(addr).reply(move |result| match result {
-                    Ok((listener, local_addr)) => ListenerMsg::Bound {
+                    Ok((listener, local_addr)) => ListenerEvent::Bound {
                         listener,
                         addr: local_addr,
                     },
-                    Err(_) => ListenerMsg::Failed,
+                    Err(_) => ListenerEvent::IoFailed,
                 })
             }
-            ListenerMsg::Bound { listener, addr } => {
+            ListenerEvent::Bound { listener, addr } => {
                 self.listener = Some(listener);
                 *self
                     .bound_addr_slot
                     .lock()
                     .expect("bound addr mutex never poisoned") = Some(addr);
                 tcp_accept(listener).reply(|result| match result {
-                    Ok((stream, _peer_addr)) => ListenerMsg::Accepted { stream },
-                    Err(_) => ListenerMsg::Failed,
+                    Ok((stream, _peer_addr)) => ListenerEvent::Accepted { stream },
+                    Err(_) => ListenerEvent::IoFailed,
                 })
             }
-            ListenerMsg::ReArmAccept => {
+            ListenerEvent::AcceptNext => {
                 let listener = self.listener.expect("listener stored before re-arm");
                 tcp_accept(listener).reply(|result| match result {
-                    Ok((stream, _peer_addr)) => ListenerMsg::Accepted { stream },
-                    Err(_) => ListenerMsg::Failed,
+                    Ok((stream, _peer_addr)) => ListenerEvent::Accepted { stream },
+                    Err(_) => ListenerEvent::IoFailed,
                 })
             }
-            ListenerMsg::Accepted { stream } => {
+            ListenerEvent::Accepted { stream } => {
                 self.accepted_count += 1;
                 let max_chunk = self.max_chunk;
                 let child = spawn(
@@ -246,25 +248,24 @@ impl Isolate for Listener {
                         },
                         8,
                     )
-                    .with_initial_message(|| ConnectionMsg::Start),
+                    .with_initial_message(|| ConnectionEvent::Begin),
                 );
-                let self_addr = self.self_addr.expect("listener captured its own address");
                 let follow_up = if self.accepted_count < self.target_accepts {
-                    ListenerMsg::ReArmAccept
+                    ListenerEvent::AcceptNext
                 } else {
-                    ListenerMsg::CloseListener
+                    ListenerEvent::Close
                 };
-                batch([child, send(self_addr, follow_up)])
+                batch([child, ctx.send_self(follow_up)])
             }
-            ListenerMsg::CloseListener => {
+            ListenerEvent::Close => {
                 let listener = self.listener.expect("listener stored before close");
                 tcp_close_listener(listener).reply(|result| match result {
-                    Ok(()) => ListenerMsg::ListenerClosed,
-                    Err(_) => ListenerMsg::Failed,
+                    Ok(()) => ListenerEvent::Closed,
+                    Err(_) => ListenerEvent::IoFailed,
                 })
             }
-            ListenerMsg::ListenerClosed => stop(),
-            ListenerMsg::Failed => stop(),
+            ListenerEvent::Closed => stop(),
+            ListenerEvent::IoFailed => stop(),
         }
     }
 }
@@ -376,7 +377,6 @@ fn main() {
             max_chunk: 256,
             target_accepts: payloads.len(),
             accepted_count: 0,
-            self_addr: None,
             listener: None,
         },
         ExampleMailbox::new(8),
@@ -388,7 +388,7 @@ fn main() {
     );
 
     runtime
-        .try_send(listener_addr, ListenerMsg::Bootstrap)
+        .try_send(listener_addr, ListenerEvent::Start)
         .expect("bootstrap accepts");
 
     step_until(&mut runtime, Duration::from_secs(2), "bind", |_| {

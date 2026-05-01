@@ -14,7 +14,7 @@
 //! - The `Registry` isolate is a tiny user-space "name server" that holds
 //!   current worker addresses keyed by stable slot. The dispatcher sends
 //!   `Forward` requests to the registry and the registry forwards to the
-//!   current incarnation by `Effect::Send`.
+//!   current incarnation by `send(...)`.
 //! - After a supervised restart, the test reads the runtime trace, finds
 //!   the `RestartChildCompleted` event for each replaced worker, and sends
 //!   `Register` messages to refresh the registry.
@@ -137,21 +137,21 @@ enum Task {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerMsg {
+enum WorkerEvent {
     Run(Task),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DispatcherMsg {
+enum DispatcherEvent {
     SpawnWorker,
     Submit { slot: u32, task: Task },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegistryMsg {
+enum RegistryEvent {
     Register {
         slot: u32,
-        address: Address<WorkerMsg>,
+        address: Address<WorkerEvent>,
     },
     Forward {
         slot: u32,
@@ -174,20 +174,22 @@ struct Worker {
 }
 
 impl Isolate for Worker {
-    type Message = WorkerMsg;
-    type Reply = ();
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: WorkerEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            WorkerMsg::Run(Task::Normal(value)) => {
+            WorkerEvent::Run(Task::Normal(value)) => {
                 self.completed.borrow_mut().push((ctx.isolate_id(), value));
                 noop()
             }
-            WorkerMsg::Run(Task::Poison) => {
+            WorkerEvent::Run(Task::Poison) => {
                 panic!("poison task in worker handler");
             }
         }
@@ -204,22 +206,24 @@ impl Isolate for Worker {
 
 #[derive(Debug)]
 struct Dispatcher {
-    registry: Address<RegistryMsg>,
+    registry: Address<RegistryEvent>,
     worker_capacity: usize,
     completed: Rc<RefCell<Vec<(IsolateId, u32)>>>,
 }
 
 impl Isolate for Dispatcher {
-    type Message = DispatcherMsg;
-    type Reply = ();
-    type Send = Outbound<RegistryMsg>;
-    type Spawn = RestartableChildDefinition<Worker>;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: DispatcherEvent,
+        reply: (),
+        send: Outbound<RegistryEvent>,
+        spawn: RestartableChildDefinition<Worker>,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            DispatcherMsg::SpawnWorker => {
+            DispatcherEvent::SpawnWorker => {
                 let completed = Rc::clone(&self.completed);
                 spawn(RestartableChildDefinition::new(
                     move || Worker {
@@ -228,8 +232,8 @@ impl Isolate for Dispatcher {
                     self.worker_capacity,
                 ))
             }
-            DispatcherMsg::Submit { slot, task } => {
-                send(self.registry, RegistryMsg::Forward { slot, task })
+            DispatcherEvent::Submit { slot, task } => {
+                send(self.registry, RegistryEvent::Forward { slot, task })
             }
         }
     }
@@ -238,7 +242,7 @@ impl Isolate for Dispatcher {
 // ---------------------------------------------------------------------------
 // Registry isolate.
 //
-// Tiny user-space name server. Holds `slot -> Address<WorkerMsg>` and
+// Tiny user-space name server. Holds `slot -> Address<WorkerEvent>` and
 // forwards `Run(task)` messages to the current incarnation. Missing slots
 // are a loud programmer error in this reference workload: the registry
 // panics instead of silently dropping work. Updates happen through
@@ -247,7 +251,7 @@ impl Isolate for Dispatcher {
 
 #[derive(Debug)]
 struct Registry {
-    addresses: HashMap<u32, Address<WorkerMsg>>,
+    addresses: HashMap<u32, Address<WorkerEvent>>,
 }
 
 impl Registry {
@@ -259,26 +263,28 @@ impl Registry {
 }
 
 impl Isolate for Registry {
-    type Message = RegistryMsg;
-    type Reply = ();
-    type Send = Outbound<WorkerMsg>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: RegistryEvent,
+        reply: (),
+        send: Outbound<WorkerEvent>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            RegistryMsg::Register { slot, address } => {
+            RegistryEvent::Register { slot, address } => {
                 self.addresses.insert(slot, address);
                 noop()
             }
-            RegistryMsg::Forward { slot, task } => {
+            RegistryEvent::Forward { slot, task } => {
                 let address = self
                     .addresses
                     .get(&slot)
                     .copied()
                     .unwrap_or_else(|| panic!("registry slot {slot} is not registered"));
-                send(address, WorkerMsg::Run(task))
+                send(address, WorkerEvent::Run(task))
             }
         }
     }
@@ -298,7 +304,7 @@ impl Isolate for Registry {
 fn replacement_address_for(
     failed_isolate: IsolateId,
     trace: &[RuntimeEvent],
-) -> Option<Address<WorkerMsg>> {
+) -> Option<Address<WorkerEvent>> {
     for event in trace.iter().rev() {
         if let RuntimeEventKind::RestartChildCompleted {
             old_isolate,
@@ -333,8 +339,8 @@ fn event_kinds(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
 struct Harness {
     runtime: Runtime<TestShard, TestMailboxFactory>,
     completed: Rc<RefCell<Vec<(IsolateId, u32)>>>,
-    dispatcher: Address<DispatcherMsg>,
-    registry: Address<RegistryMsg>,
+    dispatcher: Address<DispatcherEvent>,
+    registry: Address<RegistryEvent>,
 }
 
 impl Harness {
@@ -365,12 +371,12 @@ impl Harness {
     /// Spawns `count` workers via the dispatcher. After the runtime has
     /// stepped enough times for spawn execution, returns the new worker
     /// addresses in spawn order.
-    fn spawn_workers(&mut self, count: usize) -> Vec<Address<WorkerMsg>> {
+    fn spawn_workers(&mut self, count: usize) -> Vec<Address<WorkerEvent>> {
         let trace_len_before = self.runtime.trace().len();
 
         for _ in 0..count {
             self.runtime
-                .try_send(self.dispatcher, DispatcherMsg::SpawnWorker)
+                .try_send(self.dispatcher, DispatcherEvent::SpawnWorker)
                 .expect("dispatcher mailbox accepts SpawnWorker");
             // One step delivers the SpawnWorker message; the dispatcher
             // returns Effect::Spawn which the runtime executes immediately,
@@ -398,9 +404,9 @@ impl Harness {
 
     /// Registers a worker address in the registry under `slot`. Steps the
     /// runtime once so the registry handler observes the registration.
-    fn register_worker(&mut self, slot: u32, address: Address<WorkerMsg>) {
+    fn register_worker(&mut self, slot: u32, address: Address<WorkerEvent>) {
         self.runtime
-            .try_send(self.registry, RegistryMsg::Register { slot, address })
+            .try_send(self.registry, RegistryEvent::Register { slot, address })
             .expect("registry mailbox accepts Register");
         assert_eq!(self.runtime.step(), 1);
     }
@@ -413,7 +419,7 @@ impl Harness {
     /// - step 3: worker handles `Run`
     fn submit(&mut self, slot: u32, task: Task) {
         self.runtime
-            .try_send(self.dispatcher, DispatcherMsg::Submit { slot, task })
+            .try_send(self.dispatcher, DispatcherEvent::Submit { slot, task })
             .expect("dispatcher mailbox accepts Submit");
         let mut total = 0;
         for _ in 0..3 {
@@ -481,8 +487,8 @@ fn one_for_one_restarts_only_failed_worker_and_keeps_siblings_running() {
     // The old worker A address now fails closed.
     assert!(matches!(
         h.runtime
-            .try_send(worker_a, WorkerMsg::Run(Task::Normal(99))),
-        Err(TrySendError::Closed(WorkerMsg::Run(Task::Normal(99))))
+            .try_send(worker_a, WorkerEvent::Run(Task::Normal(99))),
+        Err(TrySendError::Closed(WorkerEvent::Run(Task::Normal(99))))
     ));
 
     // Discover the replacement worker A and refresh the registry.
@@ -545,13 +551,13 @@ fn one_for_all_restarts_every_worker_after_one_panic() {
     for address in &workers {
         assert!(matches!(
             h.runtime
-                .try_send(*address, WorkerMsg::Run(Task::Normal(99))),
+                .try_send(*address, WorkerEvent::Run(Task::Normal(99))),
             Err(TrySendError::Closed(_))
         ));
     }
 
     // Refresh the registry from trace-derived replacements for every slot.
-    let replacements: Vec<Address<WorkerMsg>> = original_ids
+    let replacements: Vec<Address<WorkerEvent>> = original_ids
         .iter()
         .map(|old| {
             replacement_address_for(*old, h.runtime.trace())
@@ -622,12 +628,12 @@ fn rest_for_one_keeps_older_siblings_and_restarts_failed_and_younger() {
     // has the original entry for slot 0).
     assert!(matches!(
         h.runtime
-            .try_send(workers[1], WorkerMsg::Run(Task::Normal(99))),
+            .try_send(workers[1], WorkerEvent::Run(Task::Normal(99))),
         Err(TrySendError::Closed(_))
     ));
     assert!(matches!(
         h.runtime
-            .try_send(workers[2], WorkerMsg::Run(Task::Normal(99))),
+            .try_send(workers[2], WorkerEvent::Run(Task::Normal(99))),
         Err(TrySendError::Closed(_))
     ));
 
@@ -709,7 +715,7 @@ fn budget_exhaustion_emits_visible_rejection_and_creates_no_replacement() {
     // even though the supervisor did not replace it).
     assert!(matches!(
         h.runtime
-            .try_send(new_worker_a, WorkerMsg::Run(Task::Normal(99))),
+            .try_send(new_worker_a, WorkerEvent::Run(Task::Normal(99))),
         Err(TrySendError::Closed(_))
     ));
 }

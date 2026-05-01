@@ -21,6 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::panic;
 use std::rc::Rc;
 
 use tina::{
@@ -114,21 +115,21 @@ enum Task {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerMsg {
+enum WorkerEvent {
     Run(Task),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DispatcherMsg {
+enum DispatcherEvent {
     SpawnWorker,
     Submit { slot: u32, task: Task },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegistryMsg {
+enum RegistryEvent {
     Register {
         slot: u32,
-        address: Address<WorkerMsg>,
+        address: Address<WorkerEvent>,
     },
     Forward {
         slot: u32,
@@ -146,41 +147,45 @@ struct Worker {
 }
 
 impl Isolate for Worker {
-    type Message = WorkerMsg;
-    type Reply = ();
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = DemoShard;
+    tina::isolate_types! {
+        message: WorkerEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: DemoShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            WorkerMsg::Run(Task::Normal(value)) => {
+            WorkerEvent::Run(Task::Normal(value)) => {
                 self.completed.borrow_mut().push((ctx.isolate_id(), value));
                 noop()
             }
-            WorkerMsg::Run(Task::Poison) => panic!("poison task"),
+            WorkerEvent::Run(Task::Poison) => panic!("poison task"),
         }
     }
 }
 
 #[derive(Debug)]
 struct Dispatcher {
-    registry: Address<RegistryMsg>,
+    registry: Address<RegistryEvent>,
     completed: Rc<RefCell<Vec<(IsolateId, u32)>>>,
 }
 
 impl Isolate for Dispatcher {
-    type Message = DispatcherMsg;
-    type Reply = ();
-    type Send = Outbound<RegistryMsg>;
-    type Spawn = RestartableChildDefinition<Worker>;
-    type Call = Infallible;
-    type Shard = DemoShard;
+    tina::isolate_types! {
+        message: DispatcherEvent,
+        reply: (),
+        send: Outbound<RegistryEvent>,
+        spawn: RestartableChildDefinition<Worker>,
+        call: Infallible,
+        shard: DemoShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            DispatcherMsg::SpawnWorker => {
+            DispatcherEvent::SpawnWorker => {
                 let completed = Rc::clone(&self.completed);
                 spawn(RestartableChildDefinition::new(
                     move || Worker {
@@ -189,8 +194,8 @@ impl Isolate for Dispatcher {
                     4,
                 ))
             }
-            DispatcherMsg::Submit { slot, task } => {
-                send(self.registry, RegistryMsg::Forward { slot, task })
+            DispatcherEvent::Submit { slot, task } => {
+                send(self.registry, RegistryEvent::Forward { slot, task })
             }
         }
     }
@@ -198,30 +203,32 @@ impl Isolate for Dispatcher {
 
 #[derive(Debug)]
 struct Registry {
-    addresses: HashMap<u32, Address<WorkerMsg>>,
+    addresses: HashMap<u32, Address<WorkerEvent>>,
 }
 
 impl Isolate for Registry {
-    type Message = RegistryMsg;
-    type Reply = ();
-    type Send = Outbound<WorkerMsg>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = DemoShard;
+    tina::isolate_types! {
+        message: RegistryEvent,
+        reply: (),
+        send: Outbound<WorkerEvent>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: DemoShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            RegistryMsg::Register { slot, address } => {
+            RegistryEvent::Register { slot, address } => {
                 self.addresses.insert(slot, address);
                 noop()
             }
-            RegistryMsg::Forward { slot, task } => {
+            RegistryEvent::Forward { slot, task } => {
                 let address = self
                     .addresses
                     .get(&slot)
                     .copied()
                     .unwrap_or_else(|| panic!("registry slot {slot} is not registered"));
-                send(address, WorkerMsg::Run(task))
+                send(address, WorkerEvent::Run(task))
             }
         }
     }
@@ -233,7 +240,7 @@ impl Isolate for Registry {
 fn replacement_address_for(
     failed_isolate: IsolateId,
     trace: &[RuntimeEvent],
-) -> Option<Address<WorkerMsg>> {
+) -> Option<Address<WorkerEvent>> {
     for event in trace.iter().rev() {
         if let RuntimeEventKind::RestartChildCompleted {
             old_isolate,
@@ -259,6 +266,9 @@ fn replacement_address_for(
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+
     let mut runtime = Runtime::new(DemoShard, DemoMailboxFactory);
     let completed: Rc<RefCell<Vec<(IsolateId, u32)>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -283,7 +293,7 @@ fn main() {
 
     // Spawn one worker through the dispatcher.
     runtime
-        .try_send(dispatcher, DispatcherMsg::SpawnWorker)
+        .try_send(dispatcher, DispatcherEvent::SpawnWorker)
         .unwrap();
     runtime.step();
     let worker_id = runtime
@@ -302,7 +312,7 @@ fn main() {
     runtime
         .try_send(
             registry,
-            RegistryMsg::Register {
+            RegistryEvent::Register {
                 slot: 0,
                 address: worker,
             },
@@ -315,7 +325,7 @@ fn main() {
     runtime
         .try_send(
             dispatcher,
-            DispatcherMsg::Submit {
+            DispatcherEvent::Submit {
                 slot: 0,
                 task: Task::Normal(42),
             },
@@ -331,7 +341,7 @@ fn main() {
     runtime
         .try_send(
             dispatcher,
-            DispatcherMsg::Submit {
+            DispatcherEvent::Submit {
                 slot: 0,
                 task: Task::Poison,
             },
@@ -342,7 +352,7 @@ fn main() {
     runtime.step();
 
     // The old worker address now fails closed.
-    let stale_send = runtime.try_send(worker, WorkerMsg::Run(Task::Normal(99)));
+    let stale_send = runtime.try_send(worker, WorkerEvent::Run(Task::Normal(99)));
     assert!(matches!(stale_send, Err(TrySendError::Closed(_))));
     println!("stale address rejected as expected: {stale_send:?}");
 
@@ -353,7 +363,7 @@ fn main() {
     runtime
         .try_send(
             registry,
-            RegistryMsg::Register {
+            RegistryEvent::Register {
                 slot: 0,
                 address: replacement,
             },
@@ -366,7 +376,7 @@ fn main() {
     runtime
         .try_send(
             dispatcher,
-            DispatcherMsg::Submit {
+            DispatcherEvent::Submit {
                 slot: 0,
                 task: Task::Normal(43),
             },
@@ -385,4 +395,6 @@ fn main() {
     );
 
     println!("dead worker is not a dead system. ✅");
+
+    panic::set_hook(previous_hook);
 }

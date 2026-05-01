@@ -97,9 +97,9 @@ fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TimerMsg {
-    Start,
-    Slept(Result<(), CallError>),
+enum TimerEvent {
+    Begin,
+    DelayFinished(Result<(), CallError>),
 }
 
 #[derive(Debug)]
@@ -108,21 +108,23 @@ struct TimerWorker {
 }
 
 impl Isolate for TimerWorker {
-    type Message = TimerMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type Call = RuntimeCall<TimerMsg>;
-    type Shard = ConsumerShard;
+    tina::isolate_types! {
+        message: TimerEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<TimerEvent>,
+        shard: ConsumerShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            TimerMsg::Start => sleep(Duration::from_millis(5)).reply(TimerMsg::Slept),
-            TimerMsg::Slept(Ok(())) => {
+            TimerEvent::Begin => sleep(Duration::from_millis(5)).reply(TimerEvent::DelayFinished),
+            TimerEvent::DelayFinished(Ok(())) => {
                 self.observations.borrow_mut().push("slept");
                 stop()
             }
-            TimerMsg::Slept(Err(_)) => {
+            TimerEvent::DelayFinished(Err(_)) => {
                 self.observations.borrow_mut().push("failed");
                 stop()
             }
@@ -141,7 +143,7 @@ fn downstream_consumer_can_use_runtime_timer_helper_end_to_end() {
         8,
     );
 
-    runtime.try_send(worker, TimerMsg::Start).unwrap();
+    runtime.try_send(worker, TimerEvent::Begin).unwrap();
     drive(&mut runtime);
 
     assert_eq!(observations.borrow().as_slice(), ["slept"]);
@@ -149,7 +151,7 @@ fn downstream_consumer_can_use_runtime_timer_helper_end_to_end() {
 }
 
 #[derive(Debug, Clone)]
-enum LowLevelMsg {
+enum LowLevelEvent {
     Start,
     Completed(Result<CallOutput, CallError>),
 }
@@ -160,27 +162,29 @@ struct LowLevelWorker {
 }
 
 impl Isolate for LowLevelWorker {
-    type Message = LowLevelMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type Call = RuntimeCall<LowLevelMsg>;
-    type Shard = ConsumerShard;
+    tina::isolate_types! {
+        message: LowLevelEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<LowLevelEvent>,
+        shard: ConsumerShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            LowLevelMsg::Start => Effect::Call(RuntimeCall::map_result(
+            LowLevelEvent::Start => Effect::Call(RuntimeCall::map_result(
                 CallInput::Sleep {
                     after: Duration::from_millis(3),
                 },
-                LowLevelMsg::Completed,
+                LowLevelEvent::Completed,
             )),
-            LowLevelMsg::Completed(Ok(CallOutput::TimerFired)) => {
+            LowLevelEvent::Completed(Ok(CallOutput::TimerFired)) => {
                 self.observations.borrow_mut().push("timer-fired");
                 stop()
             }
-            LowLevelMsg::Completed(Ok(other)) => panic!("unexpected low-level output {other:?}"),
-            LowLevelMsg::Completed(Err(_)) => {
+            LowLevelEvent::Completed(Ok(other)) => panic!("unexpected low-level output {other:?}"),
+            LowLevelEvent::Completed(Err(_)) => {
                 self.observations.borrow_mut().push("failed");
                 stop()
             }
@@ -199,15 +203,15 @@ fn downstream_consumer_can_use_low_level_call_renames_end_to_end() {
         8,
     );
 
-    runtime.try_send(worker, LowLevelMsg::Start).unwrap();
+    runtime.try_send(worker, LowLevelEvent::Start).unwrap();
     drive(&mut runtime);
 
     assert_eq!(observations.borrow().as_slice(), ["timer-fired"]);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildMsg {
-    Start,
+enum ChildEvent {
+    Begin,
 }
 
 #[derive(Debug)]
@@ -216,16 +220,18 @@ struct ChildWorker {
 }
 
 impl Isolate for ChildWorker {
-    type Message = ChildMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = ConsumerShard;
+    tina::isolate_types! {
+        message: ChildEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: ConsumerShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ChildMsg::Start => {
+            ChildEvent::Begin => {
                 self.starts.set(self.starts.get() + 1);
                 stop()
             }
@@ -234,8 +240,8 @@ impl Isolate for ChildWorker {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParentMsg {
-    Start,
+enum ParentEvent {
+    Begin,
 }
 
 #[derive(Debug)]
@@ -244,16 +250,18 @@ struct ParentWorker {
 }
 
 impl Isolate for ParentWorker {
-    type Message = ParentMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = RestartableChildDefinition<ChildWorker>;
-    type Call = Infallible;
-    type Shard = ConsumerShard;
+    tina::isolate_types! {
+        message: ParentEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: RestartableChildDefinition<ChildWorker>,
+        call: Infallible,
+        shard: ConsumerShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ParentMsg::Start => spawn(
+            ParentEvent::Begin => spawn(
                 RestartableChildDefinition::new(
                     {
                         let starts = Rc::clone(&self.starts);
@@ -263,7 +271,7 @@ impl Isolate for ParentWorker {
                     },
                     4,
                 )
-                .with_initial_message(|| ChildMsg::Start),
+                .with_initial_message(|| ChildEvent::Begin),
             ),
         }
     }
@@ -280,7 +288,7 @@ fn downstream_consumer_can_spawn_restartable_child_with_initial_message() {
         8,
     );
 
-    runtime.try_send(parent, ParentMsg::Start).unwrap();
+    runtime.try_send(parent, ParentEvent::Begin).unwrap();
     drive(&mut runtime);
 
     assert_eq!(starts.get(), 1);

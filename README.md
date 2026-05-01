@@ -13,9 +13,13 @@ This repo is a Cargo workspace. Today it has four crates:
 - **`tina-supervisor`** — supervisor policy/config vocabulary.
 - **`tina-runtime`** — deterministic single-shard runtime with trace events, local send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, and supervised panic restart.
 
-The simulator, I/O driver, multi-shard runtime, and Tokio bridge come later. See [ROADMAP.md](ROADMAP.md).
+The timer simulator, runtime-owned TCP/time path, multi-shard runtime, and
+Tokio bridge all have their own place on the roadmap. See [ROADMAP.md](ROADMAP.md).
 
-> tina-rs is **experimental**. The vocabulary, bounded SPSC mailbox, supervisor config, and first runtime core are here; the simulator and production runtime story are not yet. The API will change.
+> tina-rs is **experimental**. The vocabulary, bounded SPSC mailbox,
+> supervisor config, timer simulator, and first single-shard runtime are here.
+> The broader simulator and production runtime story are still in flight. The
+> API will change.
 
 ## Why this exists
 
@@ -44,11 +48,8 @@ If you want to contribute or find bugs, please open a PR or issue.
 
 ## What Tina code looks like
 
-The important shape is:
-
-- one struct owns one unit of state
-- one message arrives
-- the handler returns the next thing to do
+The important shape is simple: one struct owns one unit of state, one message
+arrives, and the handler returns the next thing to do.
 
 Use the prelude:
 
@@ -56,58 +57,67 @@ Use the prelude:
 use tina::prelude::*;
 ```
 
-Normal local state change plus a local send:
+First, a tiny local-state example. Imagine one session isolate. It keeps a set
+of connected users. It can be told that a user connected. It can be asked for
+a snapshot of its current users. And when a user connects, it also sends an
+audit event somewhere else. That looks like this:
 
 ```rust
+enum AuditEvent {
+    UserJoined(UserId),
+}
+
+enum Message {
+    UserConnected(UserId),
+    SnapshotRequested,
+}
+
 match msg {
-    SessionMsg::Connected(user_id) => {
+    Message::UserConnected(user_id) => {
         self.users.insert(user_id);
-        send(self.audit, AuditMsg::Joined(user_id))
+        send(self.audit, AuditEvent::UserJoined(user_id))
     }
-    SessionMsg::Snapshot => reply(self.users.clone()),
+    Message::SnapshotRequested => reply(self.users.clone()),
 }
 ```
 
-Runtime-owned time:
+Second, a tiny runtime-owned time example. Imagine one worker isolate that
+starts some work, needs a backoff delay, and then retries. The isolate does
+not sleep by itself. It asks the runtime to sleep, and later the runtime sends
+back one ordinary message saying whether that sleep finished or failed. That
+looks like this:
 
 ```rust
+use tina_runtime::{CallError, sleep};
+
+enum Message {
+    Start,
+    RetryNow,
+    BackoffFailed(CallError),
+}
+
 match msg {
-    RetryMsg::Attempt => sleep(self.backoff).reply(RetryMsg::Slept),
-    RetryMsg::Slept(Ok(())) => send(ctx.current_address(), RetryMsg::Attempt),
-    RetryMsg::Slept(Err(_)) => stop(),
+    Message::Start => sleep(self.backoff).reply(|result| match result {
+        Ok(()) => Message::RetryNow,
+        Err(reason) => Message::BackoffFailed(reason),
+    }),
+    Message::RetryNow => send(self.worker, WorkerEvent::Retry),
+    Message::BackoffFailed(_) => stop(),
 }
 ```
 
-Runtime-owned TCP stays explicit about partial writes and later completions:
+Runtime-owned TCP uses the same shape too. The state machine is bigger, but
+the idea stays the same: read some bytes, write them back, keep draining if
+the write is partial, then re-arm the next read.
 
-```rust
-match msg {
-    ConnMsg::Start => tcp_read(self.stream, 1024).reply(ConnMsg::ReadCompleted),
-    ConnMsg::ReadCompleted(Ok(bytes)) if bytes.is_empty() => stop(),
-    ConnMsg::ReadCompleted(Ok(bytes)) => {
-        self.pending_write = bytes.clone();
-        tcp_write(self.stream, bytes).reply(ConnMsg::WriteCompleted)
-    }
-    ConnMsg::WriteCompleted(Ok(count)) if count < self.pending_write.len() => {
-        self.pending_write.drain(..count);
-        tcp_write(self.stream, self.pending_write.clone()).reply(ConnMsg::WriteCompleted)
-    }
-    ConnMsg::WriteCompleted(Ok(_)) => {
-        self.pending_write.clear();
-        tcp_read(self.stream, 1024).reply(ConnMsg::ReadCompleted)
-    }
-    ConnMsg::ReadCompleted(Err(_)) | ConnMsg::WriteCompleted(Err(_)) => stop(),
-}
-```
+The full runnable example lives in
+[`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime-current/examples/tcp_echo.rs).
 
-That is the whole vibe:
-
-- handlers are synchronous
-- local state stays local
-- `send`, `reply`, `spawn`, `stop`, and `batch` are plain returned values
-- time and I/O happen in the runtime
-- completions come back later as ordinary messages
-- the code stays honest about things Tokio usually hides, like partial writes
+That is the whole vibe. Handlers stay synchronous. Local state stays local.
+`send`, `reply`, `spawn`, `stop`, and `batch` are plain returned values. Time
+and I/O happen in the runtime. Completions come back later as ordinary
+messages. The code stays honest about things Tokio usually hides, like retries
+and partial writes.
 
 Full runnable examples live here:
 
@@ -131,13 +141,15 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 ## Status
 
-What works today: the trait crate, the bounded SPSC mailbox crate, supervisor configuration, the single-shard runtime, and the simulator. You can write isolates against the preferred public API, exercise real mailbox semantics, run handlers through `tina-runtime`, and replay timer-driven behavior through `tina-sim`.
+What works today: the trait crate, the bounded SPSC mailbox crate, supervisor
+configuration, the single-shard runtime, and the timer simulator. You can
+write isolates against the preferred public API, exercise real mailbox
+semantics, run handlers through `tina-runtime`, use runtime-owned TCP and
+runtime-owned time, and replay timer-driven behavior through `tina-sim`.
 
-What's coming, in order: runtime-owned I/O on a Betelgeuse-backed explicit
-completion-driven current-thread backend, backed by a TCP echo proof; then
-runtime-owned timers; then a deterministic simulator; then a multi-shard
-runtime; and finally an adapter that lets a tina isolate run inside an
-existing Tokio app, so codebases can adopt the discipline incrementally
+What's coming next, in order: broader simulator coverage beyond timers; a
+multi-shard runtime; and then an adapter that lets a tina isolate run inside
+an existing Tokio app, so codebases can adopt the discipline incrementally
 without making Tokio the core model.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
@@ -166,7 +178,7 @@ mailbox: `make miri`.
 - [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) — the framing
 - [Seastar](https://seastar.io/) — C++ thread-per-core framework, ScyllaDB's foundation
 - [monoio](https://github.com/bytedance/monoio) — likely runtime backend
-- [shuttle](https://github.com/awslabs/shuttle) — concurrency model checking, useful when the simulator lands
+- [shuttle](https://github.com/awslabs/shuttle) — concurrency model checking, useful as the simulator grows beyond timer coverage
 - [loom](https://github.com/tokio-rs/loom) — concurrency permutation testing for unsafe primitives
 - [Miri](https://github.com/rust-lang/miri) — interpreter for catching undefined behavior in unsafe Rust
 

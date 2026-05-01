@@ -14,37 +14,39 @@ impl Shard for InlineShard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AuditMsg {
+enum AuditEvent {
     Recorded(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SessionMsg {
+enum Message {
     Note(String),
-    Snapshot,
-    SpawnChild,
+    SnapshotRequested,
+    StartWorker,
     StopNow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ChildMsg {
-    Start,
+enum ChildEvent {
+    Begin,
 }
 
 #[derive(Debug)]
 struct ChildWorker;
 
 impl Isolate for ChildWorker {
-    type Message = ChildMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = InlineShard;
+    tina::isolate_types! {
+        message: ChildEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: InlineShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ChildMsg::Start => stop(),
+            ChildEvent::Begin => stop(),
         }
     }
 }
@@ -52,28 +54,30 @@ impl Isolate for ChildWorker {
 #[derive(Debug)]
 struct Session {
     notes: Vec<String>,
-    audit: Address<AuditMsg>,
+    audit: Address<AuditEvent>,
 }
 
 impl Isolate for Session {
-    type Message = SessionMsg;
-    type Reply = Vec<String>;
-    type Send = Outbound<AuditMsg>;
-    type Spawn = ChildDefinition<ChildWorker>;
-    type Call = Infallible;
-    type Shard = InlineShard;
+    tina::isolate_types! {
+        message: Message,
+        reply: Vec<String>,
+        send: Outbound<AuditEvent>,
+        spawn: ChildDefinition<ChildWorker>,
+        call: Infallible,
+        shard: InlineShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            SessionMsg::Note(note) => {
+            Message::Note(note) => {
                 self.notes.push(note.clone());
-                send(self.audit, AuditMsg::Recorded(note))
+                send(self.audit, AuditEvent::Recorded(note))
             }
-            SessionMsg::Snapshot => reply(self.notes.clone()),
-            SessionMsg::SpawnChild => {
-                spawn(ChildDefinition::new(ChildWorker, 4).with_initial_message(ChildMsg::Start))
+            Message::SnapshotRequested => reply(self.notes.clone()),
+            Message::StartWorker => {
+                spawn(ChildDefinition::new(ChildWorker, 4).with_initial_message(ChildEvent::Begin))
             }
-            SessionMsg::StopNow => stop(),
+            Message::StopNow => stop(),
         }
     }
 }
@@ -130,31 +134,34 @@ fn preferred_surface_helpers_build_expected_effects() {
         audit,
     };
 
-    match session.handle(SessionMsg::Note("hello".to_owned()), &mut ctx) {
+    match session.handle(Message::Note("hello".to_owned()), &mut ctx) {
         Effect::Send(outbound) => {
             assert_eq!(outbound.destination(), audit);
-            assert_eq!(outbound.message(), &AuditMsg::Recorded("hello".to_owned()));
+            assert_eq!(
+                outbound.message(),
+                &AuditEvent::Recorded("hello".to_owned())
+            );
         }
         other => panic!("expected send effect, got {other:?}"),
     }
 
     assert!(matches!(
-        session.handle(SessionMsg::Snapshot, &mut ctx),
+        session.handle(Message::SnapshotRequested, &mut ctx),
         Effect::Reply(ref notes) if notes == &vec!["hello".to_owned()]
     ));
 
-    match session.handle(SessionMsg::SpawnChild, &mut ctx) {
+    match session.handle(Message::StartWorker, &mut ctx) {
         Effect::Spawn(definition) => {
             assert_eq!(definition.mailbox_capacity(), 4);
             let (_child, capacity, initial_message) = definition.into_parts();
             assert_eq!(capacity, 4);
-            assert_eq!(initial_message, Some(ChildMsg::Start));
+            assert_eq!(initial_message, Some(ChildEvent::Begin));
         }
         other => panic!("expected spawn effect, got {other:?}"),
     }
 
     assert!(matches!(
-        session.handle(SessionMsg::StopNow, &mut ctx),
+        session.handle(Message::StopNow, &mut ctx),
         Effect::Stop
     ));
 }

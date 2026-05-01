@@ -1398,10 +1398,7 @@ impl Isolate for RetryWorker {
                 self.observations
                     .borrow_mut()
                     .push(RetryObservation::BackoffElapsed);
-                Effect::Send(Outbound::new(
-                    ctx.current_address::<RetryMsg>(),
-                    RetryMsg::Attempt,
-                ))
+                ctx.send_self(RetryMsg::Attempt)
             }
         }
     }

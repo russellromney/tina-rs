@@ -17,9 +17,9 @@ impl Shard for ConsumerShard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryMsg {
-    Start,
-    Slept(Result<(), tina_runtime::CallError>),
+enum RetryEvent {
+    Begin,
+    DelayFinished(Result<(), tina_runtime::CallError>),
     RetryNow,
 }
 
@@ -36,34 +36,36 @@ struct RetryWorker {
 }
 
 impl Isolate for RetryWorker {
-    type Message = RetryMsg;
-    type Reply = ();
-    type Send = Outbound<RetryMsg>;
-    type Spawn = Infallible;
-    type Call = RuntimeCall<RetryMsg>;
-    type Shard = ConsumerShard;
+    tina::isolate_types! {
+        message: RetryEvent,
+        reply: (),
+        send: Outbound<RetryEvent>,
+        spawn: Infallible,
+        call: RuntimeCall<RetryEvent>,
+        shard: ConsumerShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            RetryMsg::Start => {
+            RetryEvent::Begin => {
                 self.observations
                     .borrow_mut()
                     .push(RetryObservation::Started);
-                sleep(Duration::from_millis(25)).reply(RetryMsg::Slept)
+                sleep(Duration::from_millis(25)).reply(RetryEvent::DelayFinished)
             }
-            RetryMsg::Slept(Ok(())) => {
+            RetryEvent::DelayFinished(Ok(())) => {
                 self.observations
                     .borrow_mut()
                     .push(RetryObservation::BackoffElapsed);
-                send(ctx.current_address::<RetryMsg>(), RetryMsg::RetryNow)
+                ctx.send_self(RetryEvent::RetryNow)
             }
-            RetryMsg::RetryNow => {
+            RetryEvent::RetryNow => {
                 self.observations
                     .borrow_mut()
                     .push(RetryObservation::Retried);
                 stop()
             }
-            RetryMsg::Slept(Err(_)) => stop(),
+            RetryEvent::DelayFinished(Err(_)) => stop(),
         }
     }
 }
@@ -77,7 +79,7 @@ fn run_retry_workload(config: SimulatorConfig) -> (Vec<RetryObservation>, Replay
         },
         8,
     );
-    sim.try_send(worker, RetryMsg::Start).unwrap();
+    sim.try_send(worker, RetryEvent::Begin).unwrap();
     sim.run_until_quiescent();
     (observations.borrow().clone(), sim.replay_artifact())
 }

@@ -5,8 +5,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, Shard,
-    ShardId, TrySendError,
+    Address, ChildDefinition, Isolate, IsolateId, Mailbox, Outbound, Shard, ShardId, TrySendError,
+    prelude::*,
 };
 use tina_runtime::{
     CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
@@ -16,12 +16,12 @@ use tina_runtime::{
 enum NeverOutbound {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParentMsg {
-    SpawnChild,
+enum ParentEvent {
+    StartChild,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildMsg {
+enum ChildEvent {
     Data(u8),
     Stop,
 }
@@ -110,21 +110,23 @@ struct Child {
 }
 
 impl Isolate for Child {
-    type Message = ChildMsg;
-    type Reply = ();
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: ChildEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ChildMsg::Data(value) => {
+            ChildEvent::Data(value) => {
                 self.order_log.borrow_mut().push("child");
                 self.seen.borrow_mut().push(value);
-                Effect::Noop
+                noop()
             }
-            ChildMsg::Stop => Effect::Stop,
+            ChildEvent::Stop => stop(),
         }
     }
 }
@@ -137,16 +139,18 @@ struct Parent {
 }
 
 impl Isolate for Parent {
-    type Message = ParentMsg;
-    type Reply = ();
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = ChildDefinition<Child>;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: ParentEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: ChildDefinition<Child>,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ParentMsg::SpawnChild => Effect::Spawn(ChildDefinition::new(
+            ParentEvent::StartChild => spawn(ChildDefinition::new(
                 Child {
                     seen: Rc::clone(&self.child_seen),
                     order_log: Rc::clone(&self.order_log),
@@ -164,20 +168,22 @@ struct OrderIsolate {
 }
 
 impl Isolate for OrderIsolate {
-    type Message = OrderMsg;
-    type Reply = ();
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: OrderMsg,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         self.log.borrow_mut().push(self.name);
-        Effect::Noop
+        noop()
     }
 }
 
-fn child_address(child_isolate: IsolateId) -> Address<ChildMsg> {
+fn child_address(child_isolate: IsolateId) -> Address<ChildEvent> {
     Address::new(ShardId::new(3), child_isolate)
 }
 
@@ -206,7 +212,7 @@ fn spawn_creates_child_and_records_trace() {
         TestMailbox::new(8),
     );
 
-    assert_eq!(runtime.try_send(parent, ParentMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
     assert_eq!(runtime.step(), 1);
     assert!(child_seen.borrow().is_empty());
 
@@ -264,11 +270,11 @@ fn spawned_child_runs_only_on_a_later_step_and_runtime_ingress_reaches_it() {
         TestMailbox::new(8),
     );
 
-    assert_eq!(runtime.try_send(parent, ParentMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
     assert_eq!(runtime.step(), 1);
 
     let child = child_address(spawned_child_isolate(runtime.trace()));
-    assert_eq!(runtime.try_send(child, ChildMsg::Data(7)), Ok(()));
+    assert_eq!(runtime.try_send(child, ChildEvent::Data(7)), Ok(()));
     assert!(child_seen.borrow().is_empty());
 
     assert_eq!(runtime.step(), 1);
@@ -296,12 +302,12 @@ fn spawned_child_appends_to_registration_order() {
         TestMailbox::new(8),
     );
 
-    assert_eq!(runtime.try_send(parent, ParentMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
     assert_eq!(runtime.step(), 1);
 
     let child = child_address(spawned_child_isolate(runtime.trace()));
     assert_eq!(runtime.try_send(sibling, OrderMsg::Tick), Ok(()));
-    assert_eq!(runtime.try_send(child, ChildMsg::Data(9)), Ok(()));
+    assert_eq!(runtime.try_send(child, ChildEvent::Data(9)), Ok(()));
 
     assert_eq!(runtime.step(), 2);
     assert_eq!(*order_log.borrow(), vec!["sibling", "child"]);
@@ -320,22 +326,22 @@ fn runtime_ingress_returns_typed_full_and_closed_for_spawned_child() {
         TestMailbox::new(8),
     );
 
-    assert_eq!(runtime.try_send(parent, ParentMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
     assert_eq!(runtime.step(), 1);
 
     let child = child_address(spawned_child_isolate(runtime.trace()));
-    assert_eq!(runtime.try_send(child, ChildMsg::Data(1)), Ok(()));
+    assert_eq!(runtime.try_send(child, ChildEvent::Data(1)), Ok(()));
     assert_eq!(
-        runtime.try_send(child, ChildMsg::Data(2)),
-        Err(TrySendError::Full(ChildMsg::Data(2))),
+        runtime.try_send(child, ChildEvent::Data(2)),
+        Err(TrySendError::Full(ChildEvent::Data(2))),
     );
 
     assert_eq!(runtime.step(), 1);
-    assert_eq!(runtime.try_send(child, ChildMsg::Stop), Ok(()));
+    assert_eq!(runtime.try_send(child, ChildEvent::Stop), Ok(()));
     assert_eq!(runtime.step(), 1);
     assert_eq!(
-        runtime.try_send(child, ChildMsg::Data(3)),
-        Err(TrySendError::Closed(ChildMsg::Data(3))),
+        runtime.try_send(child, ChildEvent::Data(3)),
+        Err(TrySendError::Closed(ChildEvent::Data(3))),
     );
 }
 
@@ -344,7 +350,7 @@ fn runtime_ingress_to_unknown_isolate_still_panics() {
     let runtime = Runtime::new(TestShard, TestMailboxFactory);
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let _ = runtime.try_send(child_address(IsolateId::new(99)), ChildMsg::Data(1));
+        let _ = runtime.try_send(child_address(IsolateId::new(99)), ChildEvent::Data(1));
     }));
 
     assert!(result.is_err());
@@ -357,7 +363,7 @@ fn runtime_ingress_to_other_shard_still_panics() {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let _ = runtime.try_send(
             Address::new(ShardId::new(9), IsolateId::new(1)),
-            ChildMsg::Data(1),
+            ChildEvent::Data(1),
         );
     }));
 
@@ -376,7 +382,7 @@ fn spawn_with_zero_capacity_panics_instead_of_creating_unreachable_child() {
         TestMailbox::new(8),
     );
 
-    assert_eq!(runtime.try_send(parent, ParentMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
 
     let result = catch_unwind(AssertUnwindSafe(|| runtime.step()));
     assert!(result.is_err());
@@ -401,11 +407,11 @@ fn identical_runs_produce_identical_spawn_sequences_and_causal_links() {
             TestMailbox::new(8),
         );
 
-        assert_eq!(runtime.try_send(parent, ParentMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
         assert_eq!(runtime.step(), 1);
 
         let child = child_address(spawned_child_isolate(runtime.trace()));
-        assert_eq!(runtime.try_send(child, ChildMsg::Data(4)), Ok(()));
+        assert_eq!(runtime.try_send(child, ChildEvent::Data(4)), Ok(()));
         assert_eq!(runtime.step(), 1);
 
         runtime.trace().to_vec()

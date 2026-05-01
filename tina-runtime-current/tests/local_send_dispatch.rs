@@ -5,7 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, Context, Effect, Isolate, IsolateId, Mailbox, Outbound, Shard, ShardId, TrySendError,
+    Address, Isolate, IsolateId, Mailbox, Outbound, Shard, ShardId, TrySendError, prelude::*,
 };
 use tina_runtime::{
     CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
@@ -21,12 +21,12 @@ enum OrderMsg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DriverMsg {
+enum DriverEvent {
     Kick(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuditMsg {
+enum AuditEvent {
     Record(u8),
 }
 
@@ -115,38 +115,42 @@ struct OrderIsolate {
 }
 
 impl Isolate for OrderIsolate {
-    type Message = OrderMsg;
-    type Reply = ();
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: OrderMsg,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         self.log.borrow_mut().push(self.name);
-        Effect::Noop
+        noop()
     }
 }
 
 #[derive(Debug)]
 struct Driver {
-    target: Address<AuditMsg>,
+    target: Address<AuditEvent>,
     handled: Rc<RefCell<Vec<u8>>>,
 }
 
 impl Isolate for Driver {
-    type Message = DriverMsg;
-    type Reply = ();
-    type Send = Outbound<AuditMsg>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: DriverEvent,
+        reply: (),
+        send: Outbound<AuditEvent>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            DriverMsg::Kick(value) => {
+            DriverEvent::Kick(value) => {
                 self.handled.borrow_mut().push(value);
-                Effect::Send(Outbound::new(self.target, AuditMsg::Record(value)))
+                send(self.target, AuditEvent::Record(value))
             }
         }
     }
@@ -158,17 +162,19 @@ struct Audit {
 }
 
 impl Isolate for Audit {
-    type Message = AuditMsg;
-    type Reply = ();
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: AuditEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        let AuditMsg::Record(value) = msg;
+        let AuditEvent::Record(value) = msg;
         self.seen.borrow_mut().push(value);
-        Effect::Noop
+        noop()
     }
 }
 
@@ -176,17 +182,19 @@ impl Isolate for Audit {
 struct ObservedIsolate;
 
 impl Isolate for ObservedIsolate {
-    type Message = ObservedMsg;
-    type Reply = u8;
-    type Send = Outbound<NeverOutbound>;
-    type Spawn = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
+    tina::isolate_types! {
+        message: ObservedMsg,
+        reply: u8,
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            ObservedMsg::Reply => Effect::Reply(7),
-            ObservedMsg::Restart => Effect::RestartChildren,
+            ObservedMsg::Reply => reply(7),
+            ObservedMsg::Restart => restart_children(),
         }
     }
 }
@@ -262,7 +270,7 @@ fn accepted_local_send_runs_target_on_a_later_step_and_records_trace() {
         driver_mailbox.clone(),
     );
 
-    assert_eq!(driver_mailbox.try_send(DriverMsg::Kick(7)), Ok(()));
+    assert_eq!(driver_mailbox.try_send(DriverEvent::Kick(7)), Ok(()));
 
     assert_eq!(runtime.step(), 1);
     assert_eq!(*driver_handled.borrow(), vec![7]);
@@ -386,8 +394,8 @@ fn rejected_local_send_is_traced_and_not_silently_buffered() {
         second_driver_mailbox.clone(),
     );
 
-    assert_eq!(first_driver_mailbox.try_send(DriverMsg::Kick(7)), Ok(()));
-    assert_eq!(second_driver_mailbox.try_send(DriverMsg::Kick(8)), Ok(()));
+    assert_eq!(first_driver_mailbox.try_send(DriverEvent::Kick(7)), Ok(()));
+    assert_eq!(second_driver_mailbox.try_send(DriverEvent::Kick(8)), Ok(()));
 
     assert_eq!(runtime.step(), 2);
     assert_eq!(
@@ -425,7 +433,7 @@ fn send_to_unknown_isolate_panics() {
         driver_mailbox.clone(),
     );
 
-    assert_eq!(driver_mailbox.try_send(DriverMsg::Kick(1)), Ok(()));
+    assert_eq!(driver_mailbox.try_send(DriverEvent::Kick(1)), Ok(()));
 
     let result = catch_unwind(AssertUnwindSafe(|| runtime.step()));
     assert!(result.is_err());
@@ -539,7 +547,7 @@ fn identical_runs_produce_identical_event_sequences_and_causal_links() {
             driver_mailbox.clone(),
         );
 
-        assert_eq!(driver_mailbox.try_send(DriverMsg::Kick(5)), Ok(()));
+        assert_eq!(driver_mailbox.try_send(DriverEvent::Kick(5)), Ok(()));
         assert_eq!(runtime.step(), 1);
         assert_eq!(runtime.step(), 1);
 
