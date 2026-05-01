@@ -116,6 +116,46 @@ impl ReplayArtifact {
     }
 }
 
+/// Captured replay data for one deterministic multi-shard simulator run.
+///
+/// Like [`ReplayArtifact`], this records one whole-run event record rather
+/// than splitting replay state into per-shard artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiShardReplayArtifact {
+    simulator_config: SimulatorConfig,
+    multishard_config: MultiShardSimulatorConfig,
+    final_time: Duration,
+    event_record: Vec<RuntimeEvent>,
+    observed_peer_output: Vec<ObservedPeerOutput>,
+}
+
+impl MultiShardReplayArtifact {
+    /// Returns the single-shard simulator config cloned onto each shard.
+    pub fn simulator_config(&self) -> &SimulatorConfig {
+        &self.simulator_config
+    }
+
+    /// Returns the multi-shard coordinator config used for the run.
+    pub const fn multishard_config(&self) -> MultiShardSimulatorConfig {
+        self.multishard_config
+    }
+
+    /// Returns the final shared virtual time reached by the run.
+    pub const fn final_time(&self) -> Duration {
+        self.final_time
+    }
+
+    /// Returns the deterministic whole-run event record captured for the run.
+    pub fn event_record(&self) -> &[RuntimeEvent] {
+        &self.event_record
+    }
+
+    /// Returns the peer-visible output captured during the run.
+    pub fn observed_peer_output(&self) -> &[ObservedPeerOutput] {
+        &self.observed_peer_output
+    }
+}
+
 /// Seeded fault configuration for one simulator run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FaultConfig {
@@ -2898,6 +2938,56 @@ where
         delivered
     }
 
+    /// Continues running until every shard and every cross-shard queue is
+    /// quiescent.
+    pub fn run_until_quiescent(&mut self) -> usize {
+        let mut total = 0;
+        loop {
+            let delivered = self.step();
+            total += delivered;
+            if delivered > 0 {
+                continue;
+            }
+            if self.advance_to_next_timer() {
+                continue;
+            }
+            if self.has_in_flight_calls() {
+                continue;
+            }
+            if !self.remote_queues.is_empty() {
+                continue;
+            }
+            if self
+                .simulators
+                .iter()
+                .any(Simulator::has_pending_messages)
+            {
+                continue;
+            }
+            break total;
+        }
+    }
+
+    /// Captures a deterministic replay artifact for the current whole-run
+    /// multi-shard state.
+    pub fn replay_artifact(&self) -> MultiShardReplayArtifact {
+        MultiShardReplayArtifact {
+            simulator_config: self
+                .simulators
+                .first()
+                .map(|simulator| simulator.config().clone())
+                .unwrap_or_default(),
+            multishard_config: self.config,
+            final_time: self.now(),
+            event_record: self.trace(),
+            observed_peer_output: self
+                .simulators
+                .iter()
+                .flat_map(Simulator::observed_peer_output)
+                .collect(),
+        }
+    }
+
     fn simulator(&self, shard: ShardId) -> &Simulator<S> {
         &self.simulators[self.checked_shard_index(shard)]
     }
@@ -3338,6 +3428,50 @@ mod tests {
             })
             .count();
         assert_eq!(closed_rejections, 1);
+    }
+
+    #[test]
+    fn cross_shard_simulation_unknown_isolate_rejects_on_destination_harvest() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+        );
+
+        let unknown = Address::new_with_generation(
+            ShardId::new(22),
+            IsolateId::new(999),
+            AddressGeneration::new(0),
+        );
+        let sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: unknown,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(sender, SimRemoteEvent::Kick).unwrap();
+
+        assert_eq!(sim.step(), 1);
+        assert_eq!(sim.step(), 0);
+
+        let trace = sim.trace();
+        let destination_closed_rejections = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(22)
+                    && matches!(
+                        event.kind(),
+                        RuntimeEventKind::SendRejected {
+                            target_isolate,
+                            reason: SendRejectedReason::Closed,
+                            ..
+                        } if target_isolate == unknown.isolate()
+                    )
+            })
+            .count();
+        assert_eq!(destination_closed_rejections, 1);
     }
 
     #[test]

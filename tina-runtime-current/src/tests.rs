@@ -1543,6 +1543,50 @@ fn cross_shard_closed_target_rejects_on_destination_harvest() {
 }
 
 #[test]
+fn cross_shard_unknown_isolate_rejects_on_destination_harvest() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
+
+    let unknown = Address::new_with_generation(
+        ShardId::new(22),
+        IsolateId::new(999),
+        AddressGeneration::new(0),
+    );
+    let sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: unknown,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(sender, RemoteEvent::Kick).unwrap();
+
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 0);
+
+    let trace = runtime.trace();
+    let destination_closed_rejections: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::SendRejected {
+                target_isolate,
+                reason,
+                ..
+            } if event.shard() == ShardId::new(22)
+                && target_isolate == unknown.isolate()
+                && reason == SendRejectedReason::Closed =>
+            {
+                Some(event.id().get())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(destination_closed_rejections.len(), 1);
+}
+
+#[test]
 fn cross_shard_destination_mailbox_full_rejects_on_harvest() {
     let mut runtime =
         MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);

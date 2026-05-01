@@ -296,6 +296,15 @@ What Galileo explicitly does **not** need to include in this same pass:
 - NUMA optimization
 - consistent-hashing sophistication or live rebalancing
 - zero-copy experiments for cross-shard ownership transfer
+- full peer-quarantine / shard-restarted broadcast semantics from upstream Tina
+
+The first Galileo slice should be explicit about one more boundary:
+
+- source-time cross-shard send result is about transport admission
+- destination harvest may still record local `Closed` / `Full` outcomes in the
+  trace as a Rust-side observability extension
+- that richer destination trace is not the same thing as a second synchronous
+  send-result contract
 
 Those belong to the next story, after the contract is real.
 

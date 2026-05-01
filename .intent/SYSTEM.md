@@ -67,6 +67,13 @@ left-to-right without opening up a new callback or effect language. In
 `tina-runtime`, later effects in the batch still run after earlier
 non-terminal effects, and `Stop` short-circuits the rest of the batch.
 
+The preferred common authoring path is now the 021 devex surface:
+`tina::prelude::*`, plain effect helpers such as `send`, `reply`, `spawn`,
+`stop`, `batch`, and `noop`, concise self-address helpers `ctx.me()` and
+`ctx.send_self(...)`, typed call helpers such as `sleep(...).reply(...)`, and
+`tina::isolate_types! { ... }` when it removes obvious associated-type slab
+boilerplate without hiding semantics.
+
 `tina-runtime` ships the first TCP call family on Betelgeuse
 (nightly Rust): TCP listener bind, accept, stream read, stream write,
 listener and stream close. Resources are runtime-owned opaque ids; raw
@@ -241,6 +248,10 @@ scope.
   copy every Tokio pattern into tina
 - cross-shard rules must be written down before multi-shard runtime work starts
 - cross-shard behavior must not be guessed from code after the fact
+- source-time cross-shard send outcomes and destination-time harvest outcomes
+  are different semantic stages and should stay described that way
+- full peer-quarantine / shard-restarted semantics are a later design step, not
+  something to quietly smuggle into early multi-shard slices
 
 ## Things that should feel wrong
 

@@ -733,3 +733,34 @@ Keeping the richer destination-side trace in `tina-rs` is defensible because
 replay/explainability is one of the Rust port's strengths, but it should be
 described as an observability extension rather than presented as "what the
 source send really returned."
+
+## Implementation Closeout Note
+
+Galileo's implemented surface now covers the promised first honest multi-shard
+story:
+
+- additive `MultiShardRuntime` and `MultiShardSimulator`
+- one global `step()` and one global `try_send(addr, msg)`
+- root placement by shard
+- shared global event-id / call-id identity
+- bounded shard-pair transport with immediate source-time `Full`
+- next-step-only remote visibility
+- deterministic destination harvest in ascending source-shard order
+- direct proofs for destination-time `Closed`, unknown-target, and
+  destination-mailbox-`Full` outcomes
+- one user-shaped two-shard dispatcher/worker workload on the preferred 021
+  surface
+- direct cross-shard request/reply causality proof
+- deterministic repeated-run proof in the live runtime
+- first-class multi-shard replay artifact in the simulator
+
+What is still intentionally *not* part of this Galileo closeout:
+
+- full upstream-style peer quarantine / shard-restarted broadcast semantics
+- cross-shard spawn placement or cross-shard supervision
+- adversarial cross-shard perturbation/checker work
+- substrate concurrency / monoio / io_uring work
+
+That is a good stopping boundary. The current implementation is already an
+honest, reviewable multi-shard semantic runtime/simulator pair without
+pretending the later shard-liveness story has landed too.

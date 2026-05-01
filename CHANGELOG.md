@@ -218,6 +218,53 @@ This file records completed work.
   pending TCP completion capacity, plus `TcpCompletionFaultMode` for seeded
   delayed-completion and ready-batch reordering perturbation.
 - Extended replay artifacts with captured peer-visible TCP output.
+
+### Phase Galileo
+
+- Added additive multi-shard coordinator shells:
+  - `tina_runtime::MultiShardRuntime`
+  - `tina_sim::MultiShardSimulator`
+- Added global explicit-step coordination in ascending shard-id order with:
+  - global `try_send(addr, msg)` routed by `addr.shard()`
+  - explicit root placement by shard
+  - destination harvest before each destination shard's handler snapshot
+  - next-step-only cross-shard visibility
+- Added shared global event-id and call-id allocation across sibling shards.
+- Added bounded shard-pair cross-shard transport with deterministic source-side
+  `Full` rejection and no hidden overflow queue.
+- Added deterministic cross-shard harvest rules:
+  - ascending source-shard order per destination
+  - FIFO within one shard-pair queue
+  - drain-one-channel-to-empty before moving to the next source
+- Added explicit source-time vs destination-time semantics for cross-shard
+  delivery:
+  - source-side `SendAccepted` / `SendRejected` describe transport admission
+  - destination harvest records `MailboxAccepted` or destination-local
+    `SendRejected` as an observability extension
+- Added direct runtime and simulator proofs for:
+  - global ingress routing
+  - next-step-only remote visibility
+  - shard-pair queue overflow
+  - stopped/closed remote target rejection
+  - unknown remote isolate rejection
+  - destination mailbox full on harvest
+  - FIFO from one source
+  - deterministic multi-source harvest order
+- Added a user-shaped two-shard dispatcher/worker workload on the preferred 021
+  surface:
+  - cross-shard request from coordinator to worker
+  - cross-shard reply from worker back to coordinator
+  - visible user-path `SendRejectedReason::Full`
+  - deterministic repeated-run proof in the live runtime
+- Added multi-shard simulator replay support:
+  - `MultiShardSimulator::run_until_quiescent()`
+  - `MultiShardSimulator::replay_artifact()`
+  - `MultiShardReplayArtifact`
+  - replay-style proof that rerunning from the saved configs reproduces the
+    same multi-shard event record and workload output
+- Documented the current Galileo boundary honestly: full upstream-style
+  peer-quarantine / shard-restarted semantics remain later work, not silently
+  bundled into this first multi-shard slice.
 - Added simulator proofs for TCP parity and replay: one-client echo,
   bounded-overlap echo, partial read/write drain behavior, invalid-resource
   failures, listener-close cancellation, stopped-requester rejection,
