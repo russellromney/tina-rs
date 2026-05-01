@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 tina = { path = "../tina" }
 tina-runtime-current = { path = "../tina-runtime-current" }
+tina-supervisor = { path = "../tina-supervisor" }

@@ -125,7 +125,13 @@ fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
 #[test]
 fn timer_does_not_fire_early() {
     let observations = Rc::new(RefCell::new(Vec::new()));
-    let mut sim = Simulator::new(TestShard, SimulatorConfig { seed: 7 });
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 7,
+            ..Default::default()
+        },
+    );
     let sleeper = sim.register(Sleeper {
         delay: Duration::from_millis(10),
         observations: Rc::clone(&observations),
@@ -143,7 +149,13 @@ fn timer_does_not_fire_early() {
 #[test]
 fn timer_fires_once_after_due_time() {
     let observations = Rc::new(RefCell::new(Vec::new()));
-    let mut sim = Simulator::new(TestShard, SimulatorConfig { seed: 11 });
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 11,
+            ..Default::default()
+        },
+    );
     let sleeper = sim.register(Sleeper {
         delay: Duration::from_millis(10),
         observations: Rc::clone(&observations),
@@ -163,7 +175,13 @@ fn timer_fires_once_after_due_time() {
 #[test]
 fn timers_wake_in_due_time_order() {
     let log = Rc::new(RefCell::new(Vec::new()));
-    let mut sim = Simulator::new(TestShard, SimulatorConfig { seed: 3 });
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 3,
+            ..Default::default()
+        },
+    );
     let slow = sim.register(OrderingSleeper {
         label: "slow",
         delay: Duration::from_millis(15),
@@ -190,7 +208,13 @@ fn timers_wake_in_due_time_order() {
 #[test]
 fn equal_deadline_timers_wake_in_request_order() {
     let log = Rc::new(RefCell::new(Vec::new()));
-    let mut sim = Simulator::new(TestShard, SimulatorConfig { seed: 5 });
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 5,
+            ..Default::default()
+        },
+    );
     let first = sim.register(OrderingSleeper {
         label: "first",
         delay: Duration::from_millis(10),
@@ -211,9 +235,53 @@ fn equal_deadline_timers_wake_in_request_order() {
 }
 
 #[test]
+fn equal_deadline_timers_preserve_request_order_when_registration_order_differs() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 17,
+            ..Default::default()
+        },
+    );
+    let registered_first = sim.register(OrderingSleeper {
+        label: "registered-first",
+        delay: Duration::from_millis(10),
+        log: Rc::clone(&log),
+    });
+    let registered_second = sim.register(OrderingSleeper {
+        label: "registered-second",
+        delay: Duration::from_millis(20),
+        log: Rc::clone(&log),
+    });
+    sim.try_send(registered_second, OrderingMsg::Start).unwrap();
+    assert_eq!(sim.step(), 1);
+
+    sim.advance_time(Duration::from_millis(10));
+    sim.try_send(registered_first, OrderingMsg::Start).unwrap();
+    assert_eq!(sim.step(), 1);
+
+    sim.advance_time(Duration::from_millis(10));
+    assert_eq!(sim.step(), 1);
+    assert_eq!(log.borrow().as_slice(), ["registered-second"]);
+
+    assert_eq!(sim.step(), 1);
+    assert_eq!(
+        log.borrow().as_slice(),
+        ["registered-second", "registered-first"]
+    );
+}
+
+#[test]
 fn stopped_requester_rejects_timer_completion() {
     let observations = Rc::new(RefCell::new(Vec::new()));
-    let mut sim = Simulator::new(TestShard, SimulatorConfig { seed: 9 });
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 9,
+            ..Default::default()
+        },
+    );
     let sleeper = sim.register(Sleeper {
         delay: Duration::from_millis(10),
         observations: Rc::clone(&observations),
@@ -240,7 +308,13 @@ fn stopped_requester_rejects_timer_completion() {
 fn same_config_reproduces_same_event_record() {
     fn run(seed: u64) -> Vec<RuntimeEvent> {
         let observations = Rc::new(RefCell::new(Vec::new()));
-        let mut sim = Simulator::new(TestShard, SimulatorConfig { seed });
+        let mut sim = Simulator::new(
+            TestShard,
+            SimulatorConfig {
+                seed,
+                ..Default::default()
+            },
+        );
         let sleeper = sim.register(Sleeper {
             delay: Duration::from_millis(4),
             observations,

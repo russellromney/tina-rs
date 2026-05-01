@@ -142,18 +142,55 @@ Those tests do not just run live histories twice; they also replay the runtime
 trace and prove the trace can recover the same worker completions and restart
 outcomes that the live workload observed.
 
-There is not yet a simulator or Tokio bridge. The runtime-owned call
-contract is substrate-neutral by design so the first deterministic
-simulator slice (`tina-sim`) can implement the same vocabulary against
-virtual time and replay without redefining `tina`.
+There is not yet a Tokio bridge. The runtime-owned call contract is
+substrate-neutral by design so `tina-sim` can implement the same
+vocabulary against virtual time and replay without redefining `tina`.
 
 `tina-sim` is intentionally still narrower than the live runtime. Today
 it is a single-shard virtual-time simulator for the shipped
-`Sleep { after }` / `TimerFired` call contract. It reuses the live
-runtime event vocabulary, captures replay artifacts containing
-config/event-record/final-virtual-time, and proves a timer-driven
-retry/backoff workload under virtual time. It does not simulate TCP,
-spawn, supervision, faults, or multi-shard semantics yet.
+`Sleep { after }` / `TimerFired` call contract plus the simplest seeded
+perturbation layer over simulator-owned surfaces:
+
+- local-send delivery may be held back by one additional delivery round
+- timer wake delivery may be delayed in virtual time
+
+The simulator reuses the live runtime event vocabulary, captures replay
+artifacts containing config/event-record/final-virtual-time and optional
+checker failure, and now supports a small checker surface that can halt a
+run with a structured reason. Proof workloads cover both timer-driven
+retry/backoff under seeded timer perturbation and a deliberate-bug
+harness under seeded local-send perturbation. Replay artifacts reproduce
+against the same workload binary and simulator version; they do not serialize
+arbitrary isolate values, spawn factories, or bootstrap closures.
+
+`tina-sim` also executes the single-shard spawn and supervision surface that
+Mariner already shipped live: `SpawnSpec`, `RestartableSpawnSpec`,
+runtime-owned parent-child lineage, restartable child records, direct-child
+`RestartChildren`, bootstrap re-delivery after restart, and supervised panic
+restart using `SupervisorConfig` policy/budget state. The proof surface covers
+same-step spawn ordering, all shipped restart policies, non-restartable skip
+events, stale-address send rejection as `Closed`, budget exhaustion,
+multi-restart replay, and direct-child-only restart scope. Spawn/restart paths
+compose additively with 017's seeded fault surfaces, but 018 does not add new
+spawn/restart-specific perturbation.
+
+`tina-sim` now also executes the shipped single-shard TCP call surface through
+scripted virtual listeners and streams: bind, accept, read, write, listener
+close, and stream close. Bind/close still complete inline during dispatch;
+accept/read/write stay pending and complete on later simulator steps through
+the same translated-message path as the live runtime. Scripted listeners report
+deterministic `local_addr`, accepted streams report deterministic `peer_addr`,
+partial reads/writes remain visible through the live `CallResult` shapes, and
+virtual listener queues, peer read buffers, peer output buffers, and pending
+TCP completion queues are explicitly bounded by simulator config rather than
+hidden unbounded buffering. The proof surface now covers one-client echo,
+overlap echo, invalid-resource failures, mailbox-full and stopped-requester
+completion rejection, listener-close cancellation, same-config replay of peer
+output, and checker-backed replay of seeded TCP completion reordering. Replay
+artifacts still reproduce against the same workload binary and simulator
+version; they do not serialize arbitrary isolate values, TCP payload scripts,
+spawn factories, or bootstrap closures. Multi-shard semantics remain out of
+scope.
 
 ## Crate boundaries that must not drift
 

@@ -168,3 +168,67 @@ This file records completed work.
 - Added a simulator-backed retry/backoff proof workload and a replay test
   proving that rerunning from the saved config reproduces the same event
   record exactly.
+- Made `SimulatorConfig.seed` semantically real for the first narrow seeded
+  perturbation surface in `tina-sim`.
+- Added `FaultConfig` / `FaultMode` for seeded perturbation over:
+  - local-send delivery
+  - timer-wake delivery
+- Added a small checker surface in `tina-sim`:
+  - `Checker`
+  - `CheckerDecision`
+  - `CheckerFailure`
+- Extended replay artifacts to preserve optional checker failure information
+  alongside config, final virtual time, and event record.
+- Added a deliberate-bug public-path simulator workload proving that a seeded
+  local-send perturbation can trip a checker, halt the run, and be reproduced
+  exactly from the saved replay artifact config.
+- Added a small structural checker proof over simulator event-id monotonicity.
+- Fixed two simulator semantic bugs uncovered by the new proof surface:
+  - delayed local sends now miss one additional delivery round instead of
+    behaving identically to ordinary handler-emitted sends
+  - `run_until_quiescent()` now continues while future-visible delayed local
+    sends remain pending, instead of stopping early
+- Tightened the timer-fault retry proof so its different-seed divergence claim
+  is stated honestly: the timer-wake perturbation changes replay-visible
+  virtual-time outcome, while the local-send perturbation changes the event
+  record and checker outcome.
+- Extended `tina-sim` with the shipped single-shard spawn and supervision
+  surface:
+  - `SpawnSpec`
+  - `RestartableSpawnSpec`
+  - direct parent-child lineage
+  - restartable child records
+  - direct-child `RestartChildren`
+  - supervised panic restart through `SupervisorConfig`
+- Added simulator proofs for spawn/restart parity: later-step child execution,
+  same-step spawn ordering, bootstrap re-delivery after restart, repeated
+  restart replay, all shipped restart policies, non-restartable skip events,
+  stale-address send rejection as `Closed`, budget exhaustion, direct-child
+  restart scope, and additive compatibility with existing `Spawn = Infallible`
+  timer/fault/checker workloads.
+- Extended `tina-sim` with scripted single-shard TCP simulation for the
+  shipped call family:
+  - `TcpBind`
+  - `TcpAccept`
+  - `TcpRead`
+  - `TcpWrite`
+  - `TcpListenerClose`
+  - `TcpStreamClose`
+- Added explicit simulator config for bounded scripted listeners, peers, and
+  pending TCP completion capacity, plus `TcpCompletionFaultMode` for seeded
+  delayed-completion and ready-batch reordering perturbation.
+- Extended replay artifacts with captured peer-visible TCP output.
+- Added simulator proofs for TCP parity and replay: one-client echo,
+  bounded-overlap echo, partial read/write drain behavior, invalid-resource
+  failures, listener-close cancellation, stopped-requester rejection,
+  mailbox-full completion rejection, same-config peer-output replay, both
+  TCP fault-surface divergence modes, and checker-backed replay of seeded TCP
+  accept reordering.
+- Fixed two simulator driver/scheduler bugs uncovered by the TCP proof
+  surface:
+  - `run_until_quiescent()` and checked replay runs now continue while pending
+    TCP calls remain in flight, instead of stopping early when no timers or
+    visible messages exist yet
+  - seeded TCP delay perturbation now preserves per-resource FIFO by never
+    allowing later completions on the same listener/stream to overtake earlier
+    ones

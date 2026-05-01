@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tina::{Context, Effect, Isolate, SendMessage, Shard, ShardId};
 use tina_runtime_current::{CallKind, CallRequest, CurrentCall, RuntimeEvent, RuntimeEventKind};
-use tina_sim::{ReplayArtifact, Simulator, SimulatorConfig};
+use tina_sim::{FaultConfig, FaultMode, ReplayArtifact, Simulator, SimulatorConfig};
 
 #[derive(Debug, Default)]
 struct TestShard;
@@ -121,7 +121,10 @@ fn run_retry_workload(config: SimulatorConfig) -> (Vec<RetryObservation>, Replay
 
 #[test]
 fn retry_backoff_retries_after_virtual_timer_wake() {
-    let (observations, artifact) = run_retry_workload(SimulatorConfig { seed: 77 });
+    let (observations, artifact) = run_retry_workload(SimulatorConfig {
+        seed: 77,
+        ..Default::default()
+    });
 
     assert_eq!(
         observations,
@@ -159,8 +162,59 @@ fn retry_backoff_retries_after_virtual_timer_wake() {
 
 #[test]
 fn replay_artifact_reproduces_same_event_record() {
-    let (_, artifact) = run_retry_workload(SimulatorConfig { seed: 99 });
-    let (_, replayed) = run_retry_workload(artifact.config());
+    let (_, artifact) = run_retry_workload(SimulatorConfig {
+        seed: 99,
+        ..Default::default()
+    });
+    let (_, replayed) = run_retry_workload(artifact.config().clone());
     assert_eq!(artifact.event_record(), replayed.event_record());
     assert_eq!(artifact.final_time(), replayed.final_time());
+}
+
+#[test]
+fn same_seed_faulted_timer_run_reproduces_same_record() {
+    let config = SimulatorConfig {
+        seed: 1,
+        faults: FaultConfig {
+            timer_wake: FaultMode::DelayBy {
+                one_in: 2,
+                by: Duration::from_millis(7),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (_, first) = run_retry_workload(config.clone());
+    let (_, second) = run_retry_workload(config);
+    assert_eq!(first.event_record(), second.event_record());
+    assert_eq!(first.final_time(), second.final_time());
+}
+
+#[test]
+fn different_seeds_can_diverge_in_virtual_time_on_timer_wake_faults() {
+    let delayed = SimulatorConfig {
+        seed: 1,
+        faults: FaultConfig {
+            timer_wake: FaultMode::DelayBy {
+                one_in: 2,
+                by: Duration::from_millis(7),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let baseline = SimulatorConfig {
+        seed: 0,
+        faults: delayed.faults,
+        ..Default::default()
+    };
+
+    let (_, delayed_artifact) = run_retry_workload(delayed);
+    let (_, baseline_artifact) = run_retry_workload(baseline);
+
+    assert_ne!(
+        delayed_artifact.final_time(),
+        baseline_artifact.final_time(),
+        "different seeds should perturb timer wake timing differently"
+    );
 }
