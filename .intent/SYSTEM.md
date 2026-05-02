@@ -189,6 +189,13 @@ runtime, and later runtimes can share one meaning model.
 - cross-shard queues are bounded and visible
 - source-time queue entry and destination-time delivery are separate
   stages
+- cross-shard send payloads are moved into erased runtime storage at the
+  effect boundary, then moved through the shard-pair queue into the
+  destination mailbox; the core transport does not require user-message
+  cloning
+- the current explicit-step coordinators store cross-shard work in one bounded
+  `VecDeque` per source/destination shard pair; no hidden unbounded overflow
+  queue is part of the model
 - remote messages become visible on the next global step
 - event ids are globally monotonic across shards in a multi-shard run
 - supervision is owned by the parent's shard
