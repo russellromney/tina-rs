@@ -52,8 +52,8 @@ mod trace;
 
 pub use call::{
     CallError, CallId, CallInput, CallOutput, ErasedCall, IntoErasedCall, ListenerId, RuntimeCall,
-    StreamId, TypedCall, sleep, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_read, tcp_write,
+    RuntimeCallParts, SendOutcome, StreamId, TypedCall, send_observed, sleep, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CauseId, EffectKind, EventId, RestartSkippedReason,
@@ -605,7 +605,7 @@ where
                     isolate: isolate_id,
                     generation: self.entries[index].generation,
                 };
-                self.dispatch_call(call, requester, cause);
+                self.dispatch_call(call, requester, cause, route_remote);
                 false
             }
             ErasedEffect::Noop => {
@@ -646,21 +646,61 @@ where
         }
     }
 
-    fn dispatch_call(&mut self, call: ErasedCall, requester: RegisteredAddress, cause: CauseId) {
+    fn dispatch_call(
+        &mut self,
+        call: ErasedCall,
+        requester: RegisteredAddress,
+        cause: CauseId,
+        route_remote: &mut impl FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
+    ) {
         let call_id = self.ids.next_call_id();
-        let call_kind = call.request.kind();
+        let call_kind = match &call.kind {
+            call::ErasedCallKind::Backend { request, .. } => request.kind(),
+            call::ErasedCallKind::ObservedSend { .. } => CallKind::ObservedSend,
+        };
 
-        self.push_event(
+        let attempted = self.push_event(
             requester.isolate,
             Some(cause),
             RuntimeEventKind::CallDispatchAttempted { call_id, call_kind },
         );
 
-        let ErasedCall {
-            request,
-            translator,
-        } = call;
+        match call.kind {
+            call::ErasedCallKind::Backend {
+                request,
+                translator,
+            } => {
+                self.dispatch_backend_call(
+                    call_id,
+                    call_kind,
+                    requester,
+                    attempted.into(),
+                    request,
+                    translator,
+                );
+            }
+            call::ErasedCallKind::ObservedSend { send, translator } => {
+                self.dispatch_observed_send(
+                    call_id,
+                    requester,
+                    attempted.into(),
+                    send,
+                    translator,
+                    route_remote,
+                );
+            }
+        }
+    }
 
+    fn dispatch_backend_call(
+        &mut self,
+        call_id: CallId,
+        call_kind: CallKind,
+        requester: RegisteredAddress,
+        cause: CauseId,
+        request: CallInput,
+        translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
+    ) {
         // Register the translator and in-flight tracking before submission
         // so a synchronous completion (bind / close on Betelgeuse) can be
         // delivered through the same path as async completions.
@@ -690,6 +730,138 @@ where
                 if let Some(immediate) = self.io_backend.submit(call_id, other) {
                     self.deliver_completion(immediate.call_id, immediate.result);
                 }
+            }
+        }
+    }
+
+    fn dispatch_observed_send(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: CauseId,
+        send: ErasedSend,
+        translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+        route_remote: &mut impl FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
+    ) {
+        let target_shard = send.target_shard;
+        let target_isolate = send.target_isolate;
+        let target_generation = send.target_generation;
+        let send_attempted = self.push_event(
+            requester.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard,
+                target_isolate,
+                target_generation,
+            },
+        );
+
+        let delivery = if target_shard == self.shard.id() {
+            self.dispatch_local_send(send)
+        } else {
+            route_remote(self.shard.id(), send, send_attempted.into())
+        };
+
+        let outcome = match delivery {
+            Ok(()) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                    },
+                );
+                SendOutcome::Accepted
+            }
+            Err(reason) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                        reason,
+                    },
+                );
+                SendOutcome::from_rejected(reason)
+            }
+        };
+
+        self.deliver_observed_send_outcome(call_id, requester, cause, outcome, translator);
+    }
+
+    fn deliver_observed_send_outcome(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: CauseId,
+        outcome: SendOutcome,
+        translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+    ) {
+        let call_kind = CallKind::ObservedSend;
+        let message = translator(outcome);
+
+        let entry_index = self.entries.iter().position(|entry| {
+            entry.id == requester.isolate && entry.generation == requester.generation
+        });
+        let Some(entry_index) = entry_index else {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        };
+
+        if self.entries[entry_index].stopped.get() {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        }
+
+        match self.entries[entry_index].mailbox.try_send_boxed(message) {
+            Ok(()) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompleted { call_id, call_kind },
+                );
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind,
+                        reason: CallCompletionRejectedReason::MailboxFull,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind,
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                    },
+                );
             }
         }
     }
@@ -2618,11 +2790,11 @@ where
     }
 }
 
-struct ErasedSend {
-    target_shard: ShardId,
-    target_isolate: IsolateId,
-    target_generation: AddressGeneration,
-    message: ErasedMessage,
+pub(crate) struct ErasedSend {
+    pub(crate) target_shard: ShardId,
+    pub(crate) target_isolate: IsolateId,
+    pub(crate) target_generation: AddressGeneration,
+    pub(crate) message: ErasedMessage,
 }
 
 struct QueuedRemoteSend {
@@ -2662,7 +2834,7 @@ impl SendableQueuedRemoteSend {
     }
 }
 
-enum ErasedMessage {
+pub(crate) enum ErasedMessage {
     Local(Box<dyn Any>),
     Sendable(Box<dyn Any + Send>),
 }

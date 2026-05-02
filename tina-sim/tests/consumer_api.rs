@@ -8,7 +8,7 @@ use tina::{
 };
 use tina_runtime::{
     CallInput, CallKind, CallOutput, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    StreamId,
+    SendOutcome, StreamId, send_observed,
 };
 use tina_sim::{
     ObservedPeerOutput, ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, Simulator,
@@ -273,6 +273,115 @@ fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
             )
         })
         .count()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedTargetMsg {
+    Work,
+    Stop,
+}
+
+#[derive(Debug)]
+struct ObservedTarget;
+
+impl Isolate for ObservedTarget {
+    type Message = ObservedTargetMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<ObservedTargetMsg>;
+    type Shard = ConsumerShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ObservedTargetMsg::Work => Effect::Noop,
+            ObservedTargetMsg::Stop => Effect::Stop,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservedSenderMsg {
+    Start(Address<ObservedTargetMsg>),
+    SendFinished(SendOutcome),
+}
+
+#[derive(Debug)]
+struct ObservedSender {
+    outcomes: Arc<Mutex<Vec<SendOutcome>>>,
+}
+
+impl Isolate for ObservedSender {
+    type Message = ObservedSenderMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<ObservedSenderMsg>;
+    type Shard = ConsumerShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ObservedSenderMsg::Start(target) => send_observed(target, ObservedTargetMsg::Work)
+                .reply(ObservedSenderMsg::SendFinished),
+            ObservedSenderMsg::SendFinished(outcome) => {
+                self.outcomes
+                    .lock()
+                    .expect("observed outcomes mutex")
+                    .push(outcome);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[test]
+fn downstream_consumer_can_replay_observed_send_outcomes() {
+    for (target_capacity, stop_first, expected) in [
+        (1, false, SendOutcome::Accepted),
+        (0, false, SendOutcome::Full),
+        (1, true, SendOutcome::Closed),
+    ] {
+        let (outcomes, first) = run_observed_send_scenario(target_capacity, stop_first);
+        let (replayed_outcomes, replayed) = run_observed_send_scenario(target_capacity, stop_first);
+
+        assert_eq!(outcomes.as_slice(), [expected]);
+        assert_eq!(replayed_outcomes, outcomes);
+        assert_eq!(
+            count_call_completed(first.event_record(), CallKind::ObservedSend),
+            1
+        );
+        assert_eq!(first.event_record(), replayed.event_record());
+    }
+}
+
+fn run_observed_send_scenario(
+    target_capacity: usize,
+    stop_first: bool,
+) -> (Vec<SendOutcome>, tina_sim::ReplayArtifact) {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
+    let target = sim.register_with_mailbox_capacity(ObservedTarget, target_capacity);
+    let sender = sim.register_with_mailbox_capacity(
+        ObservedSender {
+            outcomes: Arc::clone(&outcomes),
+        },
+        8,
+    );
+
+    if stop_first {
+        sim.try_send(target, ObservedTargetMsg::Stop)
+            .expect("stop target");
+        sim.run_until_quiescent();
+    }
+
+    sim.try_send(sender, ObservedSenderMsg::Start(target))
+        .expect("start observed send");
+    sim.run_until_quiescent();
+
+    (
+        outcomes.lock().expect("observed outcomes mutex").clone(),
+        sim.replay_artifact(),
+    )
 }
 
 fn run_consumer_workload(config: SimulatorConfig) -> tina_sim::ReplayArtifact {

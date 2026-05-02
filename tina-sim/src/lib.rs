@@ -56,8 +56,8 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutput, EffectKind,
-    ListenerId, RestartSkippedReason, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    SendRejectedReason, SupervisionRejectedReason,
+    ListenerId, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
+    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -620,11 +620,39 @@ where
         Effect::Stop => ErasedEffect::Stop,
         Effect::RestartChildren => ErasedEffect::RestartChildren,
         Effect::Call(call) => {
-            let (request, translator) = call.into_parts();
-            ErasedEffect::Call(ErasedCall {
-                request,
-                translator: Box::new(move |result| Box::new(translator(result)) as Box<dyn Any>),
-            })
+            let call = match call.into_runtime_parts() {
+                RuntimeCallParts::Backend {
+                    request,
+                    translator,
+                } => ErasedCall {
+                    kind: ErasedCallKind::Backend {
+                        request,
+                        translator: Box::new(move |result| {
+                            Box::new(translator(result)) as Box<dyn Any>
+                        }),
+                    },
+                },
+                RuntimeCallParts::ObservedSend {
+                    target_shard,
+                    target_isolate,
+                    target_generation,
+                    message,
+                    translator,
+                } => ErasedCall {
+                    kind: ErasedCallKind::ObservedSend {
+                        send: ErasedSend {
+                            target_shard,
+                            target_isolate,
+                            target_generation,
+                            message,
+                        },
+                        translator: Box::new(move |outcome| {
+                            Box::new(translator(outcome)) as Box<dyn Any>
+                        }),
+                    },
+                },
+            };
+            ErasedEffect::Call(call)
         }
         Effect::Batch(effects) => ErasedEffect::Batch(
             effects
@@ -709,8 +737,18 @@ struct QueuedRemoteSend {
 }
 
 struct ErasedCall {
-    request: CallInput,
-    translator: ErasedTranslator,
+    kind: ErasedCallKind,
+}
+
+enum ErasedCallKind {
+    Backend {
+        request: CallInput,
+        translator: ErasedTranslator,
+    },
+    ObservedSend {
+        send: ErasedSend,
+        translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+    },
 }
 
 struct SpawnOutcome<S>
@@ -1280,7 +1318,7 @@ where
                     isolate: isolate_id,
                     generation: self.entries[index].generation,
                 };
-                self.dispatch_call(call, requester, cause);
+                self.dispatch_call(call, requester, cause, route_remote);
                 false
             }
             ErasedEffect::Noop => {
@@ -1684,19 +1722,55 @@ where
         call: ErasedCall,
         requester: RegisteredAddress,
         cause: tina_runtime::CauseId,
+        route_remote: &mut impl FnMut(
+            ShardId,
+            ErasedSend,
+            tina_runtime::CauseId,
+        ) -> Result<(), SendRejectedReason>,
     ) {
         let call_id = self.ids.next_call_id();
-        let call_kind = call_kind(&call.request);
-        self.push_event(
+        let call_kind = match &call.kind {
+            ErasedCallKind::Backend { request, .. } => call_kind(request),
+            ErasedCallKind::ObservedSend { .. } => CallKind::ObservedSend,
+        };
+        let attempted = self.push_event(
             requester.isolate,
             Some(cause),
             RuntimeEventKind::CallDispatchAttempted { call_id, call_kind },
         );
 
-        let ErasedCall {
-            request,
-            translator,
-        } = call;
+        match call.kind {
+            ErasedCallKind::Backend {
+                request,
+                translator,
+            } => self.dispatch_backend_call(
+                call_id,
+                call_kind,
+                requester,
+                attempted.into(),
+                request,
+                translator,
+            ),
+            ErasedCallKind::ObservedSend { send, translator } => self.dispatch_observed_send(
+                call_id,
+                requester,
+                attempted.into(),
+                send,
+                translator,
+                route_remote,
+            ),
+        }
+    }
+
+    fn dispatch_backend_call(
+        &mut self,
+        call_id: CallId,
+        call_kind: CallKind,
+        requester: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+        request: CallInput,
+        translator: ErasedTranslator,
+    ) {
         self.in_flight_calls.push(InFlightCall {
             call_id,
             call_kind,
@@ -1732,6 +1806,72 @@ where
             }
             CallInput::TcpStreamClose { stream } => self.handle_tcp_stream_close(call_id, stream),
         }
+    }
+
+    fn dispatch_observed_send(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+        send: ErasedSend,
+        translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+        route_remote: &mut impl FnMut(
+            ShardId,
+            ErasedSend,
+            tina_runtime::CauseId,
+        ) -> Result<(), SendRejectedReason>,
+    ) {
+        let target_shard = send.target_shard;
+        let target_isolate = send.target_isolate;
+        let target_generation = send.target_generation;
+        let send_attempted = self.push_event(
+            requester.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard,
+                target_isolate,
+                target_generation,
+            },
+        );
+
+        let delivery = if target_shard == self.shard.id() {
+            self.dispatch_local_send(send)
+        } else {
+            route_remote(self.shard.id(), send, send_attempted.into())
+        };
+
+        let outcome = match delivery {
+            Ok(()) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                    },
+                );
+                SendOutcome::Accepted
+            }
+            Err(reason) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                        reason,
+                    },
+                );
+                match reason {
+                    SendRejectedReason::Full => SendOutcome::Full,
+                    SendRejectedReason::Closed => SendOutcome::Closed,
+                }
+            }
+        };
+
+        self.deliver_observed_send_outcome(call_id, requester, cause, outcome, translator);
     }
 
     fn handle_tcp_bind(&mut self, call_id: CallId, addr: SocketAddr) {
@@ -2213,6 +2353,82 @@ where
 
     fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
         self.deliver_completion_at(call_id, result, self.step_ordinal);
+    }
+
+    fn deliver_observed_send_outcome(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+        outcome: SendOutcome,
+        translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+    ) {
+        let call_kind = CallKind::ObservedSend;
+        let message = translator(outcome);
+
+        let entry_index = self.entries.iter().position(|entry| {
+            entry.id == requester.isolate && entry.generation == requester.generation
+        });
+        let Some(entry_index) = entry_index else {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        };
+
+        if self.entries[entry_index].stopped.get() {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        }
+
+        match self.entries[entry_index]
+            .inbox
+            .push(message, self.step_ordinal)
+        {
+            Ok(()) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompleted { call_id, call_kind },
+                );
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind,
+                        reason: CallCompletionRejectedReason::MailboxFull,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind,
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                    },
+                );
+            }
+        }
     }
 
     fn deliver_completion_at(&mut self, call_id: CallId, result: CallOutput, visible_at_step: u64) {

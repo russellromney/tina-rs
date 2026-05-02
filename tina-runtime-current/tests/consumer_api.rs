@@ -8,7 +8,7 @@ use std::time::Duration;
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallError, CallInput, CallKind, CallOutput, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, sleep,
+    RuntimeEventKind, SendOutcome, send_observed, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -148,6 +148,103 @@ fn downstream_consumer_can_use_runtime_timer_helper_end_to_end() {
 
     assert_eq!(observations.borrow().as_slice(), ["slept"]);
     assert_eq!(count_call_completed(runtime.trace(), CallKind::Sleep), 1);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedTargetEvent {
+    Work,
+    Stop,
+}
+
+#[derive(Debug)]
+struct ObservedTarget;
+
+impl Isolate for ObservedTarget {
+    tina::isolate_types! {
+        message: ObservedTargetEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: ConsumerShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ObservedTargetEvent::Work => noop(),
+            ObservedTargetEvent::Stop => stop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservedSenderEvent {
+    Start(Address<ObservedTargetEvent>),
+    SendFinished(SendOutcome),
+}
+
+#[derive(Debug)]
+struct ObservedSender {
+    outcomes: Rc<RefCell<Vec<SendOutcome>>>,
+}
+
+impl Isolate for ObservedSender {
+    tina::isolate_types! {
+        message: ObservedSenderEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<ObservedSenderEvent>,
+        shard: ConsumerShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ObservedSenderEvent::Start(target) => send_observed(target, ObservedTargetEvent::Work)
+                .reply(ObservedSenderEvent::SendFinished),
+            ObservedSenderEvent::SendFinished(outcome) => {
+                self.outcomes.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn downstream_consumer_can_observe_send_accepted_full_and_closed() {
+    for (target_capacity, stop_first, expected) in [
+        (1, false, SendOutcome::Accepted),
+        (0, false, SendOutcome::Full),
+        (1, true, SendOutcome::Closed),
+    ] {
+        let outcomes = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
+        let target = runtime.register_with_capacity(ObservedTarget, target_capacity);
+        let sender = runtime.register_with_capacity(
+            ObservedSender {
+                outcomes: Rc::clone(&outcomes),
+            },
+            8,
+        );
+
+        if stop_first {
+            runtime
+                .try_send(target, ObservedTargetEvent::Stop)
+                .expect("stop target");
+            drive(&mut runtime);
+        }
+
+        runtime
+            .try_send(sender, ObservedSenderEvent::Start(target))
+            .expect("start observed send");
+        drive(&mut runtime);
+
+        assert_eq!(outcomes.borrow().as_slice(), [expected]);
+        assert_eq!(
+            count_call_completed(runtime.trace(), CallKind::ObservedSend),
+            1
+        );
+    }
 }
 
 #[derive(Debug, Clone)]

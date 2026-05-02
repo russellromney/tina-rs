@@ -32,6 +32,8 @@ use std::any::Any;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tina::{Address, AddressGeneration, IsolateId, ShardId};
+
 /// Stable identifier for one runtime-issued call.
 ///
 /// The runtime assigns `CallId`s in submission order, starting at `1`.
@@ -240,6 +242,33 @@ pub enum CallError {
     Unsupported,
 }
 
+/// User-visible outcome for an observed send.
+///
+/// Ordinary [`tina::send`] stays fire-and-forget. This outcome is only
+/// produced by [`send_observed`], for code that needs explicit overload
+/// policy in normal isolate message flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SendOutcome {
+    /// The runtime accepted the send into the destination mailbox or, for a
+    /// remote shard, into the bounded transport toward that shard.
+    Accepted,
+
+    /// The destination mailbox or bounded transport was full.
+    Full,
+
+    /// The destination was closed, stale, or otherwise no longer live.
+    Closed,
+}
+
+impl SendOutcome {
+    pub(crate) fn from_rejected(reason: crate::trace::SendRejectedReason) -> Self {
+        match reason {
+            crate::trace::SendRejectedReason::Full => Self::Full,
+            crate::trace::SendRejectedReason::Closed => Self::Closed,
+        }
+    }
+}
+
 /// Backend-neutral runtime-owned call request issued by an isolate.
 ///
 /// The translator turns the runtime's later [`CallOutput`] back into one
@@ -252,8 +281,21 @@ pub enum CallError {
 /// non-`Clone` `FnOnce`.
 #[must_use = "a call request has no effect until a runtime executes it"]
 pub struct RuntimeCall<M> {
-    request: CallInput,
-    translator: Box<dyn FnOnce(CallOutput) -> M>,
+    kind: RuntimeCallKind<M>,
+}
+
+enum RuntimeCallKind<M> {
+    Backend {
+        request: CallInput,
+        translator: Box<dyn FnOnce(CallOutput) -> M>,
+    },
+    ObservedSend {
+        target_shard: ShardId,
+        target_isolate: IsolateId,
+        target_generation: AddressGeneration,
+        message: Box<dyn Any + Send>,
+        translator: Box<dyn FnOnce(SendOutcome) -> M>,
+    },
 }
 
 impl<M> RuntimeCall<M> {
@@ -269,8 +311,32 @@ impl<M> RuntimeCall<M> {
         F: FnOnce(CallOutput) -> M + 'static,
     {
         Self {
-            request,
-            translator: Box::new(translator),
+            kind: RuntimeCallKind::Backend {
+                request,
+                translator: Box::new(translator),
+            },
+        }
+    }
+
+    /// Creates a runtime-observed send request.
+    ///
+    /// The runtime attempts the send and later delivers one [`SendOutcome`]
+    /// through `translator`. This preserves Tina's effect-returning handler
+    /// model: the current handler turn still returns a description of work,
+    /// and overload feedback comes back as an ordinary later message.
+    pub fn observed_send<T, F>(destination: Address<T>, message: T, translator: F) -> Self
+    where
+        T: Send + 'static,
+        F: FnOnce(SendOutcome) -> M + 'static,
+    {
+        Self {
+            kind: RuntimeCallKind::ObservedSend {
+                target_shard: destination.shard(),
+                target_isolate: destination.isolate(),
+                target_generation: destination.generation(),
+                message: Box::new(message),
+                translator: Box::new(translator),
+            },
         }
     }
 
@@ -288,20 +354,94 @@ impl<M> RuntimeCall<M> {
 
     /// Returns a shared reference to the underlying request.
     pub fn request(&self) -> &CallInput {
-        &self.request
+        match &self.kind {
+            RuntimeCallKind::Backend { request, .. } => request,
+            RuntimeCallKind::ObservedSend { .. } => {
+                panic!("observed send does not carry a backend CallInput")
+            }
+        }
     }
 
     /// Splits the call into its request and translator.
     pub fn into_parts(self) -> (CallInput, Box<dyn FnOnce(CallOutput) -> M>) {
-        (self.request, self.translator)
+        match self.kind {
+            RuntimeCallKind::Backend {
+                request,
+                translator,
+            } => (request, translator),
+            RuntimeCallKind::ObservedSend { .. } => {
+                panic!("observed send does not carry backend call parts")
+            }
+        }
     }
+
+    /// Splits this call into the runtime action it describes.
+    ///
+    /// This is primarily for sibling runtime/simulator crates that need to
+    /// interpret `RuntimeCall` without depending on private fields.
+    #[doc(hidden)]
+    pub fn into_runtime_parts(self) -> RuntimeCallParts<M> {
+        match self.kind {
+            RuntimeCallKind::Backend {
+                request,
+                translator,
+            } => RuntimeCallParts::Backend {
+                request,
+                translator,
+            },
+            RuntimeCallKind::ObservedSend {
+                target_shard,
+                target_isolate,
+                target_generation,
+                message,
+                translator,
+            } => RuntimeCallParts::ObservedSend {
+                target_shard,
+                target_isolate,
+                target_generation,
+                message,
+                translator,
+            },
+        }
+    }
+}
+
+/// Publicly destructurable runtime action carried by [`RuntimeCall`].
+#[doc(hidden)]
+pub enum RuntimeCallParts<M> {
+    /// Backend-owned I/O/time request.
+    Backend {
+        /// Concrete backend request.
+        request: CallInput,
+        /// Completion translator.
+        translator: Box<dyn FnOnce(CallOutput) -> M>,
+    },
+    /// Runtime-observed send request.
+    ObservedSend {
+        /// Destination shard.
+        target_shard: ShardId,
+        /// Destination isolate.
+        target_isolate: IsolateId,
+        /// Destination generation.
+        target_generation: AddressGeneration,
+        /// Erased message payload.
+        message: Box<dyn Any + Send>,
+        /// Outcome translator.
+        translator: Box<dyn FnOnce(SendOutcome) -> M>,
+    },
 }
 
 impl<M> std::fmt::Debug for RuntimeCall<M> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RuntimeCall")
-            .field("request", &self.request)
+            .field(
+                "kind",
+                &match &self.kind {
+                    RuntimeCallKind::Backend { request, .. } => request.kind(),
+                    RuntimeCallKind::ObservedSend { .. } => crate::trace::CallKind::ObservedSend,
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -314,15 +454,37 @@ impl<M> std::fmt::Debug for RuntimeCall<M> {
 /// trait. The struct is exposed publicly only to make the trait method
 /// signature visible; it is not constructible from outside this crate.
 pub struct ErasedCall {
-    pub(crate) request: CallInput,
-    pub(crate) translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
+    pub(crate) kind: ErasedCallKind,
+}
+
+pub(crate) enum ErasedCallKind {
+    /// Runtime-owned I/O/time call executed by a backend.
+    Backend {
+        /// Concrete backend request.
+        request: CallInput,
+        /// Completion translator erased to `Any`.
+        translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
+    },
+    /// Runtime-observed send attempt.
+    ObservedSend {
+        /// Erased outbound message to attempt.
+        send: crate::ErasedSend,
+        /// Outcome translator erased to `Any`.
+        translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+    },
 }
 
 impl std::fmt::Debug for ErasedCall {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ErasedCall")
-            .field("request", &self.request)
+            .field(
+                "kind",
+                &match &self.kind {
+                    ErasedCallKind::Backend { request, .. } => request.kind(),
+                    ErasedCallKind::ObservedSend { .. } => crate::trace::CallKind::ObservedSend,
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -351,10 +513,37 @@ where
     M: 'static,
 {
     fn into_erased_call(self) -> ErasedCall {
-        let (request, translator) = self.into_parts();
-        ErasedCall {
-            request,
-            translator: Box::new(move |result| Box::new(translator(result)) as Box<dyn Any>),
+        match self.into_runtime_parts() {
+            RuntimeCallParts::Backend {
+                request,
+                translator,
+            } => ErasedCall {
+                kind: ErasedCallKind::Backend {
+                    request,
+                    translator: Box::new(move |result| {
+                        Box::new(translator(result)) as Box<dyn Any>
+                    }),
+                },
+            },
+            RuntimeCallParts::ObservedSend {
+                target_shard,
+                target_isolate,
+                target_generation,
+                message,
+                translator,
+            } => ErasedCall {
+                kind: ErasedCallKind::ObservedSend {
+                    send: crate::ErasedSend {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                        message: crate::ErasedMessage::Sendable(message),
+                    },
+                    translator: Box::new(move |outcome| {
+                        Box::new(translator(outcome)) as Box<dyn Any>
+                    }),
+                },
+            },
         }
     }
 }
@@ -437,6 +626,53 @@ impl CallOutput {
 pub struct TypedCall<T> {
     request: CallInput,
     decode: fn(CallOutput) -> Result<T, CallError>,
+}
+
+/// Prepared observed-send helper returned by [`send_observed`].
+#[doc(hidden)]
+pub struct ObservedSend<T> {
+    destination: Address<T>,
+    message: T,
+}
+
+impl<T> ObservedSend<T>
+where
+    T: Send + 'static,
+{
+    fn new(destination: Address<T>, message: T) -> Self {
+        Self {
+            destination,
+            message,
+        }
+    }
+
+    /// Turns this prepared observed send into one ordinary later message.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(SendOutcome) -> M + 'static,
+        M: 'static,
+    {
+        tina::Effect::Call(RuntimeCall::observed_send(
+            self.destination,
+            self.message,
+            translator,
+        ))
+    }
+}
+
+/// Returns a helper that attempts one send and later reports its outcome.
+///
+/// This is the overload-aware companion to ordinary fire-and-forget
+/// [`tina::send`]. For cross-shard sends, [`SendOutcome::Accepted`] means the
+/// source shard accepted the message into bounded transport toward the target
+/// shard; destination-local mailbox failure is still recorded on the
+/// destination trace.
+pub fn send_observed<T>(destination: Address<T>, message: T) -> ObservedSend<T>
+where
+    T: Send + 'static,
+{
+    ObservedSend::new(destination, message)
 }
 
 impl<T> TypedCall<T> {

@@ -95,6 +95,10 @@ pub enum CallKind {
 
     /// A one-shot relative sleep timer.
     Sleep,
+
+    /// A runtime-observed send attempt whose outcome is delivered back to
+    /// the requester as an ordinary later message.
+    ObservedSend,
 }
 
 /// Why a runtime-owned call's completion could not be delivered to the
