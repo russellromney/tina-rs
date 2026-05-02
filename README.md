@@ -25,16 +25,18 @@ This repo is a Cargo workspace. Today it has five crates:
 - **`tina`** — trait crate. `Isolate`, `Mailbox`, `Address`, `ChildDefinition`, `Outbound`, and the common helpers in `tina::prelude::*`.
 - **`tina-mailbox-spsc`** — bounded single-producer/single-consumer mailbox implementation.
 - **`tina-supervisor`** — supervisor policy/config types.
-- **`tina-runtime`** — explicit-step runtime with trace events, single-shard and multi-shard runners, bounded send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, and supervised panic restart.
+- **`tina-runtime`** — explicit-step runtime with trace events, single-shard and multi-shard runners, bounded send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, supervised panic restart, and the first worker-owned threaded runtime substrate.
 - **`tina-sim`** — deterministic simulator with virtual time, replay records, seeded delays/reordering, checker failures, scripted TCP simulation, and the same single-shard / multi-shard model.
 
-Real parallel thread-per-core execution and the Tokio bridge still have their
-own place on the roadmap. See [ROADMAP.md](ROADMAP.md).
+The first worker-per-shard runtime substrate exists for selected workloads.
+The Tokio bridge and production hardening still have their own place on the
+roadmap. See [ROADMAP.md](ROADMAP.md).
 
 > tina-rs is **experimental**. The core types, bounded SPSC mailbox,
 > supervisor config, explicit-step runtime, multi-shard runner, and
-> deterministic simulator are here. The production runtime is still in flight.
-> The API will change.
+> deterministic simulator are here. A first threaded runtime substrate is here
+> too. Production hardening and the public release contract are still in
+> flight. The API will change.
 
 ## Why this exists
 
@@ -50,7 +52,7 @@ The default async tools in Rust make it easy to write a server that works fine o
 - **One state machine per unit.** Each tenant, connection, worker, or protocol role is a typed struct (an `Isolate`) with one message type and one queue.
 - **Handlers are synchronous and return descriptions of work.** `fn handle(msg) -> Effect`. The handler never does I/O; it returns a value like "send this message" or "spawn this child" or "stop me." The runtime executes the description.
 - **Queues are bounded with explicit `Full` and `Closed` errors.** Backpressure is something the application sees and handles, not a leak that builds quietly.
-- **Shard-owned execution.** Each shard owns its isolates, timers, runtime resources, and cross-shard queues. The current crates prove this with an explicit-step model; the production thread-per-core runtime comes later.
+- **Shard-owned execution.** Each shard owns its isolates, timers, runtime resources, and cross-shard queues. The explicit-step runtime is the semantic oracle, and the first threaded substrate runs one worker-owned runtime per shard.
 - **The whole runtime is replayable.** Because handlers are descriptions and the runtime is the only thing that touches I/O or time, a test harness can drive the system from a seed and reproduce any failure.
 
 None of this is new: Erlang, Akka, and [Seastar](https://seastar.io/) all do versions of it. `tina-rs` is these patterns expressed as Rust traits and a small set of impl crates.
@@ -145,7 +147,7 @@ The rules fit on one page:
 
 | Idea | What it means | Why |
 |------|---------------|-----|
-| **Shard-owned execution** | A shard owns its isolates, timers, runtime resources, and cross-shard queues. The current runtime proves this with an explicit-step model; real thread-per-core execution comes later. | Work has an owner. The model does not depend on hidden task migration. |
+| **Shard-owned execution** | A shard owns its isolates, timers, runtime resources, and cross-shard queues. The explicit-step runtime is the oracle; the first threaded substrate runs one worker-owned runtime per shard. | Work has an owner. The model does not depend on hidden task migration. |
 | **Isolate-per-entity** | Tenants, connections, sessions, workers, or protocol roles each get a typed state machine. No `Arc<Mutex<…>>` spaghetti. | Local state is local. No lock contention, no false sharing. |
 | **Effect-returning handlers** | Handlers are synchronous: `fn handle(&mut self, msg, ctx) -> Effect`. The runtime executes the effect. | Pure-ish handlers are deterministic. Determinism enables simulation. |
 | **Bounded queues** | Mailboxes and cross-shard queues have capacity. `Full` and `Closed` are explicit outcomes. | Unbounded queues turn spikes into OOMs. |
@@ -157,17 +159,19 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 ## Status
 
 What works today: the trait crate, the bounded SPSC mailbox crate, supervisor
-config, the explicit-step runtime, multi-shard message routing,
-and the deterministic simulator. You can write isolates against the preferred
-public API, exercise real mailbox behavior, run handlers through
-`tina-runtime`, use runtime-owned TCP and runtime-owned time, supervise and
-restart children, route messages across shards, and replay timer-driven,
-TCP-driven, supervised, and multi-shard behavior through `tina-sim`.
+config, the explicit-step runtime, multi-shard message routing, the
+deterministic simulator, and the first threaded runtime substrate. You can
+write isolates against the preferred public API, exercise real mailbox
+behavior, run handlers through `tina-runtime`, use runtime-owned TCP and
+runtime-owned time, supervise and restart children, route messages across
+shards, replay timer-driven, TCP-driven, supervised, and multi-shard behavior
+through `tina-sim`, and run selected workloads on worker-owned runtime threads.
 
-What's coming next is Huygens: systematic DST-style harnessing plus an actual
-shard-owned runtime substrate. The goal is to prove the primitives under
-composed workload pressure and make Tina usable for selected shared-nothing
-Tokio-shaped workloads before release or bridge work.
+The proof regime now includes composed DST-style workloads plus live substrate
+tests: TCP echo / request-response, timer retry, local backpressure, live
+cross-shard request/reply, remote queue `Full`, and bad remote addresses that
+do not poison later good work. Gemini comes next: decide and document the
+release story around the framework that now exists.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 

@@ -320,3 +320,38 @@ This file records completed work.
   `multishard_runtime_path_still_has_allocations_so_the_claim_stays_narrow`,
   and narrowed the runtime allocation claim instead of pretending the whole
   multi-shard runtime path is allocation-free.
+
+### Phase Huygens
+
+- Added the first live shard-owned runtime substrate in `tina-runtime`:
+  - `ThreadedRuntime<S, F>` for one worker-owned shard runtime
+  - `ThreadedMultiShardRuntime<S, F>` for a fixed worker-per-shard runtime set
+  - `ThreadedRuntimeConfig` for bounded command ingress and idle wait tuning
+  - `ThreadedTrySendError`, `ThreadedSendObservedError`, and
+    `ThreadedControlError`
+- Defined `ThreadedRuntime::try_send` as bounded handoff only, so it does not
+  block after admission waiting for the worker to observe mailbox state.
+- Added `ThreadedRuntime::send_and_observe` as the explicit synchronous control
+  path for tests/setup that need mailbox `Full` / `Closed` outcomes.
+- Added live-threaded TCP echo proof:
+  `threaded_runtime_tcp_echo_round_trips_reference_workload`.
+- Added live bounded-ingress proof:
+  `threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker`.
+- Added live single-shard substrate proofs for stopped-target observation,
+  runtime-owned timer retry, and local mailbox `Full` trace visibility.
+- Added live fixed-shard cross-shard substrate proofs for:
+  - request/reply across two OS worker threads
+  - remote destination worker queue `Full` observed at the source
+  - stale remote address rejection without poisoning later good remote work
+- Added sendable erasure for live cross-shard payload transport while keeping
+  the explicit-step runtime one-thread-owned.
+- Changed shared runtime/simulator event and call id allocation to use a
+  cloneable atomic id source so sibling worker runtimes can preserve global
+  monotonic ids.
+- Added composed Huygens DST harness tests covering supervision + timer +
+  local-send perturbation, replayable checker failure, and remote `Full`
+  pressure on the explicit-step oracle.
+- Documented the Huygens claim boundary: live substrate exists for selected
+  workloads, while production hardening, peer quarantine, dynamic shard
+  membership, cross-shard child ownership, Tokio bridge work, and broad
+  allocation-free runtime claims remain future work.

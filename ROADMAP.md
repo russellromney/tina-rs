@@ -134,15 +134,16 @@ phases.
 | **Voyager deterministic simulation** | Planning bucket with reviewed slices delivered in `.intent/phases/016-voyager-virtual-time-and-replay/`, `.intent/phases/017-voyager-seeded-faults-and-checkers/`, `.intent/phases/018-voyager-spawn-and-supervision-simulation/`, and `.intent/phases/019-voyager-single-shard-io-simulation/`. Shipped so far: `tina-sim`, a single-shard virtual-time simulator for the shipped `Sleep { after }` / `TimerFired` contract, deterministic replay artifacts, direct timer-semantics proofs, simulator-backed retry/backoff proof, seeded perturbation over timer-wake and local-send behavior, a small checker surface with replayable failure capture, single-shard spawn/supervision replay covering public spawn payloads, restart policies, stale identity, budget exhaustion, and direct-child scope, and scripted single-shard TCP simulation covering the shipped bind/accept/read/write/close call family plus replayed echo workloads and TCP checker replay. Remaining Voyager work still includes broader PRNG policy, richer faults/checkers, and later multi-slice expansion. |
 | ~~**Galileo multi-shard semantics and simulation**~~ | Delivered in `.intent/phases/020-galileo-multi-shard-semantics-and-simulation/`: multi-shard explicit-step runtime/simulator runners, cross-shard delivery, routing/placement, deterministic traces, replay, source-time vs destination-time delivery stages, seeded simulator composition proofs, and user-shaped dispatcher/TCP/supervision proof workloads. |
 | ~~**Kepler core primitive completion**~~ | Delivered in `.intent/phases/022-kepler-core-primitive-completion/`: sealed the current explicit-step liveness non-signal, proved address-local remote failures do not poison shards, sealed shard-local supervision/restart ownership, pinned ownership/buffering/allocation non-claims, added multi-shard checker/replay pressure, and added user-shaped runtime/simulator e2e proofs. |
-| **Huygens DST harness and runtime substrate** | Next. Systematic composed-workload DST harnessing plus the smallest actual shard-owned runtime substrate that lets users try Tina on selected shared-nothing Tokio-shaped workloads. |
-| **Gemini release story** | Deferred until after Huygens proves the framework story. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
+| ~~**Huygens DST harness and runtime substrate**~~ | Delivered in `.intent/phases/023-huygens-dst-runtime-substrate/`: composed-workload DST harnessing, TCP/timer/supervision/cross-shard replay pressure, `ThreadedRuntime`, `ThreadedMultiShardRuntime`, bounded live ingress, bounded live cross-shard transport, and user-shaped live substrate proofs. |
+| **Gemini release story** | Next. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 
 Real concurrent shard execution is a substrate story around Huygens and later
 runtime work, not something Galileo or Kepler quietly smuggled in. Galileo and
-Kepler prove the multi-shard contract under one explicit global coordinator
-thread first; Huygens starts making that contract run as a framework.
+Kepler proved the multi-shard contract under one explicit global coordinator
+thread first; Huygens added the first worker-owned runtime substrate around
+that contract.
 
 ## Strategic prerequisites
 
@@ -248,21 +249,22 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 
 > After: Phase Kepler · Before: Phase Gemini
 
-- Build the systematic DST-style harness around the primitives already landed:
-  timers, local sends, TCP completions, supervision/restart, stale addresses,
-  bounded backpressure, cross-shard routing, replay, and checkers.
-- Add composed workload tests, not only primitive-local tests.
-- Keep the explicit-step runtime and simulator as semantic oracle/proof
-  engines.
-- Add the smallest actual shard-owned runtime substrate that lets users try
-  Tina against selected shared-nothing workloads without turning handlers
-  async or using unbounded queues.
-- Run at least one Tokio-shaped workload through simulator/replay, oracle, and
-  the runtime substrate, with trace assertions rather than logs.
+Delivered in `.intent/phases/023-huygens-dst-runtime-substrate/`.
 
-**Done when:** the repo can honestly say the primitives survive composed DST
-pressure and at least one real shard-owned runtime path can run a user-shaped
-workload with bounded backpressure and synchronous effect-returning handlers.
+- Added a composed DST-style proof harness around timers, local sends, TCP
+  completions, supervision/restart, stale addresses, bounded backpressure,
+  cross-shard routing, replay, and checkers.
+- Added `ThreadedRuntime`, a one-worker-thread live substrate for one shard.
+- Added `ThreadedMultiShardRuntime`, a fixed worker-per-shard live substrate
+  with bounded cross-shard transport for `Send + 'static` payloads.
+- Proved TCP echo / request-response on simulator/replay, explicit-step
+  runtime oracle, and live threaded runtime substrate.
+- Proved live bounded ingress, local mailbox `Full`, live cross-shard
+  request/reply, live remote queue `Full`, and stale remote address survival.
+
+**Done:** the repo can honestly say the primitives survive composed DST
+pressure and a real shard-owned runtime path can run selected user-shaped
+workloads with bounded backpressure and synchronous effect-returning handlers.
 
 ---
 
