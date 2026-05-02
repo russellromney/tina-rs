@@ -194,8 +194,8 @@ This file records completed work.
   record and checker outcome.
 - Extended `tina-sim` with the shipped single-shard spawn and supervision
   surface:
-  - `ChildDefinition`
-  - `RestartableChildDefinition`
+  - `SpawnSpec`
+  - `RestartableSpawnSpec`
   - direct parent-child lineage
   - restartable child records
   - direct-child `RestartChildren`
