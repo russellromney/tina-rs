@@ -2,7 +2,7 @@
 members = [
     "tina",
     "tina-mailbox-spsc",
-    "tina-runtime-current",
+    "tina-runtime",
     "tina-sim",
     "tina-supervisor",
 ]

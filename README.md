@@ -128,7 +128,7 @@ the idea stays the same: read some bytes, write them back, keep draining if
 the write is partial, then re-arm the next read.
 
 The full runnable example lives in
-[`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime-current/examples/tcp_echo.rs).
+[`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime/examples/tcp_echo.rs).
 
 That is the whole shape. Handlers stay synchronous. Local state stays local.
 `send`, `reply`, `spawn`, `stop`, and `batch` are plain returned values. Time
@@ -138,8 +138,8 @@ and partial writes.
 
 Full runnable examples live here:
 
-- [`task_dispatcher.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime-current/examples/task_dispatcher.rs)
-- [`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime-current/examples/tcp_echo.rs)
+- [`task_dispatcher.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime/examples/task_dispatcher.rs)
+- [`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime/examples/tcp_echo.rs)
 
 ## Design
 
