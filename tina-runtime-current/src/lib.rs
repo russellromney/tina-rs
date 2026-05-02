@@ -35,9 +35,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use tina::{
     Address, AddressGeneration, ChildRelation, Context, Effect, Isolate, IsolateId, Mailbox,
@@ -1643,6 +1642,291 @@ where
             }
         }
     }
+}
+
+/// Configuration for [`ThreadedRuntime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadedRuntimeConfig {
+    /// Capacity of the bounded control/ingress queue feeding the shard worker.
+    pub command_capacity: usize,
+
+    /// How long an idle worker may park before checking runtime-owned work
+    /// again.
+    pub idle_wait: Duration,
+}
+
+impl Default for ThreadedRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+        }
+    }
+}
+
+/// Error returned by setup/control operations on [`ThreadedRuntime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadedControlError {
+    /// The worker thread stopped before it could accept or answer the command.
+    WorkerStopped,
+}
+
+/// Error returned by [`ThreadedRuntime::try_send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadedTrySendError {
+    /// The bounded worker ingress queue is full.
+    IngressFull,
+
+    /// The worker thread stopped before it could accept the ingress command.
+    WorkerStopped,
+}
+
+/// Error returned by [`ThreadedRuntime::send_and_observe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadedSendObservedError {
+    /// The bounded worker ingress queue is full.
+    IngressFull,
+
+    /// The target isolate mailbox is full.
+    MailboxFull,
+
+    /// The target isolate is closed or stale.
+    MailboxClosed,
+
+    /// The worker thread stopped before the send could be observed.
+    WorkerStopped,
+}
+
+type ThreadedCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
+
+enum ThreadedCommand<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    Run(ThreadedCommandFn<S, F>),
+    Shutdown,
+}
+
+/// One live shard-owned runtime worker.
+///
+/// The worker constructs and owns a single [`Runtime`] on its OS thread. The
+/// handle only communicates through a bounded command queue, so ingress
+/// pressure remains visible instead of falling into an unbounded executor
+/// backlog. This is the smallest live substrate shape for Huygens; the
+/// explicit-step [`Runtime`] and [`MultiShardRuntime`] remain the semantic
+/// oracle.
+pub struct ThreadedRuntime<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    commands: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>,
+    handle: Option<JoinHandle<Vec<RuntimeEvent>>>,
+}
+
+impl<S, F> ThreadedRuntime<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    /// Starts one worker thread for one shard runtime.
+    pub fn new(shard: S, mailbox_factory: F) -> Self {
+        Self::with_config(shard, mailbox_factory, ThreadedRuntimeConfig::default())
+    }
+
+    /// Starts one worker thread with explicit bounded-command configuration.
+    pub fn with_config(shard: S, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self {
+        if config.command_capacity == 0 {
+            panic!("threaded runtime requires command capacity > 0");
+        }
+
+        let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
+        let handle =
+            thread::spawn(move || threaded_worker_loop(shard, mailbox_factory, receiver, config));
+
+        Self {
+            commands,
+            handle: Some(handle),
+        }
+    }
+
+    /// Registers one root isolate and lets the worker allocate its mailbox.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity<I, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<Address<I::Message>, ThreadedControlError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        self.call(move |runtime| {
+            runtime.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+        })
+    }
+
+    /// Configures a registered isolate as supervisor on the worker shard.
+    pub fn supervise<M: 'static>(
+        &self,
+        parent: Address<M>,
+        config: SupervisorConfig,
+    ) -> Result<(), ThreadedControlError> {
+        self.call(move |runtime| runtime.supervise(parent, config))
+    }
+
+    /// Attempts one typed ingress handoff through the bounded worker queue.
+    ///
+    /// Success means the worker accepted ownership of the message command. It
+    /// does not mean the target mailbox has accepted the message yet. Mailbox
+    /// `Full` / `Closed` outcomes are observed on the worker side through trace
+    /// or through [`send_and_observe`](Self::send_and_observe).
+    pub fn try_send<M: Send + 'static>(
+        &self,
+        address: Address<M>,
+        message: M,
+    ) -> Result<(), ThreadedTrySendError> {
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
+            let _ = runtime.try_send(address, message);
+        }));
+
+        match self.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(ThreadedTrySendError::IngressFull),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(ThreadedTrySendError::WorkerStopped)
+            }
+        }
+    }
+
+    /// Attempts one typed ingress send and waits for the worker to observe the
+    /// target mailbox outcome.
+    ///
+    /// This is a synchronous control path for tests and setup code that need to
+    /// distinguish mailbox `Full` from `Closed`. Ordinary ingress should prefer
+    /// [`try_send`](Self::try_send), which only proves bounded handoff.
+    pub fn send_and_observe<M: Send + 'static>(
+        &self,
+        address: Address<M>,
+        message: M,
+    ) -> Result<(), ThreadedSendObservedError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
+            let result = runtime
+                .try_send(address, message)
+                .map_err(|error| match error {
+                    TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                    TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+                });
+            let _ = reply_tx.send(result);
+        }));
+
+        match self.commands.try_send(command) {
+            Ok(()) => reply_rx
+                .recv()
+                .unwrap_or(Err(ThreadedSendObservedError::WorkerStopped)),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                Err(ThreadedSendObservedError::IngressFull)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(ThreadedSendObservedError::WorkerStopped)
+            }
+        }
+    }
+
+    /// Returns a snapshot of the worker trace.
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedControlError> {
+        self.call(|runtime| runtime.trace().to_vec())
+    }
+
+    /// Returns whether the worker still has runtime-owned work pending.
+    pub fn has_in_flight_calls(&self) -> Result<bool, ThreadedControlError> {
+        self.call(|runtime| runtime.has_in_flight_calls())
+    }
+
+    /// Requests shutdown and joins the worker, returning its final trace.
+    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, ThreadedControlError> {
+        self.shutdown_inner()
+    }
+
+    fn call<R, C>(&self, command: C) -> Result<R, ThreadedControlError>
+    where
+        R: Send + 'static,
+        C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.commands
+            .send(ThreadedCommand::Run(Box::new(move |runtime| {
+                let _ = reply_tx.send(command(runtime));
+            })))
+            .map_err(|_| ThreadedControlError::WorkerStopped)?;
+        reply_rx
+            .recv()
+            .map_err(|_| ThreadedControlError::WorkerStopped)
+    }
+
+    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedControlError> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(Vec::new());
+        };
+        let _ = self.commands.send(ThreadedCommand::Shutdown);
+        handle
+            .join()
+            .map_err(|_| ThreadedControlError::WorkerStopped)
+    }
+}
+
+impl<S, F> Drop for ThreadedRuntime<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    fn drop(&mut self) {
+        let _ = self.shutdown_inner();
+    }
+}
+
+fn threaded_worker_loop<S, F>(
+    shard: S,
+    mailbox_factory: F,
+    receiver: std::sync::mpsc::Receiver<ThreadedCommand<S, F>>,
+    config: ThreadedRuntimeConfig,
+) -> Vec<RuntimeEvent>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    let mut runtime = Runtime::new(shard, mailbox_factory);
+
+    loop {
+        match receiver.try_recv() {
+            Ok(ThreadedCommand::Run(command)) => {
+                command(&mut runtime);
+                continue;
+            }
+            Ok(ThreadedCommand::Shutdown) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        let delivered = runtime.step();
+        if delivered == 0 && !runtime.has_in_flight_calls() {
+            match receiver.recv_timeout(config.idle_wait) {
+                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::Shutdown) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        } else {
+            thread::yield_now();
+        }
+    }
+
+    runtime.trace().to_vec()
 }
 
 trait ErasedMailbox {

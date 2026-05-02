@@ -23,15 +23,16 @@ use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tina::{IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
 use tina_runtime::{
     CallInput, CallKind, ListenerId, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, StreamId, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_read, tcp_write,
+    RuntimeEventKind, StreamId, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError,
+    ThreadedTrySendError, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
+    tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -493,6 +494,100 @@ fn run_echo_scenario(
     (echoed, runtime.trace().to_vec(), listener_addr.isolate())
 }
 
+fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F)
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while !predicate() {
+        if Instant::now() > deadline {
+            panic!("wait_until({label}): predicate not satisfied within timeout");
+        }
+        thread::yield_now();
+    }
+}
+
+fn run_threaded_echo_scenario(
+    payloads: Vec<Vec<u8>>,
+    timeout: Duration,
+) -> (Vec<Vec<u8>>, Vec<RuntimeEvent>, IsolateId) {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+    let bound: BoundAddr = Arc::new(Mutex::new(None));
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        TestMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 16,
+            idle_wait: Duration::from_millis(1),
+        },
+    );
+
+    let listener_addr = runtime
+        .register_with_capacity::<Listener, _>(
+            Listener {
+                bind_addr,
+                bound_addr_slot: Arc::clone(&bound),
+                max_chunk: 256,
+                target_accepts: payloads.len(),
+                accepted_count: 0,
+                listener: None,
+            },
+            8,
+        )
+        .expect("threaded register accepts");
+
+    runtime
+        .supervise(
+            listener_addr,
+            SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
+        )
+        .expect("threaded supervise accepts");
+
+    runtime
+        .try_send(listener_addr, ListenerEvent::Start)
+        .expect("threaded bootstrap accepts");
+
+    wait_until(timeout, "threaded bind", || {
+        bound.lock().expect("mutex").is_some()
+    });
+
+    let local_addr = bound
+        .lock()
+        .expect("mutex")
+        .expect("listener published address");
+
+    let clients = payloads
+        .into_iter()
+        .map(|payload| spawn_client(local_addr, payload, None))
+        .collect::<Vec<_>>();
+
+    wait_until(timeout, "threaded clients", || {
+        clients
+            .iter()
+            .all(|client| *client.done.lock().expect("flag mutex"))
+    });
+
+    wait_until(timeout, "threaded listener stop", || {
+        let trace = runtime.trace().expect("threaded trace");
+        trace.iter().any(|event| {
+            event.isolate() == listener_addr.isolate()
+                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+        }) && !runtime
+            .has_in_flight_calls()
+            .expect("threaded in-flight check")
+    });
+
+    let mut echoed = Vec::new();
+    for client in clients {
+        client.handle.join().expect("client thread");
+        echoed.push(client.echoed.lock().expect("mutex").clone());
+    }
+
+    let trace = runtime.shutdown().expect("threaded shutdown");
+    (echoed, trace, listener_addr.isolate())
+}
+
 // ---------------------------------------------------------------------------
 // Main echo test.
 // ---------------------------------------------------------------------------
@@ -580,6 +675,153 @@ fn tcp_echo_handles_two_overlapping_clients_and_rearms_listener() {
         count_handler_finished(&trace, tina_runtime::EffectKind::Batch),
         2
     );
+}
+
+#[test]
+fn threaded_runtime_tcp_echo_round_trips_reference_workload() {
+    let payloads = vec![
+        b"threaded reference payload one".to_vec(),
+        b"threaded reference payload two".to_vec(),
+    ];
+    let (echoed, trace, listener_isolate) =
+        run_threaded_echo_scenario(payloads.clone(), Duration::from_secs(10));
+
+    assert_eq!(echoed, payloads);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpBind), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpAccept), 2);
+    assert!(count_call_completed(&trace, CallKind::TcpRead) >= 4);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpWrite), 2);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpStreamClose), 2);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpListenerClose), 1);
+    assert_eq!(count_spawned(&trace), 2);
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| {
+                event.isolate() == listener_isolate
+                    && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn threaded_runtime_surfaces_closed_mailbox_after_stop() {
+    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
+    let listener_addr = runtime
+        .register_with_capacity::<Listener, _>(
+            Listener {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+                bound_addr_slot: Arc::new(Mutex::new(None)),
+                max_chunk: 256,
+                target_accepts: 0,
+                accepted_count: 0,
+                listener: None,
+            },
+            1,
+        )
+        .expect("threaded register accepts");
+
+    runtime
+        .try_send(listener_addr, ListenerEvent::IoFailed)
+        .expect("stop message accepts");
+
+    wait_until(Duration::from_secs(2), "threaded stop", || {
+        let trace = runtime.trace().expect("threaded trace");
+        trace.iter().any(|event| {
+            event.isolate() == listener_addr.isolate()
+                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+        })
+    });
+
+    assert_eq!(
+        runtime.send_and_observe(listener_addr, ListenerEvent::Start),
+        Err(ThreadedSendObservedError::MailboxClosed)
+    );
+}
+
+#[derive(Debug, Clone)]
+enum BlockingMsg {
+    Park,
+    Wake,
+}
+
+#[derive(Debug)]
+struct BlockingIsolate {
+    parked_tx: Option<mpsc::SyncSender<()>>,
+    wake_rx: mpsc::Receiver<()>,
+}
+
+impl Isolate for BlockingIsolate {
+    tina::isolate_types! {
+        message: BlockingMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<BlockingMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            BlockingMsg::Park => {
+                if let Some(parked_tx) = self.parked_tx.take() {
+                    parked_tx.send(()).expect("test observes parked handler");
+                }
+                self.wake_rx.recv().expect("test releases parked handler");
+                noop()
+            }
+            BlockingMsg::Wake => noop(),
+        }
+    }
+}
+
+#[test]
+fn threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        TestMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 1,
+            idle_wait: Duration::from_millis(1),
+        },
+    );
+    let (parked_tx, parked_rx) = mpsc::sync_channel(0);
+    let (wake_tx, wake_rx) = mpsc::sync_channel(0);
+    let blocking_addr = runtime
+        .register_with_capacity::<BlockingIsolate, _>(
+            BlockingIsolate {
+                parked_tx: Some(parked_tx),
+                wake_rx,
+            },
+            8,
+        )
+        .expect("threaded register accepts");
+
+    runtime
+        .try_send(blocking_addr, BlockingMsg::Park)
+        .expect("park handoff accepted");
+    parked_rx.recv().expect("worker reached parked handler");
+
+    runtime
+        .try_send(blocking_addr, BlockingMsg::Wake)
+        .expect("first queued wake handoff accepted");
+    assert_eq!(
+        runtime.try_send(blocking_addr, BlockingMsg::Wake),
+        Err(ThreadedTrySendError::IngressFull)
+    );
+
+    wake_tx.send(()).expect("release parked handler");
+    wait_until(Duration::from_secs(2), "threaded ingress drain", || {
+        let trace = runtime.trace().expect("threaded trace");
+        trace
+            .iter()
+            .filter(|event| event.isolate() == blocking_addr.isolate())
+            .filter(|event| matches!(event.kind(), RuntimeEventKind::HandlerStarted))
+            .count()
+            >= 2
+    });
 }
 
 #[test]

@@ -22,10 +22,11 @@ The big ideas are:
 - runtimes schedule isolates and interpret effects
 - replay and simulation matter from the start, not as an afterthought
 
-`tina-rs` is not trying to replace Tokio or monoio. It is the Tina rule set as
-Rust crates: isolate state, explicit effects, bounded queues, supervision, and
-deterministic simulation. Production thread-per-core runtimes can come later
-without changing those rules.
+`tina-rs` is not trying to replace Tokio or monoio wholesale. It is the Tina
+rule set as Rust crates: isolate state, explicit effects, bounded queues,
+supervision, deterministic simulation, and shard-owned runtime execution.
+Threaded runtime substrates must preserve those rules instead of becoming a
+generic async scheduler.
 
 ## Where this came from
 
@@ -85,6 +86,14 @@ tracing, time calls, and Betelgeuse-backed TCP calls. Its `step()` is
 synchronous from the outside: the runtime collects finished owned work,
 translates completions into messages, and then handles ready mailbox work.
 
+`tina-runtime` also has a narrow live substrate, `ThreadedRuntime`. It starts
+one OS worker thread for one shard runtime, keeps root registration and ingress
+behind a bounded command queue, and lets tests/users run isolates without
+manually calling `step()`. This is an execution path, not a second semantic
+model: the explicit-step runtime and simulator remain the oracle. The current
+threaded substrate is single-shard; live cross-shard transport is not yet
+claimed.
+
 The shipped runtime call types are `RuntimeCall<Message>` over
 `CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep
 and TCP listener/stream operations. Sockets are runtime-owned opaque ids; raw
@@ -139,7 +148,8 @@ Peer quarantine and shard-restart rules are still later design work.
 
 There is not yet a Tokio bridge, and the bridge is not the main runtime story.
 The runtime call types do not pick a backend, so the simulator, the current
-runtime, and later runtimes can share one meaning model.
+runtime, the threaded substrate, and later runtimes can share one meaning
+model.
 
 ## Crate boundaries that must not drift
 

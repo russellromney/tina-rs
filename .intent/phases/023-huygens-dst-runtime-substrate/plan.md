@@ -32,9 +32,11 @@ Expected direction:
 
 - build a proper DST-style harness over the current primitives
 - compose primitives aggressively instead of testing them only one by one
-- add user-shaped workloads that run against both semantic oracle and runtime
-  substrate where possible
-- add an actual shard-owned runtime path, not just more explicit-step tests
+- add user-shaped workloads that run against the engines named in the proof
+  matrix, with the reference workload required on simulator/replay,
+  explicit-step oracle, and live substrate
+- add an actual shard-owned runtime path with one OS-thread worker per shard,
+  not just more explicit-step tests
 - preserve the explicit-step runtime/simulator as the semantic oracle
 - keep release/publication/Gemini work deferred until this proof exists
 
@@ -99,21 +101,31 @@ Huygens should add an actual runtime substrate path that preserves that meaning
 while running in a shape closer to the intended framework:
 
 - shard-owned execution
-- one runtime worker per shard, or a current-thread stepping runner with an
-  honest path to thread-per-core
+- one OS-thread runtime worker per shard
 - bounded ingress
 - bounded cross-shard transport
 - no hidden Tokio task migration as the core model
 - no unbounded channels
 - deterministic/traceable enough to compare against the oracle
 
-The expected substrate is conservative. If monoio/thread-per-core is too big
-for this slice, the phase should still land the smallest real runtime path that
-lets users run isolates outside test-only explicit stepping while preserving
-Tina's ownership and backpressure rules.
+The expected substrate is conservative and should live at the runtime boundary,
+not in `tina`. Prefer an additive `tina-runtime` runner type unless the code
+shape proves a new crate is cleaner. Pin the final names during implementation,
+but the smallest acceptable user shape should include:
+
+- construct runtime with shard ids and bounded capacities
+- register roots on chosen shards
+- send ingress messages through a bounded API
+- run worker threads until explicit shutdown or root-driven quiescence
+- join workers and inspect trace/output for tests
+
+A current-thread stepping runner may exist as an implementation stepping stone
+or test helper, but it does not satisfy the Huygens runtime-substrate bar by
+itself.
 
 If the only feasible path is "still explicit-step," pause. That means Huygens
-has not earned the runtime-framework claim yet.
+has not earned the runtime-framework claim yet and the closeout claim must be
+narrowed.
 
 ### 3. User-shaped parity workloads
 
@@ -121,9 +133,10 @@ Huygens should stop proving only helpers.
 
 Add or upgrade workloads that look like things users would build:
 
-- task dispatcher with worker restart and cross-shard routing
+- task dispatcher with worker restart, cross-shard routing, and bad-address
+  survival
 - retry/backoff coordinator
-- TCP echo or request/response server with partial I/O
+- TCP echo / request-response server with partial I/O
 - multi-tenant/session-style state machine with audit/log side traffic
 - bad-peer/bad-address path that does not kill good work
 
@@ -136,15 +149,24 @@ Each workload should run through the most relevant pair of engines:
 Not every workload needs every engine, but the phase must state why any gap is
 acceptable.
 
+Minimum composed proof set:
+
+- dispatcher/restart/cross-shard/bad-address survival
+- timer retry plus supervision/restart
+- TCP completion plus bounded mailbox `Full` or stopped requester
+- one checker-induced replayable composed failure
+
+Those are the floor. More is welcome, but Huygens should not close with fewer
+than these.
+
 ### 4. Runtime-substrate proof against Tokio-shaped workloads
 
-The phase should include at least one reference workload that a Tokio user
-would recognize:
-
-- TCP echo / request-response
-- timer-backed retry
-- dispatcher/worker queue
-- many independent sessions/connections
+The phase reference workload is TCP echo / request-response with partial I/O.
+That is the best user-recognizable proof because it exercises runtime-owned
+I/O, scheduling, bounded queues, and normal isolate state. If TCP proves too
+large for the first live substrate, pause and explicitly narrow the runtime
+claim to dispatcher/worker plus timer-backed retry; do not silently substitute a
+smaller workload while keeping the TCP-shaped claim.
 
 The point is not "beat Tokio." The point is:
 
@@ -153,6 +175,17 @@ The point is not "beat Tokio." The point is:
 - runtime-owned I/O/time stays out of handlers
 - failures are traceable/replayable where the simulator is used
 - the runtime path can actually run the workload
+
+Oracle/substrate parity does not require matching wall-clock timing. It does
+require matching semantic facts for the reference workload:
+
+- final app output / response bytes
+- accepted and rejected send counts
+- visible bounded-pressure outcomes
+- restart count when supervision participates
+- a shared trace-event subset: root registration, ingress accepted/rejected,
+  handler start/end, send accepted/rejected, call dispatch/completion, stop,
+  panic/restart when present
 
 ### 5. Claim boundary
 
@@ -182,6 +215,8 @@ Pause before implementation continues if:
 - the runtime substrate wants unbounded queues
 - handlers need to become async
 - the substrate requires a large public `tina` API redesign
+- the runtime substrate cannot support one OS-thread worker per shard without
+  narrowing the closeout claim
 - the DST harness needs a brand-new broad fault language before it can prove
   useful composed workloads
 - any user-shaped workload cannot be run against either simulator/replay or a
@@ -192,22 +227,29 @@ Pause before implementation continues if:
 ## Build Steps
 
 1. Audit existing simulator/test coverage and list composed primitive gaps.
-2. Add a DST harness layer or helpers that make composed workloads easy to run
-   under seed/replay/checker pressure.
+2. Add a reusable DST harness module or helpers that make composed workloads
+   easy to run under seed/replay/checker pressure and can feed the closeout
+   matrix.
 3. Add composed workload tests that combine supervision, timers, TCP, bounded
    backpressure, cross-shard routing, and replay.
-4. Design the smallest actual shard-owned runtime substrate for this phase.
+4. Design the smallest actual shard-owned runtime substrate for this phase:
+   one OS-thread worker per shard, bounded ingress, bounded cross-shard
+   transport, explicit shutdown/quiescence, and trace/output inspection.
 5. Implement the runtime substrate without changing isolate handler semantics.
-6. Run at least one user-shaped workload on:
+6. Run the TCP echo / request-response reference workload on:
    - simulator/replay
    - explicit-step runtime oracle
    - actual runtime substrate
-7. Add parity assertions between oracle/substrate where deterministic
-   comparison is possible.
+7. Add parity assertions between oracle/substrate for final output,
+   accepted/rejected counts, bounded-pressure outcomes, restart count when
+   relevant, and shared trace-event subsets.
 8. Document the exact claims Huygens earns and the exact claims it still
    refuses.
-9. Update README/ROADMAP only after the evidence lands.
-10. Run `make verify`; add any substrate-specific verification command to the
+9. Update `.intent/SYSTEM.md`, README, and ROADMAP only after the evidence
+   lands.
+10. Write a closeout artifact with the workload x engine matrix, exact test
+    names, substrate claim, non-claims, and verification result.
+11. Run `make verify`; add any substrate-specific verification command to the
     standard gate if it is required for the claim.
 
 ## Proof Plan
@@ -220,7 +262,10 @@ Required proof modes:
 - checker failures for at least one composed semantic bug
 - live/runtime e2e tests for user-shaped workloads
 - oracle/substrate parity tests where feasible
-- bounded queue/backpressure tests on the runtime substrate
+- bounded queue/backpressure tests on the runtime substrate, including bounded
+  ingress and local mailbox `Full`; if cross-shard transport is in the live
+  substrate, prove cross-shard `Full` there too, otherwise keep that proof on
+  the explicit-step multi-shard oracle
 - panic/restart behavior under composed workload pressure
 - trace assertions, not logs
 - `make verify`
@@ -232,6 +277,10 @@ The phase should also add a closeout matrix:
 
 The matrix is not paperwork. It is the thing that tells us whether the claim
 "you can try this framework today" is earned.
+
+Live substrate e2e tests must not rely on sleeps and hope. They should exit by
+explicit shutdown handle, root-driven quiescence, bounded test driver condition,
+or timeout only as a failure guard.
 
 ## What Huygens Explicitly Defers
 
@@ -251,11 +300,17 @@ Huygens is done when:
 - the DST harness exercises composed primitive paths, not just isolated unit
   cases
 - at least one replayable checker failure targets a composed workload
-- at least one Tokio-shaped workload runs on a real shard-owned runtime path
+- TCP echo / request-response runs on a real one-OS-thread-per-shard runtime
+  path, or the phase explicitly narrows the closeout claim before closing
 - that workload has oracle/substrate proof or a clearly justified comparison
   boundary
 - bounded backpressure remains visible on the runtime substrate
 - handler semantics stay synchronous and effect-returning
+- `.intent/SYSTEM.md` records the runtime-substrate boundary and claim
+  boundary
+- `.intent/phases/023-huygens-dst-runtime-substrate/closeout.md` records the
+  workload x engine matrix, exact test names, substrate claim, non-claims, and
+  verification result
 - README/ROADMAP can honestly say users can try Tina for selected
   shared-nothing workloads today
 - Gemini/release work has a real framework contract to document later
