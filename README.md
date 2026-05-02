@@ -164,9 +164,10 @@ public API, exercise real mailbox behavior, run handlers through
 restart children, route messages across shards, and replay timer-driven,
 TCP-driven, supervised, and multi-shard behavior through `tina-sim`.
 
-What's coming next is core hardening before bridges: peer/shard liveness,
-ownership and buffering honesty, stronger checker pressure, and then later a
-production runtime backend and adapter work.
+What's coming next is Gemini: the release contract before bridges. That means
+supported invariants, proof gates, public positioning, and an explicit
+publish/not-publish decision. Tokio bridge work comes after that contract is
+clear.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 
