@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{Address, RestartBudget, RestartPolicy, prelude::*};
+use tina::{Address, AddressGeneration, RestartBudget, RestartPolicy, prelude::*};
 use tina_runtime::{
     CallInput, CallKind, CallOutput, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason, StreamId, sleep,
@@ -28,6 +28,10 @@ impl Shard for WorkShard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoordinatorEvent {
     Submit {
+        job_id: u64,
+        value: u64,
+    },
+    SubmitAfterBadRemote {
         job_id: u64,
         value: u64,
     },
@@ -55,6 +59,7 @@ enum WorkerEvent {
 #[derive(Debug)]
 struct Coordinator {
     worker: Address<WorkerEvent>,
+    bad_worker: Option<Address<WorkerEvent>>,
     completed: Rc<RefCell<Vec<(u64, u64)>>>,
 }
 
@@ -78,6 +83,29 @@ impl Isolate for Coordinator {
                     reply_to: ctx.me(),
                 },
             ),
+            CoordinatorEvent::SubmitAfterBadRemote { job_id, value } => {
+                let bad_worker = self
+                    .bad_worker
+                    .expect("SubmitAfterBadRemote requires a bad worker address");
+                batch([
+                    send(
+                        bad_worker,
+                        WorkerEvent::Run {
+                            job_id: 0,
+                            value: 0,
+                            reply_to: ctx.me(),
+                        },
+                    ),
+                    send(
+                        self.worker,
+                        WorkerEvent::Run {
+                            job_id,
+                            value,
+                            reply_to: ctx.me(),
+                        },
+                    ),
+                ])
+            }
             CoordinatorEvent::SubmitPair {
                 first_job,
                 first_value,
@@ -682,6 +710,7 @@ fn run_dispatcher_workload(
         ShardId::new(11),
         Coordinator {
             worker,
+            bad_worker: None,
             completed: Rc::clone(&completed),
         },
         4,
@@ -760,6 +789,71 @@ fn multishard_dispatcher_workload_preserves_request_reply_causality() {
     assert!(request_accept < worker_mailbox);
     assert!(worker_mailbox < reply_attempt);
     assert!(reply_attempt < coordinator_mailbox);
+}
+
+#[test]
+fn multishard_dispatcher_workload_continues_after_bad_remote_address_on_same_shard() {
+    let mut sim =
+        MultiShardSimulator::new([WorkShard(11), WorkShard(22)], SimulatorConfig::default());
+    let completed = Rc::new(RefCell::new(Vec::new()));
+
+    let worker = sim.register_with_capacity_on::<Worker, WorkerEvent, CoordinatorEvent>(
+        ShardId::new(22),
+        Worker,
+        4,
+    );
+    let bad_worker = Address::new_with_generation(
+        ShardId::new(22),
+        IsolateId::new(999),
+        AddressGeneration::new(0),
+    );
+    let coordinator = sim.register_with_capacity_on::<Coordinator, CoordinatorEvent, WorkerEvent>(
+        ShardId::new(11),
+        Coordinator {
+            worker,
+            bad_worker: Some(bad_worker),
+            completed: Rc::clone(&completed),
+        },
+        4,
+    );
+
+    sim.try_send(
+        coordinator,
+        CoordinatorEvent::SubmitAfterBadRemote {
+            job_id: 31,
+            value: 4,
+        },
+    )
+    .unwrap();
+
+    assert!(sim.run_until_quiescent() > 0);
+    assert_eq!(&*completed.borrow(), &[(31, 8)]);
+
+    let trace = sim.trace();
+    let bad_rejection = event_id(&trace, |event| {
+        event.shard() == ShardId::new(22)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    target_isolate,
+                    reason: SendRejectedReason::Closed,
+                    ..
+                } if target_isolate == bad_worker.isolate()
+            )
+    });
+    let good_accept = event_id(&trace, |event| {
+        event.shard() == ShardId::new(22)
+            && event.isolate() == worker.isolate()
+            && matches!(event.kind(), RuntimeEventKind::MailboxAccepted)
+    });
+    let worker_handler = event_id(&trace, |event| {
+        event.shard() == ShardId::new(22)
+            && event.isolate() == worker.isolate()
+            && matches!(event.kind(), RuntimeEventKind::HandlerStarted)
+    });
+
+    assert!(bad_rejection < good_accept);
+    assert!(good_accept < worker_handler);
 }
 
 #[test]

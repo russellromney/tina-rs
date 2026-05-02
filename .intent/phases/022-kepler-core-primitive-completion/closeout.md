@@ -30,6 +30,10 @@ Direct proofs:
   `cross_shard_unknown_isolate_does_not_poison_destination_shard`
 - `tina-sim`:
   `cross_shard_simulation_unknown_isolate_does_not_poison_destination_shard`
+- live-runtime e2e:
+  `dispatcher_worker_workload_continues_after_bad_remote_address_on_same_shard`
+- simulator e2e:
+  `multishard_dispatcher_workload_continues_after_bad_remote_address_on_same_shard`
 - `tina-sim` checker pressure:
   `multishard_checker_accepts_address_local_remote_failure_then_good_traffic`
 - `tina-sim` adversarial replay:

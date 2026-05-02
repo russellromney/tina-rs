@@ -304,9 +304,11 @@ This file records completed work.
   restarts stay on that shard.
 - Added runtime proofs for the sealed rules:
   - `cross_shard_unknown_isolate_does_not_poison_destination_shard`
+  - `dispatcher_worker_workload_continues_after_bad_remote_address_on_same_shard`
   - `multishard_supervision_keeps_children_on_parent_shard`
 - Added simulator proofs for the same sealed rules:
   - `cross_shard_simulation_unknown_isolate_does_not_poison_destination_shard`
+  - `multishard_dispatcher_workload_continues_after_bad_remote_address_on_same_shard`
   - `multishard_simulation_supervision_keeps_children_on_parent_shard`
 - Added multi-shard checker support:
   - `MultiShardSimulator::run_until_quiescent_checked()`

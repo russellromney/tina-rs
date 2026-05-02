@@ -358,6 +358,10 @@ No blocking implementation findings.
   a bad remote address produces destination-local `Closed` rejection, and
   later valid traffic to the same destination shard is still accepted and
   handled.
+- The liveness boundary is also proved through user-shaped coordinator/worker
+  integration tests in both live runtime and simulator. The app sends one
+  bogus remote work item to the worker shard, then sends real work to the same
+  shard, and the job still completes through the ordinary request/reply path.
 - The supervision boundary is directly proved in both live runtime and
   simulator: root supervision routes by parent shard, child spawn is recorded
   on the parent shard, and supervised restart events remain on that shard.
@@ -383,6 +387,8 @@ No blocking implementation findings.
 
 - `cross_shard_unknown_isolate_does_not_poison_destination_shard`
 - `cross_shard_simulation_unknown_isolate_does_not_poison_destination_shard`
+- `dispatcher_worker_workload_continues_after_bad_remote_address_on_same_shard`
+- `multishard_dispatcher_workload_continues_after_bad_remote_address_on_same_shard`
 - `multishard_supervision_keeps_children_on_parent_shard`
 - `multishard_simulation_supervision_keeps_children_on_parent_shard`
 - `multishard_checker_accepts_address_local_remote_failure_then_good_traffic`
