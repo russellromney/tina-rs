@@ -164,18 +164,21 @@ public API, exercise real mailbox behavior, run handlers through
 restart children, route messages across shards, and replay timer-driven,
 TCP-driven, supervised, and multi-shard behavior through `tina-sim`.
 
-What's coming next is Gemini: the release contract before bridges. That means
-supported invariants, proof gates, public positioning, and an explicit
-publish/not-publish decision. Tokio bridge work comes after that contract is
-clear.
+What's coming next is Huygens: systematic DST-style harnessing plus an actual
+shard-owned runtime substrate. The goal is to prove the primitives under
+composed workload pressure and make Tina usable for selected shared-nothing
+Tokio-shaped workloads before release or bridge work.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 
 ## Non-goals
 
-- A new scheduler competing with Tokio or monoio. Use what exists.
+- A general-purpose async scheduler competing with Tokio or monoio. Tina owns
+  isolate semantics and shard ownership; runtime substrate work stays in service
+  of that model.
 - Full feature parity with Tina-Odin. We port the *shape*, not every primitive.
-- "Replacing Tokio." This is a rule layer that rides on top of a runtime.
+- A full Tokio replacement. The near-term goal is selected shared-nothing
+  workloads where bounded queues, replay, and isolate-local state are the point.
 - FFI to Tina-Odin. Two runtimes fighting for cores would be the worst of both worlds.
 
 ## Development

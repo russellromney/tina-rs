@@ -134,15 +134,15 @@ phases.
 | **Voyager deterministic simulation** | Planning bucket with reviewed slices delivered in `.intent/phases/016-voyager-virtual-time-and-replay/`, `.intent/phases/017-voyager-seeded-faults-and-checkers/`, `.intent/phases/018-voyager-spawn-and-supervision-simulation/`, and `.intent/phases/019-voyager-single-shard-io-simulation/`. Shipped so far: `tina-sim`, a single-shard virtual-time simulator for the shipped `Sleep { after }` / `TimerFired` contract, deterministic replay artifacts, direct timer-semantics proofs, simulator-backed retry/backoff proof, seeded perturbation over timer-wake and local-send behavior, a small checker surface with replayable failure capture, single-shard spawn/supervision replay covering public spawn payloads, restart policies, stale identity, budget exhaustion, and direct-child scope, and scripted single-shard TCP simulation covering the shipped bind/accept/read/write/close call family plus replayed echo workloads and TCP checker replay. Remaining Voyager work still includes broader PRNG policy, richer faults/checkers, and later multi-slice expansion. |
 | ~~**Galileo multi-shard semantics and simulation**~~ | Delivered in `.intent/phases/020-galileo-multi-shard-semantics-and-simulation/`: multi-shard explicit-step runtime/simulator runners, cross-shard delivery, routing/placement, deterministic traces, replay, source-time vs destination-time delivery stages, seeded simulator composition proofs, and user-shaped dispatcher/TCP/supervision proof workloads. |
 | ~~**Kepler core primitive completion**~~ | Delivered in `.intent/phases/022-kepler-core-primitive-completion/`: sealed the current explicit-step liveness non-signal, proved address-local remote failures do not poison shards, sealed shard-local supervision/restart ownership, pinned ownership/buffering/allocation non-claims, added multi-shard checker/replay pressure, and added user-shaped runtime/simulator e2e proofs. |
-| **Gemini release story** | Next. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it turns the settled primitive into an honest public contract before Apollo. |
+| **Huygens DST harness and runtime substrate** | Next. Systematic composed-workload DST harnessing plus the smallest actual shard-owned runtime substrate that lets users try Tina on selected shared-nothing Tokio-shaped workloads. |
+| **Gemini release story** | Deferred until after Huygens proves the framework story. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 
-Real concurrent shard execution is a later substrate story around
-`tina-runtime-monoio`, not something Galileo, Kepler, or Cassini should
-quietly smuggle in. Galileo proves the multi-shard contract under one explicit
-global coordinator thread first; later substrate work can make shards truly
-run concurrently against that already-proved contract.
+Real concurrent shard execution is a substrate story around Huygens and later
+runtime work, not something Galileo or Kepler quietly smuggled in. Galileo and
+Kepler prove the multi-shard contract under one explicit global coordinator
+thread first; Huygens starts making that contract run as a framework.
 
 ## Strategic prerequisites
 
@@ -207,7 +207,7 @@ These should be resolved early enough to avoid rework, but they do not all block
 ## Phase Voyager
 > Long-duration deep-space mission. Deterministic simulation for the single-shard runtime.
 
-> After: Phase Mariner · Before: Phase Gemini
+> After: Phase Mariner · Before: Phase Galileo / Huygens proof work
 
 - `tina-sim`: deterministic simulator for the single-shard runtime. Time is virtual, I/O is intercepted, mailbox arrival order is reproducible from a seed.
 - `tina-sim` consumes Mariner's event trace as its semantic model. The simulator does not invent a second observable surface; it provides a different execution and I/O substrate against the same event vocabulary.
@@ -225,7 +225,9 @@ These should be resolved early enough to avoid rework, but they do not all block
 - Failure injection: drop messages, simulate crashes, inject slow disk or I/O resources, delay completions, and perturb delivery order within the single-shard model.
 - Replay: every test failure produces a seed that reproduces the failure exactly.
 - Keep the abstraction boundary strict: runtime crates expose enough hooks for simulation, but the simulator owns virtual time, trace capture, and failure injection.
-- Voyager runs before Gemini deliberately: building the simulator first surfaces which runtime hooks the simulator actually needs, so Gemini can stabilize an API that already accommodates them.
+- Voyager and Huygens run before Gemini deliberately: the simulator surfaces
+  runtime hooks, and the runtime-substrate phase proves those hooks under
+  composed workloads before Gemini stabilizes a public story around them.
 
 **Proof plan:**
 
@@ -241,16 +243,39 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 
 ---
 
-## Phase Gemini
-> First crewed flight. Stabilize and publish the settled core story.
+## Phase Huygens
+> Probe deployment. Prove composed workloads and land the first real runtime substrate.
 
-> After: Phase Kepler · Before: Phase Apollo
+> After: Phase Kepler · Before: Phase Gemini
+
+- Build the systematic DST-style harness around the primitives already landed:
+  timers, local sends, TCP completions, supervision/restart, stale addresses,
+  bounded backpressure, cross-shard routing, replay, and checkers.
+- Add composed workload tests, not only primitive-local tests.
+- Keep the explicit-step runtime and simulator as semantic oracle/proof
+  engines.
+- Add the smallest actual shard-owned runtime substrate that lets users try
+  Tina against selected shared-nothing workloads without turning handlers
+  async or using unbounded queues.
+- Run at least one Tokio-shaped workload through simulator/replay, oracle, and
+  the runtime substrate, with trace assertions rather than logs.
+
+**Done when:** the repo can honestly say the primitives survive composed DST
+pressure and at least one real shard-owned runtime path can run a user-shaped
+workload with bounded backpressure and synchronous effect-returning handlers.
+
+---
+
+## Phase Gemini
+> First crewed flight. Stabilize and publish the settled framework story.
+
+> After: Phase Huygens · Before: Phase Apollo
 
 - Publish a coherent `0.1.0` story for `tina`, `tina-mailbox-spsc`,
   `tina-supervisor`, `tina-runtime`, and `tina-sim`, or explicitly decide that
-  the APIs are still private and not ready for semver promises. Kepler has
-  settled the core multi-shard primitive enough that docs and bridge
-  comparisons no longer need to chase a moving target.
+  the APIs are still private and not ready for semver promises. Kepler settled
+  the core multi-shard primitive; Huygens should prove the composed framework
+  and runtime-substrate story before Gemini publishes or freezes it.
 - Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, task-dispatcher walkthrough, and TCP echo walkthrough.
 - Document the supported invariants for the core runtime/simulator model:
   delivery behavior, mailbox guarantees, supervision behavior, replayability,
@@ -268,7 +293,7 @@ non-trivial isolate from the docs alone.
 ## Phase Kepler
 > Telescope mission. Finish the primitive before we build bridges around it.
 
-> Delivered after Phase Galileo · Before: Phase Gemini
+> Delivered after Phase Galileo · Before: Phase Huygens
 
 - Kepler was a core-completion phase, not an outward adoption phase.
 - It closed or sealed the remaining semantic gaps that still sat too close to
@@ -290,8 +315,8 @@ What Kepler explicitly did **not** include:
 
 **Delivered:** the remaining core semantic gaps after Galileo were either
 closed and directly proved or deliberately sealed as long-lived boundaries;
-runtime-level buffering/allocation claims are honest; and Gemini/Apollo can
-compare against a settled primitive instead of a still-moving one.
+runtime-level buffering/allocation claims are honest; and Huygens/Gemini/Apollo
+can compare against a settled primitive instead of a still-moving one.
 
 ---
 
