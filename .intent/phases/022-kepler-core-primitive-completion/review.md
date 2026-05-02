@@ -330,3 +330,76 @@ Most of these are one or two sentences. Findings 1, 2, 3,
 and 7 are the load-bearing ones; the rest are tightening.
 After those, Kepler is reviewable as a real settlement
 phase rather than as a five-front semantic discussion.
+
+## Implementation Review 1
+
+Reviewed the landed Kepler implementation against the amended 022 plan,
+Plan Review 1, `.intent/SYSTEM.md`, and the current multi-shard runtime /
+simulator code. Read the implementation changes in:
+
+- `tina-runtime-current/src/tests.rs`
+- `tina-runtime-current/tests/multishard_allocation.rs`
+- `tina-sim/src/lib.rs`
+- `.intent/SYSTEM.md`
+- `.intent/phases/022-kepler-core-primitive-completion/closeout.md`
+- `CHANGELOG.md`
+
+### Findings
+
+No blocking implementation findings.
+
+### What I Verified Directly
+
+- Plan Review 1's expected-direction gap is closed by implementation shape:
+  Kepler seals, it does not extend. There is no new `tina` public boundary,
+  no shard-down / peer-down vocabulary, no cross-shard child placement, and
+  no broad cross-shard fault language.
+- The liveness boundary is directly proved in both live runtime and simulator:
+  a bad remote address produces destination-local `Closed` rejection, and
+  later valid traffic to the same destination shard is still accepted and
+  handled.
+- The supervision boundary is directly proved in both live runtime and
+  simulator: root supervision routes by parent shard, child spawn is recorded
+  on the parent shard, and supervised restart events remain on that shard.
+- Multi-shard checker support mirrors the single-shard checker shape:
+  `run_until_quiescent_checked` stores an optional `CheckerFailure`, and
+  `MultiShardReplayArtifact::checker_failure()` exposes it for replay
+  comparison.
+- The adversarial checker proof targets a Kepler-sealed rule rather than a
+  stale 020 invariant: the checker fails when address-local remote failure is
+  not followed by later live traffic to the same destination shard, and replay
+  reproduces the same event record and checker failure.
+- SYSTEM.md now states the ownership/buffering model explicitly:
+  cross-shard user payloads move into erased runtime storage, then through the
+  bounded shard-pair queue, then into the destination mailbox; no user-message
+  clone is required by core transport.
+- The allocation story is honest and narrow. The new allocation probe proves
+  the current multi-shard runtime path still allocates, so the closeout does
+  not pretend the runtime/simulator hot path is allocation-free.
+- Changelog preserves historical names for older phases and records Kepler as
+  new completed work.
+
+### Proofs Checked
+
+- `cross_shard_unknown_isolate_does_not_poison_destination_shard`
+- `cross_shard_simulation_unknown_isolate_does_not_poison_destination_shard`
+- `multishard_supervision_keeps_children_on_parent_shard`
+- `multishard_simulation_supervision_keeps_children_on_parent_shard`
+- `multishard_checker_accepts_address_local_remote_failure_then_good_traffic`
+- `multishard_checker_failure_replays_for_address_local_liveness_bug`
+- `multishard_runtime_path_still_has_allocations_so_the_claim_stays_narrow`
+
+### Verification
+
+- `git diff --check main...HEAD`
+- `make verify`
+
+Both passed on the reviewed tree.
+
+### Residual Notes
+
+- The allocation probe is deliberately a narrow non-claim proof, not a
+  performance guarantee. If the path becomes allocation-free later, the test
+  should fail and force the claim to be updated.
+- Real substrate liveness, peer quarantine, shard restart broadcast semantics,
+  and cross-shard child placement remain deferred by design.
