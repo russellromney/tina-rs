@@ -194,8 +194,8 @@ This file records completed work.
   record and checker outcome.
 - Extended `tina-sim` with the shipped single-shard spawn and supervision
   surface:
-  - `SpawnSpec`
-  - `RestartableSpawnSpec`
+  - `ChildDefinition`
+  - `RestartableChildDefinition`
   - direct parent-child lineage
   - restartable child records
   - direct-child `RestartChildren`
@@ -224,6 +224,9 @@ This file records completed work.
 - Added additive multi-shard coordinator shells:
   - `tina_runtime::MultiShardRuntime`
   - `tina_sim::MultiShardSimulator`
+- Added root supervision routing on multi-shard runtime/simulator shells:
+  `supervise(parent, config)` routes to the shard that owns the parent while
+  child ownership remains shard-local.
 - Added global explicit-step coordination in ascending shard-id order with:
   - global `try_send(addr, msg)` routed by `addr.shard()`
   - explicit root placement by shard
@@ -262,6 +265,17 @@ This file records completed work.
   - `MultiShardReplayArtifact`
   - replay-style proof that rerunning from the saved configs reproduces the
     same multi-shard event record and workload output
+- Added direct proof for per-isolate-pair FIFO across one shard pair with
+  multiple source isolates and multiple target isolates, in both runtime and
+  simulator tests.
+- Added direct proof that multi-shard simulator replay works under non-default
+  seeded timer/local-send fault config.
+- Added direct proof that different non-default seeds can diverge in a
+  faulted multi-shard simulator workload.
+- Added direct proof that multi-shard scripted TCP echo composes with seeded
+  TCP completion faults.
+- Added direct proof that multi-shard supervision/restart composes with seeded
+  local-send delay.
 - Documented the current Galileo boundary honestly: full upstream-style
   peer-quarantine / shard-restarted semantics remain later work, not silently
   bundled into this first multi-shard slice.

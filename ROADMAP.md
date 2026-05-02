@@ -46,11 +46,12 @@ start from an honest baseline rather than from stale roadmap wording.
 
 | Claim | Current evidence | Still missing |
 |---|---|---|
-| Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `Outbound`, `ChildDefinition`, and supervision policy types with doc/compile-fail/downstream-style tests. | Request/reply ergonomics and the final runtime-owned I/O/timer/call contract are not done yet. |
-| Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. | This is not a full formal proof for every capacity/interleaving/refactor. Cross-shard channel semantics and any future MPSC fallback are not implemented. |
-| Single-shard runtime delivery | `tina-runtime` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, supervised panic restart with policy/budget config, an assertion-backed task-dispatcher proof package, and generated-history property tests. | Supervision is still narrow: panic-triggered only, runtime-lifetime budget only, no user-facing supervision guide, and no timed budget windows. The generated-history model is bounded and does not prove arbitrary user programs. |
+| Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `Outbound`, `ChildDefinition`, supervision policy types, and the preferred 021 authoring surface (`tina::prelude::*`, effect helpers, typed call helpers, `ctx.me()`, `ctx.send_self(...)`, and `tina::isolate_types!`). | Small call-result helper polish remains optional. |
+| Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. Cross-shard shard-pair queues are bounded and directly proved in Galileo. | This is not a full formal proof for every capacity/interleaving/refactor. Any future MPSC fallback is not implemented. |
+| Single-shard runtime delivery | `tina-runtime` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, supervised panic restart with policy/budget config, an assertion-backed task-dispatcher proof package, and generated-history property tests. | Supervision is still narrow: panic-triggered only, runtime-lifetime budget only, and no timed budget windows. The generated-history model is bounded and does not prove arbitrary user programs. |
 | Failure isolation | Unwinding handler panics become runtime events; the panicking isolate stops and the same round continues deterministically. | This is not Tina-Odin's OS trap boundary. Rust segfault isolation, shard quarantine, and `panic = "abort"` behavior are out of scope unless a later phase explicitly designs them. |
-| Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories and small generated dispatcher workloads. Trace replay proofs can reconstruct worker completions and restart outcomes from the runtime event model alone. `tina-sim` now adds single-shard virtual time, replay artifacts, seeded perturbation over timer-wake/local-send/TCP-completion behavior, a small checker surface with replayable failure capture, single-shard spawn/supervision replay for the shipped restart surface, and scripted single-shard TCP simulation with replayed peer output. | Broader fault models and multi-shard replay are still future work. |
+| Multi-shard runtime/sim | `tina-runtime` and `tina-sim` now expose multi-shard explicit-step runners with root placement, global event/call ids, bounded shard-pair queues, next-step-only remote visibility, deterministic harvest order, source-time versus destination-time delivery stages, simulator replay, and user-shaped dispatcher proofs. | Real parallel shard execution, peer quarantine, shard-restart propagation, cross-shard child ownership, and runtime-level allocation claims remain future work. |
+| Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories and small generated dispatcher workloads. Trace replay proofs can reconstruct worker completions and restart outcomes from the runtime event model alone. `tina-sim` adds virtual time, replay records, seeded delays/reordering over timer-wake/local-send/TCP-completion behavior, checker failures, spawn/supervision replay, scripted TCP simulation, and multi-shard replay under default and non-default seeded configs. | Broader peer/shard-liveness faults and stronger checker pressure are Kepler work. |
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. | The runtime currently uses boxed erasure and per-round collection; no broad runtime allocation claim is supported yet. |
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
 | Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes the first TCP call family — bind, accept, read, write, close — through Betelgeuse on nightly Rust, with caller-owned typed completion slots, runtime-assigned opaque resource ids, runtime-controlled completion translation back into ordinary `Message` values, honest `local_addr` reporting for `127.0.0.1:0` binds, accepted-stream `peer_addr`, listener re-arm through normal isolate control flow, and clean listener close. It also executes the first time call verb — `Sleep { after }` with `TimerFired` — with runtime-owned monotonic clock sampling once per step, due-timer harvest, deterministic request-order tie-break for equal deadlines, and a crate-private manual clock seam for deterministic timer tests. | The 100k-connection benchmark and broader network-server claims remain future work. |
@@ -75,13 +76,13 @@ Live examples matter, but they are smoke tests, not the proof. Every runnable ex
 
 Current future proof gaps to keep visible:
 
-- Product-level end-to-end tests do not exist yet because there is no driver,
-  I/O effect contract, TCP echo, task-dispatcher example, or simulator.
 - Runtime property tests are bounded generated histories, not a proof over all
   possible user isolate programs.
 - SPSC unsafe correctness has Loom and Miri evidence, not a complete formal
   proof across all future refactors.
 - Runtime allocation behavior is not proven beyond the narrow SPSC hot path.
+- Peer/shard liveness, shard-restart propagation, cross-shard supervision
+  boundaries, and runtime-level buffering/ownership claims remain Kepler work.
 
 ## Optional post-021 syntax cleanup
 
@@ -130,10 +131,17 @@ phases.
 | ~~**Mariner TCP completeness**~~ | Delivered as a reviewed package (`.intent/phases/014-mariner-tcp-completeness/`). Shipped: ordered `Effect::Batch(Vec<Effect<I>>)` at the `tina` boundary, direct batch-semantics proof in `tina-runtime`, listener self-addressing plus re-armed `TcpAccept` through normal isolate control flow, sequential and bounded-overlap TCP echo proofs, graceful listener close/stop, a refreshed assertion-backed `tcp_echo` example that accepts exactly `N` clients and exits, and a crate-local proof that two accepted stream reads can be pending in `IoBackend` at once. |
 | ~~**Mariner runtime-owned time and retry**~~ | Delivered as a reviewed package (`.intent/phases/015-mariner-runtime-owned-time-and-retry/`). Shipped: one-shot relative `Sleep` call verb and `TimerFired` result, runtime-owned monotonic clock sampled once per step with due-timer harvest, deterministic request-order tie-break for equal deadlines, crate-private `ManualClock` seam for deterministic timer tests, focused timer semantics proofs (single wake, no early fire, fires once, different-deadline ordering, equal-deadline tie-break, stopped-requester rejection), and a retry/backoff proof package with both crate-local semantics tests and a public-path integration test for delayed retry. |
 | **Voyager deterministic simulation** | Planning bucket with reviewed slices delivered in `.intent/phases/016-voyager-virtual-time-and-replay/`, `.intent/phases/017-voyager-seeded-faults-and-checkers/`, `.intent/phases/018-voyager-spawn-and-supervision-simulation/`, and `.intent/phases/019-voyager-single-shard-io-simulation/`. Shipped so far: `tina-sim`, a single-shard virtual-time simulator for the shipped `Sleep { after }` / `TimerFired` contract, deterministic replay artifacts, direct timer-semantics proofs, simulator-backed retry/backoff proof, seeded perturbation over timer-wake and local-send behavior, a small checker surface with replayable failure capture, single-shard spawn/supervision replay covering public spawn payloads, restart policies, stale identity, budget exhaustion, and direct-child scope, and scripted single-shard TCP simulation covering the shipped bind/accept/read/write/close call family plus replayed echo workloads and TCP checker replay. Remaining Voyager work still includes broader PRNG policy, richer faults/checkers, and later multi-slice expansion. |
-| **Gemini single-shard release story** | Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, and a clear single-shard adoption story. |
-| **Galileo multi-shard semantics and simulation** | A large coherent package: multi-shard explicit-step runtime semantics, cross-shard delivery, routing/placement, deterministic multi-shard traces, simulator parity, and a user-shaped proof workload. Explicitly does **not** include monoio substrate work or benchmark/hardening stories in the same pass. |
+| ~~**Galileo multi-shard semantics and simulation**~~ | Delivered in `.intent/phases/020-galileo-multi-shard-semantics-and-simulation/`: multi-shard explicit-step runtime/simulator runners, cross-shard delivery, routing/placement, deterministic traces, replay, source-time vs destination-time delivery stages, seeded simulator composition proofs, and user-shaped dispatcher/TCP/supervision proof workloads. |
+| **Kepler core primitive completion** | Next. Finish the remaining core concurrency-semantic gaps after Galileo: peer/shard liveness, multi-shard supervision boundary, ownership/buffering/allocation honesty, and stronger replay/checker pressure. Explicitly not a docs/examples or bridge phase. |
+| **Gemini release story** | Deferred until after the core primitive is more settled. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, and a clear adoption story. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
+
+Real concurrent shard execution is a later substrate story around
+`tina-runtime-monoio`, not something Galileo, Kepler, or Cassini should
+quietly smuggle in. Galileo proves the multi-shard contract under one explicit
+global coordinator thread first; later substrate work can make shards truly
+run concurrently against that already-proved contract.
 
 ## Strategic prerequisites
 
@@ -233,112 +241,76 @@ This is the highest-leverage phase. Deterministic simulation is what makes Tina'
 ---
 
 ## Phase Gemini
-> First crewed flight. Stabilize and publish the single-shard story.
+> First crewed flight. Stabilize and publish the settled core story.
 
-> After: Phase Voyager · Before: Phase Galileo
+> Deferred until after Phase Kepler · Before: Phase Apollo
 
-- Publish a coherent `0.1.0` story for `tina`, `tina-mailbox-spsc`, `tina-supervisor`, `tina-runtime`, and `tina-sim`, or explicitly decide that the APIs are still private and not ready for semver promises. By this point Voyager has surfaced which runtime hooks the simulator needs to be part of the stable surface and which can stay private.
+- Publish a coherent `0.1.0` story for `tina`, `tina-mailbox-spsc`,
+  `tina-supervisor`, `tina-runtime`, and `tina-sim`, or explicitly decide that
+  the APIs are still private and not ready for semver promises. By this point
+  Kepler should have settled the core multi-shard primitive enough that docs
+  and bridge comparisons are not chasing a moving target.
 - Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, task-dispatcher walkthrough, and TCP echo walkthrough.
-- Document the supported invariants for the single-shard runtime: delivery semantics, mailbox guarantees, supervision behavior, replayability, and the current allocation story.
+- Document the supported invariants for the core runtime/simulator model:
+  delivery behavior, mailbox guarantees, supervision behavior, replayability,
+  shard behavior, and the current allocation story.
 - Publishing is gated on reviewed code, docs, and proofs all existing together. "The code works locally" is not enough for `0.1.0`.
 
-**Done when:** there is either a published `0.1.0` with semver intent or an explicit decision not to publish yet; the single-shard crates have user-facing guides covering both runtime and simulator usage; the supported invariants are documented and reviewed; a developer outside the project can build a non-trivial isolate from the docs alone.
+**Done when:** there is either a published `0.1.0` with semver intent or an
+explicit decision not to publish yet; the core crates have user-facing guides
+covering both runtime and simulator usage; the supported invariants are
+documented and reviewed; a developer outside the project can build a
+non-trivial isolate from the docs alone.
 
 ---
 
-## Phase Galileo
-> Jupiter mission. Multi-shard semantics become real.
+## Phase Kepler
+> Telescope mission. Finish the primitive before we build bridges around it.
 
-> After: Phase Gemini · Before: Phase Apollo
+> After: Phase Galileo · Before: Phase Apollo
 
-Galileo should be a **big semantic package**, but still one coherent story:
-`tina-rs` stops being single-shard. The goal is not "a cross-shard helper"
-or "a monoio prototype"; the goal is that multi-shard ownership, delivery, and
-replay become first-class and reviewable.
+- Kepler is a core-completion phase, not an outward adoption phase.
+- It closes the remaining semantic gaps that still sit too close to the
+  primitive itself:
+  - peer / shard liveness semantics
+  - the multi-shard supervision boundary
+  - cross-shard ownership / buffering / allocation honesty
+  - stronger replay/checker pressure on those semantics
+- This phase should prefer runtime + simulator proof work over docs/examples.
+- If a `tina` boundary change is needed here, it should be because the core
+  primitive is still under-specified, not because a future bridge would like a
+  smoother adapter surface.
 
-Galileo should ship all of the following together:
+What Kepler explicitly does **not** include:
 
-- a multi-shard explicit-step runtime model
-- shard ownership and registration semantics
-- cross-shard message delivery
-- routing / placement policy honest enough for real workloads
-- defined ordering rules for cross-shard delivery
-- deterministic multi-shard traces
-- `tina-sim` parity for the same multi-shard semantics
-- at least one user-shaped multi-shard workload proving the model end to end
-
-Before implementation, Galileo must pin a real cross-shard semantics note as a
-phase deliverable, not as informal scaffolding. It must define:
-
-- ordering within one mailbox
-- ordering for cross-shard messages from one source to one target
-- interleaving expectations for multiple sources targeting the same destination
-- causal expectations across request/reply pairs
-- stale/closed behavior across shards
-- what is intentionally unspecified
-
-The implementation target for this phase is the **semantic runtime**, not the
-final substrate:
-
-- start from the explicit-step runtime model so the semantics are visible and
-  testable before backend complexity arrives
-- cross-shard messaging should be modeled as explicit shard-to-shard channels,
-  not as "pretend global queue" shortcuts
-- routing / placement may start simple, but must be explicit and tested
-- `tina-sim` must learn the same cross-shard rules rather than inventing a
-  second model
-
-What Galileo explicitly does **not** need to include in this same pass:
-
-- `tina-runtime-monoio`
-- io_uring / reactor substrate engineering
-- performance tuning and benchmark claims
-- NUMA optimization
-- consistent-hashing sophistication or live rebalancing
-- zero-copy experiments for cross-shard ownership transfer
-- full peer-quarantine / shard-restarted broadcast semantics from upstream Tina
-
-The first Galileo slice should be explicit about one more boundary:
-
-- source-time cross-shard send result is about transport admission
-- destination harvest may still record local `Closed` / `Full` outcomes in the
-  trace as a Rust-side observability extension
-- that richer destination trace is not the same thing as a second synchronous
-  send-result contract
-
-Those belong to the next story, after the contract is real.
+- Tokio bridge work
+- polished adoption examples
+- guide-writing
+- publication/semver positioning
+- benchmark theater beyond what is needed to make allocation claims honest
 
 **Proof plan:**
 
-- Multi-shard runtime tests prove:
-  - shard ownership and registration
-  - cross-shard delivery
-  - per-mailbox FIFO
-  - per-source -> per-target ordering
-  - defined multi-source interleaving behavior
-  - stale/closed rejection across shards
-  - deterministic repeated runs with the same event trace and causal structure
-- Extended simulator tests prove reproducible multi-shard traces against the
-  same semantics, not simulator-only rules.
-- At least one user-shaped workload proves the multi-shard model end to end.
-  Good candidates:
-  - a two-shard dispatcher/worker workload
-  - a routed multi-shard tenant/session workload
-  - a two-shard echo/control-plane split
-- Replay tests prove a saved config reproduces a multi-shard failure exactly.
+- Runtime and simulator both prove one honest peer/shard liveness model.
+- Runtime and simulator both prove the chosen multi-shard supervision
+  boundary, whether that means sealing it shard-local or extending it
+  minimally.
+- Replay/checker pressure covers the new semantics rather than only the
+  happy-path cross-shard workload.
+- Allocation/buffering evidence is strong enough that the runtime-level claim
+  is honest and reviewable.
 
-**Done when:** `tina-rs` is honestly multi-shard in both runtime and simulator
-terms; the cross-shard contract is written down and directly proved; a
-user-shaped workload exercises the model end to end; repeated seeded runs are
-deterministic and replayable; and no part of the phase depends on benchmark
-theater or substrate-specific heroics.
+**Done when:** the remaining core semantic gaps after Galileo are either
+closed and directly proved or deliberately sealed as long-lived boundaries;
+runtime-level buffering/allocation claims are honest; and Apollo can compare
+against a more settled primitive instead of a still-moving one.
 
 ---
 
 ## Phase Apollo
 > Moonshot. Tokio bridge design and implementation.
 
-> After: Phase Galileo · Before: Phase Cassini
+> After: Phase Kepler · Before: Phase Cassini
 
 - `tina-runtime-tokio-bridge`: adapter for adopting tina inside an existing Tokio app.
 - `tina-runtime-tokio-bridge` v1 must enable incremental adoption inside an existing Tokio app: drop one isolate in, not rearchitect the whole application.
@@ -386,8 +358,8 @@ These still need answers, but a couple now have an explicit phase boundary.
    question is how far runtime-lifetime budgets can go before timed windows or
    explicit deferral are required, and how to prove the task-dispatcher example
    without reconstructing supervision state from the trace.
-3. **Runtime allocation boundary.** The SPSC mailbox hot path is proven narrowly. The runtime itself still needs an allocation audit before the project repeats "no hidden allocations" as a runtime-level claim.
-4. **Cross-shard ownership.** Tina-Odin's mailboxes are SPSC; cross-shard requires copy-or-move. Investigate whether we can use ownership transfer (move + atomic pointer swap) for zero-copy. If not, accept the copy.
+3. **Runtime allocation boundary.** The SPSC mailbox hot path is proven narrowly. The runtime itself still needs an allocation audit before the project repeats "no hidden allocations" as a runtime-level claim. Kepler should own that decision.
+4. **Cross-shard ownership.** Tina-Odin's mailboxes are SPSC; cross-shard requires copy-or-move. Investigate whether we can use ownership transfer (move + atomic pointer swap) for zero-copy. If not, accept the copy. Kepler should turn this from an open investigation into an explicit core rule.
 5. **Supervisor split.** Resolved for the current shape: policy types live in
    `tina`, supervisor configuration lives in `tina-supervisor`, and mutable
    runtime supervision state/execution lives in runtime crates. Future reusable

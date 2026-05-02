@@ -2,25 +2,39 @@
 
 ![tina-rs hero](tina.png)
 
-`tina-rs` is a Rust library for building servers out of independent state machines. Each tenant, connection, room, or session is its own struct with its own message queue, and they never share memory. Handlers process one message at a time and return a value describing what to do next — `Send this`, `Spawn that`, `Reply with X`, `Stop`. The runtime is the only thing that actually does I/O. Because handlers are descriptions of work rather than the work itself, the whole system can be driven deterministically in tests: every failure becomes a seed you can replay.
+`tina-rs` is Tina for Rust: bounded, shared-nothing concurrency.
 
-It's an independent Rust port inspired by [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina), and the motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency) which you should read first, then check out the Odin reference impl, then come back here.
+You write small, synchronous state machines called isolates. Each isolate owns
+its state, receives one message at a time, and returns an `Effect` describing
+what should happen next: send this message, spawn that child, sleep, read,
+write, reply, or stop. The runtime owns scheduling, time, messages between
+shards, and I/O.
+
+That split is the whole thing. Application code stays local and plain.
+Mailboxes are bounded. Messages between shards are bounded too. Failures
+become trace events. The same isolate code can run in a simulator where time,
+TCP, message delays, and replay are controlled by a seed.
+
+It's an independent Rust port inspired by [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina).
+The motivation lives in his article [Why async/await complect concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency).
+Read that first, then check out the Odin reference implementation, then come
+back here.
 
 This repo is a Cargo workspace. Today it has five crates:
 
 - **`tina`** — trait crate. `Isolate`, `Mailbox`, `Address`, `ChildDefinition`, `Outbound`, and the common helpers in `tina::prelude::*`.
 - **`tina-mailbox-spsc`** — bounded single-producer/single-consumer mailbox implementation.
-- **`tina-supervisor`** — supervisor policy/config vocabulary.
-- **`tina-runtime`** — deterministic single-shard runtime with trace events, local send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, and supervised panic restart.
-- **`tina-sim`** — deterministic simulator with virtual time, replay artifacts, seeded perturbation, checker failures, and scripted single-shard TCP simulation.
+- **`tina-supervisor`** — supervisor policy/config types.
+- **`tina-runtime`** — explicit-step runtime with trace events, single-shard and multi-shard runners, bounded send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, and supervised panic restart.
+- **`tina-sim`** — deterministic simulator with virtual time, replay records, seeded delays/reordering, checker failures, scripted TCP simulation, and the same single-shard / multi-shard model.
 
-The multi-shard runtime and Tokio bridge still have their own place on the
-roadmap. See [ROADMAP.md](ROADMAP.md).
+Real parallel thread-per-core execution and the Tokio bridge still have their
+own place on the roadmap. See [ROADMAP.md](ROADMAP.md).
 
-> tina-rs is **experimental**. The vocabulary, bounded SPSC mailbox,
-> supervisor config, single-shard runtime, and deterministic simulator are
-> here. The broader production-runtime and multi-shard story are still in
-> flight. The API will change.
+> tina-rs is **experimental**. The core types, bounded SPSC mailbox,
+> supervisor config, explicit-step runtime, multi-shard runner, and
+> deterministic simulator are here. The production runtime is still in flight.
+> The API will change.
 
 ## Why this exists
 
@@ -31,19 +45,19 @@ The default async tools in Rust make it easy to write a server that works fine o
 - **A blocking call on a Tokio worker stalls everything that worker was juggling.** One slow SQLite query or one cgo call can pause unrelated tasks for hundreds of milliseconds.
 - **`Arc<Mutex<…>>` is a graveyard.** Once you reach for it, you've accepted that several units are sharing state, and the lock is going to be where every weird latency spike comes from.
 
-`tina-rs` enforces a different set of ideas:
+`tina-rs` enforces different rules:
 
-- **One state machine per unit.** Each tenant or connection is a typed struct (an `Isolate`) with one message type and one queue.
+- **One state machine per unit.** Each tenant, connection, worker, or protocol role is a typed struct (an `Isolate`) with one message type and one queue.
 - **Handlers are synchronous and return descriptions of work.** `fn handle(msg) -> Effect`. The handler never does I/O; it returns a value like "send this message" or "spawn this child" or "stop me." The runtime executes the description.
 - **Queues are bounded with explicit `Full` and `Closed` errors.** Backpressure is something the application sees and handles, not a leak that builds quietly.
-- **One OS thread per core, pinned, no stealing.** Each shard owns a fixed set of isolates. Work doesn't move between cores. Cache stays warm.
+- **Shard-owned execution.** Each shard owns its isolates, timers, runtime resources, and cross-shard queues. The current crates prove this with an explicit-step model; the production thread-per-core runtime comes later.
 - **The whole runtime is replayable.** Because handlers are descriptions and the runtime is the only thing that touches I/O or time, a test harness can drive the system from a seed and reproduce any failure.
 
 None of this is new: Erlang, Akka, and [Seastar](https://seastar.io/) all do versions of it. `tina-rs` is these patterns expressed as Rust traits and a small set of impl crates.
 
 ## Why not write a new runtime?
 
-Thread-per-core runtimes for Rust already exist. [monoio](https://github.com/bytedance/monoio) is io_uring-based and actively maintained. [glommio](https://github.com/DataDog/glommio) is the Datadog version. `tokio::runtime::Builder::new_current_thread` gives you the same single-threaded idea inside the existing async ecosystem. The challenge lies in the discipline above rather than the scheduler, and that layer is portable across runtimes. `tina-rs` is the discipline; the scheduler is whatever you pick.
+Thread-per-core runtimes for Rust already exist. [monoio](https://github.com/bytedance/monoio) is io_uring-based and actively maintained. [glommio](https://github.com/DataDog/glommio) is the Datadog version. `tokio::runtime::Builder::new_current_thread` gives you the same single-threaded idea inside the existing async ecosystem. The hard part is the rule set above: isolate ownership, explicit effects, bounded queues, supervision, and simulation. `tina-rs` builds those rules first. Runtime backends can plug in underneath.
 
 If you want to contribute or find bugs, please open a PR or issue.
 
@@ -114,7 +128,7 @@ the write is partial, then re-arm the next read.
 The full runnable example lives in
 [`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime-current/examples/tcp_echo.rs).
 
-That is the whole vibe. Handlers stay synchronous. Local state stays local.
+That is the whole shape. Handlers stay synchronous. Local state stays local.
 `send`, `reply`, `spawn`, `stop`, and `batch` are plain returned values. Time
 and I/O happen in the runtime. Completions come back later as ordinary
 messages. The code stays honest about things Tokio usually hides, like retries
@@ -127,40 +141,40 @@ Full runnable examples live here:
 
 ## Design
 
-The discipline is small enough to list on one page:
+The rules fit on one page:
 
 | Idea | What it means | Why |
 |------|---------------|-----|
-| **Thread-per-core, no work-stealing** | One OS thread per core, pinned. Each shard owns a fixed set of isolates. | Work-stealing destroys cache locality. Pinning preserves it. |
-| **Isolate-per-entity** | Tenants, connections, sessions each get a typed state machine in a pre-allocated arena. No `Arc<Mutex<…>>` spaghetti. | Local state is local. No lock contention, no false sharing. |
+| **Shard-owned execution** | A shard owns its isolates, timers, runtime resources, and cross-shard queues. The current runtime proves this with an explicit-step model; real thread-per-core execution comes later. | Work has an owner. The model does not depend on hidden task migration. |
+| **Isolate-per-entity** | Tenants, connections, sessions, workers, or protocol roles each get a typed state machine. No `Arc<Mutex<…>>` spaghetti. | Local state is local. No lock contention, no false sharing. |
 | **Effect-returning handlers** | Handlers are synchronous: `fn handle(&mut self, msg, ctx) -> Effect`. The runtime executes the effect. | Pure-ish handlers are deterministic. Determinism enables simulation. |
-| **Bounded mailboxes** | SPSC ring buffers with `try_send`. `Full` and `Closed` are explicit errors. | Unbounded queues turn spikes into OOMs. |
+| **Bounded queues** | Mailboxes and cross-shard queues have capacity. `Full` and `Closed` are explicit outcomes. | Unbounded queues turn spikes into OOMs. |
 | **Supervision trees** | Parent isolates watch children; restart policies (`one-for-one`, `one-for-all`, `rest-for-one`) with budgets. | Failures stay local. Restart budgets keep crash loops from cascading. |
-| **Deterministic simulation** | Time, I/O, and message-arrival order are controlled by a seeded test harness. | Failures become reproducible artifacts, not phantoms. |
+| **Deterministic simulation** | Time, I/O, and message order are controlled by a seeded test harness. | Failures become replayable records, not mysteries. |
 
-None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), and Tina-Odin all do versions of this. `tina-rs` collects them into Rust traits plus a small set of impl crates.
+None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), and Tina-Odin all do versions of this. `tina-rs` puts them into Rust traits plus a small set of crates.
 
 ## Status
 
 What works today: the trait crate, the bounded SPSC mailbox crate, supervisor
-configuration, the single-shard runtime, and the deterministic simulator. You
-can write isolates against the preferred public API, exercise real mailbox
-semantics, run handlers through `tina-runtime`, use runtime-owned TCP and
-runtime-owned time, and replay timer-driven or scripted single-shard TCP
-behavior through `tina-sim`.
+config, the explicit-step runtime, multi-shard message routing,
+and the deterministic simulator. You can write isolates against the preferred
+public API, exercise real mailbox behavior, run handlers through
+`tina-runtime`, use runtime-owned TCP and runtime-owned time, supervise and
+restart children, route messages across shards, and replay timer-driven,
+TCP-driven, supervised, and multi-shard behavior through `tina-sim`.
 
-What's coming next, in order: a multi-shard runtime; and then an adapter that
-lets a tina isolate run inside
-an existing Tokio app, so codebases can adopt the discipline incrementally
-without making Tokio the core model.
+What's coming next is core hardening before bridges: peer/shard liveness,
+ownership and buffering honesty, stronger checker pressure, and then later a
+production runtime backend and adapter work.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 
 ## Non-goals
 
-- A new runtime competing with Tokio or monoio. Use what exists.
+- A new scheduler competing with Tokio or monoio. Use what exists.
 - Full feature parity with Tina-Odin. We port the *shape*, not every primitive.
-- "Replacing Tokio." This is a discipline layer that rides on top of any thread-per-core runtime.
+- "Replacing Tokio." This is a rule layer that rides on top of a runtime.
 - FFI to Tina-Odin. Two runtimes fighting for cores would be the worst of both worlds.
 
 ## Development

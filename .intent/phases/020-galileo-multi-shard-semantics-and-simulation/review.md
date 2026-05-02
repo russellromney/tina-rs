@@ -764,3 +764,339 @@ What is still intentionally *not* part of this Galileo closeout:
 That is a good stopping boundary. The current implementation is already an
 honest, reviewable multi-shard semantic runtime/simulator pair without
 pretending the later shard-liveness story has landed too.
+
+## Implementation Review 1 — Session B
+
+Reviewed the landed implementation against the amended plan, Plan Review
+1/2/3 closeouts, and the upstream-alignment / closeout notes by Session
+A. Inspected `tina-runtime-current/src/lib.rs` (`MultiShardRuntime` shell
+at line 1410), `tina-sim/src/lib.rs` (`MultiShardSimulator` shell at line
+2708), the new `tests/multishard_dispatcher.rs` files in both crates,
+the inline cross-shard tests in `tina-runtime-current/src/tests.rs`, and
+the SYSTEM/CHANGELOG updates. Reran the multi-shard test surface and
+`make verify` end-to-end.
+
+Note: 020 was implemented on top of 021's rename pass. The crate
+`tina-runtime-current` is now `tina-runtime`, and the new vocabulary
+(`Runtime`, `RuntimeCall`, `CallInput`, `CallOutput`, `CallError`,
+`ChildDefinition`, `RestartableChildDefinition`, `with_initial_message`,
+`register_with_capacity`, `tina::prelude`) is in place. The 020 review
+artifacts and code references in this section reflect the post-021
+naming.
+
+### What I verified directly
+
+- `cargo +nightly test -p tina-sim -p tina-runtime` passes the full
+  multi-shard test surface: 8 inline runtime tests + 3
+  `multishard_dispatcher` workload tests on the runtime side; 8 inline
+  simulator tests + 3 `multishard_dispatcher` workload tests on the
+  sim side. 22 multi-shard tests, 22 green.
+- `make verify` exits 0. clippy `-D warnings`, doc, loom, full
+  workspace test all clean.
+- Existing 016-019 simulator and runtime tests still green without
+  changes — additivity holds across the rename + multi-shard work.
+- `tina/src/lib.rs` boundary unchanged for 020; the new public surface
+  lives in `tina_runtime::MultiShardRuntime` and
+  `tina_sim::MultiShardSimulator` plus their `Config` siblings, none
+  of which require new `tina` vocabulary.
+- 020 lands in the existing runtime/simulator crates rather than a new
+  substrate crate (matches Plan Review 3 finding 6).
+
+### Plan direct-proof items: status against the implementation
+
+All plan build-step-14 direct proofs are exercised by named tests:
+
+| Plan item | Test |
+| --- | --- |
+| root registration / placement on multiple shards | `multishard_runtime_routes_ingress_and_steps_in_ascending_shard_order`, sim variant |
+| same-shard behavior unchanged | blast-radius via `make verify` |
+| `try_send(addr, msg)` ingress routes by `addr.shard()` | same as row 1 |
+| cross-shard send delivery | `cross_shard_send_becomes_visible_on_the_next_global_step` |
+| in-step cross-shard visibility follows next-step-only rule | same |
+| bounded shard-pair queue rejection at source-time | `cross_shard_queue_overflow_rejects_at_source_time` |
+| per-source -> per-target FIFO | `cross_shard_harvest_preserves_fifo_from_one_source` (3 messages from one source isolate via `KickThrice`) |
+| three-message FIFO across one shard-pair | same |
+| deterministic multi-source interleaving | `cross_shard_harvest_drains_sources_in_ascending_shard_order` (4 shards: 33, 22, 11, 44 — sources 11, 22, 33 to sink on 44) |
+| N >= 3 shard harvest ordering | same — 3 source shards + 1 sink shard |
+| cross-shard stale/closed rejection | `cross_shard_closed_target_rejects_on_destination_harvest` |
+| cross-shard unknown-isolate rejection | `cross_shard_unknown_isolate_rejects_on_destination_harvest` |
+| destination mailbox full on harvest | `cross_shard_destination_mailbox_full_rejects_on_harvest` |
+| request/reply causality across shards | `dispatcher_worker_workload_preserves_cross_shard_request_reply_causality` (asserts strict event-id ordering: source attempt < source accept < destination harvest < reply attempt < reply harvest) |
+| deterministic repeated runs | `dispatcher_worker_workload_is_deterministic_across_identical_runs` |
+| simulator replay from saved config | `multishard_dispatcher_workload_replays_from_saved_config` (rebuilds simulator from artifact's `simulator_config()` + `multishard_config()`) |
+| user-shaped two-shard workload exercises a `SendRejected` path | `dispatcher_worker_workload_surfaces_source_time_full_rejection` (`Full` named per build step 15) |
+
+### Specific implementation invariants I verified
+
+- **Global event-id monotonicity across shards.** `IdSource` is
+  `Rc<Cell<u64>>` cloned into every per-shard simulator
+  (`tina-sim/src/lib.rs:783, 2783`). Each shard increments the same
+  counter, so EventIds are globally monotonic. Same pattern in
+  `tina-runtime` (`IdSource::clone()` passed via
+  `Runtime::with_clock_and_ids`). 017's structural
+  event-id-monotonicity checker remains meaningful by construction.
+- **Next-step-only cross-shard visibility.** `step()` does
+  `let mut ready = std::mem::take(&mut self.remote_queues);` at the
+  start, so harvest reads only sends enqueued *before* this step;
+  sends produced during this step go to a freshly cleared
+  `self.remote_queues` and become harvestable next step. The test
+  `cross_shard_send_becomes_visible_on_the_next_global_step`
+  directly asserts that the destination shard's `HandlerStarted`
+  count is 0 after step 1 (sender ran but reached only the queue)
+  and 1 after step 2 (harvest produced `MailboxAccepted`).
+- **Ascending source-shard harvest, drain-to-empty per channel.**
+  `harvest_for_destination` iterates `shard_ids` in ascending order
+  (the `shard_ids` vec is built from `BTreeMap` keys, sorted by
+  `Shard::id` at construction in `with_config`). For each source it
+  drains its queue with `while let Some(queued) =
+  queue.pop_front()`. Drain-to-empty per source matches the plan's
+  "drain each shard-pair channel FIFO-to-empty before harvest moves
+  to the next source shard."
+- **Source-time vs destination-time semantic stages.** Source-side
+  `SendDispatchAttempted` / `SendAccepted` / `SendRejected` are
+  emitted on the source shard during the source handler's effect
+  execution. Destination-side `MailboxAccepted` and destination-
+  local rejection events are emitted on the destination shard
+  during harvest. Each test asserts both shards' events explicitly,
+  honoring the SYSTEM.md committed constraint that the two stages
+  are different and should stay described that way.
+- **Bounded shard-pair channels with source-time `Full`.**
+  `MultiShardRuntimeConfig.shard_pair_capacity` (default 64) is
+  enforced by `if queue.len() >= config.shard_pair_capacity {
+  return Err(SendRejectedReason::Full); }` in the closure passed to
+  `step_with_remote`. The runtime's `KickTwice` test sets capacity
+  to 1 and asserts a single source-shard `SendRejected{Full}`. The
+  dispatcher full-rejection workload uses `shard_pair_capacity: 1`
+  to make `SubmitPair` overflow on the second request.
+- **Multi-shard quiescence.**
+  `MultiShardSimulator::run_until_quiescent` (sim-side at line
+  2943) checks all four conditions before declaring quiescence:
+  - delivered count == 0
+  - no due timers across any shard
+  - no in-flight calls across any shard
+  - `!self.remote_queues.is_empty()` is false (no pending cross-
+    shard messages)
+  - no shard has pending mailbox messages
+  Mirrors the 019 lesson where ignoring an in-flight category
+  produced a stop-too-early bug. Honored here.
+- **Replay artifact stays one whole-run record.**
+  `MultiShardReplayArtifact.event_record: Vec<RuntimeEvent>` (sim
+  line 128) plus the doc comment "this records one whole-run event
+  record rather than splitting replay state into per-shard
+  artifacts" matches Plan Review 3 finding 5.
+- **Programmer-error misuse panics.**
+  `MultiShardRuntime::with_config` panics on empty shard set,
+  duplicate shard ids, or zero pair capacity (lines 1460-1475).
+  `register_on` and `try_send` panic via `checked_shard_index` if
+  the target shard isn't owned. Same in the simulator. Matches the
+  plan's programmer-error rule.
+
+### Plan Review 1/2/3 small gaps: status against the implementation
+
+All 26 plan-review findings (18 + 8) closed in code:
+
+- Coordinator API: one global `step()` ascending shard-id, no
+  per-shard public stepping API. ✓
+- Shard-pair channel boundedness with source-time `Full`. ✓
+- Trace observability with source-side and destination-side events. ✓
+- Globally-monotonic `EventId` via shared `IdSource`. ✓
+- Multi-shard quiescence: all-shards-local + all-pair-channels-empty.
+  ✓
+- Additivity: existing 016-019 tests untouched. ✓
+- Global ingress routing by `addr.shard()`. ✓
+- No `Router` API: routing is `Address::shard()` only. ✓
+- No cross-shard perturbation surface (deferred to 021/later). ✓
+- Source-side `Full` vs destination-side `Closed` distinction. ✓
+- Drain-to-empty per channel before next source. ✓
+- 017/019 perturbation surfaces stay shard-local (they only fire on
+  `Simulator`-local code paths, which the multi-shard simulator
+  composes per shard with shared seed and per-surface tagging). ✓
+- Runtime-owned calls stay shard-local. ✓
+- Unknown-isolate rejection on destination harvest. ✓
+- `Shard` trait unchanged. ✓
+- Cross-shard misuse panics. ✓
+- Still explicit-step / synchronous: verified by inspection — no
+  threading or async substrate. ✓
+- N >= 3 ordering test, three-message FIFO, workload exercises
+  `SendRejected`. ✓
+- In-step cross-shard visibility next-step-only. ✓
+- Per-shard/per-surface ordinals (017/019 surfaces are shard-local
+  by virtue of running inside per-shard `Simulator` instances; the
+  shared seed has per-surface constants from 017 and 019). ✓
+- No adversarial proof mode. ✓
+- Existing 016-019 surface stays untouched (verified by `make
+  verify`). ✓
+- Replay artifact one whole-run `Vec<RuntimeEvent>`. ✓
+- Multi-shard semantics in existing runtime/simulator crates. ✓
+- Workloads obtain remote `Address<M>` via existing public
+  `Address::new_with_generation` (the unknown-isolate test
+  constructs an address with `IsolateId::new(999)` directly). ✓
+- Workload's `SendRejected` reason named (`Full` in the dispatcher
+  full-rejection test). ✓
+
+### Specific implementation observations beyond the plan
+
+- The Session-A "Upstream Alignment Note" (review.md lines 707-735)
+  is honest: upstream Tina treats post-admission destination drops as
+  destination-local facts. The implementation reflects this — source-
+  side `SendAccepted` is emitted *only* if the shard-pair queue
+  accepts the message (`Ok(()) => SendAccepted`), and any later
+  destination-side rejection (mailbox-full on harvest, stale-target,
+  unknown-isolate) is emitted as a separate event on the destination
+  shard, not as a retroactive change to the source-side outcome.
+  This is the right read of the upstream model.
+- The 4-shard ordering test (`cross_shard_harvest_drains_sources_in_
+  ascending_shard_order`) is constructed deliberately to defeat
+  symmetric-shard-id bias: shards are passed in `[33, 22, 11, 44]`
+  order, then sorted internally to `[11, 22, 33, 44]` for stepping;
+  senders are `try_send`'d in `[33, 22, 11]` order; assertion is
+  that destination causes match the *send-order event-id sequence*
+  (which is itself ascending because senders run in step-order
+  ascending). A bug that drained in registration order or input
+  order would fail this test.
+- The dispatcher request/reply causality test asserts strict
+  event-id ordering across five distinct trace events on two shards
+  (request-attempt, request-accept, worker-mailbox, reply-attempt,
+  coordinator-mailbox). This is the strongest single-workload proof
+  of cross-shard causality preservation in the suite.
+
+### How this could still be broken while the listed tests pass
+
+- **Per-source-isolate / per-target-isolate FIFO is technically a
+  consequence of per-shard-pair FIFO, not an independent
+  invariant.** All messages from any isolate on shard A to any
+  isolate on shard B share the same `(A, B)` queue. Two source
+  isolates on the same shard sending to two different target
+  isolates on the same shard all go through one queue and harvest
+  in interleave-by-send-order. The plan's "messages sent from one
+  source isolate to one target isolate preserve send order" holds
+  by construction — the per-isolate-pair claim is subsumed by the
+  per-shard-pair claim, but no test actually exercises the harder
+  case (two sources on shard A, two targets on shard B, prove that
+  per-isolate-pair order holds even when interleaved). Today every
+  test uses one source and one target per shard pair. Surrogate-
+  supported, not directly proved.
+- **The 4-shard test still uses one sink isolate.** A regression
+  that broke harvest ordering for the case of multiple destination
+  isolates on the same shard (different mailboxes, same harvest
+  step) would not be caught by the existing 4-shard test. Surrogate
+  via the dispatcher workload (which has 1 coordinator + 1 worker)
+  but the multi-isolate-per-shard ordering case is not directly
+  pinned.
+- **`run_until_quiescent` correctness depends on `mem::take` clearing
+  `remote_queues` at start of step.** A future refactor that
+  changed this to "mutate in place" would make the
+  `!self.remote_queues.is_empty()` quiescence check always true (or
+  always false) depending on the change. No invariant test pins
+  this. Mitigation is plumbing-discipline rather than test surface.
+- **The dispatcher's `Full` workload uses `shard_pair_capacity: 1`
+  which makes the second admission fail.** With pair capacity 2 or
+  greater, the `SubmitPair` workload would not exercise `Full`. The
+  workload demonstrates the rejection path under a pinned capacity,
+  which is fine, but a test with the default capacity would not
+  exercise `Full` on this workload. Acceptable — the test names
+  the capacity and the `SendRejected` shape, matching build step
+  15's "name whether it proves `Full` or `Closed`" requirement.
+- **Cross-shard composition with 017 local-send / timer-wake faults
+  and 019 TCP perturbation is implicit, not directly tested.**
+  Each per-shard `Simulator` carries the same `SimulatorConfig`
+  cloned, so faults fire shard-locally. No test exercises a
+  multi-shard run with non-default 017/019 perturbations. Plan
+  Review 1 finding 12 was closed as "stay scoped to existing
+  surfaces"; that holds by construction but is not directly
+  proved. Acceptable for closeout, deferred to a later
+  cross-shard-perturbation slice (021's note about deferring
+  cross-shard perturbation).
+- **The simulator replay test uses `SimulatorConfig::default()`**.
+  Same-config replay with default seeds is the easy case. Replay
+  under a non-default seed across shards is not directly tested.
+  The simulator's seeded paths are all shard-local, so this is
+  surrogate-supported by the existing 017 same-seed-replay tests
+  + the 020 multi-shard replay test together.
+
+### What old behavior is still at risk
+
+- 016-019 tests pass under `make verify`, but the test surface for
+  each prior phase remains identical. No prior tests were rewritten.
+  Implementation review treats this as the right blast-radius
+  posture.
+- 017 structural event-id monotonicity checker continues to be
+  meaningful because EventIds are globally monotonic.
+- 018 spawn/restart and 019 TCP semantics are untouched: the
+  multi-shard runtime/simulator delegate per-shard logic to the
+  existing single-shard `Runtime` / `Simulator`. Spawn lineage and
+  TCP resources stay shard-local by routing through the existing
+  per-shard implementations.
+
+### What needs a human decision
+
+- **Whether to add a focused per-shard-pair test with multiple
+  sources/targets on each side.** Not required for closeout; the
+  per-shard-pair FIFO is honored by construction and the existing
+  3-message FIFO test plus 4-shard ordering test cover the load-
+  bearing cases. Worth a closeout note that per-isolate-pair
+  ordering is surrogate-supported through per-shard-pair FIFO.
+- **Whether to add a multi-shard run under non-default
+  017/019 fault config.** Not required; cross-shard perturbation
+  is explicitly deferred. Worth a closeout note acknowledging
+  surrogate proof through composition rather than direct test.
+
+### Recommendation
+
+020 closes on its own terms.
+
+- All 18 Plan Review 1 findings, all 8 Plan Review 2 small
+  refinements, and all 16 build-step-14 direct proofs are
+  exercised by green tests.
+- The two user-shaped workloads (one runtime, one simulator)
+  exercise the hardest invariant the plan named — request/reply
+  causality across shards — directly through cross-shard event-id
+  ordering assertions, not through helper-state probes.
+- The implementation flushed out the right discipline (next-step-
+  only visibility via `mem::take`, ascending source-shard harvest
+  via `BTreeMap` shard indexing, drain-to-empty per channel,
+  shared `IdSource` for global event-id monotonicity).
+- SYSTEM.md gained the right two committed constraints
+  (source-time vs destination-time stages; full peer-quarantine /
+  shard-restarted is later work).
+- CHANGELOG documents the slice honestly.
+- Boundary promise held: no `tina` API additions; multi-shard
+  surface lives in `tina_runtime` and `tina_sim` as additive
+  shells.
+- `make verify` exit 0, including all 016-019 suites.
+
+Suggested non-blocking closeout notes for `commits.txt` /
+closeout review:
+
+1. Per-isolate-pair FIFO across shards is surrogate-supported by
+   per-shard-pair FIFO; no test directly exercises two sources
+   plus two targets sharing one shard pair.
+2. Multi-shard composition with 017/019 fault surfaces is
+   surrogate-supported by per-shard scoping; no test runs a
+   multi-shard workload under non-default seed/fault config.
+3. Multi-shard simulator replay is proved under
+   `SimulatorConfig::default()`; non-default-seed multi-shard
+   replay is surrogate-supported through 017's per-shard replay
+   plus the multi-shard ordering tests.
+
+After those notes, 020 closes single-shard semantics' first honest
+multi-shard chapter: deterministic ordering, source vs destination
+stages, replayability, additivity, and explicit future-work
+boundary against shard-quarantine and substrate concurrency.
+
+## Closeout Update
+
+The three recommended closeout proof notes were promoted from surrogate
+evidence to direct evidence before merge.
+
+- Per-isolate-pair FIFO across shards now has a direct runtime and simulator
+  proof with two source isolates and two target isolates sharing one shard
+  pair.
+- Multi-shard simulator replay now has a direct non-default seeded fault proof.
+- Multi-shard composition with existing seeded fault surfaces now has direct
+  proofs for timer/local-send faults, scripted TCP completion faults, and
+  supervised restart under seeded local-send delay.
+
+020 is closed. Remaining work belongs to Kepler: peer/shard liveness,
+shard-restart or quarantine rules, cross-shard supervision boundaries, and
+runtime-level buffering/allocation claims.

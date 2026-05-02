@@ -8,18 +8,24 @@ by accident.
 
 ## What tina-rs is
 
-`tina-rs` is a way to build servers out of many small state machines.
+`tina-rs` is Tina for Rust: bounded, shared-nothing concurrency.
 
 The big ideas are:
 
-- each isolate is one small state machine with its own state
-- handlers are synchronous and return effects instead of doing I/O themselves
+- application logic is written as small synchronous state machines called
+  isolates
+- each isolate owns its state and handles one message at a time
+- handlers return effects instead of doing I/O themselves
 - mailboxes are bounded, and backpressure is visible
-- runtimes do the scheduling and run the effects
+- shards own isolate execution, runtime-owned resources, timers, and
+  cross-shard queues
+- runtimes schedule isolates and interpret effects
 - replay and simulation matter from the start, not as an afterthought
 
-`tina-rs` is not a new scheduler. It is not trying to replace Tokio or
-monoio. It is a small set of crates that sit on top of existing runtimes.
+`tina-rs` is not trying to replace Tokio or monoio. It is the Tina rule set as
+Rust crates: isolate state, explicit effects, bounded queues, supervision, and
+deterministic simulation. Production thread-per-core runtimes can come later
+without changing those rules.
 
 ## Where this came from
 
@@ -33,171 +39,99 @@ The main blog post behind the project is:
 
 - [The Tokio/Rayon Trap and Why Async/Await Fails Concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency)
 
-We are trying to carry over the shape and discipline of Tina, not copy every
-detail one-for-one.
+We are trying to carry over Tina's shape, not copy every detail one-for-one.
 
-## Current shipped surface
+## What ships now
 
 Today the repo ships `tina`, `tina-mailbox-spsc`, `tina-supervisor`,
 `tina-runtime`, and `tina-sim`.
 
-`tina` provides the shared words and types, including supervision policy types.
+`tina` owns the shared words: `Isolate`, `Address`, `Context`, `Effect`,
+`Outbound`, child definitions, and supervision policy types. It does not pick
+a runtime backend. Concrete runtime calls live in runtime crates.
 
-`tina-supervisor` provides supervisor configuration vocabulary. Runtime-owned
-supervision state and restart execution stay in runtime crates.
+The normal user path is the prelude:
 
-`tina-runtime` is still a small, in-progress runtime. Today it has
-deterministic runtime events, a single-shard stepping model, local
-same-shard send dispatch, local same-shard spawn dispatch, typed runtime
-ingress for sending to registered isolates, stored direct parent-child lineage
-for spawned children, restartable child records, and direct-child
-`RestartChildren` execution. It can also apply configured supervisor policy and
-runtime-lifetime budget state when a direct child handler panics.
+- `tina::prelude::*`
+- helpers such as `send`, `reply`, `spawn`, `stop`, `batch`, and `noop`
+- context helpers such as `ctx.me()` and `ctx.send_self(...)`
+- typed runtime calls such as `sleep(...).reply(...)`
+- `tina::isolate_types! { ... }` when it removes associated-type boilerplate
+  without hiding meaning
 
-`tina` now also names a runtime-owned call effect family
-(`Effect::Call(I::Call)` plus the `Isolate::Call` associated type). The trait
-crate stays substrate-neutral: concrete request and result vocabulary live
-in runtime crates. Completion is delivered as an ordinary later `Message`
-via a translator carried inside the call payload, never as a second public
-handler entry point.
+Low-level constructors still exist for tests and advanced consumers, but they
+are not the teaching path.
 
-`tina` also ships an ordered batch effect,
-`Effect::Batch(Vec<Effect<I>>)`, for sequencing existing effects
-left-to-right without opening up a new callback or effect language. In
-`tina-runtime`, later effects in the batch still run after earlier
-non-terminal effects, and `Stop` short-circuits the rest of the batch.
+`Effect` is the closed language between isolate code and a runtime:
 
-The preferred common authoring path is now the 021 devex surface:
-`tina::prelude::*`, plain effect helpers such as `send`, `reply`, `spawn`,
-`stop`, `batch`, and `noop`, concise self-address helpers `ctx.me()` and
-`ctx.send_self(...)`, typed call helpers such as `sleep(...).reply(...)`, and
-`tina::isolate_types! { ... }` when it removes obvious associated-type slab
-boilerplate without hiding semantics.
+- `Send` delivers an `Outbound<M>` to another addressed isolate.
+- `Reply` returns a value to the outside caller.
+- `Spawn` creates a child isolate from a `ChildDefinition` or
+  `RestartableChildDefinition`.
+- `Call` asks the runtime to own an operation and later translate its
+  `CallOutput` into an ordinary message.
+- `Batch` sequences effects left-to-right; `Stop` short-circuits the rest.
+- `Stop` ends the current isolate incarnation.
 
-`tina-runtime` ships the first TCP call family on Betelgeuse
-(nightly Rust): TCP listener bind, accept, stream read, stream write,
-listener and stream close. Resources are runtime-owned opaque ids; raw
-sockets never escape into isolate state. `step()` stays synchronous: the
-runtime drives the Betelgeuse loop forward at the start of each step,
-harvests completed operations from caller-owned typed completion slots,
-runs the per-call translator, and enqueues the resulting `Message` in the
-requesting isolate's mailbox. Synchronous Betelgeuse ops (bind, close)
-complete inline during dispatch; async ops (accept, recv, send) stay in a
-pending list until their slot has a result.
+`ChildDefinition` describes one child incarnation. `RestartableChildDefinition`
+describes how to make a fresh incarnation after restart. Both may carry an
+initial message through `with_initial_message`, delivered after spawn and after
+each restart for restartable children.
 
-`tina-runtime` now also ships the first runtime-owned time call
-verb: `CallInput::Sleep { after }` with `CallOutput::TimerFired`. The
-runtime owns a monotonic clock and samples it once at the start of each
-`step()`; timers due at or before that sampled instant are harvested and
-delivered as ordinary later `Message` values through the same call
-translator path. Equal-deadline timers wake in deterministic request
-order. A crate-private manual clock seam lets tests prove timer semantics
-directly without brittle wall-clock sleeps. A separate assertion-backed
-integration test drives the public runtime path with the shipped monotonic
-clock and proves a real "fail, back off, retry, succeed" workload.
+`tina-runtime` is the explicit-step runtime. It handles same-shard sends,
+same-shard child spawn, supervision, restart, sends into the runtime from
+outside, bounded mailboxes, stale generation rejection, panic capture, abandon
+tracing, time calls, and Betelgeuse-backed TCP calls. Its `step()` is
+synchronous from the outside: the runtime collects finished owned work,
+translates completions into messages, and then handles ready mailbox work.
 
-`ChildDefinition` and `RestartableChildDefinition` now carry an optional bootstrap
-message that the runtime delivers to the new child immediately after spawn
-(and after each restart, for restartable specs). This is what lets a
-listener isolate spawn a connection-handler child with its initial
-`Start` kick without forcing the test harness to peek at trace events.
-
-The repo now also has an assertion-backed task-dispatcher proof workload and a
-matching runnable example. They show the current reference shape for supervised
-work: clients send tasks to a dispatcher isolate, the dispatcher asks a small
-registry isolate for the current worker address, and later work can continue
-through replacement workers after a panic.
-
-A live TCP echo proof and matching runnable example exist for the call
-effect path: a listener isolate is the supervised parent that issues bind,
-accept, and listener-close calls, and each accepted connection becomes a
-restartable connection-handler child that issues read / write / close
-calls. The listener captures its own typed address, uses
-`Effect::Batch(Vec<Effect<I>>)` to sequence "spawn child, then send self a
-re-arm or close message," and spawns the connection child via
-`RestartableChildDefinition::with_initial_message`, so the connection's first read
-fires through the normal handler pipeline rather than via test-harness
-trace introspection. The proof binds to `127.0.0.1:0`, relies on the
-runtime to report the actual bound address, and now covers one-client
-smoke, sequential multi-client handling, bounded overlap, graceful
-listener close, and listener stop. The connection isolate honors partial
-writes through a small pending-buffer + drain pattern, exercised by a
-separate unit test, and crate-local runtime tests directly prove that two
-accepted stream reads can be pending in `IoBackend` at the same time.
+The shipped runtime call types are `RuntimeCall<Message>` over
+`CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep
+and TCP listener/stream operations. Sockets are runtime-owned opaque ids; raw
+sockets do not live in isolate state.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
-most one cause, but one event may be the direct cause of many later events.
+most one cause, but one event may directly cause many later events. Trace
+consumers must not flatten this into a single causal chain.
 
 `Address<M>` names one isolate incarnation, not a logical service name. Its
 identity includes shard id, isolate id, and generation. Runtime sends and
-runtime ingress reject stale known generations as closed instead of silently
-delivering to a current incarnation.
+outside sends into the runtime reject stale known generations as closed instead
+of silently delivering to a newer incarnation.
 
-In `tina-runtime`, an accepted message does not disappear silently. It
-is either handled by an isolate or recorded in the trace as abandoned if the
-isolate stops first.
+`tina-sim` is the deterministic simulator for the same model. It uses virtual
+time, scripted TCP resources, seeded delays/reordering, replay records, and
+checker failures, while keeping the live runtime event types. Replay records
+reproduce against the same workload binary and simulator version; they do not
+serialize arbitrary isolate values, spawn factories, bootstrap closures, or TCP
+scripts.
 
-If a handler unwinds with a panic in `tina-runtime`, that panic becomes
-a runtime event. The isolate is stopped and traced instead of tearing down the
-whole round.
+The simulator can move simulator-owned events without changing the model:
+local-send delivery, timer wake delivery, and TCP completion order can shift in
+controlled seeded ways. These shifts are there to find ordering bugs, not to
+create a second meaning for the program.
 
-Some runtime proofs live in crate-local unit tests when the thing being proved
-is internal runtime state that should not become public API yet.
+`tina-runtime` and `tina-sim` now both expose multi-shard runners. A
+multi-shard runner is still an explicit-step model, not real parallel shard
+execution. It owns several shard-local runtimes/simulators, routes roots by
+shard id, preserves a globally monotonic event id source, and uses bounded
+shard-pair queues for cross-shard sends.
 
-Generated runtime-property tests also exist for small dispatcher workloads.
-Those tests do not just run live histories twice; they also replay the runtime
-trace and prove the trace can recover the same worker completions and restart
-outcomes that the live workload observed.
+Cross-shard sends have two visible stages. Source-time dispatch says whether
+the sender could enter the shard-pair queue at all, including queue `Full`.
+Destination-time delivery says what happened when the target shard tried to
+deliver the message, including unknown isolate, closed generation, or target
+mailbox `Full`. Remote messages become visible on the next global step, not
+the same step that sent them.
 
-There is not yet a Tokio bridge. The runtime-owned call contract is
-substrate-neutral by design so `tina-sim` can implement the same
-vocabulary against virtual time and replay without redefining `tina`.
+Supervision remains owned by the parent isolate's shard. Multi-shard
+runners may route root `supervise` config to the owning shard, but
+they do not invent cross-shard child ownership. Peer quarantine and
+shard-restart rules are still later design work.
 
-`tina-sim` is intentionally still narrower than the live runtime. Today
-it is a single-shard virtual-time simulator for the shipped
-`Sleep { after }` / `TimerFired` call contract plus the simplest seeded
-perturbation layer over simulator-owned surfaces:
-
-- local-send delivery may be held back by one additional delivery round
-- timer wake delivery may be delayed in virtual time
-
-The simulator reuses the live runtime event vocabulary, captures replay
-artifacts containing config/event-record/final-virtual-time and optional
-checker failure, and now supports a small checker surface that can halt a
-run with a structured reason. Proof workloads cover both timer-driven
-retry/backoff under seeded timer perturbation and a deliberate-bug
-harness under seeded local-send perturbation. Replay artifacts reproduce
-against the same workload binary and simulator version; they do not serialize
-arbitrary isolate values, spawn factories, or bootstrap closures.
-
-`tina-sim` also executes the single-shard spawn and supervision surface that
-Mariner already shipped live: `ChildDefinition`, `RestartableChildDefinition`,
-runtime-owned parent-child lineage, restartable child records, direct-child
-`RestartChildren`, bootstrap re-delivery after restart, and supervised panic
-restart using `SupervisorConfig` policy/budget state. The proof surface covers
-same-step spawn ordering, all shipped restart policies, non-restartable skip
-events, stale-address send rejection as `Closed`, budget exhaustion,
-multi-restart replay, and direct-child-only restart scope. Spawn/restart paths
-compose additively with 017's seeded fault surfaces, but 018 does not add new
-spawn/restart-specific perturbation.
-
-`tina-sim` now also executes the shipped single-shard TCP call surface through
-scripted virtual listeners and streams: bind, accept, read, write, listener
-close, and stream close. Bind/close still complete inline during dispatch;
-accept/read/write stay pending and complete on later simulator steps through
-the same translated-message path as the live runtime. Scripted listeners report
-deterministic `local_addr`, accepted streams report deterministic `peer_addr`,
-partial reads/writes remain visible through the live `CallOutput` shapes, and
-virtual listener queues, peer read buffers, peer output buffers, and pending
-TCP completion queues are explicitly bounded by simulator config rather than
-hidden unbounded buffering. The proof surface now covers one-client echo,
-overlap echo, invalid-resource failures, mailbox-full and stopped-requester
-completion rejection, listener-close cancellation, same-config replay of peer
-output, and checker-backed replay of seeded TCP completion reordering. Replay
-artifacts still reproduce against the same workload binary and simulator
-version; they do not serialize arbitrary isolate values, TCP payload scripts,
-spawn factories, or bootstrap closures. Multi-shard semantics remain out of
-scope.
+There is not yet a Tokio bridge, and the bridge is not the main runtime story.
+The runtime call types do not pick a backend, so the simulator, the current
+runtime, and later runtimes can share one meaning model.
 
 ## Crate boundaries that must not drift
 
@@ -207,8 +141,9 @@ scope.
 - mailbox behavior belongs in mailbox crates such as `tina-mailbox-spsc`.
 - runtime scheduling, polling, effect execution, and runtime event traces
   belong in runtime crates.
-- supervision policy types may live in `tina`, but the actual supervision
-  mechanism does not ship before there is a runtime to host it.
+- supervision policy/config types may live in `tina` and
+  `tina-supervisor`, but runtime-owned supervision state and restart execution
+  belong in runtime crates.
 - the simulator must use the real runtime event model. It must not make up a
   second visible model with different rules.
 
@@ -217,7 +152,7 @@ scope.
 - an isolate handles one message at a time
 - handlers change local state and return an `Effect`
 - the effect language is intentionally closed at the trait boundary
-- the dispatcher is the only place real I/O happens
+- runtime-owned calls are the only place real I/O happens
 - if runtime code quietly moves I/O into handlers, helper traits, or test-only
   shims, that is a design break
 
@@ -235,23 +170,28 @@ scope.
 - dynamically sized payloads, if supported, travel behind owning pointers; the
   ring stores fixed-size slot values, not inline DST payloads
 
-## Committed future constraints
+## Shard model
 
-- the first runtime introduces the deterministic runtime event trace with
-  causal links
-- that trace is part of the design, not optional test decoration
-- trace consumers must not assume the trace is a linear chain; restart execution
-  can produce multiple direct consequences from one cause
-- the simulator uses the runtime trace vocabulary as its meaning model
+- a shard is an ownership boundary
+- current multi-shard runners are explicit-step models over many shards,
+  not real parallel execution
+- cross-shard queues are bounded and visible
+- source-time queue entry and destination-time delivery are separate
+  stages
+- remote messages become visible on the next global step
+- event ids are globally monotonic across shards in a multi-shard run
+- supervision is owned by the parent's shard
+- full peer-quarantine and shard-restart rules are a later design step,
+  not something to quietly smuggle into the current multi-shard model
+
+## Bridge posture
+
 - the Tokio bridge is for small, gradual adoption inside existing Tokio apps
-- the Tokio bridge is not the main runtime story, and it is not a reason to
-  copy every Tokio pattern into tina
-- cross-shard rules must be written down before multi-shard runtime work starts
-- cross-shard behavior must not be guessed from code after the fact
-- source-time cross-shard send outcomes and destination-time harvest outcomes
-  are different semantic stages and should stay described that way
-- full peer-quarantine / shard-restarted semantics are a later design step, not
-  something to quietly smuggle into early multi-shard slices
+- the Tokio bridge is not the main runtime story
+- bridge work must not copy Tokio patterns into tina when they fight the
+  isolate/effect model
+- real parallel shard execution belongs to later runtime backend work, not
+  to the current explicit-step runtime
 
 ## Things that should feel wrong
 
