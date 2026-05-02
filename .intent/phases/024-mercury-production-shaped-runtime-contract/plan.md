@@ -194,6 +194,12 @@ count, recovery after load drop, max queue depth where visible, latency for
 accepted requests, and memory/RSS or a narrower allocation proxy if RSS is too
 noisy for CI.
 
+The comparison surface is pinned in
+[`tokio-vs-tina-examples.md`](tokio-vs-tina-examples.md): 20 user-shaped
+examples compare naive Tokio, hardened Tokio, and Tina where relevant. Mercury
+should implement the overload lab by covering as many of those examples as
+possible without drifting into docs-only theater.
+
 ### 9. Capacity And Allocation Claim
 
 Expected direction:
