@@ -99,6 +99,10 @@ pub enum CallKind {
     /// A runtime-observed send attempt whose outcome is delivered back to
     /// the requester as an ordinary later message.
     ObservedSend,
+
+    /// An isolate-to-isolate call whose reply is delivered back to the
+    /// requester as an ordinary later message.
+    IsolateCall,
 }
 
 /// Why a runtime-owned call's completion could not be delivered to the

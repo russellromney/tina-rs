@@ -34,6 +34,11 @@ use std::time::Duration;
 
 use tina::{Address, AddressGeneration, IsolateId, ShardId};
 
+type ErasedReply = Box<dyn Any>;
+type ErasedCallOutcome = CallOutcome<ErasedReply>;
+type IsolateCallTranslator<M> = Box<dyn FnOnce(ErasedCallOutcome) -> M>;
+type ErasedIsolateCallTranslator = Box<dyn FnOnce(ErasedCallOutcome) -> Box<dyn Any>>;
+
 /// Stable identifier for one runtime-issued call.
 ///
 /// The runtime assigns `CallId`s in submission order, starting at `1`.
@@ -240,6 +245,17 @@ pub enum CallError {
     /// perform on the current substrate revision. Future gaps should
     /// surface here rather than through silent fallbacks.
     Unsupported,
+
+    /// The target isolate's mailbox was full when the runtime attempted an
+    /// isolate-to-isolate call.
+    TargetFull,
+
+    /// The target isolate was closed, stale, or otherwise unavailable when
+    /// the runtime attempted an isolate-to-isolate call.
+    TargetClosed,
+
+    /// The target isolate did not reply before the caller's timeout elapsed.
+    Timeout,
 }
 
 /// User-visible outcome for an observed send.
@@ -258,6 +274,25 @@ pub enum SendOutcome {
 
     /// The destination was closed, stale, or otherwise no longer live.
     Closed,
+}
+
+/// User-visible outcome for an isolate-to-isolate call.
+///
+/// A call is just a bounded message send plus one later reply. The timeout is
+/// mandatory so callers cannot accidentally create invisible forever-waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallOutcome<T> {
+    /// The target isolate replied with a value of the expected type.
+    Replied(T),
+
+    /// The target isolate's mailbox was full.
+    Full,
+
+    /// The target isolate was closed, stale, or otherwise unavailable.
+    Closed,
+
+    /// The target isolate did not reply before the timeout elapsed.
+    Timeout,
 }
 
 impl SendOutcome {
@@ -295,6 +330,14 @@ enum RuntimeCallKind<M> {
         target_generation: AddressGeneration,
         message: Box<dyn Any + Send>,
         translator: Box<dyn FnOnce(SendOutcome) -> M>,
+    },
+    IsolateCall {
+        target_shard: ShardId,
+        target_isolate: IsolateId,
+        target_generation: AddressGeneration,
+        message: Box<dyn Any + Send>,
+        timeout: Duration,
+        translator: IsolateCallTranslator<M>,
     },
 }
 
@@ -340,6 +383,47 @@ impl<M> RuntimeCall<M> {
         }
     }
 
+    /// Creates an isolate-to-isolate call request.
+    ///
+    /// The destination receives `message` as an ordinary handler message. If
+    /// that handler later returns [`tina::reply`], the reply becomes
+    /// [`CallOutcome::Replied`] for the requester. The timeout is mandatory.
+    pub fn isolate_call<T, R, F>(
+        destination: Address<T>,
+        message: T,
+        timeout: Duration,
+        translator: F,
+    ) -> Self
+    where
+        T: Send + 'static,
+        R: 'static,
+        F: FnOnce(CallOutcome<R>) -> M + 'static,
+    {
+        Self {
+            kind: RuntimeCallKind::IsolateCall {
+                target_shard: destination.shard(),
+                target_isolate: destination.isolate(),
+                target_generation: destination.generation(),
+                message: Box::new(message),
+                timeout,
+                translator: Box::new(move |outcome| match outcome {
+                    CallOutcome::Replied(reply) => {
+                        let reply = *reply.downcast::<R>().unwrap_or_else(|_| {
+                            panic!(
+                                "isolate call reply had the wrong type; expected {}",
+                                std::any::type_name::<R>()
+                            )
+                        });
+                        translator(CallOutcome::Replied(reply))
+                    }
+                    CallOutcome::Full => translator(CallOutcome::Full),
+                    CallOutcome::Closed => translator(CallOutcome::Closed),
+                    CallOutcome::Timeout => translator(CallOutcome::Timeout),
+                }),
+            },
+        }
+    }
+
     /// Creates a call that receives a plain `Result<CallOutput, CallError>`
     /// instead of matching the failure variant manually.
     pub fn map_result<F>(request: CallInput, translator: F) -> Self
@@ -359,6 +443,9 @@ impl<M> RuntimeCall<M> {
             RuntimeCallKind::ObservedSend { .. } => {
                 panic!("observed send does not carry a backend CallInput")
             }
+            RuntimeCallKind::IsolateCall { .. } => {
+                panic!("isolate call does not carry a backend CallInput")
+            }
         }
     }
 
@@ -371,6 +458,9 @@ impl<M> RuntimeCall<M> {
             } => (request, translator),
             RuntimeCallKind::ObservedSend { .. } => {
                 panic!("observed send does not carry backend call parts")
+            }
+            RuntimeCallKind::IsolateCall { .. } => {
+                panic!("isolate call does not carry backend call parts")
             }
         }
     }
@@ -402,6 +492,21 @@ impl<M> RuntimeCall<M> {
                 message,
                 translator,
             },
+            RuntimeCallKind::IsolateCall {
+                target_shard,
+                target_isolate,
+                target_generation,
+                message,
+                timeout,
+                translator,
+            } => RuntimeCallParts::IsolateCall {
+                target_shard,
+                target_isolate,
+                target_generation,
+                message,
+                timeout,
+                translator,
+            },
         }
     }
 }
@@ -429,6 +534,21 @@ pub enum RuntimeCallParts<M> {
         /// Outcome translator.
         translator: Box<dyn FnOnce(SendOutcome) -> M>,
     },
+    /// Isolate-to-isolate call request.
+    IsolateCall {
+        /// Destination shard.
+        target_shard: ShardId,
+        /// Destination isolate.
+        target_isolate: IsolateId,
+        /// Destination generation.
+        target_generation: AddressGeneration,
+        /// Erased request message payload.
+        message: Box<dyn Any + Send>,
+        /// Mandatory caller timeout.
+        timeout: Duration,
+        /// Outcome translator.
+        translator: IsolateCallTranslator<M>,
+    },
 }
 
 impl<M> std::fmt::Debug for RuntimeCall<M> {
@@ -440,6 +560,7 @@ impl<M> std::fmt::Debug for RuntimeCall<M> {
                 &match &self.kind {
                     RuntimeCallKind::Backend { request, .. } => request.kind(),
                     RuntimeCallKind::ObservedSend { .. } => crate::trace::CallKind::ObservedSend,
+                    RuntimeCallKind::IsolateCall { .. } => crate::trace::CallKind::IsolateCall,
                 },
             )
             .finish_non_exhaustive()
@@ -472,6 +593,15 @@ pub(crate) enum ErasedCallKind {
         /// Outcome translator erased to `Any`.
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
     },
+    /// Isolate-to-isolate call request.
+    IsolateCall {
+        /// Erased outbound request message.
+        send: crate::ErasedSend,
+        /// Mandatory caller timeout.
+        timeout: Duration,
+        /// Outcome translator erased to `Any`.
+        translator: ErasedIsolateCallTranslator,
+    },
 }
 
 impl std::fmt::Debug for ErasedCall {
@@ -483,6 +613,7 @@ impl std::fmt::Debug for ErasedCall {
                 &match &self.kind {
                     ErasedCallKind::Backend { request, .. } => request.kind(),
                     ErasedCallKind::ObservedSend { .. } => crate::trace::CallKind::ObservedSend,
+                    ErasedCallKind::IsolateCall { .. } => crate::trace::CallKind::IsolateCall,
                 },
             )
             .finish_non_exhaustive()
@@ -539,6 +670,27 @@ where
                         target_generation,
                         message: crate::ErasedMessage::Sendable(message),
                     },
+                    translator: Box::new(move |outcome| {
+                        Box::new(translator(outcome)) as Box<dyn Any>
+                    }),
+                },
+            },
+            RuntimeCallParts::IsolateCall {
+                target_shard,
+                target_isolate,
+                target_generation,
+                message,
+                timeout,
+                translator,
+            } => ErasedCall {
+                kind: ErasedCallKind::IsolateCall {
+                    send: crate::ErasedSend {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                        message: crate::ErasedMessage::Sendable(message),
+                    },
+                    timeout,
                     translator: Box::new(move |outcome| {
                         Box::new(translator(outcome)) as Box<dyn Any>
                     }),
@@ -635,6 +787,15 @@ pub struct ObservedSend<T> {
     message: T,
 }
 
+/// Prepared isolate-call helper returned by [`call`].
+#[doc(hidden)]
+pub struct IsolateCall<T, R> {
+    destination: Address<T>,
+    message: T,
+    timeout: Duration,
+    marker: std::marker::PhantomData<fn() -> R>,
+}
+
 impl<T> ObservedSend<T>
 where
     T: Send + 'static,
@@ -673,6 +834,45 @@ where
     T: Send + 'static,
 {
     ObservedSend::new(destination, message)
+}
+
+impl<T, R> IsolateCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+{
+    fn new(destination: Address<T>, message: T, timeout: Duration) -> Self {
+        Self {
+            destination,
+            message,
+            timeout,
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Turns this prepared call into one ordinary later message.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(CallOutcome<R>) -> M + 'static,
+        M: 'static,
+    {
+        tina::Effect::Call(RuntimeCall::isolate_call(
+            self.destination,
+            self.message,
+            self.timeout,
+            translator,
+        ))
+    }
+}
+
+/// Returns a helper that calls another isolate and requires a timeout.
+pub fn call<T, R>(destination: Address<T>, message: T, timeout: Duration) -> IsolateCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+{
+    IsolateCall::new(destination, message, timeout)
 }
 
 impl<T> TypedCall<T> {

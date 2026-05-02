@@ -7,8 +7,9 @@ use tina::{
     RestartableChildDefinition, Shard, ShardId,
 };
 use tina_runtime::{
-    CallInput, CallKind, CallOutput, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    SendOutcome, StreamId, send_observed,
+    CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
+    ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome, StreamId, call,
+    send_observed,
 };
 use tina_sim::{
     ObservedPeerOutput, ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, Simulator,
@@ -275,6 +276,36 @@ fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
         .count()
 }
 
+fn count_call_failed(trace: &[RuntimeEvent], kind: CallKind, reason: CallError) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed { call_kind, reason: found, .. }
+                    if call_kind == kind && found == reason
+            )
+        })
+        .count()
+}
+
+fn count_call_completion_rejected(
+    trace: &[RuntimeEvent],
+    kind: CallKind,
+    reason: CallCompletionRejectedReason,
+) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected { call_kind, reason: found, .. }
+                    if call_kind == kind && found == reason
+            )
+        })
+        .count()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservedTargetMsg {
     Work,
@@ -380,6 +411,209 @@ fn run_observed_send_scenario(
 
     (
         outcomes.lock().expect("observed outcomes mutex").clone(),
+        sim.replay_artifact(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerReply(&'static str);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerRequest {
+    ReplyNow,
+    DoNotReply,
+    Stop,
+}
+
+#[derive(Debug)]
+struct ReplyWorker;
+
+impl Isolate for ReplyWorker {
+    type Message = WorkerRequest;
+    type Reply = WorkerReply;
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<WorkerRequest>;
+    type Shard = ConsumerShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            WorkerRequest::ReplyNow => Effect::Reply(WorkerReply("pong")),
+            WorkerRequest::DoNotReply => Effect::Noop,
+            WorkerRequest::Stop => Effect::Stop,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallerMsg {
+    Start(Address<WorkerRequest>, WorkerRequest),
+    StartAndStop(Address<WorkerRequest>),
+    Returned(CallOutcome<WorkerReply>),
+}
+
+#[derive(Debug)]
+struct CallerWorker {
+    outcomes: Arc<Mutex<Vec<CallOutcome<WorkerReply>>>>,
+}
+
+impl Isolate for CallerWorker {
+    type Message = CallerMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<CallerMsg>;
+    type Shard = ConsumerShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            CallerMsg::Start(target, request) => call::<WorkerRequest, WorkerReply>(
+                target,
+                request,
+                std::time::Duration::from_millis(5),
+            )
+            .reply(CallerMsg::Returned),
+            CallerMsg::StartAndStop(target) => Effect::Batch(vec![
+                call::<WorkerRequest, WorkerReply>(
+                    target,
+                    WorkerRequest::ReplyNow,
+                    std::time::Duration::from_millis(5),
+                )
+                .reply(CallerMsg::Returned),
+                Effect::Stop,
+            ]),
+            CallerMsg::Returned(outcome) => {
+                self.outcomes
+                    .lock()
+                    .expect("call outcomes mutex")
+                    .push(outcome);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[test]
+fn downstream_consumer_can_replay_isolate_call_reply_full_closed_timeout() {
+    for (target_capacity, stop_first, request, expected, failed) in [
+        (
+            1,
+            false,
+            WorkerRequest::ReplyNow,
+            CallOutcome::Replied(WorkerReply("pong")),
+            None,
+        ),
+        (
+            0,
+            false,
+            WorkerRequest::ReplyNow,
+            CallOutcome::Full,
+            Some(CallError::TargetFull),
+        ),
+        (
+            1,
+            true,
+            WorkerRequest::ReplyNow,
+            CallOutcome::Closed,
+            Some(CallError::TargetClosed),
+        ),
+        (
+            1,
+            false,
+            WorkerRequest::DoNotReply,
+            CallOutcome::Timeout,
+            Some(CallError::Timeout),
+        ),
+    ] {
+        let (outcomes, first) = run_isolate_call_scenario(target_capacity, stop_first, request);
+        let (replayed_outcomes, replayed) =
+            run_isolate_call_scenario(target_capacity, stop_first, request);
+
+        assert_eq!(outcomes.as_slice(), [expected]);
+        assert_eq!(replayed_outcomes, outcomes);
+        assert_eq!(first.event_record(), replayed.event_record());
+        if failed.is_none() {
+            assert_eq!(
+                count_call_completed(first.event_record(), CallKind::IsolateCall),
+                1
+            );
+        }
+        if let Some(reason) = failed {
+            assert_eq!(
+                count_call_failed(first.event_record(), CallKind::IsolateCall, reason),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn downstream_consumer_replays_isolate_call_completion_rejected_when_requester_stops() {
+    let (outcomes, first) = run_stopped_requester_isolate_call_scenario();
+    let (replayed_outcomes, replayed) = run_stopped_requester_isolate_call_scenario();
+
+    assert!(outcomes.is_empty());
+    assert_eq!(replayed_outcomes, outcomes);
+    assert_eq!(first.event_record(), replayed.event_record());
+    assert_eq!(
+        count_call_completion_rejected(
+            first.event_record(),
+            CallKind::IsolateCall,
+            CallCompletionRejectedReason::RequesterClosed,
+        ),
+        1
+    );
+}
+
+fn run_stopped_requester_isolate_call_scenario()
+-> (Vec<CallOutcome<WorkerReply>>, tina_sim::ReplayArtifact) {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
+    let target = sim.register_with_mailbox_capacity(ReplyWorker, 8);
+    let caller = sim.register_with_mailbox_capacity(
+        CallerWorker {
+            outcomes: Arc::clone(&outcomes),
+        },
+        8,
+    );
+
+    sim.try_send(caller, CallerMsg::StartAndStop(target))
+        .expect("start call then stop");
+    sim.run_until_quiescent();
+
+    (
+        outcomes.lock().expect("call outcomes mutex").clone(),
+        sim.replay_artifact(),
+    )
+}
+
+fn run_isolate_call_scenario(
+    target_capacity: usize,
+    stop_first: bool,
+    request: WorkerRequest,
+) -> (Vec<CallOutcome<WorkerReply>>, tina_sim::ReplayArtifact) {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
+    let target = sim.register_with_mailbox_capacity(ReplyWorker, target_capacity);
+    let caller = sim.register_with_mailbox_capacity(
+        CallerWorker {
+            outcomes: Arc::clone(&outcomes),
+        },
+        8,
+    );
+
+    if stop_first {
+        sim.try_send(target, WorkerRequest::Stop)
+            .expect("stop target");
+        sim.run_until_quiescent();
+    }
+
+    sim.try_send(caller, CallerMsg::Start(target, request))
+        .expect("start isolate call");
+    sim.run_until_quiescent();
+
+    (
+        outcomes.lock().expect("call outcomes mutex").clone(),
         sim.replay_artifact(),
     )
 }

@@ -218,14 +218,18 @@ overload lab and future users do not depend on private test-only glue.
 ## Build Order
 
 1. **Observed send outcome**
-   - pin final names
-   - implement runtime/simulator support
-   - prove `Accepted`, `Full`, and `Closed` as user-visible messages
-   - prove ordinary `send(...)` remains unchanged
+   - done: `send_observed(...).reply(...)`
+   - done: runtime/simulator support
+   - done: `Accepted`, `Full`, and `Closed` are proved as user-visible
+     messages
+   - done: ordinary `send(...)` remains unchanged
 2. **Timeout call**
-   - implement call request/reply with mandatory timeout
-   - prove reply, target full, target closed, timeout, requester stopped
-   - test runtime and simulator paths
+   - done: `call(..., timeout).reply(...)`
+   - done: runtime/simulator same-shard request/reply support
+   - done: reply, target full, target closed, and timeout are proved as
+     user-visible messages
+   - done: direct requester-stopped rejection proof
+   - remaining: cross-shard call reply transport is not claimed yet
 3. **Semantic overload lab**
    - build the core state-machine workload without relying on a new backend
    - prove overload, timeout, rejection, recovery, and replay

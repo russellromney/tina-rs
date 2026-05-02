@@ -55,8 +55,8 @@ use tina::{
     ShardId, TrySendError,
 };
 use tina_runtime::{
-    CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutput, EffectKind,
-    ListenerId, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
+    CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
+    EffectKind, ListenerId, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
     RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason,
 };
 use tina_supervisor::SupervisorConfig;
@@ -376,6 +376,7 @@ struct InFlightCall {
 }
 
 type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
+type ErasedIsolateCallTranslator = Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
 
 struct StoredTranslator {
     call_id: CallId,
@@ -396,6 +397,25 @@ struct TimerEntry {
     call_id: CallId,
     deadline: Duration,
     insertion_order: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MessageCallContext {
+    call_id: CallId,
+}
+
+struct DeliveredMessage {
+    message: Box<dyn Any>,
+    call_context: Option<MessageCallContext>,
+}
+
+struct PendingIsolateCall {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    cause: tina_runtime::CauseId,
+    deadline: Duration,
+    insertion_order: u64,
+    translator: Option<ErasedIsolateCallTranslator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -457,6 +477,7 @@ struct StreamState {
 struct QueuedMessage {
     message: Box<dyn Any>,
     visible_at_step: u64,
+    call_context: Option<MessageCallContext>,
 }
 
 struct LocalInbox {
@@ -489,6 +510,7 @@ impl LocalInbox {
         &self,
         message: Box<dyn Any>,
         visible_at_step: u64,
+        call_context: Option<MessageCallContext>,
     ) -> Result<(), TrySendError<Box<dyn Any>>> {
         if self.closed.get() {
             return Err(TrySendError::Closed(message));
@@ -500,18 +522,22 @@ impl LocalInbox {
         queue.push_back(QueuedMessage {
             message,
             visible_at_step,
+            call_context,
         });
         Ok(())
     }
 
-    fn pop_visible(&self, current_step: u64) -> Option<Box<dyn Any>> {
+    fn pop_visible(&self, current_step: u64) -> Option<DeliveredMessage> {
         let mut queue = self.queue.borrow_mut();
         let visible = queue
             .front()
             .map(|entry| entry.visible_at_step <= current_step)
             .unwrap_or(false);
         if visible {
-            queue.pop_front().map(|entry| entry.message)
+            queue.pop_front().map(|entry| DeliveredMessage {
+                message: entry.message,
+                call_context: entry.call_context,
+            })
         } else {
             None
         }
@@ -572,6 +598,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -600,13 +627,14 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
 {
     match effect {
         Effect::Noop => ErasedEffect::Noop,
-        Effect::Reply(_) => ErasedEffect::Reply,
+        Effect::Reply(reply) => ErasedEffect::Reply(Box::new(reply)),
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
@@ -646,6 +674,27 @@ where
                             target_generation,
                             message,
                         },
+                        translator: Box::new(move |outcome| {
+                            Box::new(translator(outcome)) as Box<dyn Any>
+                        }),
+                    },
+                },
+                RuntimeCallParts::IsolateCall {
+                    target_shard,
+                    target_isolate,
+                    target_generation,
+                    message,
+                    timeout,
+                    translator,
+                } => ErasedCall {
+                    kind: ErasedCallKind::IsolateCall {
+                        send: ErasedSend {
+                            target_shard,
+                            target_isolate,
+                            target_generation,
+                            message,
+                        },
+                        timeout,
                         translator: Box::new(move |outcome| {
                             Box::new(translator(outcome)) as Box<dyn Any>
                         }),
@@ -697,7 +746,7 @@ where
     S: Shard,
 {
     Noop,
-    Reply,
+    Reply(Box<dyn Any>),
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S>>),
     Stop,
@@ -713,7 +762,7 @@ where
     fn kind(&self) -> EffectKind {
         match self {
             Self::Noop => EffectKind::Noop,
-            Self::Reply => EffectKind::Reply,
+            Self::Reply(_) => EffectKind::Reply,
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
             Self::Stop => EffectKind::Stop,
@@ -748,6 +797,11 @@ enum ErasedCallKind {
     ObservedSend {
         send: ErasedSend,
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+    },
+    IsolateCall {
+        send: ErasedSend,
+        timeout: Duration,
+        translator: ErasedIsolateCallTranslator,
     },
 }
 
@@ -833,6 +887,8 @@ where
     pending_tcp_completions: Vec<PendingTcpCompletion>,
     in_flight_calls: Vec<InFlightCall>,
     translators: Vec<StoredTranslator>,
+    pending_isolate_calls: Vec<PendingIsolateCall>,
+    next_isolate_call_ordinal: u64,
     last_checker_failure: Option<CheckerFailure>,
 }
 
@@ -869,6 +925,8 @@ where
             pending_tcp_completions: Vec::new(),
             in_flight_calls: Vec::new(),
             translators: Vec::new(),
+            pending_isolate_calls: Vec::new(),
+            next_isolate_call_ordinal: 0,
             last_checker_failure: None,
         }
     }
@@ -895,6 +953,7 @@ where
             || !self.timers.is_empty()
             || !self.pending_tcp_completions.is_empty()
             || !self.pending_accepts.is_empty()
+            || !self.pending_isolate_calls.is_empty()
     }
 
     /// Registers one isolate and returns its typed address.
@@ -911,6 +970,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -933,6 +993,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -996,7 +1057,7 @@ where
             return Err(TrySendError::Closed(message));
         }
 
-        match entry.inbox.push(Box::new(message), self.step_ordinal) {
+        match entry.inbox.push(Box::new(message), self.step_ordinal, None) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(message)) => {
                 Err(TrySendError::Full(*message.downcast::<M>().unwrap_or_else(
@@ -1018,7 +1079,17 @@ where
 
     /// Advances virtual time directly to the next due timer, if any.
     pub fn advance_to_next_timer(&mut self) -> bool {
-        let Some(next_deadline) = self.timers.iter().map(|entry| entry.deadline).min() else {
+        let Some(next_deadline) = self
+            .timers
+            .iter()
+            .map(|entry| entry.deadline)
+            .chain(
+                self.pending_isolate_calls
+                    .iter()
+                    .map(|entry| entry.deadline),
+            )
+            .min()
+        else {
             return false;
         };
         if next_deadline > self.virtual_now {
@@ -1050,9 +1121,10 @@ where
         self.step_ordinal += 1;
         let now = self.virtual_now;
         self.harvest_timers(now);
+        self.harvest_isolate_call_timeouts(now);
         self.harvest_tcp();
 
-        let mut round_messages: Vec<Option<Box<dyn Any>>> = self
+        let mut round_messages: Vec<Option<DeliveredMessage>> = self
             .entries
             .iter()
             .map(|entry| {
@@ -1095,7 +1167,7 @@ where
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
                 catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message, &mut self.shard, isolate_id)
+                    handler.handle_boxed(message.message, &mut self.shard, isolate_id)
                 }))
             };
 
@@ -1132,9 +1204,9 @@ where
 
             self.execute_effect(
                 index,
-                isolate_id,
                 handler_finished.into(),
                 effect,
+                message.call_context,
                 &mut round_messages,
                 route_remote,
             );
@@ -1235,16 +1307,17 @@ where
     fn execute_effect(
         &mut self,
         index: usize,
-        isolate_id: IsolateId,
         cause: tina_runtime::CauseId,
         effect: ErasedEffect<S>,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        call_context: Option<MessageCallContext>,
+        round_messages: &mut [Option<DeliveredMessage>],
         route_remote: &mut impl FnMut(
             ShardId,
             ErasedSend,
             tina_runtime::CauseId,
         ) -> Result<(), SendRejectedReason>,
     ) -> bool {
+        let isolate_id = self.entries[index].id;
         match effect {
             ErasedEffect::Stop => {
                 self.stop_entry(index, isolate_id, cause);
@@ -1331,14 +1404,30 @@ where
                 );
                 false
             }
-            ErasedEffect::Reply => {
-                self.push_event(
-                    isolate_id,
-                    Some(cause),
-                    RuntimeEventKind::EffectObserved {
-                        effect: EffectKind::Reply,
-                    },
-                );
+            ErasedEffect::Reply(reply) => {
+                if let Some(context) = call_context {
+                    if !self.complete_isolate_call(
+                        context.call_id,
+                        cause,
+                        CallOutcome::Replied(reply),
+                    ) {
+                        self.push_event(
+                            isolate_id,
+                            Some(cause),
+                            RuntimeEventKind::EffectObserved {
+                                effect: EffectKind::Reply,
+                            },
+                        );
+                    }
+                } else {
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::EffectObserved {
+                            effect: EffectKind::Reply,
+                        },
+                    );
+                }
                 false
             }
             ErasedEffect::RestartChildren => {
@@ -1349,9 +1438,9 @@ where
                 for subeffect in effects {
                     if self.execute_effect(
                         index,
-                        isolate_id,
                         cause,
                         subeffect,
+                        call_context,
                         round_messages,
                         route_remote,
                     ) {
@@ -1377,6 +1466,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -1418,6 +1508,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -1465,7 +1556,7 @@ where
             .unwrap_or_else(|| panic!("bootstrap referenced unknown child {:?}", child.isolate));
         entry
             .inbox
-            .push(message, self.step_ordinal)
+            .push(message, self.step_ordinal, None)
             .unwrap_or_else(|_| {
                 panic!(
                     "simulator failed to enqueue bootstrap message for child {:?}",
@@ -1483,7 +1574,7 @@ where
         &mut self,
         parent: IsolateId,
         cause: tina_runtime::CauseId,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        round_messages: &mut [Option<DeliveredMessage>],
     ) {
         let child_record_indices: Vec<usize> = self
             .child_records
@@ -1501,7 +1592,7 @@ where
         &mut self,
         failed_child: RegisteredAddress,
         cause: tina_runtime::CauseId,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        round_messages: &mut [Option<DeliveredMessage>],
     ) {
         let Some(failed_record_index) = self.child_record_index_by_child(failed_child) else {
             return;
@@ -1586,7 +1677,7 @@ where
         parent: IsolateId,
         child_record_index: usize,
         cause: tina_runtime::CauseId,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        round_messages: &mut [Option<DeliveredMessage>],
     ) {
         let child_ordinal = self.child_records[child_record_index].child_ordinal;
         let old_child = self.child_records[child_record_index].child;
@@ -1732,6 +1823,7 @@ where
         let call_kind = match &call.kind {
             ErasedCallKind::Backend { request, .. } => call_kind(request),
             ErasedCallKind::ObservedSend { .. } => CallKind::ObservedSend,
+            ErasedCallKind::IsolateCall { .. } => CallKind::IsolateCall,
         };
         let attempted = self.push_event(
             requester.isolate,
@@ -1758,6 +1850,18 @@ where
                 send,
                 translator,
                 route_remote,
+            ),
+            ErasedCallKind::IsolateCall {
+                send,
+                timeout,
+                translator,
+            } => self.dispatch_isolate_call(
+                call_id,
+                requester,
+                attempted.into(),
+                send,
+                timeout,
+                translator,
             ),
         }
     }
@@ -1872,6 +1976,102 @@ where
         };
 
         self.deliver_observed_send_outcome(call_id, requester, cause, outcome, translator);
+    }
+
+    fn dispatch_isolate_call(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+        send: ErasedSend,
+        timeout: Duration,
+        translator: ErasedIsolateCallTranslator,
+    ) {
+        let target_shard = send.target_shard;
+        let target_isolate = send.target_isolate;
+        let target_generation = send.target_generation;
+        let send_attempted = self.push_event(
+            requester.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard,
+                target_isolate,
+                target_generation,
+            },
+        );
+
+        if target_shard != self.shard.id() {
+            self.push_event(
+                requester.isolate,
+                Some(send_attempted.into()),
+                RuntimeEventKind::SendRejected {
+                    target_shard,
+                    target_isolate,
+                    target_generation,
+                    reason: SendRejectedReason::Closed,
+                },
+            );
+            self.deliver_isolate_call_outcome(
+                call_id,
+                requester,
+                cause,
+                CallOutcome::Closed,
+                translator,
+                self.step_ordinal,
+            );
+            return;
+        }
+
+        let delivery =
+            self.dispatch_local_send_with_context(send, Some(MessageCallContext { call_id }));
+
+        match delivery {
+            Ok(()) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                    },
+                );
+                let insertion_order = self.next_isolate_call_ordinal;
+                self.next_isolate_call_ordinal += 1;
+                self.pending_isolate_calls.push(PendingIsolateCall {
+                    call_id,
+                    requester,
+                    cause,
+                    deadline: self.virtual_now + timeout,
+                    insertion_order,
+                    translator: Some(translator),
+                });
+            }
+            Err(reason) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                        reason,
+                    },
+                );
+                let outcome = match reason {
+                    SendRejectedReason::Full => CallOutcome::Full,
+                    SendRejectedReason::Closed => CallOutcome::Closed,
+                };
+                self.deliver_isolate_call_outcome(
+                    call_id,
+                    requester,
+                    cause,
+                    outcome,
+                    translator,
+                    self.step_ordinal,
+                );
+            }
+        }
     }
 
     fn handle_tcp_bind(&mut self, call_id: CallId, addr: SocketAddr) {
@@ -2351,6 +2551,37 @@ where
         }
     }
 
+    fn harvest_isolate_call_timeouts(&mut self, now: Duration) {
+        let mut due = Vec::new();
+        let mut still_pending = Vec::new();
+        for entry in std::mem::take(&mut self.pending_isolate_calls) {
+            if entry.deadline <= now {
+                due.push(entry);
+            } else {
+                still_pending.push(entry);
+            }
+        }
+        self.pending_isolate_calls = still_pending;
+        due.sort_by(|a, b| {
+            a.deadline
+                .cmp(&b.deadline)
+                .then_with(|| a.insertion_order.cmp(&b.insertion_order))
+        });
+        for mut entry in due {
+            let translator = entry.translator.take().unwrap_or_else(|| {
+                panic!("translator for call {:?} already consumed", entry.call_id)
+            });
+            self.deliver_isolate_call_outcome(
+                entry.call_id,
+                entry.requester,
+                entry.cause,
+                CallOutcome::Timeout,
+                translator,
+                self.step_ordinal,
+            );
+        }
+    }
+
     fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
         self.deliver_completion_at(call_id, result, self.step_ordinal);
     }
@@ -2397,7 +2628,7 @@ where
 
         match self.entries[entry_index]
             .inbox
-            .push(message, self.step_ordinal)
+            .push(message, self.step_ordinal, None)
         {
             Ok(()) => {
                 self.push_event(
@@ -2424,6 +2655,133 @@ where
                     RuntimeEventKind::CallCompletionRejected {
                         call_id,
                         call_kind,
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                    },
+                );
+            }
+        }
+    }
+
+    fn complete_isolate_call(
+        &mut self,
+        call_id: CallId,
+        cause: tina_runtime::CauseId,
+        outcome: CallOutcome<Box<dyn Any>>,
+    ) -> bool {
+        let Some(index) = self
+            .pending_isolate_calls
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        else {
+            return false;
+        };
+        let mut pending = self.pending_isolate_calls.remove(index);
+        let translator = pending
+            .translator
+            .take()
+            .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
+        self.deliver_isolate_call_outcome(
+            call_id,
+            pending.requester,
+            cause,
+            outcome,
+            translator,
+            self.step_ordinal,
+        );
+        true
+    }
+
+    fn deliver_isolate_call_outcome(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+        outcome: CallOutcome<Box<dyn Any>>,
+        translator: ErasedIsolateCallTranslator,
+        visible_at_step: u64,
+    ) {
+        let failure_reason = match &outcome {
+            CallOutcome::Replied(_) => None,
+            CallOutcome::Full => Some(CallError::TargetFull),
+            CallOutcome::Closed => Some(CallError::TargetClosed),
+            CallOutcome::Timeout => Some(CallError::Timeout),
+        };
+
+        if let Some(reason) = failure_reason {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallFailed {
+                    call_id,
+                    call_kind: CallKind::IsolateCall,
+                    reason,
+                },
+            );
+        }
+
+        let message = translator(outcome);
+        let Some(entry_index) = self.entries.iter().position(|entry| {
+            entry.id == requester.isolate && entry.generation == requester.generation
+        }) else {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        };
+
+        if self.entries[entry_index].stopped.get() {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        }
+
+        match self.entries[entry_index]
+            .inbox
+            .push(message, visible_at_step, None)
+        {
+            Ok(()) => {
+                if failure_reason.is_none() {
+                    self.push_event(
+                        requester.isolate,
+                        Some(cause),
+                        RuntimeEventKind::CallCompleted {
+                            call_id,
+                            call_kind: CallKind::IsolateCall,
+                        },
+                    );
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind: CallKind::IsolateCall,
+                        reason: CallCompletionRejectedReason::MailboxFull,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind: CallKind::IsolateCall,
                         reason: CallCompletionRejectedReason::RequesterClosed,
                     },
                 );
@@ -2502,7 +2860,7 @@ where
 
         match self.entries[entry_index]
             .inbox
-            .push(message, visible_at_step)
+            .push(message, visible_at_step, None)
         {
             Ok(()) => {
                 if failure_reason.is_none() {
@@ -2542,6 +2900,14 @@ where
     }
 
     fn dispatch_local_send(&mut self, send: ErasedSend) -> Result<(), SendRejectedReason> {
+        self.dispatch_local_send_with_context(send, None)
+    }
+
+    fn dispatch_local_send_with_context(
+        &mut self,
+        send: ErasedSend,
+        call_context: Option<MessageCallContext>,
+    ) -> Result<(), SendRejectedReason> {
         if send.target_shard != self.shard.id() {
             panic!(
                 "cross-shard simulation is out of scope in this slice: target shard {} != simulator shard {}",
@@ -2570,7 +2936,7 @@ where
 
         entry
             .inbox
-            .push(send.message, visible_at_step)
+            .push(send.message, visible_at_step, call_context)
             .map_err(|reason| match reason {
                 TrySendError::Full(_) => SendRejectedReason::Full,
                 TrySendError::Closed(_) => SendRejectedReason::Closed,
@@ -2614,7 +2980,7 @@ where
             return;
         }
 
-        match entry.inbox.push(send.message, self.step_ordinal + 1) {
+        match entry.inbox.push(send.message, self.step_ordinal + 1, None) {
             Ok(()) => {
                 self.push_event(
                     send.target_isolate,
@@ -2694,7 +3060,7 @@ where
         index: usize,
         isolate_id: IsolateId,
         cause: tina_runtime::CauseId,
-        precollected: Option<Box<dyn Any>>,
+        precollected: Option<DeliveredMessage>,
     ) -> tina_runtime::EventId {
         if self.entries[index].stopped.get() {
             let stopped = self.entries[index]
@@ -2812,6 +3178,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -2831,6 +3198,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -2861,6 +3229,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -2886,6 +3255,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -2907,6 +3277,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -3059,6 +3430,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -3083,6 +3455,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
     {

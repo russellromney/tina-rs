@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, CallInput, CallKind, CallOutput, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, SendOutcome, send_observed, sleep,
+    CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
+    MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome, call,
+    send_observed, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -91,6 +92,36 @@ fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
             matches!(
                 event.kind(),
                 RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == kind
+            )
+        })
+        .count()
+}
+
+fn count_call_failed(trace: &[RuntimeEvent], kind: CallKind, reason: CallError) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed { call_kind, reason: found, .. }
+                    if call_kind == kind && found == reason
+            )
+        })
+        .count()
+}
+
+fn count_call_completion_rejected(
+    trace: &[RuntimeEvent],
+    kind: CallKind,
+    reason: CallCompletionRejectedReason,
+) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected { call_kind, reason: found, .. }
+                    if call_kind == kind && found == reason
             )
         })
         .count()
@@ -245,6 +276,184 @@ fn downstream_consumer_can_observe_send_accepted_full_and_closed() {
             1
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerReply(&'static str);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerRequest {
+    ReplyNow,
+    DoNotReply,
+    Stop,
+}
+
+#[derive(Debug)]
+struct ReplyWorker;
+
+impl Isolate for ReplyWorker {
+    tina::isolate_types! {
+        message: WorkerRequest,
+        reply: WorkerReply,
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: ConsumerShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            WorkerRequest::ReplyNow => reply(WorkerReply("pong")),
+            WorkerRequest::DoNotReply => noop(),
+            WorkerRequest::Stop => stop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallerEvent {
+    Start(Address<WorkerRequest>, WorkerRequest, Duration),
+    StartAndStop(Address<WorkerRequest>),
+    Returned(CallOutcome<WorkerReply>),
+}
+
+#[derive(Debug)]
+struct CallerWorker {
+    outcomes: Rc<RefCell<Vec<CallOutcome<WorkerReply>>>>,
+}
+
+impl Isolate for CallerWorker {
+    tina::isolate_types! {
+        message: CallerEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<CallerEvent>,
+        shard: ConsumerShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            CallerEvent::Start(target, request, timeout) => {
+                call::<WorkerRequest, WorkerReply>(target, request, timeout)
+                    .reply(CallerEvent::Returned)
+            }
+            CallerEvent::StartAndStop(target) => batch(vec![
+                call::<WorkerRequest, WorkerReply>(
+                    target,
+                    WorkerRequest::ReplyNow,
+                    Duration::from_millis(10),
+                )
+                .reply(CallerEvent::Returned),
+                stop(),
+            ]),
+            CallerEvent::Returned(outcome) => {
+                self.outcomes.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn downstream_consumer_can_call_isolate_and_observe_reply_full_closed_timeout() {
+    for (target_capacity, setup_stop, request, expected, failed) in [
+        (
+            1,
+            false,
+            WorkerRequest::ReplyNow,
+            CallOutcome::Replied(WorkerReply("pong")),
+            None,
+        ),
+        (
+            0,
+            false,
+            WorkerRequest::ReplyNow,
+            CallOutcome::Full,
+            Some(CallError::TargetFull),
+        ),
+        (
+            1,
+            true,
+            WorkerRequest::ReplyNow,
+            CallOutcome::Closed,
+            Some(CallError::TargetClosed),
+        ),
+        (
+            1,
+            false,
+            WorkerRequest::DoNotReply,
+            CallOutcome::Timeout,
+            Some(CallError::Timeout),
+        ),
+    ] {
+        let outcomes = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
+        let target = runtime.register_with_capacity(ReplyWorker, target_capacity);
+        let caller = runtime.register_with_capacity(
+            CallerWorker {
+                outcomes: Rc::clone(&outcomes),
+            },
+            8,
+        );
+
+        if setup_stop {
+            runtime
+                .try_send(target, WorkerRequest::Stop)
+                .expect("stop target");
+            drive(&mut runtime);
+        }
+
+        runtime
+            .try_send(
+                caller,
+                CallerEvent::Start(target, request, Duration::from_millis(2)),
+            )
+            .expect("start isolate call");
+        drive(&mut runtime);
+
+        assert_eq!(outcomes.borrow().as_slice(), [expected]);
+        if failed.is_none() {
+            assert_eq!(
+                count_call_completed(runtime.trace(), CallKind::IsolateCall),
+                1
+            );
+        }
+        if let Some(reason) = failed {
+            assert_eq!(
+                count_call_failed(runtime.trace(), CallKind::IsolateCall, reason),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_stops() {
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
+    let target = runtime.register_with_capacity(ReplyWorker, 8);
+    let caller = runtime.register_with_capacity(
+        CallerWorker {
+            outcomes: Rc::clone(&outcomes),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(caller, CallerEvent::StartAndStop(target))
+        .expect("start call then stop");
+    drive(&mut runtime);
+
+    assert!(outcomes.borrow().is_empty());
+    assert_eq!(
+        count_call_completion_rejected(
+            runtime.trace(),
+            CallKind::IsolateCall,
+            CallCompletionRejectedReason::RequesterClosed,
+        ),
+        1
+    );
 }
 
 #[derive(Debug, Clone)]

@@ -51,9 +51,10 @@ mod io_backend;
 mod trace;
 
 pub use call::{
-    CallError, CallId, CallInput, CallOutput, ErasedCall, IntoErasedCall, ListenerId, RuntimeCall,
-    RuntimeCallParts, SendOutcome, StreamId, TypedCall, send_observed, sleep, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, IntoErasedCall, IsolateCall,
+    ListenerId, RuntimeCall, RuntimeCallParts, SendOutcome, StreamId, TypedCall, call,
+    send_observed, sleep, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
+    tcp_write,
 };
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CauseId, EffectKind, EventId, RestartSkippedReason,
@@ -131,6 +132,16 @@ struct TimerEntry {
     insertion_order: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MessageCallContext {
+    call_id: CallId,
+}
+
+struct DeliveredMessage {
+    message: Box<dyn Any>,
+    call_context: Option<MessageCallContext>,
+}
+
 #[derive(Debug, Clone)]
 struct IdSource {
     next_event_id: Arc<AtomicU64>,
@@ -180,6 +191,8 @@ where
     clock: Box<dyn Clock>,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
+    pending_isolate_calls: Vec<PendingIsolateCall>,
+    next_isolate_call_ordinal: u64,
 }
 
 #[derive(Debug)]
@@ -191,6 +204,7 @@ struct InFlightCall {
 }
 
 type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
+type ErasedIsolateCallTranslator = Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
 
 struct StoredTranslator {
     call_id: CallId,
@@ -202,6 +216,28 @@ impl std::fmt::Debug for StoredTranslator {
         formatter
             .debug_struct("StoredTranslator")
             .field("call_id", &self.call_id)
+            .finish_non_exhaustive()
+    }
+}
+
+struct PendingIsolateCall {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    cause: CauseId,
+    deadline: Instant,
+    insertion_order: u64,
+    translator: Option<ErasedIsolateCallTranslator>,
+}
+
+impl std::fmt::Debug for PendingIsolateCall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingIsolateCall")
+            .field("call_id", &self.call_id)
+            .field("requester", &self.requester)
+            .field("cause", &self.cause)
+            .field("deadline", &self.deadline)
+            .field("insertion_order", &self.insertion_order)
             .finish_non_exhaustive()
     }
 }
@@ -248,6 +284,8 @@ where
             clock,
             timers: Vec::new(),
             next_timer_ordinal: 0,
+            pending_isolate_calls: Vec::new(),
+            next_isolate_call_ordinal: 0,
         }
     }
 
@@ -255,7 +293,10 @@ where
     /// yet been delivered. Tests use this to know when stepping further
     /// can produce more I/O completions.
     pub fn has_in_flight_calls(&self) -> bool {
-        !self.in_flight_calls.is_empty() || self.io_backend.has_pending() || !self.timers.is_empty()
+        !self.in_flight_calls.is_empty()
+            || self.io_backend.has_pending()
+            || !self.timers.is_empty()
+            || !self.pending_isolate_calls.is_empty()
     }
 
     #[cfg(test)]
@@ -281,6 +322,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
@@ -308,6 +350,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
@@ -358,7 +401,13 @@ where
             return Err(TrySendError::Closed(message));
         }
 
-        match entry.mailbox.try_send_boxed(Box::new(message)) {
+        let entry_index = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == address.isolate())
+            .unwrap_or_else(|| panic!("runtime ingress found entry then lost it"));
+
+        match self.enqueue_entry_message(entry_index, Box::new(message), None) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(message)) => Err(TrySendError::Full(
                 *message.downcast::<M>().unwrap_or_else(|_| {
@@ -425,15 +474,17 @@ where
         let now = self.clock.now();
         self.advance_io_backend();
         self.harvest_timers(now);
+        self.harvest_isolate_call_timeouts(now);
 
-        let mut round_messages: Vec<Option<Box<dyn Any>>> = self
+        let mut round_messages: Vec<Option<DeliveredMessage>> = self
             .entries
             .iter()
-            .map(|entry| {
+            .enumerate()
+            .map(|(index, entry)| {
                 if entry.stopped.get() {
                     None
                 } else {
-                    entry.mailbox.recv_boxed()
+                    self.recv_entry_message(index)
                 }
             })
             .collect();
@@ -470,7 +521,7 @@ where
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
                 catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message, &mut self.shard, isolate_id)
+                    handler.handle_boxed(message.message, &mut self.shard, isolate_id)
                 }))
             };
 
@@ -507,9 +558,9 @@ where
 
             self.execute_effect(
                 index,
-                isolate_id,
                 handler_finished.into(),
                 effect,
+                message.call_context,
                 &mut round_messages,
                 route_remote,
             );
@@ -521,12 +572,13 @@ where
     fn execute_effect(
         &mut self,
         index: usize,
-        isolate_id: IsolateId,
         cause: CauseId,
         effect: ErasedEffect<S, F>,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        call_context: Option<MessageCallContext>,
+        round_messages: &mut [Option<DeliveredMessage>],
         route_remote: &mut impl FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
     ) -> bool {
+        let isolate_id = self.entries[index].id;
         match effect {
             ErasedEffect::Stop => {
                 self.stop_entry(index, isolate_id, cause);
@@ -618,23 +670,39 @@ where
                 );
                 false
             }
-            ErasedEffect::Reply => {
-                self.push_event(
-                    isolate_id,
-                    Some(cause),
-                    RuntimeEventKind::EffectObserved {
-                        effect: EffectKind::Reply,
-                    },
-                );
+            ErasedEffect::Reply(reply) => {
+                if let Some(context) = call_context {
+                    if !self.complete_isolate_call(
+                        context.call_id,
+                        cause,
+                        CallOutcome::Replied(reply.into_any()),
+                    ) {
+                        self.push_event(
+                            isolate_id,
+                            Some(cause),
+                            RuntimeEventKind::EffectObserved {
+                                effect: EffectKind::Reply,
+                            },
+                        );
+                    }
+                } else {
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::EffectObserved {
+                            effect: EffectKind::Reply,
+                        },
+                    );
+                }
                 false
             }
             ErasedEffect::Batch(effects) => {
                 for subeffect in effects {
                     if self.execute_effect(
                         index,
-                        isolate_id,
                         cause,
                         subeffect,
+                        call_context,
                         round_messages,
                         route_remote,
                     ) {
@@ -657,6 +725,7 @@ where
         let call_kind = match &call.kind {
             call::ErasedCallKind::Backend { request, .. } => request.kind(),
             call::ErasedCallKind::ObservedSend { .. } => CallKind::ObservedSend,
+            call::ErasedCallKind::IsolateCall { .. } => CallKind::IsolateCall,
         };
 
         let attempted = self.push_event(
@@ -687,6 +756,20 @@ where
                     send,
                     translator,
                     route_remote,
+                );
+            }
+            call::ErasedCallKind::IsolateCall {
+                send,
+                timeout,
+                translator,
+            } => {
+                self.dispatch_isolate_call(
+                    call_id,
+                    requester,
+                    attempted.into(),
+                    send,
+                    timeout,
+                    translator,
                 );
             }
         }
@@ -833,7 +916,7 @@ where
             return;
         }
 
-        match self.entries[entry_index].mailbox.try_send_boxed(message) {
+        match self.enqueue_entry_message(entry_index, message, None) {
             Ok(()) => {
                 self.push_event(
                     requester.isolate,
@@ -859,6 +942,240 @@ where
                     RuntimeEventKind::CallCompletionRejected {
                         call_id,
                         call_kind,
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                    },
+                );
+            }
+        }
+    }
+
+    fn dispatch_isolate_call(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: CauseId,
+        send: ErasedSend,
+        timeout: Duration,
+        translator: ErasedIsolateCallTranslator,
+    ) {
+        let target_shard = send.target_shard;
+        let target_isolate = send.target_isolate;
+        let target_generation = send.target_generation;
+        let send_attempted = self.push_event(
+            requester.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard,
+                target_isolate,
+                target_generation,
+            },
+        );
+
+        if target_shard != self.shard.id() {
+            self.push_event(
+                requester.isolate,
+                Some(send_attempted.into()),
+                RuntimeEventKind::SendRejected {
+                    target_shard,
+                    target_isolate,
+                    target_generation,
+                    reason: SendRejectedReason::Closed,
+                },
+            );
+            self.deliver_isolate_call_outcome(
+                call_id,
+                requester,
+                cause,
+                CallOutcome::Closed,
+                translator,
+            );
+            return;
+        }
+
+        let delivery =
+            self.dispatch_local_send_with_context(send, Some(MessageCallContext { call_id }));
+
+        match delivery {
+            Ok(()) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                    },
+                );
+                let insertion_order = self.next_isolate_call_ordinal;
+                self.next_isolate_call_ordinal += 1;
+                self.pending_isolate_calls.push(PendingIsolateCall {
+                    call_id,
+                    requester,
+                    cause,
+                    deadline: self.clock.now() + timeout,
+                    insertion_order,
+                    translator: Some(translator),
+                });
+            }
+            Err(reason) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(send_attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard,
+                        target_isolate,
+                        target_generation,
+                        reason,
+                    },
+                );
+                let outcome = match reason {
+                    SendRejectedReason::Full => CallOutcome::Full,
+                    SendRejectedReason::Closed => CallOutcome::Closed,
+                };
+                self.deliver_isolate_call_outcome(call_id, requester, cause, outcome, translator);
+            }
+        }
+    }
+
+    fn harvest_isolate_call_timeouts(&mut self, now: Instant) {
+        let mut due = Vec::new();
+        let mut still_pending = Vec::new();
+        for entry in std::mem::take(&mut self.pending_isolate_calls) {
+            if entry.deadline <= now {
+                due.push(entry);
+            } else {
+                still_pending.push(entry);
+            }
+        }
+        self.pending_isolate_calls = still_pending;
+        due.sort_by(|a, b| {
+            a.deadline
+                .cmp(&b.deadline)
+                .then_with(|| a.insertion_order.cmp(&b.insertion_order))
+        });
+        for mut entry in due {
+            let translator = entry.translator.take().unwrap_or_else(|| {
+                panic!("translator for call {:?} already consumed", entry.call_id)
+            });
+            self.deliver_isolate_call_outcome(
+                entry.call_id,
+                entry.requester,
+                entry.cause,
+                CallOutcome::Timeout,
+                translator,
+            );
+        }
+    }
+
+    fn complete_isolate_call(
+        &mut self,
+        call_id: CallId,
+        cause: CauseId,
+        outcome: CallOutcome<Box<dyn Any>>,
+    ) -> bool {
+        let Some(index) = self
+            .pending_isolate_calls
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        else {
+            return false;
+        };
+        let mut pending = self.pending_isolate_calls.remove(index);
+        let translator = pending
+            .translator
+            .take()
+            .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
+        self.deliver_isolate_call_outcome(call_id, pending.requester, cause, outcome, translator);
+        true
+    }
+
+    fn deliver_isolate_call_outcome(
+        &mut self,
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: CauseId,
+        outcome: CallOutcome<Box<dyn Any>>,
+        translator: ErasedIsolateCallTranslator,
+    ) {
+        let failure_reason = match &outcome {
+            CallOutcome::Replied(_) => None,
+            CallOutcome::Full => Some(CallError::TargetFull),
+            CallOutcome::Closed => Some(CallError::TargetClosed),
+            CallOutcome::Timeout => Some(CallError::Timeout),
+        };
+
+        if let Some(reason) = failure_reason {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallFailed {
+                    call_id,
+                    call_kind: CallKind::IsolateCall,
+                    reason,
+                },
+            );
+        }
+
+        let message = translator(outcome);
+        let Some(entry_index) = self.entries.iter().position(|entry| {
+            entry.id == requester.isolate && entry.generation == requester.generation
+        }) else {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        };
+
+        if self.entries[entry_index].stopped.get() {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        }
+
+        match self.enqueue_entry_message(entry_index, message, None) {
+            Ok(()) => {
+                if failure_reason.is_none() {
+                    self.push_event(
+                        requester.isolate,
+                        Some(cause),
+                        RuntimeEventKind::CallCompleted {
+                            call_id,
+                            call_kind: CallKind::IsolateCall,
+                        },
+                    );
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind: CallKind::IsolateCall,
+                        reason: CallCompletionRejectedReason::MailboxFull,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    requester.isolate,
+                    Some(cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id,
+                        call_kind: CallKind::IsolateCall,
                         reason: CallCompletionRejectedReason::RequesterClosed,
                     },
                 );
@@ -972,7 +1289,7 @@ where
             return;
         }
 
-        match self.entries[entry_index].mailbox.try_send_boxed(message) {
+        match self.enqueue_entry_message(entry_index, message, None) {
             Ok(()) => {
                 if failure_reason.is_none() {
                     self.push_event(
@@ -1020,17 +1337,18 @@ where
         message: Box<dyn Any>,
         cause: CauseId,
     ) {
-        let entry = self
+        let entry_index = self
             .entries
             .iter()
-            .find(|entry| entry.id == child.isolate && entry.generation == child.generation)
+            .position(|entry| entry.id == child.isolate && entry.generation == child.generation)
             .unwrap_or_else(|| panic!("bootstrap referenced unknown child {:?}", child.isolate));
-        entry.mailbox.try_send_boxed(message).unwrap_or_else(|_| {
-            panic!(
-                "runtime failed to enqueue bootstrap message for child {:?}",
-                child.isolate
-            )
-        });
+        self.enqueue_entry_message(entry_index, message, None)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "runtime failed to enqueue bootstrap message for child {:?}",
+                    child.isolate
+                )
+            });
         self.push_event(
             child.isolate,
             Some(cause),
@@ -1047,7 +1365,7 @@ where
         index: usize,
         isolate_id: IsolateId,
         cause: CauseId,
-        precollected: Option<Box<dyn Any>>,
+        precollected: Option<DeliveredMessage>,
     ) -> EventId {
         if self.entries[index].stopped.get() {
             let stopped = self.entries[index]
@@ -1075,7 +1393,7 @@ where
                 RuntimeEventKind::MessageAbandoned,
             );
         }
-        while self.entries[index].mailbox.recv_boxed().is_some() {
+        while self.recv_entry_message(index).is_some() {
             self.push_event(
                 isolate_id,
                 Some(stopped.into()),
@@ -1089,7 +1407,7 @@ where
         &mut self,
         parent: IsolateId,
         cause: CauseId,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        round_messages: &mut [Option<DeliveredMessage>],
     ) {
         let child_record_indices: Vec<usize> = self
             .child_records
@@ -1107,7 +1425,7 @@ where
         &mut self,
         failed_child: RegisteredAddress,
         cause: CauseId,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        round_messages: &mut [Option<DeliveredMessage>],
     ) {
         let Some(failed_record_index) = self.child_record_index_by_child(failed_child) else {
             return;
@@ -1192,7 +1510,7 @@ where
         parent: IsolateId,
         child_record_index: usize,
         cause: CauseId,
-        round_messages: &mut [Option<Box<dyn Any>>],
+        round_messages: &mut [Option<DeliveredMessage>],
     ) {
         let child_ordinal = self.child_records[child_record_index].child_ordinal;
         let old_child = self.child_records[child_record_index].child;
@@ -1276,7 +1594,46 @@ where
         id
     }
 
+    fn enqueue_entry_message(
+        &self,
+        entry_index: usize,
+        message: Box<dyn Any>,
+        call_context: Option<MessageCallContext>,
+    ) -> Result<(), TrySendError<Box<dyn Any>>> {
+        match self.entries[entry_index].mailbox.try_send_boxed(message) {
+            Ok(()) => {
+                self.entries[entry_index]
+                    .call_contexts
+                    .borrow_mut()
+                    .push_back(call_context);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn recv_entry_message(&self, entry_index: usize) -> Option<DeliveredMessage> {
+        let message = self.entries[entry_index].mailbox.recv_boxed()?;
+        let call_context = self.entries[entry_index]
+            .call_contexts
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(None);
+        Some(DeliveredMessage {
+            message,
+            call_context,
+        })
+    }
+
     fn dispatch_local_send(&self, send: ErasedSend) -> Result<(), SendRejectedReason> {
+        self.dispatch_local_send_with_context(send, None)
+    }
+
+    fn dispatch_local_send_with_context(
+        &self,
+        send: ErasedSend,
+        call_context: Option<MessageCallContext>,
+    ) -> Result<(), SendRejectedReason> {
         if send.target_shard != self.shard.id() {
             panic!(
                 "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",
@@ -1285,10 +1642,10 @@ where
             );
         }
 
-        let Some(entry) = self
+        let Some(entry_index) = self
             .entries
             .iter()
-            .find(|entry| entry.id == send.target_isolate)
+            .position(|entry| entry.id == send.target_isolate)
         else {
             panic!(
                 "send targeted unknown isolate {} on shard {}",
@@ -1296,14 +1653,13 @@ where
                 send.target_shard.get(),
             );
         };
+        let entry = &self.entries[entry_index];
 
         if entry.generation != send.target_generation {
             return Err(SendRejectedReason::Closed);
         }
 
-        entry
-            .mailbox
-            .try_send_boxed(send.message.into_any())
+        self.enqueue_entry_message(entry_index, send.message.into_any(), call_context)
             .map_err(|reason| match reason {
                 TrySendError::Full(_) => SendRejectedReason::Full,
                 TrySendError::Closed(_) => SendRejectedReason::Closed,
@@ -1315,10 +1671,10 @@ where
         // What we record here is destination-local harvest outcome, not a
         // retroactive change to the source-side send result.
         let send = queued.send;
-        let Some(entry) = self
+        let Some(entry_index) = self
             .entries
             .iter()
-            .find(|entry| entry.id == send.target_isolate)
+            .position(|entry| entry.id == send.target_isolate)
         else {
             self.push_event(
                 send.target_isolate,
@@ -1332,6 +1688,7 @@ where
             );
             return;
         };
+        let entry = &self.entries[entry_index];
 
         if entry.generation != send.target_generation {
             self.push_event(
@@ -1347,7 +1704,7 @@ where
             return;
         }
 
-        match entry.mailbox.try_send_boxed(send.message.into_any()) {
+        match self.enqueue_entry_message(entry_index, send.message.into_any(), None) {
             Ok(()) => {
                 self.push_event(
                     send.target_isolate,
@@ -1454,6 +1811,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
@@ -1469,6 +1827,7 @@ where
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
             mailbox,
+            call_contexts: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
                 marker: PhantomData,
@@ -1490,6 +1849,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
@@ -1515,6 +1875,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
@@ -1530,6 +1891,7 @@ where
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
             mailbox,
+            call_contexts: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {
                 isolate,
                 marker: PhantomData,
@@ -1553,6 +1915,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
@@ -1763,6 +2126,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
@@ -1784,6 +2148,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
         I::Message: 'static,
+        I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
@@ -1994,6 +2359,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
         I::Message: 'static,
+        I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
@@ -2249,6 +2615,7 @@ where
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
         I::Message: 'static,
+        I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
@@ -2609,6 +2976,7 @@ impl<I, S, F, Outbound> ErasedHandler<S, F> for HandlerAdapter<I, Outbound>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
+    I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
@@ -2646,6 +3014,7 @@ impl<I, S, F, Outbound> ErasedHandler<S, F> for SendableHandlerAdapter<I, Outbou
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
+    I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: Send + 'static,
@@ -2675,6 +3044,7 @@ fn erase_effect<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
+    I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
@@ -2683,7 +3053,7 @@ where
 {
     match effect {
         Effect::Noop => ErasedEffect::Noop,
-        Effect::Reply(_) => ErasedEffect::Reply,
+        Effect::Reply(reply) => ErasedEffect::Reply(ErasedMessage::Local(Box::new(reply))),
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
@@ -2710,6 +3080,7 @@ fn erase_effect_sendable<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
+    I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: Send + 'static,
@@ -2718,7 +3089,7 @@ where
 {
     match effect {
         Effect::Noop => ErasedEffect::Noop,
-        Effect::Reply(_) => ErasedEffect::Reply,
+        Effect::Reply(reply) => ErasedEffect::Reply(ErasedMessage::Sendable(Box::new(reply))),
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
@@ -2753,6 +3124,7 @@ where
     stopped: Cell<bool>,
     stopped_event: Cell<Option<EventId>>,
     mailbox: Box<dyn ErasedMailbox>,
+    call_contexts: RefCell<VecDeque<Option<MessageCallContext>>>,
     handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
 }
 
@@ -2762,7 +3134,7 @@ where
     F: MailboxFactory,
 {
     Noop,
-    Reply,
+    Reply(ErasedMessage),
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S, F>>),
     Stop,
@@ -2779,7 +3151,7 @@ where
     fn kind(&self) -> EffectKind {
         match self {
             Self::Noop => EffectKind::Noop,
-            Self::Reply => EffectKind::Reply,
+            Self::Reply(_) => EffectKind::Reply,
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
             Self::Stop => EffectKind::Stop,
@@ -2881,6 +3253,7 @@ impl<I, S, F, Outbound> ErasedSpawn<S, F> for SpawnAdapter<I, Outbound>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
+    I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
@@ -2905,6 +3278,7 @@ impl<I, S, F, OutboundMsg> IntoErasedSpawn<S, F> for tina::ChildDefinition<I>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<OutboundMsg>> + 'static,
     I::Message: 'static,
+    I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     OutboundMsg: 'static,
@@ -2936,6 +3310,7 @@ impl<I, S, F, Outbound> ErasedSpawn<S, F> for RestartableSpawnAdapter<I, Outboun
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
+    I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
@@ -2966,6 +3341,7 @@ impl<I, S, F, Outbound> ErasedRestartRecipe<S, F> for RestartableSpawnAdapter<I,
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
+    I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
@@ -2988,6 +3364,7 @@ impl<I, S, F, OutboundMsg> IntoErasedSpawn<S, F> for tina::RestartableChildDefin
 where
     I: Isolate<Shard = S, Send = TinaOutbound<OutboundMsg>> + 'static,
     I::Message: 'static,
+    I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     OutboundMsg: 'static,
