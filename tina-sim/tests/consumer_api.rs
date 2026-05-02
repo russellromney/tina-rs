@@ -8,8 +8,8 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
-    ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome, StreamId, call,
-    send_observed,
+    EffectKind, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome, StreamId,
+    call, send_observed,
 };
 use tina_sim::{
     ObservedPeerOutput, ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, Simulator,
@@ -447,8 +447,9 @@ impl Isolate for ReplyWorker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CallerMsg {
-    Start(Address<WorkerRequest>, WorkerRequest),
+    Start(Address<WorkerRequest>, WorkerRequest, std::time::Duration),
     StartAndStop(Address<WorkerRequest>),
+    Filler,
     Returned(CallOutcome<WorkerReply>),
 }
 
@@ -467,12 +468,10 @@ impl Isolate for CallerWorker {
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            CallerMsg::Start(target, request) => call::<WorkerRequest, WorkerReply>(
-                target,
-                request,
-                std::time::Duration::from_millis(5),
-            )
-            .reply(CallerMsg::Returned),
+            CallerMsg::Start(target, request, timeout) => {
+                call::<WorkerRequest, WorkerReply>(target, request, timeout)
+                    .reply(CallerMsg::Returned)
+            }
             CallerMsg::StartAndStop(target) => Effect::Batch(vec![
                 call::<WorkerRequest, WorkerReply>(
                     target,
@@ -482,6 +481,7 @@ impl Isolate for CallerWorker {
                 .reply(CallerMsg::Returned),
                 Effect::Stop,
             ]),
+            CallerMsg::Filler => Effect::Noop,
             CallerMsg::Returned(outcome) => {
                 self.outcomes
                     .lock()
@@ -491,6 +491,91 @@ impl Isolate for CallerWorker {
             }
         }
     }
+}
+
+#[test]
+fn downstream_consumer_replays_late_isolate_call_reply_as_plain_reply_after_timeout() {
+    let (outcomes, first) =
+        run_isolate_call_scenario(8, false, WorkerRequest::ReplyNow, std::time::Duration::ZERO);
+    let (replayed_outcomes, replayed) =
+        run_isolate_call_scenario(8, false, WorkerRequest::ReplyNow, std::time::Duration::ZERO);
+
+    assert_eq!(outcomes.as_slice(), [CallOutcome::Timeout]);
+    assert_eq!(replayed_outcomes, outcomes);
+    assert_eq!(first.event_record(), replayed.event_record());
+    assert_eq!(
+        count_call_failed(
+            first.event_record(),
+            CallKind::IsolateCall,
+            CallError::Timeout
+        ),
+        1
+    );
+    assert_eq!(
+        count_call_completed(first.event_record(), CallKind::IsolateCall),
+        0
+    );
+    assert!(
+        first.event_record().iter().any(|event| matches!(
+            event.kind(),
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Reply
+            }
+        )),
+        "late reply after timeout should fall back to ordinary reply observation"
+    );
+}
+
+#[test]
+fn downstream_consumer_replays_isolate_call_completion_rejected_when_requester_mailbox_full() {
+    let (outcomes, first) = run_full_requester_mailbox_isolate_call_scenario();
+    let (replayed_outcomes, replayed) = run_full_requester_mailbox_isolate_call_scenario();
+
+    assert!(outcomes.is_empty());
+    assert_eq!(replayed_outcomes, outcomes);
+    assert_eq!(first.event_record(), replayed.event_record());
+    assert_eq!(
+        count_call_completion_rejected(
+            first.event_record(),
+            CallKind::IsolateCall,
+            CallCompletionRejectedReason::MailboxFull,
+        ),
+        1
+    );
+}
+
+fn run_full_requester_mailbox_isolate_call_scenario()
+-> (Vec<CallOutcome<WorkerReply>>, tina_sim::ReplayArtifact) {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
+    let target = sim.register_with_mailbox_capacity(ReplyWorker, 8);
+    let caller = sim.register_with_mailbox_capacity(
+        CallerWorker {
+            outcomes: Arc::clone(&outcomes),
+        },
+        1,
+    );
+
+    sim.try_send(
+        caller,
+        CallerMsg::Start(
+            target,
+            WorkerRequest::DoNotReply,
+            std::time::Duration::from_millis(5),
+        ),
+    )
+    .expect("start isolate call");
+    assert_eq!(sim.step(), 1);
+    assert_eq!(sim.step(), 1);
+    sim.try_send(caller, CallerMsg::Filler)
+        .expect("fill requester mailbox before timeout completion");
+    assert!(sim.advance_to_next_timer());
+    assert_eq!(sim.step(), 1);
+
+    (
+        outcomes.lock().expect("call outcomes mutex").clone(),
+        sim.replay_artifact(),
+    )
 }
 
 #[test]
@@ -525,9 +610,18 @@ fn downstream_consumer_can_replay_isolate_call_reply_full_closed_timeout() {
             Some(CallError::Timeout),
         ),
     ] {
-        let (outcomes, first) = run_isolate_call_scenario(target_capacity, stop_first, request);
-        let (replayed_outcomes, replayed) =
-            run_isolate_call_scenario(target_capacity, stop_first, request);
+        let (outcomes, first) = run_isolate_call_scenario(
+            target_capacity,
+            stop_first,
+            request,
+            std::time::Duration::from_millis(5),
+        );
+        let (replayed_outcomes, replayed) = run_isolate_call_scenario(
+            target_capacity,
+            stop_first,
+            request,
+            std::time::Duration::from_millis(5),
+        );
 
         assert_eq!(outcomes.as_slice(), [expected]);
         assert_eq!(replayed_outcomes, outcomes);
@@ -591,6 +685,7 @@ fn run_isolate_call_scenario(
     target_capacity: usize,
     stop_first: bool,
     request: WorkerRequest,
+    timeout: std::time::Duration,
 ) -> (Vec<CallOutcome<WorkerReply>>, tina_sim::ReplayArtifact) {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
@@ -608,7 +703,7 @@ fn run_isolate_call_scenario(
         sim.run_until_quiescent();
     }
 
-    sim.try_send(caller, CallerMsg::Start(target, request))
+    sim.try_send(caller, CallerMsg::Start(target, request, timeout))
         .expect("start isolate call");
     sim.run_until_quiescent();
 

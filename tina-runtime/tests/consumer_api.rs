@@ -8,8 +8,8 @@ use std::time::Duration;
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
-    MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome, call,
-    send_observed, sleep,
+    EffectKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome,
+    call, send_observed, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -314,6 +314,7 @@ impl Isolate for ReplyWorker {
 enum CallerEvent {
     Start(Address<WorkerRequest>, WorkerRequest, Duration),
     StartAndStop(Address<WorkerRequest>),
+    Filler,
     Returned(CallOutcome<WorkerReply>),
 }
 
@@ -347,10 +348,36 @@ impl Isolate for CallerWorker {
                 .reply(CallerEvent::Returned),
                 stop(),
             ]),
+            CallerEvent::Filler => noop(),
             CallerEvent::Returned(outcome) => {
                 self.outcomes.borrow_mut().push(outcome);
                 noop()
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillerEvent {
+    Fill(Address<CallerEvent>),
+}
+
+#[derive(Debug)]
+struct FillerWorker;
+
+impl Isolate for FillerWorker {
+    tina::isolate_types! {
+        message: FillerEvent,
+        reply: (),
+        send: Outbound<CallerEvent>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: ConsumerShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            FillerEvent::Fill(caller) => send(caller, CallerEvent::Filler),
         }
     }
 }
@@ -426,6 +453,82 @@ fn downstream_consumer_can_call_isolate_and_observe_reply_full_closed_timeout() 
             );
         }
     }
+}
+
+#[test]
+fn downstream_consumer_sees_late_isolate_call_reply_as_plain_reply_after_timeout() {
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
+    let target = runtime.register_with_capacity(ReplyWorker, 8);
+    let caller = runtime.register_with_capacity(
+        CallerWorker {
+            outcomes: Rc::clone(&outcomes),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(
+            caller,
+            CallerEvent::Start(target, WorkerRequest::ReplyNow, Duration::ZERO),
+        )
+        .expect("start zero-timeout isolate call");
+    drive(&mut runtime);
+
+    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Timeout]);
+    assert_eq!(
+        count_call_failed(runtime.trace(), CallKind::IsolateCall, CallError::Timeout),
+        1
+    );
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::IsolateCall),
+        0
+    );
+    assert!(
+        runtime.trace().iter().any(|event| matches!(
+            event.kind(),
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Reply
+            }
+        )),
+        "late reply after timeout should fall back to ordinary reply observation"
+    );
+}
+
+#[test]
+fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_mailbox_full() {
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
+    let filler = runtime.register_with_capacity(FillerWorker, 8);
+    let target = runtime.register_with_capacity(ReplyWorker, 8);
+    let caller = runtime.register_with_capacity(
+        CallerWorker {
+            outcomes: Rc::clone(&outcomes),
+        },
+        1,
+    );
+
+    runtime
+        .try_send(
+            caller,
+            CallerEvent::Start(target, WorkerRequest::ReplyNow, Duration::from_millis(10)),
+        )
+        .expect("start isolate call");
+    assert_eq!(runtime.step(), 1);
+    runtime
+        .try_send(filler, FillerEvent::Fill(caller))
+        .expect("ask filler to fill requester mailbox before reply");
+    drive(&mut runtime);
+
+    assert!(outcomes.borrow().is_empty());
+    assert_eq!(
+        count_call_completion_rejected(
+            runtime.trace(),
+            CallKind::IsolateCall,
+            CallCompletionRejectedReason::MailboxFull,
+        ),
+        1
+    );
 }
 
 #[test]

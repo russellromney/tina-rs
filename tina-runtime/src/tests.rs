@@ -2283,6 +2283,124 @@ fn pending_timer_completion_is_rejected_when_requester_stops() {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualCallRequest {
+    NoReply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManualCallReply;
+
+#[derive(Debug)]
+struct ManualCallTarget;
+
+impl Isolate for ManualCallTarget {
+    type Message = ManualCallRequest;
+    type Reply = ManualCallReply;
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = Infallible;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ManualCallRequest::NoReply => noop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualCallCallerMsg {
+    Start(Address<ManualCallRequest>),
+    Returned(CallOutcome<ManualCallReply>),
+}
+
+#[derive(Debug)]
+struct ManualCallCaller {
+    outcomes: Rc<RefCell<Vec<CallOutcome<ManualCallReply>>>>,
+}
+
+impl Isolate for ManualCallCaller {
+    type Message = ManualCallCallerMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<ManualCallCallerMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ManualCallCallerMsg::Start(target) => Effect::Call(RuntimeCall::isolate_call(
+                target,
+                ManualCallRequest::NoReply,
+                Duration::from_millis(10),
+                ManualCallCallerMsg::Returned,
+            )),
+            ManualCallCallerMsg::Returned(outcome) => {
+                self.outcomes.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn isolate_call_timeout_uses_manual_clock_without_wall_clock_sleep() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let target = runtime.register(ManualCallTarget, TestMailbox::new(8));
+    let caller = runtime.register(
+        ManualCallCaller {
+            outcomes: Rc::clone(&outcomes),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(caller, ManualCallCallerMsg::Start(target))
+        .unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+
+    clock.advance(Duration::from_millis(9));
+    assert_eq!(runtime.step(), 0);
+    assert!(outcomes.borrow().is_empty());
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|event| matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::Timeout,
+                    ..
+                }
+            ))
+            .count(),
+        0
+    );
+
+    clock.advance(Duration::from_millis(1));
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Timeout]);
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|event| matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::Timeout,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryMsg {
     Attempt,
     RetryNow,
