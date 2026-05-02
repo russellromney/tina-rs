@@ -1498,7 +1498,10 @@ where
 
     /// Returns the shard ids owned by this coordinator in global step order.
     pub fn shard_ids(&self) -> Vec<ShardId> {
-        self.runtimes.iter().map(|runtime| runtime.shard().id()).collect()
+        self.runtimes
+            .iter()
+            .map(|runtime| runtime.shard().id())
+            .collect()
     }
 
     /// Returns the merged deterministic event record in global event-id order.
@@ -1533,7 +1536,8 @@ where
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
-        self.runtime_mut(shard).register::<I, M, Outbound>(isolate, mailbox)
+        self.runtime_mut(shard)
+            .register::<I, M, Outbound>(isolate, mailbox)
     }
 
     /// Registers one root isolate on the requested shard and lets that shard
@@ -1554,6 +1558,11 @@ where
     {
         self.runtime_mut(shard)
             .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Configures a registered isolate as supervisor on its owning shard.
+    pub fn supervise<M: 'static>(&mut self, parent: Address<M>, config: SupervisorConfig) {
+        self.runtime_mut(parent.shard()).supervise(parent, config);
     }
 
     /// Attempts one typed global ingress send routed strictly by target shard.
@@ -1608,12 +1617,10 @@ where
     }
 
     fn checked_shard_index(&self, shard: ShardId) -> usize {
-        self.shard_indexes.get(&shard).copied().unwrap_or_else(|| {
-            panic!(
-                "multi-shard runtime targeted unknown shard {}",
-                shard.get()
-            )
-        })
+        self.shard_indexes
+            .get(&shard)
+            .copied()
+            .unwrap_or_else(|| panic!("multi-shard runtime targeted unknown shard {}", shard.get()))
     }
 
     fn harvest_for_destination(

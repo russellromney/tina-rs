@@ -81,14 +81,20 @@ impl MailboxFactory for TestMailboxFactory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoordinatorEvent {
-    Submit { job_id: u64, value: u64 },
+    Submit {
+        job_id: u64,
+        value: u64,
+    },
     SubmitPair {
         first_job: u64,
         first_value: u64,
         second_job: u64,
         second_value: u64,
     },
-    JobCompleted { job_id: u64, doubled: u64 },
+    JobCompleted {
+        job_id: u64,
+        doubled: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +206,8 @@ fn run_until_idle(runtime: &mut MultiShardRuntime<WorkShard, TestMailboxFactory>
 }
 
 fn event_id(trace: &[RuntimeEvent], predicate: impl Fn(&RuntimeEvent) -> bool) -> u64 {
-    trace.iter()
+    trace
+        .iter()
         .find(|event| predicate(event))
         .unwrap_or_else(|| panic!("expected matching event in trace"))
         .id()
@@ -215,11 +222,8 @@ fn run_dispatcher_workload(
         MultiShardRuntime::with_config([WorkShard(11), WorkShard(22)], TestMailboxFactory, config);
     let completed = Rc::new(RefCell::new(Vec::new()));
 
-    let worker = runtime.register_with_capacity_on::<Worker, CoordinatorEvent>(
-        ShardId::new(22),
-        Worker,
-        4,
-    );
+    let worker =
+        runtime.register_with_capacity_on::<Worker, CoordinatorEvent>(ShardId::new(22), Worker, 4);
     let coordinator = runtime.register_with_capacity_on::<Coordinator, WorkerEvent>(
         ShardId::new(11),
         Coordinator {
@@ -240,11 +244,8 @@ fn dispatcher_worker_workload_preserves_cross_shard_request_reply_causality() {
     let mut runtime = MultiShardRuntime::new([WorkShard(11), WorkShard(22)], TestMailboxFactory);
     let completed = Rc::new(RefCell::new(Vec::new()));
 
-    let worker = runtime.register_with_capacity_on::<Worker, CoordinatorEvent>(
-        ShardId::new(22),
-        Worker,
-        4,
-    );
+    let worker =
+        runtime.register_with_capacity_on::<Worker, CoordinatorEvent>(ShardId::new(22), Worker, 4);
     let coordinator = runtime.register_with_capacity_on::<Coordinator, WorkerEvent>(
         ShardId::new(11),
         Coordinator {
@@ -293,7 +294,9 @@ fn dispatcher_worker_workload_preserves_cross_shard_request_reply_causality() {
     let worker_mailbox = event_id(&trace, |event| {
         event.shard() == ShardId::new(22)
             && matches!(event.kind(), RuntimeEventKind::MailboxAccepted)
-            && event.cause().is_some_and(|cause| cause.event().get() == request_attempt)
+            && event
+                .cause()
+                .is_some_and(|cause| cause.event().get() == request_attempt)
     });
     let reply_attempt = event_id(&trace, |event| {
         event.shard() == ShardId::new(22)
@@ -309,7 +312,9 @@ fn dispatcher_worker_workload_preserves_cross_shard_request_reply_causality() {
     let coordinator_mailbox = event_id(&trace, |event| {
         event.shard() == ShardId::new(11)
             && matches!(event.kind(), RuntimeEventKind::MailboxAccepted)
-            && event.cause().is_some_and(|cause| cause.event().get() == reply_attempt)
+            && event
+                .cause()
+                .is_some_and(|cause| cause.event().get() == reply_attempt)
     });
 
     assert!(request_attempt < request_accept);

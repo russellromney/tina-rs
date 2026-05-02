@@ -1152,11 +1152,7 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(
-        &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
-    ) -> Effect<Self> {
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             StepEvent::Tick => Effect::Noop,
         }
@@ -1174,11 +1170,7 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(
-        &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
-    ) -> Effect<Self> {
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             RemoteEvent::Kick => send(self.target, RemoteEvent::Arrived),
             RemoteEvent::KickTwice => batch([
@@ -1207,11 +1199,7 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(
-        &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
-    ) -> Effect<Self> {
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             RemoteEvent::Arrived
             | RemoteEvent::Kick
@@ -1358,7 +1346,10 @@ fn multishard_runtime_routes_ingress_and_steps_in_ascending_shard_order() {
     let mut runtime =
         MultiShardRuntime::new([NumberedShard(22), NumberedShard(11)], TestMailboxFactory);
 
-    assert_eq!(runtime.shard_ids(), vec![ShardId::new(11), ShardId::new(22)]);
+    assert_eq!(
+        runtime.shard_ids(),
+        vec![ShardId::new(11), ShardId::new(22)]
+    );
 
     let shard_twenty_two = runtime.register_with_capacity_on::<NumberedRecorder<NumberedShard>, _>(
         ShardId::new(22),
@@ -1693,6 +1684,98 @@ fn cross_shard_harvest_preserves_fifo_from_one_source() {
         })
         .collect();
     assert_eq!(destination_causes, source_attempts);
+}
+
+#[test]
+fn cross_shard_harvest_preserves_fifo_per_isolate_pair_with_multiple_sources_and_targets() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(44)], TestMailboxFactory);
+
+    let sink_a = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(44),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        8,
+    );
+    let sink_b = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(44),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        8,
+    );
+    let sender_a = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink_a,
+            marker: PhantomData,
+        },
+        4,
+    );
+    let sender_b = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: sink_b,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(sender_a, RemoteEvent::KickThrice).unwrap();
+    runtime.try_send(sender_b, RemoteEvent::KickTwice).unwrap();
+
+    assert_eq!(runtime.step(), 2);
+    assert_eq!(runtime.step(), 2);
+
+    let trace = runtime.trace();
+    let sender_a_attempts: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::SendDispatchAttempted { .. }
+                if event.shard() == ShardId::new(11) && event.isolate() == sender_a.isolate() =>
+            {
+                Some(event.id().get())
+            }
+            _ => None,
+        })
+        .collect();
+    let sender_b_attempts: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::SendDispatchAttempted { .. }
+                if event.shard() == ShardId::new(11) && event.isolate() == sender_b.isolate() =>
+            {
+                Some(event.id().get())
+            }
+            _ => None,
+        })
+        .collect();
+    let sink_a_causes: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::MailboxAccepted
+                if event.shard() == ShardId::new(44) && event.isolate() == sink_a.isolate() =>
+            {
+                event.cause().map(|cause| cause.event().get())
+            }
+            _ => None,
+        })
+        .collect();
+    let sink_b_causes: Vec<_> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::MailboxAccepted
+                if event.shard() == ShardId::new(44) && event.isolate() == sink_b.isolate() =>
+            {
+                event.cause().map(|cause| cause.event().get())
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(sink_a_causes, sender_a_attempts);
+    assert_eq!(sink_b_causes, sender_b_attempts);
 }
 
 #[test]
