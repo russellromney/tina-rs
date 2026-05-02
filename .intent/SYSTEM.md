@@ -86,13 +86,13 @@ tracing, time calls, and Betelgeuse-backed TCP calls. Its `step()` is
 synchronous from the outside: the runtime collects finished owned work,
 translates completions into messages, and then handles ready mailbox work.
 
-`tina-runtime` also has a narrow live substrate, `ThreadedRuntime`. It starts
-one OS worker thread for one shard runtime, keeps root registration and ingress
-behind a bounded command queue, and lets tests/users run isolates without
-manually calling `step()`. This is an execution path, not a second semantic
-model: the explicit-step runtime and simulator remain the oracle. The current
-threaded substrate is single-shard; live cross-shard transport is not yet
-claimed.
+`tina-runtime` also has a narrow live substrate: `ThreadedRuntime` for one
+shard and `ThreadedMultiShardRuntime` for a fixed shard set. Each shard runtime
+is constructed and owned by one OS worker thread; handles communicate through
+bounded command queues. Live cross-shard sends move `Send + 'static` payloads
+through those bounded worker queues. This is an execution path, not a second
+semantic model: the explicit-step runtime and simulator remain the oracle.
+Peer quarantine and cross-shard child ownership are not claimed.
 
 The shipped runtime call types are `RuntimeCall<Message>` over
 `CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep

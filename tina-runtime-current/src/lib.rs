@@ -35,6 +35,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -131,27 +133,25 @@ struct TimerEntry {
 
 #[derive(Debug, Clone)]
 struct IdSource {
-    next_event_id: Rc<Cell<u64>>,
-    next_call_id: Rc<Cell<u64>>,
+    next_event_id: Arc<AtomicU64>,
+    next_call_id: Arc<AtomicU64>,
 }
 
 impl IdSource {
     fn new() -> Self {
         Self {
-            next_event_id: Rc::new(Cell::new(1)),
-            next_call_id: Rc::new(Cell::new(1)),
+            next_event_id: Arc::new(AtomicU64::new(1)),
+            next_call_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
     fn next_event_id(&self) -> EventId {
-        let raw = self.next_event_id.get();
-        self.next_event_id.set(raw + 1);
+        let raw = self.next_event_id.fetch_add(1, Ordering::Relaxed);
         EventId::new(raw)
     }
 
     fn next_call_id(&self) -> CallId {
-        let raw = self.next_call_id.get();
-        self.next_call_id.set(raw + 1);
+        let raw = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         CallId::new(raw)
     }
 }
@@ -1131,7 +1131,7 @@ where
 
         entry
             .mailbox
-            .try_send_boxed(send.message)
+            .try_send_boxed(send.message.into_any())
             .map_err(|reason| match reason {
                 TrySendError::Full(_) => SendRejectedReason::Full,
                 TrySendError::Closed(_) => SendRejectedReason::Closed,
@@ -1175,7 +1175,7 @@ where
             return;
         }
 
-        match entry.mailbox.try_send_boxed(send.message) {
+        match entry.mailbox.try_send_boxed(send.message.into_any()) {
             Ok(()) => {
                 self.push_event(
                     send.target_isolate,
@@ -1298,6 +1298,67 @@ where
             stopped_event: Cell::new(None),
             mailbox,
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
+                isolate,
+                marker: PhantomData,
+            })),
+        });
+
+        RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: isolate_id,
+            generation,
+        }
+    }
+
+    fn register_sendable_with_capacity<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Address<I::Message>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: Send + 'static,
+    {
+        let address = self.register_sendable_entry::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(MailboxAdapter::<Box<dyn Mailbox<I::Message>>, I::Message> {
+                mailbox: self.mailbox_factory.create::<I::Message>(mailbox_capacity),
+                marker: PhantomData,
+            }),
+        );
+
+        Address::new_with_generation(address.shard, address.isolate, address.generation)
+    }
+
+    fn register_sendable_entry<I, Outbound>(
+        &mut self,
+        isolate: I,
+        parent: Option<IsolateId>,
+        mailbox: Box<dyn ErasedMailbox>,
+    ) -> RegisteredAddress
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: Send + 'static,
+    {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
+        let generation = AddressGeneration::new(0);
+
+        self.entries.push(RegisteredEntry {
+            id: isolate_id,
+            generation,
+            parent,
+            stopped: Cell::new(false),
+            stopped_event: Cell::new(None),
+            mailbox,
+            handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {
                 isolate,
                 marker: PhantomData,
             })),
@@ -1929,6 +1990,264 @@ where
     runtime.trace().to_vec()
 }
 
+/// One live worker-per-shard runtime over a fixed shard set.
+///
+/// This is Huygens' narrow live multi-shard substrate. It keeps each shard
+/// runtime owned by one OS thread, routes cross-shard effects through bounded
+/// worker queues, and preserves the explicit-step runtime/simulator as the
+/// semantic oracle. Live cross-shard payloads must be `Send` because they move
+/// between worker threads.
+pub struct ThreadedMultiShardRuntime<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    commands: BTreeMap<ShardId, std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>>,
+    handles: Vec<JoinHandle<Vec<RuntimeEvent>>>,
+}
+
+impl<S, F> ThreadedMultiShardRuntime<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    /// Starts one live worker thread per shard.
+    pub fn new<I>(shards: I, mailbox_factory: F) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::with_config(shards, mailbox_factory, ThreadedRuntimeConfig::default())
+    }
+
+    /// Starts one live worker thread per shard with explicit queue config.
+    pub fn with_config<I>(shards: I, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        if config.command_capacity == 0 {
+            panic!("threaded multi-shard runtime requires command capacity > 0");
+        }
+
+        let mut shards: Vec<S> = shards.into_iter().collect();
+        if shards.is_empty() {
+            panic!("threaded multi-shard runtime requires at least one shard");
+        }
+        shards.sort_by_key(Shard::id);
+        for pair in shards.windows(2) {
+            if pair[0].id() == pair[1].id() {
+                panic!(
+                    "threaded multi-shard runtime received duplicate shard id {}",
+                    pair[0].id().get()
+                );
+            }
+        }
+
+        let mut commands = BTreeMap::new();
+        let mut receivers = Vec::with_capacity(shards.len());
+        for shard in &shards {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
+            commands.insert(shard.id(), sender);
+            receivers.push((shard.id(), receiver));
+        }
+
+        let ids = IdSource::new();
+        let mut handles = Vec::with_capacity(shards.len());
+        for (shard, (_shard_id, receiver)) in shards.into_iter().zip(receivers) {
+            let factory = mailbox_factory.clone();
+            let ids = ids.clone();
+            let remote_senders = commands.clone();
+            handles.push(thread::spawn(move || {
+                let runtime =
+                    Runtime::with_clock_and_ids(shard, factory, Box::new(MonotonicClock), ids);
+                threaded_worker_loop_with_remote(runtime, receiver, config, remote_senders)
+            }));
+        }
+
+        Self { commands, handles }
+    }
+
+    /// Registers one root isolate on a chosen shard.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_on<I, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<Address<I::Message>, ThreadedControlError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: Send + 'static,
+    {
+        self.call_on(shard, move |runtime| {
+            runtime.register_sendable_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+        })
+    }
+
+    /// Configures a registered root isolate as supervisor on its owning shard.
+    pub fn supervise<M: 'static>(
+        &self,
+        parent: Address<M>,
+        config: SupervisorConfig,
+    ) -> Result<(), ThreadedControlError> {
+        self.call_on(parent.shard(), move |runtime| {
+            runtime.supervise(parent, config)
+        })
+    }
+
+    /// Attempts bounded ingress to the worker that owns `address`.
+    pub fn try_send<M: Send + 'static>(
+        &self,
+        address: Address<M>,
+        message: M,
+    ) -> Result<(), ThreadedTrySendError> {
+        let Some(sender) = self.commands.get(&address.shard()) else {
+            panic!(
+                "threaded multi-shard runtime targeted unknown shard {}",
+                address.shard().get()
+            );
+        };
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
+            let _ = runtime.try_send(address, message);
+        }));
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(ThreadedTrySendError::IngressFull),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(ThreadedTrySendError::WorkerStopped)
+            }
+        }
+    }
+
+    /// Returns a globally sorted trace snapshot across all worker shards.
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedControlError> {
+        let mut events = Vec::new();
+        for shard in self.commands.keys().copied().collect::<Vec<_>>() {
+            events.extend(self.call_on(shard, |runtime| runtime.trace().to_vec())?);
+        }
+        events.sort_by_key(|event| event.id());
+        Ok(events)
+    }
+
+    /// Returns a trace snapshot from one worker shard.
+    pub fn trace_on(&self, shard: ShardId) -> Result<Vec<RuntimeEvent>, ThreadedControlError> {
+        self.call_on(shard, |runtime| runtime.trace().to_vec())
+    }
+
+    /// Requests shutdown and joins every worker.
+    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, ThreadedControlError> {
+        self.shutdown_inner()
+    }
+
+    fn call_on<R, C>(&self, shard: ShardId, command: C) -> Result<R, ThreadedControlError>
+    where
+        R: Send + 'static,
+        C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
+    {
+        let Some(sender) = self.commands.get(&shard) else {
+            panic!(
+                "threaded multi-shard runtime targeted unknown shard {}",
+                shard.get()
+            );
+        };
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        sender
+            .send(ThreadedCommand::Run(Box::new(move |runtime| {
+                let _ = reply_tx.send(command(runtime));
+            })))
+            .map_err(|_| ThreadedControlError::WorkerStopped)?;
+        reply_rx
+            .recv()
+            .map_err(|_| ThreadedControlError::WorkerStopped)
+    }
+
+    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedControlError> {
+        for sender in self.commands.values() {
+            let _ = sender.send(ThreadedCommand::Shutdown);
+        }
+
+        let mut events = Vec::new();
+        for handle in std::mem::take(&mut self.handles) {
+            events.extend(
+                handle
+                    .join()
+                    .map_err(|_| ThreadedControlError::WorkerStopped)?,
+            );
+        }
+        events.sort_by_key(|event| event.id());
+        Ok(events)
+    }
+}
+
+impl<S, F> Drop for ThreadedMultiShardRuntime<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    fn drop(&mut self) {
+        let _ = self.shutdown_inner();
+    }
+}
+
+fn threaded_worker_loop_with_remote<S, F>(
+    mut runtime: Runtime<S, F>,
+    receiver: std::sync::mpsc::Receiver<ThreadedCommand<S, F>>,
+    config: ThreadedRuntimeConfig,
+    remote_senders: BTreeMap<ShardId, std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>>,
+) -> Vec<RuntimeEvent>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    loop {
+        match receiver.try_recv() {
+            Ok(ThreadedCommand::Run(command)) => {
+                command(&mut runtime);
+                continue;
+            }
+            Ok(ThreadedCommand::Shutdown) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        let delivered = runtime.step_with_remote(&mut |_, send, cause| {
+            let target_shard = send.target_shard;
+            let Some(sender) = remote_senders.get(&target_shard) else {
+                panic!(
+                    "threaded multi-shard runtime targeted unknown destination shard {}",
+                    target_shard.get()
+                );
+            };
+            let queued = SendableQueuedRemoteSend::new(send, cause);
+            let command = ThreadedCommand::Run(Box::new(move |runtime| {
+                runtime.harvest_remote_send(queued.into_queued_remote_send());
+            }));
+            match sender.try_send(command) {
+                Ok(()) => Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => Err(SendRejectedReason::Full),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    Err(SendRejectedReason::Closed)
+                }
+            }
+        });
+
+        if delivered == 0 && !runtime.has_in_flight_calls() {
+            match receiver.recv_timeout(config.idle_wait) {
+                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::Shutdown) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        } else {
+            thread::yield_now();
+        }
+    }
+
+    runtime.trace().to_vec()
+}
+
 trait ErasedMailbox {
     fn recv_boxed(&self) -> Option<Box<dyn Any>>;
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>>;
@@ -2143,6 +2462,43 @@ where
     }
 }
 
+struct SendableHandlerAdapter<I, Outbound>
+where
+    I: Isolate,
+{
+    isolate: I,
+    marker: PhantomData<fn(Outbound) -> Outbound>,
+}
+
+impl<I, S, F, Outbound> ErasedHandler<S, F> for SendableHandlerAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    Outbound: Send + 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn handle_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+    ) -> ErasedEffect<S, F> {
+        let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
+            panic!("runtime attempted to deliver a handler message with the wrong type")
+        });
+
+        let effect = {
+            let mut ctx = Context::new(shard, isolate_id);
+            self.isolate.handle(*message, &mut ctx)
+        };
+
+        erase_effect_sendable::<I, S, F, Outbound>(effect)
+    }
+}
+
 fn erase_effect<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
@@ -2162,7 +2518,7 @@ where
                 target_shard: destination.shard(),
                 target_isolate: destination.isolate(),
                 target_generation: destination.generation(),
-                message: Box::new(message),
+                message: ErasedMessage::Local(Box::new(message)),
             })
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
@@ -2173,6 +2529,41 @@ where
             effects
                 .into_iter()
                 .map(erase_effect::<I, S, F, Outbound>)
+                .collect(),
+        ),
+    }
+}
+
+fn erase_effect_sendable<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
+where
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+    I::Message: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    Outbound: Send + 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    match effect {
+        Effect::Noop => ErasedEffect::Noop,
+        Effect::Reply(_) => ErasedEffect::Reply,
+        Effect::Send(send) => {
+            let (destination, message) = send.into_parts();
+            ErasedEffect::Send(ErasedSend {
+                target_shard: destination.shard(),
+                target_isolate: destination.isolate(),
+                target_generation: destination.generation(),
+                message: ErasedMessage::Sendable(Box::new(message)),
+            })
+        }
+        Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::Stop => ErasedEffect::Stop,
+        Effect::RestartChildren => ErasedEffect::RestartChildren,
+        Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
+        Effect::Batch(effects) => ErasedEffect::Batch(
+            effects
+                .into_iter()
+                .map(erase_effect_sendable::<I, S, F, Outbound>)
                 .collect(),
         ),
     }
@@ -2231,12 +2622,67 @@ struct ErasedSend {
     target_shard: ShardId,
     target_isolate: IsolateId,
     target_generation: AddressGeneration,
-    message: Box<dyn Any>,
+    message: ErasedMessage,
 }
 
 struct QueuedRemoteSend {
     send: ErasedSend,
     cause: CauseId,
+}
+
+struct SendableQueuedRemoteSend {
+    target_shard: ShardId,
+    target_isolate: IsolateId,
+    target_generation: AddressGeneration,
+    message: Box<dyn Any + Send>,
+    cause: CauseId,
+}
+
+impl SendableQueuedRemoteSend {
+    fn new(send: ErasedSend, cause: CauseId) -> Self {
+        Self {
+            target_shard: send.target_shard,
+            target_isolate: send.target_isolate,
+            target_generation: send.target_generation,
+            message: send.message.into_sendable(),
+            cause,
+        }
+    }
+
+    fn into_queued_remote_send(self) -> QueuedRemoteSend {
+        QueuedRemoteSend {
+            send: ErasedSend {
+                target_shard: self.target_shard,
+                target_isolate: self.target_isolate,
+                target_generation: self.target_generation,
+                message: ErasedMessage::Sendable(self.message),
+            },
+            cause: self.cause,
+        }
+    }
+}
+
+enum ErasedMessage {
+    Local(Box<dyn Any>),
+    Sendable(Box<dyn Any + Send>),
+}
+
+impl ErasedMessage {
+    fn into_any(self) -> Box<dyn Any> {
+        match self {
+            Self::Local(message) => message,
+            Self::Sendable(message) => message,
+        }
+    }
+
+    fn into_sendable(self) -> Box<dyn Any + Send> {
+        match self {
+            Self::Local(_) => {
+                panic!("live cross-shard send attempted to move a non-Send message")
+            }
+            Self::Sendable(message) => message,
+        }
+    }
 }
 
 impl<S, F> IntoErasedSpawn<S, F> for std::convert::Infallible

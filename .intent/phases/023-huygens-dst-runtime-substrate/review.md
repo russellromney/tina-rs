@@ -148,6 +148,10 @@ bounded ingress, user-shaped TCP reference workload, DST/replay/checker
 composition, explicit-step oracle remains semantic source of truth, and no
 live cross-shard claim until implemented.
 
+Session C follow-up: live fixed-shard transport is now implemented through
+`ThreadedMultiShardRuntime`. The older single-shard-only note below is kept as
+review history, not current phase state.
+
 Verdict: strong first implementation chunk, but not yet Huygens-complete. The
 shape is right: `ThreadedRuntime` is additive, lives in `tina-runtime`, starts a
 real OS thread that owns its shard runtime, and the TCP echo test now proves a
@@ -207,6 +211,8 @@ prove composed simulator pressure instead of isolated helper proof.
   and SYSTEM.md say so plainly. It should not close the whole phase until either
   live cross-shard transport exists or the closeout claim remains explicitly
   single-shard-live / multi-shard-oracle.
+  **Status:** fixed in Session C follow-up. Live cross-shard request/reply,
+  remote queue `Full`, and stale-remote/non-poisoning are now directly tested.
 - `DstHarness` currently lives in a test file as a small reusable helper. Good
   enough for the first chunk. If more Huygens tests start duplicating setup,
   promote it into a small test support module.
