@@ -293,3 +293,28 @@ This file records completed work.
   - seeded TCP delay perturbation now preserves per-resource FIFO by never
     allowing later completions on the same listener/stream to overtake earlier
     ones
+
+### Phase Kepler
+
+- Sealed the current explicit-step multi-shard liveness boundary:
+  address-local remote failures remain address-local, and there is still no
+  shard-down / peer-down / restarted-peer event vocabulary.
+- Sealed multi-shard supervision as shard-local: root supervision routes to the
+  parent shard, spawned children stay on the parent shard, and supervised
+  restarts stay on that shard.
+- Added runtime proofs for the sealed rules:
+  - `cross_shard_unknown_isolate_does_not_poison_destination_shard`
+  - `multishard_supervision_keeps_children_on_parent_shard`
+- Added simulator proofs for the same sealed rules:
+  - `cross_shard_simulation_unknown_isolate_does_not_poison_destination_shard`
+  - `multishard_simulation_supervision_keeps_children_on_parent_shard`
+- Added multi-shard checker support:
+  - `MultiShardSimulator::run_until_quiescent_checked()`
+  - `MultiShardReplayArtifact::checker_failure()`
+- Added checker/replay proofs for the liveness boundary:
+  - `multishard_checker_accepts_address_local_remote_failure_then_good_traffic`
+  - `multishard_checker_failure_replays_for_address_local_liveness_bug`
+- Added a focused allocation probe,
+  `multishard_runtime_path_still_has_allocations_so_the_claim_stays_narrow`,
+  and narrowed the runtime allocation claim instead of pretending the whole
+  multi-shard runtime path is allocation-free.

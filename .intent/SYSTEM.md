@@ -126,8 +126,16 @@ the same step that sent them.
 
 Supervision remains owned by the parent isolate's shard. Multi-shard
 runners may route root `supervise` config to the owning shard, but
-they do not invent cross-shard child ownership. Peer quarantine and
-shard-restart rules are still later design work.
+they do not invent cross-shard child ownership. Children spawned by a parent
+belong to the parent's shard, and restart policy applies to direct children on
+that shard. Once an isolate is placed, its shard ownership stays stable for
+that incarnation.
+
+The current explicit-step multi-shard runner has no peer-unavailable signal.
+Address-local remote failures stay address-local: an unknown, stopped, stale,
+or full remote target does not poison the whole destination shard. There is no
+shard-down, peer-down, shard-restarted, or peer-restarted event vocabulary yet.
+Peer quarantine and shard-restart rules are still later design work.
 
 There is not yet a Tokio bridge, and the bridge is not the main runtime story.
 The runtime call types do not pick a backend, so the simulator, the current
@@ -167,6 +175,9 @@ runtime, and later runtimes can share one meaning model.
 - the hot SPSC path is meant to avoid per-message allocation after warm-up for
   fixed-size payloads
 - claims about allocation behavior must stay narrow and be backed by evidence
+- the current runtime and simulator do not have a broad allocation-free hot-path
+  claim; boxed erasure, traces, replay records, and coordinator storage may
+  allocate
 - dynamically sized payloads, if supported, travel behind owning pointers; the
   ring stores fixed-size slot values, not inline DST payloads
 
@@ -181,6 +192,7 @@ runtime, and later runtimes can share one meaning model.
 - remote messages become visible on the next global step
 - event ids are globally monotonic across shards in a multi-shard run
 - supervision is owned by the parent's shard
+- address-local remote failures do not become shard-liveness facts
 - full peer-quarantine and shard-restart rules are a later design step,
   not something to quietly smuggle into the current multi-shard model
 

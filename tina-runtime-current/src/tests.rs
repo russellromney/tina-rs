@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tina::{Outbound, batch, noop, send, stop};
+use tina::{Outbound, batch, noop, send, spawn, stop};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -1125,6 +1125,13 @@ enum RemoteEvent {
     StopNow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardLocalSupervisionEvent {
+    SpawnChild,
+    Panic,
+    Noop,
+}
+
 #[derive(Debug)]
 struct NumberedRecorder<S> {
     marker: PhantomData<S>,
@@ -1138,6 +1145,16 @@ struct RemoteSender<S> {
 
 #[derive(Debug)]
 struct RemoteSink<S> {
+    marker: PhantomData<S>,
+}
+
+#[derive(Debug)]
+struct ShardLocalParent<S> {
+    marker: PhantomData<S>,
+}
+
+#[derive(Debug)]
+struct ShardLocalChild<S> {
     marker: PhantomData<S>,
 }
 
@@ -1206,6 +1223,50 @@ where
             | RemoteEvent::KickTwice
             | RemoteEvent::KickThrice => noop(),
             RemoteEvent::StopNow => stop(),
+        }
+    }
+}
+
+impl<S> Isolate for ShardLocalParent<S>
+where
+    S: Shard + 'static,
+{
+    type Message = ShardLocalSupervisionEvent;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = tina::RestartableChildDefinition<ShardLocalChild<S>>;
+    type Call = Infallible;
+    type Shard = S;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ShardLocalSupervisionEvent::SpawnChild => spawn(tina::RestartableChildDefinition::new(
+                || ShardLocalChild {
+                    marker: PhantomData,
+                },
+                4,
+            )),
+            ShardLocalSupervisionEvent::Panic => panic!("parent should not panic in this test"),
+            ShardLocalSupervisionEvent::Noop => noop(),
+        }
+    }
+}
+
+impl<S> Isolate for ShardLocalChild<S>
+where
+    S: Shard + 'static,
+{
+    type Message = ShardLocalSupervisionEvent;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = Infallible;
+    type Shard = S;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ShardLocalSupervisionEvent::Panic => panic!("child panicked for restart test"),
+            ShardLocalSupervisionEvent::SpawnChild | ShardLocalSupervisionEvent::Noop => noop(),
         }
     }
 }
@@ -1578,6 +1639,83 @@ fn cross_shard_unknown_isolate_rejects_on_destination_harvest() {
 }
 
 #[test]
+fn cross_shard_unknown_isolate_does_not_poison_destination_shard() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
+
+    let unknown = Address::new_with_generation(
+        ShardId::new(22),
+        IsolateId::new(999),
+        AddressGeneration::new(0),
+    );
+    let live_sink = runtime.register_with_capacity_on::<RemoteSink<NumberedShard>, _>(
+        ShardId::new(22),
+        RemoteSink {
+            marker: PhantomData,
+        },
+        4,
+    );
+    let bad_sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: unknown,
+            marker: PhantomData,
+        },
+        4,
+    );
+    let good_sender = runtime.register_with_capacity_on::<RemoteSender<NumberedShard>, _>(
+        ShardId::new(11),
+        RemoteSender {
+            target: live_sink,
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    runtime.try_send(bad_sender, RemoteEvent::Kick).unwrap();
+    runtime.try_send(good_sender, RemoteEvent::Kick).unwrap();
+
+    assert_eq!(runtime.step(), 2);
+    assert_eq!(runtime.step(), 1);
+
+    let trace = runtime.trace();
+    let unknown_rejection = trace
+        .iter()
+        .find(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    target_isolate,
+                    reason: SendRejectedReason::Closed,
+                    ..
+                } if event.shard() == ShardId::new(22)
+                    && target_isolate == unknown.isolate()
+            )
+        })
+        .expect("unknown remote target should reject on destination shard");
+    let live_accept = trace
+        .iter()
+        .find(|event| {
+            event.shard() == ShardId::new(22)
+                && event.isolate() == live_sink.isolate()
+                && matches!(event.kind(), RuntimeEventKind::MailboxAccepted)
+        })
+        .expect("later valid traffic to same shard should still be accepted");
+
+    assert!(unknown_rejection.id() < live_accept.id());
+
+    let live_handler_count = trace
+        .iter()
+        .filter(|event| {
+            event.shard() == ShardId::new(22)
+                && event.isolate() == live_sink.isolate()
+                && matches!(event.kind(), RuntimeEventKind::HandlerStarted)
+        })
+        .count();
+    assert_eq!(live_handler_count, 1);
+}
+
+#[test]
 fn cross_shard_destination_mailbox_full_rejects_on_harvest() {
     let mut runtime =
         MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
@@ -1853,6 +1991,85 @@ fn cross_shard_harvest_drains_sources_in_ascending_shard_order() {
 
     let expected: Vec<_> = source_order.into_iter().map(|(_, id)| id).collect();
     assert_eq!(destination_causes, expected);
+}
+
+#[test]
+fn multishard_supervision_keeps_children_on_parent_shard() {
+    let mut runtime =
+        MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
+
+    let parent = runtime.register_with_capacity_on::<ShardLocalParent<NumberedShard>, _>(
+        ShardId::new(22),
+        ShardLocalParent {
+            marker: PhantomData,
+        },
+        4,
+    );
+    runtime.supervise(
+        parent,
+        SupervisorConfig::new(tina::RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+    );
+
+    runtime
+        .try_send(parent, ShardLocalSupervisionEvent::SpawnChild)
+        .unwrap();
+    assert_eq!(runtime.step(), 1);
+
+    let trace = runtime.trace();
+    let child = trace
+        .iter()
+        .find_map(|event| match event.kind() {
+            RuntimeEventKind::Spawned { child_isolate } if event.shard() == ShardId::new(22) => {
+                Some(child_isolate)
+            }
+            _ => None,
+        })
+        .expect("child spawn should be recorded on the parent shard");
+    assert!(
+        trace.iter().all(|event| {
+            !matches!(event.kind(), RuntimeEventKind::Spawned { .. })
+                || event.shard() == ShardId::new(22)
+        }),
+        "multi-shard supervision must not create children on another shard"
+    );
+
+    let child_address = Address::new(ShardId::new(22), child);
+    runtime
+        .try_send(child_address, ShardLocalSupervisionEvent::Panic)
+        .unwrap();
+    assert_eq!(runtime.step(), 1);
+
+    let trace = runtime.trace();
+    let restart = trace
+        .iter()
+        .find_map(|event| match event.kind() {
+            RuntimeEventKind::RestartChildCompleted {
+                old_isolate,
+                new_isolate,
+                ..
+            } if event.shard() == ShardId::new(22) && old_isolate == child => Some(new_isolate),
+            _ => None,
+        })
+        .expect("supervised restart should complete on the parent shard");
+    assert_ne!(restart, child);
+    assert!(
+        trace.iter().all(|event| {
+            !matches!(
+                event.kind(),
+                RuntimeEventKind::SupervisorRestartTriggered { .. }
+                    | RuntimeEventKind::RestartChildAttempted { .. }
+                    | RuntimeEventKind::RestartChildCompleted { .. }
+            ) || event.shard() == ShardId::new(22)
+        }),
+        "restart events must stay on the parent shard"
+    );
+
+    runtime
+        .try_send(
+            Address::new(ShardId::new(22), restart),
+            ShardLocalSupervisionEvent::Noop,
+        )
+        .unwrap();
 }
 
 #[test]

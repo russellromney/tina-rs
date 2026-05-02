@@ -126,6 +126,7 @@ pub struct MultiShardReplayArtifact {
     multishard_config: MultiShardSimulatorConfig,
     final_time: Duration,
     event_record: Vec<RuntimeEvent>,
+    checker_failure: Option<CheckerFailure>,
     observed_peer_output: Vec<ObservedPeerOutput>,
 }
 
@@ -148,6 +149,11 @@ impl MultiShardReplayArtifact {
     /// Returns the deterministic whole-run event record captured for the run.
     pub fn event_record(&self) -> &[RuntimeEvent] {
         &self.event_record
+    }
+
+    /// Returns the optional checker failure captured for the run.
+    pub fn checker_failure(&self) -> Option<&CheckerFailure> {
+        self.checker_failure.as_ref()
     }
 
     /// Returns the peer-visible output captured during the run.
@@ -2713,6 +2719,7 @@ where
     shard_indexes: BTreeMap<ShardId, usize>,
     config: MultiShardSimulatorConfig,
     remote_queues: BTreeMap<(ShardId, ShardId), VecDeque<QueuedRemoteSend>>,
+    last_checker_failure: Option<CheckerFailure>,
 }
 
 /// Bounded coordinator config for additive multi-shard simulator shells.
@@ -2788,6 +2795,7 @@ where
             shard_indexes,
             config: multishard,
             remote_queues: BTreeMap::new(),
+            last_checker_failure: None,
         }
     }
 
@@ -2967,6 +2975,39 @@ where
         }
     }
 
+    /// Runs until every shard and every cross-shard queue is quiescent, or
+    /// until a checker halts the whole multi-shard run.
+    pub fn run_until_quiescent_checked<C: Checker>(
+        &mut self,
+        checker: &mut C,
+    ) -> Option<CheckerFailure> {
+        self.last_checker_failure = None;
+        let mut observed_len = 0;
+        loop {
+            let delivered = self.step();
+            if let Some(failure) = self.observe_new_events(checker, &mut observed_len) {
+                self.last_checker_failure = Some(failure.clone());
+                return Some(failure);
+            }
+            if delivered > 0 {
+                continue;
+            }
+            if self.advance_to_next_timer() {
+                continue;
+            }
+            if self.has_in_flight_calls() {
+                continue;
+            }
+            if !self.remote_queues.is_empty() {
+                continue;
+            }
+            if self.simulators.iter().any(Simulator::has_pending_messages) {
+                continue;
+            }
+            return None;
+        }
+    }
+
     /// Captures a deterministic replay artifact for the current whole-run
     /// multi-shard state.
     pub fn replay_artifact(&self) -> MultiShardReplayArtifact {
@@ -2979,6 +3020,7 @@ where
             multishard_config: self.config,
             final_time: self.now(),
             event_record: self.trace(),
+            checker_failure: self.last_checker_failure.clone(),
             observed_peer_output: self
                 .simulators
                 .iter()
@@ -3003,6 +3045,29 @@ where
                 shard.get()
             )
         })
+    }
+
+    fn observe_new_events<C: Checker>(
+        &self,
+        checker: &mut C,
+        observed_len: &mut usize,
+    ) -> Option<CheckerFailure> {
+        let trace = self.trace();
+        while *observed_len < trace.len() {
+            let event = trace[*observed_len];
+            *observed_len += 1;
+            match checker.on_event(&event) {
+                CheckerDecision::Continue => {}
+                CheckerDecision::Fail(reason) => {
+                    return Some(CheckerFailure {
+                        checker_name: checker.name(),
+                        event_id: event.id(),
+                        reason,
+                    });
+                }
+            }
+        }
+        None
     }
 
     fn harvest_for_destination(
@@ -3031,7 +3096,7 @@ where
 mod tests {
     use super::*;
     use std::convert::Infallible;
-    use tina::{Outbound, batch, noop, send, stop};
+    use tina::{Outbound, batch, noop, send, spawn, stop};
 
     #[derive(Debug, Clone, Copy)]
     struct NumberedShard(u32);
@@ -3062,6 +3127,13 @@ mod tests {
         StopNow,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimShardLocalSupervisionEvent {
+        SpawnChild,
+        Panic,
+        Noop,
+    }
+
     #[derive(Debug)]
     struct SimSleeper<S> {
         delay: Duration,
@@ -3081,6 +3153,16 @@ mod tests {
 
     #[derive(Debug)]
     struct SimRemoteSink<S> {
+        marker: PhantomData<S>,
+    }
+
+    #[derive(Debug)]
+    struct SimShardLocalParent<S> {
+        marker: PhantomData<S>,
+    }
+
+    #[derive(Debug)]
+    struct SimShardLocalChild<S> {
         marker: PhantomData<S>,
     }
 
@@ -3191,6 +3273,193 @@ mod tests {
                 | SimRemoteEvent::KickThrice => noop(),
                 SimRemoteEvent::StopNow => stop(),
             }
+        }
+    }
+
+    impl<S> Isolate for SimShardLocalParent<S>
+    where
+        S: Shard + 'static,
+    {
+        type Message = SimShardLocalSupervisionEvent;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = tina::RestartableChildDefinition<SimShardLocalChild<S>>;
+        type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
+        type Shard = S;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                SimShardLocalSupervisionEvent::SpawnChild => {
+                    spawn(tina::RestartableChildDefinition::new(
+                        || SimShardLocalChild {
+                            marker: PhantomData,
+                        },
+                        4,
+                    ))
+                }
+                SimShardLocalSupervisionEvent::Panic => {
+                    panic!("parent should not panic in this test")
+                }
+                SimShardLocalSupervisionEvent::Noop => noop(),
+            }
+        }
+    }
+
+    impl<S> Isolate for SimShardLocalChild<S>
+    where
+        S: Shard + 'static,
+    {
+        type Message = SimShardLocalSupervisionEvent;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
+        type Shard = S;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            match msg {
+                SimShardLocalSupervisionEvent::Panic => {
+                    panic!("child panicked for restart test")
+                }
+                SimShardLocalSupervisionEvent::SpawnChild | SimShardLocalSupervisionEvent::Noop => {
+                    noop()
+                }
+            }
+        }
+    }
+
+    struct AddressLocalRemoteFailureRun {
+        artifact: MultiShardReplayArtifact,
+        failure: Option<CheckerFailure>,
+    }
+
+    struct AddressLocalRemoteFailureChecker {
+        destination: ShardId,
+        rejected: IsolateId,
+        live: IsolateId,
+        marker_shard: ShardId,
+        marker: IsolateId,
+        saw_address_rejection: bool,
+        saw_live_accept_after_rejection: bool,
+    }
+
+    impl Checker for AddressLocalRemoteFailureChecker {
+        fn name(&self) -> &'static str {
+            "address_local_remote_failure"
+        }
+
+        fn on_event(&mut self, event: &RuntimeEvent) -> CheckerDecision {
+            match event.kind() {
+                RuntimeEventKind::SendRejected {
+                    target_isolate,
+                    reason: SendRejectedReason::Closed,
+                    ..
+                } if event.shard() == self.destination && target_isolate == self.rejected => {
+                    self.saw_address_rejection = true;
+                }
+                RuntimeEventKind::MailboxAccepted
+                    if self.saw_address_rejection
+                        && event.shard() == self.destination
+                        && event.isolate() == self.live =>
+                {
+                    self.saw_live_accept_after_rejection = true;
+                }
+                RuntimeEventKind::HandlerStarted
+                    if self.saw_address_rejection
+                        && event.shard() == self.marker_shard
+                        && event.isolate() == self.marker
+                        && !self.saw_live_accept_after_rejection =>
+                {
+                    return CheckerDecision::Fail(
+                        "destination shard did not accept later live traffic after address-local remote failure"
+                            .into(),
+                    );
+                }
+                _ => {}
+            }
+
+            CheckerDecision::Continue
+        }
+    }
+
+    fn run_address_local_remote_failure_checker_workload(
+        include_live_send: bool,
+        config: SimulatorConfig,
+        multishard: MultiShardSimulatorConfig,
+    ) -> AddressLocalRemoteFailureRun {
+        let mut sim = MultiShardSimulator::with_config(
+            [NumberedShard(11), NumberedShard(22)],
+            config,
+            multishard,
+        );
+
+        let unknown = Address::new_with_generation(
+            ShardId::new(22),
+            IsolateId::new(999),
+            AddressGeneration::new(0),
+        );
+        let live_sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            4,
+        );
+        let marker = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            4,
+        );
+        let bad_sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: unknown,
+                marker: PhantomData,
+            },
+            4,
+        );
+        let good_sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: live_sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(bad_sender, SimRemoteEvent::Kick).unwrap();
+        if include_live_send {
+            sim.try_send(good_sender, SimRemoteEvent::Kick).unwrap();
+        }
+
+        sim.step();
+        sim.step();
+        sim.try_send(marker, SimRemoteEvent::Kick).unwrap();
+
+        let mut checker = AddressLocalRemoteFailureChecker {
+            destination: ShardId::new(22),
+            rejected: unknown.isolate(),
+            live: live_sink.isolate(),
+            marker_shard: ShardId::new(11),
+            marker: marker.isolate(),
+            saw_address_rejection: false,
+            saw_live_accept_after_rejection: false,
+        };
+        let failure = sim.run_until_quiescent_checked(&mut checker);
+
+        AddressLocalRemoteFailureRun {
+            artifact: sim.replay_artifact(),
+            failure,
         }
     }
 
@@ -3471,6 +3740,128 @@ mod tests {
             })
             .count();
         assert_eq!(destination_closed_rejections, 1);
+    }
+
+    #[test]
+    fn cross_shard_simulation_unknown_isolate_does_not_poison_destination_shard() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+        );
+
+        let unknown = Address::new_with_generation(
+            ShardId::new(22),
+            IsolateId::new(999),
+            AddressGeneration::new(0),
+        );
+        let live_sink = sim.register_with_capacity_on::<SimRemoteSink<NumberedShard>, _, _>(
+            ShardId::new(22),
+            SimRemoteSink {
+                marker: PhantomData,
+            },
+            4,
+        );
+        let bad_sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: unknown,
+                marker: PhantomData,
+            },
+            4,
+        );
+        let good_sender = sim.register_with_capacity_on::<SimRemoteSender<NumberedShard>, _, _>(
+            ShardId::new(11),
+            SimRemoteSender {
+                target: live_sink,
+                marker: PhantomData,
+            },
+            4,
+        );
+
+        sim.try_send(bad_sender, SimRemoteEvent::Kick).unwrap();
+        sim.try_send(good_sender, SimRemoteEvent::Kick).unwrap();
+
+        assert_eq!(sim.step(), 2);
+        assert_eq!(sim.step(), 1);
+
+        let trace = sim.trace();
+        let unknown_rejection = trace
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::SendRejected {
+                        target_isolate,
+                        reason: SendRejectedReason::Closed,
+                        ..
+                    } if event.shard() == ShardId::new(22)
+                        && target_isolate == unknown.isolate()
+                )
+            })
+            .expect("unknown remote target should reject on destination shard");
+        let live_accept = trace
+            .iter()
+            .find(|event| {
+                event.shard() == ShardId::new(22)
+                    && event.isolate() == live_sink.isolate()
+                    && matches!(event.kind(), RuntimeEventKind::MailboxAccepted)
+            })
+            .expect("later valid traffic to same shard should still be accepted");
+
+        assert!(unknown_rejection.id() < live_accept.id());
+
+        let live_handler_count = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(22)
+                    && event.isolate() == live_sink.isolate()
+                    && matches!(event.kind(), RuntimeEventKind::HandlerStarted)
+            })
+            .count();
+        assert_eq!(live_handler_count, 1);
+    }
+
+    #[test]
+    fn multishard_checker_accepts_address_local_remote_failure_then_good_traffic() {
+        let run = run_address_local_remote_failure_checker_workload(
+            true,
+            SimulatorConfig::default(),
+            MultiShardSimulatorConfig::default(),
+        );
+
+        assert!(run.failure.is_none());
+        assert!(run.artifact.checker_failure().is_none());
+    }
+
+    #[test]
+    fn multishard_checker_failure_replays_for_address_local_liveness_bug() {
+        let first = run_address_local_remote_failure_checker_workload(
+            false,
+            SimulatorConfig::default(),
+            MultiShardSimulatorConfig::default(),
+        );
+        let replayed = run_address_local_remote_failure_checker_workload(
+            false,
+            first.artifact.simulator_config().clone(),
+            first.artifact.multishard_config(),
+        );
+
+        let failure = first
+            .failure
+            .as_ref()
+            .expect("checker should catch missing later live traffic");
+        assert_eq!(failure.checker_name(), "address_local_remote_failure");
+        assert_eq!(first.artifact.checker_failure(), Some(failure));
+        assert_eq!(
+            first.artifact.event_record(),
+            replayed.artifact.event_record()
+        );
+        assert_eq!(first.artifact.final_time(), replayed.artifact.final_time());
+        assert_eq!(
+            first.artifact.checker_failure(),
+            replayed.artifact.checker_failure()
+        );
+        assert_eq!(first.failure, replayed.failure);
     }
 
     #[test]
@@ -3758,5 +4149,86 @@ mod tests {
             .collect();
         let expected: Vec<_> = source_order.into_iter().map(|(_, id)| id).collect();
         assert_eq!(destination_causes, expected);
+    }
+
+    #[test]
+    fn multishard_simulation_supervision_keeps_children_on_parent_shard() {
+        let mut sim = MultiShardSimulator::new(
+            [NumberedShard(11), NumberedShard(22)],
+            SimulatorConfig::default(),
+        );
+
+        let parent = sim
+            .register_with_capacity_on::<SimShardLocalParent<NumberedShard>, _, Infallible>(
+                ShardId::new(22),
+                SimShardLocalParent {
+                    marker: PhantomData,
+                },
+                4,
+            );
+        sim.supervise(
+            parent,
+            SupervisorConfig::new(tina::RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+        );
+
+        sim.try_send(parent, SimShardLocalSupervisionEvent::SpawnChild)
+            .unwrap();
+        assert_eq!(sim.step(), 1);
+
+        let trace = sim.trace();
+        let child = trace
+            .iter()
+            .find_map(|event| match event.kind() {
+                RuntimeEventKind::Spawned { child_isolate }
+                    if event.shard() == ShardId::new(22) =>
+                {
+                    Some(child_isolate)
+                }
+                _ => None,
+            })
+            .expect("child spawn should be recorded on the parent shard");
+        assert!(
+            trace.iter().all(|event| {
+                !matches!(event.kind(), RuntimeEventKind::Spawned { .. })
+                    || event.shard() == ShardId::new(22)
+            }),
+            "multi-shard supervision must not create children on another shard"
+        );
+
+        let child_address = Address::new(ShardId::new(22), child);
+        sim.try_send(child_address, SimShardLocalSupervisionEvent::Panic)
+            .unwrap();
+        assert_eq!(sim.step(), 1);
+
+        let trace = sim.trace();
+        let restart = trace
+            .iter()
+            .find_map(|event| match event.kind() {
+                RuntimeEventKind::RestartChildCompleted {
+                    old_isolate,
+                    new_isolate,
+                    ..
+                } if event.shard() == ShardId::new(22) && old_isolate == child => Some(new_isolate),
+                _ => None,
+            })
+            .expect("supervised restart should complete on the parent shard");
+        assert_ne!(restart, child);
+        assert!(
+            trace.iter().all(|event| {
+                !matches!(
+                    event.kind(),
+                    RuntimeEventKind::SupervisorRestartTriggered { .. }
+                        | RuntimeEventKind::RestartChildAttempted { .. }
+                        | RuntimeEventKind::RestartChildCompleted { .. }
+                ) || event.shard() == ShardId::new(22)
+            }),
+            "restart events must stay on the parent shard"
+        );
+
+        sim.try_send(
+            Address::new(ShardId::new(22), restart),
+            SimShardLocalSupervisionEvent::Noop,
+        )
+        .unwrap();
     }
 }
