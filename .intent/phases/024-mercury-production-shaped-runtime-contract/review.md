@@ -1,5 +1,10 @@
 # 024 Mercury Plan Review
 
+Status: superseded by Session B plan rewrite. The review remains as the
+historical first review of the roadmap seed; the current `plan.md` now makes
+the overload lab the first proof and moves monoio behind the practical Tokio
+current-thread backend decision.
+
 Reviewed:
 
 - `ROADMAP.md` Mercury section as the current plan seed

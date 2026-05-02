@@ -135,7 +135,7 @@ phases.
 | ~~**Galileo multi-shard semantics and simulation**~~ | Delivered in `.intent/phases/020-galileo-multi-shard-semantics-and-simulation/`: multi-shard explicit-step runtime/simulator runners, cross-shard delivery, routing/placement, deterministic traces, replay, source-time vs destination-time delivery stages, seeded simulator composition proofs, and user-shaped dispatcher/TCP/supervision proof workloads. |
 | ~~**Kepler core primitive completion**~~ | Delivered in `.intent/phases/022-kepler-core-primitive-completion/`: sealed the current explicit-step liveness non-signal, proved address-local remote failures do not poison shards, sealed shard-local supervision/restart ownership, pinned ownership/buffering/allocation non-claims, added multi-shard checker/replay pressure, and added user-shaped runtime/simulator e2e proofs. |
 | ~~**Huygens DST harness and runtime substrate**~~ | Delivered in `.intent/phases/023-huygens-dst-runtime-substrate/`: composed-workload DST harnessing, TCP/timer/supervision/cross-shard replay pressure, `ThreadedRuntime`, `ThreadedMultiShardRuntime`, bounded live ingress, bounded live cross-shard transport, and user-shaped live substrate proofs. |
-| **Mercury production-shaped runtime contract** | Next. Make the Huygens substrate story tryable enough to say selected Tokio-shaped workloads can move to Tina's model: decide/spike monoio or explicitly bless current threaded+Betelgeuse substrate, add user-visible send backpressure, add isolate-to-isolate call with timeout, harden runner lifecycle, prove spawned-child cross-shard live behavior, prove live supervision/restart, dogfood a real service-shaped workload, pin capacity/allocation claims, and expose a small public-ish DST harness surface. |
+| **Mercury overload lab and runtime contract** | Next. Make the Huygens substrate story concrete with an overload proof app: bounded observed send, isolate-to-isolate call with mandatory timeout, live runner lifecycle, spawned-child cross-shard proof, live supervision/restart, simulator replay, and a narrow Tokio current-thread backend for TCP/time so the same Tina-shaped workload can be compared against naive and hardened Tokio. Monoio remains the native thread-per-core backend candidate, but not the first blocker. |
 | **Gemini release story** | Deferred until Mercury makes the tryable runtime contract true. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
@@ -272,18 +272,17 @@ workloads with bounded backpressure and synchronous effect-returning handlers.
 ---
 
 ## Phase Mercury
-> Production-shaped runtime contract. Make Tina tryable for selected Tokio-shaped workloads.
+> Overload lab and runtime contract. Prove Tina's primitive under constrained memory.
 
 > After: Phase Huygens · Before: Phase Gemini
 
 Mercury exists because Huygens proved the model and first live substrate, but
-not the full "try this instead of Tokio for this class of workload" contract.
-Do Mercury before release/docs polish.
+not the proof app that makes Tina's value obvious. Do Mercury before
+release/docs polish.
 
-- Decide the production-shaped substrate direction:
-  - spike `monoio` / io_uring as the likely shard-local I/O reactor, or
-  - explicitly bless the current threaded+Betelgeuse substrate as the tryable
-    backend for now, with written tradeoffs.
+- Build the overload lab: one stateful TCP-shaped service under tiny bounded
+  capacities, with a traffic spike, slow worker mode, recovery after overload,
+  and asserted latency/memory/backpressure outcomes.
 - Add user-visible send backpressure. App code must be able to react to
   `Accepted`, `Full`, and `Closed`, not only inspect trace after the fact.
 - Add isolate-to-isolate call with mandatory timeout for request/reply work.
@@ -293,9 +292,16 @@ Do Mercury before release/docs polish.
   clear guard that prevents unsupported behavior.
 - Prove live supervision/restart on the threaded substrate: a worker panics,
   supervisor restarts it, and later work succeeds.
-- Dogfood one real service-shaped workload: TCP ingress, per-connection/session
-  isolate, worker/session shard, overload policy, timeout call, restart, and
-  simulator replay/checker coverage for the same isolate logic.
+- Run the same core Tina workload through deterministic simulator replay and
+  the live runner.
+- Add a narrow Tokio current-thread backend for TCP/time only, so the overload
+  lab can run on a known, cross-platform Rust substrate without async handlers.
+- Compare against naive Tokio and hardened Tokio versions of the same workload:
+  the naive version should show the overload failure mode; the hardened version
+  should survive with explicit user discipline; Tina should survive by default
+  framework shape.
+- Keep `monoio` as the likely native thread-per-core backend candidate after
+  this proof. Do not block Mercury on a full monoio backend.
 - Pin capacity/allocation claims: either prove stronger runtime bounds or keep
   the claim explicitly narrower than Tina-Odin's no-hidden-allocation story.
 - Expose a small public-ish DST harness surface so users can test their own

@@ -3,6 +3,7 @@
 Session:
 
 - A (substrate seam audit)
+- B (Tokio bridge/backend decision)
 
 ## Current Runtime Substrate Shape
 
@@ -58,7 +59,40 @@ The risky integration would be:
 
 Those are Mercury pause-gate violations.
 
-## Smallest Spike
+## Tokio Current-Thread Assessment
+
+Tokio current-thread is not the purest Tina substrate, but it is the most
+practical comparison/backend substrate for Mercury.
+
+Useful facts for Mercury:
+
+- Tokio has a current-thread scheduler that executes tasks on the current
+  thread.
+- Tokio can enable I/O and time drivers on that runtime.
+- Tokio is the known Rust ecosystem substrate, so a comparison against Tokio is
+  credible and easy for Rust users to understand.
+- A Tina shard can be shaped as one OS thread, one Tokio current-thread
+  runtime, and one Tina interpreter owned by that thread.
+
+The clean integration is:
+
+- user handlers stay synchronous and effect-returning
+- Tina owns admission, mailbox capacity, supervision, trace, and completion
+  routing
+- Tokio owns socket/timer mechanics underneath runtime-owned Tina effects
+- completions come back as ordinary Tina messages
+
+The risky integration would be:
+
+- expose `tokio::Handle` in Tina context
+- accept arbitrary user futures as normal effects
+- let user handlers become `async fn`
+- hide unbounded Tokio/library queues behind an `Accepted` Tina outcome
+- run the Tina shard on Tokio multi-thread and still claim thread-per-shard
+
+Those are Mercury pause-gate violations.
+
+## Smallest Monoio Spike
 
 Smallest useful monoio spike:
 
@@ -76,6 +110,19 @@ Smallest useful monoio spike:
 If this cannot be done without async handlers or unbounded queues, defer monoio
 and continue Mercury on the threaded+Betelgeuse substrate with that decision
 written down.
+
+## Smallest Tokio Current-Thread Proof
+
+Smallest useful Tokio proof:
+
+1. Add a narrow backend module or runner path for Tokio current-thread.
+2. Run one Tina shard on one OS thread that owns the Tokio runtime.
+3. Support only TCP/time effects needed by the overload lab.
+4. Keep isolate handlers sync and keep backend handles out of user context.
+5. Prove the same Tina workload reaches the same accepted/rejected/timeout
+   outcomes as the semantic oracle for a bounded scenario.
+6. Add naive Tokio and hardened Tokio comparison programs/tests for the same
+   overload shape.
 
 ## Current Design Debt Found
 
@@ -99,10 +146,17 @@ written down.
 
 ## Recommendation
 
-Do not start with a full `tina-runtime-monoio` crate.
+Do not start Mercury with a full `tina-runtime-monoio` crate.
 
-Start with one narrow monoio spike behind a feature or experimental module. If
-the spike proves the seam, promote to a sibling crate later. If it fights the
-model, keep threaded+Betelgeuse as Mercury's tryable substrate and spend the
-phase on user-visible backpressure, timeout call, live supervision, spawned
-child cross-shard proof, and dogfood workload.
+Start with the Tina semantics and overload lab:
+
+1. observed send outcome
+2. mandatory-timeout isolate call
+3. semantic overload lab through runtime/simulator/live threaded runner
+4. runner lifecycle, live cross-shard child behavior, and live supervision
+5. narrow Tokio current-thread TCP/time backend for the overload lab
+6. naive Tokio and hardened Tokio comparison variants
+
+Keep monoio as the likely native thread-per-core backend candidate after this
+proof. The Mercury demo needs a known substrate and a fair Tokio comparison
+more than it needs the perfect native backend on day one.
