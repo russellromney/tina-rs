@@ -64,12 +64,20 @@ Evidence added:
     thread
   - asserts echoed bytes and trace-level TCP bind/accept/read/write/close
     completions
+  - compares final bytes and a shared TCP trace-count subset against the
+    explicit-step runtime oracle
 - `threaded_runtime_surfaces_closed_mailbox_after_stop`
   - proves live substrate ingress observes closed target after stop
 - `threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker`
   - parks the worker in a handler, fills the bounded command queue, and proves
     `try_send` returns `IngressFull` without waiting for the worker to drain
     the first accepted command
+- `threaded_runtime_timer_retry_runs_without_manual_stepping`
+  - proves runtime-owned `Sleep` wakes and retries on the live worker without
+    manual stepping
+- `threaded_runtime_local_mailbox_full_is_visible_in_trace`
+  - proves live local-send pressure surfaces as `SendRejected { Full }` in the
+    runtime trace
 - `dst_harness_replays_supervision_timer_and_local_send_composition`
   - replays a composed simulator workload using supervision restart, timer
     wake, local send perturbation, and app observations

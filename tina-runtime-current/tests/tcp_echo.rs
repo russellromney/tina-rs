@@ -363,6 +363,20 @@ fn count_handler_finished(trace: &[RuntimeEvent], effect: tina_runtime::EffectKi
         .count()
 }
 
+fn tcp_semantic_counts(trace: &[RuntimeEvent]) -> Vec<(CallKind, usize)> {
+    [
+        CallKind::TcpBind,
+        CallKind::TcpAccept,
+        CallKind::TcpRead,
+        CallKind::TcpWrite,
+        CallKind::TcpStreamClose,
+        CallKind::TcpListenerClose,
+    ]
+    .into_iter()
+    .map(|kind| (kind, count_call_completed(trace, kind)))
+    .collect()
+}
+
 struct ClientRun {
     done: Arc<Mutex<bool>>,
     echoed: Arc<Mutex<Vec<u8>>>,
@@ -685,8 +699,16 @@ fn threaded_runtime_tcp_echo_round_trips_reference_workload() {
     ];
     let (echoed, trace, listener_isolate) =
         run_threaded_echo_scenario(payloads.clone(), Duration::from_secs(10));
+    let (oracle_echoed, oracle_trace, _) =
+        run_echo_scenario(payloads.clone(), false, Duration::from_secs(10));
 
     assert_eq!(echoed, payloads);
+    assert_eq!(echoed, oracle_echoed);
+    assert_eq!(
+        tcp_semantic_counts(&trace),
+        tcp_semantic_counts(&oracle_trace)
+    );
+    assert_eq!(count_spawned(&trace), count_spawned(&oracle_trace));
     assert_eq!(count_call_completed(&trace, CallKind::TcpBind), 1);
     assert_eq!(count_call_completed(&trace, CallKind::TcpAccept), 2);
     assert!(count_call_completed(&trace, CallKind::TcpRead) >= 4);
