@@ -1,16 +1,21 @@
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use betelgeuse::io::simulated::{SimulatedIO, SimulatedPeer};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseRuntime, CallInput, CallOutcome, CallOutput, MailboxFactory, MultiShardRuntime,
-    Runtime, RuntimeCall, call,
+    BetelgeuseRuntime, CallInput, CallOutcome, CallOutput, ListenerId, MailboxFactory,
+    MultiShardRuntime, Runtime, RuntimeCall, StreamId, call,
 };
 
 const EXPECTED_MULTISHARD_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
@@ -27,6 +32,14 @@ const EXPECTED_BETELGEUSE_INGRESS_HANDOFF: AllocationSnapshot = AllocationSnapsh
 };
 const EXPECTED_DRIVER_TIMER_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
     allocations: 10,
+    reallocations: 1,
+};
+const EXPECTED_DRIVER_TCP_READ_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 13,
+    reallocations: 1,
+};
+const EXPECTED_DRIVER_TCP_WRITE_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 13,
     reallocations: 1,
 };
 const EXPECTED_SINGLE_SHARD_SEND_ROUND_PROGRESS: &[usize] = &[1, 1, 0];
@@ -228,6 +241,21 @@ enum TimerMsg {
     Fired,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TcpCostMsg {
+    Bind,
+    Bound {
+        listener: ListenerId,
+        addr: SocketAddr,
+    },
+    Accept,
+    Accepted(StreamId),
+    Read,
+    ReadDone(usize),
+    Write,
+    Wrote(usize),
+}
+
 #[derive(Debug)]
 struct CallTarget;
 
@@ -236,6 +264,23 @@ struct CallClient;
 
 #[derive(Debug)]
 struct TimerClient;
+
+#[derive(Debug)]
+struct TcpCostClient {
+    bind_addr: SocketAddr,
+    listener: Option<ListenerId>,
+    stream: Option<StreamId>,
+    addr_slot: Rc<RefCell<Option<SocketAddr>>>,
+    stream_slot: Rc<Cell<Option<StreamId>>>,
+    log: Rc<RefCell<Vec<TcpCostMsg>>>,
+}
+
+type TcpCostSetup = (
+    Runtime<AllocationShard, TestMailboxFactory>,
+    Address<TcpCostMsg>,
+    SimulatedPeer,
+    Rc<RefCell<Vec<TcpCostMsg>>>,
+);
 
 impl Isolate for CallTarget {
     tina::isolate_types! {
@@ -299,6 +344,132 @@ impl Isolate for TimerClient {
             TimerMsg::Fired => noop(),
         }
     }
+}
+
+impl Isolate for TcpCostClient {
+    tina::isolate_types! {
+        message: TcpCostMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<TcpCostMsg>,
+        shard: AllocationShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            TcpCostMsg::Bind => Effect::Call(RuntimeCall::new(
+                CallInput::TcpBind {
+                    addr: self.bind_addr,
+                },
+                |result| match result {
+                    CallOutput::TcpBound {
+                        listener,
+                        local_addr,
+                    } => TcpCostMsg::Bound {
+                        listener,
+                        addr: local_addr,
+                    },
+                    other => panic!("expected TcpBound, got {other:?}"),
+                },
+            )),
+            TcpCostMsg::Bound { listener, addr } => {
+                self.listener = Some(listener);
+                *self.addr_slot.borrow_mut() = Some(addr);
+                noop()
+            }
+            TcpCostMsg::Accept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
+                    listener: self.listener.expect("listener bound before accept"),
+                },
+                |result| match result {
+                    CallOutput::TcpAccepted { stream, .. } => TcpCostMsg::Accepted(stream),
+                    other => panic!("expected TcpAccepted, got {other:?}"),
+                },
+            )),
+            TcpCostMsg::Accepted(stream) => {
+                self.stream = Some(stream);
+                self.stream_slot.set(Some(stream));
+                noop()
+            }
+            TcpCostMsg::Read => Effect::Call(RuntimeCall::new(
+                CallInput::TcpRead {
+                    stream: self.stream.expect("stream accepted before read"),
+                    max_len: 16,
+                },
+                |result| match result {
+                    CallOutput::TcpRead { bytes } => TcpCostMsg::ReadDone(bytes.len()),
+                    other => panic!("expected TcpRead, got {other:?}"),
+                },
+            )),
+            TcpCostMsg::ReadDone(_) | TcpCostMsg::Wrote(_) => {
+                self.log.borrow_mut().push(msg);
+                noop()
+            }
+            TcpCostMsg::Write => Effect::Call(RuntimeCall::new(
+                CallInput::TcpWrite {
+                    stream: self.stream.expect("stream accepted before write"),
+                    bytes: b"cost".to_vec(),
+                },
+                |result| match result {
+                    CallOutput::TcpWrote { count } => TcpCostMsg::Wrote(count),
+                    other => panic!("expected TcpWrote, got {other:?}"),
+                },
+            )),
+        }
+    }
+}
+
+fn drive_until<F>(runtime: &mut Runtime<AllocationShard, TestMailboxFactory>, mut done: F)
+where
+    F: FnMut() -> bool,
+{
+    for _ in 0..12 {
+        if done() {
+            return;
+        }
+        runtime.step();
+    }
+    panic!("runtime did not reach expected state in bounded drive");
+}
+
+fn setup_tcp_cost_runtime() -> TcpCostSetup {
+    let simulated_io = SimulatedIO::new();
+    let mut runtime = Runtime::with_betelgeuse_io_loop(
+        AllocationShard(11),
+        TestMailboxFactory,
+        simulated_io.loop_handle(Global),
+    );
+    let addr_slot = Rc::new(RefCell::new(None));
+    let stream_slot = Rc::new(Cell::new(None));
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let worker = runtime.register_with_capacity::<TcpCostClient, Infallible>(
+        TcpCostClient {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            listener: None,
+            stream: None,
+            addr_slot: Rc::clone(&addr_slot),
+            stream_slot: Rc::clone(&stream_slot),
+            log: Rc::clone(&log),
+        },
+        8,
+    );
+
+    runtime.try_send(worker, TcpCostMsg::Bind).unwrap();
+    drive_until(&mut runtime, || addr_slot.borrow().is_some());
+    let peer = simulated_io
+        .connect(
+            addr_slot
+                .borrow()
+                .expect("local addr published by TcpCostClient"),
+            Vec::new(),
+        )
+        .expect("simulated peer connects");
+
+    runtime.try_send(worker, TcpCostMsg::Accept).unwrap();
+    drive_until(&mut runtime, || stream_slot.get().is_some());
+
+    (runtime, worker, peer, log)
 }
 
 #[test]
@@ -454,5 +625,47 @@ fn driver_timer_hot_path_allocation_count_is_pinned_after_warmup() {
     assert_eq!(
         hot_path, EXPECTED_DRIVER_TIMER_HOT_PATH,
         "driver timer hot path allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn driver_tcp_read_hot_path_allocation_count_is_pinned_after_warmup() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut runtime, worker, peer, log) = setup_tcp_cost_runtime();
+
+    peer.push_input(b"warm");
+    runtime.try_send(worker, TcpCostMsg::Read).unwrap();
+    drive_until(&mut runtime, || log.borrow().len() == 1);
+
+    peer.push_input(b"cost");
+    runtime.try_send(worker, TcpCostMsg::Read).unwrap();
+    let hot_path = measure_allocations(|| {
+        drive_until(&mut runtime, || log.borrow().len() == 2);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_DRIVER_TCP_READ_HOT_PATH,
+        "driver TCP read hot path allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn driver_tcp_write_hot_path_allocation_count_is_pinned_after_warmup() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut runtime, worker, _peer, log) = setup_tcp_cost_runtime();
+
+    runtime.try_send(worker, TcpCostMsg::Write).unwrap();
+    drive_until(&mut runtime, || log.borrow().len() == 1);
+
+    runtime.try_send(worker, TcpCostMsg::Write).unwrap();
+    let hot_path = measure_allocations(|| {
+        drive_until(&mut runtime, || log.borrow().len() == 2);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_DRIVER_TCP_WRITE_HOT_PATH,
+        "driver TCP write hot path allocation count changed; update the runtime allocation claim"
     );
 }

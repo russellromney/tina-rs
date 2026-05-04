@@ -246,11 +246,12 @@ pub enum CallError {
     /// surface here rather than through silent fallbacks.
     Unsupported,
 
-    /// The referenced runtime resource already has an in-flight operation.
+    /// The referenced runtime resource lane already has an in-flight
+    /// operation.
     ///
-    /// This keeps cancellation honest: if a stopped requester cancels a
-    /// pending TCP operation, Tina can close that operation's resource without
-    /// silently invalidating another live operation on the same resource.
+    /// TCP accepts, reads, and writes occupy separate lanes. A stream may have
+    /// one read and one write pending at the same time, but duplicate work on
+    /// the same lane and explicit close while any lane is pending fail here.
     ResourceBusy,
 
     /// The target isolate's mailbox was full when the runtime attempted an

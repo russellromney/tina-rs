@@ -1446,6 +1446,74 @@ fn same_resource_second_read_fails_resource_busy_under_tcp_delay_faults() {
 }
 
 #[test]
+fn read_and_write_on_same_stream_use_separate_lanes() {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 1,
+                    steps: 1,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 8,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48590),
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(
+                        1,
+                        peer_addr(58590),
+                        vec![b"input".to_vec()],
+                        None,
+                        8,
+                    )],
+                }],
+            },
+            ..Default::default()
+        },
+    );
+
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (stream, _) = accept_stream(&mut sim, listener);
+
+    let read_log = Rc::new(RefCell::new(Vec::new()));
+    let write_log = Rc::new(RefCell::new(Vec::new()));
+    let reader = sim.register(ReadProbe {
+        stream,
+        max_len: 8,
+        log: Rc::clone(&read_log),
+    });
+    let writer = sim.register(WriteProbe {
+        stream,
+        bytes: b"output".to_vec(),
+        log: Rc::clone(&write_log),
+    });
+
+    sim.try_send(reader, ReadProbeMsg::StartRead).unwrap();
+    sim.try_send(writer, WriteProbeMsg::StartWrite).unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        *read_log.borrow(),
+        vec![ReadProbeMsg::ReadCompleted(b"input".to_vec())]
+    );
+    assert_eq!(*write_log.borrow(), vec![WriteProbeMsg::Wrote(6)]);
+    assert!(
+        !sim.trace().iter().any(|event| matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                reason: CallError::ResourceBusy,
+                ..
+            }
+        )),
+        "different TCP lanes on one stream must not fail as ResourceBusy"
+    );
+}
+
+#[test]
 fn stream_close_fails_pending_read() {
     let mut sim = Simulator::new(
         TestShard,

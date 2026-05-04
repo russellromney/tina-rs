@@ -25,6 +25,18 @@ use betelgeuse::{
 use crate::call::{CallError, CallId, CallInput, CallOutput, ListenerId, StreamId};
 
 /// Runtime-owned substrate driver.
+///
+/// A driver must not run user isolate code, own isolate mailboxes, or hide an
+/// unbounded executor behind Tina. It owns only substrate calls submitted by
+/// [`crate::Runtime`], advances them when the runtime asks, and returns typed
+/// completions for the runtime to deliver on later turns.
+///
+/// TCP drivers must treat listener accept, stream read, and stream write as
+/// separate pending lanes. Duplicate work on one lane fails with
+/// [`CallError::ResourceBusy`]; closing a listener or stream while any relevant
+/// lane is pending also fails with [`CallError::ResourceBusy`]. Per-call cancel
+/// must stop requester completion and quiescence pressure without silently
+/// invalidating unrelated active lanes.
 pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// Submits one runtime-owned call.
     fn submit(
@@ -44,6 +56,10 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
     fn cancel_pending(&mut self);
 
     /// Cancels one runtime-owned call by id.
+    ///
+    /// Cancellation removes completion delivery responsibility from the
+    /// driver. It is not a promise that an already-submitted substrate side
+    /// effect, such as a TCP write handed to the OS, can be undone.
     fn cancel(&mut self, call_id: CallId) -> bool;
 
     #[cfg(test)]
@@ -97,7 +113,7 @@ struct StreamEntry {
 struct PendingOperation {
     call_id: CallId,
     kind: PendingKind,
-    resource: PendingResource,
+    lane: PendingLane,
     cancelled: bool,
 }
 
@@ -105,10 +121,10 @@ struct PendingOperation {
 ///
 /// The completion slot is heap-allocated so Betelgeuse's stored pointer
 /// to the inner `CompletionInner` stays valid while the `PendingOperation`
-/// itself is moved through the `pending` vector. We do not track the
-/// originating listener/stream id on the pending entry: the runtime's
-/// `call_id` is the stable handle the rest of the runtime uses, and the
-/// completion slot itself carries everything Betelgeuse needs.
+/// itself is moved through the `pending` vector. We track the originating
+/// listener/stream lane so Tina can allow full-duplex stream use while still
+/// rejecting duplicate work on one lane. The runtime's `call_id` remains the
+/// stable handle used for cancellation and completion delivery.
 enum PendingKind {
     Accept(Box<AcceptCompletion>),
     Read(Box<RecvCompletion>),
@@ -116,9 +132,10 @@ enum PendingKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingResource {
-    Listener(ListenerId),
-    Stream(StreamId),
+enum PendingLane {
+    ListenerAccept(ListenerId),
+    StreamRead(StreamId),
+    StreamWrite(StreamId),
 }
 
 /// One completion the driver produced during [`RuntimeDriver::advance`].
@@ -249,8 +266,8 @@ impl BetelgeuseTcp {
                 result: self.do_stream_close(stream),
             }),
             CallInput::TcpAccept { listener } => {
-                let resource = PendingResource::Listener(listener);
-                if self.resource_has_active_pending(resource) {
+                let lane = PendingLane::ListenerAccept(listener);
+                if self.lane_has_pending(lane) {
                     return Some(DriverCompletion {
                         call_id,
                         result: CallOutput::Failed(CallError::ResourceBusy),
@@ -261,7 +278,7 @@ impl BetelgeuseTcp {
                         self.pending.push(PendingOperation {
                             call_id,
                             kind: pending,
-                            resource,
+                            lane,
                             cancelled: false,
                         });
                         None
@@ -270,8 +287,8 @@ impl BetelgeuseTcp {
                 }
             }
             CallInput::TcpRead { stream, max_len } => {
-                let resource = PendingResource::Stream(stream);
-                if self.resource_has_active_pending(resource) {
+                let lane = PendingLane::StreamRead(stream);
+                if self.lane_has_pending(lane) {
                     return Some(DriverCompletion {
                         call_id,
                         result: CallOutput::Failed(CallError::ResourceBusy),
@@ -282,7 +299,7 @@ impl BetelgeuseTcp {
                         self.pending.push(PendingOperation {
                             call_id,
                             kind: pending,
-                            resource,
+                            lane,
                             cancelled: false,
                         });
                         None
@@ -291,8 +308,8 @@ impl BetelgeuseTcp {
                 }
             }
             CallInput::TcpWrite { stream, bytes } => {
-                let resource = PendingResource::Stream(stream);
-                if self.resource_has_active_pending(resource) {
+                let lane = PendingLane::StreamWrite(stream);
+                if self.lane_has_pending(lane) {
                     return Some(DriverCompletion {
                         call_id,
                         result: CallOutput::Failed(CallError::ResourceBusy),
@@ -303,7 +320,7 @@ impl BetelgeuseTcp {
                         self.pending.push(PendingOperation {
                             call_id,
                             kind: pending,
-                            resource,
+                            lane,
                             cancelled: false,
                         });
                         None
@@ -318,10 +335,19 @@ impl BetelgeuseTcp {
         }
     }
 
-    fn resource_has_active_pending(&self, resource: PendingResource) -> bool {
+    fn lane_has_active_pending(&self, lane: PendingLane) -> bool {
         self.pending
             .iter()
-            .any(|op| op.resource == resource && !op.cancelled)
+            .any(|op| op.lane == lane && !op.cancelled)
+    }
+
+    fn lane_has_pending(&self, lane: PendingLane) -> bool {
+        self.pending.iter().any(|op| op.lane == lane)
+    }
+
+    fn stream_has_active_pending(&self, stream: StreamId) -> bool {
+        self.lane_has_active_pending(PendingLane::StreamRead(stream))
+            || self.lane_has_active_pending(PendingLane::StreamWrite(stream))
     }
 
     /// Advances Betelgeuse by one tick and harvests any pending operations
@@ -382,8 +408,6 @@ impl BetelgeuseTcp {
         else {
             return false;
         };
-        let resource = self.pending[index].resource;
-        self.close_pending_resource(resource);
         self.pending[index].cancelled = true;
         true
     }
@@ -472,7 +496,7 @@ impl BetelgeuseTcp {
     }
 
     fn do_listener_close(&mut self, listener: ListenerId) -> CallOutput {
-        if self.resource_has_active_pending(PendingResource::Listener(listener)) {
+        if self.lane_has_active_pending(PendingLane::ListenerAccept(listener)) {
             return CallOutput::Failed(CallError::ResourceBusy);
         }
 
@@ -487,7 +511,7 @@ impl BetelgeuseTcp {
     }
 
     fn do_stream_close(&mut self, stream: StreamId) -> CallOutput {
-        if self.resource_has_active_pending(PendingResource::Stream(stream)) {
+        if self.stream_has_active_pending(stream) {
             return CallOutput::Failed(CallError::ResourceBusy);
         }
 
@@ -538,23 +562,6 @@ impl BetelgeuseTcp {
             return Err(CallOutput::Failed(CallError::Io));
         }
         Ok(PendingKind::Write(completion))
-    }
-
-    fn close_pending_resource(&mut self, resource: PendingResource) {
-        match resource {
-            PendingResource::Listener(listener) => {
-                if let Some(index) = self.listeners.iter().position(|entry| entry.id == listener) {
-                    let entry = self.listeners.remove(index);
-                    entry.socket.close();
-                }
-            }
-            PendingResource::Stream(stream) => {
-                if let Some(index) = self.streams.iter().position(|entry| entry.id == stream) {
-                    let entry = self.streams.remove(index);
-                    entry.socket.close();
-                }
-            }
-        }
     }
 }
 

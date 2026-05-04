@@ -1,15 +1,21 @@
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use betelgeuse::io::simulated::SimulatedIO;
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseControlError, BetelgeuseMultiShardRuntime, BetelgeuseRuntime,
-    BetelgeuseRuntimeConfig, CallCompletionRejectedReason, CallError, CallKind, CallOutcome,
-    MailboxFactory, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendRejectedReason, call, sleep,
+    BetelgeuseRuntimeConfig, CallCompletionRejectedReason, CallError, CallInput, CallKind,
+    CallOutcome, CallOutput, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, SendRejectedReason, call, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -264,6 +270,139 @@ fn betelgeuse_runtime_shutdown_rejects_outstanding_timer_completion() {
                 event.kind(),
                 RuntimeEventKind::CallCompletionRejected {
                     call_kind: CallKind::Sleep,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                    ..
+                }
+            )
+    }));
+}
+
+#[derive(Debug, Clone)]
+enum TcpAcceptMsg {
+    Bind,
+    Bound {
+        listener: ListenerId,
+        addr: SocketAddr,
+    },
+    StartAccept,
+    Accepted,
+    Failed,
+}
+
+#[derive(Debug)]
+struct TcpAcceptWorker {
+    bind_addr: SocketAddr,
+    listener: Option<ListenerId>,
+    published: Arc<Mutex<Option<SocketAddr>>>,
+    observed: Arc<Mutex<Vec<TcpAcceptMsg>>>,
+}
+
+impl Isolate for TcpAcceptWorker {
+    tina::isolate_types! {
+        message: TcpAcceptMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<TcpAcceptMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            TcpAcceptMsg::Bind => Effect::Call(RuntimeCall::new(
+                CallInput::TcpBind {
+                    addr: self.bind_addr,
+                },
+                |result| match result {
+                    CallOutput::TcpBound {
+                        listener,
+                        local_addr,
+                    } => TcpAcceptMsg::Bound {
+                        listener,
+                        addr: local_addr,
+                    },
+                    other => panic!("expected TcpBound, got {other:?}"),
+                },
+            )),
+            TcpAcceptMsg::Bound { listener, addr } => {
+                self.listener = Some(listener);
+                *self.published.lock().expect("published addr mutex") = Some(addr);
+                noop()
+            }
+            TcpAcceptMsg::StartAccept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
+                    listener: self.listener.expect("listener bound before accept"),
+                },
+                |result| match result {
+                    CallOutput::TcpAccepted { .. } => TcpAcceptMsg::Accepted,
+                    CallOutput::Failed(_) => TcpAcceptMsg::Failed,
+                    other => panic!("unexpected accept result {other:?}"),
+                },
+            )),
+            TcpAcceptMsg::Accepted | TcpAcceptMsg::Failed => {
+                self.observed.lock().expect("observed mutex").push(msg);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn betelgeuse_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
+    let simulated_io = SimulatedIO::new();
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let runtime = {
+        let simulated_io = simulated_io.clone();
+        BetelgeuseRuntime::with_config_and_io_loop_factory(
+            TestShard,
+            TestMailboxFactory,
+            BetelgeuseRuntimeConfig {
+                command_capacity: 8,
+                idle_wait: Duration::from_millis(1),
+            },
+            move || simulated_io.loop_handle(Global),
+        )
+    };
+    let worker = runtime
+        .register_with_capacity::<TcpAcceptWorker, _>(
+            TcpAcceptWorker {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                listener: None,
+                published: Arc::clone(&published),
+                observed: Arc::clone(&observed),
+            },
+            8,
+        )
+        .expect("tcp worker register accepts");
+
+    runtime
+        .try_send(worker, TcpAcceptMsg::Bind)
+        .expect("bind handoff accepted");
+    wait_until(Duration::from_secs(2), "tcp bind published", || {
+        published.lock().expect("published addr mutex").is_some()
+    });
+
+    runtime
+        .try_send(worker, TcpAcceptMsg::StartAccept)
+        .expect("accept handoff accepted");
+    wait_until(Duration::from_secs(2), "tcp accept pending", || {
+        runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+
+    let trace = runtime.shutdown().expect("Betelgeuse shutdown");
+    assert!(
+        observed.lock().expect("observed mutex").is_empty(),
+        "shutdown must not deliver translated accept completion"
+    );
+    assert!(trace.iter().any(|event| {
+        event.isolate() == worker.isolate()
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_kind: CallKind::TcpAccept,
                     reason: CallCompletionRejectedReason::RequesterClosed,
                     ..
                 }

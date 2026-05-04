@@ -139,8 +139,8 @@ phases.
 | ~~**Betelgeuse runtime substrate completion**~~ | Delivered in `.intent/phases/025-betelgeuse-runtime-substrate-completion/`: backend-honest `BetelgeuseRuntime` / `BetelgeuseMultiShardRuntime` names, shard-local Betelgeuse ownership, bounded ingress proof, live time/TCP completion semantics, live multi-shard bounded send, typed live cross-shard call rejection, narrow Betelgeuse simulated TCP backend with seeded delay/partial-write pressure, allocation probes, and oracle/sim/live parity tests. Tokio stays comparison/later bridge, not the main runtime story. |
 | ~~**Tina TCP driver contract**~~ | Delivered in `.intent/phases/026-tina-driver-contract/`: runtime-owned time/TCP behind a small Tina-owned driver boundary, timers, TCP submissions, completions, cancellation, shutdown, native Betelgeuse adapter, simulated Betelgeuse adapter, same-resource `ResourceBusy` semantics, and direct cancellation/late-completion proofs. This is not a general async runtime and not a Tokio bridge. |
 | ~~**Parallel substrate support**~~ | Delivered in `.intent/phases/027-parallel-substrate-support/`: Betelgeuse simulated I/O polish, narrow substrate cost evidence, expanded Tokio-vs-Tina constrained/backpressure comparisons, external review prompts, Tokio current-thread/Monoio/Glommio/Compio adapter research, and brief README/story refinement without changing Tina core semantics. |
-| **Ranger core runtime substrate completion** | Planned in `.intent/phases/028-ranger-substrate-driver-maturity/`. Finish Tina's core runtime substrate before service-framework work: driver capability contract, full-duplex TCP decision, cancellation/shutdown semantics, live/sim/oracle parity, substrate direction decision, measured cost pressure, and a written core/non-core boundary. Ranger is allowed to be as large as needed to settle core runtime/substrate semantics. This is not a service demo phase and not a Tokio bridge. |
-| **Gemini release story** | Deferred until the live substrate/driver story is strong enough to explain. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
+| ~~**Ranger core runtime substrate completion**~~ | Delivered in `.intent/phases/028-ranger-substrate-driver-maturity/`: documented the driver capability contract, moved TCP pending ownership to listener/read/write lanes, allowed full-duplex same-stream read/write, kept close and duplicate-lane `ResourceBusy` honest, made per-call cancel tombstone without silently closing unrelated lanes, added live worker TCP shutdown proof, pinned TCP read/write allocation counts, and recorded Betelgeuse as the near-term substrate direction. |
+| **Gemini release story** | Next release-story phase now that Ranger settled the core substrate boundary. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 
@@ -426,7 +426,8 @@ beneath future service work. It is allowed to be as large as needed to settle
 Tina core; it should not close while later phases would still have to reopen
 runtime/substrate fundamentals.
 
-The plan should live in `.intent/phases/028-ranger-substrate-driver-maturity/plan.md`.
+The delivered plan and review live in
+`.intent/phases/028-ranger-substrate-driver-maturity/`.
 
 ### Driver Capability Contract
 
@@ -535,8 +536,8 @@ on Ranger rather than reopen core runtime/substrate semantics.
   the core multi-shard primitive; Huygens proved the composed framework and
   first runtime-substrate story; Mercury sharpened the overload/call contract;
   Betelgeuse and the Tina driver contract made the first tryable runtime
-  substrate true; Ranger must mature that substrate/driver story before
-  Gemini publishes or freezes it.
+  substrate true; Ranger matured the substrate/driver story enough for Gemini
+  to document it instead of reopening core semantics.
 - Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, task-dispatcher walkthrough, and TCP echo walkthrough.
 - Document the supported invariants for the core runtime/simulator model:
   delivery behavior, mailbox guarantees, supervision behavior, replayability,
