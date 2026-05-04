@@ -2155,12 +2155,18 @@ where
             return;
         }
 
+        let resource = TcpResourceKey::Listener(listener);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
         self.promote_ready_peers(listener_index);
         if let Some(peer) = self.listeners[listener_index].ready_peers.pop_front() {
             let (stream, peer_addr) = self.open_stream_from_peer(peer);
             self.schedule_tcp_completion(
                 call_id,
-                TcpResourceKey::Listener(listener),
+                resource,
                 CallOutput::TcpAccepted { stream, peer_addr },
             );
             return;
@@ -2181,12 +2187,18 @@ where
             return;
         };
 
+        let resource = TcpResourceKey::Stream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
         let Some(result) = self.stream_read_result(stream_index, max_len) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
-        self.schedule_tcp_completion(call_id, TcpResourceKey::Stream(stream), result);
+        self.schedule_tcp_completion(call_id, resource, result);
     }
 
     fn handle_tcp_write(
@@ -2200,12 +2212,18 @@ where
             return;
         };
 
+        let resource = TcpResourceKey::Stream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
         let Some(result) = self.stream_write_result(stream_index, &bytes) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
 
-        self.schedule_tcp_completion(call_id, TcpResourceKey::Stream(stream), result);
+        self.schedule_tcp_completion(call_id, resource, result);
     }
 
     fn handle_tcp_listener_close(&mut self, call_id: CallId, listener: ListenerId) {
@@ -2219,9 +2237,15 @@ where
             return;
         }
 
+        let resource = TcpResourceKey::Listener(listener);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
         self.listeners[listener_index].closed = true;
         self.fail_pending_accepts(listener);
-        self.fail_pending_tcp_completions(TcpResourceKey::Listener(listener));
+        self.fail_pending_tcp_completions(resource);
         self.deliver_completion(call_id, CallOutput::TcpListenerClosed);
     }
 
@@ -2236,9 +2260,30 @@ where
             return;
         }
 
+        let resource = TcpResourceKey::Stream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
         self.streams[stream_index].closed = true;
-        self.fail_pending_tcp_completions(TcpResourceKey::Stream(stream));
+        self.fail_pending_tcp_completions(resource);
         self.deliver_completion(call_id, CallOutput::TcpStreamClosed);
+    }
+
+    fn resource_has_active_pending(&self, resource: TcpResourceKey) -> bool {
+        let queued_accept = match resource {
+            TcpResourceKey::Listener(listener) => self
+                .pending_accepts
+                .iter()
+                .any(|pending| pending.listener == listener),
+            TcpResourceKey::Stream(_) => false,
+        };
+        queued_accept
+            || self
+                .pending_tcp_completions
+                .iter()
+                .any(|pending| pending.resource == resource)
     }
 
     fn schedule_tcp_completion(

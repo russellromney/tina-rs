@@ -50,7 +50,7 @@ use tina_supervisor::SupervisorConfig;
 use betelgeuse::{IOLoopHandle, io_loop};
 
 mod call;
-mod io_backend;
+mod driver;
 mod trace;
 
 pub use call::{
@@ -70,7 +70,7 @@ pub use trace::{
     SupervisionRejectedReason,
 };
 
-use io_backend::IoBackend;
+use driver::{BetelgeuseDriver, RuntimeDriver};
 
 /// Runtime-owned mailbox factory for spawned children.
 ///
@@ -133,14 +133,6 @@ impl Clock for Rc<ManualClock> {
     }
 }
 
-/// One pending timer tracked by the runtime.
-#[derive(Debug)]
-struct TimerEntry {
-    call_id: CallId,
-    deadline: Instant,
-    insertion_order: u64,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct MessageCallContext {
     call_id: CallId,
@@ -194,12 +186,10 @@ where
     next_isolate_id: u64,
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
-    io_backend: IoBackend,
+    driver: Box<dyn RuntimeDriver>,
     in_flight_calls: Vec<InFlightCall>,
     translators: Vec<StoredTranslator>,
     clock: Box<dyn Clock>,
-    timers: Vec<TimerEntry>,
-    next_timer_ordinal: u64,
     pending_isolate_calls: Vec<PendingIsolateCall>,
     next_isolate_call_ordinal: u64,
 }
@@ -277,12 +267,12 @@ where
         mailbox_factory: F,
         io_loop: IOLoopHandle<Global>,
     ) -> Self {
-        Self::with_clock_and_ids_and_io_backend(
+        Self::with_clock_and_ids_and_driver(
             shard,
             mailbox_factory,
             Box::new(MonotonicClock),
             IdSource::new(),
-            IoBackend::with_io_loop(io_loop),
+            Box::new(BetelgeuseDriver::with_io_loop(io_loop)),
         )
     }
 
@@ -297,21 +287,21 @@ where
         clock: Box<dyn Clock>,
         ids: IdSource,
     ) -> Self {
-        Self::with_clock_and_ids_and_io_backend(
+        Self::with_clock_and_ids_and_driver(
             shard,
             mailbox_factory,
             clock,
             ids,
-            IoBackend::new(),
+            Box::new(BetelgeuseDriver::new()),
         )
     }
 
-    fn with_clock_and_ids_and_io_backend(
+    fn with_clock_and_ids_and_driver(
         shard: S,
         mailbox_factory: F,
         clock: Box<dyn Clock>,
         ids: IdSource,
-        io_backend: IoBackend,
+        driver: Box<dyn RuntimeDriver>,
     ) -> Self {
         Self {
             shard,
@@ -322,12 +312,10 @@ where
             next_isolate_id: 1,
             ids,
             trace: Vec::new(),
-            io_backend,
+            driver,
             in_flight_calls: Vec::new(),
             translators: Vec::new(),
             clock,
-            timers: Vec::new(),
-            next_timer_ordinal: 0,
             pending_isolate_calls: Vec::new(),
             next_isolate_call_ordinal: 0,
         }
@@ -338,14 +326,13 @@ where
     /// can produce more I/O completions.
     pub fn has_in_flight_calls(&self) -> bool {
         !self.in_flight_calls.is_empty()
-            || self.io_backend.has_pending()
-            || !self.timers.is_empty()
+            || self.driver.has_pending()
             || !self.pending_isolate_calls.is_empty()
     }
 
     #[cfg(test)]
     fn io_pending_count(&self) -> usize {
-        self.io_backend.pending_count()
+        self.driver.io_pending_count()
     }
 
     /// Returns a shared reference to the shard.
@@ -359,8 +346,7 @@ where
     }
 
     fn cancel_in_flight_calls_for_shutdown(&mut self) {
-        self.timers.clear();
-        self.io_backend.cancel_pending();
+        self.driver.cancel_pending();
         self.translators.clear();
 
         let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
@@ -388,6 +374,36 @@ where
                 },
             );
         }
+    }
+
+    fn cancel_driver_calls_for_requester(&mut self, requester: RegisteredAddress) {
+        let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
+        for call in in_flight_calls {
+            if call.requester == requester {
+                self.driver.cancel(call.call_id);
+                self.remove_translator(call.call_id);
+                self.push_event(
+                    call.requester.isolate,
+                    Some(call.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id: call.call_id,
+                        call_kind: call.call_kind,
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                    },
+                );
+            } else {
+                self.in_flight_calls.push(call);
+            }
+        }
+    }
+
+    fn remove_translator(&mut self, call_id: CallId) {
+        let translator_index = self
+            .translators
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+            .unwrap_or_else(|| panic!("missing translator for call {call_id:?}"));
+        self.translators.remove(translator_index);
     }
 
     /// Registers one isolate and returns its typed address.
@@ -530,7 +546,7 @@ where
 
     /// Runs one deterministic round over all registered isolates.
     ///
-    /// The runtime first advances its I/O backend so any pending
+    /// The runtime first advances its driver so any pending
     /// runtime-owned calls that finished since the previous step can be
     /// delivered as ordinary later-turn messages. Then each registered
     /// isolate gets at most one delivery chance, in registration order.
@@ -552,8 +568,7 @@ where
         FR: FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
     {
         let now = self.clock.now();
-        self.advance_io_backend();
-        self.harvest_timers(now);
+        self.advance_driver(now);
         self.harvest_isolate_call_timeouts(now);
 
         let mut round_messages: Vec<Option<DeliveredMessage>> = self
@@ -820,7 +835,7 @@ where
                 request,
                 translator,
             } => {
-                self.dispatch_backend_call(
+                self.dispatch_driver_call(
                     call_id,
                     call_kind,
                     requester,
@@ -856,7 +871,7 @@ where
         }
     }
 
-    fn dispatch_backend_call(
+    fn dispatch_driver_call(
         &mut self,
         call_id: CallId,
         call_kind: CallKind,
@@ -879,22 +894,8 @@ where
             translator: Some(translator),
         });
 
-        match request {
-            CallInput::Sleep { after } => {
-                let deadline = self.clock.now() + after;
-                let insertion_order = self.next_timer_ordinal;
-                self.next_timer_ordinal += 1;
-                self.timers.push(TimerEntry {
-                    call_id,
-                    deadline,
-                    insertion_order,
-                });
-            }
-            other => {
-                if let Some(immediate) = self.io_backend.submit(call_id, other) {
-                    self.deliver_completion(immediate.call_id, immediate.result);
-                }
-            }
+        if let Some(immediate) = self.driver.submit(call_id, request, self.clock.now()) {
+            self.deliver_completion(immediate.call_id, immediate.result);
         }
     }
 
@@ -1264,31 +1265,10 @@ where
         }
     }
 
-    fn advance_io_backend(&mut self) {
-        let completed = self.io_backend.advance();
+    fn advance_driver(&mut self, now: Instant) {
+        let completed = self.driver.advance(now);
         for op in completed {
             self.deliver_completion(op.call_id, op.result);
-        }
-    }
-
-    fn harvest_timers(&mut self, now: Instant) {
-        let mut due = Vec::new();
-        let mut still_pending = Vec::new();
-        for entry in std::mem::take(&mut self.timers) {
-            if entry.deadline <= now {
-                due.push(entry);
-            } else {
-                still_pending.push(entry);
-            }
-        }
-        self.timers = still_pending;
-        due.sort_by(|a, b| {
-            a.deadline
-                .cmp(&b.deadline)
-                .then_with(|| a.insertion_order.cmp(&b.insertion_order))
-        });
-        for entry in due {
-            self.deliver_completion(entry.call_id, CallOutput::TimerFired);
         }
     }
 
@@ -1297,9 +1277,7 @@ where
             .in_flight_calls
             .iter()
             .position(|entry| entry.call_id == call_id)
-            .unwrap_or_else(|| {
-                panic!("io backend produced completion for unknown call {call_id:?}")
-            });
+            .unwrap_or_else(|| panic!("driver produced completion for unknown call {call_id:?}"));
         let in_flight = self.in_flight_calls.remove(in_flight_index);
 
         let translator_index = self
@@ -1467,6 +1445,11 @@ where
         self.entries[index].mailbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
+        self.cancel_driver_calls_for_requester(RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: isolate_id,
+            generation: self.entries[index].generation,
+        });
         if precollected.is_some() {
             self.push_event(
                 isolate_id,
@@ -2603,12 +2586,12 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    let mut runtime = Runtime::with_clock_and_ids_and_io_backend(
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
         shard,
         mailbox_factory,
         Box::new(MonotonicClock),
         IdSource::new(),
-        IoBackend::with_io_loop(io_loop_factory()),
+        Box::new(BetelgeuseDriver::with_io_loop(io_loop_factory())),
     );
 
     loop {

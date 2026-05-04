@@ -1263,14 +1263,11 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
                 listeners: vec![ScriptedListenerConfig {
                     bind_addr: bind_addr(),
                     local_addr: local_addr(48550),
-                    backlog_capacity: 1,
-                    peers: vec![peer_script(
-                        1,
-                        peer_addr(58550),
-                        vec![b"chunk".to_vec()],
-                        None,
-                        8,
-                    )],
+                    backlog_capacity: 2,
+                    peers: vec![
+                        peer_script(1, peer_addr(58550), vec![b"chunk".to_vec()], None, 8),
+                        peer_script(1, peer_addr(58551), vec![b"other".to_vec()], None, 8),
+                    ],
                 }],
             },
             ..Default::default()
@@ -1279,6 +1276,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
 
     let (listener, _) = bind_listener(&mut sim, bind_addr());
     let (stream, _) = accept_stream(&mut sim, listener);
+    let (other_stream, _) = accept_stream(&mut sim, listener);
 
     let read_log = Rc::new(RefCell::new(Vec::new()));
     let reader_one = sim.register(ReadProbe {
@@ -1287,7 +1285,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
         log: Rc::clone(&read_log),
     });
     let reader_two = sim.register(ReadProbe {
-        stream,
+        stream: other_stream,
         max_len: 8,
         log: Rc::clone(&read_log),
     });
@@ -1316,7 +1314,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
 }
 
 #[test]
-fn listener_close_fails_pending_accept() {
+fn listener_close_while_accept_pending_fails_resource_busy() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
@@ -1346,21 +1344,7 @@ fn listener_close_fails_pending_accept() {
         },
     );
 
-    let bound = Arc::new(Mutex::new(None));
-    let listener = sim.register(Listener {
-        bind_addr: bind_addr(),
-        bound_addr_slot: Arc::clone(&bound),
-        max_chunk: 32,
-        target_accepts: 1,
-        accepted_count: 0,
-        self_addr: None,
-        listener: None,
-    });
-    sim.try_send(listener, ListenerMsg::Bootstrap).unwrap();
-    sim.step();
-    sim.step();
-
-    let listener_resource = ListenerId::new(1);
+    let (listener_resource, _) = bind_listener(&mut sim, bind_addr());
     let log = Rc::new(RefCell::new(Vec::new()));
     let waiter = sim.register(Waiter {
         listener: listener_resource,
@@ -1375,21 +1359,25 @@ fn listener_close_fails_pending_accept() {
     sim.try_send(closer, CloserMsg::CloseListener).unwrap();
     sim.run_until_quiescent();
 
-    assert_eq!(*log.borrow(), vec![WaiterMsg::Failed]);
+    assert_eq!(*log.borrow(), vec![WaiterMsg::Accepted]);
     assert!(sim.trace().iter().any(|event| {
         matches!(
             event.kind(),
             RuntimeEventKind::CallFailed {
-                call_kind: CallKind::TcpAccept,
-                reason: CallError::InvalidResource,
+                call_kind: CallKind::TcpListenerClose,
+                reason: CallError::ResourceBusy,
                 ..
             }
         )
     }));
+    assert_eq!(
+        count_call_completed(sim.trace(), CallKind::TcpListenerClose),
+        0
+    );
 }
 
 #[test]
-fn same_resource_fifo_is_preserved_under_tcp_delay_faults() {
+fn same_resource_second_read_fails_resource_busy_under_tcp_delay_faults() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
@@ -1436,7 +1424,6 @@ fn same_resource_fifo_is_preserved_under_tcp_delay_faults() {
     });
 
     sim.try_send(first_reader, ReadProbeMsg::StartRead).unwrap();
-    sim.step();
     sim.try_send(second_reader, ReadProbeMsg::StartRead)
         .unwrap();
     sim.run_until_quiescent();
@@ -1445,24 +1432,17 @@ fn same_resource_fifo_is_preserved_under_tcp_delay_faults() {
         *first_log.borrow(),
         vec![ReadProbeMsg::ReadCompleted(b"first".to_vec())]
     );
-    assert_eq!(
-        *second_log.borrow(),
-        vec![ReadProbeMsg::ReadCompleted(b"second".to_vec())]
-    );
-
-    let completed = completed_call_isolates(sim.trace(), CallKind::TcpRead);
-    let first_index = completed
-        .iter()
-        .position(|isolate| *isolate == first_reader.isolate())
-        .expect("first read completion");
-    let second_index = completed
-        .iter()
-        .position(|isolate| *isolate == second_reader.isolate())
-        .expect("second read completion");
-    assert!(
-        first_index < second_index,
-        "same-stream read completions must preserve submission order under delay faults"
-    );
+    assert_eq!(*second_log.borrow(), vec![ReadProbeMsg::Failed]);
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TcpRead,
+                reason: CallError::ResourceBusy,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]
@@ -1512,17 +1492,24 @@ fn stream_close_fails_pending_read() {
     sim.try_send(closer, CloserMsg::CloseStream).unwrap();
     sim.run_until_quiescent();
 
-    assert_eq!(*read_log.borrow(), vec![ReadProbeMsg::Failed]);
+    assert_eq!(
+        *read_log.borrow(),
+        vec![ReadProbeMsg::ReadCompleted(b"soon".to_vec())]
+    );
     assert!(sim.trace().iter().any(|event| {
         matches!(
             event.kind(),
             RuntimeEventKind::CallFailed {
-                call_kind: CallKind::TcpRead,
-                reason: CallError::InvalidResource,
+                call_kind: CallKind::TcpStreamClose,
+                reason: CallError::ResourceBusy,
                 ..
             }
         )
     }));
+    assert_eq!(
+        count_call_completed(sim.trace(), CallKind::TcpStreamClose),
+        0
+    );
 }
 
 #[test]
@@ -1572,17 +1559,21 @@ fn stream_close_fails_pending_write() {
     sim.try_send(closer, CloserMsg::CloseStream).unwrap();
     sim.run_until_quiescent();
 
-    assert_eq!(*write_log.borrow(), vec![WriteProbeMsg::Failed]);
+    assert_eq!(*write_log.borrow(), vec![WriteProbeMsg::Wrote(7)]);
     assert!(sim.trace().iter().any(|event| {
         matches!(
             event.kind(),
             RuntimeEventKind::CallFailed {
-                call_kind: CallKind::TcpWrite,
-                reason: CallError::InvalidResource,
+                call_kind: CallKind::TcpStreamClose,
+                reason: CallError::ResourceBusy,
                 ..
             }
         )
     }));
+    assert_eq!(
+        count_call_completed(sim.trace(), CallKind::TcpStreamClose),
+        0
+    );
 }
 
 #[test]

@@ -246,6 +246,13 @@ pub enum CallError {
     /// surface here rather than through silent fallbacks.
     Unsupported,
 
+    /// The referenced runtime resource already has an in-flight operation.
+    ///
+    /// This keeps cancellation honest: if a stopped requester cancels a
+    /// pending TCP operation, Tina can close that operation's resource without
+    /// silently invalidating another live operation on the same resource.
+    ResourceBusy,
+
     /// The target isolate's mailbox was full when the runtime attempted an
     /// isolate-to-isolate call.
     TargetFull,

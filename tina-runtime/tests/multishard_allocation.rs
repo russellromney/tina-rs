@@ -5,10 +5,12 @@ use std::convert::Infallible;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseRuntime, CallOutcome, MailboxFactory, MultiShardRuntime, Runtime, RuntimeCall, call,
+    BetelgeuseRuntime, CallInput, CallOutcome, CallOutput, MailboxFactory, MultiShardRuntime,
+    Runtime, RuntimeCall, call,
 };
 
 const EXPECTED_MULTISHARD_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
@@ -22,6 +24,10 @@ const EXPECTED_ISOLATE_CALL_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
 const EXPECTED_BETELGEUSE_INGRESS_HANDOFF: AllocationSnapshot = AllocationSnapshot {
     allocations: 1,
     reallocations: 0,
+};
+const EXPECTED_DRIVER_TIMER_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 10,
+    reallocations: 1,
 };
 
 struct CountingAllocator;
@@ -199,11 +205,20 @@ enum CallClientMsg {
     Returned(CallOutcome<CallReply>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerMsg {
+    Start,
+    Fired,
+}
+
 #[derive(Debug)]
 struct CallTarget;
 
 #[derive(Debug)]
 struct CallClient;
+
+#[derive(Debug)]
+struct TimerClient;
 
 impl Isolate for CallTarget {
     tina::isolate_types! {
@@ -239,6 +254,32 @@ impl Isolate for CallClient {
             )
             .reply(CallClientMsg::Returned),
             CallClientMsg::Returned(_) => noop(),
+        }
+    }
+}
+
+impl Isolate for TimerClient {
+    tina::isolate_types! {
+        message: TimerMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<TimerMsg>,
+        shard: AllocationShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            TimerMsg::Start => Effect::Call(RuntimeCall::new(
+                CallInput::Sleep {
+                    after: Duration::ZERO,
+                },
+                |result| match result {
+                    CallOutput::TimerFired => TimerMsg::Fired,
+                    other => panic!("expected timer fired, got {other:?}"),
+                },
+            )),
+            TimerMsg::Fired => noop(),
         }
     }
 }
@@ -332,4 +373,27 @@ fn betelgeuse_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
         "Betelgeuse ingress handoff allocation count changed; this measures the caller thread only"
     );
     let _ = runtime.shutdown();
+}
+
+#[test]
+fn driver_timer_hot_path_allocation_count_is_pinned_after_warmup() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let timer = runtime.register_with_capacity::<TimerClient, Infallible>(TimerClient, 8);
+
+    runtime.try_send(timer, TimerMsg::Start).unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+
+    runtime.try_send(timer, TimerMsg::Start).unwrap();
+    let hot_path = measure_allocations(|| {
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(runtime.step(), 1);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_DRIVER_TIMER_HOT_PATH,
+        "driver timer hot path allocation count changed; update the runtime allocation claim"
+    );
 }

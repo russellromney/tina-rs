@@ -265,9 +265,12 @@ impl Client {
                     Err(CallError::TargetFull) => push(&self.events, "full"),
                     Err(CallError::TargetClosed) => push(&self.events, "closed"),
                     Err(CallError::Timeout) => push(&self.events, "timeout"),
-                    Err(CallError::InvalidResource | CallError::Io | CallError::Unsupported) => {
-                        push(&self.events, "unexpected_call_error")
-                    }
+                    Err(
+                        CallError::InvalidResource
+                        | CallError::Io
+                        | CallError::Unsupported
+                        | CallError::ResourceBusy,
+                    ) => push(&self.events, "unexpected_call_error"),
                 }
                 noop()
             }

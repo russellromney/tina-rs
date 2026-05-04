@@ -1,3 +1,5 @@
+#![feature(allocator_api)]
+
 //! Focused tests for the runtime-owned call effect path.
 //!
 //! These tests deliberately exercise non-network call semantics through
@@ -15,6 +17,7 @@
 //! Phase 012 is TCP-first, so we drive these scenarios through the same
 //! TCP call vocabulary the echo test uses.
 
+use std::alloc::Global;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -23,9 +26,10 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use betelgeuse::io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO};
 use tina::{Address, Context, Effect, Isolate, Mailbox, Outbound, Shard, ShardId, TrySendError};
 use tina_runtime::{
-    CallCompletionRejectedReason, CallId, CallInput, CallKind, CallOutput, ListenerId,
+    CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutput, ListenerId,
     MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
 };
 
@@ -113,6 +117,36 @@ enum WaiterMsg {
     StartAccept,
     StopNow,
     AcceptedObserved(SocketAddr),
+    FailedObserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptStreamMsg {
+    StartAccept,
+    Accepted(StreamId),
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderMsg {
+    StartRead,
+    StopNow,
+    ReadObserved,
+    FailedObserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterMsg {
+    StartWrite,
+    StopNow,
+    WroteObserved,
+    FailedObserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloserMsg {
+    CloseStream(StreamId),
+    ClosedObserved,
     FailedObserved,
 }
 
@@ -212,6 +246,29 @@ struct Waiter {
     peer_slot: Arc<Mutex<Option<SocketAddr>>>,
 }
 
+#[derive(Debug)]
+struct StreamAcceptor {
+    listener: ListenerId,
+    stream_slot: Rc<Cell<Option<StreamId>>>,
+}
+
+#[derive(Debug)]
+struct Reader {
+    stream: StreamId,
+    log: Rc<RefCell<Vec<ReaderMsg>>>,
+}
+
+#[derive(Debug)]
+struct Writer {
+    stream: StreamId,
+    log: Rc<RefCell<Vec<WriterMsg>>>,
+}
+
+#[derive(Debug)]
+struct Closer {
+    log: Rc<RefCell<Vec<CloserMsg>>>,
+}
+
 impl Isolate for Waiter {
     type Message = WaiterMsg;
     type Reply = ();
@@ -244,6 +301,133 @@ impl Isolate for Waiter {
             }
             WaiterMsg::FailedObserved => {
                 self.log.borrow_mut().push(WaiterMsg::FailedObserved);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+impl Isolate for StreamAcceptor {
+    type Message = AcceptStreamMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<AcceptStreamMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            AcceptStreamMsg::StartAccept => Effect::Call(RuntimeCall::new(
+                CallInput::TcpAccept {
+                    listener: self.listener,
+                },
+                |result| match result {
+                    CallOutput::TcpAccepted { stream, .. } => AcceptStreamMsg::Accepted(stream),
+                    CallOutput::Failed(_) => AcceptStreamMsg::Failed,
+                    other => panic!("unexpected accept result {other:?}"),
+                },
+            )),
+            AcceptStreamMsg::Accepted(stream) => {
+                self.stream_slot.set(Some(stream));
+                Effect::Noop
+            }
+            AcceptStreamMsg::Failed => Effect::Noop,
+        }
+    }
+}
+
+impl Isolate for Reader {
+    type Message = ReaderMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<ReaderMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ReaderMsg::StartRead => Effect::Call(RuntimeCall::new(
+                CallInput::TcpRead {
+                    stream: self.stream,
+                    max_len: 64,
+                },
+                |result| match result {
+                    CallOutput::TcpRead { .. } => ReaderMsg::ReadObserved,
+                    CallOutput::Failed(_) => ReaderMsg::FailedObserved,
+                    other => panic!("unexpected read result {other:?}"),
+                },
+            )),
+            ReaderMsg::StopNow => Effect::Stop,
+            ReaderMsg::ReadObserved => {
+                self.log.borrow_mut().push(ReaderMsg::ReadObserved);
+                Effect::Noop
+            }
+            ReaderMsg::FailedObserved => {
+                self.log.borrow_mut().push(ReaderMsg::FailedObserved);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+impl Isolate for Writer {
+    type Message = WriterMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<WriterMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            WriterMsg::StartWrite => Effect::Call(RuntimeCall::new(
+                CallInput::TcpWrite {
+                    stream: self.stream,
+                    bytes: b"cancel me before completion".to_vec(),
+                },
+                |result| match result {
+                    CallOutput::TcpWrote { .. } => WriterMsg::WroteObserved,
+                    CallOutput::Failed(_) => WriterMsg::FailedObserved,
+                    other => panic!("unexpected write result {other:?}"),
+                },
+            )),
+            WriterMsg::StopNow => Effect::Stop,
+            WriterMsg::WroteObserved => {
+                self.log.borrow_mut().push(WriterMsg::WroteObserved);
+                Effect::Noop
+            }
+            WriterMsg::FailedObserved => {
+                self.log.borrow_mut().push(WriterMsg::FailedObserved);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+impl Isolate for Closer {
+    type Message = CloserMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<CloserMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            CloserMsg::CloseStream(stream) => Effect::Call(RuntimeCall::new(
+                CallInput::TcpStreamClose { stream },
+                |result| match result {
+                    CallOutput::TcpStreamClosed => CloserMsg::ClosedObserved,
+                    CallOutput::Failed(_) => CloserMsg::FailedObserved,
+                    other => panic!("unexpected stream close result {other:?}"),
+                },
+            )),
+            CloserMsg::ClosedObserved => {
+                self.log.borrow_mut().push(CloserMsg::ClosedObserved);
+                Effect::Noop
+            }
+            CloserMsg::FailedObserved => {
+                self.log.borrow_mut().push(CloserMsg::FailedObserved);
                 Effect::Noop
             }
         }
@@ -418,7 +602,7 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
         .lock()
         .expect("listener mutex")
         .expect("listener published");
-    let local_addr = addr_slot
+    let _local_addr = addr_slot
         .lock()
         .expect("addr mutex")
         .expect("addr published");
@@ -442,19 +626,10 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
         .expect("ingress accepts StopNow");
     runtime.step();
 
-    let client = TcpStream::connect(local_addr).expect("connect to listener");
-    drop(client);
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while runtime.has_in_flight_calls() {
-        runtime.step();
-        if Instant::now() > deadline {
-            panic!(
-                "timed out waiting for pending accept completion; trace = {:#?}",
-                runtime.trace()
-            );
-        }
-    }
+    assert!(
+        !runtime.has_in_flight_calls(),
+        "stopped requester must cancel pending accept without needing a peer connection"
+    );
 
     assert!(
         waiter_log.borrow().is_empty(),
@@ -486,6 +661,505 @@ fn pending_accept_completion_is_rejected_when_requester_stops_first() {
             }
         )),
         "rejected completion must not produce CallCompleted: {kinds:?}"
+    );
+}
+
+#[test]
+fn pending_read_is_cancelled_when_requester_stops_without_peer_input() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
+    let stream_slot = Rc::new(Cell::new(None));
+    let reader_log = Rc::new(RefCell::new(Vec::new()));
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let binder = runtime.register(
+        Binder {
+            bind_addr,
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
+    runtime.step();
+    runtime.step();
+
+    let listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    let acceptor = runtime.register(
+        StreamAcceptor {
+            listener,
+            stream_slot: Rc::clone(&stream_slot),
+        },
+        TestMailbox::new(8),
+    );
+    runtime
+        .try_send(acceptor, AcceptStreamMsg::StartAccept)
+        .expect("ingress accepts StartAccept");
+    runtime.step();
+
+    let _client = TcpStream::connect(local_addr).expect("connect to listener");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while stream_slot.get().is_none() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for accepted stream; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    let reader = runtime.register(
+        Reader {
+            stream: stream_slot.get().expect("accepted stream id"),
+            log: Rc::clone(&reader_log),
+        },
+        TestMailbox::new(8),
+    );
+    runtime
+        .try_send(reader, ReaderMsg::StartRead)
+        .expect("ingress accepts StartRead");
+    runtime.step();
+    assert!(runtime.has_in_flight_calls());
+
+    runtime
+        .try_send(reader, ReaderMsg::StopNow)
+        .expect("ingress accepts StopNow");
+    runtime.step();
+
+    assert!(
+        !runtime.has_in_flight_calls(),
+        "stopped requester must cancel pending read without peer input"
+    );
+    assert!(
+        reader_log.borrow().is_empty(),
+        "stopped requester must not observe translated read completion messages"
+    );
+
+    let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpRead,
+                reason: CallCompletionRejectedReason::RequesterClosed,
+                ..
+            }
+        )),
+        "trace must record CallCompletionRejected{{RequesterClosed}} for pending read: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpRead,
+                ..
+            }
+        )),
+        "stopped requester must not observe TcpRead CallCompleted"
+    );
+}
+
+#[test]
+fn pending_write_is_cancelled_when_requester_stops_before_simulated_completion() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
+    let stream_slot = Rc::new(Cell::new(None));
+    let writer_log = Rc::new(RefCell::new(Vec::new()));
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+    let simulated_io = SimulatedIO::with_config(SimulatedConfig {
+        seed: 26,
+        completion_delay: SimulatedDelay::Every {
+            one_in: 1,
+            steps: 3,
+        },
+        max_send_chunk: None,
+    });
+
+    let mut runtime = Runtime::with_betelgeuse_io_loop(
+        TestShard,
+        TestMailboxFactory,
+        simulated_io.loop_handle(Global),
+    );
+    let binder = runtime.register(
+        Binder {
+            bind_addr,
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
+    runtime.step();
+    runtime.step();
+
+    let listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    let acceptor = runtime.register(
+        StreamAcceptor {
+            listener,
+            stream_slot: Rc::clone(&stream_slot),
+        },
+        TestMailbox::new(8),
+    );
+    runtime
+        .try_send(acceptor, AcceptStreamMsg::StartAccept)
+        .expect("ingress accepts StartAccept");
+    runtime.step();
+
+    let peer = simulated_io
+        .connect(local_addr, Vec::new())
+        .expect("simulated peer connects");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while stream_slot.get().is_none() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for accepted stream; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    let writer = runtime.register(
+        Writer {
+            stream: stream_slot.get().expect("accepted stream id"),
+            log: Rc::clone(&writer_log),
+        },
+        TestMailbox::new(8),
+    );
+    runtime
+        .try_send(writer, WriterMsg::StartWrite)
+        .expect("ingress accepts StartWrite");
+    runtime.step();
+    assert!(runtime.has_in_flight_calls());
+
+    runtime
+        .try_send(writer, WriterMsg::StopNow)
+        .expect("ingress accepts StopNow");
+    runtime.step();
+
+    assert!(
+        !runtime.has_in_flight_calls(),
+        "stopped requester must cancel pending write before simulated completion"
+    );
+    assert!(
+        writer_log.borrow().is_empty(),
+        "stopped requester must not observe translated write completion messages"
+    );
+    assert!(
+        peer.output().is_empty(),
+        "cancelled write must not become visible to the simulated peer before completion"
+    );
+
+    let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpWrite,
+                reason: CallCompletionRejectedReason::RequesterClosed,
+                ..
+            }
+        )),
+        "trace must record CallCompletionRejected{{RequesterClosed}} for pending write: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpWrite,
+                ..
+            }
+        )),
+        "stopped requester must not observe TcpWrite CallCompleted"
+    );
+
+    for _ in 0..5 {
+        runtime.step();
+    }
+    let matured_kinds = call_event_kinds(runtime.trace());
+    assert!(
+        peer.output().is_empty(),
+        "cancelled write must stay invisible after delayed completion matures"
+    );
+    assert!(
+        writer_log.borrow().is_empty(),
+        "late tombstoned completion must not deliver translated write messages"
+    );
+    assert!(
+        !matured_kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpWrite,
+                ..
+            }
+        )),
+        "late tombstoned write must not produce TcpWrite CallCompleted"
+    );
+}
+
+#[test]
+fn second_pending_operation_on_same_stream_fails_resource_busy() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
+    let stream_slot = Rc::new(Cell::new(None));
+    let reader_log = Rc::new(RefCell::new(Vec::new()));
+    let writer_log = Rc::new(RefCell::new(Vec::new()));
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let binder = runtime.register(
+        Binder {
+            bind_addr,
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
+    runtime.step();
+    runtime.step();
+
+    let listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    let acceptor = runtime.register(
+        StreamAcceptor {
+            listener,
+            stream_slot: Rc::clone(&stream_slot),
+        },
+        TestMailbox::new(8),
+    );
+    runtime
+        .try_send(acceptor, AcceptStreamMsg::StartAccept)
+        .expect("ingress accepts StartAccept");
+    runtime.step();
+
+    let _client = TcpStream::connect(local_addr).expect("connect to listener");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while stream_slot.get().is_none() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for accepted stream; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    let stream = stream_slot.get().expect("accepted stream id");
+    let reader = runtime.register(
+        Reader {
+            stream,
+            log: Rc::clone(&reader_log),
+        },
+        TestMailbox::new(8),
+    );
+    let writer = runtime.register(
+        Writer {
+            stream,
+            log: Rc::clone(&writer_log),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(reader, ReaderMsg::StartRead)
+        .expect("ingress accepts StartRead");
+    runtime.step();
+    assert!(runtime.has_in_flight_calls());
+
+    runtime
+        .try_send(writer, WriterMsg::StartWrite)
+        .expect("ingress accepts StartWrite");
+    runtime.step();
+    runtime.step();
+
+    assert!(
+        writer_log.borrow().contains(&WriterMsg::FailedObserved),
+        "second pending operation on one stream must fail visibly"
+    );
+    assert!(
+        reader_log.borrow().is_empty(),
+        "the original pending read must not be completed by the busy write"
+    );
+    assert!(
+        runtime.has_in_flight_calls(),
+        "the original read remains the one active pending operation"
+    );
+
+    let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TcpWrite,
+                reason: CallError::ResourceBusy,
+                ..
+            }
+        )),
+        "trace must record TcpWrite ResourceBusy failure: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpWrite,
+                ..
+            }
+        )),
+        "busy write must not complete successfully"
+    );
+}
+
+#[test]
+fn stream_close_while_read_pending_fails_resource_busy() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
+    let stream_slot = Rc::new(Cell::new(None));
+    let reader_log = Rc::new(RefCell::new(Vec::new()));
+    let closer_log = Rc::new(RefCell::new(Vec::new()));
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let binder = runtime.register(
+        Binder {
+            bind_addr,
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
+    runtime.step();
+    runtime.step();
+
+    let listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    let acceptor = runtime.register(
+        StreamAcceptor {
+            listener,
+            stream_slot: Rc::clone(&stream_slot),
+        },
+        TestMailbox::new(8),
+    );
+    runtime
+        .try_send(acceptor, AcceptStreamMsg::StartAccept)
+        .expect("ingress accepts StartAccept");
+    runtime.step();
+
+    let _client = TcpStream::connect(local_addr).expect("connect to listener");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while stream_slot.get().is_none() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for accepted stream; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    let stream = stream_slot.get().expect("accepted stream id");
+    let reader = runtime.register(
+        Reader {
+            stream,
+            log: Rc::clone(&reader_log),
+        },
+        TestMailbox::new(8),
+    );
+    let closer = runtime.register(
+        Closer {
+            log: Rc::clone(&closer_log),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(reader, ReaderMsg::StartRead)
+        .expect("ingress accepts StartRead");
+    runtime.step();
+    assert!(runtime.has_in_flight_calls());
+
+    runtime
+        .try_send(closer, CloserMsg::CloseStream(stream))
+        .expect("ingress accepts CloseStream");
+    runtime.step();
+    runtime.step();
+
+    assert_eq!(*closer_log.borrow(), vec![CloserMsg::FailedObserved]);
+    assert!(
+        reader_log.borrow().is_empty(),
+        "resource-busy close must not complete the active read"
+    );
+    assert!(
+        runtime.has_in_flight_calls(),
+        "active read stays pending after busy close rejection"
+    );
+
+    let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TcpStreamClose,
+                reason: CallError::ResourceBusy,
+                ..
+            }
+        )),
+        "trace must record TcpStreamClose ResourceBusy failure: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpStreamClose,
+                ..
+            }
+        )),
+        "busy stream close must not complete successfully"
     );
 }
 

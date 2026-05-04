@@ -1,3 +1,4 @@
+use super::driver::{DriverCompletion, RuntimeDriver};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -988,7 +989,7 @@ impl Isolate for Reader {
 }
 
 #[test]
-fn two_stream_reads_can_be_pending_in_io_backend_at_once() {
+fn two_stream_reads_can_be_pending_in_driver_at_once() {
     let bound_addr = Arc::new(Mutex::new(None));
     let accepted_streams = Arc::new(Mutex::new(Vec::new()));
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
@@ -1103,6 +1104,63 @@ fn new_manual_runtime() -> (Runtime<TestShard, TestMailboxFactory>, Rc<ManualClo
     let clock = Rc::new(ManualClock::new());
     let runtime = Runtime::with_clock(TestShard, TestMailboxFactory, Box::new(Rc::clone(&clock)));
     (runtime, clock)
+}
+
+#[derive(Debug)]
+struct FakeDriver {
+    submitted: Rc<RefCell<Vec<CallInput>>>,
+    pending: VecDeque<DriverCompletion>,
+    cancelled: Rc<Cell<bool>>,
+}
+
+impl FakeDriver {
+    fn new(submitted: Rc<RefCell<Vec<CallInput>>>) -> Self {
+        Self::with_cancelled(submitted, Rc::new(Cell::new(false)))
+    }
+
+    fn with_cancelled(submitted: Rc<RefCell<Vec<CallInput>>>, cancelled: Rc<Cell<bool>>) -> Self {
+        Self {
+            submitted,
+            pending: VecDeque::new(),
+            cancelled,
+        }
+    }
+}
+
+impl RuntimeDriver for FakeDriver {
+    fn submit(
+        &mut self,
+        call_id: CallId,
+        request: CallInput,
+        _now: Instant,
+    ) -> Option<DriverCompletion> {
+        self.submitted.borrow_mut().push(request);
+        self.pending.push_back(DriverCompletion {
+            call_id,
+            result: CallOutput::TimerFired,
+        });
+        None
+    }
+
+    fn advance(&mut self, _now: Instant) -> Vec<DriverCompletion> {
+        self.pending.drain(..).collect()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn cancel_pending(&mut self) {
+        self.cancelled.set(true);
+        self.pending.clear();
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        let before = self.pending.len();
+        self.pending
+            .retain(|completion| completion.call_id != call_id);
+        before != self.pending.len()
+    }
 }
 
 #[derive(Debug)]
@@ -2105,6 +2163,85 @@ fn timer_does_not_fire_early() {
         })
         .count();
     assert_eq!(fired_count, 0, "timer must not fire before deadline");
+}
+
+#[test]
+fn runtime_timer_path_can_use_non_betelgeuse_driver() {
+    let submitted = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::clone(&submitted))),
+    );
+    let sleeper = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(sleeper, TimerMsg::StartSleep).unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert!(runtime.has_in_flight_calls());
+    {
+        let submitted = submitted.borrow();
+        assert_eq!(submitted.len(), 1);
+        match &submitted[0] {
+            CallInput::Sleep { after } => assert_eq!(*after, Duration::from_millis(10)),
+            other => panic!("expected sleep request, got {other:?}"),
+        }
+    }
+
+    assert_eq!(runtime.step(), 1);
+    assert!(!runtime.has_in_flight_calls());
+    assert!(runtime.trace().iter().any(|event| matches!(
+        event.kind(),
+        RuntimeEventKind::CallCompleted {
+            call_kind: CallKind::Sleep,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn runtime_shutdown_cancels_non_betelgeuse_driver_pending_call() {
+    let submitted = Rc::new(RefCell::new(Vec::new()));
+    let cancelled = Rc::new(Cell::new(false));
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::with_cancelled(
+            Rc::clone(&submitted),
+            Rc::clone(&cancelled),
+        )),
+    );
+    let sleeper = runtime.register(
+        Sleeper {
+            delay: Duration::from_millis(10),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(sleeper, TimerMsg::StartSleep).unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert!(runtime.has_in_flight_calls());
+
+    runtime.cancel_in_flight_calls_for_shutdown();
+
+    assert!(cancelled.get(), "runtime must cancel pending driver ops");
+    assert!(!runtime.has_in_flight_calls());
+    assert!(runtime.trace().iter().any(|event| matches!(
+        event.kind(),
+        RuntimeEventKind::CallCompletionRejected {
+            call_kind: CallKind::Sleep,
+            reason: CallCompletionRejectedReason::RequesterClosed,
+            ..
+        }
+    )));
 }
 
 #[test]
