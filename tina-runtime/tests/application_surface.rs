@@ -1277,7 +1277,7 @@ fn simulated_io_local_server_keeps_partial_slow_peer_semantics_through_threaded_
 }
 
 #[test]
-fn local_server_supervision_restarts_worker_and_rejects_stale_address() {
+fn llama_supervised_worker_service_restarts_worker_and_rejects_stale_address() {
     let capacities = ServiceCapacities::default();
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));

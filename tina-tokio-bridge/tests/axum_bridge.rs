@@ -151,7 +151,7 @@ async fn brush(State(bridge): State<LlamaBridge>) -> (StatusCode, String) {
 }
 
 #[tokio::test]
-async fn axum_route_calls_tina_over_bounded_bridge() {
+async fn llama_http_bridge_service_routes_axum_to_tower_bridge() {
     let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,

@@ -98,7 +98,35 @@ Self-review fix:
 Remaining for Piet:
 
 - stronger lifecycle failure/worker-panic terminal proof;
-- named `llama_http_bridge_service`, `llama_supervised_worker_service`, and
-  simulator/DST parity workload;
+- performance-envelope artifact;
+- any API tightening discovered while moving more tests to `LocalApp`.
+
+## Implementation Review 2
+
+Status: named workload rails are now visible in the test suite.
+
+What changed:
+
+- Renamed the Axum/Tower bridge proof to
+  `llama_http_bridge_service_routes_axum_to_tower_bridge`.
+- Renamed the local supervision proof to
+  `llama_supervised_worker_service_restarts_worker_and_rejects_stale_address`.
+- Renamed the simulator oracle proof to
+  `llama_sim_dst_parity_service_replays_bounded_worker_pressure_and_partial_writes`.
+- `llama_tcp_timer_service_uses_local_app_runtime_owned_time` already landed in
+  the new `LocalApp` test file.
+
+Targeted verification:
+
+- `cargo test -p tina-runtime --test local_app`
+- `cargo test -p tina-runtime --test application_surface llama_supervised_worker_service`
+- `cargo test -p tina-sim --test application_surface llama_sim_dst_parity_service`
+- `cargo test -p tina-tokio-bridge --test axum_bridge llama_http_bridge_service`
+
+All pass locally.
+
+Remaining for Piet:
+
+- stronger lifecycle failure/worker-panic terminal proof;
 - performance-envelope artifact;
 - any API tightening discovered while moving more tests to `LocalApp`.

@@ -580,7 +580,7 @@ fn run_local_server_oracle(seed: u64) -> LocalServerOracleRun {
 }
 
 #[test]
-fn local_server_oracle_replays_bounded_worker_pressure_and_partial_writes() {
+fn llama_sim_dst_parity_service_replays_bounded_worker_pressure_and_partial_writes() {
     let first = run_local_server_oracle(30);
     let replayed = run_local_server_oracle(30);
 
