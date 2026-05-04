@@ -1,9 +1,8 @@
-# 028 Ranger Substrate Driver Maturity Plan
+# 028 Ranger Core Runtime Substrate Completion Plan
 
 ## Purpose
 
-Move Tina's live substrate story from narrow live implementation to
-real-workload foundation.
+Finish Tina's core runtime substrate.
 
 026 gave Tina a driver boundary for runtime-owned time and TCP. That was the
 right boundary, but the substrate story is not yet strong enough to build
@@ -11,11 +10,17 @@ service-shaped framework work on top of it. Ranger should harden the driver
 and live runtime substrate before Gemini documents it or a later phase builds
 service patterns around it.
 
-This is not a service example phase, not a Tokio bridge phase, and not release
-polish. It is the next core framework phase for answering:
+This is not a service example phase, not a Tokio bridge phase, not a narrow
+polish pass, and not release documentation. It is the core-completion phase
+for answering:
 
 > What must be true about the live driver/runtime substrate before Tina can
 > honestly support real workloads?
+
+Ranger should be as large as it needs to be to settle Tina core. It should not
+close merely because one neat slice landed. It closes when the remaining work
+is service patterns, docs, ecosystem adapters, benchmarks, packaging, and
+production polish rather than basic runtime/substrate semantics.
 
 ## Context
 
@@ -37,13 +42,50 @@ Those phases leave several live-substrate gaps:
   need a clearer contract.
 
 Ranger should close or explicitly pin these gaps before service workload
-hardening begins.
+hardening begins. If implementation exposes another core runtime/substrate gap,
+that gap belongs in Ranger unless it is clearly an ecosystem adapter, docs,
+benchmarking, or post-core production-operations concern.
+
+## Phase Size
+
+Ranger is intentionally allowed to be large.
+
+Do not split work just to keep the phase small if the split would leave Tina's
+core runtime substrate half-settled. Smaller commits and internal review
+checkpoints are good; premature phase closeout is not.
+
+The standard is:
+
+> After Ranger, Tina core is done enough that later phases build on it instead
+> of reopening runtime/substrate fundamentals.
+
+If that standard requires multiple implementation chunks, keep them inside
+Ranger and record progress in `review.md`.
+
+## Expected Direction
+
+Default path: keep hardening the vendored Betelgeuse-backed driver for Ranger.
+
+Ranger should not begin by building a Tokio, Monoio, Glommio, or Compio
+adapter. Those remain future substrate options unless Betelgeuse blocks a core
+semantic that Ranger must settle. If Betelgeuse does block a required semantic,
+pause and record why the project is changing substrate direction before
+implementing an adapter or Tina-owned completion substrate.
+
+The expected core outcome is:
+
+- Betelgeuse remains the near-term live substrate;
+- Tina's `RuntimeDriver` contract becomes precise enough that another driver
+  can implement it later;
+- simulator and live behavior stay aligned for modeled time/TCP semantics;
+- future adapter work becomes an implementation of a settled contract, not a
+  redesign of Tina core.
 
 ## Scope
 
 ### 1. Driver Capability Contract
 
-Turn the 026 driver boundary into a capability contract.
+Turn the 026 driver boundary into a real capability contract.
 
 Name what a Tina runtime driver must provide for real workloads:
 
@@ -54,6 +96,10 @@ Name what a Tina runtime driver must provide for real workloads:
 - explicit progress through runtime-owned steps or worker turns;
 - deterministic simulator compatibility where applicable;
 - traceable cancellation, shutdown, and substrate failure.
+
+The contract should be written where future driver implementers will see it,
+not only in phase notes. `review.md` should record the reasoning and remaining
+non-claims.
 
 Record capability gaps in `review.md`. Do not hide a missing capability behind
 silent fallback behavior.
@@ -120,6 +166,10 @@ Ranger does not need to implement a new adapter unless the existing substrate
 blocks the phase's required semantics. But Ranger must leave the roadmap with
 a clear next substrate direction, not another open-ended research note.
 
+If Betelgeuse is selected as the near-term substrate, Ranger must say what
+that means concretely: which semantics are now supported, which are explicitly
+not, and what would trigger revisiting the choice.
+
 ### 6. Cost And Allocation Pressure
 
 Measure enough to keep substrate claims honest:
@@ -142,6 +192,56 @@ It exists only to catch driver/lifecycle bugs that unit tests miss.
 
 Defer real service framework hardening until after the substrate/driver story
 is ready.
+
+### 8. Core Boundary Closeout
+
+At the end of Ranger, write down what is now considered Tina core and what is
+not.
+
+Core should include at least:
+
+- isolate scheduling and bounded mailboxes;
+- local and cross-shard delivery semantics;
+- supervision/restart semantics already settled by prior phases;
+- runtime-owned time;
+- runtime-owned TCP at the capability level Ranger settles;
+- driver progress/cancel/shutdown semantics;
+- simulator/live parity boundaries;
+- allocation and buffering claims that the core is willing to make.
+
+Non-core should include at least:
+
+- Tower/Axum/Hyper integration;
+- arbitrary futures inside isolate handlers;
+- broad protocol libraries;
+- service-framework convenience APIs;
+- release docs and packaging;
+- throughput benchmarks beyond narrow substrate measurements.
+
+## Build Order
+
+1. **Capability audit.** Read the current live driver, threaded runtime,
+   simulated Betelgeuse driver/runtime, and `tina-sim` TCP/time paths. Produce
+   the capability contract and a gap list in `review.md` before changing
+   behavior.
+2. **TCP lanes.** Implement or explicitly defer lane-based TCP concurrency:
+   listener accept lane, stream read lane, stream write lane, and close
+   rejection while lanes are active. Keep live, simulated driver, and `tina-sim`
+   aligned where the behavior is modeled.
+3. **Cancellation and shutdown.** Harden stopped-requester, explicit close,
+   runtime shutdown, late completion, requester-mailbox-full completion, and
+   timeout races against the lane model.
+4. **Cost pressure.** Add or update allocation/operation probes for the named
+   hot paths. Record which costs come from core semantics and which are current
+   implementation overhead.
+5. **Minimal service smoke.** Add only enough service-shaped workload to catch
+   lifecycle/substrate bugs missed by focused tests.
+6. **Substrate decision and core boundary.** Record the near-term substrate
+   decision, core/non-core boundary, and any remaining non-claims in
+   `review.md` and the roadmap.
+
+Each chunk should leave `make verify` green before moving to the next chunk
+unless a pause gate is active.
 
 ## Refusals
 
@@ -167,6 +267,8 @@ Pause and record a design decision if:
 - implementing a Tokio/Monoio/Glommio/Compio adapter becomes necessary rather
   than future work;
 - service-shaped work starts dominating the substrate phase.
+- a discovered issue appears to require a new core primitive rather than a
+  driver/runtime implementation change.
 
 ## Review Prompts
 
@@ -198,4 +300,9 @@ Ask reviewers to focus on:
   a deliberate change.
 - `review.md` records capability gaps, design decisions, cost evidence, and
   remaining non-claims.
+- `review.md` records the core boundary: what Tina core now includes, what is
+  deliberately outside core, and why later phases should not need to reopen
+  runtime/substrate fundamentals.
+- Later service/docs/adapter phases can proceed without depending on unresolved
+  core runtime substrate questions.
 - `make verify` passes.
