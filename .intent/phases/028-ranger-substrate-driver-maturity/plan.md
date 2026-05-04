@@ -243,6 +243,25 @@ Non-core should include at least:
 Each chunk should leave `make verify` green before moving to the next chunk
 unless a pause gate is active.
 
+## Production-ish Next Layer
+
+Ranger should close Tina's core runtime/substrate semantics, not every
+production concern. The next production-ish layer after Ranger should focus on
+hardening the implementation around the settled contract:
+
+- reduce or justify hot-path allocation sources such as boxed completions,
+  erased translators, trace growth, and replay artifacts;
+- add stronger shutdown/drop safety probes around backends that hold external
+  completion ownership;
+- decide whether requester-stop should cancel pending isolate-call waits the
+  same way it cancels driver calls, or keep isolate-call settlement as
+  reply/timeout-driven;
+- turn the driver contract into adapter guidance for a future Tokio
+  current-thread, Monoio, Glommio, Compio, or Tina-owned substrate.
+
+Those are production-hardening and adapter-readiness tasks. They should not
+reopen the core lane/cancel/shutdown semantics Ranger settles.
+
 ## Refusals
 
 - Do not build `tina-runtime-tokio-bridge` in Ranger unless the phase pauses

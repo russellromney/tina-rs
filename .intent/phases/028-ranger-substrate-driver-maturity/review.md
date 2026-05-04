@@ -248,3 +248,94 @@ Remaining honest non-claims:
 Full verification:
 
 - `make verify` passed.
+
+## Implementation Review 7 - Shutdown/Oracle Bug Fixes
+
+External review found two real Ranger bugs.
+
+Fixed live shutdown:
+
+- `BetelgeuseTcp::cancel_pending()` no longer drops completion boxes while a
+  Betelgeuse backend may still hold raw completion pointers.
+- Shutdown now marks pending TCP ops canceled, closes all TCP resources, drains
+  canceled completions for bounded steps, and intentionally leaks any
+  still-owned slots rather than risking a dangling completion pointer.
+- The threaded simulated-I/O shutdown proof now steps the external
+  `SimulatedIO` after runtime shutdown, so the test pressures the exact
+  post-shutdown ownership edge.
+
+Fixed simulator oracle stop semantics:
+
+- `tina-sim` now cancels requester-owned backend calls when an isolate stops.
+- The cancel path removes timers, pending accepts, pending TCP completions, the
+  in-flight call entry, and the stored translator, then records
+  `CallCompletionRejected { reason: RequesterClosed }`.
+- Timer, accept, read, and write stopped-requester tests now prove immediate
+  quiescence after stop rather than waiting for future completion.
+
+This keeps live runtime and oracle aligned: stopped requester cancels
+runtime-driver work immediately. Isolate-call waits remain reply/timeout-driven
+in this slice and are named in the plan as production-ish follow-up decision
+surface.
+
+Focused and full verification:
+
+- `cargo +nightly test -p tina-runtime --test betelgeuse_substrate` passed.
+- `cargo +nightly test -p tina-sim --test timer_semantics` passed.
+- `cargo +nightly test -p tina-sim --test io_simulation` passed.
+- `make verify` passed.
+
+## Implementation Review 8 - Tina/Odin Alignment
+
+Sources checked:
+
+- Peter Mbanugo's "Why Queues Don't Fix Overload";
+- `pmbanugo/tina` README;
+- Tina concepts docs for isolates, thread-per-core, I/O/data flow,
+  backpressure, and supervision.
+
+Spirit alignment is strong:
+
+- Tina-rs keeps the main mental model: Isolates are synchronous state machines
+  that return Effects; user code does not become async/await.
+- Mailboxes and cross-shard queues are bounded and surface explicit failure.
+- Runtime-owned calls make time and TCP scheduler effects, not user syscalls.
+- Deterministic simulation is first-class: same isolate-shaped code can be run
+  under an oracle with replay and fault injection.
+- Shards are stable ownership domains; live Betelgeuse workers keep each shard
+  runtime owned by one OS thread.
+- Generational addresses, stale-address rejection, supervision restart budgets,
+  and abandoned-message tracing match the original safety direction.
+
+Letter differences remain and should stay honest:
+
+- Original Odin Tina is built around preallocated arenas, fixed envelopes, and no
+  dynamic allocation after boot. Tina-rs currently allocates in broader runtime
+  paths and has measured those costs rather than eliminating them.
+- Original Tina's `ctx_send` returns a synchronous `Send_Result` in the handler.
+  Tina-rs has immediate ingress outcomes and observed-send outcomes, but ordinary
+  Effects still express work for the runtime to interpret on later turns.
+- Original Tina uses platform reactors (`io_uring`/`kqueue`/`IOCP`) with
+  reactor-owned buffer pools. Tina-rs currently uses a Betelgeuse-backed driver
+  contract and boxed completion slots; the substrate shape is honest but not yet
+  the same implementation letter.
+- Original Tina claims trap-boundary recovery for panics and segfaults. Tina-rs
+  catches Rust panics and uses supervision, but it does not structurally recover
+  from arbitrary native memory faults inside the same process.
+- Original Tina describes one outstanding call/I/O per Isolate, with full-duplex
+  protocols decomposed into cooperating Isolates. Ranger's TCP lane model allows
+  read/write overlap on one stream at the resource level while preserving one
+  returned Effect per handler turn.
+
+Production-ish upgrades suggested by the comparison:
+
+- reduce hot-path allocation pressure or make the allocation budget part of the
+  public contract;
+- decide whether Rust should grow arena/envelope-style message storage closer to
+  Odin Tina, or keep `Box<dyn Any>` as an experimental implementation trade;
+- keep tightening true per-operation cancel/resource ownership so canceled
+  tombstones do not become long-lived resource friction;
+- define the real reactor/substrate adapter story against the settled
+  `RuntimeDriver` contract;
+- keep the README language careful: Tina-rs is spiritually Tina, but not yet
+  Odin Tina's zero-allocation, platform-reactor, segfault-trap implementation.

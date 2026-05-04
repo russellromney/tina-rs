@@ -3116,6 +3116,11 @@ where
         self.entries[index].inbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
+        self.cancel_backend_calls_for_requester(RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: isolate_id,
+            generation: self.entries[index].generation,
+        });
         if precollected.is_some() {
             self.push_event(
                 isolate_id,
@@ -3131,6 +3136,44 @@ where
             );
         }
         stopped
+    }
+
+    fn cancel_backend_calls_for_requester(&mut self, requester: RegisteredAddress) {
+        let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
+        for call in in_flight_calls {
+            if call.requester == requester {
+                self.cancel_pending_backend_work(call.call_id);
+                self.remove_backend_translator(call.call_id);
+                self.push_event(
+                    call.requester.isolate,
+                    Some(call.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id: call.call_id,
+                        call_kind: call.call_kind,
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                    },
+                );
+            } else {
+                self.in_flight_calls.push(call);
+            }
+        }
+    }
+
+    fn cancel_pending_backend_work(&mut self, call_id: CallId) {
+        self.timers.retain(|timer| timer.call_id != call_id);
+        self.pending_accepts
+            .retain(|pending| pending.call_id != call_id);
+        self.pending_tcp_completions
+            .retain(|completion| completion.call_id != call_id);
+    }
+
+    fn remove_backend_translator(&mut self, call_id: CallId) {
+        let translator_index = self
+            .translators
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+            .unwrap_or_else(|| panic!("missing simulator translator for call {call_id:?}"));
+        self.translators.remove(translator_index);
     }
 
     fn push_event(

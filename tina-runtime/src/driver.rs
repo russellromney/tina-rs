@@ -391,13 +391,25 @@ impl BetelgeuseTcp {
         self.pending.iter().any(|op| !op.cancelled)
     }
 
-    /// Drops pending TCP operations during runtime shutdown.
+    /// Cancels pending TCP operations during runtime shutdown.
     ///
     /// Tina emits requester-facing shutdown/cancel trace events from
     /// `Runtime`; TCP state only owns the substrate completion slots and
     /// resource handles.
     fn cancel_pending(&mut self) {
-        self.pending.clear();
+        for op in &mut self.pending {
+            op.cancelled = true;
+        }
+        self.close_all_resources();
+        self.drain_cancelled_pending_for_shutdown();
+        if !self.pending.is_empty() {
+            // Betelgeuse backends own raw pointers to caller-owned completion
+            // slots while operations are pending. If a backend cannot be drained
+            // during shutdown, leaking the slots is preferable to dropping them
+            // while the backend may still complete into their addresses.
+            let leaked = std::mem::take(&mut self.pending);
+            std::mem::forget(leaked);
+        }
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
@@ -415,6 +427,35 @@ impl BetelgeuseTcp {
     #[cfg(test)]
     fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    fn close_all_resources(&mut self) {
+        for entry in std::mem::take(&mut self.listeners) {
+            entry.socket.close();
+        }
+        for entry in std::mem::take(&mut self.streams) {
+            entry.socket.close();
+        }
+    }
+
+    fn drain_cancelled_pending_for_shutdown(&mut self) {
+        const SHUTDOWN_DRAIN_STEPS: usize = 64;
+
+        for _ in 0..SHUTDOWN_DRAIN_STEPS {
+            if self.pending.is_empty() {
+                return;
+            }
+
+            let _ = self.io_loop.step();
+            let mut still_pending = Vec::with_capacity(self.pending.len());
+            for op in std::mem::take(&mut self.pending) {
+                if op.kind.has_result() {
+                    continue;
+                }
+                still_pending.push(op);
+            }
+            self.pending = still_pending;
+        }
     }
 
     fn try_complete(&mut self, op: &mut PendingOperation) -> Option<CallOutput> {

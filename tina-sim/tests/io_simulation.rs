@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tina::{
     Address, Context, Effect, Isolate, IsolateId, Outbound, RestartBudget, RestartPolicy,
@@ -1691,7 +1692,13 @@ fn stopped_requester_rejects_pending_accept_completion() {
     sim.try_send(waiter, WaiterMsg::StartAccept).unwrap();
     sim.step();
     sim.try_send(waiter, WaiterMsg::StopNow).unwrap();
-    sim.run_until_quiescent();
+    assert_eq!(sim.step(), 1);
+    assert!(
+        !sim.has_in_flight_calls(),
+        "stopped requester should cancel its pending accept immediately"
+    );
+    sim.advance_time(Duration::from_millis(10));
+    assert_eq!(sim.step(), 0);
 
     assert!(log.borrow().is_empty());
     assert!(sim.trace().iter().any(|event| {
@@ -1749,7 +1756,14 @@ fn stopped_requester_rejects_pending_read_completion() {
     sim.try_send(reader, ReadProbeMsg::StartRead).unwrap();
     sim.step();
     sim.try_send(reader, ReadProbeMsg::StopNow).unwrap();
-    sim.run_until_quiescent();
+    assert_eq!(sim.step(), 1);
+    assert!(
+        !sim.has_in_flight_calls(),
+        "stopped requester should cancel its pending read immediately"
+    );
+    for _ in 0..3 {
+        assert_eq!(sim.step(), 0);
+    }
 
     assert!(read_log.borrow().is_empty());
     assert!(sim.trace().iter().any(|event| {
@@ -1807,7 +1821,14 @@ fn stopped_requester_rejects_pending_write_completion() {
     sim.try_send(writer, WriteProbeMsg::StartWrite).unwrap();
     sim.step();
     sim.try_send(writer, WriteProbeMsg::StopNow).unwrap();
-    sim.run_until_quiescent();
+    assert_eq!(sim.step(), 1);
+    assert!(
+        !sim.has_in_flight_calls(),
+        "stopped requester should cancel its pending write immediately"
+    );
+    for _ in 0..3 {
+        assert_eq!(sim.step(), 0);
+    }
 
     assert!(write_log.borrow().is_empty());
     assert!(sim.trace().iter().any(|event| {

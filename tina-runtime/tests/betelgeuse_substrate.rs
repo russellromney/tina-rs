@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use betelgeuse::io::simulated::SimulatedIO;
+use betelgeuse::{IOLoop, io::simulated::SimulatedIO};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseControlError, BetelgeuseMultiShardRuntime, BetelgeuseRuntime,
@@ -393,6 +393,11 @@ fn betelgeuse_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
     });
 
     let trace = runtime.shutdown().expect("Betelgeuse shutdown");
+    for _ in 0..3 {
+        simulated_io
+            .step()
+            .expect("external simulated I/O step after shutdown stays safe");
+    }
     assert!(
         observed.lock().expect("observed mutex").is_empty(),
         "shutdown must not deliver translated accept completion"

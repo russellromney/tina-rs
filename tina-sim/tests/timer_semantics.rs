@@ -288,6 +288,20 @@ fn stopped_requester_rejects_timer_completion() {
     });
     sim.try_send(sleeper, TimerMsg::StartAndStop).unwrap();
     assert_eq!(sim.step(), 1);
+    assert!(
+        !sim.has_in_flight_calls(),
+        "stopped requester should cancel its pending timer immediately"
+    );
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::Sleep,
+                reason: CallCompletionRejectedReason::RequesterClosed,
+                ..
+            }
+        )
+    }));
 
     sim.advance_time(Duration::from_millis(10));
     assert_eq!(sim.step(), 0);
