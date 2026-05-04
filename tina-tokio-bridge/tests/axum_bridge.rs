@@ -12,11 +12,11 @@ use axum::routing::get;
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, MailboxFactory, RuntimeEventKind,
+    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, MailboxFactory, RuntimeEventKind, sleep,
 };
 use tina_tokio_bridge::{
     BRIDGE_CAPABILITIES, BridgeBackpressure, BridgeError, BridgeHandle, BridgeHealth, BridgeHost,
-    BridgeRequest, BridgeResponder, CapabilityStatus,
+    BridgeMessage, BridgeRequest, BridgeResponder, BridgeShutdownError, CapabilityStatus,
 };
 use tower::ServiceExt;
 
@@ -199,7 +199,7 @@ async fn axum_route_calls_tina_over_bounded_bridge() {
 
 #[tokio::test]
 async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
-    let host = BridgeHost::new(
+    let mut host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
         BetelgeuseBackedRuntimeConfig {
@@ -223,11 +223,13 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
         })
     );
     assert!(
-        host.shutdown().is_err(),
+        matches!(host.try_shutdown(), Err(BridgeShutdownError::StillShared)),
         "live bridge handle keeps host shared"
     );
+    drop(bridge);
+    let _ = host.try_shutdown().expect("retryable host shutdown");
 
-    let host = BridgeHost::new(
+    let mut host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
         BetelgeuseBackedRuntimeConfig {
@@ -244,7 +246,7 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
         )
         .expect("register bridge service");
     drop(bridge);
-    let _ = host.shutdown().expect("host shutdown");
+    let _ = host.try_shutdown().expect("host shutdown");
 }
 
 #[tokio::test]
@@ -382,6 +384,80 @@ impl HoldingWorker {
 }
 
 #[derive(Debug)]
+enum ScheduledMsg {
+    Request(BridgeRequest<BrushRequest, BrushReply>),
+    Ready(BridgeRequest<BrushRequest, BrushReply>),
+}
+
+impl From<BridgeRequest<BrushRequest, BrushReply>> for ScheduledMsg {
+    fn from(request: BridgeRequest<BrushRequest, BrushReply>) -> Self {
+        Self::Request(request)
+    }
+}
+
+impl BridgeMessage for ScheduledMsg {
+    fn bridge_cancelled(&self) -> bool {
+        match self {
+            Self::Request(request) | Self::Ready(request) => request.is_cancelled(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScheduledWorker {
+    completed: usize,
+}
+
+#[tina_runtime::isolate(message = ScheduledMsg, shard = BridgeShard)]
+impl ScheduledWorker {
+    fn handle(&mut self, msg: ScheduledMsg, _ctx: &mut Context<'_, BridgeShard>) -> Effect<Self> {
+        match msg {
+            ScheduledMsg::Request(request) => {
+                sleep(Duration::from_millis(1)).reply(move |_| ScheduledMsg::Ready(request))
+            }
+            ScheduledMsg::Ready(request) => {
+                let (request, responder) = request.into_parts();
+                self.completed += 1;
+                let _ = responder.respond(BrushReply {
+                    line: format!("{} scheduled {}", request.llama, self.completed),
+                });
+                noop()
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bridge_host_can_register_runtime_call_service_message_enum() {
+    let host = BridgeHost::new(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let bridge = host
+        .register_bridge::<ScheduledWorker, BrushRequest, BrushReply, Infallible>(
+            ScheduledWorker { completed: 0 },
+            8,
+            Duration::from_secs(1),
+        )
+        .expect("register scheduled worker");
+
+    assert_eq!(
+        bridge.call(BrushRequest { llama: "Tina" }).await,
+        Ok(BrushReply {
+            line: "Tina scheduled 1".to_string()
+        })
+    );
+
+    drop(bridge);
+    let _ = host.shutdown().expect("host shutdown");
+}
+
+#[derive(Debug)]
 struct BlockingWorker {
     entered: SyncSender<()>,
     release: Receiver<()>,
@@ -406,7 +482,7 @@ impl BlockingWorker {
 }
 
 #[tokio::test]
-async fn bridge_records_worker_observed_full_even_after_caller_timeout() {
+async fn bridge_records_worker_preflight_cancel_after_caller_timeout() {
     let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
@@ -455,17 +531,17 @@ async fn bridge_records_worker_observed_full_even_after_caller_timeout() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(1);
-    while full_bridge.metrics().full == 0 {
+    while full_bridge.metrics().closed == 0 {
         assert!(
             Instant::now() < deadline,
-            "worker-observed mailbox Full should still be counted after caller timeout"
+            "worker-side preflight should observe cancelled queued work after caller timeout"
         );
         tokio::task::yield_now().await;
     }
 
     assert_eq!(full_bridge.metrics().attempts, 1);
     assert_eq!(full_bridge.metrics().timeout, 1);
-    assert_eq!(full_bridge.metrics().full, 1);
+    assert_eq!(full_bridge.metrics().closed, 1);
 
     drop(full_bridge);
     let runtime = match Arc::try_unwrap(runtime) {
@@ -473,6 +549,67 @@ async fn bridge_records_worker_observed_full_even_after_caller_timeout() {
         Err(_) => panic!("bridge handles dropped"),
     };
     let _ = runtime.shutdown().expect("runtime shutdown");
+}
+
+#[tokio::test]
+async fn bridge_host_skips_cancelled_queued_request_before_user_state_mutates() {
+    let host = BridgeHost::new(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let blocker = host
+        .register_bridge::<BlockingWorker, GateRequest, GateReply, Infallible>(
+            BlockingWorker {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            8,
+            Duration::from_secs(5),
+        )
+        .expect("register blocking worker");
+    let scheduled = host
+        .register_bridge::<ScheduledWorker, BrushRequest, BrushReply, Infallible>(
+            ScheduledWorker { completed: 0 },
+            8,
+            Duration::from_secs(1),
+        )
+        .expect("register scheduled worker");
+
+    let blocker_task = tokio::spawn(async move { blocker.call(GateRequest("released")).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(1)))
+        .await
+        .expect("entered wait task")
+        .expect("blocking handler entered");
+
+    assert_eq!(
+        scheduled
+            .call_with_timeout(BrushRequest { llama: "Tina" }, Duration::from_millis(1))
+            .await,
+        Err(BridgeError::Timeout)
+    );
+
+    release_tx.send(()).expect("release blocking handler");
+    assert_eq!(
+        blocker_task.await.expect("blocker task"),
+        Ok(GateReply("released"))
+    );
+
+    assert_eq!(
+        scheduled.call(BrushRequest { llama: "Tina" }).await,
+        Ok(BrushReply {
+            line: "Tina scheduled 1".to_string()
+        })
+    );
+
+    drop(scheduled);
+    let _ = host.shutdown().expect("host shutdown");
 }
 
 #[tokio::test]

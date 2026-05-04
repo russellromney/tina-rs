@@ -78,3 +78,18 @@ Review notes:
   the worker-observed callback for mailbox admission outcomes. Regression proof:
   if the caller times out while the worker is blocked, a later target
   mailbox-`Full` observation is still counted instead of disappearing.
+
+Fourth pass after review findings:
+
+- Bridge timeout/cancellation now has behavior, not just prose. Each bridge
+  request carries a cancellation token. If Tokio drops or times out before the
+  worker admits the request, worker-side preflight rejects it. If the request is
+  already in a host-registered mailbox but has not reached user code, the
+  `BridgeGuard` skips the user handler so state does not mutate.
+- `BridgeHost::register_bridge` now supports larger service message enums via
+  `From<BridgeRequest<M, R>> + BridgeMessage`, so a bridge-facing service can
+  also use runtime calls such as `sleep(...)` in the same isolate.
+- `BridgeHost::try_shutdown` keeps the host intact on `StillShared`, making
+  "drop handles, retry shutdown" the natural lifecycle path.
+- `BridgeBackpressure::Retry` now names `max_retries`; docs call the timeout
+  parameter a per-attempt timeout.

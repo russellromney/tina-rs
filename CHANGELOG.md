@@ -24,6 +24,10 @@ This file records completed work.
 - Added bridge compile-fail guardrails for non-`Send` requests and wrong
   response shapes, plus tests for lifecycle, metrics, cancellation, timeout,
   overload, and clean host shutdown.
+- Tightened bridge timeout/cancellation semantics: host-registered services
+  skip cancelled queued requests before user state mutates, bridge handles can
+  map requests into larger service message enums, and `BridgeHost::try_shutdown`
+  can be retried after handles are dropped.
 - Added `TINA_DRIVER_RUNTIME_CONTRACT` to name Tina's driver-runtime target:
   completion-shaped I/O, bounded commands, explicit cancellation, owned
   shutdown, explicit progress, deterministic simulation, no hidden executor

@@ -199,7 +199,8 @@ This repo is a Cargo workspace with six crates:
   checkers, scripted TCP, and replay.
 - **`tina-tokio-bridge`**: narrow bounded ingress from Tokio/Tower/Axum into a
   Tina service, with explicit health, metrics, timeout, cancellation, and
-  overload policies. Tokio owns the edge. Tina owns the isolate state.
+  overload policies. Bridge-hosted services can use ordinary Tina message enums,
+  so runtime calls still fit. Tokio owns the edge. Tina owns the isolate state.
 
 You can write isolates against the modern surface: `Outbound`,
 `ChildDefinition`, `RestartableChildDefinition`, `RuntimeCall`, `CallInput`,

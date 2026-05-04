@@ -2763,7 +2763,33 @@ where
         R: 'static,
         O: FnOnce(Result<(), BetelgeuseBackedSendObservedError>) + Send + 'static,
     {
+        self.try_send_and_observe_with_preflight(address, message, |_| None, observer)
+    }
+
+    /// Attempts one typed ingress send with a worker-side preflight check.
+    ///
+    /// The preflight runs on the worker thread immediately before mailbox
+    /// admission. It is for already-queued commands that may have become stale
+    /// before the worker could observe them; it must stay nonblocking.
+    pub fn try_send_and_observe_with_preflight<M, R, P, O>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        preflight: P,
+        observer: O,
+    ) -> Result<(), BetelgeuseBackedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        P: FnOnce(&M) -> Option<BetelgeuseBackedSendObservedError> + Send + 'static,
+        O: FnOnce(Result<(), BetelgeuseBackedSendObservedError>) + Send + 'static,
+    {
         let command = BetelgeuseCommand::Run(Box::new(move |runtime| {
+            if let Some(error) = preflight(&message) {
+                observer(Err(error));
+                return;
+            }
+
             observer(
                 runtime
                     .try_send(address, message)

@@ -34,8 +34,8 @@ use std::time::Duration;
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
 use tina_runtime::{
     BetelgeuseBackedControlError, BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig,
-    BetelgeuseBackedSendObservedError, BetelgeuseBackedTrySendError, CallError, MailboxFactory,
-    RuntimeEvent, SendRejectedReason,
+    BetelgeuseBackedSendObservedError, BetelgeuseBackedTrySendError, CallError, IntoErasedCall,
+    MailboxFactory, RuntimeEvent, SendRejectedReason,
 };
 use tokio::sync::oneshot;
 use tower_service::Service;
@@ -95,7 +95,7 @@ pub enum BridgeBackpressure {
     /// Retry `Full` with an explicit delay and bounded retry count.
     Retry {
         /// Number of additional attempts after the first failed attempt.
-        attempts: usize,
+        max_retries: usize,
         /// Delay between attempts.
         delay: Duration,
     },
@@ -107,9 +107,12 @@ impl BridgeBackpressure {
         Self::Reject
     }
 
-    /// Retry overload with an explicit delay and retry count.
-    pub const fn retry(attempts: usize, delay: Duration) -> Self {
-        Self::Retry { attempts, delay }
+    /// Retry overload with an explicit delay and maximum retry count.
+    ///
+    /// `max_retries` counts retries after the first attempt, so
+    /// `retry(2, delay)` can make at most three attempts.
+    pub const fn retry(max_retries: usize, delay: Duration) -> Self {
+        Self::Retry { max_retries, delay }
     }
 }
 
@@ -191,6 +194,109 @@ enum BridgeWaitOutcome<R> {
     ReplyClosed,
 }
 
+struct BridgeCancellation {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl BridgeCancellation {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BridgeCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Message types accepted by a bridge handle.
+///
+/// Bridge-hosted services can use a larger service enum instead of accepting
+/// [`BridgeRequest`] directly. Implement this trait by returning whether the
+/// wrapped bridge request has been cancelled; runtime completion messages
+/// should normally return `false`.
+pub trait BridgeMessage {
+    /// Returns whether this message wraps a cancelled bridge request.
+    fn bridge_cancelled(&self) -> bool;
+}
+
+struct BridgeGuard<I> {
+    inner: I,
+}
+
+impl<I> BridgeGuard<I> {
+    fn new(inner: I) -> Self {
+        Self { inner }
+    }
+}
+
+impl<I> std::fmt::Debug for BridgeGuard<I>
+where
+    I: std::fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BridgeGuard")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<I> Isolate for BridgeGuard<I>
+where
+    I: Isolate,
+    I::Message: BridgeMessage,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+    type Send = I::Send;
+    type Spawn = I::Spawn;
+    type Call = I::Call;
+    type Shard = I::Shard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut tina::Context<'_, Self::Shard>,
+    ) -> tina::Effect<Self> {
+        if msg.bridge_cancelled() {
+            return tina::noop();
+        }
+
+        remap_effect(self.inner.handle(msg, ctx))
+    }
+}
+
+fn remap_effect<I>(effect: tina::Effect<I>) -> tina::Effect<BridgeGuard<I>>
+where
+    I: Isolate,
+    I::Message: BridgeMessage,
+{
+    match effect {
+        tina::Effect::Noop => tina::Effect::Noop,
+        tina::Effect::Reply(reply) => tina::Effect::Reply(reply),
+        tina::Effect::Send(send) => tina::Effect::Send(send),
+        tina::Effect::Spawn(spawn) => tina::Effect::Spawn(spawn),
+        tina::Effect::Stop => tina::Effect::Stop,
+        tina::Effect::RestartChildren => tina::Effect::RestartChildren,
+        tina::Effect::Call(call) => tina::Effect::Call(call),
+        tina::Effect::Batch(effects) => {
+            tina::Effect::Batch(effects.into_iter().map(remap_effect).collect())
+        }
+    }
+}
+
 impl From<BetelgeuseBackedTrySendError> for BridgeError {
     fn from(error: BetelgeuseBackedTrySendError) -> Self {
         match error {
@@ -238,6 +344,7 @@ impl From<BridgeError> for SendRejectedReason {
 pub struct BridgeRequest<M, R> {
     message: M,
     responder: BridgeResponder<R>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<M, R> BridgeRequest<M, R> {
@@ -249,22 +356,40 @@ impl<M, R> BridgeRequest<M, R> {
                 sender: Some(sender),
                 state: None,
             },
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn with_metrics(message: M, sender: oneshot::Sender<R>, state: Arc<BridgeState>) -> Self {
+    fn with_metrics(
+        message: M,
+        sender: oneshot::Sender<R>,
+        state: Arc<BridgeState>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             message,
             responder: BridgeResponder {
                 sender: Some(sender),
                 state: Some(state),
             },
+            cancelled,
         }
+    }
+
+    /// Returns whether the Tokio caller has cancelled or timed out.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
     /// Splits the bridge request into the user message and responder.
     pub fn into_parts(self) -> (M, BridgeResponder<R>) {
         (self.message, self.responder)
+    }
+}
+
+impl<M, R> BridgeMessage for BridgeRequest<M, R> {
+    fn bridge_cancelled(&self) -> bool {
+        self.is_cancelled()
     }
 }
 
@@ -306,13 +431,17 @@ impl<R> BridgeResponder<R> {
     }
 }
 
+/// Bridge handle returned when a [`BridgeHost`] registers an isolate.
+pub type RegisteredBridgeHandle<M, R, S, F, I> =
+    BridgeHandle<M, R, S, F, <I as Isolate>::Reply, <I as Isolate>::Message>;
+
 /// Owns one Betelgeuse-backed Tina runtime for bridge-hosted services.
 pub struct BridgeHost<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    runtime: Arc<BetelgeuseBackedRuntime<S, F>>,
+    runtime: Option<Arc<BetelgeuseBackedRuntime<S, F>>>,
 }
 
 impl<S, F> BridgeHost<S, F>
@@ -323,17 +452,19 @@ where
     /// Starts a bridge host over one shard-owned Tina runtime.
     pub fn new(shard: S, mailbox_factory: F, config: BetelgeuseBackedRuntimeConfig) -> Self {
         Self {
-            runtime: Arc::new(BetelgeuseBackedRuntime::with_config(
+            runtime: Some(Arc::new(BetelgeuseBackedRuntime::with_config(
                 shard,
                 mailbox_factory,
                 config,
-            )),
+            ))),
         }
     }
 
     /// Returns the hosted Tina runtime.
     pub fn runtime(&self) -> &Arc<BetelgeuseBackedRuntime<S, F>> {
-        &self.runtime
+        self.runtime
+            .as_ref()
+            .expect("bridge host runtime is unavailable after shutdown")
     }
 
     /// Registers one bridge-facing Tina service and returns its bridge handle.
@@ -342,77 +473,84 @@ where
         isolate: I,
         mailbox_capacity: usize,
         timeout: Duration,
-    ) -> Result<BridgeHandle<M, R, S, F, I::Reply>, BetelgeuseBackedControlError>
+    ) -> Result<RegisteredBridgeHandle<M, R, S, F, I>, BetelgeuseBackedControlError>
     where
-        I: Isolate<
-                Message = BridgeRequest<M, R>,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Spawn = Infallible,
-                Call = Infallible,
-            > + Send
-            + 'static,
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>, Spawn = Infallible> + Send + 'static,
+        I::Message: BridgeMessage + From<BridgeRequest<M, R>> + Send + 'static,
         I::Reply: Send + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
         M: Send + 'static,
         R: Send + 'static,
         Outbound: 'static,
     {
         let address = self
             .runtime
-            .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)?;
-        Ok(BridgeHandle::new(
-            Arc::clone(&self.runtime),
+            .as_ref()
+            .expect("bridge host runtime is unavailable after shutdown")
+            .register_with_capacity::<BridgeGuard<I>, Outbound>(
+                BridgeGuard::new(isolate),
+                mailbox_capacity,
+            )?;
+        Ok(BridgeHandle::with_message(
+            Arc::clone(
+                self.runtime
+                    .as_ref()
+                    .expect("bridge host runtime is unavailable after shutdown"),
+            ),
             address,
             timeout,
+            I::Message::from,
         ))
     }
 
+    /// Attempts to shut down the hosted runtime.
+    ///
+    /// If bridge handles still exist, the host is left intact so callers can
+    /// drop handles and retry.
+    pub fn try_shutdown(&mut self) -> Result<Vec<RuntimeEvent>, BridgeShutdownError> {
+        let Some(runtime) = self.runtime.take() else {
+            return Ok(Vec::new());
+        };
+
+        match Arc::try_unwrap(runtime) {
+            Ok(runtime) => runtime.shutdown().map_err(BridgeShutdownError::Runtime),
+            Err(runtime) => {
+                self.runtime = Some(runtime);
+                Err(BridgeShutdownError::StillShared)
+            }
+        }
+    }
+
     /// Shuts down the hosted runtime once all bridge handles have been dropped.
-    pub fn shutdown(self) -> Result<Vec<RuntimeEvent>, BridgeShutdownError<S, F>> {
-        let runtime = Arc::try_unwrap(self.runtime).map_err(BridgeShutdownError::StillShared)?;
-        runtime.shutdown().map_err(BridgeShutdownError::Runtime)
+    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, BridgeShutdownError> {
+        self.try_shutdown()
     }
 }
 
 /// Error returned by [`BridgeHost::shutdown`].
-pub enum BridgeShutdownError<S, F>
-where
-    S: Shard + Send + 'static,
-    F: MailboxFactory + Send + 'static,
-{
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeShutdownError {
     /// Some bridge handles still hold the runtime.
-    StillShared(Arc<BetelgeuseBackedRuntime<S, F>>),
+    StillShared,
     /// The hosted runtime failed during shutdown.
     Runtime(BetelgeuseBackedControlError),
 }
 
-impl<S, F> std::fmt::Debug for BridgeShutdownError<S, F>
-where
-    S: Shard + Send + 'static,
-    F: MailboxFactory + Send + 'static,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StillShared(_) => formatter.write_str("BridgeShutdownError::StillShared"),
-            Self::Runtime(error) => formatter.debug_tuple("Runtime").field(error).finish(),
-        }
-    }
-}
-
 /// Cloneable bounded bridge handle for Tokio/Tower callers.
-pub struct BridgeHandle<M, R, S, F, AR = ()>
+pub struct BridgeHandle<M, R, S, F, AR = (), TM = BridgeRequest<M, R>>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
     runtime: Arc<BetelgeuseBackedRuntime<S, F>>,
-    address: Address<BridgeRequest<M, R>, AR>,
+    address: Address<TM, AR>,
     timeout: Duration,
     state: Arc<BridgeState>,
-    marker: PhantomData<fn(M, R, AR)>,
+    into_message: Arc<dyn Fn(BridgeRequest<M, R>) -> TM + Send + Sync>,
+    marker: PhantomData<fn(M, R, AR, TM)>,
 }
 
-impl<M, R, S, F, AR> Clone for BridgeHandle<M, R, S, F, AR>
+impl<M, R, S, F, AR, TM> Clone for BridgeHandle<M, R, S, F, AR, TM>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
@@ -423,12 +561,13 @@ where
             address: self.address,
             timeout: self.timeout,
             state: Arc::clone(&self.state),
+            into_message: Arc::clone(&self.into_message),
             marker: PhantomData,
         }
     }
 }
 
-impl<M, R, S, F, AR> BridgeHandle<M, R, S, F, AR>
+impl<M, R, S, F, AR> BridgeHandle<M, R, S, F, AR, BridgeRequest<M, R>>
 where
     M: Send + 'static,
     R: Send + 'static,
@@ -447,6 +586,35 @@ where
             address,
             timeout,
             state: Arc::new(BridgeState::default()),
+            into_message: Arc::new(|request| request),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<M, R, S, F, AR, TM> BridgeHandle<M, R, S, F, AR, TM>
+where
+    M: Send + 'static,
+    R: Send + 'static,
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+    AR: Send + 'static,
+    TM: BridgeMessage + Send + 'static,
+{
+    /// Builds a bridge handle that maps bridge requests into a larger Tina
+    /// service message type.
+    pub fn with_message(
+        runtime: Arc<BetelgeuseBackedRuntime<S, F>>,
+        address: Address<TM, AR>,
+        timeout: Duration,
+        into_message: impl Fn(BridgeRequest<M, R>) -> TM + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            runtime,
+            address,
+            timeout,
+            state: Arc::new(BridgeState::default()),
+            into_message: Arc::new(into_message),
             marker: PhantomData,
         }
     }
@@ -480,22 +648,23 @@ where
         self.call_once(message, timeout).await
     }
 
-    /// Sends one request with an explicit overload policy and timeout.
+    /// Sends one request with an explicit overload policy and per-attempt
+    /// timeout.
     pub async fn call_with_policy(
         &self,
         message: M,
         policy: BridgeBackpressure,
-        timeout: Duration,
+        per_attempt_timeout: Duration,
     ) -> Result<R, BridgeError>
     where
         M: Clone,
     {
         let (mut remaining, delay) = match policy {
             BridgeBackpressure::Reject => (0, Duration::ZERO),
-            BridgeBackpressure::Retry { attempts, delay } => (attempts, delay),
+            BridgeBackpressure::Retry { max_retries, delay } => (max_retries, delay),
         };
         loop {
-            match self.call_once(message.clone(), timeout).await {
+            match self.call_once(message.clone(), per_attempt_timeout).await {
                 Err(BridgeError::Full) if remaining > 0 => {
                     remaining -= 1;
                     tokio::time::sleep(delay).await;
@@ -512,13 +681,23 @@ where
             return Err(BridgeError::Closed);
         }
 
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut cancellation = BridgeCancellation::new(Arc::clone(&cancelled));
         let (reply_tx, reply_rx) = oneshot::channel();
         let (observed_tx, observed_rx) = oneshot::channel();
         let state = Arc::clone(&self.state);
+        let request =
+            BridgeRequest::with_metrics(message, reply_tx, Arc::clone(&self.state), cancelled);
+        let message = (self.into_message)(request);
         self.runtime
-            .try_send_and_observe_with(
+            .try_send_and_observe_with_preflight(
                 self.address,
-                BridgeRequest::with_metrics(message, reply_tx, Arc::clone(&self.state)),
+                message,
+                |message| {
+                    message
+                        .bridge_cancelled()
+                        .then_some(BetelgeuseBackedSendObservedError::MailboxClosed)
+                },
                 move |result| {
                     let result = result.map_err(BridgeError::from);
                     match result {
@@ -562,11 +741,16 @@ where
 
         match outcome {
             BridgeWaitOutcome::Response(response) => {
+                cancellation.disarm();
                 self.state.metrics.responses.fetch_add(1, Ordering::Relaxed);
                 Ok(response)
             }
-            BridgeWaitOutcome::ObservedError(error) => Err(error),
+            BridgeWaitOutcome::ObservedError(error) => {
+                cancellation.disarm();
+                Err(error)
+            }
             BridgeWaitOutcome::ObserveChannelClosed | BridgeWaitOutcome::ReplyClosed => {
+                cancellation.disarm();
                 self.record_error(BridgeError::Closed);
                 Err(BridgeError::Closed)
             }
@@ -592,13 +776,14 @@ where
     }
 }
 
-impl<M, R, S, F, AR> Service<M> for BridgeHandle<M, R, S, F, AR>
+impl<M, R, S, F, AR, TM> Service<M> for BridgeHandle<M, R, S, F, AR, TM>
 where
     M: Send + 'static,
     R: Send + 'static,
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
     AR: Send + 'static,
+    TM: BridgeMessage + Send + 'static,
 {
     type Response = R;
     type Error = BridgeError;
