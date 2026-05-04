@@ -137,10 +137,10 @@ phases.
 | ~~**Huygens DST harness and runtime substrate**~~ | Delivered in `.intent/phases/023-huygens-dst-runtime-substrate/`: composed-workload DST harnessing, TCP/timer/supervision/cross-shard replay pressure, `ThreadedRuntime`, `ThreadedMultiShardRuntime`, bounded live ingress, bounded live cross-shard transport, and user-shaped live substrate proofs. |
 | ~~**Mercury production-shaped runtime contract**~~ | Delivered in `.intent/phases/024-mercury-production-shaped-runtime-contract/`: bounded observed send, isolate-to-isolate call with mandatory timeout, live runner lifecycle, live supervision/restart, allocation probes, macros/devex cleanup, and Tokio-vs-Tina semantic comparisons. Mercury made the primitive sharper; it is not the final substrate story. |
 | ~~**Betelgeuse runtime substrate completion**~~ | Delivered in `.intent/phases/025-betelgeuse-runtime-substrate-completion/`: backend-honest `BetelgeuseRuntime` / `BetelgeuseMultiShardRuntime` names, shard-local Betelgeuse ownership, bounded ingress proof, live time/TCP completion semantics, live multi-shard bounded send, typed live cross-shard call rejection, narrow Betelgeuse simulated TCP backend with seeded delay/partial-write pressure, allocation probes, and oracle/sim/live parity tests. Tokio stays comparison/later bridge, not the main runtime story. |
-| **Tina TCP driver contract** | Planned in `.intent/phases/026-tina-driver-contract/`. Factor runtime-owned time/TCP behind a small Tina-owned driver boundary: timers, TCP submissions, completions, cancellation, shutdown, native Betelgeuse adapter, simulated Betelgeuse adapter, and proof that Tina semantics do not depend on one backend implementation. This is not a general async runtime and not a Tokio bridge. |
-| **Parallel substrate support** | Parallel/support phase in `.intent/phases/027-parallel-substrate-support/`. Polish Betelgeuse simulated I/O for possible upstreaming, add narrow substrate cost evidence, expand Tokio-vs-Tina constrained/backpressure comparisons, keep small API ergonomics honest, prepare external review prompts, research Tokio current-thread/Monoio/Glommio/Compio adapters, and refine README/story language without changing Tina core semantics. |
-| **Ranger Tokio-workload replacement proof** | Pre-Gemini product/proof phase. Make Tina tryable for concrete workloads that users currently solve with Tokio when they do not need Tokio ecosystem integrations: bounded TCP services, framed request/response, timers/backoff, shutdown, overload, and supervision. This is not a Tokio bridge and not release docs; it is replacement evidence with runnable examples and tests. |
-| **Gemini release story** | Deferred until the Betelgeuse substrate story and Tina driver contract are true enough to explain. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
+| ~~**Tina TCP driver contract**~~ | Delivered in `.intent/phases/026-tina-driver-contract/`: runtime-owned time/TCP behind a small Tina-owned driver boundary, timers, TCP submissions, completions, cancellation, shutdown, native Betelgeuse adapter, simulated Betelgeuse adapter, same-resource `ResourceBusy` semantics, and direct cancellation/late-completion proofs. This is not a general async runtime and not a Tokio bridge. |
+| ~~**Parallel substrate support**~~ | Delivered in `.intent/phases/027-parallel-substrate-support/`: Betelgeuse simulated I/O polish, narrow substrate cost evidence, expanded Tokio-vs-Tina constrained/backpressure comparisons, external review prompts, Tokio current-thread/Monoio/Glommio/Compio adapter research, and brief README/story refinement without changing Tina core semantics. |
+| **Ranger substrate driver maturity** | Planned in `.intent/phases/028-ranger-substrate-driver-maturity/`. Harden Tina's live substrate story before service-framework work: driver capability contract, full-duplex TCP decision, cancellation/shutdown semantics, live/sim/oracle parity, substrate direction decision, and measured cost pressure. This is not a service demo phase and not a Tokio bridge. |
+| **Gemini release story** | Deferred until the live substrate/driver story is strong enough to explain. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 
@@ -154,10 +154,12 @@ Galileo and Kepler proved the multi-shard contract under one explicit global
 coordinator thread first. Huygens added the first worker-owned runtime
 substrate around that contract. Mercury sharpened the overload/call contract.
 025 makes Betelgeuse the honest tryable runtime substrate instead of letting a
-Tokio bridge become the center of gravity by accident.
-Ranger sits before Gemini because "write docs" is not enough. Users need to see
-Tina replace real Tokio-shaped workloads first; Gemini should document that
-evidence, not invent it.
+Tokio bridge become the center of gravity by accident. 026 and 027 make the
+driver boundary and support evidence real enough to inspect. Ranger sits before
+Gemini because the live substrate/driver story is still the load-bearing
+production-readiness question: full-duplex TCP, cancellation, shutdown,
+driver capabilities, cost, and the next substrate direction must be settled
+before docs or service-framework work freeze the story.
 
 ## Strategic prerequisites
 
@@ -406,110 +408,106 @@ changing Tina core semantics or creating a second substrate direction.
 ---
 
 ## Phase Ranger
-> Prove Tina can replace concrete Tokio-shaped workloads when no Tokio ecosystem dependency is required.
+> Mature Tina's live substrate/driver story before service-framework work.
 
 > After: Phase Tina Driver Contract + Phase Parallel Substrate Support · Before: Phase Gemini
 
-This phase exists because the next question is not "can we document Tina?" It
-is:
+This phase exists because the next question is not "can we build service
+examples?" It is:
 
-> Can a user see Tina, run it, and replace an actual small Tokio service with
-> Tina while preserving bounded queues, synchronous handlers, runtime-owned
-> time/TCP, shutdown, supervision, overload visibility, and simulation proof?
+> What must be true about the live driver/runtime substrate before Tina can
+> honestly support real workloads?
 
-Ranger is not a Tokio bridge. It does not host Tina inside a Tokio app and does
-not depend on Tower, Axum, Hyper, or arbitrary futures. Apollo owns ecosystem
-interop later. Ranger is the no-ecosystem-dependency replacement path: if a
-service only needs TCP, timers, bounded work, supervision, and local state,
-Tina should be a complete alternative.
+Ranger is not a Tokio bridge, not a service demo phase, and not release docs.
+It hardens the load-bearing substrate story beneath future service work.
 
-The plan should live in `.intent/phases/028-ranger-tokio-workload-replacement/plan.md`.
+The plan should live in `.intent/phases/028-ranger-substrate-driver-maturity/plan.md`.
 
-### Workloads To Prove
+### Driver Capability Contract
 
-Ranger should ship a small replacement ladder. Each rung must have a runnable
-example and a black-box assertion-backed test. Logs are not proof.
+Turn the 026 driver boundary into a capability contract:
 
-1. **Framed TCP request/response service.**
-   A line-delimited or length-prefixed service with multiple clients,
-   partial reads/writes, malformed-frame handling, connection close, and
-   graceful listener shutdown. This is the "I would normally start with
-   `tokio::net::TcpListener` plus tasks" replacement.
+- timer submission, wake, timeout, and cancel;
+- TCP bind, accept, read, write, close, and cancel;
+- bounded pending-operation admission;
+- no hidden unbounded queues;
+- explicit runtime-owned progress;
+- deterministic simulator compatibility where applicable;
+- traceable cancellation, shutdown, and substrate failure.
 
-2. **Stateful per-connection or per-session service.**
-   One isolate owns session state. Another isolate owns shared routing or
-   registry state. The proof should show local state stays local, no
-   `Arc<Mutex<...>>` is required, and bounded mailboxes expose overload.
+### TCP Resource Concurrency
 
-3. **Timer/backoff workload under real runtime and simulator.**
-   A retrying client or worker pool with timeout, backoff, cancellation,
-   requester-stopped behavior, and deterministic simulator replay.
+Revisit the conservative 026 `ResourceBusy` rule. Expected direction:
+support full-duplex TCP read/write on one stream if it can be done with honest
+ownership and cancellation. A likely shape is separate resource lanes:
+listener accept, stream read, stream write, and close rejection while any lane
+is active.
 
-4. **Supervised worker pool / task dispatcher.**
-   A bounded queue of work, worker failure, restart, stale-address rejection,
-   budget exhaustion, and continued service for healthy workers. This should
-   be close enough to a real "background job runner" to be recognizable.
+If Betelgeuse cannot cancel one lane without closing the underlying stream,
+the runtime may still use tombstones internally, but it must not invalidate an
+unrelated live operation silently.
 
-5. **Overload lab.**
-   Bounded ingress, target mailbox `Full`, cross-shard queue `Full` where
-   applicable, slow consumer pressure, shutdown under pending work, and
-   evidence that failure is visible instead of becoming hidden memory growth.
+### Cancellation, Shutdown, And Late Completion
 
-### User Surface To Prove
+Harden stopped-requester, explicit-close, timeout, and runtime-shutdown
+behavior under live and simulated drivers:
 
-The workloads should use the preferred public surface:
+- stopped requester with pending accept/read/write/timer;
+- explicit stream/listener close while operations are pending;
+- runtime shutdown with pending timer and TCP operations;
+- late substrate completion after cancel or shutdown;
+- requester mailbox full when completion arrives;
+- timeout racing with late completion where the call shape supports timeout.
 
-- `tina::prelude::*`
-- `#[tina::isolate(...)]` or `#[tina_runtime::isolate(...)]`
-- effect helpers such as `send`, `reply`, `spawn`, `batch`, `stop`, and
-  runtime-owned call helpers
-- `BetelgeuseRuntime` / `BetelgeuseMultiShardRuntime` or the post-026 driver
-  backed equivalent
-- `tina-sim` for replayable proof of the same logic where the workload fits
+### Live / Sim / Oracle Parity
 
-Do not add broad helper DSLs just to make examples prettier. If a workload is
-awkward, record the friction. Add only the smallest helper that removes
-repeated boilerplate without creating a second way to write Tina.
+Keep the three layers aligned: live Betelgeuse-backed runtime, Betelgeuse
+simulated driver/runtime, and `tina-sim` deterministic oracle where the
+behavior is modeled there. If a behavior belongs only to the live driver,
+record why.
 
-### Comparison Bar
+### Substrate Direction Decision
 
-For each workload, Ranger should include a short side-by-side note:
+Leave the roadmap with a real next substrate decision: continue hardening
+vendored Betelgeuse for now, add a Tokio current-thread driver later,
+investigate Monoio/Glommio/Compio later, or build a small Tina-owned
+completion substrate later. Ranger does not need to implement a new adapter
+unless the existing substrate blocks required semantics.
 
-- what the Tokio version would normally use
-- what Tina uses instead
-- what guarantees are preserved or strengthened
-- what Tina does not provide
-- whether the workload is a true replacement candidate or still needs Apollo
-  because it depends on Tokio ecosystem APIs
+### Cost And Allocation Pressure
 
-This is not marketing. Hardened Tokio variants count. If Tokio can solve a
-case cleanly with bounded channels, `try_reserve`, `send_timeout`, or
-structured shutdown, say so.
+Measure enough to keep substrate claims honest: per timer call, per TCP
+read/write completion, per isolate call, per cross-shard send, and live worker
+ingress handoff. Prefer allocation counts, operation counts, and bounded
+resource counts before wall-clock benchmarks.
 
 ### Refusals
 
-- Do not build `tina-runtime-tokio-bridge`.
+- Do not build `tina-runtime-tokio-bridge` unless a pause gate records that
+  Betelgeuse cannot support required semantics.
 - Do not add Tower, Axum, Hyper, or arbitrary futures integration.
 - Do not make isolate handlers async.
 - Do not expose driver/backend handles to isolate code.
 - Do not add unbounded queues for convenience.
-- Do not claim full production readiness or broad Tokio replacement.
-- Do not start Gemini release docs until Ranger has replacement evidence.
+- Do not build a broad service example suite here.
+- Do not claim production readiness or broad Tokio replacement.
+- Do not start Gemini release docs until the substrate direction is settled.
 
 ### Done Means
 
-- A new user can run at least two non-trivial Tina services that look like
-  things they would otherwise write with Tokio.
-- Each service has assertion-backed tests for happy path, malformed input,
-  backpressure, timeout/cancellation, shutdown, and failure/restart where
-  relevant.
-- At least one workload runs through live runtime, simulated driver/runtime,
-  and `tina-sim` or has a written reason why one layer does not apply.
-- The examples use the preferred public surface and do not depend on internal
-  test shims.
-- The review records remaining user-friction as concrete API candidates, not
-  vague "docs need work."
-- Gemini has real replacement workloads to document.
+- `RuntimeDriver` has a documented capability contract for time/TCP, progress,
+  cancellation, shutdown, and bounded pending work.
+- Full-duplex TCP read/write on one stream is supported with direct tests or
+  explicitly deferred with the blocker recorded.
+- Explicit close, stopped-requester cancellation, timeout, runtime shutdown,
+  and late completion are tested across live and simulated drivers where
+  applicable.
+- Live Betelgeuse, Betelgeuse simulated driver/runtime, and `tina-sim` agree on
+  modeled TCP/time semantics or concrete non-overlap is recorded.
+- Allocation and operation costs are pinned for named hot paths.
+- The roadmap names the next substrate direction after Ranger.
+- Any service-shaped workload is minimal and exists only to pressure the
+  substrate.
 
 ---
 
@@ -523,9 +521,9 @@ structured shutdown, say so.
   the APIs are still private and not ready for semver promises. Kepler settled
   the core multi-shard primitive; Huygens proved the composed framework and
   first runtime-substrate story; Mercury sharpened the overload/call contract;
-  Betelgeuse and the Tina driver contract must make the tryable runtime
-  substrate true, and Ranger must prove concrete Tokio-shaped replacement
-  workloads, before Gemini publishes or freezes it.
+  Betelgeuse and the Tina driver contract made the first tryable runtime
+  substrate true; Ranger must mature that substrate/driver story before
+  Gemini publishes or freezes it.
 - Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, task-dispatcher walkthrough, and TCP echo walkthrough.
 - Document the supported invariants for the core runtime/simulator model:
   delivery behavior, mailbox guarantees, supervision behavior, replayability,
