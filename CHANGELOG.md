@@ -18,6 +18,16 @@ This file records completed work.
   `BetelgeuseBackedRuntime` / `BetelgeuseBackedMultiShardRuntime`.
 - Added a runnable `llama_bridge` example showing Tokio caller code crossing
   into Tina without async handlers or hidden unbounded queues.
+- Added bridge production-shape helpers: `BridgeHost`, explicit close/health,
+  metrics snapshots, bounded retry/reject policy helpers, caller-timeout late
+  response accounting, and a preserved/weakened bridge capability table.
+- Added bridge compile-fail guardrails for non-`Send` requests and wrong
+  response shapes, plus tests for lifecycle, metrics, cancellation, timeout,
+  overload, and clean host shutdown.
+- Added `TINA_DRIVER_RUNTIME_CONTRACT` to name Tina's driver-runtime target:
+  completion-shaped I/O, bounded commands, explicit cancellation, owned
+  shutdown, explicit progress, deterministic simulation, no hidden executor
+  tasks, and no claim of being a general async runtime.
 - Rewrote the README into a shorter Tina-as-concurrency-primitive story with
   explicit inspiration links and current non-claims.
 

@@ -193,11 +193,13 @@ This repo is a Cargo workspace with six crates:
 - **`tina-supervisor`**: supervisor config.
 - **`tina-runtime`**: explicit-step runtime, multi-shard runner,
   Betelgeuse-backed threaded runtime, runtime-owned TCP/time, observed
-  backpressure, isolate calls with mandatory timeout.
+  backpressure, isolate calls with mandatory timeout, and a named
+  `TINA_DRIVER_RUNTIME_CONTRACT`.
 - **`tina-sim`**: deterministic simulator with virtual time, seeded faults,
   checkers, scripted TCP, and replay.
 - **`tina-tokio-bridge`**: narrow bounded ingress from Tokio/Tower/Axum into a
-  Tina service. Tokio owns the edge. Tina owns the isolate state.
+  Tina service, with explicit health, metrics, timeout, cancellation, and
+  overload policies. Tokio owns the edge. Tina owns the isolate state.
 
 You can write isolates against the modern surface: `Outbound`,
 `ChildDefinition`, `RestartableChildDefinition`, `RuntimeCall`, `CallInput`,
@@ -213,6 +215,8 @@ public teaching surface.
 
 - not production-ready;
 - Tokio/Tower/Axum bridge is narrow first form only;
+- the driver-runtime contract is named, but Tina is not a general Rust async
+  runtime;
 - no persistence;
 - no remoting or clustering;
 - no broad zero-allocation claim;

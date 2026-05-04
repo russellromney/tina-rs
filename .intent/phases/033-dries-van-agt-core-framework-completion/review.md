@@ -47,3 +47,34 @@ Second pass after fixes:
 
 - `make verify` passes after the bridge mailbox-full fix and rustdoc cleanup.
 - No additional correctness bugs found in the touched public surface.
+
+Third pass after bridge production-shape additions:
+
+- Added `BridgeHost` so the common app path is one owner for runtime startup,
+  service registration, bridge handle creation, and shutdown.
+- Added explicit bridge health/close state, bounded retry/reject policy helpers,
+  metrics counters, and a capability table that separates preserved Tina
+  guarantees from weakened Tokio-edge behavior.
+- Added compile-fail guardrails for non-`Send` bridge requests and wrong bridge
+  response type, plus runtime tests for health, metrics, explicit retry budget,
+  host shutdown ownership, caller timeout, late response rejection, ingress
+  full, target mailbox full, and Axum entry.
+- Added `TINA_DRIVER_RUNTIME_CONTRACT`, pinning Tina's substrate direction as
+  completion-based I/O with bounded commands, explicit cancellation, owned
+  shutdown, explicit progress, deterministic simulation, and no hidden executor
+  tasks or general async-runtime claim.
+
+Review notes:
+
+- `poll_ready` remains intentionally modest: it reports bridge closed/open
+  state only. Queue capacity is still a call-time fact because the underlying
+  runtime does not expose a stable capacity probe.
+- `BridgeBackpressure::Retry` is explicit and bounded. It sleeps between
+  attempts; it does not create a hidden queue.
+- Late response accounting is tracked only for bridge-created responders. Manual
+  `BridgeRequest::new` remains available for tests/low-level use and does not
+  attach shared metrics.
+- During self-review, bridge metrics were moved from the caller wait path into
+  the worker-observed callback for mailbox admission outcomes. Regression proof:
+  if the caller times out while the worker is blocked, a later target
+  mailbox-`Full` observation is still counted instead of disappearing.

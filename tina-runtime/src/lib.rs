@@ -88,6 +88,57 @@ pub trait MailboxFactory {
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>>;
 }
 
+/// Requirement level for Tina's driver-runtime contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverRuntimeRequirement {
+    /// A Tina-shaped driver runtime must provide this.
+    Required,
+    /// A Tina-shaped driver runtime must not provide this behind Tina's back.
+    Forbidden,
+    /// This is useful for some backend implementations but not part of the
+    /// core Tina contract.
+    BackendSpecific,
+    /// Tina makes no claim for this capability.
+    NotClaimed,
+}
+
+/// The substrate contract Tina wants underneath a shard-local runner.
+///
+/// This is not a claim that Tina is a general Rust async runtime. It names the
+/// smaller thing Tina needs: completion-shaped I/O that the Tina runner owns,
+/// advances, cancels, and can simulate deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TinaDriverRuntimeContract {
+    /// I/O completes by writing into caller-owned completion state.
+    pub completion_based_io: DriverRuntimeRequirement,
+    /// Runtime ingress and cross-thread commands stay bounded.
+    pub bounded_runtime_commands: DriverRuntimeRequirement,
+    /// Pending work can be explicitly canceled by runtime-owned call id.
+    pub explicit_cancellation: DriverRuntimeRequirement,
+    /// Shutdown owns the driver lifecycle and proves completion storage release.
+    pub owned_shutdown: DriverRuntimeRequirement,
+    /// Driver progress is advanced by the Tina runner, not hidden tasks.
+    pub explicit_progress: DriverRuntimeRequirement,
+    /// A deterministic simulated backend exists for DST and replay.
+    pub deterministic_simulation: DriverRuntimeRequirement,
+    /// Hidden executor tasks inside the driver are forbidden.
+    pub hidden_executor_tasks: DriverRuntimeRequirement,
+    /// A general async/futures executor is outside this contract.
+    pub general_async_executor: DriverRuntimeRequirement,
+}
+
+/// Tina's current driver-runtime contract target.
+pub const TINA_DRIVER_RUNTIME_CONTRACT: TinaDriverRuntimeContract = TinaDriverRuntimeContract {
+    completion_based_io: DriverRuntimeRequirement::Required,
+    bounded_runtime_commands: DriverRuntimeRequirement::Required,
+    explicit_cancellation: DriverRuntimeRequirement::Required,
+    owned_shutdown: DriverRuntimeRequirement::Required,
+    explicit_progress: DriverRuntimeRequirement::Required,
+    deterministic_simulation: DriverRuntimeRequirement::Required,
+    hidden_executor_tasks: DriverRuntimeRequirement::Forbidden,
+    general_async_executor: DriverRuntimeRequirement::NotClaimed,
+};
+
 /// Runtime-owned clock abstraction.
 ///
 /// Production uses a monotonic wall-clock. Tests may inject a manual clock

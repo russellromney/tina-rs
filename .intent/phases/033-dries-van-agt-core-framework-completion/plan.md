@@ -180,7 +180,63 @@ Refusals:
 - do not pretend Tokio work-stealing is deterministic replay;
 - do not hide unbounded Tokio queues behind Tina APIs.
 
-## Rock 6: Hardening And Cost Closeout
+## Rock 6: Bridge Production Shape
+
+Make the first bridge usable enough that a Tokio application can host one Tina
+service without bespoke glue.
+
+Required additions:
+
+- user-facing app/host helper for "build runtime, register Tina service, expose
+  bridge, shut down";
+- explicit bridge caller-cancellation story: if the Tokio caller drops or times
+  out, late Tina responses are rejected/observable and do not leak;
+- backpressure policy helpers for the common choices: reject immediately, retry
+  with explicit delay/budget, or timeout;
+- service health/readiness state: accepting, closing, closed;
+- structured bridge metrics counters for accepted, full, closed, timeout,
+  cancelled/dropped response, and successful response paths;
+- a compact real example app, llama-flavored if possible, that exercises HTTP
+  ingress, overload, timeout, restart/failure, and graceful shutdown;
+- compile-fail guardrails for async handlers, non-`Send` bridge messages, and
+  wrong bridge response shapes where Rust can catch them;
+- a preserved/weakened capability table for sim/live/bridge so future docs do
+  not overclaim.
+
+Proof:
+
+- bridge tests assert health, metrics, cancellation, timeout, full, closed, and
+  graceful shutdown behavior;
+- the example compiles and is backed by tests;
+- `poll_ready` is honest: it may report local bridge closed/open state, but
+  bounded queue admission remains a call-time fact unless the runtime exposes a
+  real capacity probe.
+
+## Rock 7: Tina Driver Runtime Direction
+
+Do not announce a general Rust runtime. Do start separating Tina's own
+driver-runtime contract from the current Betelgeuse-backed implementation.
+
+Expected direction:
+
+- name a Tina-owned shard runner / driver-runtime contract;
+- keep deterministic simulated/DST backend first-class;
+- keep Betelgeuse as one backend implementation, not the source of Tina's
+  semantics;
+- preserve completion-shaped I/O, bounded commands, explicit cancellation,
+  shutdown ownership, and no hidden tasks;
+- leave native reactor expansion for a later phase unless the contract is small
+  enough to implement safely now.
+
+Proof:
+
+- plan/code names distinguish Tina driver-runtime contract from Betelgeuse
+  adapter;
+- no public claim says Tina has replaced Tokio/monoio/glommio as a general
+  runtime;
+- existing live and simulator proofs still pass unchanged.
+
+## Rock 8: Hardening And Cost Closeout
 
 Pull in the old Cassini bar after the real surface exists:
 
@@ -222,6 +278,10 @@ Pause for human review if:
 - Live lifecycle and worker topology are boring to use and directly tested.
 - The Tokio/Tower/Axum bridge exists in its narrow first form, with explicit
   preserved/weakened guarantees.
+- Bridge production shape covers lifecycle, cancellation, metrics, health, and
+  bounded overload policies.
+- Tina's driver-runtime direction is named without pretending a full general
+  runtime exists.
 - CI, benchmarks, memory profile, and optional MPSC decision are real enough to
   support or narrow the public claim.
 - Gemini can document the framework instead of discovering missing core work.

@@ -19,8 +19,9 @@ use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseBackedControlError, BetelgeuseBackedMultiShardRuntime, BetelgeuseBackedRuntime,
     BetelgeuseBackedRuntimeConfig, CallCompletionRejectedReason, CallError, CallInput, CallKind,
-    CallOutcome, CallOutput, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, SendRejectedReason, TraceRetention, call, sleep,
+    CallOutcome, CallOutput, DriverRuntimeRequirement, ListenerId, MailboxFactory, RuntimeCall,
+    RuntimeEvent, RuntimeEventKind, SendRejectedReason, TINA_DRIVER_RUNTIME_CONTRACT,
+    TraceRetention, call, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -101,6 +102,41 @@ fn count_event(trace: &[RuntimeEvent], predicate: impl Fn(&RuntimeEventKind) -> 
         .iter()
         .filter(|event| predicate(&event.kind()))
         .count()
+}
+
+#[test]
+fn tina_driver_runtime_contract_names_core_substrate_without_general_runtime_claim() {
+    let contract = TINA_DRIVER_RUNTIME_CONTRACT;
+
+    assert_eq!(
+        contract.completion_based_io,
+        DriverRuntimeRequirement::Required
+    );
+    assert_eq!(
+        contract.bounded_runtime_commands,
+        DriverRuntimeRequirement::Required
+    );
+    assert_eq!(
+        contract.explicit_cancellation,
+        DriverRuntimeRequirement::Required
+    );
+    assert_eq!(contract.owned_shutdown, DriverRuntimeRequirement::Required);
+    assert_eq!(
+        contract.explicit_progress,
+        DriverRuntimeRequirement::Required
+    );
+    assert_eq!(
+        contract.deterministic_simulation,
+        DriverRuntimeRequirement::Required
+    );
+    assert_eq!(
+        contract.hidden_executor_tasks,
+        DriverRuntimeRequirement::Forbidden
+    );
+    assert_eq!(
+        contract.general_async_executor,
+        DriverRuntimeRequirement::NotClaimed
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -14,7 +14,10 @@ use tina::{Mailbox, TrySendError};
 use tina_runtime::{
     BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, MailboxFactory, RuntimeEventKind,
 };
-use tina_tokio_bridge::{BridgeError, BridgeHandle, BridgeRequest, BridgeResponder};
+use tina_tokio_bridge::{
+    BRIDGE_CAPABILITIES, BridgeBackpressure, BridgeError, BridgeHandle, BridgeHealth, BridgeHost,
+    BridgeRequest, BridgeResponder, CapabilityStatus,
+};
 use tower::ServiceExt;
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +116,30 @@ impl LlamaCounter {
     }
 }
 
+#[test]
+fn bridge_capability_table_keeps_preserved_and_weakened_claims_explicit() {
+    assert_eq!(
+        BRIDGE_CAPABILITIES.bounded_ingress,
+        CapabilityStatus::Preserved
+    );
+    assert_eq!(
+        BRIDGE_CAPABILITIES.synchronous_handlers,
+        CapabilityStatus::Preserved
+    );
+    assert_eq!(
+        BRIDGE_CAPABILITIES.visible_failures,
+        CapabilityStatus::Preserved
+    );
+    assert_eq!(
+        BRIDGE_CAPABILITIES.deterministic_replay,
+        CapabilityStatus::Weakened
+    );
+    assert_eq!(
+        BRIDGE_CAPABILITIES.tokio_scheduler_control,
+        CapabilityStatus::NotClaimed
+    );
+}
+
 type LlamaBridge = BridgeHandle<BrushRequest, BrushReply, BridgeShard, BridgeMailboxFactory, ()>;
 
 async fn brush(State(bridge): State<LlamaBridge>) -> (StatusCode, String) {
@@ -171,6 +198,90 @@ async fn axum_route_calls_tina_over_bounded_bridge() {
 }
 
 #[tokio::test]
+async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
+    let host = BridgeHost::new(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let bridge = host
+        .register_bridge::<LlamaCounter, BrushRequest, BrushReply, Infallible>(
+            LlamaCounter { brushes: 0 },
+            8,
+            Duration::from_secs(1),
+        )
+        .expect("register bridge service");
+
+    assert_eq!(
+        bridge.call(BrushRequest { llama: "Tina" }).await,
+        Ok(BrushReply {
+            line: "Tina brushed 1".to_string()
+        })
+    );
+    assert!(
+        host.shutdown().is_err(),
+        "live bridge handle keeps host shared"
+    );
+
+    let host = BridgeHost::new(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let bridge = host
+        .register_bridge::<LlamaCounter, BrushRequest, BrushReply, Infallible>(
+            LlamaCounter { brushes: 0 },
+            8,
+            Duration::from_secs(1),
+        )
+        .expect("register bridge service");
+    drop(bridge);
+    let _ = host.shutdown().expect("host shutdown");
+}
+
+#[tokio::test]
+async fn bridge_close_health_and_metrics_are_visible() {
+    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ));
+    let address = runtime
+        .register_with_capacity::<LlamaCounter, Infallible>(LlamaCounter { brushes: 0 }, 8)
+        .expect("register llama isolate");
+    let bridge = BridgeHandle::new(Arc::clone(&runtime), address, Duration::from_secs(1));
+
+    assert_eq!(bridge.health(), BridgeHealth::Accepting);
+    bridge.close();
+    assert_eq!(bridge.health(), BridgeHealth::Closed);
+    assert_eq!(
+        bridge.call(BrushRequest { llama: "Tina" }).await,
+        Err(BridgeError::Closed)
+    );
+    assert_eq!(bridge.metrics().attempts, 1);
+    assert_eq!(bridge.metrics().closed, 1);
+
+    drop(bridge);
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("bridge handle dropped"),
+    };
+    let _ = runtime.shutdown().expect("runtime shutdown");
+}
+
+#[tokio::test]
 async fn bridge_reports_target_mailbox_full_without_waiting_for_timeout() {
     let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
         BridgeShard,
@@ -195,6 +306,45 @@ async fn bridge_reports_target_mailbox_full_without_waiting_for_timeout() {
         started.elapsed() < Duration::from_secs(1),
         "mailbox Full should surface as Full, not timeout"
     );
+    assert_eq!(bridge.metrics().attempts, 1);
+    assert_eq!(bridge.metrics().full, 1);
+
+    drop(bridge);
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("bridge handle dropped"),
+    };
+    let _ = runtime.shutdown().expect("runtime shutdown");
+}
+
+#[tokio::test]
+async fn bridge_retry_policy_is_bounded_and_explicit() {
+    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ));
+    let address = runtime
+        .register_with_capacity::<LlamaCounter, Infallible>(LlamaCounter { brushes: 0 }, 0)
+        .expect("register zero-capacity llama isolate");
+    let bridge = BridgeHandle::new(Arc::clone(&runtime), address, Duration::from_secs(1));
+
+    assert_eq!(
+        bridge
+            .call_with_policy(
+                BrushRequest { llama: "Tina" },
+                BridgeBackpressure::retry(2, Duration::from_millis(1)),
+                Duration::from_secs(1),
+            )
+            .await,
+        Err(BridgeError::Full)
+    );
+    assert_eq!(bridge.metrics().attempts, 3);
+    assert_eq!(bridge.metrics().full, 3);
 
     drop(bridge);
     let runtime = match Arc::try_unwrap(runtime) {
@@ -231,6 +381,100 @@ impl HoldingWorker {
     }
 }
 
+#[derive(Debug)]
+struct BlockingWorker {
+    entered: SyncSender<()>,
+    release: Receiver<()>,
+}
+
+#[tina::isolate(
+    message = BridgeRequest<GateRequest, GateReply>,
+    shard = BridgeShard
+)]
+impl BlockingWorker {
+    fn handle(
+        &mut self,
+        msg: BridgeRequest<GateRequest, GateReply>,
+        _ctx: &mut Context<'_, BridgeShard>,
+    ) -> Effect<Self> {
+        let (request, responder) = msg.into_parts();
+        self.entered.send(()).expect("entered signal");
+        self.release.recv().expect("release signal");
+        let _ = responder.respond(GateReply(request.0));
+        noop()
+    }
+}
+
+#[tokio::test]
+async fn bridge_records_worker_observed_full_even_after_caller_timeout() {
+    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ));
+    let full_address = runtime
+        .register_with_capacity::<LlamaCounter, Infallible>(LlamaCounter { brushes: 0 }, 0)
+        .expect("register zero-capacity llama isolate");
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let blocker_address = runtime
+        .register_with_capacity::<BlockingWorker, Infallible>(
+            BlockingWorker {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            8,
+        )
+        .expect("register blocking worker");
+
+    let blocker = BridgeHandle::new(
+        Arc::clone(&runtime),
+        blocker_address,
+        Duration::from_secs(5),
+    );
+    let full_bridge =
+        BridgeHandle::new(Arc::clone(&runtime), full_address, Duration::from_millis(1));
+    let blocker_task = tokio::spawn(async move { blocker.call(GateRequest("released")).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(1)))
+        .await
+        .expect("entered wait task")
+        .expect("blocking handler entered");
+
+    assert_eq!(
+        full_bridge.call(BrushRequest { llama: "Tina" }).await,
+        Err(BridgeError::Timeout)
+    );
+    release_tx.send(()).expect("release blocking handler");
+    assert_eq!(
+        blocker_task.await.expect("blocker task"),
+        Ok(GateReply("released"))
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while full_bridge.metrics().full == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "worker-observed mailbox Full should still be counted after caller timeout"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(full_bridge.metrics().attempts, 1);
+    assert_eq!(full_bridge.metrics().timeout, 1);
+    assert_eq!(full_bridge.metrics().full, 1);
+
+    drop(full_bridge);
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("bridge handles dropped"),
+    };
+    let _ = runtime.shutdown().expect("runtime shutdown");
+}
+
 #[tokio::test]
 async fn bridge_timeout_is_explicit_when_tina_keeps_responder_open() {
     let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
@@ -251,6 +495,71 @@ async fn bridge_timeout_is_explicit_when_tina_keeps_responder_open() {
         bridge.call(GateRequest("held")).await,
         Err(BridgeError::Timeout)
     );
+
+    drop(bridge);
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("bridge handle dropped"),
+    };
+    let _ = runtime.shutdown().expect("runtime shutdown");
+}
+
+#[derive(Debug)]
+struct CapturingWorker {
+    captured: Arc<Mutex<Option<BridgeResponder<GateReply>>>>,
+}
+
+#[tina::isolate(
+    message = BridgeRequest<GateRequest, GateReply>,
+    shard = BridgeShard
+)]
+impl CapturingWorker {
+    fn handle(
+        &mut self,
+        msg: BridgeRequest<GateRequest, GateReply>,
+        _ctx: &mut Context<'_, BridgeShard>,
+    ) -> Effect<Self> {
+        let (_request, responder) = msg.into_parts();
+        *self.captured.lock().expect("captured responder lock") = Some(responder);
+        noop()
+    }
+}
+
+#[tokio::test]
+async fn bridge_caller_timeout_closes_responder_and_counts_late_response() {
+    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ));
+    let captured = Arc::new(Mutex::new(None));
+    let address = runtime
+        .register_with_capacity::<CapturingWorker, Infallible>(
+            CapturingWorker {
+                captured: Arc::clone(&captured),
+            },
+            8,
+        )
+        .expect("register capturing worker");
+    let bridge = BridgeHandle::new(Arc::clone(&runtime), address, Duration::from_millis(10));
+
+    assert_eq!(
+        bridge.call(GateRequest("held")).await,
+        Err(BridgeError::Timeout)
+    );
+    let responder = captured
+        .lock()
+        .expect("captured responder lock")
+        .take()
+        .expect("handler captured responder");
+    assert!(responder.is_closed());
+    assert_eq!(responder.respond(GateReply("late")), Err(GateReply("late")));
+    assert_eq!(bridge.metrics().timeout, 1);
+    assert_eq!(bridge.metrics().dropped_responses, 1);
 
     drop(bridge);
     let runtime = match Arc::try_unwrap(runtime) {

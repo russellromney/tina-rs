@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
-use tina_runtime::{BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, MailboxFactory};
-use tina_tokio_bridge::{BridgeHandle, BridgeRequest};
+use tina_runtime::{BetelgeuseBackedRuntimeConfig, MailboxFactory};
+use tina_tokio_bridge::{BridgeHost, BridgeRequest};
 
 #[derive(Debug, Clone, Copy)]
 struct BarnShard;
@@ -103,7 +103,7 @@ impl Tina {
 }
 
 fn main() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let host = BridgeHost::new(
         BarnShard,
         BarnMailboxFactory,
         BetelgeuseBackedRuntimeConfig {
@@ -111,11 +111,14 @@ fn main() {
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },
-    ));
-    let tina = runtime
-        .register_with_capacity::<Tina, Infallible>(Tina { snacks_eaten: 0 }, 16)
+    );
+    let bridge = host
+        .register_bridge::<Tina, LlamaQuestion, LlamaAnswer, Infallible>(
+            Tina { snacks_eaten: 0 },
+            16,
+            Duration::from_secs(1),
+        )
         .expect("register Tina");
-    let bridge = BridgeHandle::new(Arc::clone(&runtime), tina, Duration::from_secs(1));
 
     let tokio = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -128,10 +131,7 @@ fn main() {
     assert_eq!(answer.line, "ate ham (1)");
     println!("{}", answer.line);
 
+    assert_eq!(bridge.metrics().responses, 1);
     drop(bridge);
-    let runtime = match Arc::try_unwrap(runtime) {
-        Ok(runtime) => runtime,
-        Err(_) => panic!("bridge dropped"),
-    };
-    runtime.shutdown().expect("shutdown");
+    host.shutdown().expect("shutdown");
 }
