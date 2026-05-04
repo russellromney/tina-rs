@@ -61,12 +61,11 @@ Default path: implement a Tina-owned Betelgeuse adapter inside `tina-runtime`.
 
 Expected shape:
 
-- the adapter owns the `IOLoopHandle`, all sockets, all completion slots, and all
-  operation bookkeeping;
+- production adapters own the `IOLoopHandle`, all sockets, all completion slots,
+  and all operation bookkeeping exclusively;
 - user isolates and higher runtime layers never see Betelgeuse handles;
-- tests may use a controlled simulated backend handle, but not one that can step
-  behind the adapter after adapter shutdown unless the adapter explicitly permits
-  and proves it;
+- tests may use an instrumented backend only through a Tina-owned test seam;
+  external post-shutdown stepping is not a production behavior users can rely on;
 - completion slots live in stable adapter-owned storage until the adapter has
   proof the backend no longer owns their pointers;
 - canceled operations become tombstones until the backend releases the pointer;
@@ -107,9 +106,24 @@ Required result:
 
 - no `mem::forget` of pending completion slots in normal Tina shutdown;
 - no completion box dropped while the backend may still own its pointer;
-- shutdown cannot hang forever without hitting a typed/tested terminal error;
-- once shutdown reports complete, later legal backend activity cannot write into
-  dropped Tina memory.
+- shutdown cannot hang forever;
+- clean shutdown returns only after all backend completion ownership has been
+  released;
+- failed drain returns a typed/tested shutdown/control error, not a leak and not
+  an unbounded wait;
+- once clean shutdown reports complete, later legal backend activity cannot write
+  into dropped Tina memory.
+
+Expected terminal shape:
+
+- add an internal driver shutdown result/error for incomplete release, such as
+  `DriverShutdownError::BackendStillOwnsCompletions`;
+- convert that through live runtime handles as a typed `BetelgeuseControlError`
+  shutdown failure;
+- test both the clean drain path and a forced bounded failure path with an
+  instrumented backend seam;
+- treat "backend still owns completions after bounded drain" as a runtime
+  lifecycle failure, not as a successful shutdown.
 
 The exact shape can be:
 
@@ -128,8 +142,9 @@ Required proofs:
 
 - pending accept/read/write shutdown releases completion ownership;
 - canceled tombstones drain without requester delivery;
-- stepping a controlled simulated backend after adapter shutdown is either
-  impossible by construction or proven harmless;
+- production adapter ownership prevents external stepping after shutdown;
+- a Tina-owned test seam may step an instrumented backend only to prove that
+  release happened before adapter drop;
 - delayed completions cannot resurrect canceled operations;
 - no test relies on sleeps or "probably drained" timing.
 
@@ -151,8 +166,19 @@ For macOS/kqueue, distinguish:
 - retry/wait paths;
 - close/unwatch behavior.
 
+Expected direction:
+
+- first make the simulated/Tina adapter path satisfy the release guarantee with
+  direct tests;
+- then either add the smallest Betelgeuse release hook needed by simulated and
+  native backends, or explicitly gate native `BetelgeuseRuntime` shutdown as not
+  yet no-leak-proved;
+- Surveyor must not close on "native audited" if native still has queued or
+  submitted raw pointer ownership without a release guarantee.
+
 If native backend cannot provide no-leak release without a new hook, pause and
-write the hook. Do not preserve a silent leak fallback as "done."
+write the hook or explicitly gate native runtime construction behind the
+remaining non-claim. Do not preserve a silent leak fallback as "done."
 
 ### 5. Driver Surface Cleanup
 
@@ -163,8 +189,11 @@ Likely contract language:
 - `cancel(call_id)` cancels requester completion and quiescence pressure for one
   operation;
 - `cancel_pending()` begins shutdown cancellation for all operations;
-- after `cancel_pending()` returns, the driver may be dropped without leaking
-  completion slots or leaving backend-owned pointers to Tina memory;
+- after successful `cancel_pending()` / shutdown drain, the driver may be dropped
+  without leaking completion slots or leaving backend-owned pointers to Tina
+  memory;
+- failed shutdown drain reports a typed control error and does not pretend the
+  runtime closed cleanly;
 - `has_pending()` excludes canceled operations for runtime quiescence, but the
   driver still tracks canceled tombstones internally until released.
 
@@ -190,11 +219,13 @@ phase. Name those as later production-hardening if they remain.
    Linux, and macOS backends. Record every place a backend stores a raw
    completion pointer.
 2. **Adapter design.** Choose the smallest Tina-owned adapter shape that can
-   prove release without leaking. Write the decision in `review.md`.
+   prove release without leaking. Pin the typed incomplete-shutdown error shape
+   and write the decision in `review.md`.
 3. **Simulated implementation.** Make the simulated path satisfy the new
    ownership/drain contract first.
 4. **Native implementation.** Harden Linux/macOS behavior or add the smallest
-   vendored Betelgeuse hook needed for release accounting.
+   vendored Betelgeuse hook needed for release accounting. If native cannot be
+   made honest in this slice, gate it explicitly and record the non-claim.
 5. **Remove leak fallback.** Delete Ranger's `mem::forget` shutdown escape hatch
    from the Tina driver.
 6. **Regression proofs.** Add direct tests for pending accept/read/write
@@ -212,6 +243,10 @@ phase. Name those as later production-hardening if they remain.
 - Do not make upstream Betelgeuse acceptance block Tina progress.
 - Do not hide a remaining leak behind "bounded rare shutdown leak" and call it
   done.
+- Do not hide a remaining native-backend raw-pointer hazard behind "audited" and
+  call it done.
+- Do not allow external backend stepping behind the production adapter as a
+  user-visible behavior.
 - Do not claim zero-allocation runtime hot paths unless directly measured.
 - Do not broaden into arena/envelope redesign unless cancellation ownership
   cannot be solved otherwise.
@@ -235,9 +270,13 @@ Direct proof is required for:
 - stopped requester with pending timer/accept/read/write still quiesces;
 - runtime shutdown with pending timer/accept/read/write releases completion
   ownership;
+- forced incomplete release returns the typed shutdown/control error without
+  hanging or reporting clean shutdown;
 - late simulated completion after cancel/shutdown does not deliver a message and
   cannot write into dropped Tina-owned memory;
 - same-stream read/write lane behavior from Ranger still holds;
+- live runtime and `tina-sim` still cancel runtime-driver work immediately on
+  requester stop;
 - `make verify` remains green.
 
 Helpful extra proof if feasible:
@@ -252,6 +291,8 @@ Helpful extra proof if feasible:
 - Tina has a named Betelgeuse adapter/implementation layer with explicit
   completion ownership.
 - Ranger's shutdown leak fallback is gone.
+- A grep for `mem::forget` in Tina shutdown/driver code proves no remaining
+  completion-slot leak fallback.
 - `RuntimeDriver` lifecycle docs state the release guarantee.
 - Simulated and native Betelgeuse paths satisfy or explicitly gate the release
   guarantee.
