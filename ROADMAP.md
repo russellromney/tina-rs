@@ -144,9 +144,7 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Dries van Agt core framework completion** | Consolidate the remaining pre-release core-framework rocks already named elsewhere: public lifecycle/test helpers, helper/macro completeness, bounded trace policy, thread-per-core runtime polish, user simulation surface, I/O breadth decision, and remaining cost cleanup. |
-| **Apollo Tokio bridge** | Build the narrowest useful Tokio bridge for incremental adoption, with a preserved/weakened-guarantees table against Tina's local-framework invariants. |
-| **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
+| **Dries van Agt core framework completion** | One large pre-Gemini phase that includes the old Dries/Apollo/Cassini rocks in order: finish the public local-framework surface, then build the narrowest useful Tokio/Tower/Axum bridge with preserved/weakened guarantees, then harden with CI, benchmark/memory evidence, optional MPSC decision, and dogfood-style proof. |
 
 ## Later capability roadmap
 
@@ -187,20 +185,18 @@ These still need answers, but each now has an intended phase home.
 1. **Supervisor budget windows.** Direct `RestartChildren` execution and
    panic-triggered supervised restart now exist. The next supervision design
    question is how far runtime-lifetime budgets can go before timed windows or
-   explicit deferral are required. Home: Dries or Cassini, depending on whether
-   it blocks local framework completeness.
+   explicit deferral are required. Home: Dries.
 2. **Trace retention.** Full trace forever is not a production-bounded story.
-   Home: Dries if it blocks the framework claim; otherwise Cassini.
+   Home: Dries.
 3. **Runtime-owned I/O breadth.** Decide whether the first local framework
    claim is TCP/time only or includes one more I/O family. Home: Dries.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
-   transport is not claimed. Home: Dries if local framework completeness needs
-   it; otherwise Apollo/remoting.
-5. **MPSC fallback.** Optional only. Home: Cassini unless a real workload proves
-   SPSC is too narrow for the local framework.
+   transport is not claimed. Home: Dries if local framework completeness or
+   the bridge needs it; otherwise later remoting.
+5. **MPSC fallback.** Optional only. Home: Dries decision, implementation only
+   if a real workload proves SPSC is too narrow for the local framework.
 6. **Zero-copy / lower-allocation transport.** The current cost model is
-   honest but not final. Home: Dries for framework-blocking costs, Cassini for
-   benchmark/hardening work.
+   honest but not final. Home: Dries.
 
 ---
 
