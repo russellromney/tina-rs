@@ -51,3 +51,54 @@ surfaces, or foggy closeout.
    genuinely missing.
 
 Grug says ready. Big fire, but ring of stones now exists.
+
+## Implementation Review 1
+
+Status: first execution slice landed locally; not the whole phase yet.
+
+What changed:
+
+- Added `tina_runtime::LocalApp` as the canonical single-shard live app owner.
+  It wraps `BetelgeuseBackedRuntime` rather than replacing the proven runner.
+- Added `LocalApp::single_shard(...)` and `LocalApp::multi_shard(...)` entry
+  points. Multi-shard currently returns `LocalMultiShardApp`, preserving one
+  `LocalApp` entry name while keeping the concrete owner honest.
+- Added terminal lifecycle types: `LocalAppState`, `LocalAppTerminalReport`,
+  `LocalAppShutdown`, and `LocalMultiShardAppShutdown`.
+- Added `BridgeHost::from_app(app)` so bridge-hosted services can start from
+  the canonical `LocalApp` path instead of constructing the lower-level runner
+  directly.
+- Added `BridgeBackpressure::retry_within(...)` so retry policy can have both a
+  per-attempt timeout and a total policy deadline.
+
+Proof added:
+
+- `tina-runtime/tests/local_app.rs`
+  - `local_app_single_shard_is_canonical_live_owner`
+  - `local_app_multi_shard_uses_same_entry_name_for_topology`
+  - `llama_tcp_timer_service_uses_local_app_runtime_owned_time`
+- `tina-tokio-bridge/tests/axum_bridge.rs`
+  - `bridge_host_can_be_built_from_canonical_local_app`
+  - `bridge_retry_policy_can_have_total_deadline`
+
+Targeted verification:
+
+- `cargo test -p tina-runtime --test local_app -p tina-tokio-bridge --test axum_bridge`
+  passes locally.
+- `make verify` passes locally.
+
+Self-review fix:
+
+- `LocalAppMultiShardBuilder::shard_pair_capacity(...)` initially risked being
+  a pretend knob. The live multi-shard substrate currently routes remote sends
+  through the target worker's bounded command queue, so the method now sets the
+  same underlying capacity and documents that limitation instead of doing
+  nothing.
+
+Remaining for Piet:
+
+- stronger lifecycle failure/worker-panic terminal proof;
+- named `llama_http_bridge_service`, `llama_supervised_worker_service`, and
+  simulator/DST parity workload;
+- performance-envelope artifact;
+- any API tightening discovered while moving more tests to `LocalApp`.

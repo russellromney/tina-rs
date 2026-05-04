@@ -2572,6 +2572,418 @@ pub enum BetelgeuseBackedSendObservedError {
 type BetelgeuseCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
 type BetelgeuseIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
 
+/// Lifecycle state for the canonical local Tina app owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAppState {
+    /// The app owner has been created but has not yet accepted work.
+    Starting,
+    /// The app accepts bounded ingress.
+    Accepting,
+    /// Shutdown has been requested.
+    Closing,
+    /// Shutdown is draining runtime-owned work.
+    Draining,
+    /// The app has closed cleanly.
+    Closed,
+    /// The app failed during shutdown or worker execution.
+    Failed,
+}
+
+/// Terminal report returned by [`LocalApp`] and [`LocalMultiShardApp`] shutdown.
+#[derive(Debug)]
+pub struct LocalAppTerminalReport {
+    state: LocalAppState,
+    trace: Vec<RuntimeEvent>,
+}
+
+impl LocalAppTerminalReport {
+    /// Creates a terminal report from final state and trace.
+    pub fn new(state: LocalAppState, trace: Vec<RuntimeEvent>) -> Self {
+        Self { state, trace }
+    }
+
+    /// Final lifecycle state.
+    pub const fn state(&self) -> LocalAppState {
+        self.state
+    }
+
+    /// Final trace returned by the live worker.
+    pub fn trace(&self) -> &[RuntimeEvent] {
+        &self.trace
+    }
+
+    /// Consumes the report and returns the final trace.
+    pub fn into_trace(self) -> Vec<RuntimeEvent> {
+        self.trace
+    }
+}
+
+/// Canonical live app owner for one local Tina shard.
+///
+/// `LocalApp` is the preferred user-facing owner for local live services.
+/// [`BetelgeuseBackedRuntime`] remains the lower-level backend-honest runner
+/// underneath it.
+pub struct LocalApp<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    runtime: Option<BetelgeuseBackedRuntime<S, F>>,
+}
+
+impl<S, F> LocalApp<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    /// Starts configuring one single-shard local app.
+    pub fn single_shard(shard: S, mailbox_factory: F) -> LocalAppSingleShardBuilder<S, F> {
+        LocalAppSingleShardBuilder {
+            shard,
+            mailbox_factory,
+            config: BetelgeuseBackedRuntimeConfig::default(),
+        }
+    }
+
+    /// Starts configuring one multi-shard local app.
+    pub fn multi_shard(mailbox_factory: F) -> LocalAppMultiShardBuilder<S, F>
+    where
+        F: Clone,
+    {
+        LocalAppMultiShardBuilder {
+            shards: Vec::new(),
+            mailbox_factory,
+            config: BetelgeuseBackedRuntimeConfig::default(),
+        }
+    }
+
+    /// Returns current lifecycle state.
+    pub fn state(&self) -> LocalAppState {
+        if self.runtime.is_some() {
+            LocalAppState::Accepting
+        } else {
+            LocalAppState::Closed
+        }
+    }
+
+    /// Registers one root isolate with a runtime-allocated mailbox.
+    #[allow(private_bounds)]
+    pub fn register_root<I, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<Address<I::Message, I::Reply>, BetelgeuseBackedControlError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        self.runtime()
+            .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Configures a registered root as a supervisor.
+    pub fn supervise<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+        config: SupervisorConfig,
+    ) -> Result<(), BetelgeuseBackedControlError> {
+        self.runtime().supervise(parent, config)
+    }
+
+    /// Attempts one bounded ingress handoff.
+    pub fn try_send<M: Send + 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+    ) -> Result<(), BetelgeuseBackedTrySendError> {
+        self.runtime().try_send(address, message)
+    }
+
+    /// Attempts one ingress send and observes the mailbox outcome.
+    pub fn send_and_observe<M: Send + 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+    ) -> Result<(), BetelgeuseBackedSendObservedError> {
+        self.runtime().send_and_observe(address, message)
+    }
+
+    /// Returns a trace snapshot.
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+        self.runtime().trace()
+    }
+
+    /// Begins graceful shutdown.
+    pub fn shutdown(self) -> LocalAppShutdown<S, F> {
+        LocalAppShutdown {
+            runtime: self.runtime,
+        }
+    }
+
+    /// Consumes the app and returns its lower-level Betelgeuse-backed runtime.
+    ///
+    /// This is for bridge/adapters that need to share the backend runner behind
+    /// an `Arc` while preserving `LocalApp` as the preferred construction path.
+    pub fn into_betelgeuse_runtime(mut self) -> BetelgeuseBackedRuntime<S, F> {
+        self.runtime
+            .take()
+            .expect("local app runtime is unavailable after shutdown")
+    }
+
+    fn runtime(&self) -> &BetelgeuseBackedRuntime<S, F> {
+        self.runtime
+            .as_ref()
+            .expect("local app runtime is unavailable after shutdown")
+    }
+}
+
+/// Builder for a single-shard [`LocalApp`].
+pub struct LocalAppSingleShardBuilder<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    shard: S,
+    mailbox_factory: F,
+    config: BetelgeuseBackedRuntimeConfig,
+}
+
+impl<S, F> LocalAppSingleShardBuilder<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    /// Sets bounded ingress command capacity.
+    pub const fn ingress_capacity(mut self, capacity: usize) -> Self {
+        self.config.command_capacity = capacity;
+        self
+    }
+
+    /// Sets trace retention for the worker-owned runtime.
+    pub const fn trace_retention(mut self, retention: TraceRetention) -> Self {
+        self.config.trace_retention = retention;
+        self
+    }
+
+    /// Sets idle wait duration for the live worker.
+    pub const fn idle_wait(mut self, idle_wait: Duration) -> Self {
+        self.config.idle_wait = idle_wait;
+        self
+    }
+
+    /// Builds the local app and starts its worker.
+    pub fn build(self) -> LocalApp<S, F> {
+        LocalApp {
+            runtime: Some(BetelgeuseBackedRuntime::with_config(
+                self.shard,
+                self.mailbox_factory,
+                self.config,
+            )),
+        }
+    }
+}
+
+/// Graceful shutdown handle for [`LocalApp`].
+pub struct LocalAppShutdown<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    runtime: Option<BetelgeuseBackedRuntime<S, F>>,
+}
+
+impl<S, F> LocalAppShutdown<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    /// Marks the shutdown as draining runtime-owned work.
+    ///
+    /// Current Betelgeuse-backed shutdown drains/cancels inside worker
+    /// shutdown. The method exists to keep the user-facing lifecycle explicit.
+    pub fn drain(self) -> Self {
+        self
+    }
+
+    /// Joins the worker and returns its terminal report.
+    pub fn join(mut self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+        let Some(runtime) = self.runtime.take() else {
+            return Ok(LocalAppTerminalReport::new(
+                LocalAppState::Closed,
+                Vec::new(),
+            ));
+        };
+        runtime
+            .shutdown()
+            .map(|trace| LocalAppTerminalReport::new(LocalAppState::Closed, trace))
+    }
+}
+
+/// Builder for a multi-shard local app.
+pub struct LocalAppMultiShardBuilder<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    shards: Vec<S>,
+    mailbox_factory: F,
+    config: BetelgeuseBackedRuntimeConfig,
+}
+
+impl<S, F> LocalAppMultiShardBuilder<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    /// Adds one shard to the local app topology.
+    pub fn shard(mut self, shard: S) -> Self {
+        self.shards.push(shard);
+        self
+    }
+
+    /// Sets bounded ingress command capacity.
+    pub const fn ingress_capacity(mut self, capacity: usize) -> Self {
+        self.config.command_capacity = capacity;
+        self
+    }
+
+    /// Names desired shard-pair capacity for live remote sends.
+    ///
+    /// The current live substrate routes remote sends through the target
+    /// worker's bounded command queue, so this sets the same underlying
+    /// capacity as [`ingress_capacity`](Self::ingress_capacity) until a
+    /// dedicated live shard-pair queue exists.
+    pub const fn shard_pair_capacity(mut self, capacity: usize) -> Self {
+        self.config.command_capacity = capacity;
+        self
+    }
+
+    /// Sets trace retention for worker-owned runtimes.
+    pub const fn trace_retention(mut self, retention: TraceRetention) -> Self {
+        self.config.trace_retention = retention;
+        self
+    }
+
+    /// Builds the multi-shard local app and starts one worker per shard.
+    pub fn build(self) -> LocalMultiShardApp<S, F> {
+        LocalMultiShardApp {
+            runtime: Some(BetelgeuseBackedMultiShardRuntime::with_config(
+                self.shards,
+                self.mailbox_factory,
+                self.config,
+            )),
+        }
+    }
+}
+
+/// Canonical live app owner for a local multi-shard Tina service.
+pub struct LocalMultiShardApp<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    runtime: Option<BetelgeuseBackedMultiShardRuntime<S, F>>,
+}
+
+impl<S, F> LocalMultiShardApp<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    /// Registers one root isolate on the chosen shard.
+    #[allow(private_bounds)]
+    pub fn register_root_on<I, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<Address<I::Message, I::Reply>, BetelgeuseBackedControlError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: Send + 'static,
+    {
+        self.runtime()
+            .register_with_capacity_on::<I, Outbound>(shard, isolate, mailbox_capacity)
+    }
+
+    /// Configures a registered root as a supervisor.
+    pub fn supervise<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+        config: SupervisorConfig,
+    ) -> Result<(), BetelgeuseBackedControlError> {
+        self.runtime().supervise(parent, config)
+    }
+
+    /// Attempts one bounded ingress handoff to the owning worker shard.
+    pub fn try_send<M: Send + 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+    ) -> Result<(), BetelgeuseBackedTrySendError> {
+        self.runtime().try_send(address, message)
+    }
+
+    /// Returns a globally sorted trace snapshot.
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+        self.runtime().trace()
+    }
+
+    /// Begins graceful shutdown.
+    pub fn shutdown(self) -> LocalMultiShardAppShutdown<S, F> {
+        LocalMultiShardAppShutdown {
+            runtime: self.runtime,
+        }
+    }
+
+    fn runtime(&self) -> &BetelgeuseBackedMultiShardRuntime<S, F> {
+        self.runtime
+            .as_ref()
+            .expect("local multi-shard app runtime is unavailable after shutdown")
+    }
+}
+
+/// Graceful shutdown handle for [`LocalMultiShardApp`].
+pub struct LocalMultiShardAppShutdown<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    runtime: Option<BetelgeuseBackedMultiShardRuntime<S, F>>,
+}
+
+impl<S, F> LocalMultiShardAppShutdown<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    /// Marks the shutdown as draining runtime-owned work.
+    pub fn drain(self) -> Self {
+        self
+    }
+
+    /// Joins all workers and returns a terminal report.
+    pub fn join(mut self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+        let Some(runtime) = self.runtime.take() else {
+            return Ok(LocalAppTerminalReport::new(
+                LocalAppState::Closed,
+                Vec::new(),
+            ));
+        };
+        runtime
+            .shutdown()
+            .map(|trace| LocalAppTerminalReport::new(LocalAppState::Closed, trace))
+    }
+}
+
 enum BetelgeuseCommand<S, F>
 where
     S: Shard,

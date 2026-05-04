@@ -12,7 +12,8 @@ use axum::routing::get;
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, MailboxFactory, RuntimeEventKind, sleep,
+    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, LocalApp, MailboxFactory,
+    RuntimeEventKind, sleep,
 };
 use tina_tokio_bridge::{
     BRIDGE_CAPABILITIES, BridgeBackpressure, BridgeError, BridgeHandle, BridgeHealth, BridgeHost,
@@ -250,6 +251,39 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
 }
 
 #[tokio::test]
+async fn bridge_host_can_be_built_from_canonical_local_app() {
+    let app = LocalApp::single_shard(BridgeShard, BridgeMailboxFactory)
+        .ingress_capacity(8)
+        .build();
+    let mut host = BridgeHost::from_app(app);
+    let bridge = host
+        .register_bridge::<LlamaCounter, BrushRequest, BrushReply, Infallible>(
+            LlamaCounter { brushes: 0 },
+            8,
+            Duration::from_secs(1),
+        )
+        .expect("register bridge service from local app");
+
+    assert_eq!(
+        bridge.call(BrushRequest { llama: "Tina" }).await,
+        Ok(BrushReply {
+            line: "Tina brushed 1".to_string()
+        })
+    );
+
+    drop(bridge);
+    let terminal_trace = host.try_shutdown().expect("shutdown local-app bridge host");
+    assert!(terminal_trace.iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::HandlerFinished {
+                effect: tina_runtime::EffectKind::Noop
+            }
+        )
+    }));
+}
+
+#[tokio::test]
 async fn bridge_close_health_and_metrics_are_visible() {
     let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
         BridgeShard,
@@ -347,6 +381,52 @@ async fn bridge_retry_policy_is_bounded_and_explicit() {
     );
     assert_eq!(bridge.metrics().attempts, 3);
     assert_eq!(bridge.metrics().full, 3);
+
+    drop(bridge);
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("bridge handle dropped"),
+    };
+    let _ = runtime.shutdown().expect("runtime shutdown");
+}
+
+#[tokio::test]
+async fn bridge_retry_policy_can_have_total_deadline() {
+    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ));
+    let address = runtime
+        .register_with_capacity::<LlamaCounter, Infallible>(LlamaCounter { brushes: 0 }, 0)
+        .expect("register zero-capacity llama isolate");
+    let bridge = BridgeHandle::new(Arc::clone(&runtime), address, Duration::from_secs(1));
+
+    let started = Instant::now();
+    assert_eq!(
+        bridge
+            .call_with_policy(
+                BrushRequest { llama: "Tina" },
+                BridgeBackpressure::retry_within(
+                    100,
+                    Duration::from_millis(25),
+                    Duration::from_millis(30),
+                ),
+                Duration::from_secs(1),
+            )
+            .await,
+        Err(BridgeError::Timeout)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "total retry deadline should bound all attempts plus delays"
+    );
+    assert_eq!(bridge.metrics().timeout, 1);
+    assert!(bridge.metrics().attempts >= 1);
 
     drop(bridge);
     let runtime = match Arc::try_unwrap(runtime) {

@@ -35,7 +35,7 @@ use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
 use tina_runtime::{
     BetelgeuseBackedControlError, BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig,
     BetelgeuseBackedSendObservedError, BetelgeuseBackedTrySendError, CallError, IntoErasedCall,
-    MailboxFactory, RuntimeEvent, SendRejectedReason,
+    LocalApp, MailboxFactory, RuntimeEvent, SendRejectedReason,
 };
 use tokio::sync::oneshot;
 use tower_service::Service;
@@ -99,6 +99,15 @@ pub enum BridgeBackpressure {
         /// Delay between attempts.
         delay: Duration,
     },
+    /// Retry `Full` with a bounded retry count and total deadline.
+    RetryWithin {
+        /// Number of additional attempts after the first failed attempt.
+        max_retries: usize,
+        /// Delay between attempts.
+        delay: Duration,
+        /// Total deadline for all attempts and retry delays.
+        total_timeout: Duration,
+    },
 }
 
 impl BridgeBackpressure {
@@ -113,6 +122,20 @@ impl BridgeBackpressure {
     /// `retry(2, delay)` can make at most three attempts.
     pub const fn retry(max_retries: usize, delay: Duration) -> Self {
         Self::Retry { max_retries, delay }
+    }
+
+    /// Retry overload with an explicit delay, maximum retry count, and total
+    /// deadline for the whole policy.
+    pub const fn retry_within(
+        max_retries: usize,
+        delay: Duration,
+        total_timeout: Duration,
+    ) -> Self {
+        Self::RetryWithin {
+            max_retries,
+            delay,
+            total_timeout,
+        }
     }
 }
 
@@ -460,6 +483,13 @@ where
         }
     }
 
+    /// Builds a bridge host from the canonical local app owner.
+    pub fn from_app(app: LocalApp<S, F>) -> Self {
+        Self {
+            runtime: Some(Arc::new(app.into_betelgeuse_runtime())),
+        }
+    }
+
     /// Returns the hosted Tina runtime.
     pub fn runtime(&self) -> &Arc<BetelgeuseBackedRuntime<S, F>> {
         self.runtime
@@ -659,10 +689,43 @@ where
     where
         M: Clone,
     {
-        let (mut remaining, delay) = match policy {
-            BridgeBackpressure::Reject => (0, Duration::ZERO),
-            BridgeBackpressure::Retry { max_retries, delay } => (max_retries, delay),
-        };
+        match policy {
+            BridgeBackpressure::Reject => self.call_once(message, per_attempt_timeout).await,
+            BridgeBackpressure::Retry { max_retries, delay } => {
+                self.call_with_retry(message, max_retries, delay, per_attempt_timeout)
+                    .await
+            }
+            BridgeBackpressure::RetryWithin {
+                max_retries,
+                delay,
+                total_timeout,
+            } => {
+                match tokio::time::timeout(
+                    total_timeout,
+                    self.call_with_retry(message, max_retries, delay, per_attempt_timeout),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        self.record_error(BridgeError::Timeout);
+                        Err(BridgeError::Timeout)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn call_with_retry(
+        &self,
+        message: M,
+        mut remaining: usize,
+        delay: Duration,
+        per_attempt_timeout: Duration,
+    ) -> Result<R, BridgeError>
+    where
+        M: Clone,
+    {
         loop {
             match self.call_once(message.clone(), per_attempt_timeout).await {
                 Err(BridgeError::Full) if remaining > 0 => {
