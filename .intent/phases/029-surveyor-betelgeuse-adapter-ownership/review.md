@@ -157,3 +157,65 @@ CI follow-up added:
   `macos-latest` for pull requests plus pushes to `main` and `codex/**`.
 - This turns the Surveyor native-backend proof into a two-platform check:
   macOS exercises Darwin/kqueue and Linux exercises io_uring.
+
+## Implementation Review 2
+
+Verdict: Surveyor is closed enough to build on.
+
+I re-reviewed the implementation against the plan after the full workspace
+verification and two-platform CI gate existed.
+
+What I checked:
+
+- `RuntimeDriver::cancel_pending()` now has a real lifecycle result:
+  `Result<(), DriverShutdownError>`.
+- `BetelgeuseRuntime::shutdown()` and
+  `BetelgeuseMultiShardRuntime::shutdown()` convert driver release failure into
+  `BetelgeuseControlError::DriverShutdownFailed`.
+- The Betelgeuse `IOLoop` hook is backend-generic:
+  `pending_completion_count()` plus `cancel_pending_completions()`.
+- Simulated I/O removes pending accept/recv/send records and completes their
+  slots with `Interrupted`.
+- Darwin/kqueue tracks `queued` and `watched` completion pointers and deletes
+  kqueue watches before completing canceled slots.
+- Linux/io_uring tracks `queued` and `inflight` completion pointers, completes
+  queued work with `EINTR`, and submits `AsyncCancel` for submitted work.
+- A grep for `mem::forget` in `tina-runtime/src` and `vendor-betelgeuse`
+  returns no hits.
+
+Focused proof:
+
+- `runtime_shutdown_surfaces_driver_completion_release_failure` proves the
+  explicit-step runtime does not turn driver release failure into success.
+- `betelgeuse_runtime_shutdown_reports_driver_release_failure` proves the live
+  worker handle returns `BetelgeuseControlError::DriverShutdownFailed`.
+- Existing threaded shutdown tests prove pending TCP accept cancellation rejects
+  requester completion instead of delivering late work.
+- Existing simulated post-shutdown stepping pressure still passes without the
+  old leak fallback.
+
+Verification:
+
+- Local `make verify` passed after Surveyor and the 030 plan artifacts:
+  `fmt`, `check`, full workspace tests, loom SPSC tests, docs, and clippy
+  `-D warnings`.
+- GitHub Actions `verify` passed on `ubuntu-latest`.
+- GitHub Actions `verify` passed on `macos-latest`.
+
+No blocking findings.
+
+Residual risk to preserve:
+
+- The native backends still rely on the production rule that the Tina worker
+  owns the backend. If a future API exposes externally-steppable native
+  `IOLoopHandle`s behind a live Tina runtime, the completion-slot release proof
+  must be reopened.
+- If native `cancel_pending_completions()` returns an error, Tina reports a
+  typed lifecycle failure rather than clean shutdown. That is the right
+  Surveyor contract, but future hardening may still want a stronger backend
+  drain/reporting model.
+
+Decision:
+
+- 029 should be treated as done.
+- 030 may build on Surveyor's shutdown/release contract.
