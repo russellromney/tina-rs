@@ -159,8 +159,8 @@ phases.
 | ~~**Tina TCP driver contract**~~ | Delivered in `.intent/phases/026-tina-driver-contract/`: runtime-owned time/TCP behind a small Tina-owned driver boundary, timers, TCP submissions, completions, cancellation, shutdown, native Betelgeuse adapter, simulated Betelgeuse adapter, same-resource `ResourceBusy` semantics, and direct cancellation/late-completion proofs. This is not a general async runtime and not a Tokio bridge. |
 | ~~**Parallel substrate support**~~ | Delivered in `.intent/phases/027-parallel-substrate-support/`: Betelgeuse simulated I/O polish, narrow substrate cost evidence, expanded Tokio-vs-Tina constrained/backpressure comparisons, external review prompts, Tokio current-thread/Monoio/Glommio/Compio adapter research, and brief README/story refinement without changing Tina core semantics. |
 | ~~**Ranger core runtime substrate completion**~~ | Delivered in `.intent/phases/028-ranger-substrate-driver-maturity/`: documented the driver capability contract, moved TCP pending ownership to listener/read/write lanes, allowed full-duplex same-stream read/write, kept close and duplicate-lane `ResourceBusy` honest, made per-call cancel tombstone without silently closing unrelated lanes, added live worker TCP shutdown proof, pinned TCP read/write allocation counts, and recorded Betelgeuse as the near-term substrate direction. |
-| **Surveyor Betelgeuse adapter ownership** | Planned in `.intent/phases/029-surveyor-betelgeuse-adapter-ownership/`: treat Tina's live substrate as a Tina-owned implementation over Betelgeuse, with explicit completion-slot ownership, no-leak shutdown/cancel-drain, controlled simulated/native backend release proofs, and no dependence on upstream Betelgeuse growing Tina-specific guarantees first. |
-| **Willem Drees local production runtime** | Planned in `.intent/phases/030-willem-drees-local-production-runtime/`: make the one-process Tina server story boring: listener/connection lifecycle, graceful shutdown, bounded overload, supervisor behavior under live TCP pressure, memory ceilings, Linux/macOS CI proof, and server-shaped assertions rather than demo logs. |
+| ~~**Surveyor Betelgeuse adapter ownership**~~ | Delivered in `.intent/phases/029-surveyor-betelgeuse-adapter-ownership/`: Tina now treats its live substrate as a Tina-owned implementation over Betelgeuse, with explicit completion-slot ownership, no-leak shutdown/cancel-drain, controlled simulated/native backend release proofs, and no dependence on upstream Betelgeuse growing Tina-specific guarantees first. |
+| ~~**Willem Drees local production runtime**~~ | Delivered in `.intent/phases/030-willem-drees-local-production-runtime/`: Tina now has a composed one-process server-shaped proof covering listener/connection lifecycle, graceful shutdown, bounded overload, supervisor behavior under live TCP pressure, memory ceilings/backpressure guards, and server-shaped assertions rather than demo logs. |
 | **Ruud Lubbers performance and memory hardening** | Measure and improve the hot paths that matter for a performant Rust concurrency framework: mailbox, send, call, TCP read/write, spawn/restart, trace pressure, boxed erasure, and allocation behavior. Keep claims narrow and numerical. |
 | **Joop den Uyl porting surface** | Make "have Codex port my small Tokio-shaped TCP/control-plane service to Tina" realistic without turning Tina into Tokio or Akka. Add only the helpers, macros, patterns, and regression tests needed for clear listener/connection/worker/supervisor code. |
 | **Gemini release story** | Release-story phase after the local production runtime, performance/memory story, and porting surface are real. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
@@ -188,11 +188,10 @@ boundary. Surveyor follows because the Betelgeuse implementation should now be
 treated as Tina-owned code over Betelgeuse primitives, with its own
 completion-ownership and no-leak shutdown contract.
 
-After Surveyor, the roadmap deliberately stays local before release polish:
-Willem Drees makes the local server runtime production-shaped; Ruud Lubbers
-keeps performance and allocation claims honest; Joop den Uyl makes porting
-ordinary server-shaped code to Tina less fragile. Gemini only freezes and
-publishes the story after those rocks are real. Persistence, remoting, and
+After Willem Drees, the roadmap deliberately stays local before release polish:
+Ruud Lubbers keeps performance and allocation claims honest; Joop den Uyl makes
+porting ordinary server-shaped code to Tina less fragile. Gemini only freezes
+and publishes the story after those rocks are real. Persistence, remoting, and
 clustering remain later Tina capabilities, not Akka-parity launch blockers.
 
 ## Strategic prerequisites
@@ -561,6 +560,8 @@ on Ranger rather than reopen core runtime/substrate semantics.
 > Local production runtime. Make one-process Tina servers boring before release polish.
 
 > After: Phase Surveyor · Before: Phase Ruud Lubbers
+
+Delivered in `.intent/phases/030-willem-drees-local-production-runtime/`.
 
 Willem Drees exists because Tina should not launch as "Akka in Rust" or as a
 demo framework. It should first be a safe local concurrency runtime that can

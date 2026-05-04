@@ -355,3 +355,33 @@ This file records completed work.
   workloads, while production hardening, peer quarantine, dynamic shard
   membership, cross-shard child ownership, Tokio bridge work, and broad
   allocation-free runtime claims remain future work.
+
+### Phase Surveyor
+
+- Treated Tina's live substrate as a Tina-owned implementation over Betelgeuse
+  instead of waiting for upstream Betelgeuse to provide Tina-specific
+  guarantees.
+- Hardened completion-slot ownership so shutdown and cancellation no longer
+  depend on dropping slots while a backend may still hold pending completion
+  state.
+- Added no-leak shutdown/cancel-drain proofs across native and simulated
+  Betelgeuse-backed runtime paths.
+- Preserved the explicit-step runtime and `tina-sim` as the semantic oracle;
+  Surveyor changed live-substrate ownership, not Tina's isolate model.
+
+### Phase Willem Drees
+
+- Added a composed local-production workload in `tina-runtime` with listener
+  isolate, connection isolates, bounded worker, supervisor restart,
+  runtime-owned TCP, runtime-owned time, and shutdown pressure.
+- Proved the workload on live Betelgeuse TCP with real loopback clients,
+  observing typed `CallOutcome::{Replied, Full, Timeout}` and trace events.
+- Proved the same server shape through Betelgeuse simulated I/O with delayed
+  completions and partial writes, driven through the threaded runtime loop.
+- Added a `tina-sim` oracle version that replays the bounded TCP flow
+  byte-for-byte for observations, peer output, and event kinds.
+- Added composed shutdown proof for pending accept, read, write, sleep, and
+  isolate-call work.
+- Added server-shaped backpressure guards: explicit mailbox/ingress
+  capacities, forced worker `Full`, and exact-sized scripted peer output
+  buffers so hidden writes cannot be masked.
