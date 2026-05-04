@@ -195,9 +195,16 @@ model.
 - the hot SPSC path is meant to avoid per-message allocation after warm-up for
   fixed-size payloads
 - claims about allocation behavior must stay narrow and be backed by evidence
-- the current runtime and simulator do not have a broad allocation-free hot-path
-  claim; boxed erasure, traces, replay records, and coordinator storage may
-  allocate
+- the current runtime and simulator do not have a broad allocation-free
+  framework claim; boxed erasure, call translators, trace storage, replay
+  records, completion slots, and coordinator storage may allocate
+- selected runtime hot paths are pinned numerically by allocation tests; those
+  numbers are cost-model evidence, not marketing benchmarks
+- optimizations must not disable trace/replay, hide bounded pressure, or move
+  work into background queues to make allocation counts look better
+- reusable scratch buffers and preallocation are allowed when tests prove the
+  warmed path and semantics still hold, including entry counts above tiny
+  defaults
 - dynamically sized payloads, if supported, travel behind owning pointers; the
   ring stores fixed-size slot values, not inline DST payloads
 

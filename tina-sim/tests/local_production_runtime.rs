@@ -364,7 +364,24 @@ fn peer(
     }
 }
 
-fn run_local_server_oracle(seed: u64) -> (Vec<Observation>, Vec<Vec<u8>>, Vec<RuntimeEventKind>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalServerOracleCost {
+    parent_deliveries: usize,
+    server_deliveries: usize,
+    event_count: usize,
+    tcp_write_completions: usize,
+    isolate_call_failures: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalServerOracleRun {
+    observations: Vec<Observation>,
+    outputs: Vec<Vec<u8>>,
+    event_kinds: Vec<RuntimeEventKind>,
+    cost: LocalServerOracleCost,
+}
+
+fn run_local_server_oracle(seed: u64) -> LocalServerOracleRun {
     let observations = Rc::new(RefCell::new(Vec::new()));
     let worker_addresses = Rc::new(RefCell::new(Vec::new()));
     let mut sim = Simulator::new(
@@ -398,7 +415,7 @@ fn run_local_server_oracle(seed: u64) -> (Vec<Observation>, Vec<Vec<u8>>, Vec<Ru
         addresses: Rc::clone(&worker_addresses),
     });
     sim.try_send(parent, ParentMsg::Spawn).unwrap();
-    sim.run_until_quiescent();
+    let parent_deliveries = sim.run_until_quiescent();
     let worker = worker_addresses.borrow()[0];
     let listener = sim.register_with_mailbox_capacity(
         Listener {
@@ -412,7 +429,7 @@ fn run_local_server_oracle(seed: u64) -> (Vec<Observation>, Vec<Vec<u8>>, Vec<Ru
         8,
     );
     sim.try_send(listener, ListenerMsg::Start).unwrap();
-    sim.run_until_quiescent();
+    let server_deliveries = sim.run_until_quiescent();
 
     let outputs = sim
         .replay_artifact()
@@ -426,7 +443,41 @@ fn run_local_server_oracle(seed: u64) -> (Vec<Observation>, Vec<Vec<u8>>, Vec<Ru
         .iter()
         .map(|event| event.kind())
         .collect::<Vec<_>>();
-    (observations.borrow().clone(), outputs, event_kinds)
+    let cost = LocalServerOracleCost {
+        parent_deliveries,
+        server_deliveries,
+        event_count: event_kinds.len(),
+        tcp_write_completions: event_kinds
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    RuntimeEventKind::CallCompleted {
+                        call_kind: CallKind::TcpWrite,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        isolate_call_failures: event_kinds
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    RuntimeEventKind::CallFailed {
+                        call_kind: CallKind::IsolateCall,
+                        ..
+                    }
+                )
+            })
+            .count(),
+    };
+    LocalServerOracleRun {
+        observations: observations.borrow().clone(),
+        outputs,
+        event_kinds,
+        cost,
+    }
 }
 
 #[test]
@@ -436,18 +487,29 @@ fn local_server_oracle_replays_bounded_worker_pressure_and_partial_writes() {
 
     assert_eq!(first, replayed);
     assert_eq!(
-        first.1,
+        first.cost,
+        LocalServerOracleCost {
+            parent_deliveries: 2,
+            server_deliveries: 41,
+            event_count: 220,
+            tcp_write_completions: 16,
+            isolate_call_failures: 2,
+        },
+        "local-production oracle operation counts changed; update the cost model"
+    );
+    assert_eq!(
+        first.outputs,
         vec![
             b"alpha".to_vec(),
             b"worker-full".to_vec(),
             b"worker-timeout".to_vec()
         ]
     );
-    assert!(first.0.contains(&Observation::WorkerBooted));
-    assert!(first.0.contains(&Observation::Replied));
-    assert!(first.0.contains(&Observation::Full));
-    assert!(first.0.contains(&Observation::Timeout));
-    assert!(first.2.iter().any(|kind| {
+    assert!(first.observations.contains(&Observation::WorkerBooted));
+    assert!(first.observations.contains(&Observation::Replied));
+    assert!(first.observations.contains(&Observation::Full));
+    assert!(first.observations.contains(&Observation::Timeout));
+    assert!(first.event_kinds.iter().any(|kind| {
         matches!(
             kind,
             RuntimeEventKind::CallFailed {
@@ -457,7 +519,7 @@ fn local_server_oracle_replays_bounded_worker_pressure_and_partial_writes() {
             }
         )
     }));
-    assert!(first.2.iter().any(|kind| {
+    assert!(first.event_kinds.iter().any(|kind| {
         matches!(
             kind,
             RuntimeEventKind::CallFailed {
@@ -469,7 +531,7 @@ fn local_server_oracle_replays_bounded_worker_pressure_and_partial_writes() {
     }));
     assert!(
         first
-            .2
+            .event_kinds
             .iter()
             .filter(|kind| matches!(
                 kind,

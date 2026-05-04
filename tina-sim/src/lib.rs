@@ -379,6 +379,23 @@ struct InFlightCall {
 type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
 type ErasedIsolateCallTranslator = Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
 
+const INITIAL_ENTRY_CAPACITY: usize = 8;
+const INITIAL_CHILD_RECORD_CAPACITY: usize = 8;
+const INITIAL_SUPERVISOR_CAPACITY: usize = 4;
+const INITIAL_TRACE_CAPACITY: usize = 256;
+const INITIAL_CALL_CAPACITY: usize = 8;
+const INITIAL_TCP_RESOURCE_CAPACITY: usize = 4;
+
+fn reserve_round_message_scratch(
+    round_messages: &mut Vec<Option<DeliveredMessage>>,
+    entry_count: usize,
+) {
+    debug_assert!(round_messages.is_empty());
+    if round_messages.capacity() < entry_count {
+        round_messages.reserve(entry_count);
+    }
+}
+
 struct StoredTranslator {
     call_id: CallId,
     translator: Option<ErasedTranslator>,
@@ -890,6 +907,7 @@ where
     in_flight_calls: Vec<InFlightCall>,
     translators: Vec<StoredTranslator>,
     pending_isolate_calls: Vec<PendingIsolateCall>,
+    round_messages: Vec<Option<DeliveredMessage>>,
     next_isolate_call_ordinal: u64,
     last_checker_failure: Option<CheckerFailure>,
 }
@@ -907,27 +925,28 @@ where
         Self {
             shard,
             config,
-            entries: Vec::new(),
-            child_records: Vec::new(),
-            supervisors: Vec::new(),
+            entries: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
+            child_records: Vec::with_capacity(INITIAL_CHILD_RECORD_CAPACITY),
+            supervisors: Vec::with_capacity(INITIAL_SUPERVISOR_CAPACITY),
             next_isolate_id: 1,
             next_listener_id: 1,
             next_stream_id: 1,
             ids,
-            trace: Vec::new(),
+            trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
             virtual_now: Duration::ZERO,
             step_ordinal: 0,
-            timers: Vec::new(),
+            timers: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             next_timer_ordinal: 0,
             next_send_ordinal: 0,
             next_tcp_completion_ordinal: 0,
-            listeners: Vec::new(),
-            streams: Vec::new(),
-            pending_accepts: Vec::new(),
-            pending_tcp_completions: Vec::new(),
-            in_flight_calls: Vec::new(),
-            translators: Vec::new(),
-            pending_isolate_calls: Vec::new(),
+            listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            pending_accepts: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_tcp_completions: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            in_flight_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            translators: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_isolate_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            round_messages: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
             next_isolate_call_ordinal: 0,
             last_checker_failure: None,
         }
@@ -1126,17 +1145,17 @@ where
         self.harvest_isolate_call_timeouts(now);
         self.harvest_tcp();
 
-        let mut round_messages: Vec<Option<DeliveredMessage>> = self
-            .entries
-            .iter()
-            .map(|entry| {
-                if entry.stopped.get() {
-                    None
-                } else {
-                    entry.inbox.pop_visible(self.step_ordinal)
-                }
-            })
-            .collect();
+        let mut round_messages = std::mem::take(&mut self.round_messages);
+        round_messages.clear();
+        reserve_round_message_scratch(&mut round_messages, self.entries.len());
+        for entry in &self.entries {
+            let message = if entry.stopped.get() {
+                None
+            } else {
+                entry.inbox.pop_visible(self.step_ordinal)
+            };
+            round_messages.push(message);
+        }
 
         let mut delivered = 0;
 
@@ -1214,6 +1233,8 @@ where
             );
         }
 
+        round_messages.clear();
+        self.round_messages = round_messages;
         delivered
     }
 
@@ -1579,15 +1600,10 @@ where
         cause: tina_runtime::CauseId,
         round_messages: &mut [Option<DeliveredMessage>],
     ) {
-        let child_record_indices: Vec<usize> = self
-            .child_records
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| (record.parent == parent).then_some(index))
-            .collect();
-
-        for child_record_index in child_record_indices {
-            self.restart_child_record(parent, child_record_index, cause, round_messages);
+        for child_record_index in 0..self.child_records.len() {
+            if self.child_records[child_record_index].parent == parent {
+                self.restart_child_record(parent, child_record_index, cause, round_messages);
+            }
         }
     }
 
@@ -1656,22 +1672,23 @@ where
             },
         );
 
-        let selected: Vec<usize> = self
-            .child_records
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| {
-                if record.parent != parent {
-                    return None;
-                }
+        for child_record_index in 0..self.child_records.len() {
+            if self.child_records[child_record_index].parent != parent {
+                continue;
+            }
 
-                let relation = ChildRelation::from_ordinals(record.child_ordinal, failed_ordinal);
-                policy.restarts(relation).then_some(index)
-            })
-            .collect();
-
-        for child_record_index in selected {
-            self.restart_child_record(parent, child_record_index, triggered.into(), round_messages);
+            let relation = ChildRelation::from_ordinals(
+                self.child_records[child_record_index].child_ordinal,
+                failed_ordinal,
+            );
+            if policy.restarts(relation) {
+                self.restart_child_record(
+                    parent,
+                    child_record_index,
+                    triggered.into(),
+                    round_messages,
+                );
+            }
         }
     }
 
@@ -2552,25 +2569,21 @@ where
     }
 
     fn harvest_timers(&mut self, now: Duration) {
-        let mut due = Vec::new();
-        let mut still_pending = Vec::new();
-        for entry in std::mem::take(&mut self.timers) {
-            if entry.deadline <= now {
-                due.push(entry);
-            } else {
-                still_pending.push(entry);
-            }
-        }
-        self.timers = still_pending;
-        due.sort_by(|a, b| {
-            a.deadline
-                .cmp(&b.deadline)
-                .then_with(|| a.insertion_order.cmp(&b.insertion_order))
-        });
-
         let mut batch_offset = 0;
         let mut last_registration_index = None;
-        for entry in due {
+        while let Some(index) = self
+            .timers
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.deadline <= now)
+            .min_by(|(_, left), (_, right)| {
+                left.deadline
+                    .cmp(&right.deadline)
+                    .then_with(|| left.insertion_order.cmp(&right.insertion_order))
+            })
+            .map(|(index, _)| index)
+        {
+            let entry = self.timers.remove(index);
             let registration_index = self.requester_registration_index(entry.call_id);
             if let Some(previous) = last_registration_index {
                 if registration_index <= previous {
@@ -2587,22 +2600,19 @@ where
     }
 
     fn harvest_isolate_call_timeouts(&mut self, now: Duration) {
-        let mut due = Vec::new();
-        let mut still_pending = Vec::new();
-        for entry in std::mem::take(&mut self.pending_isolate_calls) {
-            if entry.deadline <= now {
-                due.push(entry);
-            } else {
-                still_pending.push(entry);
-            }
-        }
-        self.pending_isolate_calls = still_pending;
-        due.sort_by(|a, b| {
-            a.deadline
-                .cmp(&b.deadline)
-                .then_with(|| a.insertion_order.cmp(&b.insertion_order))
-        });
-        for mut entry in due {
+        while let Some(index) = self
+            .pending_isolate_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.deadline <= now)
+            .min_by(|(_, left), (_, right)| {
+                left.deadline
+                    .cmp(&right.deadline)
+                    .then_with(|| left.insertion_order.cmp(&right.insertion_order))
+            })
+            .map(|(index, _)| index)
+        {
+            let mut entry = self.pending_isolate_calls.remove(index);
             let translator = entry.translator.take().unwrap_or_else(|| {
                 panic!("translator for call {:?} already consumed", entry.call_id)
             });
@@ -3139,23 +3149,25 @@ where
     }
 
     fn cancel_backend_calls_for_requester(&mut self, requester: RegisteredAddress) {
-        let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
-        for call in in_flight_calls {
-            if call.requester == requester {
-                self.cancel_pending_backend_work(call.call_id);
-                self.remove_backend_translator(call.call_id);
-                self.push_event(
-                    call.requester.isolate,
-                    Some(call.cause),
-                    RuntimeEventKind::CallCompletionRejected {
-                        call_id: call.call_id,
-                        call_kind: call.call_kind,
-                        reason: CallCompletionRejectedReason::RequesterClosed,
-                    },
-                );
-            } else {
-                self.in_flight_calls.push(call);
+        let mut index = 0;
+        while index < self.in_flight_calls.len() {
+            if self.in_flight_calls[index].requester != requester {
+                index += 1;
+                continue;
             }
+
+            let call = self.in_flight_calls.remove(index);
+            self.cancel_pending_backend_work(call.call_id);
+            self.remove_backend_translator(call.call_id);
+            self.push_event(
+                call.requester.isolate,
+                Some(call.cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id: call.call_id,
+                    call_kind: call.call_kind,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
         }
     }
 
@@ -3371,6 +3383,9 @@ where
     }
 }
 
+type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
+type RemoteQueues = Vec<VecDeque<QueuedRemoteSend>>;
+
 /// Deterministic explicit-step coordinator over a fixed set of shard simulators.
 ///
 /// This additive shell preserves the existing single-shard [`Simulator`] API
@@ -3381,9 +3396,12 @@ where
     S: Shard + 'static,
 {
     simulators: Vec<Simulator<S>>,
+    shard_ids: Vec<ShardId>,
     shard_indexes: BTreeMap<ShardId, usize>,
+    remote_queue_indexes: RemoteQueueIndexes,
     config: MultiShardSimulatorConfig,
-    remote_queues: BTreeMap<(ShardId, ShardId), VecDeque<QueuedRemoteSend>>,
+    remote_queues: RemoteQueues,
+    next_remote_queues: RemoteQueues,
     last_checker_failure: Option<CheckerFailure>,
 }
 
@@ -3448,28 +3466,34 @@ where
 
         let ids = IdSource::new();
         let mut simulators = Vec::with_capacity(shards.len());
+        let mut shard_ids = Vec::with_capacity(shards.len());
         let mut shard_indexes = BTreeMap::new();
         for shard in shards {
             let shard_id = shard.id();
             shard_indexes.insert(shard_id, simulators.len());
+            shard_ids.push(shard_id);
             simulators.push(Simulator::with_ids(shard, config.clone(), ids.clone()));
         }
+        let (remote_queue_indexes, remote_queues) =
+            build_remote_queues(&shard_ids, multishard.shard_pair_capacity);
+        let next_remote_queues =
+            build_remote_queue_storage(&shard_ids, multishard.shard_pair_capacity);
 
         Self {
             simulators,
+            shard_ids,
             shard_indexes,
+            remote_queue_indexes,
             config: multishard,
-            remote_queues: BTreeMap::new(),
+            remote_queues,
+            next_remote_queues,
             last_checker_failure: None,
         }
     }
 
     /// Returns the shard ids owned by this coordinator in global step order.
     pub fn shard_ids(&self) -> Vec<ShardId> {
-        self.simulators
-            .iter()
-            .map(|simulator| simulator.shard.id())
-            .collect()
+        self.shard_ids.clone()
     }
 
     /// Returns the current shared virtual time.
@@ -3588,33 +3612,62 @@ where
 
     /// Runs one global deterministic round in ascending shard-id order.
     pub fn step(&mut self) -> usize {
-        let mut ready = std::mem::take(&mut self.remote_queues);
-        let shard_ids = self.shard_ids();
+        std::mem::swap(&mut self.remote_queues, &mut self.next_remote_queues);
         let mut delivered = 0;
+        let config = self.config;
+        let shard_ids = &self.shard_ids;
+        let shard_indexes = &self.shard_indexes;
+        let remote_queue_indexes = &self.remote_queue_indexes;
+        let remote_queues = &mut self.remote_queues;
+        let next_remote_queues = &mut self.next_remote_queues;
+        let simulators = &mut self.simulators;
 
-        for destination in &shard_ids {
-            self.harvest_for_destination(*destination, &shard_ids, &mut ready);
-            let index = self.checked_shard_index(*destination);
-            let config = self.config;
-            let shard_indexes = self.shard_indexes.clone();
-            let remote_queues = &mut self.remote_queues;
-            delivered +=
-                self.simulators[index].step_with_remote(&mut |source_shard, send, cause| {
-                    if !shard_indexes.contains_key(&send.target_shard) {
-                        panic!(
-                            "multi-shard simulator targeted unknown destination shard {}",
-                            send.target_shard.get()
-                        );
-                    }
-
-                    let key = (source_shard, send.target_shard);
-                    let queue = remote_queues.entry(key).or_default();
-                    if queue.len() >= config.shard_pair_capacity {
-                        return Err(SendRejectedReason::Full);
-                    }
-                    queue.push_back(QueuedRemoteSend { send, cause });
-                    Ok(())
+        for destination in shard_ids.iter().copied() {
+            let index = shard_indexes.get(&destination).copied().unwrap_or_else(|| {
+                panic!(
+                    "multi-shard simulator targeted unknown shard {}",
+                    destination.get()
+                )
+            });
+            for source in shard_ids.iter().copied() {
+                if source == destination {
+                    continue;
+                }
+                let key = (source, destination);
+                let queue_index = remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
+                    panic!(
+                        "multi-shard simulator missing queue from shard {} to shard {}",
+                        source.get(),
+                        destination.get()
+                    )
                 });
+                while let Some(queued) = remote_queues[queue_index].pop_front() {
+                    simulators[index].harvest_remote_send(queued);
+                }
+            }
+            delivered += simulators[index].step_with_remote(&mut |source_shard, send, cause| {
+                if !shard_indexes.contains_key(&send.target_shard) {
+                    panic!(
+                        "multi-shard simulator targeted unknown destination shard {}",
+                        send.target_shard.get()
+                    );
+                }
+
+                let key = (source_shard, send.target_shard);
+                let queue_index = remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
+                    panic!(
+                        "multi-shard simulator missing queue from shard {} to shard {}",
+                        source_shard.get(),
+                        send.target_shard.get()
+                    )
+                });
+                let queue = &mut next_remote_queues[queue_index];
+                if queue.len() >= config.shard_pair_capacity {
+                    return Err(SendRejectedReason::Full);
+                }
+                queue.push_back(QueuedRemoteSend { send, cause });
+                Ok(())
+            });
         }
 
         delivered
@@ -3636,7 +3689,12 @@ where
             if self.has_in_flight_calls() {
                 continue;
             }
-            if !self.remote_queues.is_empty() {
+            if self.remote_queues.iter().any(|queue| !queue.is_empty())
+                || self
+                    .next_remote_queues
+                    .iter()
+                    .any(|queue| !queue.is_empty())
+            {
                 continue;
             }
             if self.simulators.iter().any(Simulator::has_pending_messages) {
@@ -3669,7 +3727,12 @@ where
             if self.has_in_flight_calls() {
                 continue;
             }
-            if !self.remote_queues.is_empty() {
+            if self.remote_queues.iter().any(|queue| !queue.is_empty())
+                || self
+                    .next_remote_queues
+                    .iter()
+                    .any(|queue| !queue.is_empty())
+            {
                 continue;
             }
             if self.simulators.iter().any(Simulator::has_pending_messages) {
@@ -3740,27 +3803,38 @@ where
         }
         None
     }
+}
 
-    fn harvest_for_destination(
-        &mut self,
-        destination: ShardId,
-        shard_ids: &[ShardId],
-        ready: &mut BTreeMap<(ShardId, ShardId), VecDeque<QueuedRemoteSend>>,
-    ) {
-        let index = self.checked_shard_index(destination);
-        for source in shard_ids {
-            if *source == destination {
+fn build_remote_queues(
+    shard_ids: &[ShardId],
+    shard_pair_capacity: usize,
+) -> (RemoteQueueIndexes, RemoteQueues) {
+    let queue_count = shard_ids
+        .len()
+        .saturating_mul(shard_ids.len().saturating_sub(1));
+    let mut indexes = BTreeMap::new();
+    let mut queues = Vec::with_capacity(queue_count);
+    for source in shard_ids.iter().copied() {
+        for destination in shard_ids.iter().copied() {
+            if source == destination {
                 continue;
             }
-            let key = (*source, destination);
-            let Some(queue) = ready.get_mut(&key) else {
-                continue;
-            };
-            while let Some(queued) = queue.pop_front() {
-                self.simulators[index].harvest_remote_send(queued);
-            }
+            indexes.insert((source, destination), queues.len());
+            queues.push(VecDeque::with_capacity(shard_pair_capacity));
         }
     }
+    (indexes, queues)
+}
+
+fn build_remote_queue_storage(shard_ids: &[ShardId], shard_pair_capacity: usize) -> RemoteQueues {
+    let queue_count = shard_ids
+        .len()
+        .saturating_mul(shard_ids.len().saturating_sub(1));
+    let mut queues = Vec::with_capacity(queue_count);
+    for _ in 0..queue_count {
+        queues.push(VecDeque::with_capacity(shard_pair_capacity));
+    }
+    queues
 }
 
 #[cfg(test)]
@@ -3768,6 +3842,17 @@ mod tests {
     use super::*;
     use std::convert::Infallible;
     use tina::{Outbound, batch, noop, send, spawn, stop};
+
+    #[test]
+    fn round_message_scratch_reserve_covers_more_than_initial_capacity() {
+        let mut scratch = Vec::with_capacity(INITIAL_ENTRY_CAPACITY);
+        scratch.clear();
+        reserve_round_message_scratch(&mut scratch, INITIAL_ENTRY_CAPACITY + 4);
+        assert!(
+            scratch.capacity() >= INITIAL_ENTRY_CAPACITY + 4,
+            "scratch reserve must cover the entry count before push-time growth"
+        );
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct NumberedShard(u32);

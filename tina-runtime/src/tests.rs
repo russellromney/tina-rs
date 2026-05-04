@@ -32,6 +32,17 @@ type RunEvidence = (
     Vec<ChildRecordSnapshot>,
 );
 
+#[test]
+fn round_message_scratch_reserve_covers_more_than_initial_capacity() {
+    let mut scratch = Vec::with_capacity(INITIAL_ENTRY_CAPACITY);
+    scratch.clear();
+    reserve_round_message_scratch(&mut scratch, INITIAL_ENTRY_CAPACITY + 4);
+    assert!(
+        scratch.capacity() >= INITIAL_ENTRY_CAPACITY + 4,
+        "scratch reserve must cover the entry count before push-time growth"
+    );
+}
+
 #[derive(Debug, Default)]
 struct TestShard;
 
@@ -1156,8 +1167,8 @@ impl RuntimeDriver for FakeDriver {
         None
     }
 
-    fn advance(&mut self, _now: Instant) -> Vec<DriverCompletion> {
-        self.pending.drain(..).collect()
+    fn advance(&mut self, _now: Instant, completed: &mut Vec<DriverCompletion>) {
+        completed.extend(self.pending.drain(..));
     }
 
     fn has_pending(&self) -> bool {

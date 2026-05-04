@@ -12,35 +12,55 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use betelgeuse::io::simulated::{SimulatedIO, SimulatedPeer};
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::{ChildDefinition, Mailbox, RestartableChildDefinition, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseRuntime, CallInput, CallOutcome, CallOutput, ListenerId, MailboxFactory,
     MultiShardRuntime, Runtime, RuntimeCall, StreamId, call,
 };
 
 const EXPECTED_MULTISHARD_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
-    allocations: 15,
-    reallocations: 2,
+    allocations: 1,
+    reallocations: 0,
 };
 const EXPECTED_ISOLATE_CALL_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
-    allocations: 9,
-    reallocations: 1,
+    allocations: 2,
+    reallocations: 0,
 };
 const EXPECTED_BETELGEUSE_INGRESS_HANDOFF: AllocationSnapshot = AllocationSnapshot {
     allocations: 1,
     reallocations: 0,
 };
 const EXPECTED_DRIVER_TIMER_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
-    allocations: 10,
-    reallocations: 1,
+    allocations: 2,
+    reallocations: 0,
 };
 const EXPECTED_DRIVER_TCP_READ_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
-    allocations: 13,
-    reallocations: 1,
+    allocations: 6,
+    reallocations: 0,
 };
 const EXPECTED_DRIVER_TCP_WRITE_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
-    allocations: 13,
-    reallocations: 1,
+    allocations: 6,
+    reallocations: 0,
+};
+const EXPECTED_BATCH_TWO_SEND_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 4,
+    reallocations: 0,
+};
+const EXPECTED_SPAWN_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 6,
+    reallocations: 0,
+};
+const EXPECTED_RESTART_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 4,
+    reallocations: 0,
+};
+const EXPECTED_TRACE_PRESSURE_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 16,
+    reallocations: 0,
+};
+const EXPECTED_HIGH_CARDINALITY_IDLE_STEP: AllocationSnapshot = AllocationSnapshot {
+    allocations: 0,
+    reallocations: 0,
 };
 const EXPECTED_SINGLE_SHARD_SEND_ROUND_PROGRESS: &[usize] = &[1, 1, 0];
 const EXPECTED_MULTISHARD_SEND_ROUND_PROGRESS: &[usize] = &[1, 1, 0];
@@ -188,6 +208,23 @@ struct AllocationSender {
 #[derive(Debug)]
 struct AllocationSink;
 
+#[derive(Debug)]
+struct BatchSender {
+    target: Address<AllocationEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnCostMsg {
+    Spawn,
+    Restart,
+}
+
+#[derive(Debug)]
+struct SpawnCostParent;
+
+#[derive(Debug)]
+struct SpawnCostChild;
+
 impl Isolate for AllocationSender {
     tina::isolate_types! {
         message: AllocationEvent,
@@ -218,6 +255,62 @@ impl Isolate for AllocationSink {
 
     fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         noop()
+    }
+}
+
+impl Isolate for BatchSender {
+    tina::isolate_types! {
+        message: AllocationEvent,
+        reply: (),
+        send: Outbound<AllocationEvent>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: AllocationShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            AllocationEvent::Kick => batch(vec![
+                send(self.target, AllocationEvent::Arrived),
+                send(self.target, AllocationEvent::Arrived),
+            ]),
+            AllocationEvent::Arrived => noop(),
+        }
+    }
+}
+
+impl Isolate for SpawnCostParent {
+    tina::isolate_types! {
+        message: SpawnCostMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: RestartableChildDefinition<SpawnCostChild>,
+        call: Infallible,
+        shard: AllocationShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            SpawnCostMsg::Spawn => spawn(RestartableChildDefinition::new(|| SpawnCostChild, 8)),
+            SpawnCostMsg::Restart => restart_children(),
+        }
+    }
+}
+
+impl Isolate for SpawnCostChild {
+    tina::isolate_types! {
+        message: SpawnCostMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: ChildDefinition<AllocationSink>,
+        call: Infallible,
+        shard: AllocationShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            SpawnCostMsg::Spawn | SpawnCostMsg::Restart => noop(),
+        }
     }
 }
 
@@ -547,6 +640,122 @@ fn multishard_send_round_count_keeps_the_cost_claim_named() {
         collect_round_progress(|| runtime.step()),
         EXPECTED_MULTISHARD_SEND_ROUND_PROGRESS,
         "multi-shard send round count changed; this names coordinator progress only"
+    );
+}
+
+#[test]
+fn two_send_batch_hot_path_allocation_count_is_pinned_after_warmup() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let sink = runtime.register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 8);
+    let sender = runtime
+        .register_with_capacity::<BatchSender, AllocationEvent>(BatchSender { target: sink }, 8);
+
+    runtime.try_send(sender, AllocationEvent::Kick).unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+
+    runtime.try_send(sender, AllocationEvent::Kick).unwrap();
+    let hot_path = measure_allocations(|| {
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(runtime.step(), 1);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_BATCH_TWO_SEND_HOT_PATH,
+        "two-send batch hot path allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn spawn_hot_path_allocation_count_is_pinned_after_warmup() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let parent = runtime.register_with_capacity::<SpawnCostParent, Infallible>(SpawnCostParent, 8);
+
+    runtime.try_send(parent, SpawnCostMsg::Spawn).unwrap();
+    assert_eq!(runtime.step(), 1);
+
+    runtime.try_send(parent, SpawnCostMsg::Spawn).unwrap();
+    let hot_path = measure_allocations(|| {
+        assert_eq!(runtime.step(), 1);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_SPAWN_HOT_PATH,
+        "spawn hot path allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn direct_restart_hot_path_allocation_count_is_pinned_after_warmup() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let parent = runtime.register_with_capacity::<SpawnCostParent, Infallible>(SpawnCostParent, 8);
+    runtime.try_send(parent, SpawnCostMsg::Spawn).unwrap();
+    assert_eq!(runtime.step(), 1);
+
+    runtime.try_send(parent, SpawnCostMsg::Restart).unwrap();
+    assert_eq!(runtime.step(), 1);
+
+    runtime.try_send(parent, SpawnCostMsg::Restart).unwrap();
+    let hot_path = measure_allocations(|| {
+        assert_eq!(runtime.step(), 1);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_RESTART_HOT_PATH,
+        "direct restart hot path allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn repeated_trace_event_growth_allocation_count_is_pinned() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let sink = runtime.register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 128);
+
+    for _ in 0..16 {
+        runtime.try_send(sink, AllocationEvent::Arrived).unwrap();
+        assert_eq!(runtime.step(), 1);
+    }
+
+    let hot_path = measure_allocations(|| {
+        for _ in 0..16 {
+            runtime.try_send(sink, AllocationEvent::Arrived).unwrap();
+            assert_eq!(runtime.step(), 1);
+        }
+    });
+    assert_eq!(
+        hot_path, EXPECTED_TRACE_PRESSURE_HOT_PATH,
+        "trace pressure allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn high_cardinality_idle_step_reuses_round_message_scratch_after_warmup() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    for _ in 0..12 {
+        runtime.register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 8);
+    }
+
+    assert_eq!(runtime.step(), 0);
+    let hot_path = measure_allocations(|| {
+        assert_eq!(runtime.step(), 0);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_HIGH_CARDINALITY_IDLE_STEP,
+        "high-cardinality idle step should reuse round-message scratch after warm-up"
     );
 }
 

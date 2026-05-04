@@ -385,3 +385,26 @@ This file records completed work.
 - Added server-shaped backpressure guards: explicit mailbox/ingress
   capacities, forced worker `Full`, and exact-sized scripted peer output
   buffers so hidden writes cannot be masked.
+
+### Phase Ruud Lubbers
+
+- Added a narrow numerical runtime cost model with allocation probes for
+  multi-shard send, isolate call, timer, TCP read/write, two-send batch,
+  spawn, restart, repeated trace pressure, live ingress handoff, and
+  high-cardinality idle stepping.
+- Kept the SPSC mailbox no-allocation proof intact while improving runtime,
+  simulator, driver, and coordinator allocation behavior.
+- Reused runtime and simulator round-message scratch storage, driver
+  completion scratch storage, and preallocated common runtime/simulator
+  bookkeeping vectors.
+- Changed runtime-created mailboxes to store erased message boxes directly,
+  avoiding an extra box/downcast/box cycle for runtime-created mailboxes while
+  preserving user-provided typed mailbox registration.
+- Reworked multi-shard runtime and simulator coordinator queues into prebuilt
+  indexed double buffers, reducing the multi-shard send hot path to
+  `1 alloc / 0 realloc` while preserving next-global-step remote visibility.
+- Added regression proof for more-than-initial-capacity round-message scratch
+  reuse, including a 12-isolate idle-step allocation test.
+- Recorded medium follow-up rocks in the roadmap: batch small path, live worker
+  command boxing, sizing knobs, trace retention policy, typed fast paths, and
+  completion-slot pooling/slabbing.

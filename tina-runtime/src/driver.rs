@@ -8,8 +8,9 @@
 //!
 //! - one [`RuntimeDriver::submit`] per [`CallInput`] issued by an isolate.
 //! - one [`RuntimeDriver::advance`] per [`crate::Runtime::step`].
-//! - the driver returns [`DriverCompletion`] values; `Runtime` translates them
-//!   into ordinary later-turn messages and trace events.
+//! - the driver appends [`DriverCompletion`] values into runtime-owned scratch
+//!   storage; `Runtime` translates them into ordinary later-turn messages and
+//!   trace events.
 //! - resource ids ([`ListenerId`], [`StreamId`]) are runtime-assigned
 //!   monotonic counters, not OS file descriptors. Isolate code never sees
 //!   raw fds or `Box<dyn IOSocket>` values.
@@ -27,6 +28,10 @@ use betelgeuse::{
 };
 
 use crate::call::{CallError, CallId, CallInput, CallOutput, ListenerId, StreamId};
+
+const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
+const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
+const INITIAL_DRIVER_PENDING_CAPACITY: usize = 8;
 
 /// Runtime-owned substrate driver.
 ///
@@ -50,8 +55,9 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
         now: Instant,
     ) -> Option<DriverCompletion>;
 
-    /// Advances the substrate by one runtime step.
-    fn advance(&mut self, now: Instant) -> Vec<DriverCompletion>;
+    /// Advances the substrate by one runtime step and appends ready
+    /// completions in deterministic order.
+    fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>);
 
     /// Returns whether substrate completions are still pending.
     fn has_pending(&self) -> bool;
@@ -171,7 +177,7 @@ impl BetelgeuseDriver {
     pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
-            timers: Vec::new(),
+            timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
     }
@@ -199,10 +205,9 @@ impl RuntimeDriver for BetelgeuseDriver {
         }
     }
 
-    fn advance(&mut self, now: Instant) -> Vec<DriverCompletion> {
-        let mut completed = self.tcp.advance();
-        completed.extend(self.harvest_timers(now));
-        completed
+    fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        self.tcp.advance(completed);
+        self.harvest_timers(now, completed);
     }
 
     fn has_pending(&self) -> bool {
@@ -227,28 +232,25 @@ impl RuntimeDriver for BetelgeuseDriver {
 }
 
 impl BetelgeuseDriver {
-    fn harvest_timers(&mut self, now: Instant) -> Vec<DriverCompletion> {
-        let mut due = Vec::new();
-        let mut still_pending = Vec::new();
-        for entry in std::mem::take(&mut self.timers) {
-            if entry.deadline <= now {
-                due.push(entry);
-            } else {
-                still_pending.push(entry);
-            }
-        }
-        self.timers = still_pending;
-        due.sort_by(|a, b| {
-            a.deadline
-                .cmp(&b.deadline)
-                .then_with(|| a.insertion_order.cmp(&b.insertion_order))
-        });
-        due.into_iter()
-            .map(|entry| DriverCompletion {
+    fn harvest_timers(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        while let Some(index) = self
+            .timers
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.deadline <= now)
+            .min_by(|(_, left), (_, right)| {
+                left.deadline
+                    .cmp(&right.deadline)
+                    .then_with(|| left.insertion_order.cmp(&right.insertion_order))
+            })
+            .map(|(index, _)| index)
+        {
+            let entry = self.timers.remove(index);
+            completed.push(DriverCompletion {
                 call_id: entry.call_id,
                 result: CallOutput::TimerFired,
-            })
-            .collect()
+            });
+        }
     }
 }
 
@@ -258,9 +260,9 @@ impl BetelgeuseTcp {
             io_loop,
             next_listener_id: 1,
             next_stream_id: 1,
-            listeners: Vec::new(),
-            streams: Vec::new(),
-            pending: Vec::new(),
+            listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            pending: Vec::with_capacity(INITIAL_DRIVER_PENDING_CAPACITY),
         }
     }
 
@@ -369,35 +371,39 @@ impl BetelgeuseTcp {
     /// Advances Betelgeuse by one tick and harvests any pending operations
     /// whose completion slots have a result available. Returned in
     /// submission order.
-    fn advance(&mut self) -> Vec<DriverCompletion> {
+    fn advance(&mut self, completed: &mut Vec<DriverCompletion>) {
         // One substrate tick. Errors here are non-fatal: pending ops still
         // hold their slots and will be checked anyway.
         let _ = self.io_loop.step();
 
-        let mut completed = Vec::new();
-        let mut still_pending: Vec<PendingOperation> = Vec::with_capacity(self.pending.len());
-
         // Drain in submission order so completion ordering is stable
         // relative to submission ordering whenever Betelgeuse permits it.
-        for mut op in std::mem::take(&mut self.pending) {
+        let mut index = 0;
+        while index < self.pending.len() {
+            let mut op = self.pending.remove(index);
             if op.cancelled {
                 if op.kind.has_result() {
                     continue;
                 }
-                still_pending.push(op);
+                self.pending.insert(index, op);
+                index += 1;
                 continue;
             }
-            match self.try_complete(&mut op) {
-                Some(result) => completed.push(DriverCompletion {
-                    call_id: op.call_id,
-                    result,
-                }),
-                None => still_pending.push(op),
+
+            let result = self.try_complete(&mut op);
+            match result {
+                Some(result) => {
+                    completed.push(DriverCompletion {
+                        call_id: op.call_id,
+                        result,
+                    });
+                }
+                None => {
+                    self.pending.insert(index, op);
+                    index += 1;
+                }
             }
         }
-
-        self.pending = still_pending;
-        completed
     }
 
     /// Returns whether TCP has any pending operations. Tests use
@@ -462,14 +468,14 @@ impl BetelgeuseTcp {
             }
 
             let _ = self.io_loop.step();
-            let mut still_pending = Vec::with_capacity(self.pending.len());
-            for op in std::mem::take(&mut self.pending) {
-                if op.kind.has_result() {
-                    continue;
+            let mut index = 0;
+            while index < self.pending.len() {
+                if self.pending[index].kind.has_result() {
+                    self.pending.remove(index);
+                } else {
+                    index += 1;
                 }
-                still_pending.push(op);
             }
-            self.pending = still_pending;
         }
     }
 
