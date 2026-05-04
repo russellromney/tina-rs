@@ -1,18 +1,24 @@
-# 028 Ranger Tokio-Workload Replacement Plan
+# 028 Ranger Service Workload Hardening Plan
 
 ## Purpose
 
-Prove that Tina can replace concrete Tokio-shaped workloads when the user does
-not need Tokio ecosystem integration.
+Move Tina from primitive-complete toward service-ready.
 
-The question Ranger answers is:
+Ranger is a framework-development phase. It should build the service-shaped
+runtime pieces that are still missing or under-pressure after the driver
+contract work:
 
-> Can a user see Tina, run it, and replace an actual small Tokio service with
-> Tina while keeping bounded queues, synchronous handlers, runtime-owned
-> time/TCP, shutdown, supervision, overload visibility, and simulation proof?
+- reusable framed TCP service structure;
+- stateful session / registry coordination without shared mutable state;
+- timer/backoff and shutdown behavior inside service-shaped flows;
+- supervised bounded work execution;
+- overload handling that remains visible and bounded under real service
+  pressure.
 
-This is not release polish. Gemini should document replacement evidence that
-already exists. Ranger creates that evidence.
+This is not release polish and not a demo phase. The examples and tests are
+development pressure: they should reveal missing helpers, awkward APIs, weak
+runtime behavior, or incomplete service semantics before Gemini tries to
+explain the framework.
 
 ## Context
 
@@ -21,19 +27,22 @@ already exists. Ranger creates that evidence.
 027 added parallel support evidence, Betelgeuse simulated-I/O polish,
 Tokio-vs-Tina constrained comparisons, and adapter research.
 
-The next missing thing is user belief. TCP echo and small semantic comparisons
-are useful, but they are not enough for a user to say, "I can write my next
-small Tokio service in Tina instead."
+The next missing thing is service-shaped pressure on the framework. TCP echo
+and small semantic comparisons are useful, but they do not force the same
+design questions as a service with framing, state, overload, shutdown,
+supervision, and retry behavior.
 
-Ranger should build a replacement ladder: small services that look like things
-Rust users write with Tokio today, but implemented directly in Tina without
-Tokio, Tower, Axum, Hyper, arbitrary futures, or async isolate handlers.
+Ranger should build a small set of service workloads directly in Tina without
+Tokio, Tower, Axum, Hyper, arbitrary futures, or async isolate handlers. The
+goal is not to market Tina as a Tokio replacement. The goal is to make the
+core framework better by exercising the kind of code users would eventually
+write on top of it.
 
 ## Scope
 
 ### 1. Framed TCP Request/Response Service
 
-Build one framed TCP service with real protocol pressure:
+Build one framed TCP service with reusable service structure:
 
 - line-delimited or length-prefixed requests
 - multiple clients
@@ -44,12 +53,12 @@ Build one framed TCP service with real protocol pressure:
 - graceful listener shutdown
 - bounded per-connection and service mailboxes
 
-This is the direct replacement for "start with `tokio::net::TcpListener`,
-spawn one task per connection, parse frames, write responses."
+This should push the runtime-owned TCP helpers, connection state shape,
+partial-write handling, and shutdown semantics harder than echo did.
 
 ### 2. Stateful Session / Registry Service
 
-Build a workload where local state matters:
+Build a workload where local state and routing matter:
 
 - one isolate owns per-session state
 - one isolate owns shared registry/routing state
@@ -57,12 +66,12 @@ Build a workload where local state matters:
 - bounded mailboxes expose overload
 - stale or stopped session addresses fail visibly
 
-This proves Tina's core value: state stays local and the runtime owns
-communication.
+This should pressure address ownership, stale-address handling, user-facing
+registry ergonomics, and the "state stays local" programming model.
 
 ### 3. Timer / Backoff Workload
 
-Build a retrying client or worker:
+Build timer and retry behavior into service-shaped flow:
 
 - timeout
 - retry/backoff
@@ -70,9 +79,12 @@ Build a retrying client or worker:
 - shutdown with pending timer or I/O work
 - deterministic simulator replay for the same logic where applicable
 
+This should not be a standalone toy if it can naturally live inside the TCP or
+worker service.
+
 ### 4. Supervised Worker Pool
 
-Build a task-dispatcher-shaped service:
+Build a task-dispatcher-shaped service that can become a reusable pattern:
 
 - bounded work queue
 - worker failure
@@ -81,8 +93,8 @@ Build a task-dispatcher-shaped service:
 - restart budget exhaustion
 - continued service for healthy workers
 
-This should be recognizable as a small background job runner, not only a unit
-test for restart events.
+This should pressure supervision ergonomics as service code, not only as trace
+unit tests.
 
 ### 5. Overload Lab
 
@@ -98,9 +110,22 @@ Pin overload behavior across the above workloads:
 Use operation/allocation evidence only where it is narrow and stable. Do not
 turn this into benchmark theater.
 
+## Build Shape
+
+Ranger should prefer two complete service-shaped implementations over many
+small demos:
+
+1. A framed TCP request/response service.
+2. A supervised stateful worker/registry service.
+
+Timer/backoff, overload, malformed input, shutdown, restart, stale addresses,
+and bounded pressure should be folded into those services where possible. Add
+separate focused tests only when a behavior cannot be made clear inside the
+service workloads.
+
 ## User Surface Requirements
 
-All examples should use the preferred public surface:
+All service code should use the preferred public surface:
 
 - `tina::prelude::*`
 - `#[tina::isolate(...)]` or `#[tina_runtime::isolate(...)]`
@@ -110,24 +135,38 @@ All examples should use the preferred public surface:
   driver-backed public equivalent
 - `tina-sim` for deterministic proof when the workload fits simulation
 
-If an example needs internal test shims to be understandable, that is an API
+If service code needs internal test shims to be understandable, that is an API
 friction finding. Record it in `review.md`. Add only tiny helpers that reduce
 repeated boilerplate without creating a second DSL.
 
-## Tokio Comparison Requirements
+## API Friction Log
 
-For each workload, record a short comparison in `review.md`:
+For each ugly or repetitive service-code shape, record:
 
-- what a typical Tokio version would use
-- what Tina uses instead
-- what Tina strengthens
-- what Tina weakens or does not provide
-- whether this is a true replacement candidate or needs Apollo because it
-  depends on Tokio ecosystem APIs
+- the awkward snippet or pattern;
+- why it exists;
+- whether it is core semantic cost or removable boilerplate;
+- the smallest helper or API change that would improve it;
+- whether that helper should land in Ranger or be deferred.
 
-Use hardened Tokio examples where useful. Bounded `mpsc`, `try_reserve`,
-`send_timeout`, structured shutdown, and current-thread Tokio all count. Do not
-compare only against naive unbounded-channel examples.
+Ranger may add small helpers only when they reinforce one preferred Tina
+surface. Do not add parallel micro-DSLs.
+
+## Tokio Context Notes
+
+Tokio remains useful context because many service-shaped expectations come
+from Rust users who know Tokio. Do not build side-by-side marketing demos.
+Instead, record short notes in `review.md` where relevant:
+
+- what service concern Tokio users would recognize;
+- what Tina handles differently;
+- what Tina still does not provide;
+- whether the missing piece belongs in core, in an adapter phase, or nowhere.
+
+Use hardened Tokio examples only when they clarify a design decision. Bounded
+`mpsc`, `try_reserve`, `send_timeout`, structured shutdown, and current-thread
+Tokio are fair references. Do not compare only against naive unbounded-channel
+examples.
 
 ## Refusals
 
@@ -136,18 +175,17 @@ compare only against naive unbounded-channel examples.
 - Do not make isolate handlers async.
 - Do not expose driver/backend handles to user isolates.
 - Do not add unbounded queues for convenience.
-- Do not claim full production readiness.
-- Do not claim broad Tokio replacement. Claim only no-ecosystem-dependency
-  workload replacement where the evidence exists.
-- Do not start Gemini release docs until Ranger gives Gemini concrete
-  replacement workloads to document.
+- Do not claim production readiness.
+- Do not claim broad Tokio replacement.
+- Do not start Gemini release docs until Ranger has service-shaped framework
+  behavior worth documenting.
 
 ## Review Prompts
 
 Ask reviewers to focus on:
 
-- whether these workloads are recognizable replacements for small Tokio
-  services
+- whether these workloads create real service-shaped pressure on Tina's public
+  API and runtime behavior
 - whether examples use the real preferred public Tina surface
 - whether test coverage proves behavior rather than checking logs
 - whether overload and shutdown outcomes stay visible
@@ -157,18 +195,23 @@ Ask reviewers to focus on:
 
 ## Done Means
 
-- At least two non-trivial Tina services are runnable by a new user and look
-  like things they would otherwise write with Tokio.
-- Each service has black-box assertion-backed tests for happy path, malformed
-  input where relevant, backpressure, timeout/cancellation, shutdown, and
-  failure/restart where relevant.
+- At least two non-trivial service-shaped Tina workloads exist and are written
+  against the preferred public surface.
+- The framed TCP service has assertion-backed tests for happy path, malformed
+  input, partial reads/writes, backpressure, peer close, and graceful shutdown.
+- The supervised stateful worker/registry service has assertion-backed tests
+  for bounded work, local state, stale addresses, restart, budget exhaustion,
+  and continued service for healthy workers.
+- Timer/backoff and cancellation behavior is exercised inside service-shaped
+  flow, not only in a toy timer test.
 - At least one workload runs through live runtime, simulated driver/runtime,
-  and `tina-sim`, or `review.md` records why one layer does not apply.
+  and `tina-sim`, or `review.md` records the concrete reason one layer does not
+  apply.
 - No Tina core semantics change unless the phase pauses and records the design
   decision first.
 - No Tokio bridge or ecosystem integration appears.
-- `review.md` records the replacement evidence, fair Tokio comparisons, API
-  friction, and remaining non-claims.
-- Gemini can document a real try-it-and-replace-it path instead of inventing a
-  docs story around smaller proof snippets.
+- `review.md` records service behavior, API friction, small helper decisions,
+  Tokio-context notes, and remaining non-claims.
+- Gemini can document real service-shaped framework capability instead of
+  inventing a docs story around smaller proof snippets.
 - `make verify` passes.
