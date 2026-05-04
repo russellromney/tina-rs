@@ -122,6 +122,7 @@ Targeted verification:
 - `cargo test -p tina-runtime --test application_surface llama_supervised_worker_service`
 - `cargo test -p tina-sim --test application_surface llama_sim_dst_parity_service`
 - `cargo test -p tina-tokio-bridge --test axum_bridge llama_http_bridge_service`
+- `make verify`
 
 All pass locally.
 
