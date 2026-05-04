@@ -267,3 +267,122 @@ First slice should prove:
 
 Then add restart/stale-address and simulated slow-peer pressure as the second
 slice if the first slice stays readable.
+
+## Implementation Slice 1
+
+Verdict: first composed local-production workload landed.
+
+New direct proof:
+
+- `tina-runtime/tests/local_production_runtime.rs`
+  - `live_local_server_routes_tcp_through_bounded_worker_pressure` runs the
+    live Betelgeuse threaded runtime with real loopback TCP. One listener
+    accepts three concurrent clients, each connection isolate calls a bounded
+    worker, and the workload directly observes `Replied`, `Full`, and
+    `Timeout` through user messages plus `CallFailed` trace events.
+  - `simulated_io_local_server_keeps_partial_slow_peer_semantics_through_threaded_runtime`
+    runs the same listener/connection/worker shape through the threaded
+    Betelgeuse runtime over simulated I/O. Delayed completions and a write cap
+    force partial writes while preserving typed worker pressure.
+  - `local_server_supervision_restarts_worker_and_rejects_stale_address`
+    proves the supervised worker shape restarts on panic and a stale worker
+    address rejects from inside Tina with `SendOutcome::Closed` plus
+    `SendRejected { Closed }`.
+  - `local_server_shutdown_cancels_pending_accept_read_timer_and_call_work`
+    composes server-shaped shutdown with a pending accept, pending read,
+    pending sleep, and pending isolate call. Shutdown returns cleanly and the
+    trace records `CallCompletionRejected { RequesterClosed }` for each pending
+    call kind.
+  - `local_server_shutdown_cancels_pending_write_work` composes server-shaped
+    shutdown with a delayed simulated TCP write through the live worker loop,
+    then externally steps simulated I/O after shutdown to prove the tombstoned
+    write does not leak bytes to the peer.
+- `tina-sim/tests/local_production_runtime.rs`
+  - `local_server_oracle_replays_bounded_worker_pressure_and_partial_writes`
+    models the same listener/connection/bounded-worker workload in `tina-sim`.
+    It proves byte-for-byte replay of observations, peer outputs, and event
+    kinds under seeded TCP completion delay, including partial writes, worker
+    `Full`, and worker `Timeout`. Each scripted peer output buffer is sized
+    exactly to its expected response, so the oracle workload cannot hide extra
+    writes behind unbounded peer output.
+
+What this closes from the audit:
+
+- Direct composed proof now exists for live native TCP, threaded simulated I/O,
+  and `tina-sim` oracle replay.
+- Worker mailbox pressure is direct, not sleep-proved: two isolate calls are
+  issued in one connection turn into a capacity-1 worker mailbox.
+- Server-shaped buffers now have narrow guards: live isolate mailboxes and
+  command ingress use explicit capacities, simulated peer output has exact
+  capacities, and the workload forces the worker capacity limit.
+- Timeout is direct user flow: a connection receives `CallOutcome::Timeout` and
+  writes the timeout response.
+- Stale-address rejection is runtime-internal proof, not only handle ingress:
+  a Tina isolate observes `SendOutcome::Closed`.
+- Shutdown cancellation is proven in the local-server test shape, not only in
+  narrow driver tests.
+
+Remaining Willem Drees work:
+
+- None for this implementation slice. Deeper allocation numbers belong to Ruud
+  Lubbers; Willem Drees now has direct capacity/backpressure guards around its
+  composed workload.
+
+Verification:
+
+- `cargo +nightly test -p tina-runtime --test local_production_runtime`
+  passed.
+- `cargo +nightly test -p tina-sim --test local_production_runtime` passed.
+- Focused regression sweep passed:
+  `cargo +nightly test -p tina-runtime --test local_production_runtime --test tcp_echo --test betelgeuse_substrate --test call_dispatch`
+  and
+  `cargo +nightly test -p tina-sim --test local_production_runtime --test io_simulation --test multishard_dispatcher`.
+- `make verify` passed after the clippy needless-update fix.
+
+## Implementation Review 1
+
+Verdict: no blocking findings.
+
+Reviewed against the Willem Drees plan:
+
+- The phase now has one canonical local-server shape instead of unrelated demos:
+  listener isolate, connection isolates, a bounded worker, supervisor restart,
+  runtime-owned TCP, runtime-owned time, and explicit shutdown pressure.
+- Live Betelgeuse proof is user-shaped: real loopback clients drive Tina
+  isolates through typed `CallOutcome::{Replied, Full, Timeout}` and trace
+  assertions.
+- Betelgeuse simulated-I/O proof is e2e through the threaded runtime worker
+  loop, not direct driver calls. It forces delayed completions and partial
+  writes.
+- `tina-sim` oracle proof reuses the same listener/connection/worker flow for
+  modeled semantics and proves bytewise replay of observations, peer output,
+  and event kinds.
+- Shutdown proof is composed, not narrow-only: pending accept, read, write,
+  sleep, and isolate-call work are canceled or rejected under the local-server
+  shape.
+- Backpressure proof is direct: small command/mailbox capacities are explicit,
+  worker capacity is forced to `Full`, and scripted peer output buffers are
+  exact-sized so the test cannot hide extra writes.
+
+Review notes:
+
+- The live native workload keeps the client count small enough for CI, but still
+  forces concurrent worker pressure. This is the right proof for semantics, not
+  a throughput claim.
+- The shutdown-write test uses a documented deterministic simulated-I/O
+  seed/frequency to delay the first write. That is acceptable because the point
+  is the seeded simulated-I/O contract; native timing would be a worse proof.
+- The `tina-sim` local-production test does not duplicate every focused
+  restart/shutdown oracle test. It proves the composed bounded TCP flow and
+  relies on existing oracle tests for restart and stopped-requester cancellation
+  semantics. No broader oracle claim is made.
+- The workload parser is intentionally tiny and one-request-per-connection.
+  Protocol parsing is not a Tina runtime primitive and should not expand this
+  phase.
+- Deeper allocation/performance numbers remain Ruud Lubbers scope. Willem
+  Drees pins capacities and failure visibility around new buffering; it does
+  not claim a throughput or per-message allocation win.
+
+Verification:
+
+- `make verify` passed after this review pass.
