@@ -29,6 +29,8 @@ const EXPECTED_DRIVER_TIMER_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
     allocations: 10,
     reallocations: 1,
 };
+const EXPECTED_SINGLE_SHARD_SEND_ROUND_PROGRESS: &[usize] = &[1, 1, 0];
+const EXPECTED_MULTISHARD_SEND_ROUND_PROGRESS: &[usize] = &[1, 1, 0];
 
 struct CountingAllocator;
 
@@ -82,6 +84,21 @@ where
         allocations: ALLOCATIONS.load(Ordering::SeqCst),
         reallocations: REALLOCATIONS.load(Ordering::SeqCst),
     }
+}
+
+fn collect_round_progress<F>(mut step: F) -> Vec<usize>
+where
+    F: FnMut() -> usize,
+{
+    let mut progress = Vec::new();
+    for _ in 0..8 {
+        let delivered = step();
+        progress.push(delivered);
+        if delivered == 0 {
+            return progress;
+        }
+    }
+    panic!("runtime did not quiesce within bounded progress probe: {progress:?}");
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -317,6 +334,48 @@ fn multishard_runtime_path_still_has_allocations_so_the_claim_stays_narrow() {
     assert_eq!(
         hot_path, EXPECTED_MULTISHARD_HOT_PATH,
         "multi-shard hot path allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn single_shard_send_round_count_keeps_the_cost_claim_named() {
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let sink = runtime.register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 8);
+    let sender = runtime.register_with_capacity::<AllocationSender, AllocationEvent>(
+        AllocationSender { target: sink },
+        8,
+    );
+
+    runtime.try_send(sender, AllocationEvent::Kick).unwrap();
+    assert_eq!(
+        collect_round_progress(|| runtime.step()),
+        EXPECTED_SINGLE_SHARD_SEND_ROUND_PROGRESS,
+        "single-shard send round count changed; this is operation evidence, not a latency claim"
+    );
+}
+
+#[test]
+fn multishard_send_round_count_keeps_the_cost_claim_named() {
+    let mut runtime = MultiShardRuntime::new(
+        [AllocationShard(11), AllocationShard(22)],
+        TestMailboxFactory,
+    );
+    let sink = runtime.register_with_capacity_on::<AllocationSink, Infallible>(
+        ShardId::new(22),
+        AllocationSink,
+        8,
+    );
+    let sender = runtime.register_with_capacity_on::<AllocationSender, AllocationEvent>(
+        ShardId::new(11),
+        AllocationSender { target: sink },
+        8,
+    );
+
+    runtime.try_send(sender, AllocationEvent::Kick).unwrap();
+    assert_eq!(
+        collect_round_progress(|| runtime.step()),
+        EXPECTED_MULTISHARD_SEND_ROUND_PROGRESS,
+        "multi-shard send round count changed; this names coordinator progress only"
     );
 }
 

@@ -141,7 +141,7 @@ the idea stays the same: read some bytes, write them back, keep draining if
 the write is partial, then re-arm the next read.
 
 The full runnable example lives in
-[`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime/examples/tcp_echo.rs).
+[`tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs).
 
 That is the whole shape. Handlers stay synchronous. Local state stays local.
 `send`, `reply`, `spawn`, `stop`, and `batch` are plain returned values. Time
@@ -151,8 +151,8 @@ and partial writes.
 
 Full runnable examples live here:
 
-- [`task_dispatcher.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime/examples/task_dispatcher.rs)
-- [`tcp_echo.rs`](/Users/russellromney/.codex/worktrees/3ac3/tina-rs/tina-runtime/examples/tcp_echo.rs)
+- [`task_dispatcher.rs`](tina-runtime/examples/task_dispatcher.rs)
+- [`tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs)
 
 ## Design
 
@@ -180,11 +180,13 @@ runtime-owned time, supervise and restart children, route messages across
 shards, replay timer-driven, TCP-driven, supervised, and multi-shard behavior
 through `tina-sim`, and run selected workloads on worker-owned runtime threads.
 
-The proof regime now includes composed DST-style workloads plus substrate
-tests: TCP echo / request-response, timer retry, local backpressure, live
-cross-shard request/reply, remote queue `Full`, bad remote addresses that do
-not poison later good work, and Betelgeuse simulated TCP with deterministic
-delay and partial-write pressure.
+The proof regime now includes composed DST-style workloads plus narrow
+substrate evidence: TCP echo / request-response, timer retry, local
+backpressure, live cross-shard request/reply, remote queue `Full`, bad remote
+addresses that do not poison later good work, Betelgeuse simulated TCP with
+deterministic delay and partial-write pressure, and allocation / operation
+counts for selected runtime hot paths. Those counts are evidence for specific
+paths, not a broad performance claim.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 

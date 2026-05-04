@@ -7,7 +7,7 @@ use std::{
 };
 
 use betelgeuse::{
-    AcceptCompletion, IO, IOLoop, RecvCompletion, SendCompletion,
+    AcceptCompletion, IO, IOLoop, MkdirCompletion, OpenOptions, RecvCompletion, SendCompletion,
     io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO},
 };
 
@@ -28,9 +28,13 @@ where
     panic!("simulated I/O operation did not complete");
 }
 
-#[test]
-fn simulated_accept_recv_send_roundtrip() -> io::Result<()> {
-    let io = SimulatedIO::new();
+fn connected_stream(
+    io: &SimulatedIO,
+    input: &[u8],
+) -> io::Result<(
+    Box<dyn betelgeuse::IOSocket>,
+    betelgeuse::io::simulated::SimulatedPeer,
+)> {
     let loop_handle = io.loop_handle(Global);
     let listener = loop_handle.io().socket()?;
     listener.bind(localhost(0))?;
@@ -38,12 +42,15 @@ fn simulated_accept_recv_send_roundtrip() -> io::Result<()> {
 
     let mut accept = AcceptCompletion::new();
     listener.accept(&mut accept)?;
-    assert!(!io.step()?);
-    assert!(!accept.has_result());
+    let peer = io.connect(bound, input.to_vec())?;
+    pump_until(io, || accept.has_result())?;
+    Ok((accept.take_result().unwrap()?, peer))
+}
 
-    let peer = io.connect(bound, b"ping".to_vec())?;
-    pump_until(&io, || accept.has_result())?;
-    let accepted = accept.take_result().unwrap()?;
+#[test]
+fn simulated_tcp_accept_recv_send_roundtrip() -> io::Result<()> {
+    let io = SimulatedIO::new();
+    let (accepted, peer) = connected_stream(&io, b"ping")?;
 
     let mut recv = RecvCompletion::new();
     accepted.recv(&mut recv, 32)?;
@@ -59,21 +66,12 @@ fn simulated_accept_recv_send_roundtrip() -> io::Result<()> {
 }
 
 #[test]
-fn simulated_send_respects_partial_write_limit() -> io::Result<()> {
+fn simulated_tcp_send_respects_partial_write_limit() -> io::Result<()> {
     let io = SimulatedIO::with_config(SimulatedConfig {
         max_send_chunk: Some(2),
         ..SimulatedConfig::default()
     });
-    let loop_handle = io.loop_handle(Global);
-    let listener = loop_handle.io().socket()?;
-    listener.bind(localhost(0))?;
-    let bound = listener.local_addr()?;
-
-    let mut accept = AcceptCompletion::new();
-    listener.accept(&mut accept)?;
-    let peer = io.connect(bound, Vec::new())?;
-    pump_until(&io, || accept.has_result())?;
-    let accepted = accept.take_result().unwrap()?;
+    let (accepted, peer) = connected_stream(&io, &[])?;
 
     let mut send = SendCompletion::new();
     accepted.send(&mut send, b"abcdef".to_vec())?;
@@ -84,7 +82,7 @@ fn simulated_send_respects_partial_write_limit() -> io::Result<()> {
 }
 
 #[test]
-fn simulated_delay_defers_ready_completion() -> io::Result<()> {
+fn simulated_tcp_delay_defers_ready_completion() -> io::Result<()> {
     let io = SimulatedIO::with_config(SimulatedConfig {
         seed: 7,
         completion_delay: SimulatedDelay::Every {
@@ -107,4 +105,60 @@ fn simulated_delay_defers_ready_completion() -> io::Result<()> {
     assert!(io.step()?);
     assert!(accept.has_result());
     Ok(())
+}
+
+#[test]
+fn simulated_tcp_recv_waits_until_peer_provides_input_or_eof() -> io::Result<()> {
+    let io = SimulatedIO::new();
+    let (accepted, peer) = connected_stream(&io, &[])?;
+    peer.push_input(b"later");
+
+    let mut recv = RecvCompletion::new();
+    accepted.recv(&mut recv, 32)?;
+    pump_until(&io, || recv.has_result())?;
+    assert_eq!(recv.take_result().unwrap()?, b"later");
+
+    let mut eof = RecvCompletion::new();
+    peer.close_input();
+    accepted.recv(&mut eof, 32)?;
+    pump_until(&io, || eof.has_result())?;
+    assert!(eof.take_result().unwrap()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn simulated_tcp_reports_listener_and_stream_addresses() -> io::Result<()> {
+    let io = SimulatedIO::new();
+    let loop_handle = io.loop_handle(Global);
+    let listener = loop_handle.io().socket()?;
+    listener.bind(localhost(0))?;
+    let bound = listener.local_addr()?;
+    assert_eq!(bound.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_ne!(bound.port(), 0);
+
+    let mut accept = AcceptCompletion::new();
+    listener.accept(&mut accept)?;
+    let _peer = io.connect(bound, b"hello".to_vec())?;
+    pump_until(&io, || accept.has_result())?;
+    let accepted = accept.take_result().unwrap()?;
+
+    assert_eq!(accepted.local_addr()?, bound);
+    assert_eq!(accepted.peer_addr()?.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    Ok(())
+}
+
+#[test]
+fn simulated_tcp_backend_keeps_file_operations_unsupported() {
+    let io = SimulatedIO::new();
+    let open_error = match io.open(std::path::Path::new("not-modeled"), OpenOptions::default()) {
+        Ok(_) => panic!("simulated backend should not open files"),
+        Err(error) => error,
+    };
+    assert_eq!(open_error.kind(), io::ErrorKind::Unsupported);
+
+    let mut mkdir = MkdirCompletion::new();
+    let mkdir_error = io
+        .mkdir(&mut mkdir, std::path::Path::new("not-modeled"), 0o755)
+        .unwrap_err();
+    assert_eq!(mkdir_error.kind(), io::ErrorKind::Unsupported);
 }

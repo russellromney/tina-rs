@@ -505,6 +505,28 @@ fn tina_bounded_ingress_full() -> Vec<&'static str> {
     }
 }
 
+fn tina_ingress_try_send_backpressure() -> Vec<&'static str> {
+    let events = events();
+    let mut sim = simulator();
+    let sink = sim.register_with_mailbox_capacity(
+        Sink {
+            events: Arc::clone(&events),
+        },
+        1,
+    );
+    sim.try_send(sink, SinkMsg::Hit).unwrap();
+    let admission = match sim.try_send(sink, SinkMsg::Hit) {
+        Ok(()) => "accepted",
+        Err(TrySendError::Full(_)) => "full",
+        Err(TrySendError::Closed(_)) => "closed",
+    };
+    sim.run_until_quiescent();
+
+    let mut out = vec![admission];
+    out.extend(snapshot(&events));
+    out
+}
+
 fn tina_stop_abandons_buffered_work() -> Vec<&'static str> {
     let events = events();
     let mut sim = simulator();
@@ -950,6 +972,45 @@ async fn tokio_transport_full() -> Vec<&'static str> {
     }
 }
 
+async fn tokio_try_reserve_backpressure() -> Vec<&'static str> {
+    let (tx, mut rx) = mpsc::channel::<&'static str>(1);
+    let permit = tx.try_reserve().unwrap();
+    let admission = match tx.try_reserve() {
+        Ok(_) => "accepted",
+        Err(mpsc::error::TrySendError::Full(_)) => "full",
+        Err(mpsc::error::TrySendError::Closed(_)) => "closed",
+    };
+    permit.send("hit");
+    vec![admission, rx.recv().await.unwrap()]
+}
+
+async fn tokio_send_timeout_under_backpressure() -> Vec<&'static str> {
+    let (tx, _rx) = mpsc::channel::<&'static str>(1);
+    tx.try_send("queued").unwrap();
+    match tx.send_timeout("blocked", Duration::from_millis(1)).await {
+        Ok(()) => vec!["accepted"],
+        Err(mpsc::error::SendTimeoutError::Timeout(_)) => vec!["timeout"],
+        Err(mpsc::error::SendTimeoutError::Closed(_)) => vec!["closed"],
+    }
+}
+
+async fn tokio_shutdown_drains_buffered_channel() -> Vec<&'static str> {
+    let (tx, mut rx) = mpsc::channel::<&'static str>(1);
+    tx.send("work").await.unwrap();
+    rx.close();
+    let admission = match tx.try_send("late") {
+        Ok(()) => "accepted",
+        Err(mpsc::error::TrySendError::Full(_)) => "full",
+        Err(mpsc::error::TrySendError::Closed(_)) => "closed",
+    };
+    let drained = match rx.recv().await {
+        Some("work") => "drained",
+        Some(_) => "unexpected",
+        None => "empty",
+    };
+    vec![admission, drained]
+}
+
 async fn tokio_constrained_overload_service() -> Vec<&'static str> {
     let (tx, mut rx) = mpsc::channel::<&'static str>(1);
     let mut out = Vec::new();
@@ -1149,6 +1210,33 @@ fn compare_cross_shard_transport_full_shape() -> Comparison {
     )
 }
 
+fn compare_try_reserve_backpressure_shape() -> Comparison {
+    Comparison::exact(
+        "bounded try-reserve backpressure",
+        block_on(tokio_try_reserve_backpressure()),
+        tina_ingress_try_send_backpressure(),
+        Ease::B,
+    )
+}
+
+fn compare_timed_send_under_backpressure() -> Comparison {
+    Comparison::different_but_expected(
+        "timed send under backpressure",
+        block_on(tokio_send_timeout_under_backpressure()),
+        tina_observed_send(0, false),
+        Ease::B,
+    )
+}
+
+fn compare_shutdown_drain_vs_stop_abandonment() -> Comparison {
+    Comparison::different_but_expected(
+        "shutdown drain versus stop abandonment",
+        block_on(tokio_shutdown_drains_buffered_channel()),
+        tina_stop_abandons_buffered_work(),
+        Ease::B,
+    )
+}
+
 fn compare_constrained_overload_service_shape() -> Comparison {
     Comparison::exact(
         "constrained overload service",
@@ -1170,9 +1258,9 @@ macro_rules! comparison_suite {
         )+
 
         #[test]
-        fn runnable_comparison_suite_has_twenty_examples() {
+        fn runnable_comparison_suite_has_twenty_three_examples() {
             let examples = [$($label),+];
-            assert_eq!(examples.len(), 20);
+            assert_eq!(examples.len(), 23);
         }
 
         #[test]
@@ -1224,7 +1312,13 @@ comparison_suite! {
         "supervision restart shape",
     example_19_cross_shard_bounded_transport_full => compare_cross_shard_transport_full_shape:
         "cross-shard bounded transport full",
-    example_20_constrained_overload_service => compare_constrained_overload_service_shape:
+    example_20_bounded_try_reserve_backpressure => compare_try_reserve_backpressure_shape:
+        "bounded try-reserve backpressure",
+    example_21_timed_send_under_backpressure => compare_timed_send_under_backpressure:
+        "timed send under backpressure",
+    example_22_shutdown_drain_vs_stop_abandonment => compare_shutdown_drain_vs_stop_abandonment:
+        "shutdown drain versus stop abandonment",
+    example_23_constrained_overload_service => compare_constrained_overload_service_shape:
         "constrained overload service",
 }
 

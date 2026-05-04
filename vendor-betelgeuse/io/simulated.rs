@@ -1,3 +1,15 @@
+//! Deterministic in-memory TCP backend for Betelgeuse tests.
+//!
+//! The backend implements Betelgeuse's socket-facing [`IO`] and [`IOLoop`]
+//! traits without kernel I/O. Callers submit ordinary bind/accept/recv/send
+//! operations, then explicitly drive completion readiness with [`IOLoop::step`].
+//! Tests can connect synthetic peers, delay ready completions, and force
+//! partial sends while keeping ownership of completion slots unchanged.
+//!
+//! This module intentionally stays at the Betelgeuse I/O layer: it models TCP
+//! streams, listeners, completion ordering, and peer bytes, not application
+//! protocols or a higher-level runtime.
+
 use std::{
     alloc::Allocator,
     collections::{BTreeMap, VecDeque},
@@ -45,7 +57,7 @@ pub enum SimulatedDelay {
 /// Cloneable handle to one deterministic simulated I/O backend.
 #[derive(Clone)]
 pub struct SimulatedIO {
-    state: Arc<Mutex<SimState>>,
+    state: Arc<Mutex<SimulatedState>>,
 }
 
 impl SimulatedIO {
@@ -57,7 +69,7 @@ impl SimulatedIO {
     /// Creates a simulated backend with explicit deterministic fault config.
     pub fn with_config(config: SimulatedConfig) -> Self {
         Self {
-            state: Arc::new(Mutex::new(SimState {
+            state: Arc::new(Mutex::new(SimulatedState {
                 config,
                 next_socket_id: 1,
                 next_port: 40_000,
@@ -92,7 +104,7 @@ impl SimulatedIO {
             .sockets
             .get(&listener_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "listener closed"))?;
-        if listener.closed || !matches!(listener.kind, SocketKind::Listener) {
+        if listener.closed || !matches!(listener.kind, SimulatedSocketKind::Listener) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "listener closed",
@@ -104,8 +116,8 @@ impl SimulatedIO {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), state.allocate_peer_port());
         state.sockets.insert(
             stream_id,
-            SocketState {
-                kind: SocketKind::Stream,
+            SimulatedSocketState {
+                kind: SimulatedSocketKind::Stream,
                 local_addr: Some(listener_addr),
                 peer_addr: Some(peer_addr),
                 closed: false,
@@ -138,7 +150,7 @@ impl Default for SimulatedIO {
 /// Handle for the peer side of one simulated stream.
 #[derive(Clone)]
 pub struct SimulatedPeer {
-    state: Arc<Mutex<SimState>>,
+    state: Arc<Mutex<SimulatedState>>,
     stream_id: i32,
 }
 
@@ -172,18 +184,18 @@ impl SimulatedPeer {
     }
 }
 
-struct SimState {
+struct SimulatedState {
     config: SimulatedConfig,
     next_socket_id: i32,
     next_port: u16,
     next_peer_port: u16,
     ready_ordinal: u64,
-    sockets: BTreeMap<i32, SocketState>,
+    sockets: BTreeMap<i32, SimulatedSocketState>,
     listeners_by_addr: BTreeMap<SocketAddr, i32>,
-    pending: VecDeque<PendingOp>,
+    pending: VecDeque<SimulatedPendingOp>,
 }
 
-impl SimState {
+impl SimulatedState {
     fn allocate_socket_id(&mut self) -> i32 {
         let id = self.next_socket_id;
         self.next_socket_id += 1;
@@ -220,14 +232,14 @@ impl SimState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SocketKind {
+enum SimulatedSocketKind {
     Unbound,
     Listener,
     Stream,
 }
 
-struct SocketState {
-    kind: SocketKind,
+struct SimulatedSocketState {
+    kind: SimulatedSocketKind,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     closed: bool,
@@ -237,7 +249,7 @@ struct SocketState {
     backlog: VecDeque<i32>,
 }
 
-enum PendingOp {
+enum SimulatedPendingOp {
     Accept {
         socket_id: i32,
         completion: usize,
@@ -258,12 +270,12 @@ enum PendingOp {
 }
 
 #[derive(Clone)]
-struct SimSocket {
-    state: Arc<Mutex<SimState>>,
+struct SimulatedSocket {
+    state: Arc<Mutex<SimulatedState>>,
     socket_id: Arc<Mutex<i32>>,
 }
 
-impl IOSocket for SimSocket {
+impl IOSocket for SimulatedSocket {
     fn bind(&self, addr: SocketAddr) -> io::Result<()> {
         let mut state = self.state.lock().expect("simulated io mutex");
         let socket_id = *self.socket_id.lock().expect("socket id mutex");
@@ -281,7 +293,7 @@ impl IOSocket for SimSocket {
             .sockets
             .get_mut(&socket_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "socket missing"))?;
-        socket.kind = SocketKind::Listener;
+        socket.kind = SimulatedSocketKind::Listener;
         socket.local_addr = Some(local_addr);
         socket.closed = false;
         state.listeners_by_addr.insert(local_addr, socket_id);
@@ -315,7 +327,7 @@ impl IOSocket for SimSocket {
             .sockets
             .get(&socket_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "listener missing"))?;
-        if socket.closed || !matches!(socket.kind, SocketKind::Listener) {
+        if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Listener) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "accept requires open listener",
@@ -328,7 +340,7 @@ impl IOSocket for SimSocket {
             .lock()
             .expect("simulated io mutex")
             .pending
-            .push_back(PendingOp::Accept {
+            .push_back(SimulatedPendingOp::Accept {
                 socket_id,
                 completion: c as *mut AcceptCompletion as usize,
                 delay: None,
@@ -343,7 +355,7 @@ impl IOSocket for SimSocket {
             .sockets
             .get(&socket_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream missing"))?;
-        if socket.closed || !matches!(socket.kind, SocketKind::Stream) {
+        if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Stream) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "recv requires open stream",
@@ -359,7 +371,7 @@ impl IOSocket for SimSocket {
             .lock()
             .expect("simulated io mutex")
             .pending
-            .push_back(PendingOp::Recv {
+            .push_back(SimulatedPendingOp::Recv {
                 socket_id,
                 len,
                 completion: c as *mut RecvCompletion as usize,
@@ -375,7 +387,7 @@ impl IOSocket for SimSocket {
             .sockets
             .get(&socket_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream missing"))?;
-        if socket.closed || !matches!(socket.kind, SocketKind::Stream) {
+        if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Stream) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "send requires open stream",
@@ -391,7 +403,7 @@ impl IOSocket for SimSocket {
             .lock()
             .expect("simulated io mutex")
             .pending
-            .push_back(PendingOp::Send {
+            .push_back(SimulatedPendingOp::Send {
                 socket_id,
                 bytes: buf,
                 completion: c as *mut SendCompletion as usize,
@@ -426,8 +438,8 @@ impl IO for SimulatedIO {
         let socket_id = state.allocate_socket_id();
         state.sockets.insert(
             socket_id,
-            SocketState {
-                kind: SocketKind::Unbound,
+            SimulatedSocketState {
+                kind: SimulatedSocketKind::Unbound,
                 local_addr: None,
                 peer_addr: None,
                 closed: false,
@@ -437,7 +449,7 @@ impl IO for SimulatedIO {
                 backlog: VecDeque::new(),
             },
         );
-        Ok(Box::new(SimSocket {
+        Ok(Box::new(SimulatedSocket {
             state: Arc::clone(&self.state),
             socket_id: Arc::new(Mutex::new(socket_id)),
         }))
@@ -488,7 +500,7 @@ impl IOLoop for SimulatedIO {
     }
 }
 
-impl PendingOp {
+impl SimulatedPendingOp {
     fn delay_mut(&mut self) -> &mut Option<u64> {
         match self {
             Self::Accept { delay, .. } | Self::Recv { delay, .. } | Self::Send { delay, .. } => {
@@ -497,28 +509,28 @@ impl PendingOp {
         }
     }
 
-    fn ready_result(&mut self, state: &mut SimState) -> Option<ReadyResult> {
+    fn ready_result(&mut self, state: &mut SimulatedState) -> Option<SimulatedReadyResult> {
         match self {
             Self::Accept { socket_id, .. } => {
                 let listener = state.sockets.get_mut(socket_id)?;
                 if listener.closed {
-                    return Some(ReadyResult::Accept(Err(io::Error::new(
+                    return Some(SimulatedReadyResult::Accept(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "listener closed",
                     ))));
                 }
                 let stream_id = listener.backlog.pop_front()?;
-                Some(ReadyResult::Accept(Ok(stream_id)))
+                Some(SimulatedReadyResult::Accept(Ok(stream_id)))
             }
             Self::Recv { socket_id, len, .. } => {
                 let Some(stream) = state.sockets.get_mut(socket_id) else {
-                    return Some(ReadyResult::Recv(Err(io::Error::new(
+                    return Some(SimulatedReadyResult::Recv(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "stream missing",
                     ))));
                 };
                 if stream.closed {
-                    return Some(ReadyResult::Recv(Err(io::Error::new(
+                    return Some(SimulatedReadyResult::Recv(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "stream closed",
                     ))));
@@ -528,32 +540,32 @@ impl PendingOp {
                 }
                 let count = (*len).min(stream.inbound.len());
                 let bytes = stream.inbound.drain(..count).collect();
-                Some(ReadyResult::Recv(Ok(bytes)))
+                Some(SimulatedReadyResult::Recv(Ok(bytes)))
             }
             Self::Send {
                 socket_id, bytes, ..
             } => {
                 let max_count = state.config.max_send_chunk.unwrap_or(bytes.len());
                 let Some(stream) = state.sockets.get_mut(socket_id) else {
-                    return Some(ReadyResult::Send(Err(io::Error::new(
+                    return Some(SimulatedReadyResult::Send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "stream missing",
                     ))));
                 };
                 if stream.closed {
-                    return Some(ReadyResult::Send(Err(io::Error::new(
+                    return Some(SimulatedReadyResult::Send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "stream closed",
                     ))));
                 }
                 let count = max_count.min(bytes.len());
                 stream.peer_output.extend_from_slice(&bytes[..count]);
-                Some(ReadyResult::Send(Ok(count)))
+                Some(SimulatedReadyResult::Send(Ok(count)))
             }
         }
     }
 
-    fn is_ready(&self, state: &SimState) -> bool {
+    fn is_ready(&self, state: &SimulatedState) -> bool {
         match self {
             Self::Accept { socket_id, .. } => match state.sockets.get(socket_id) {
                 Some(listener) if !listener.closed => !listener.backlog.is_empty(),
@@ -569,22 +581,22 @@ impl PendingOp {
         }
     }
 
-    fn complete(self, result: ReadyResult, state: &Arc<Mutex<SimState>>) {
+    fn complete(self, result: SimulatedReadyResult, state: &Arc<Mutex<SimulatedState>>) {
         match (self, result) {
-            (Self::Accept { completion, .. }, ReadyResult::Accept(Ok(stream_id))) => unsafe {
+            (Self::Accept { completion, .. }, SimulatedReadyResult::Accept(Ok(stream_id))) => unsafe {
                 let completion = &mut *(completion as *mut AcceptCompletion);
-                completion.complete(Ok(Box::new(SimSocket {
+                completion.complete(Ok(Box::new(SimulatedSocket {
                     state: Arc::clone(state),
                     socket_id: Arc::new(Mutex::new(stream_id)),
                 })));
             },
-            (Self::Accept { completion, .. }, ReadyResult::Accept(Err(error))) => unsafe {
+            (Self::Accept { completion, .. }, SimulatedReadyResult::Accept(Err(error))) => unsafe {
                 (&mut *(completion as *mut AcceptCompletion)).complete(Err(error));
             },
-            (Self::Recv { completion, .. }, ReadyResult::Recv(result)) => unsafe {
+            (Self::Recv { completion, .. }, SimulatedReadyResult::Recv(result)) => unsafe {
                 (&mut *(completion as *mut RecvCompletion)).complete(result);
             },
-            (Self::Send { completion, .. }, ReadyResult::Send(result)) => unsafe {
+            (Self::Send { completion, .. }, SimulatedReadyResult::Send(result)) => unsafe {
                 (&mut *(completion as *mut SendCompletion)).complete(result);
             },
             _ => unreachable!("pending op and ready result mismatch"),
@@ -592,7 +604,7 @@ impl PendingOp {
     }
 }
 
-enum ReadyResult {
+enum SimulatedReadyResult {
     Accept(io::Result<i32>),
     Recv(io::Result<Vec<u8>>),
     Send(io::Result<usize>),
