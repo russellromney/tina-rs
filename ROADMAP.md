@@ -136,6 +136,9 @@ and reviews live under `.intent/phases/`.
   Betelgeuse-adapter ownership.
 - Willem Drees / Ruud Lubbers / Joop den Uyl: local production-shaped runtime
   proof, performance/memory hardening, and canonical application-surface tests.
+- Dries van Agt: backend-honest live names, bounded trace retention, narrow
+  Tokio/Tower/Axum bridge, bridge production-shape fixes, bridge metrics,
+  cancellation, retry semantics, and the named Tina driver-runtime contract.
 
 ## Near-term roadmap
 
@@ -144,7 +147,7 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Dries van Agt core framework completion** | One large pre-Gemini phase that includes the old Dries/Apollo/Cassini rocks in order: finish the public local-framework surface, then build the narrowest useful Tokio/Tower/Axum bridge with preserved/weakened guarantees, then harden with CI, benchmark/memory evidence, optional MPSC decision, and dogfood-style proof. |
+| **Piet de Jong local production readiness** | Intense pre-Gemini phase for the five remaining local-core gaps: mature the driver-runtime substrate, widen the Tokio/Tower/Axum bridge into a real adoption edge, add CI/stress hardening, produce a measured performance/allocation envelope, and complete the preferred local-service API surface. |
 
 ## Later capability roadmap
 
@@ -185,18 +188,19 @@ These still need answers, but each now has an intended phase home.
 1. **Supervisor budget windows.** Direct `RestartChildren` execution and
    panic-triggered supervised restart now exist. The next supervision design
    question is how far runtime-lifetime budgets can go before timed windows or
-   explicit deferral are required. Home: Dries.
-2. **Trace retention.** Full trace forever is not a production-bounded story.
-   Home: Dries.
+   explicit deferral are required. Home: Piet de Jong.
+2. **Trace retention.** Bounded/off modes exist now; Piet de Jong should decide
+   whether they are enough for local production use or need sink/lifecycle
+   polish. Home: Piet de Jong.
 3. **Runtime-owned I/O breadth.** Decide whether the first local framework
-   claim is TCP/time only or includes one more I/O family. Home: Dries.
+   claim is TCP/time only or includes one more I/O family. Home: Piet de Jong.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
-   transport is not claimed. Home: Dries if local framework completeness or
+   transport is not claimed. Home: Piet de Jong if local framework completeness or
    the bridge needs it; otherwise later remoting.
-5. **MPSC fallback.** Optional only. Home: Dries decision, implementation only
+5. **MPSC fallback.** Optional only. Home: Piet de Jong decision, implementation only
    if a real workload proves SPSC is too narrow for the local framework.
 6. **Zero-copy / lower-allocation transport.** The current cost model is
-   honest but not final. Home: Dries.
+   honest but not final. Home: Piet de Jong.
 
 ---
 
