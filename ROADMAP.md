@@ -140,7 +140,8 @@ phases.
 | ~~**Tina TCP driver contract**~~ | Delivered in `.intent/phases/026-tina-driver-contract/`: runtime-owned time/TCP behind a small Tina-owned driver boundary, timers, TCP submissions, completions, cancellation, shutdown, native Betelgeuse adapter, simulated Betelgeuse adapter, same-resource `ResourceBusy` semantics, and direct cancellation/late-completion proofs. This is not a general async runtime and not a Tokio bridge. |
 | ~~**Parallel substrate support**~~ | Delivered in `.intent/phases/027-parallel-substrate-support/`: Betelgeuse simulated I/O polish, narrow substrate cost evidence, expanded Tokio-vs-Tina constrained/backpressure comparisons, external review prompts, Tokio current-thread/Monoio/Glommio/Compio adapter research, and brief README/story refinement without changing Tina core semantics. |
 | ~~**Ranger core runtime substrate completion**~~ | Delivered in `.intent/phases/028-ranger-substrate-driver-maturity/`: documented the driver capability contract, moved TCP pending ownership to listener/read/write lanes, allowed full-duplex same-stream read/write, kept close and duplicate-lane `ResourceBusy` honest, made per-call cancel tombstone without silently closing unrelated lanes, added live worker TCP shutdown proof, pinned TCP read/write allocation counts, and recorded Betelgeuse as the near-term substrate direction. |
-| **Gemini release story** | Next release-story phase now that Ranger settled the core substrate boundary. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
+| **Surveyor Betelgeuse adapter ownership** | Planned in `.intent/phases/029-surveyor-betelgeuse-adapter-ownership/`: treat Tina's live substrate as a Tina-owned implementation over Betelgeuse, with explicit completion-slot ownership, no-leak shutdown/cancel-drain, controlled simulated/native backend release proofs, and no dependence on upstream Betelgeuse growing Tina-specific guarantees first. |
+| **Gemini release story** | Release-story phase after Surveyor removes the last core substrate ownership wart. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 
@@ -155,13 +156,13 @@ coordinator thread first. Huygens added the first worker-owned runtime
 substrate around that contract. Mercury sharpened the overload/call contract.
 025 makes Betelgeuse the honest tryable runtime substrate instead of letting a
 Tokio bridge become the center of gravity by accident. 026 and 027 make the
-driver boundary and support evidence real enough to inspect. Ranger sits before
-Gemini because the live substrate/driver story is still the load-bearing
-production-readiness question: full-duplex TCP, cancellation, shutdown,
+driver boundary and support evidence real enough to inspect. Ranger settles the
+live substrate/driver semantics: full-duplex TCP, cancellation, shutdown,
 driver capabilities, cost, the next substrate direction, and the core/non-core
-boundary must be settled before docs or service-framework work freeze the
-story. Ranger should be as large as it needs to be; after Ranger, later phases
-should build on Tina core rather than reopen runtime/substrate fundamentals.
+boundary. Surveyor follows because the Betelgeuse implementation should now be
+treated as Tina-owned code over Betelgeuse primitives, with its own
+completion-ownership and no-leak shutdown contract, before Gemini freezes the
+story in release docs.
 
 ## Strategic prerequisites
 
