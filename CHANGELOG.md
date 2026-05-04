@@ -294,6 +294,22 @@ This file records completed work.
     allowing later completions on the same listener/stream to overtake earlier
     ones
 
+### Phase 021 Devex and Call Ergonomics
+
+- Renamed the user-facing runtime crate directory and package surface from the
+  transitional `tina-runtime-current` shape to `tina-runtime`.
+- Reworked the preferred authoring vocabulary around `Runtime`,
+  `RuntimeCall`, `CallInput`, `CallOutput`, `CallError`, `Outbound`,
+  `ChildDefinition`, and `RestartableChildDefinition`.
+- Added the preferred prelude and isolate authoring macros so common isolates
+  do not need the old wall of associated-type boilerplate.
+- Added typed runtime-call helpers such as `sleep(...)`, `tcp_read(...)`, and
+  `tcp_write(...)` with `reply(...)` as the single public completion combinator.
+- Removed the old compatibility-alias plan before public use; Tina kept one
+  preferred surface instead of silent equal-peer names.
+- Reworked README and tests toward the new syntax and proved the renamed
+  surface through runtime and simulator consumer tests.
+
 ### Phase Kepler
 
 - Sealed the current explicit-step multi-shard liveness boundary:
@@ -355,6 +371,76 @@ This file records completed work.
   workloads, while production hardening, peer quarantine, dynamic shard
   membership, cross-shard child ownership, Tokio bridge work, and broad
   allocation-free runtime claims remain future work.
+
+### Phase Mercury
+
+- Added user-visible observed send outcomes so application code can branch on
+  `Accepted`, `Full`, and `Closed` instead of only inspecting trace after the
+  fact.
+- Added same-shard isolate-to-isolate call with mandatory timeout and typed
+  outcomes for reply, target full, target closed, timeout, and requester-stop
+  completion rejection.
+- Added focused runtime and simulator tests for reply delivery, full/closed
+  targets, timeout, late replies after timeout, requester stopped, requester
+  mailbox full at completion, and replay determinism.
+- Added macro/devex cleanup and a runnable Tokio-vs-Tina semantic comparison
+  suite to pressure ergonomics without making Tokio the substrate story.
+- Recorded cross-shard call reply transport as not yet claimed; cross-shard
+  call rejects deterministically in this slice.
+
+### Phase Betelgeuse
+
+- Renamed the live substrate surface to backend-honest
+  `BetelgeuseRuntime` / `BetelgeuseMultiShardRuntime`.
+- Kept explicit-step runtime and `tina-sim` as the semantic oracle while
+  proving selected workloads on live Betelgeuse-backed runners.
+- Added bounded ingress proof, live time/TCP completion semantics, live
+  multi-shard bounded send, typed live cross-shard call rejection, and
+  oracle/sim/live parity tests.
+- Added a narrow Betelgeuse simulated TCP backend with seeded completion delay
+  and partial-write pressure.
+- Pinned allocation and cost probes for the touched substrate paths and kept
+  Tokio as comparison/later bridge rather than the main runtime story.
+
+### Phase Tina TCP Driver Contract
+
+- Moved runtime-owned time/TCP behind a small Tina-owned driver boundary for
+  timers, TCP operations, completions, cancellation, shutdown, and wakeups.
+- Added native Betelgeuse and simulated Betelgeuse driver adapters under the
+  same runtime semantics.
+- Added same-resource `ResourceBusy` semantics, bounded pending-operation
+  admission, and direct cancellation/late-completion proofs.
+- Proved user-shaped workloads on explicit runtime, native Betelgeuse-backed
+  runtime, and simulated-driver runtime without adding futures, wakers, async
+  handlers, or arbitrary task spawning.
+
+### Phase Parallel Substrate Support
+
+- Polished the simulated Betelgeuse I/O surface as generic substrate support
+  rather than Tina-specific magic.
+- Added narrow allocation/performance probes for current hot paths.
+- Expanded runnable Tokio-vs-Tina comparisons around constrained capacity,
+  backpressure, timeout, shutdown, and overload behavior.
+- Added only small helper/macro polish that preserved one preferred Tina
+  surface.
+- Recorded external review prompts and substrate research notes for Tokio
+  current-thread, Monoio, Glommio, and Compio.
+
+### Phase Ranger
+
+- Documented the driver capability contract for time/TCP progress,
+  cancellation, shutdown, bounded pending work, and deterministic simulator
+  compatibility.
+- Moved TCP pending ownership to listener/read/write lanes and allowed
+  full-duplex same-stream read/write while keeping close and duplicate-lane
+  `ResourceBusy` honest.
+- Made per-call cancel tombstone the selected call without silently closing
+  unrelated resource lanes.
+- Added live and simulated proofs for stopped-requester cancellation, explicit
+  close, runtime shutdown, late completion swallowing, requester mailbox full
+  at completion, and live worker TCP shutdown.
+- Pinned TCP read/write allocation counts and recorded Betelgeuse as the
+  near-term substrate direction.
 
 ### Phase Surveyor
 
