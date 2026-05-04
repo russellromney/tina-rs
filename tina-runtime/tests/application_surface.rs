@@ -16,7 +16,7 @@ use betelgeuse::io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO};
 use tina::{Address, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseRuntime, BetelgeuseRuntimeConfig, CallCompletionRejectedReason, CallError, CallKind,
-    CallOutcome, ListenerId, MailboxFactory, RuntimeEvent, RuntimeEventKind, SendOutcome,
+    CallOutcome, ListenerId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind, SendOutcome,
     SendRejectedReason, StreamId, call, send_observed, sleep, tcp_accept, tcp_bind,
     tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
@@ -96,6 +96,32 @@ enum ServerObservation {
 type Observations = Arc<Mutex<Vec<ServerObservation>>>;
 type BoundAddr = Arc<Mutex<Option<SocketAddr>>>;
 type WorkerAddresses = Arc<Mutex<Vec<Address<WorkerMsg, WorkerReply>>>>;
+type WorkerOutcomes = Arc<Mutex<Vec<CallOutcome<WorkerReply>>>>;
+type AuditLog = Arc<Mutex<Vec<u64>>>;
+type SessionSnapshots = Arc<Mutex<Vec<Vec<u64>>>>;
+
+#[derive(Debug, Clone, Copy)]
+struct ServiceCapacities {
+    command_queue: usize,
+    parent_mailbox: usize,
+    worker_mailbox: usize,
+    listener_mailbox: usize,
+    connection_mailbox: usize,
+    utility_mailbox: usize,
+}
+
+impl Default for ServiceCapacities {
+    fn default() -> Self {
+        Self {
+            command_queue: 16,
+            parent_mailbox: 8,
+            worker_mailbox: 1,
+            listener_mailbox: 8,
+            connection_mailbox: 8,
+            utility_mailbox: 8,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerMsg {
@@ -149,6 +175,7 @@ enum WorkerParentMsg {
 struct WorkerParent {
     observations: Observations,
     addresses: WorkerAddresses,
+    capacities: ServiceCapacities,
 }
 
 #[tina_runtime::isolate(
@@ -168,7 +195,7 @@ impl WorkerParent {
                             observations: Arc::clone(&observations),
                             addresses: Arc::clone(&addresses),
                         },
-                        1,
+                        self.capacities.worker_mailbox,
                     )
                     .with_initial_message(|| WorkerMsg::Boot),
                 )
@@ -229,7 +256,7 @@ impl Connection {
                 }
                 (RequestMode::Full, _) => {
                     self.mode = Some(RequestMode::Full);
-                    batch(vec![
+                    batch([
                         call(
                             self.worker,
                             WorkerMsg::Echo(b"accepted-before-full".to_vec()),
@@ -351,6 +378,7 @@ struct Listener {
     bound_addr: BoundAddr,
     worker: Address<WorkerMsg, WorkerReply>,
     observations: Observations,
+    capacities: ServiceCapacities,
     listener: Option<ListenerId>,
     accepted: usize,
     target_accepts: usize,
@@ -392,7 +420,7 @@ impl Listener {
                             pending_write: Vec::new(),
                             response_started: false,
                         },
-                        8,
+                        self.capacities.connection_mailbox,
                     )
                     .with_initial_message(|| ConnectionMsg::Begin),
                 );
@@ -401,7 +429,7 @@ impl Listener {
                 } else {
                     ListenerMsg::Close
                 };
-                batch(vec![child, ctx.send_self(follow_up)])
+                batch([child, ctx.send_self(follow_up)])
             }
             ListenerMsg::Close => {
                 let listener = self.listener.expect("listener stored before close");
@@ -438,7 +466,7 @@ struct LongWork;
 impl LongWork {
     fn handle(&mut self, msg: LongWorkMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
         match msg {
-            LongWorkMsg::Start { worker } => batch(vec![
+            LongWorkMsg::Start { worker } => batch([
                 sleep(Duration::from_secs(60)).reply(|_| LongWorkMsg::Slept),
                 call(worker, WorkerMsg::NoReply, Duration::from_secs(60))
                     .reply(|_| LongWorkMsg::WorkerReturned),
@@ -476,6 +504,99 @@ impl StaleProbe {
             }
             StaleProbeMsg::Observed(SendOutcome::Accepted | SendOutcome::Full) => {
                 panic!("stale worker address must reject as closed")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RouterMsg {
+    Start,
+    WorkerReturned(CallOutcome<WorkerReply>),
+}
+
+#[derive(Debug)]
+struct Router {
+    worker: Address<WorkerMsg, WorkerReply>,
+    outcomes: WorkerOutcomes,
+}
+
+#[tina_runtime::isolate(message = RouterMsg, shard = LocalShard)]
+impl Router {
+    fn handle(&mut self, msg: RouterMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+        match msg {
+            RouterMsg::Start => batch([
+                call(
+                    self.worker,
+                    WorkerMsg::Echo(b"first".to_vec()),
+                    Duration::from_millis(250),
+                )
+                .reply(RouterMsg::WorkerReturned),
+                call(
+                    self.worker,
+                    WorkerMsg::Echo(b"second".to_vec()),
+                    Duration::from_millis(250),
+                )
+                .reply(RouterMsg::WorkerReturned),
+            ]),
+            RouterMsg::WorkerReturned(outcome) => {
+                self.outcomes.lock().expect("outcomes mutex").push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionAuditMsg {
+    Joined(u64),
+}
+
+#[derive(Debug)]
+struct SessionAudit {
+    log: AuditLog,
+}
+
+#[tina_runtime::isolate(message = SessionAuditMsg, shard = LocalShard)]
+impl SessionAudit {
+    fn handle(&mut self, msg: SessionAuditMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+        let SessionAuditMsg::Joined(user_id) = msg;
+        self.log.lock().expect("audit log mutex").push(user_id);
+        noop()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionMsg {
+    Connected(u64),
+    Snapshot,
+}
+
+#[derive(Debug)]
+struct Session {
+    audit: Address<SessionAuditMsg>,
+    users: Vec<u64>,
+    snapshots: SessionSnapshots,
+}
+
+#[tina_runtime::isolate(
+    message = SessionMsg,
+    send = Outbound<SessionAuditMsg>,
+    shard = LocalShard
+)]
+impl Session {
+    fn handle(&mut self, msg: SessionMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+        match msg {
+            SessionMsg::Connected(user_id) => {
+                self.users.push(user_id);
+                send(self.audit, SessionAuditMsg::Joined(user_id))
+            }
+            SessionMsg::Snapshot => {
+                self.snapshots
+                    .lock()
+                    .expect("snapshots mutex")
+                    .push(self.users.clone());
+                noop()
             }
         }
     }
@@ -531,22 +652,138 @@ where
     }
 }
 
+fn step_until<F>(
+    runtime: &mut Runtime<LocalShard, LocalMailboxFactory>,
+    timeout: Duration,
+    label: &str,
+    predicate: F,
+) where
+    F: Fn(&Runtime<LocalShard, LocalMailboxFactory>) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while !predicate(runtime) {
+        if Instant::now() > deadline {
+            panic!(
+                "step_until({label}) timed out; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+        runtime.step();
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn runtime_config(capacities: ServiceCapacities) -> BetelgeuseRuntimeConfig {
+    BetelgeuseRuntimeConfig {
+        command_capacity: capacities.command_queue,
+        idle_wait: Duration::from_millis(1),
+    }
+}
+
 fn count_kind(trace: &[RuntimeEvent], predicate: impl Fn(RuntimeEventKind) -> bool) -> usize {
     trace.iter().filter(|event| predicate(event.kind())).count()
+}
+
+fn assert_event_count(
+    trace: &[RuntimeEvent],
+    label: &str,
+    expected: usize,
+    predicate: impl Fn(RuntimeEventKind) -> bool,
+) {
+    let count = count_kind(trace, predicate);
+    assert_eq!(count, expected, "{label}; trace = {trace:#?}");
+}
+
+fn assert_event_count_at_least(
+    trace: &[RuntimeEvent],
+    label: &str,
+    minimum: usize,
+    predicate: impl Fn(RuntimeEventKind) -> bool,
+) {
+    let count = count_kind(trace, predicate);
+    assert!(
+        count >= minimum,
+        "{label}; expected at least {minimum}, got {count}; trace = {trace:#?}"
+    );
+}
+
+fn assert_event_exists(
+    trace: &[RuntimeEvent],
+    label: &str,
+    predicate: impl Fn(RuntimeEventKind) -> bool,
+) {
+    assert_event_count_at_least(trace, label, 1, predicate);
+}
+
+fn assert_observed(observations: &[ServerObservation], expected: ServerObservation) {
+    assert!(
+        observations.contains(&expected),
+        "missing {expected:?}; observations = {observations:?}"
+    );
+}
+
+fn assert_listener_stopped_and_idle(
+    runtime: &BetelgeuseRuntime<LocalShard, LocalMailboxFactory>,
+    listener: Address<ListenerMsg>,
+    label: &str,
+) {
+    wait_until(Duration::from_secs(2), label, || {
+        let trace = runtime.trace().expect("trace query succeeds");
+        trace.iter().any(|event| {
+            event.isolate() == listener.isolate()
+                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+        }) && !runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+}
+
+fn assert_dispatch_attempts_have_terminal_outcomes(trace: &[RuntimeEvent]) {
+    let send_attempts = count_kind(trace, |kind| {
+        matches!(kind, RuntimeEventKind::SendDispatchAttempted { .. })
+    });
+    let send_outcomes = count_kind(trace, |kind| {
+        matches!(
+            kind,
+            RuntimeEventKind::SendAccepted { .. } | RuntimeEventKind::SendRejected { .. }
+        )
+    });
+    assert_eq!(
+        send_attempts, send_outcomes,
+        "every send dispatch attempt needs one visible accepted/rejected outcome; trace = {trace:#?}"
+    );
+
+    let call_attempts = count_kind(trace, |kind| {
+        matches!(kind, RuntimeEventKind::CallDispatchAttempted { .. })
+    });
+    let call_outcomes = count_kind(trace, |kind| {
+        matches!(
+            kind,
+            RuntimeEventKind::CallCompleted { .. }
+                | RuntimeEventKind::CallFailed { .. }
+                | RuntimeEventKind::CallCompletionRejected { .. }
+        )
+    });
+    assert_eq!(
+        call_attempts, call_outcomes,
+        "every call dispatch attempt needs one visible terminal outcome; trace = {trace:#?}"
+    );
 }
 
 fn start_supervised_worker(
     runtime: &BetelgeuseRuntime<LocalShard, LocalMailboxFactory>,
     observations: &Observations,
     addresses: &WorkerAddresses,
+    capacities: ServiceCapacities,
 ) -> (Address<WorkerParentMsg>, Address<WorkerMsg, WorkerReply>) {
     let parent = runtime
         .register_with_capacity::<WorkerParent, _>(
             WorkerParent {
                 observations: Arc::clone(observations),
                 addresses: Arc::clone(addresses),
+                capacities,
             },
-            8,
+            capacities.parent_mailbox,
         )
         .expect("worker parent register accepts");
     runtime
@@ -565,20 +802,47 @@ fn start_supervised_worker(
     (parent, worker)
 }
 
+fn start_supervised_worker_explicit(
+    runtime: &mut Runtime<LocalShard, LocalMailboxFactory>,
+    observations: &Observations,
+    addresses: &WorkerAddresses,
+    capacities: ServiceCapacities,
+) -> (Address<WorkerParentMsg>, Address<WorkerMsg, WorkerReply>) {
+    let parent = runtime.register_with_capacity::<WorkerParent, _>(
+        WorkerParent {
+            observations: Arc::clone(observations),
+            addresses: Arc::clone(addresses),
+            capacities,
+        },
+        capacities.parent_mailbox,
+    );
+    runtime.supervise(
+        parent,
+        SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
+    );
+    runtime
+        .try_send(parent, WorkerParentMsg::Spawn)
+        .expect("spawn handoff accepts");
+    step_until(
+        runtime,
+        Duration::from_secs(2),
+        "explicit worker boot",
+        |_| !addresses.lock().expect("worker address mutex").is_empty(),
+    );
+    let worker = addresses.lock().expect("worker address mutex")[0];
+    (parent, worker)
+}
+
 #[test]
 fn live_local_server_routes_tcp_through_bounded_worker_pressure() {
+    let capacities = ServiceCapacities::default();
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));
     let bound_addr = Arc::new(Mutex::new(None));
-    let runtime = BetelgeuseRuntime::with_config(
-        LocalShard,
-        LocalMailboxFactory,
-        BetelgeuseRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-        },
-    );
-    let (_parent, worker) = start_supervised_worker(&runtime, &observations, &worker_addresses);
+    let runtime =
+        BetelgeuseRuntime::with_config(LocalShard, LocalMailboxFactory, runtime_config(capacities));
+    let (_parent, worker) =
+        start_supervised_worker(&runtime, &observations, &worker_addresses, capacities);
     let listener = runtime
         .register_with_capacity::<Listener, _>(
             Listener {
@@ -586,11 +850,12 @@ fn live_local_server_routes_tcp_through_bounded_worker_pressure() {
                 bound_addr: Arc::clone(&bound_addr),
                 worker,
                 observations: Arc::clone(&observations),
+                capacities,
                 listener: None,
                 accepted: 0,
                 target_accepts: 3,
             },
-            8,
+            capacities.listener_mailbox,
         )
         .expect("listener register accepts");
 
@@ -637,58 +902,295 @@ fn live_local_server_routes_tcp_through_bounded_worker_pressure() {
         ]
     );
 
-    wait_until(Duration::from_secs(2), "listener stopped", || {
-        let trace = runtime.trace().expect("trace query succeeds");
-        trace.iter().any(|event| {
-            event.isolate() == listener.isolate()
-                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
-        }) && !runtime
-            .has_in_flight_calls()
-            .expect("in-flight query succeeds")
-    });
+    assert_listener_stopped_and_idle(&runtime, listener, "listener stopped");
 
     let trace = runtime.shutdown().expect("runtime shutdown succeeds");
+    assert_dispatch_attempts_have_terminal_outcomes(&trace);
     let observations = observations.lock().expect("observations mutex").clone();
-    assert!(observations.contains(&ServerObservation::WorkerBooted));
-    assert!(observations.contains(&ServerObservation::WorkerReplied));
-    assert!(observations.contains(&ServerObservation::WorkerFull));
-    assert!(observations.contains(&ServerObservation::WorkerTimeout));
-    assert!(
-        count_kind(&trace, |kind| matches!(
-            kind,
-            RuntimeEventKind::CallFailed {
-                call_kind: CallKind::IsolateCall,
-                reason: CallError::TargetFull,
-                ..
-            }
-        )) >= 1,
-        "native live client ordering may create more than one full outcome, but bounded pressure must be visible"
+    assert_observed(&observations, ServerObservation::WorkerBooted);
+    assert_observed(&observations, ServerObservation::WorkerReplied);
+    assert_observed(&observations, ServerObservation::WorkerFull);
+    assert_observed(&observations, ServerObservation::WorkerTimeout);
+    assert_event_count_at_least(
+        &trace,
+        "native live client ordering may create more than one full outcome, but bounded pressure must be visible",
+        1,
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetFull,
+                    ..
+                }
+            )
+        },
     );
-    assert_eq!(
-        count_kind(&trace, |kind| matches!(
+    assert_event_count(&trace, "timeout outcome stays singular", 1, |kind| {
+        matches!(
             kind,
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::IsolateCall,
                 reason: CallError::Timeout,
                 ..
             }
-        )),
-        1
+        )
+    });
+    assert_event_count(
+        &trace,
+        "all three native clients should complete accept",
+        3,
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpAccept,
+                    ..
+                }
+            )
+        },
+    );
+}
+
+#[test]
+fn explicit_step_application_surface_routes_simulated_tcp_with_visible_pressure() {
+    let capacities = ServiceCapacities::default();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let worker_addresses = Arc::new(Mutex::new(Vec::new()));
+    let bound_addr = Arc::new(Mutex::new(None));
+    let simulated_io = SimulatedIO::with_config(SimulatedConfig {
+        seed: 32,
+        completion_delay: SimulatedDelay::Every {
+            one_in: 1,
+            steps: 1,
+        },
+        max_send_chunk: Some(2),
+    });
+    let mut runtime = Runtime::with_betelgeuse_io_loop(
+        LocalShard,
+        LocalMailboxFactory,
+        simulated_io.loop_handle(Global),
+    );
+    let (_parent, worker) = start_supervised_worker_explicit(
+        &mut runtime,
+        &observations,
+        &worker_addresses,
+        capacities,
+    );
+    let listener = runtime.register_with_capacity::<Listener, _>(
+        Listener {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+            bound_addr: Arc::clone(&bound_addr),
+            worker,
+            observations: Arc::clone(&observations),
+            capacities,
+            listener: None,
+            accepted: 0,
+            target_accepts: 2,
+        },
+        capacities.listener_mailbox,
+    );
+
+    runtime
+        .try_send(listener, ListenerMsg::Start)
+        .expect("listener start handoff accepts");
+    step_until(
+        &mut runtime,
+        Duration::from_secs(2),
+        "explicit bind",
+        |_| bound_addr.lock().expect("bound addr mutex").is_some(),
+    );
+    let local_addr = bound_addr
+        .lock()
+        .expect("bound addr mutex")
+        .expect("listener bound addr");
+    let echo_peer = simulated_io
+        .connect(local_addr, b"echo:explicit".to_vec())
+        .expect("simulated echo peer connects");
+    let full_peer = simulated_io
+        .connect(local_addr, b"full".to_vec())
+        .expect("simulated full peer connects");
+
+    step_until(
+        &mut runtime,
+        Duration::from_secs(3),
+        "explicit simulated peers finish",
+        |runtime| {
+            echo_peer.output() == b"explicit"
+                && full_peer.output() == b"worker-full"
+                && !runtime.has_in_flight_calls()
+                && runtime.trace().iter().any(|event| {
+                    event.isolate() == listener.isolate()
+                        && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                })
+        },
+    );
+
+    assert_eq!(echo_peer.output(), b"explicit");
+    assert_eq!(full_peer.output(), b"worker-full");
+    let trace = runtime.trace().to_vec();
+    assert_dispatch_attempts_have_terminal_outcomes(&trace);
+    assert_event_exists(
+        &trace,
+        "explicit runtime should surface TargetFull",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetFull,
+                    ..
+                }
+            )
+        },
+    );
+    assert_event_count_at_least(
+        &trace,
+        "explicit runtime should prove partial writes through repeated completions",
+        4,
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpWrite,
+                    ..
+                }
+            )
+        },
+    );
+    let observations = observations.lock().expect("observations mutex").clone();
+    assert_observed(&observations, ServerObservation::WorkerFull);
+}
+
+#[test]
+fn application_surface_routes_bounded_worker_pressure_without_tcp() {
+    let capacities = ServiceCapacities::default();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let worker_addresses = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = Runtime::new(LocalShard, LocalMailboxFactory);
+    let (_parent, worker) = start_supervised_worker_explicit(
+        &mut runtime,
+        &observations,
+        &worker_addresses,
+        capacities,
+    );
+    let router = runtime.register_with_capacity::<Router, _>(
+        Router {
+            worker,
+            outcomes: Arc::clone(&outcomes),
+        },
+        capacities.utility_mailbox,
+    );
+
+    runtime
+        .try_send(router, RouterMsg::Start)
+        .expect("router start accepts");
+    step_until(
+        &mut runtime,
+        Duration::from_secs(2),
+        "bounded router outcomes",
+        |_| outcomes.lock().expect("outcomes mutex").len() == 2,
+    );
+
+    let outcomes = outcomes.lock().expect("outcomes mutex").clone();
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Replied(WorkerReply(bytes)) if bytes == b"first")),
+        "one worker call should complete successfully; outcomes = {outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Full)),
+        "second worker call should surface bounded backpressure; outcomes = {outcomes:?}"
+    );
+    assert_dispatch_attempts_have_terminal_outcomes(runtime.trace());
+    assert_event_exists(
+        runtime.trace(),
+        "router proof should trace worker mailbox full",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetFull,
+                    ..
+                }
+            )
+        },
+    );
+}
+
+#[test]
+fn application_surface_stateful_session_updates_state_and_audits_locally() {
+    let capacities = ServiceCapacities::default();
+    let audit_log = Arc::new(Mutex::new(Vec::new()));
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = Runtime::new(LocalShard, LocalMailboxFactory);
+    let audit = runtime.register_with_capacity::<SessionAudit, _>(
+        SessionAudit {
+            log: Arc::clone(&audit_log),
+        },
+        capacities.utility_mailbox,
+    );
+    let session = runtime.register_with_capacity::<Session, _>(
+        Session {
+            audit,
+            users: Vec::new(),
+            snapshots: Arc::clone(&snapshots),
+        },
+        capacities.utility_mailbox,
+    );
+
+    runtime
+        .try_send(session, SessionMsg::Connected(7))
+        .expect("first session event accepts");
+    runtime
+        .try_send(session, SessionMsg::Connected(9))
+        .expect("second session event accepts");
+    runtime
+        .try_send(session, SessionMsg::Snapshot)
+        .expect("snapshot event accepts");
+    step_until(
+        &mut runtime,
+        Duration::from_secs(2),
+        "session snapshot and audit",
+        |_| {
+            audit_log.lock().expect("audit log mutex").len() == 2
+                && snapshots.lock().expect("snapshots mutex").len() == 1
+        },
+    );
+
+    assert_eq!(
+        audit_log.lock().expect("audit log mutex").as_slice(),
+        [7, 9]
     );
     assert_eq!(
-        count_kind(&trace, |kind| matches!(
-            kind,
-            RuntimeEventKind::CallCompleted {
-                call_kind: CallKind::TcpAccept,
-                ..
-            }
-        )),
-        3
+        snapshots.lock().expect("snapshots mutex").as_slice(),
+        [vec![7, 9]]
+    );
+    assert_dispatch_attempts_have_terminal_outcomes(runtime.trace());
+    assert_event_count(
+        runtime.trace(),
+        "two audit sends should be accepted",
+        2,
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::SendAccepted {
+                    target_isolate,
+                    ..
+                } if target_isolate == audit.isolate()
+            )
+        },
     );
 }
 
 #[test]
 fn simulated_io_local_server_keeps_partial_slow_peer_semantics_through_threaded_runtime() {
+    let capacities = ServiceCapacities::default();
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));
     let bound_addr = Arc::new(Mutex::new(None));
@@ -704,13 +1206,11 @@ fn simulated_io_local_server_keeps_partial_slow_peer_semantics_through_threaded_
     let runtime = BetelgeuseRuntime::with_config_and_io_loop_factory(
         LocalShard,
         LocalMailboxFactory,
-        BetelgeuseRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-        },
+        runtime_config(capacities),
         move || io_for_worker.loop_handle(Global),
     );
-    let (_parent, worker) = start_supervised_worker(&runtime, &observations, &worker_addresses);
+    let (_parent, worker) =
+        start_supervised_worker(&runtime, &observations, &worker_addresses, capacities);
     let listener = runtime
         .register_with_capacity::<Listener, _>(
             Listener {
@@ -718,11 +1218,12 @@ fn simulated_io_local_server_keeps_partial_slow_peer_semantics_through_threaded_
                 bound_addr: Arc::clone(&bound_addr),
                 worker,
                 observations: Arc::clone(&observations),
+                capacities,
                 listener: None,
                 accepted: 0,
                 target_accepts: 2,
             },
-            8,
+            capacities.listener_mailbox,
         )
         .expect("listener register accepts");
 
@@ -747,51 +1248,39 @@ fn simulated_io_local_server_keeps_partial_slow_peer_semantics_through_threaded_
     wait_until(Duration::from_secs(3), "simulated peers finish", || {
         echo_peer.output() == b"abcdef" && full_peer.output() == b"worker-full"
     });
-    wait_until(Duration::from_secs(2), "simulated listener stopped", || {
-        let trace = runtime.trace().expect("trace query succeeds");
-        trace.iter().any(|event| {
-            event.isolate() == listener.isolate()
-                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
-        }) && !runtime
-            .has_in_flight_calls()
-            .expect("in-flight query succeeds")
-    });
+    assert_listener_stopped_and_idle(&runtime, listener, "simulated listener stopped");
 
     let trace = runtime.shutdown().expect("runtime shutdown succeeds");
+    assert_dispatch_attempts_have_terminal_outcomes(&trace);
     assert_eq!(echo_peer.output(), b"abcdef");
     assert_eq!(full_peer.output(), b"worker-full");
-    assert!(
-        count_kind(&trace, |kind| matches!(
-            kind,
-            RuntimeEventKind::CallCompleted {
-                call_kind: CallKind::TcpWrite,
-                ..
-            }
-        )) > 2,
-        "partial send limit should force more than one write completion per response"
+    assert_event_count_at_least(
+        &trace,
+        "partial send limit should force more than one write completion per response",
+        3,
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpWrite,
+                    ..
+                }
+            )
+        },
     );
-    assert!(
-        observations
-            .lock()
-            .expect("observations mutex")
-            .contains(&ServerObservation::WorkerFull)
-    );
+    let observations = observations.lock().expect("observations mutex").clone();
+    assert_observed(&observations, ServerObservation::WorkerFull);
 }
 
 #[test]
 fn local_server_supervision_restarts_worker_and_rejects_stale_address() {
+    let capacities = ServiceCapacities::default();
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseRuntime::with_config(
-        LocalShard,
-        LocalMailboxFactory,
-        BetelgeuseRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-        },
-    );
+    let runtime =
+        BetelgeuseRuntime::with_config(LocalShard, LocalMailboxFactory, runtime_config(capacities));
     let (_parent, first_worker) =
-        start_supervised_worker(&runtime, &observations, &worker_addresses);
+        start_supervised_worker(&runtime, &observations, &worker_addresses, capacities);
 
     runtime
         .try_send(first_worker, WorkerMsg::Panic)
@@ -807,7 +1296,7 @@ fn local_server_supervision_restarts_worker_and_rejects_stale_address() {
             StaleProbe {
                 observations: Arc::clone(&observations),
             },
-            8,
+            capacities.utility_mailbox,
         )
         .expect("stale probe register accepts");
     runtime
@@ -824,32 +1313,38 @@ fn local_server_supervision_restarts_worker_and_rejects_stale_address() {
         .expect("replacement worker accepts observed send");
 
     let trace = runtime.shutdown().expect("runtime shutdown succeeds");
-    assert!(trace.iter().any(|event| {
+    assert_dispatch_attempts_have_terminal_outcomes(&trace);
+    assert_event_exists(&trace, "worker restart should be visible", |kind| {
         matches!(
-            event.kind(),
+            kind,
             RuntimeEventKind::RestartChildCompleted {
                 old_isolate,
                 new_isolate,
                 ..
             } if old_isolate == first_worker.isolate() && new_isolate == replacement.isolate()
         )
-    }));
-    assert!(trace.iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::SendRejected {
-                target_isolate,
-                target_generation,
-                reason: SendRejectedReason::Closed,
-                ..
-            } if target_isolate == first_worker.isolate()
-                && target_generation == first_worker.generation()
-        )
-    }));
+    });
+    assert_event_exists(
+        &trace,
+        "stale worker address should reject closed",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::SendRejected {
+                    target_isolate,
+                    target_generation,
+                    reason: SendRejectedReason::Closed,
+                    ..
+                } if target_isolate == first_worker.isolate()
+                    && target_generation == first_worker.generation()
+            )
+        },
+    );
 }
 
 #[test]
 fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
+    let capacities = ServiceCapacities::default();
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));
     let bound_addr = Arc::new(Mutex::new(None));
@@ -865,13 +1360,11 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
     let runtime = BetelgeuseRuntime::with_config_and_io_loop_factory(
         LocalShard,
         LocalMailboxFactory,
-        BetelgeuseRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-        },
+        runtime_config(capacities),
         move || io_for_worker.loop_handle(Global),
     );
-    let (_parent, worker) = start_supervised_worker(&runtime, &observations, &worker_addresses);
+    let (_parent, worker) =
+        start_supervised_worker(&runtime, &observations, &worker_addresses, capacities);
     let listener = runtime
         .register_with_capacity::<Listener, _>(
             Listener {
@@ -879,15 +1372,16 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
                 bound_addr: Arc::clone(&bound_addr),
                 worker,
                 observations: Arc::clone(&observations),
+                capacities,
                 listener: None,
                 accepted: 0,
                 target_accepts: 4,
             },
-            8,
+            capacities.listener_mailbox,
         )
         .expect("listener register accepts");
     let long_work = runtime
-        .register_with_capacity::<LongWork, _>(LongWork, 8)
+        .register_with_capacity::<LongWork, _>(LongWork, capacities.utility_mailbox)
         .expect("long work register accepts");
 
     runtime
@@ -938,30 +1432,33 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
     });
 
     let trace = runtime.shutdown().expect("runtime shutdown succeeds");
+    assert_dispatch_attempts_have_terminal_outcomes(&trace);
     for call_kind in [
         CallKind::TcpAccept,
         CallKind::TcpRead,
         CallKind::Sleep,
         CallKind::IsolateCall,
     ] {
-        assert!(
-            trace.iter().any(|event| {
+        assert_event_exists(
+            &trace,
+            &format!("shutdown should reject pending {call_kind:?} completion"),
+            |kind| {
                 matches!(
-                    event.kind(),
+                    kind,
                     RuntimeEventKind::CallCompletionRejected {
                         call_kind: found,
                         reason: CallCompletionRejectedReason::RequesterClosed,
                         ..
                     } if found == call_kind
                 )
-            }),
-            "shutdown should reject pending {call_kind:?} completion; trace = {trace:#?}"
+            },
         );
     }
 }
 
 #[test]
 fn local_server_shutdown_cancels_pending_write_work() {
+    let capacities = ServiceCapacities::default();
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));
     let bound_addr = Arc::new(Mutex::new(None));
@@ -979,13 +1476,11 @@ fn local_server_shutdown_cancels_pending_write_work() {
     let runtime = BetelgeuseRuntime::with_config_and_io_loop_factory(
         LocalShard,
         LocalMailboxFactory,
-        BetelgeuseRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-        },
+        runtime_config(capacities),
         move || io_for_worker.loop_handle(Global),
     );
-    let (_parent, worker) = start_supervised_worker(&runtime, &observations, &worker_addresses);
+    let (_parent, worker) =
+        start_supervised_worker(&runtime, &observations, &worker_addresses, capacities);
     let listener = runtime
         .register_with_capacity::<Listener, _>(
             Listener {
@@ -993,11 +1488,12 @@ fn local_server_shutdown_cancels_pending_write_work() {
                 bound_addr: Arc::clone(&bound_addr),
                 worker,
                 observations: Arc::clone(&observations),
+                capacities,
                 listener: None,
                 accepted: 0,
                 target_accepts: 1,
             },
-            8,
+            capacities.listener_mailbox,
         )
         .expect("listener register accepts");
 
@@ -1032,6 +1528,7 @@ fn local_server_shutdown_cancels_pending_write_work() {
     });
 
     let trace = runtime.shutdown().expect("runtime shutdown succeeds");
+    assert_dispatch_attempts_have_terminal_outcomes(&trace);
     for _ in 0..4 {
         simulated_io
             .step()
@@ -1041,14 +1538,14 @@ fn local_server_shutdown_cancels_pending_write_work() {
         peer.output().is_empty(),
         "pending write should be canceled before simulated peer observes bytes"
     );
-    assert!(trace.iter().any(|event| {
+    assert_event_exists(&trace, "shutdown should reject pending write", |kind| {
         matches!(
-            event.kind(),
+            kind,
             RuntimeEventKind::CallCompletionRejected {
                 call_kind: CallKind::TcpWrite,
                 reason: CallCompletionRejectedReason::RequesterClosed,
                 ..
             }
         )
-    }));
+    });
 }

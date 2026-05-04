@@ -162,8 +162,8 @@ phases.
 | ~~**Surveyor Betelgeuse adapter ownership**~~ | Delivered in `.intent/phases/029-surveyor-betelgeuse-adapter-ownership/`: Tina now treats its live substrate as a Tina-owned implementation over Betelgeuse, with explicit completion-slot ownership, no-leak shutdown/cancel-drain, controlled simulated/native backend release proofs, and no dependence on upstream Betelgeuse growing Tina-specific guarantees first. |
 | ~~**Willem Drees local production runtime**~~ | Delivered in `.intent/phases/030-willem-drees-local-production-runtime/`: Tina now has a composed one-process server-shaped proof covering listener/connection lifecycle, graceful shutdown, bounded overload, supervisor behavior under live TCP pressure, memory ceilings/backpressure guards, and server-shaped assertions rather than demo logs. |
 | ~~**Ruud Lubbers performance and memory hardening**~~ | Delivered in `.intent/phases/031-ruud-lubbers-performance-memory-hardening/`: measured and improved runtime/simulator/driver hot paths, pinned narrow allocation counts for send/call/timer/TCP/batch/spawn/restart/trace/live-ingress/high-cardinality idle stepping, reduced multi-shard send hot path to `1 alloc / 0 realloc`, kept SPSC no-allocation proof intact, preserved trace/replay and next-step remote visibility, and deferred medium cost rocks explicitly. |
-| **Joop den Uyl porting surface** | Make "have Codex port my small Tokio-shaped TCP/control-plane service to Tina" realistic without turning Tina into Tokio or Akka. Add only the helpers, macros, patterns, and regression tests needed for clear listener/connection/worker/supervisor code. |
-| **Gemini release story** | Release-story phase after the local production runtime, performance/memory story, and porting surface are real. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
+| ~~**Joop den Uyl application surface**~~ | Delivered in `.intent/phases/032-joop-den-uyl-application-surface/`: migrated the local-production workload into canonical `application_surface` tests, named service capacities in the harness, added trace assertion helpers and terminal-outcome invariants, proved the service shape across `tina-sim`, explicit-step runtime, threaded simulated I/O, and live Betelgeuse loopback, and added bounded-router plus stateful-session porting proofs without adding a premature public app-builder surface. |
+| **Gemini release story** | Release-story phase after the local production runtime, performance/memory story, and application surface are real. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. Apollo remains an adoption bridge, not the center of Tina's runtime story. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 | **Wim Kok persistence** | Future durable-state phase: snapshots, event journal, restart recovery, durable replay artifacts, and explicit non-claims around durable mailboxes until they are designed. Not required for first local-runtime launch. |
@@ -190,9 +190,10 @@ completion-ownership and no-leak shutdown contract.
 
 After Willem Drees, the roadmap deliberately stays local before release polish:
 Ruud Lubbers keeps performance and allocation claims honest; Joop den Uyl makes
-porting ordinary server-shaped code to Tina less fragile. Gemini only freezes
-and publishes the story after those rocks are real. Persistence, remoting, and
-clustering remain later Tina capabilities, not Akka-parity launch blockers.
+ordinary server-shaped Tina applications less fragile to structure and port.
+Gemini only freezes and publishes the story after those rocks are real.
+Persistence, remoting, and clustering remain later Tina capabilities, not
+Akka-parity launch blockers.
 
 ## Strategic prerequisites
 
@@ -640,34 +641,35 @@ performance work.
 ---
 
 ## Phase Joop den Uyl
-> Porting surface. Make generated and human-written Tina server code hard to mess up.
+> Application surface. Make local Tina services boring to structure.
 
 > After: Phase Ruud Lubbers · Before: Phase Gemini
 
-Joop den Uyl is not a docs polish phase. It is the phase that makes the
-preferred Tina shape obvious enough that a human or Codex can port a small
-Tokio-shaped TCP/control-plane service without inventing five local dialects.
+Joop den Uyl is not a docs polish phase. It is the phase that makes Tina's
+local application structure obvious enough that a human or Codex can port a
+small Tokio-shaped TCP/control-plane service without inventing five local
+dialects.
 
-- Audit real Tina server-shaped code for repeated friction:
-  - listener isolate setup
-  - connection isolate setup
-  - worker pool request/reply
-  - backpressure handling
-  - timeout cleanup
-  - supervisor config
-  - shutdown choreography
-- Add only small helpers/macros that preserve one preferred API surface.
-- Keep `Effect` and runtime-owned calls explicit. Do not add async handlers or
-  arbitrary future execution.
-- Add runnable porting comparisons as tests, not demos: each comparison should
-  assert behavior under success, overload, timeout, and shutdown.
-- Improve examples only where they reveal the preferred code shape; broad docs
-  still belong to Gemini.
+- Establish one canonical service shape:
+  listener isolate, connection isolate, bounded worker pool, supervisor,
+  shutdown owner, capacity config, mandatory call timeouts, and trace
+  assertions.
+- Prove that shape through `tina-sim`, explicit-step runtime, and
+  Betelgeuse-backed live runtime tests where each layer applies.
+- Audit existing server/comparison code for repeated ceremony, then add only
+  helpers/macros justified by that audit and used by the canonical tests.
+- Keep `Effect`, message enums, addresses, capacities, timeouts, bounded
+  failure outcomes, and runtime-owned calls explicit.
+- Add runnable porting proofs for TCP service, bounded router/worker, and
+  stateful control-plane/session shapes.
+- Pull in only the 031 medium rocks that directly help application structure,
+  such as capacity config or test trace query helpers. Defer performance-only
+  rocks.
 
-**Done when:** the preferred way to write listener/connection/worker/supervisor
-Tina code is clear in tests, the code is not ceremony-heavy compared with the
-guarantees it buys, and new helper surface is small enough that there is still
-one obvious way to do things.
+**Done when:** Tina has one obvious local-service structure, proved in tests
+across the relevant runners; the helper surface is small enough that there is
+still one preferred path; and Gemini can document the service shape without
+reopening core semantics.
 
 ---
 
@@ -684,7 +686,7 @@ one obvious way to do things.
   Betelgeuse and the Tina driver contract made the first tryable runtime
   substrate true; Ranger and Surveyor matured the substrate/driver ownership
   story; Willem Drees, Ruud Lubbers, and Joop den Uyl make the local
-  production/runtime/porting story real enough for Gemini to document instead
+  production/runtime/application story real enough for Gemini to document instead
   of reopening core semantics.
 - Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, task-dispatcher walkthrough, and TCP echo walkthrough.
 - Document the supported invariants for the core runtime/simulator model:

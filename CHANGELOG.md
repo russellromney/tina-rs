@@ -408,3 +408,20 @@ This file records completed work.
 - Recorded medium follow-up rocks in the roadmap: batch small path, live worker
   command boxing, sizing knobs, trace retention policy, typed fast paths, and
   completion-slot pooling/slabbing.
+
+### Phase Joop den Uyl
+
+- Migrated the composed local-production workload into canonical
+  `application_surface` test artifacts for `tina-runtime` and `tina-sim`.
+- Added a named local service-capacity pattern in the canonical harness so
+  listener, connection, worker, command, backlog, and pending-completion
+  capacities are explicit instead of scattered magic numbers.
+- Added test-local trace assertion helpers for event existence/counts,
+  stopped-and-idle service checks, and terminal send/call outcome invariants.
+- Added direct application-surface proofs across live Betelgeuse loopback,
+  threaded simulated I/O, explicit-step runtime with simulated I/O, and
+  deterministic `tina-sim` replay.
+- Added non-TCP porting proofs for bounded worker/router pressure and a
+  stateful session/control-plane shape with local audit send.
+- Kept helper surface test-local for now; no public application builder,
+  router, registry, or macro was added.

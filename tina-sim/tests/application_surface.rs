@@ -33,6 +33,29 @@ enum Observation {
 type Observations = Rc<RefCell<Vec<Observation>>>;
 type WorkerAddresses = Rc<RefCell<Vec<Address<WorkerMsg, WorkerReply>>>>;
 
+#[derive(Debug, Clone, Copy)]
+struct ServiceCapacities {
+    parent_mailbox: usize,
+    worker_mailbox: usize,
+    listener_mailbox: usize,
+    connection_mailbox: usize,
+    pending_tcp_completions: usize,
+    listener_backlog: usize,
+}
+
+impl Default for ServiceCapacities {
+    fn default() -> Self {
+        Self {
+            parent_mailbox: 8,
+            worker_mailbox: 1,
+            listener_mailbox: 8,
+            connection_mailbox: 8,
+            pending_tcp_completions: 32,
+            listener_backlog: 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerMsg {
     Boot,
@@ -81,6 +104,7 @@ enum ParentMsg {
 struct Parent {
     observations: Observations,
     addresses: WorkerAddresses,
+    capacities: ServiceCapacities,
 }
 
 #[tina_runtime::isolate(
@@ -100,7 +124,7 @@ impl Parent {
                             observations: Rc::clone(&observations),
                             addresses: Rc::clone(&addresses),
                         },
-                        1,
+                        self.capacities.worker_mailbox,
                     )
                     .with_initial_message(|| WorkerMsg::Boot),
                 )
@@ -157,7 +181,7 @@ impl Connection {
                 }
                 (RequestMode::Full, _) => {
                     self.mode = Some(RequestMode::Full);
-                    batch(vec![
+                    batch([
                         call(
                             self.worker,
                             WorkerMsg::Echo(b"accepted-before-full".to_vec()),
@@ -264,6 +288,7 @@ struct Listener {
     bind_addr: SocketAddr,
     worker: Address<WorkerMsg, WorkerReply>,
     observations: Observations,
+    capacities: ServiceCapacities,
     listener: Option<ListenerId>,
     accepted: usize,
     target_accepts: usize,
@@ -304,7 +329,7 @@ impl Listener {
                             pending_write: Vec::new(),
                             response_started: false,
                         },
-                        8,
+                        self.capacities.connection_mailbox,
                     )
                     .with_initial_message(|| ConnectionMsg::Begin),
                 );
@@ -313,7 +338,7 @@ impl Listener {
                 } else {
                     ListenerMsg::Close
                 };
-                batch(vec![child, ctx.send_self(follow_up)])
+                batch([child, ctx.send_self(follow_up)])
             }
             ListenerMsg::Close => {
                 let listener = self.listener.expect("listener stored before close");
@@ -364,6 +389,74 @@ fn peer(
     }
 }
 
+fn assert_event_exists(
+    event_kinds: &[RuntimeEventKind],
+    label: &str,
+    predicate: impl Fn(RuntimeEventKind) -> bool,
+) {
+    assert!(
+        event_kinds.iter().copied().any(predicate),
+        "{label}; event_kinds = {event_kinds:#?}"
+    );
+}
+
+fn assert_event_count_at_least(
+    event_kinds: &[RuntimeEventKind],
+    label: &str,
+    minimum: usize,
+    predicate: impl Fn(RuntimeEventKind) -> bool,
+) {
+    let count = event_kinds
+        .iter()
+        .copied()
+        .filter(|kind| predicate(*kind))
+        .count();
+    assert!(
+        count >= minimum,
+        "{label}; expected at least {minimum}, got {count}; event_kinds = {event_kinds:#?}"
+    );
+}
+
+fn assert_dispatch_attempts_have_terminal_outcomes(event_kinds: &[RuntimeEventKind]) {
+    let send_attempts = event_kinds
+        .iter()
+        .filter(|kind| matches!(kind, RuntimeEventKind::SendDispatchAttempted { .. }))
+        .count();
+    let send_outcomes = event_kinds
+        .iter()
+        .filter(|kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::SendAccepted { .. } | RuntimeEventKind::SendRejected { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        send_attempts, send_outcomes,
+        "every send dispatch attempt needs one visible accepted/rejected outcome"
+    );
+
+    let call_attempts = event_kinds
+        .iter()
+        .filter(|kind| matches!(kind, RuntimeEventKind::CallDispatchAttempted { .. }))
+        .count();
+    let call_outcomes = event_kinds
+        .iter()
+        .filter(|kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallCompleted { .. }
+                    | RuntimeEventKind::CallFailed { .. }
+                    | RuntimeEventKind::CallCompletionRejected { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        call_attempts, call_outcomes,
+        "every call dispatch attempt needs one visible terminal outcome"
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalServerOracleCost {
     parent_deliveries: usize,
@@ -382,6 +475,7 @@ struct LocalServerOracleRun {
 }
 
 fn run_local_server_oracle(seed: u64) -> LocalServerOracleRun {
+    let capacities = ServiceCapacities::default();
     let observations = Rc::new(RefCell::new(Vec::new()));
     let worker_addresses = Rc::new(RefCell::new(Vec::new()));
     let mut sim = Simulator::new(
@@ -396,11 +490,11 @@ fn run_local_server_oracle(seed: u64) -> LocalServerOracleRun {
                 ..Default::default()
             },
             tcp: ScriptedTcpConfig {
-                pending_completion_capacity: 32,
+                pending_completion_capacity: capacities.pending_tcp_completions,
                 listeners: vec![ScriptedListenerConfig {
                     bind_addr: bind_addr(),
                     local_addr: local_addr(),
-                    backlog_capacity: 3,
+                    backlog_capacity: capacities.listener_backlog,
                     peers: vec![
                         peer(61031, b"echo:alpha", None, 2, b"alpha".len()),
                         peer(61032, b"full", None, 2, b"worker-full".len()),
@@ -410,10 +504,14 @@ fn run_local_server_oracle(seed: u64) -> LocalServerOracleRun {
             },
         },
     );
-    let parent = sim.register(Parent {
-        observations: Rc::clone(&observations),
-        addresses: Rc::clone(&worker_addresses),
-    });
+    let parent = sim.register_with_mailbox_capacity(
+        Parent {
+            observations: Rc::clone(&observations),
+            addresses: Rc::clone(&worker_addresses),
+            capacities,
+        },
+        capacities.parent_mailbox,
+    );
     sim.try_send(parent, ParentMsg::Spawn).unwrap();
     let parent_deliveries = sim.run_until_quiescent();
     let worker = worker_addresses.borrow()[0];
@@ -422,11 +520,12 @@ fn run_local_server_oracle(seed: u64) -> LocalServerOracleRun {
             bind_addr: bind_addr(),
             worker,
             observations: Rc::clone(&observations),
+            capacities,
             listener: None,
             accepted: 0,
             target_accepts: 3,
         },
-        8,
+        capacities.listener_mailbox,
     );
     sim.try_send(listener, ListenerMsg::Start).unwrap();
     let server_deliveries = sim.run_until_quiescent();
@@ -486,6 +585,7 @@ fn local_server_oracle_replays_bounded_worker_pressure_and_partial_writes() {
     let replayed = run_local_server_oracle(30);
 
     assert_eq!(first, replayed);
+    assert_dispatch_attempts_have_terminal_outcomes(&first.event_kinds);
     assert_eq!(
         first.cost,
         LocalServerOracleCost {
@@ -509,39 +609,77 @@ fn local_server_oracle_replays_bounded_worker_pressure_and_partial_writes() {
     assert!(first.observations.contains(&Observation::Replied));
     assert!(first.observations.contains(&Observation::Full));
     assert!(first.observations.contains(&Observation::Timeout));
-    assert!(first.event_kinds.iter().any(|kind| {
-        matches!(
-            kind,
-            RuntimeEventKind::CallFailed {
-                call_kind: CallKind::IsolateCall,
-                reason: CallError::TargetFull,
-                ..
-            }
-        )
-    }));
-    assert!(first.event_kinds.iter().any(|kind| {
-        matches!(
-            kind,
-            RuntimeEventKind::CallFailed {
-                call_kind: CallKind::IsolateCall,
-                reason: CallError::Timeout,
-                ..
-            }
-        )
-    }));
-    assert!(
-        first
-            .event_kinds
-            .iter()
-            .filter(|kind| matches!(
+    assert_event_exists(
+        &first.event_kinds,
+        "bounded worker overload must be visible as TargetFull",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetFull,
+                    ..
+                }
+            )
+        },
+    );
+    assert_event_exists(
+        &first.event_kinds,
+        "mandatory call deadline must be visible as Timeout",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::Timeout,
+                    ..
+                }
+            )
+        },
+    );
+    assert_event_count_at_least(
+        &first.event_kinds,
+        "write_cap should force partial writes in the oracle workload",
+        4,
+        |kind| {
+            matches!(
                 kind,
                 RuntimeEventKind::CallCompleted {
                     call_kind: CallKind::TcpWrite,
                     ..
                 }
-            ))
-            .count()
-            > 3,
-        "write_cap should force partial writes in the oracle workload"
+            )
+        },
+    );
+}
+
+#[test]
+fn application_surface_oracle_replays_under_non_default_seed() {
+    let first = run_local_server_oracle(91);
+    let replayed = run_local_server_oracle(91);
+
+    assert_eq!(first, replayed);
+    assert_dispatch_attempts_have_terminal_outcomes(&first.event_kinds);
+    assert_eq!(
+        first.outputs,
+        vec![
+            b"alpha".to_vec(),
+            b"worker-full".to_vec(),
+            b"worker-timeout".to_vec()
+        ]
+    );
+    assert_event_exists(
+        &first.event_kinds,
+        "non-default seed still preserves visible bounded pressure",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetFull,
+                    ..
+                }
+            )
+        },
     );
 }
