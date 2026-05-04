@@ -70,7 +70,7 @@ pub use trace::{
     SupervisionRejectedReason,
 };
 
-use driver::{BetelgeuseDriver, RuntimeDriver};
+use driver::{BetelgeuseDriver, DriverShutdownError, RuntimeDriver};
 
 /// Runtime-owned mailbox factory for spawned children.
 ///
@@ -345,8 +345,8 @@ where
         &self.trace
     }
 
-    fn cancel_in_flight_calls_for_shutdown(&mut self) {
-        self.driver.cancel_pending();
+    fn cancel_in_flight_calls_for_shutdown(&mut self) -> Result<(), DriverShutdownError> {
+        self.driver.cancel_pending()?;
         self.translators.clear();
 
         let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
@@ -374,6 +374,7 @@ where
                 },
             );
         }
+        Ok(())
     }
 
     fn cancel_driver_calls_for_requester(&mut self, requester: RegisteredAddress) {
@@ -2331,6 +2332,9 @@ impl Default for BetelgeuseRuntimeConfig {
 pub enum BetelgeuseControlError {
     /// The worker thread stopped before it could accept or answer the command.
     WorkerStopped,
+    /// The worker could not prove backend completion-slot ownership was
+    /// released during shutdown.
+    DriverShutdownFailed,
 }
 
 /// Error returned by [`BetelgeuseRuntime::try_send`].
@@ -2385,7 +2389,7 @@ where
     F: MailboxFactory + Send + 'static,
 {
     commands: std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>,
-    handle: Option<JoinHandle<Vec<RuntimeEvent>>>,
+    handle: Option<JoinHandle<Result<Vec<RuntimeEvent>, BetelgeuseControlError>>>,
 }
 
 impl<S, F> BetelgeuseRuntime<S, F>
@@ -2562,6 +2566,7 @@ where
         handle
             .join()
             .map_err(|_| BetelgeuseControlError::WorkerStopped)
+            .and_then(std::convert::identity)
     }
 }
 
@@ -2581,7 +2586,7 @@ fn betelgeuse_worker_loop<S, F>(
     receiver: std::sync::mpsc::Receiver<BetelgeuseCommand<S, F>>,
     config: BetelgeuseRuntimeConfig,
     io_loop_factory: BetelgeuseIoLoopFactory,
-) -> Vec<RuntimeEvent>
+) -> Result<Vec<RuntimeEvent>, BetelgeuseControlError>
 where
     S: Shard,
     F: MailboxFactory,
@@ -2618,8 +2623,10 @@ where
         }
     }
 
-    runtime.cancel_in_flight_calls_for_shutdown();
-    runtime.trace().to_vec()
+    runtime
+        .cancel_in_flight_calls_for_shutdown()
+        .map_err(|_| BetelgeuseControlError::DriverShutdownFailed)?;
+    Ok(runtime.trace().to_vec())
 }
 
 /// One live worker-per-shard runtime over a fixed shard set.
@@ -2635,7 +2642,7 @@ where
     F: MailboxFactory + Send + Clone + 'static,
 {
     commands: BTreeMap<ShardId, std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>>,
-    handles: Vec<JoinHandle<Vec<RuntimeEvent>>>,
+    handles: Vec<JoinHandle<Result<Vec<RuntimeEvent>, BetelgeuseControlError>>>,
 }
 
 impl<S, F> BetelgeuseMultiShardRuntime<S, F>
@@ -2806,7 +2813,7 @@ where
             events.extend(
                 handle
                     .join()
-                    .map_err(|_| BetelgeuseControlError::WorkerStopped)?,
+                    .map_err(|_| BetelgeuseControlError::WorkerStopped)??,
             );
         }
         events.sort_by_key(|event| event.id());
@@ -2829,7 +2836,7 @@ fn betelgeuse_worker_loop_with_remote<S, F>(
     receiver: std::sync::mpsc::Receiver<BetelgeuseCommand<S, F>>,
     config: BetelgeuseRuntimeConfig,
     remote_senders: BTreeMap<ShardId, std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>>,
-) -> Vec<RuntimeEvent>
+) -> Result<Vec<RuntimeEvent>, BetelgeuseControlError>
 where
     S: Shard,
     F: MailboxFactory,
@@ -2878,8 +2885,10 @@ where
         }
     }
 
-    runtime.cancel_in_flight_calls_for_shutdown();
-    runtime.trace().to_vec()
+    runtime
+        .cancel_in_flight_calls_for_shutdown()
+        .map_err(|_| BetelgeuseControlError::DriverShutdownFailed)?;
+    Ok(runtime.trace().to_vec())
 }
 
 trait ErasedMailbox {

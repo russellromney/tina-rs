@@ -4,12 +4,17 @@ use std::alloc::Global;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use betelgeuse::{IOLoop, io::simulated::SimulatedIO};
+use betelgeuse::{
+    AcceptCompletion, AcceptOp, IO, IOFile, IOLoop, IOLoopHandle, IOSocket, OpenOptions, Operation,
+    RecvCompletion, SendCompletion, io::simulated::SimulatedIO,
+};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseControlError, BetelgeuseMultiShardRuntime, BetelgeuseRuntime,
@@ -413,6 +418,164 @@ fn betelgeuse_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
                 }
             )
     }));
+}
+
+#[derive(Clone, Default)]
+struct StuckReleaseIo {
+    state: Arc<Mutex<StuckReleaseState>>,
+}
+
+#[derive(Default)]
+struct StuckReleaseState {
+    local_addr: Option<SocketAddr>,
+    pending_completion_count: usize,
+}
+
+impl StuckReleaseIo {
+    fn loop_handle(&self) -> IOLoopHandle<Global> {
+        IOLoopHandle::new(std::rc::Rc::new(self.clone()), Global)
+    }
+}
+
+#[derive(Clone)]
+struct StuckReleaseSocket {
+    state: Arc<Mutex<StuckReleaseState>>,
+}
+
+impl IOSocket for StuckReleaseSocket {
+    fn bind(&self, mut addr: SocketAddr) -> io::Result<()> {
+        if addr.port() == 0 {
+            addr.set_port(41_911);
+        }
+        self.state.lock().expect("stuck io mutex").local_addr = Some(addr);
+        Ok(())
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.state
+            .lock()
+            .expect("stuck io mutex")
+            .local_addr
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "not bound"))
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        Err(io::Error::new(io::ErrorKind::NotConnected, "no peer"))
+    }
+
+    fn accept(&self, c: &mut AcceptCompletion) -> io::Result<()> {
+        c.inner_mut()
+            .prepare(Operation::Accept(AcceptOp { fd: 41_911 }));
+        self.state
+            .lock()
+            .expect("stuck io mutex")
+            .pending_completion_count += 1;
+        Ok(())
+    }
+
+    fn recv(&self, _c: &mut RecvCompletion, _len: usize) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "stuck recv"))
+    }
+
+    fn send(&self, _c: &mut SendCompletion, _buf: Vec<u8>) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "stuck send"))
+    }
+
+    fn set_nodelay(&self, _on: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn close(&self) {}
+}
+
+impl IO for StuckReleaseIo {
+    fn open(&self, _path: &Path, _options: OpenOptions) -> io::Result<Box<dyn IOFile>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "stuck open"))
+    }
+
+    fn socket(&self) -> io::Result<Box<dyn IOSocket>> {
+        Ok(Box::new(StuckReleaseSocket {
+            state: Arc::clone(&self.state),
+        }))
+    }
+
+    fn mkdir(
+        &self,
+        _c: &mut betelgeuse::MkdirCompletion,
+        _path: &Path,
+        _mode: u32,
+    ) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "stuck mkdir"))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "stuck-release-test"
+    }
+}
+
+impl IOLoop for StuckReleaseIo {
+    fn step(&self) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn pending_completion_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("stuck io mutex")
+            .pending_completion_count
+    }
+
+    fn cancel_pending_completions(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn betelgeuse_runtime_shutdown_reports_driver_release_failure() {
+    let stuck_io = StuckReleaseIo::default();
+    let io_for_worker = stuck_io.clone();
+    let runtime = BetelgeuseRuntime::with_config_and_io_loop_factory(
+        TestShard,
+        TestMailboxFactory,
+        BetelgeuseRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+        },
+        move || io_for_worker.loop_handle(),
+    );
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let worker = runtime
+        .register_with_capacity::<TcpAcceptWorker, _>(
+            TcpAcceptWorker {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+                published: Arc::clone(&published),
+                listener: None,
+                observed,
+            },
+            8,
+        )
+        .expect("Betelgeuse register accepts");
+
+    runtime
+        .try_send(worker, TcpAcceptMsg::Bind)
+        .expect("bind handoff accepted");
+    wait_until(Duration::from_secs(2), "stuck bind published", || {
+        published.lock().expect("published addr mutex").is_some()
+    });
+    runtime
+        .try_send(worker, TcpAcceptMsg::StartAccept)
+        .expect("accept handoff accepted");
+    wait_until(Duration::from_secs(2), "stuck accept pending", || {
+        runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+
+    assert_eq!(
+        runtime.shutdown(),
+        Err(BetelgeuseControlError::DriverShutdownFailed)
+    );
 }
 
 #[derive(Debug, Clone, Copy)]

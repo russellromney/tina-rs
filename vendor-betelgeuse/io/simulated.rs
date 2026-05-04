@@ -498,6 +498,21 @@ impl IOLoop for SimulatedIO {
         state.pending = next_pending;
         Ok(progressed)
     }
+
+    fn pending_completion_count(&self) -> usize {
+        self.state.lock().expect("simulated io mutex").pending.len()
+    }
+
+    fn cancel_pending_completions(&self) -> io::Result<()> {
+        let mut state = self.state.lock().expect("simulated io mutex");
+        let pending = std::mem::take(&mut state.pending);
+        drop(state);
+
+        for pending in pending {
+            pending.complete_cancelled();
+        }
+        Ok(())
+    }
 }
 
 impl SimulatedPendingOp {
@@ -600,6 +615,21 @@ impl SimulatedPendingOp {
                 (&mut *(completion as *mut SendCompletion)).complete(result);
             },
             _ => unreachable!("pending op and ready result mismatch"),
+        }
+    }
+
+    fn complete_cancelled(self) {
+        let error = || io::Error::new(io::ErrorKind::Interrupted, "simulated operation cancelled");
+        match self {
+            Self::Accept { completion, .. } => unsafe {
+                (&mut *(completion as *mut AcceptCompletion)).complete(Err(error()));
+            },
+            Self::Recv { completion, .. } => unsafe {
+                (&mut *(completion as *mut RecvCompletion)).complete(Err(error()));
+            },
+            Self::Send { completion, .. } => unsafe {
+                (&mut *(completion as *mut SendCompletion)).complete(Err(error()));
+            },
         }
     }
 }

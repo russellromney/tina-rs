@@ -1,4 +1,4 @@
-use super::driver::{DriverCompletion, RuntimeDriver};
+use super::driver::{DriverCompletion, DriverShutdownError, RuntimeDriver};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -1111,6 +1111,7 @@ struct FakeDriver {
     submitted: Rc<RefCell<Vec<CallInput>>>,
     pending: VecDeque<DriverCompletion>,
     cancelled: Rc<Cell<bool>>,
+    shutdown_error: Option<DriverShutdownError>,
 }
 
 impl FakeDriver {
@@ -1123,6 +1124,19 @@ impl FakeDriver {
             submitted,
             pending: VecDeque::new(),
             cancelled,
+            shutdown_error: None,
+        }
+    }
+
+    fn with_shutdown_error(
+        submitted: Rc<RefCell<Vec<CallInput>>>,
+        error: DriverShutdownError,
+    ) -> Self {
+        Self {
+            submitted,
+            pending: VecDeque::new(),
+            cancelled: Rc::new(Cell::new(false)),
+            shutdown_error: Some(error),
         }
     }
 }
@@ -1150,9 +1164,13 @@ impl RuntimeDriver for FakeDriver {
         !self.pending.is_empty()
     }
 
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
         self.cancelled.set(true);
+        if let Some(error) = self.shutdown_error {
+            return Err(error);
+        }
         self.pending.clear();
+        Ok(())
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
@@ -2230,7 +2248,9 @@ fn runtime_shutdown_cancels_non_betelgeuse_driver_pending_call() {
     assert_eq!(runtime.step(), 1);
     assert!(runtime.has_in_flight_calls());
 
-    runtime.cancel_in_flight_calls_for_shutdown();
+    runtime
+        .cancel_in_flight_calls_for_shutdown()
+        .expect("fake driver shutdown succeeds");
 
     assert!(cancelled.get(), "runtime must cancel pending driver ops");
     assert!(!runtime.has_in_flight_calls());
@@ -2242,6 +2262,26 @@ fn runtime_shutdown_cancels_non_betelgeuse_driver_pending_call() {
             ..
         }
     )));
+}
+
+#[test]
+fn runtime_shutdown_surfaces_driver_completion_release_failure() {
+    let submitted = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(ManualClock::new()),
+        IdSource::new(),
+        Box::new(FakeDriver::with_shutdown_error(
+            submitted,
+            DriverShutdownError::BackendStillOwnsCompletions,
+        )),
+    );
+
+    assert_eq!(
+        runtime.cancel_in_flight_calls_for_shutdown(),
+        Err(DriverShutdownError::BackendStillOwnsCompletions)
+    );
 }
 
 #[test]

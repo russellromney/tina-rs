@@ -92,3 +92,68 @@ Useful tightenings also landed:
 
 Implementation should start with the ownership audit, then the smallest adapter
 design that can remove the leak fallback without introducing shutdown hangs.
+
+## Implementation Review 1
+
+Verdict: first Surveyor implementation slice matches the plan shape.
+
+What changed:
+
+- Betelgeuse now exposes a tiny backend-generic lifecycle hook on `IOLoop`:
+  `pending_completion_count()` and `cancel_pending_completions()`.
+- `IOLoopHandle` forwards the hook, so Tina calls the real backend rather than
+  a default no-op.
+- Simulated I/O cancels pending accept/recv/send by completing the caller-owned
+  slot with `Interrupted` and removing the backend raw pointer.
+- Darwin/kqueue tracks watched completion pointers separately from queued
+  pointers, deletes kqueue watches during shutdown cancellation, and completes
+  canceled slots before Tina drops them.
+- Linux/io_uring now tracks submitted completion pointers instead of only an
+  inflight count, completes queued slots with `Interrupted`, and submits
+  `AsyncCancel` requests for submitted slots.
+- Tina's `RuntimeDriver::cancel_pending()` now returns
+  `Result<(), DriverShutdownError>` instead of silently leaking or pretending
+  shutdown succeeded.
+- `BetelgeuseRuntime::shutdown()` and `BetelgeuseMultiShardRuntime::shutdown()`
+  convert driver release failure into
+  `BetelgeuseControlError::DriverShutdownFailed`.
+- Ranger's `std::mem::forget` shutdown escape hatch is gone from Tina driver
+  code.
+
+Direct proofs added or preserved:
+
+- `runtime_shutdown_surfaces_driver_completion_release_failure` proves the
+  explicit-step runtime sees `DriverShutdownError::BackendStillOwnsCompletions`
+  from a failing driver.
+- `betelgeuse_runtime_shutdown_reports_driver_release_failure` proves the live
+  handle returns `BetelgeuseControlError::DriverShutdownFailed` instead of
+  hanging or reporting clean shutdown when an instrumented backend refuses to
+  release completion ownership.
+- Existing live and simulated shutdown tests still prove pending TCP accept
+  cancellation rejects requester completion and does not deliver late work.
+- Existing post-shutdown simulated external-step pressure still passes, now
+  because the simulated backend releases pointers rather than because Tina
+  intentionally leaked slots.
+
+Verification run:
+
+- `cargo +nightly test -p tina-runtime --tests` passed.
+- `cargo +nightly test -p betelgeuse` passed on this Darwin host.
+
+Honesty notes:
+
+- Darwin native behavior was exercised by the existing native TCP tests on this
+  host.
+- Linux/io_uring was updated in the same generic shape, but not executed on this
+  host. A Linux CI run should be treated as required before calling the Linux
+  native hook fully proven.
+- The hook is deliberately Betelgeuse-level, not Tina-specific: it reports and
+  releases backend-owned completion pointers, and Tina decides how to turn that
+  into runtime shutdown semantics.
+
+CI follow-up added:
+
+- `.github/workflows/verify.yml` runs `make verify` on `ubuntu-latest` and
+  `macos-latest` for pull requests plus pushes to `main` and `codex/**`.
+- This turns the Surveyor native-backend proof into a two-platform check:
+  macOS exercises Darwin/kqueue and Linux exercises io_uring.

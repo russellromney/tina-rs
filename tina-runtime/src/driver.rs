@@ -13,6 +13,10 @@
 //! - resource ids ([`ListenerId`], [`StreamId`]) are runtime-assigned
 //!   monotonic counters, not OS file descriptors. Isolate code never sees
 //!   raw fds or `Box<dyn IOSocket>` values.
+//! - shutdown cancellation keeps completion slots alive until the backend
+//!   reports that it no longer owns their raw pointers. A driver that cannot
+//!   prove release returns [`DriverShutdownError`] instead of pretending
+//!   shutdown was clean.
 //!
 use std::alloc::Global;
 use std::net::SocketAddr;
@@ -52,8 +56,12 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// Returns whether substrate completions are still pending.
     fn has_pending(&self) -> bool;
 
-    /// Drops pending substrate operations during runtime shutdown.
-    fn cancel_pending(&mut self);
+    /// Cancels pending substrate operations during runtime shutdown.
+    ///
+    /// After this returns `Ok(())`, the driver may be dropped without leaving
+    /// backend-owned pointers to driver-owned completion storage. `Err` means
+    /// shutdown reached a typed lifecycle failure.
+    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError>;
 
     /// Cancels one runtime-owned call by id.
     ///
@@ -66,6 +74,14 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
     fn io_pending_count(&self) -> usize {
         0
     }
+}
+
+/// Driver-level shutdown failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverShutdownError {
+    /// The backend still reports ownership of completion slots after Tina's
+    /// bounded shutdown drain.
+    BackendStillOwnsCompletions,
 }
 
 /// Betelgeuse-backed runtime driver.
@@ -193,9 +209,9 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.tcp.has_pending() || !self.timers.is_empty()
     }
 
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
         self.timers.clear();
-        self.tcp.cancel_pending();
+        self.tcp.cancel_pending()
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
@@ -396,20 +412,19 @@ impl BetelgeuseTcp {
     /// Tina emits requester-facing shutdown/cancel trace events from
     /// `Runtime`; TCP state only owns the substrate completion slots and
     /// resource handles.
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
         for op in &mut self.pending {
             op.cancelled = true;
         }
+        self.io_loop
+            .cancel_pending_completions()
+            .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions)?;
         self.close_all_resources();
         self.drain_cancelled_pending_for_shutdown();
-        if !self.pending.is_empty() {
-            // Betelgeuse backends own raw pointers to caller-owned completion
-            // slots while operations are pending. If a backend cannot be drained
-            // during shutdown, leaking the slots is preferable to dropping them
-            // while the backend may still complete into their addresses.
-            let leaked = std::mem::take(&mut self.pending);
-            std::mem::forget(leaked);
+        if !self.pending.is_empty() || self.io_loop.pending_completion_count() != 0 {
+            return Err(DriverShutdownError::BackendStillOwnsCompletions);
         }
+        Ok(())
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
