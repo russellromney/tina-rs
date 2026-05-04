@@ -6,6 +6,7 @@ members = [
     "tina-runtime",
     "tina-sim",
     "tina-supervisor",
+    "tina-tokio-bridge",
 ]
 resolver = "2"
 

@@ -14,7 +14,7 @@ use std::time::Duration;
 use betelgeuse::io::simulated::{SimulatedIO, SimulatedPeer};
 use tina::{ChildDefinition, Mailbox, RestartableChildDefinition, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseRuntime, CallInput, CallOutcome, CallOutput, ListenerId, MailboxFactory,
+    BetelgeuseBackedRuntime, CallInput, CallOutcome, CallOutput, ListenerId, MailboxFactory,
     MultiShardRuntime, Runtime, RuntimeCall, StreamId, call,
 };
 
@@ -794,7 +794,7 @@ fn betelgeuse_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
     let _guard = ALLOCATION_TEST_GUARD
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let runtime = BetelgeuseRuntime::new(AllocationShard(11), TestMailboxFactory);
+    let runtime = BetelgeuseBackedRuntime::new(AllocationShard(11), TestMailboxFactory);
     let sink = runtime
         .register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 8)
         .expect("sink register accepts");

@@ -9,6 +9,7 @@ use tina::{
 };
 use tina_runtime::{
     CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
+    TraceRetention,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,4 +323,41 @@ fn identical_runs_produce_identical_event_sequences_and_causal_links() {
     }
 
     assert_eq!(run_once(), run_once());
+}
+
+#[test]
+fn bounded_trace_retention_keeps_only_recent_events_and_counts_drops() {
+    let mut harness = harness();
+    harness
+        .runtime
+        .set_trace_retention(TraceRetention::Bounded(3));
+
+    harness.send(SessionMsg::Record(1));
+    harness.send(SessionMsg::Record(2));
+
+    assert_eq!(harness.runtime.step(), 1);
+    assert_eq!(harness.runtime.trace().len(), 3);
+    assert_eq!(harness.runtime.trace_dropped(), 1);
+
+    assert_eq!(harness.runtime.step(), 1);
+    assert_eq!(harness.runtime.trace().len(), 3);
+    assert_eq!(harness.runtime.trace_dropped(), 5);
+    assert_eq!(
+        harness.runtime.trace().last().map(|event| event.kind()),
+        Some(RuntimeEventKind::EffectObserved {
+            effect: EffectKind::Noop,
+        })
+    );
+}
+
+#[test]
+fn off_trace_retention_preserves_event_ids_without_retaining_events() {
+    let mut harness = harness();
+    harness.runtime.set_trace_retention(TraceRetention::Off);
+
+    harness.send(SessionMsg::Record(9));
+
+    assert_eq!(harness.runtime.step(), 1);
+    assert!(harness.runtime.trace().is_empty());
+    assert_eq!(harness.runtime.trace_dropped(), 4);
 }

@@ -41,8 +41,8 @@ At Dries start:
 - Joop left canonical application-surface tests but no broad public app builder
   or public test harness.
 - Ruud left a narrow cost model plus deferred medium rocks.
-- Live Betelgeuse runtime exists, but the stable public substrate story and CI
-  story are not release-ready.
+- Live Betelgeuse-backed Tina runtime exists, but the stable public substrate
+  story and CI story are not release-ready.
 - No Tokio/Tower/Axum bridge exists.
 - Gemini is intentionally blocked until this phase says the core is ready to
   document instead of still being completed.
@@ -111,6 +111,9 @@ Decide local thread-per-core polish:
 
 - named shard topology/config;
 - worker lifecycle visibility;
+- backend-honest live runner names: use `BetelgeuseBackedRuntime` /
+  `BetelgeuseBackedMultiShardRuntime`, so Tina does not imply Betelgeuse itself
+  is an actor/runtime framework;
 - optional thread/core placement policy if it is small and portable enough;
 - final live cross-shard isolate-call decision: implement reply transport if
   required for local framework completeness, otherwise keep a sharper typed
@@ -222,3 +225,14 @@ Pause for human review if:
 - CI, benchmarks, memory profile, and optional MPSC decision are real enough to
   support or narrow the public claim.
 - Gemini can document the framework instead of discovering missing core work.
+
+## Implementation Notes
+
+- Live runner names are `BetelgeuseBackedRuntime` and
+  `BetelgeuseBackedMultiShardRuntime`.
+- Trace retention is implemented as full, bounded recent retention, or off.
+- The first bridge lives in `tina-tokio-bridge`; it preserves bounded Tina
+  ingress and surfaces `Full`, `Closed`, and `Timeout` without making isolate
+  handlers async.
+- The bridge has Axum/Tower proof, bounded ingress-full proof, target
+  mailbox-full proof, explicit timeout proof, and a runnable llama example.

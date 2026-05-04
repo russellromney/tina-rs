@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseRuntime, CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
+    BetelgeuseBackedRuntime, CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
     RuntimeEventKind, sleep_then,
 };
 use tina_sim::{Simulator, SimulatorConfig};
@@ -214,7 +214,7 @@ fn run_simulator() -> (Vec<RetryObservation>, Vec<RuntimeEvent>) {
 
 fn run_betelgeuse() -> (Vec<RetryObservation>, Vec<RuntimeEvent>) {
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseRuntime::new(TestShard, TestMailboxFactory);
+    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
     let worker = runtime
         .register_with_capacity::<RetryWorker, RetryMsg>(
             RetryWorker {

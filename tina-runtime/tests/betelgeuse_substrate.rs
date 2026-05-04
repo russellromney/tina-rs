@@ -17,10 +17,10 @@ use betelgeuse::{
 };
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseControlError, BetelgeuseMultiShardRuntime, BetelgeuseRuntime,
-    BetelgeuseRuntimeConfig, CallCompletionRejectedReason, CallError, CallInput, CallKind,
+    BetelgeuseBackedControlError, BetelgeuseBackedMultiShardRuntime, BetelgeuseBackedRuntime,
+    BetelgeuseBackedRuntimeConfig, CallCompletionRejectedReason, CallError, CallInput, CallKind,
     CallOutcome, CallOutput, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, SendRejectedReason, call, sleep,
+    RuntimeEventKind, SendRejectedReason, TraceRetention, call, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -170,12 +170,13 @@ impl Isolate for RetryWorker {
 #[test]
 fn betelgeuse_runtime_timer_retry_runs_without_manual_stepping() {
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseRuntime::with_config(
+    let runtime = BetelgeuseBackedRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseRuntimeConfig {
+        BetelgeuseBackedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
+            ..Default::default()
         },
     );
     let worker = runtime
@@ -217,6 +218,46 @@ fn betelgeuse_runtime_timer_retry_runs_without_manual_stepping() {
     );
 }
 
+#[test]
+fn betelgeuse_backed_runtime_honors_bounded_trace_retention() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let runtime = BetelgeuseBackedRuntime::with_config(
+        TestShard,
+        TestMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            trace_retention: TraceRetention::Bounded(5),
+            idle_wait: Duration::from_millis(1),
+        },
+    );
+    let worker = runtime
+        .register_with_capacity::<RetryWorker, _>(
+            RetryWorker {
+                backoff: Duration::from_millis(1),
+                attempts: 0,
+                observations: Arc::clone(&observations),
+            },
+            8,
+        )
+        .expect("worker register accepts");
+
+    runtime
+        .try_send(worker, RetryMsg::TryWork)
+        .expect("worker ingress accepts");
+    wait_until(Duration::from_secs(1), "retry completed", || {
+        observations
+            .lock()
+            .expect("observations mutex")
+            .contains(&RetryObservation::Succeeded(2))
+    });
+
+    let trace = runtime.trace().expect("trace snapshot");
+    assert_eq!(trace.len(), 5);
+    assert!(trace.first().expect("retained first event").id().get() > 1);
+    assert!(trace.windows(2).all(|pair| pair[0].id() < pair[1].id()));
+    let _ = runtime.shutdown().expect("runtime shutdown");
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LongTimerMsg {
     Start,
@@ -246,12 +287,13 @@ impl Isolate for LongTimer {
 
 #[test]
 fn betelgeuse_runtime_shutdown_rejects_outstanding_timer_completion() {
-    let runtime = BetelgeuseRuntime::with_config(
+    let runtime = BetelgeuseBackedRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseRuntimeConfig {
+        BetelgeuseBackedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
+            ..Default::default()
         },
     );
     let timer = runtime
@@ -359,12 +401,13 @@ fn betelgeuse_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let runtime = {
         let simulated_io = simulated_io.clone();
-        BetelgeuseRuntime::with_config_and_io_loop_factory(
+        BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
             TestShard,
             TestMailboxFactory,
-            BetelgeuseRuntimeConfig {
+            BetelgeuseBackedRuntimeConfig {
                 command_capacity: 8,
                 idle_wait: Duration::from_millis(1),
+                ..Default::default()
             },
             move || simulated_io.loop_handle(Global),
         )
@@ -534,12 +577,13 @@ impl IOLoop for StuckReleaseIo {
 fn betelgeuse_runtime_shutdown_reports_driver_release_failure() {
     let stuck_io = StuckReleaseIo::default();
     let io_for_worker = stuck_io.clone();
-    let runtime = BetelgeuseRuntime::with_config_and_io_loop_factory(
+    let runtime = BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseRuntimeConfig {
+        BetelgeuseBackedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
+            ..Default::default()
         },
         move || io_for_worker.loop_handle(),
     );
@@ -574,7 +618,7 @@ fn betelgeuse_runtime_shutdown_reports_driver_release_failure() {
 
     assert_eq!(
         runtime.shutdown(),
-        Err(BetelgeuseControlError::DriverShutdownFailed)
+        Err(BetelgeuseBackedControlError::DriverShutdownFailed)
     );
 }
 
@@ -589,13 +633,16 @@ impl MailboxFactory for PanickingMailboxFactory {
 
 #[test]
 fn betelgeuse_runtime_worker_panic_returns_typed_handle_error() {
-    let runtime = BetelgeuseRuntime::new(TestShard, PanickingMailboxFactory);
+    let runtime = BetelgeuseBackedRuntime::new(TestShard, PanickingMailboxFactory);
 
     assert_eq!(
         runtime.register_with_capacity::<LongTimer, _>(LongTimer, 8),
-        Err(BetelgeuseControlError::WorkerStopped)
+        Err(BetelgeuseBackedControlError::WorkerStopped)
     );
-    assert_eq!(runtime.trace(), Err(BetelgeuseControlError::WorkerStopped));
+    assert_eq!(
+        runtime.trace(),
+        Err(BetelgeuseBackedControlError::WorkerStopped)
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -652,7 +699,7 @@ impl Isolate for Sink {
 
 #[test]
 fn betelgeuse_runtime_local_mailbox_full_is_visible_in_trace() {
-    let runtime = BetelgeuseRuntime::new(TestShard, TestMailboxFactory);
+    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
     let sink = runtime
         .register_with_capacity::<Sink, _>(Sink, 1)
         .expect("sink register accepts");
@@ -844,12 +891,13 @@ fn has_send_accepted_between(trace: &[RuntimeEvent], from: u32, to: u32) -> bool
 
 #[test]
 fn betelgeuse_multishard_dispatcher_round_trips_between_worker_threads() {
-    let runtime = BetelgeuseMultiShardRuntime::with_config(
+    let runtime = BetelgeuseBackedMultiShardRuntime::with_config(
         [WorkShard(1), WorkShard(2)],
         TestMailboxFactory,
-        BetelgeuseRuntimeConfig {
+        BetelgeuseBackedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
+            ..Default::default()
         },
     );
     let completed = Arc::new(Mutex::new(Vec::new()));
@@ -893,7 +941,7 @@ fn betelgeuse_multishard_dispatcher_round_trips_between_worker_threads() {
 #[test]
 fn betelgeuse_multishard_bad_remote_does_not_poison_good_remote_work() {
     let runtime =
-        BetelgeuseMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
+        BetelgeuseBackedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
     let completed = Arc::new(Mutex::new(Vec::new()));
     let worker = runtime
         .register_with_capacity_on::<Worker, _>(ShardId::new(2), Worker, 8)
@@ -1028,7 +1076,7 @@ impl Isolate for CallClient {
 #[test]
 fn betelgeuse_multishard_isolate_call_rejects_cross_shard_with_typed_outcome() {
     let runtime =
-        BetelgeuseMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
+        BetelgeuseBackedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
     let target_hits = Arc::new(Mutex::new(0));
     let observations = Arc::new(Mutex::new(Vec::new()));
     let target = runtime
@@ -1154,12 +1202,13 @@ impl Isolate for RemoteBurst {
 
 #[test]
 fn betelgeuse_multishard_remote_queue_full_is_visible_at_source() {
-    let runtime = BetelgeuseMultiShardRuntime::with_config(
+    let runtime = BetelgeuseBackedMultiShardRuntime::with_config(
         [WorkShard(1), WorkShard(2)],
         TestMailboxFactory,
-        BetelgeuseRuntimeConfig {
+        BetelgeuseBackedRuntimeConfig {
             command_capacity: 1,
             idle_wait: Duration::from_millis(1),
+            ..Default::default()
         },
     );
     let (parked_tx, parked_rx) = mpsc::sync_channel(0);

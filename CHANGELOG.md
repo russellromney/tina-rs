@@ -4,6 +4,23 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Dries van Agt
+
+- Added `tina-tokio-bridge`, a narrow Tokio/Tower bridge that sends bounded
+  `BridgeRequest` messages into a Betelgeuse-backed Tina runtime and waits for
+  explicit typed responses with timeout.
+- Added Axum integration proof plus bridge overload tests for worker-ingress
+  `Full` and target-mailbox `Full`, so the bridge does not degrade bounded
+  pressure into silent timeout.
+- Added `TraceRetention::{Full, Bounded, Off}` to `tina-runtime`, wired it into
+  `BetelgeuseBackedRuntimeConfig`, and proved bounded live trace retention.
+- Renamed the live runner surface to backend-honest
+  `BetelgeuseBackedRuntime` / `BetelgeuseBackedMultiShardRuntime`.
+- Added a runnable `llama_bridge` example showing Tokio caller code crossing
+  into Tina without async handlers or hidden unbounded queues.
+- Rewrote the README into a shorter Tina-as-concurrency-primitive story with
+  explicit inspiration links and current non-claims.
+
 ### Phase Sputnik
 
 - Added the `tina` trait crate as the shared vocabulary layer.
@@ -390,8 +407,8 @@ This file records completed work.
 
 ### Phase Betelgeuse
 
-- Renamed the live substrate surface to backend-honest
-  `BetelgeuseRuntime` / `BetelgeuseMultiShardRuntime`.
+- Added the first live substrate surface as `BetelgeuseRuntime` /
+  `BetelgeuseMultiShardRuntime`.
 - Kept explicit-step runtime and `tina-sim` as the semantic oracle while
   proving selected workloads on live Betelgeuse-backed runners.
 - Added bounded ingress proof, live time/TCP completion semantics, live
