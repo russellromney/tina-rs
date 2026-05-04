@@ -25,16 +25,19 @@ This repo is a Cargo workspace. Today it has five crates:
 - **`tina`** — trait crate. `Isolate`, `Mailbox`, `Address`, `ChildDefinition`, `Outbound`, and the common helpers in `tina::prelude::*`.
 - **`tina-mailbox-spsc`** — bounded single-producer/single-consumer mailbox implementation.
 - **`tina-supervisor`** — supervisor policy/config types.
-- **`tina-runtime`** — explicit-step runtime with trace events, single-shard and multi-shard runners, bounded send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, supervised panic restart, and the first worker-owned threaded runtime substrate.
+- **`tina-runtime`** — explicit-step runtime with trace events, single-shard and multi-shard runners, bounded send/spawn dispatch, runtime-owned calls, stop-and-abandon behavior, panic capture, parent-child lineage, supervised panic restart, and the first worker-owned Betelgeuse runtime substrate.
 - **`tina-sim`** — deterministic simulator with virtual time, replay records, seeded delays/reordering, checker failures, scripted TCP simulation, and the same single-shard / multi-shard model.
 
 The first worker-per-shard runtime substrate exists for selected workloads.
+Betelgeuse also has a narrow simulated TCP backend now, so runtime-owned Tina
+TCP effects can be tested through a seeded step-driven substrate without OS
+sockets.
 The Tokio bridge and production hardening still have their own place on the
 roadmap. See [ROADMAP.md](ROADMAP.md).
 
 > tina-rs is **experimental**. The core types, bounded SPSC mailbox,
 > supervisor config, explicit-step runtime, multi-shard runner, and
-> deterministic simulator are here. A first threaded runtime substrate is here
+> deterministic simulator are here. A first Betelgeuse runtime substrate is here
 > too. Production hardening and the public release contract are still in
 > flight. The API will change.
 
@@ -52,7 +55,7 @@ The default async tools in Rust make it easy to write a server that works fine o
 - **One state machine per unit.** Each tenant, connection, worker, or protocol role is a typed struct (an `Isolate`) with one message type and one queue.
 - **Handlers are synchronous and return descriptions of work.** `fn handle(msg) -> Effect`. The handler never does I/O; it returns a value like "send this message" or "spawn this child" or "stop me." The runtime executes the description.
 - **Queues are bounded with explicit `Full` and `Closed` errors.** Backpressure is something the application sees and handles, not a leak that builds quietly.
-- **Shard-owned execution.** Each shard owns its isolates, timers, runtime resources, and cross-shard queues. The explicit-step runtime is the semantic oracle, and the first threaded substrate runs one worker-owned runtime per shard.
+- **Shard-owned execution.** Each shard owns its isolates, timers, runtime resources, and cross-shard queues. The explicit-step runtime is the semantic oracle, and the first Betelgeuse substrate runs one worker-owned runtime per shard.
 - **The whole runtime is replayable.** Because handlers are descriptions and the runtime is the only thing that touches I/O or time, a test harness can drive the system from a seed and reproduce any failure.
 
 None of this is new: Erlang, Akka, and [Seastar](https://seastar.io/) all do versions of it. `tina-rs` is these patterns expressed as Rust traits and a small set of impl crates.
@@ -68,7 +71,7 @@ If you want to contribute or find bugs, please open a PR or issue.
 The important shape is simple: one struct owns one unit of state, one message
 arrives, and the handler returns the next thing to do.
 
-Use the prelude:
+Use the prelude and the isolate attribute:
 
 ```rust
 use tina::prelude::*;
@@ -89,12 +92,22 @@ enum Message {
     SnapshotRequested,
 }
 
-match msg {
-    Message::UserConnected(user_id) => {
-        self.users.insert(user_id);
-        send(self.audit, AuditEvent::UserJoined(user_id))
+#[tina::isolate(
+    message = Message,
+    reply = Vec<UserId>,
+    send = Outbound<AuditEvent>,
+    shard = AppShard
+)]
+impl Session {
+    fn handle(&mut self, msg: Message, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            Message::UserConnected(user_id) => {
+                self.users.insert(user_id);
+                send(self.audit, AuditEvent::UserJoined(user_id))
+            }
+            Message::SnapshotRequested => reply(self.users.clone()),
+        }
     }
-    Message::SnapshotRequested => reply(self.users.clone()),
 }
 ```
 
@@ -147,7 +160,7 @@ The rules fit on one page:
 
 | Idea | What it means | Why |
 |------|---------------|-----|
-| **Shard-owned execution** | A shard owns its isolates, timers, runtime resources, and cross-shard queues. The explicit-step runtime is the oracle; the first threaded substrate runs one worker-owned runtime per shard. | Work has an owner. The model does not depend on hidden task migration. |
+| **Shard-owned execution** | A shard owns its isolates, timers, runtime resources, and cross-shard queues. The explicit-step runtime is the oracle; the first Betelgeuse substrate runs one worker-owned runtime per shard. | Work has an owner. The model does not depend on hidden task migration. |
 | **Isolate-per-entity** | Tenants, connections, sessions, workers, or protocol roles each get a typed state machine. No `Arc<Mutex<…>>` spaghetti. | Local state is local. No lock contention, no false sharing. |
 | **Effect-returning handlers** | Handlers are synchronous: `fn handle(&mut self, msg, ctx) -> Effect`. The runtime executes the effect. | Pure-ish handlers are deterministic. Determinism enables simulation. |
 | **Bounded queues** | Mailboxes and cross-shard queues have capacity. `Full` and `Closed` are explicit outcomes. | Unbounded queues turn spikes into OOMs. |
@@ -160,18 +173,18 @@ None of these ideas are new — Erlang, Akka, [Seastar](https://seastar.io/), an
 
 What works today: the trait crate, the bounded SPSC mailbox crate, supervisor
 config, the explicit-step runtime, multi-shard message routing, the
-deterministic simulator, and the first threaded runtime substrate. You can
+deterministic simulator, and the first Betelgeuse runtime substrate. You can
 write isolates against the preferred public API, exercise real mailbox
 behavior, run handlers through `tina-runtime`, use runtime-owned TCP and
 runtime-owned time, supervise and restart children, route messages across
 shards, replay timer-driven, TCP-driven, supervised, and multi-shard behavior
 through `tina-sim`, and run selected workloads on worker-owned runtime threads.
 
-The proof regime now includes composed DST-style workloads plus live substrate
+The proof regime now includes composed DST-style workloads plus substrate
 tests: TCP echo / request-response, timer retry, local backpressure, live
-cross-shard request/reply, remote queue `Full`, and bad remote addresses that
-do not poison later good work. Gemini comes next: decide and document the
-release story around the framework that now exists.
+cross-shard request/reply, remote queue `Full`, bad remote addresses that do
+not poison later good work, and Betelgeuse simulated TCP with deterministic
+delay and partial-write pressure.
 
 See [ROADMAP.md](ROADMAP.md) for what each step delivers and how it gets proven.
 

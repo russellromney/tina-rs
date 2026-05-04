@@ -265,7 +265,7 @@ Pause and split before implementation continues if:
    - explicit list of allowed allocations and non-claims
 5. Add narrow checker/replay pressure around the sealed rules.
 6. Add one adversarial bug proof targeted at a Kepler-sealed rule.
-7. Update `CHANGELOG.md` and any closeout artifact with concrete test names and
+7. Update `CHANGELOG.md` and `review.md` with concrete test names and
    the final allocation/buffering claim.
 
 ## Proof Plan
@@ -347,7 +347,7 @@ Kepler is done when all of the following are true:
   level, not just at the mailbox level
 - replay/checker pressure covers at least one Kepler-sealed rule rather than
   only the happy path
-- any closeout artifact lists the concrete tests that prove each rule
+- `review.md` lists the concrete tests that prove each rule
 - `CHANGELOG.md` records the completed work without rewriting old names from
   earlier phases
 - `make verify` passes

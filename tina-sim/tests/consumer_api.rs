@@ -8,8 +8,8 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
-    EffectKind, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome, StreamId,
-    call, send_observed,
+    CallReplyRejectedReason, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendOutcome,
+    StreamId, call, send_observed,
 };
 use tina_sim::{
     ObservedPeerOutput, ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, Simulator,
@@ -447,8 +447,12 @@ impl Isolate for ReplyWorker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CallerMsg {
-    Start(Address<WorkerRequest>, WorkerRequest, std::time::Duration),
-    StartAndStop(Address<WorkerRequest>),
+    Start(
+        Address<WorkerRequest, WorkerReply>,
+        WorkerRequest,
+        std::time::Duration,
+    ),
+    StartAndStop(Address<WorkerRequest, WorkerReply>),
     Filler,
     Returned(CallOutcome<WorkerReply>),
 }
@@ -469,11 +473,10 @@ impl Isolate for CallerWorker {
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             CallerMsg::Start(target, request, timeout) => {
-                call::<WorkerRequest, WorkerReply>(target, request, timeout)
-                    .reply(CallerMsg::Returned)
+                call(target, request, timeout).reply(CallerMsg::Returned)
             }
             CallerMsg::StartAndStop(target) => Effect::Batch(vec![
-                call::<WorkerRequest, WorkerReply>(
+                call(
                     target,
                     WorkerRequest::ReplyNow,
                     std::time::Duration::from_millis(5),
@@ -494,7 +497,7 @@ impl Isolate for CallerWorker {
 }
 
 #[test]
-fn downstream_consumer_replays_late_isolate_call_reply_as_plain_reply_after_timeout() {
+fn downstream_consumer_replays_late_isolate_call_reply_rejected_after_timeout() {
     let (outcomes, first) =
         run_isolate_call_scenario(8, false, WorkerRequest::ReplyNow, std::time::Duration::ZERO);
     let (replayed_outcomes, replayed) =
@@ -518,11 +521,12 @@ fn downstream_consumer_replays_late_isolate_call_reply_as_plain_reply_after_time
     assert!(
         first.event_record().iter().any(|event| matches!(
             event.kind(),
-            RuntimeEventKind::EffectObserved {
-                effect: EffectKind::Reply
+            RuntimeEventKind::CallReplyRejected {
+                reason: CallReplyRejectedReason::NoPendingCall,
+                ..
             }
         )),
-        "late reply after timeout should fall back to ordinary reply observation"
+        "late reply after timeout should be explicit in the trace"
     );
 }
 

@@ -1,0 +1,262 @@
+use std::collections::VecDeque;
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use tina::{Mailbox, TrySendError, prelude::*};
+use tina_runtime::{
+    BetelgeuseRuntime, CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, sleep_then,
+};
+use tina_sim::{Simulator, SimulatorConfig};
+
+#[derive(Debug, Clone, Copy)]
+struct TestShard;
+
+impl Shard for TestShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(91)
+    }
+}
+
+struct TestMailbox<T> {
+    capacity: usize,
+    queue: Mutex<VecDeque<T>>,
+    closed: Mutex<bool>,
+}
+
+impl<T> TestMailbox<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            queue: Mutex::new(VecDeque::new()),
+            closed: Mutex::new(false),
+        }
+    }
+}
+
+impl<T> Mailbox<T> for TestMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        if *self.closed.lock().expect("closed mutex") {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.lock().expect("queue mutex");
+        if queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        queue.push_back(message);
+        Ok(())
+    }
+
+    fn recv(&self) -> Option<T> {
+        self.queue.lock().expect("queue mutex").pop_front()
+    }
+
+    fn close(&self) {
+        *self.closed.lock().expect("closed mutex") = true;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TestMailboxFactory;
+
+impl MailboxFactory for TestMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(TestMailbox::new(capacity))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryMsg {
+    TryWork,
+    RetryNow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryObservation {
+    Attempted(usize),
+    Failed(usize),
+    BackoffElapsed,
+    Succeeded(usize),
+}
+
+#[derive(Debug)]
+struct RetryWorker {
+    attempts: usize,
+    observations: Arc<Mutex<Vec<RetryObservation>>>,
+}
+
+impl Isolate for RetryWorker {
+    tina::isolate_types! {
+        message: RetryMsg,
+        reply: (),
+        send: Outbound<RetryMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<RetryMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            RetryMsg::TryWork => {
+                self.attempts += 1;
+                self.observations
+                    .lock()
+                    .expect("observations mutex")
+                    .push(RetryObservation::Attempted(self.attempts));
+                if self.attempts == 1 {
+                    self.observations
+                        .lock()
+                        .expect("observations mutex")
+                        .push(RetryObservation::Failed(self.attempts));
+                    sleep_then(Duration::ZERO, RetryMsg::RetryNow)
+                } else {
+                    self.observations
+                        .lock()
+                        .expect("observations mutex")
+                        .push(RetryObservation::Succeeded(self.attempts));
+                    noop()
+                }
+            }
+            RetryMsg::RetryNow => {
+                self.observations
+                    .lock()
+                    .expect("observations mutex")
+                    .push(RetryObservation::BackoffElapsed);
+                ctx.send_self(RetryMsg::TryWork)
+            }
+        }
+    }
+}
+
+fn expected_observations() -> Vec<RetryObservation> {
+    vec![
+        RetryObservation::Attempted(1),
+        RetryObservation::Failed(1),
+        RetryObservation::BackoffElapsed,
+        RetryObservation::Attempted(2),
+        RetryObservation::Succeeded(2),
+    ]
+}
+
+fn count_sleep_completed(trace: &[RuntimeEvent]) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn run_oracle() -> (Vec<RetryObservation>, Vec<RuntimeEvent>) {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let worker = runtime.register_with_capacity::<RetryWorker, RetryMsg>(
+        RetryWorker {
+            attempts: 0,
+            observations: Arc::clone(&observations),
+        },
+        8,
+    );
+    runtime.try_send(worker, RetryMsg::TryWork).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while observations.lock().expect("observations mutex").as_slice()
+        != expected_observations().as_slice()
+    {
+        if Instant::now() > deadline {
+            panic!(
+                "oracle retry workload did not finish: {:#?}",
+                runtime.trace()
+            );
+        }
+        runtime.step();
+        thread::yield_now();
+    }
+
+    (
+        observations.lock().expect("observations mutex").clone(),
+        runtime.trace().to_vec(),
+    )
+}
+
+fn run_simulator() -> (Vec<RetryObservation>, Vec<RuntimeEvent>) {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 25,
+            ..Default::default()
+        },
+    );
+    let worker = sim.register(RetryWorker {
+        attempts: 0,
+        observations: Arc::clone(&observations),
+    });
+    sim.try_send(worker, RetryMsg::TryWork).unwrap();
+    sim.run_until_quiescent();
+    (
+        observations.lock().expect("observations mutex").clone(),
+        sim.trace().to_vec(),
+    )
+}
+
+fn run_betelgeuse() -> (Vec<RetryObservation>, Vec<RuntimeEvent>) {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let runtime = BetelgeuseRuntime::new(TestShard, TestMailboxFactory);
+    let worker = runtime
+        .register_with_capacity::<RetryWorker, RetryMsg>(
+            RetryWorker {
+                attempts: 0,
+                observations: Arc::clone(&observations),
+            },
+            8,
+        )
+        .expect("worker register accepts");
+    runtime
+        .try_send(worker, RetryMsg::TryWork)
+        .expect("retry start accepts");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while observations.lock().expect("observations mutex").as_slice()
+        != expected_observations().as_slice()
+    {
+        if Instant::now() > deadline {
+            panic!(
+                "Betelgeuse retry workload did not finish: {:#?}",
+                runtime.trace()
+            );
+        }
+        thread::yield_now();
+    }
+
+    (
+        observations.lock().expect("observations mutex").clone(),
+        runtime.shutdown().expect("Betelgeuse shutdown"),
+    )
+}
+
+#[test]
+fn retry_timer_workload_matches_oracle_simulator_and_betelgeuse_runner() {
+    let (oracle_observations, oracle_trace) = run_oracle();
+    let (sim_observations, sim_trace) = run_simulator();
+    let (betelgeuse_observations, betelgeuse_trace) = run_betelgeuse();
+
+    assert_eq!(oracle_observations, expected_observations());
+    assert_eq!(sim_observations, oracle_observations);
+    assert_eq!(betelgeuse_observations, oracle_observations);
+    assert_eq!(count_sleep_completed(&oracle_trace), 1);
+    assert_eq!(count_sleep_completed(&sim_trace), 1);
+    assert_eq!(count_sleep_completed(&betelgeuse_trace), 1);
+}

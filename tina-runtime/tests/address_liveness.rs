@@ -109,7 +109,7 @@ impl Isolate for Target {
 
 #[derive(Debug)]
 struct Driver {
-    target: Address<TargetMsg>,
+    target: Address<TargetMsg, Infallible>,
 }
 
 impl Isolate for Driver {
@@ -169,7 +169,7 @@ fn runtime_ingress_to_stopped_address_returns_closed() {
 fn runtime_ingress_to_wrong_generation_returns_closed() {
     let mut runtime = runtime();
     let address = runtime.register(Target, TestMailbox::default());
-    let stale = Address::new_with_generation(
+    let stale: Address<TargetMsg, Infallible> = Address::new_with_generation(
         address.shard(),
         address.isolate(),
         AddressGeneration::new(address.generation().get() + 1),

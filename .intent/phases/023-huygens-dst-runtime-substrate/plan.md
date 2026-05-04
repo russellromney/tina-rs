@@ -247,7 +247,7 @@ Pause before implementation continues if:
    refuses.
 9. Update `.intent/SYSTEM.md`, README, and ROADMAP only after the evidence
    lands.
-10. Write a closeout artifact with the workload x engine matrix, exact test
+10. Write a final evidence section in `review.md` with the workload x engine matrix, exact test
     names, substrate claim, non-claims, and verification result.
 11. Run `make verify`; add any substrate-specific verification command to the
     standard gate if it is required for the claim.
@@ -270,7 +270,7 @@ Required proof modes:
 - trace assertions, not logs
 - `make verify`
 
-The phase should also add a closeout matrix:
+The phase should also add a final evidence matrix in `review.md`:
 
 | Workload | Simulator/replay | Explicit-step oracle | Runtime substrate | Checker |
 |---|---|---|---|---|
@@ -308,7 +308,7 @@ Huygens is done when:
 - handler semantics stay synchronous and effect-returning
 - `.intent/SYSTEM.md` records the runtime-substrate boundary and claim
   boundary
-- `.intent/phases/023-huygens-dst-runtime-substrate/closeout.md` records the
+- `.intent/phases/023-huygens-dst-runtime-substrate/review.md` records the
   workload x engine matrix, exact test names, substrate claim, non-claims, and
   verification result
 - README/ROADMAP can honestly say users can try Tina for selected

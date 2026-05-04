@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{Shard, ShardId, prelude::*};
-use tina_runtime::{CallKind, RuntimeCall, RuntimeEvent, RuntimeEventKind, sleep};
+use tina_runtime::{CallKind, RuntimeCall, RuntimeEvent, RuntimeEventKind, sleep_then};
 use tina_sim::{FaultConfig, FaultMode, ReplayArtifact, Simulator, SimulatorConfig};
 
 #[derive(Debug, Default)]
@@ -58,7 +58,7 @@ impl Isolate for RetryWorker {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Failed(self.attempts));
-                    sleep(self.backoff).reply(|_| RetryEvent::RetryNow)
+                    sleep_then(self.backoff, RetryEvent::RetryNow)
                 } else {
                     self.observations
                         .borrow_mut()

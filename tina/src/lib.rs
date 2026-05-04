@@ -33,8 +33,6 @@
 //! build values; they do not perform I/O directly.
 //!
 //! ```
-//! use std::convert::Infallible;
-//!
 //! use tina::{
 //!     send, reply, Address, Context, Effect, Isolate, IsolateId, Outbound, Shard, ShardId,
 //! };
@@ -64,17 +62,14 @@
 //!     audit: Address<AuditEvent>,
 //! }
 //!
-//! impl Isolate for Counter {
-//!     tina::isolate_types! {
-//!         message: Message,
-//!         reply: u64,
-//!         send: Outbound<AuditEvent>,
-//!         spawn: Infallible,
-//!         call: Infallible,
-//!         shard: InlineShard,
-//!     }
-//!
-//!     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+//! #[tina::isolate(
+//!     message = Message,
+//!     reply = u64,
+//!     send = Outbound<AuditEvent>,
+//!     shard = InlineShard
+//! )]
+//! impl Counter {
+//!     fn handle(&mut self, msg: Message, _ctx: &mut Context<'_, InlineShard>) -> Effect<Self> {
 //!         match msg {
 //!             Message::Add(delta) => {
 //!                 self.total += delta;
@@ -107,11 +102,43 @@
 
 use std::marker::PhantomData;
 
+/// Declares a Tina isolate from an inherent `impl` block.
+///
+/// This is the preferred authoring path for ordinary Tina code. Only `message`
+/// and `shard` are required; `reply`, `send`, `spawn`, and `call` default to
+/// the no-reply/no-send/no-spawn/no-runtime-call shape.
+///
+/// ```compile_fail
+/// struct DemoShard;
+///
+/// impl tina::Shard for DemoShard {
+///     fn id(&self) -> tina::ShardId {
+///         tina::ShardId::new(0)
+///     }
+/// }
+///
+/// struct Worker;
+///
+/// #[tina::isolate(message = (), shard = DemoShard)]
+/// impl Worker {
+///     async fn handle(
+///         &mut self,
+///         _msg: (),
+///         _ctx: &mut tina::Context<'_, DemoShard>,
+///     ) -> tina::Effect<Self> {
+///         tina::noop()
+///     }
+/// }
+/// ```
+pub use tina_macros::isolate;
+
+type AddressMarker<M, R> = PhantomData<fn(M, R) -> (M, R)>;
+
 /// Declares the associated-type slab for one [`Isolate`] impl.
 ///
-/// This macro is intentionally small and boring. It removes repeated type
-/// lines from the common path without hiding Tina's model or inventing a
-/// second way to describe handlers.
+/// This macro is intentionally small and boring. Prefer [`#[tina::isolate]`](isolate)
+/// for ordinary code; use this when an explicit trait impl is clearer for
+/// tests, generated code, or unusual boundaries.
 ///
 /// ```
 /// struct DemoShard;
@@ -279,7 +306,7 @@ where
 }
 
 /// Returns an effect that sends one typed message to another isolate.
-pub fn send<I, M>(destination: Address<M>, message: M) -> Effect<I>
+pub fn send<I, M, R>(destination: Address<M, R>, message: M) -> Effect<I>
 where
     I: Isolate<Send = Outbound<M>>,
 {
@@ -643,21 +670,26 @@ where
 /// site: an `Address<HttpMsg>` cannot be used where `Address<AuditEvent>` is
 /// required.
 ///
+/// The reply type parameter is used by runtime crates that support
+/// isolate-to-isolate calls. Ordinary sends ignore it, but `call(target, ...)`
+/// can infer the target's reply type from `Address<Message, Reply>` instead of
+/// trusting a separate turbofish at the call site.
+///
 /// An address identifies one incarnation of an isolate: shard id, isolate id,
 /// and generation. Runtime-issued addresses should be preferred for real
 /// delivery. Manually constructed addresses are useful in tests and examples,
 /// but may be stale or unknown to a runtime.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Address<M> {
+pub struct Address<M, R = ()> {
     shard: ShardId,
     isolate: IsolateId,
     generation: AddressGeneration,
-    marker: PhantomData<fn(M) -> M>,
+    marker: AddressMarker<M, R>,
 }
 
-impl<M> Copy for Address<M> {}
+impl<M, R> Copy for Address<M, R> {}
 
-impl<M> Clone for Address<M> {
+impl<M, R> Clone for Address<M, R> {
     fn clone(&self) -> Self {
         *self
     }
@@ -668,7 +700,9 @@ impl<M> Address<M> {
     pub const fn new(shard: ShardId, isolate: IsolateId) -> Self {
         Self::new_with_generation(shard, isolate, AddressGeneration::new(0))
     }
+}
 
+impl<M, R> Address<M, R> {
     /// Creates a new typed address from shard, isolate, and generation.
     pub const fn new_with_generation(
         shard: ShardId,
@@ -696,6 +730,14 @@ impl<M> Address<M> {
     /// Returns the isolate generation this address targets.
     pub const fn generation(self) -> AddressGeneration {
         self.generation
+    }
+
+    /// Returns the same runtime address with a different reply marker.
+    ///
+    /// Runtime-issued addresses already carry the right reply type. This is
+    /// mostly useful for tests that manually construct addresses.
+    pub const fn with_reply<Reply>(self) -> Address<M, Reply> {
+        Address::new_with_generation(self.shard, self.isolate, self.generation)
     }
 }
 
@@ -727,9 +769,9 @@ pub struct Outbound<M> {
 
 impl<M> Outbound<M> {
     /// Creates a new outbound send request.
-    pub fn new(destination: Address<M>, message: M) -> Self {
+    pub fn new<R>(destination: Address<M, R>, message: M) -> Self {
         Self {
-            destination,
+            destination: destination.with_reply::<()>(),
             message,
         }
     }
@@ -938,7 +980,7 @@ impl AddressGeneration {
 pub mod prelude {
     pub use crate::{
         Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
-        RestartableChildDefinition, Shard, ShardId, batch, noop, reply, restart_children, send,
-        spawn, stop,
+        RestartableChildDefinition, Shard, ShardId, batch, isolate, isolate_types, noop, reply,
+        restart_children, send, spawn, stop,
     };
 }

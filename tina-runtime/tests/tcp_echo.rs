@@ -1,3 +1,5 @@
+#![feature(allocator_api)]
+
 //! Live TCP echo proof for `Runtime` plus the runtime-owned call
 //! contract.
 //!
@@ -17,6 +19,7 @@
 //! - keep assertions per-stream and on event multiplicity; do not claim
 //!   cross-stream ordering the runtime never promised
 
+use std::alloc::Global;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -27,12 +30,13 @@ use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use betelgeuse::io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO};
 use tina::{IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
 use tina_runtime::{
-    CallInput, CallKind, ListenerId, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, StreamId, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError,
-    ThreadedTrySendError, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
-    tcp_write,
+    BetelgeuseRuntime, BetelgeuseRuntimeConfig, BetelgeuseSendObservedError,
+    BetelgeuseTrySendError, CallCompletionRejectedReason, CallInput, CallKind, ListenerId,
+    MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId, tcp_accept,
+    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -521,17 +525,17 @@ where
     }
 }
 
-fn run_threaded_echo_scenario(
+fn run_betelgeuse_echo_scenario(
     payloads: Vec<Vec<u8>>,
     timeout: Duration,
 ) -> (Vec<Vec<u8>>, Vec<RuntimeEvent>, IsolateId) {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
     let bound: BoundAddr = Arc::new(Mutex::new(None));
 
-    let runtime = ThreadedRuntime::with_config(
+    let runtime = BetelgeuseRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        ThreadedRuntimeConfig {
+        BetelgeuseRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
         },
@@ -549,20 +553,20 @@ fn run_threaded_echo_scenario(
             },
             8,
         )
-        .expect("threaded register accepts");
+        .expect("Betelgeuse register accepts");
 
     runtime
         .supervise(
             listener_addr,
             SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
         )
-        .expect("threaded supervise accepts");
+        .expect("Betelgeuse supervise accepts");
 
     runtime
         .try_send(listener_addr, ListenerEvent::Start)
-        .expect("threaded bootstrap accepts");
+        .expect("Betelgeuse bootstrap accepts");
 
-    wait_until(timeout, "threaded bind", || {
+    wait_until(timeout, "Betelgeuse bind", || {
         bound.lock().expect("mutex").is_some()
     });
 
@@ -576,20 +580,20 @@ fn run_threaded_echo_scenario(
         .map(|payload| spawn_client(local_addr, payload, None))
         .collect::<Vec<_>>();
 
-    wait_until(timeout, "threaded clients", || {
+    wait_until(timeout, "Betelgeuse clients", || {
         clients
             .iter()
             .all(|client| *client.done.lock().expect("flag mutex"))
     });
 
-    wait_until(timeout, "threaded listener stop", || {
-        let trace = runtime.trace().expect("threaded trace");
+    wait_until(timeout, "Betelgeuse listener stop", || {
+        let trace = runtime.trace().expect("Betelgeuse trace");
         trace.iter().any(|event| {
             event.isolate() == listener_addr.isolate()
                 && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
         }) && !runtime
             .has_in_flight_calls()
-            .expect("threaded in-flight check")
+            .expect("Betelgeuse in-flight check")
     });
 
     let mut echoed = Vec::new();
@@ -598,8 +602,145 @@ fn run_threaded_echo_scenario(
         echoed.push(client.echoed.lock().expect("mutex").clone());
     }
 
-    let trace = runtime.shutdown().expect("threaded shutdown");
+    let trace = runtime.shutdown().expect("Betelgeuse shutdown");
     (echoed, trace, listener_addr.isolate())
+}
+
+fn run_simulated_betelgeuse_echo_scenario(payload: Vec<u8>) -> (Vec<u8>, Vec<RuntimeEvent>) {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+    let bound: BoundAddr = Arc::new(Mutex::new(None));
+    let simulated_io = SimulatedIO::with_config(SimulatedConfig {
+        seed: 25,
+        completion_delay: SimulatedDelay::Every {
+            one_in: 1,
+            steps: 1,
+        },
+        max_send_chunk: Some(3),
+    });
+    let mut runtime = Runtime::with_betelgeuse_io_loop(
+        TestShard,
+        TestMailboxFactory,
+        simulated_io.loop_handle(Global),
+    );
+
+    let listener_addr = runtime.register(
+        Listener {
+            bind_addr,
+            bound_addr_slot: Arc::clone(&bound),
+            max_chunk: 256,
+            target_accepts: 1,
+            accepted_count: 0,
+            listener: None,
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(listener_addr, ListenerEvent::Start)
+        .expect("bootstrap accepts");
+
+    step_until(
+        &mut runtime,
+        Duration::from_secs(2),
+        "simulated bind",
+        |_| bound.lock().expect("mutex").is_some(),
+    );
+
+    let local_addr = bound
+        .lock()
+        .expect("mutex")
+        .expect("listener published address");
+    let peer = simulated_io
+        .connect(local_addr, payload)
+        .expect("simulated peer connects to listener");
+
+    step_until(
+        &mut runtime,
+        Duration::from_secs(2),
+        "simulated echo close",
+        |runtime| {
+            !runtime.has_in_flight_calls()
+                && runtime.trace().iter().any(|event| {
+                    event.isolate() == listener_addr.isolate()
+                        && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                })
+        },
+    );
+
+    (peer.output(), runtime.trace().to_vec())
+}
+
+fn run_threaded_simulated_betelgeuse_echo_scenario(
+    payload: Vec<u8>,
+) -> (Vec<u8>, Vec<RuntimeEvent>) {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+    let bound: BoundAddr = Arc::new(Mutex::new(None));
+    let simulated_io = SimulatedIO::with_config(SimulatedConfig {
+        seed: 26,
+        completion_delay: SimulatedDelay::Every {
+            one_in: 1,
+            steps: 1,
+        },
+        max_send_chunk: Some(3),
+    });
+    let io_for_worker = simulated_io.clone();
+    let runtime = BetelgeuseRuntime::with_config_and_io_loop_factory(
+        TestShard,
+        TestMailboxFactory,
+        BetelgeuseRuntimeConfig {
+            command_capacity: 16,
+            idle_wait: Duration::from_millis(1),
+        },
+        move || io_for_worker.loop_handle(Global),
+    );
+
+    let listener_addr = runtime
+        .register_with_capacity::<Listener, _>(
+            Listener {
+                bind_addr,
+                bound_addr_slot: Arc::clone(&bound),
+                max_chunk: 256,
+                target_accepts: 1,
+                accepted_count: 0,
+                listener: None,
+            },
+            8,
+        )
+        .expect("Betelgeuse register accepts");
+
+    runtime
+        .try_send(listener_addr, ListenerEvent::Start)
+        .expect("bootstrap accepts");
+
+    wait_until(Duration::from_secs(2), "threaded simulated bind", || {
+        bound.lock().expect("mutex").is_some()
+    });
+
+    let local_addr = bound
+        .lock()
+        .expect("mutex")
+        .expect("listener published address");
+    let peer = simulated_io
+        .connect(local_addr, payload)
+        .expect("simulated peer connects to listener");
+
+    wait_until(
+        Duration::from_secs(2),
+        "threaded simulated echo close",
+        || {
+            let trace = runtime.trace().expect("trace query succeeds");
+            trace.iter().any(|event| {
+                event.isolate() == listener_addr.isolate()
+                    && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+            }) && !runtime
+                .has_in_flight_calls()
+                .expect("in-flight query succeeds")
+        },
+    );
+
+    let output = peer.output();
+    let trace = runtime.shutdown().expect("shutdown succeeds");
+    (output, trace)
 }
 
 // ---------------------------------------------------------------------------
@@ -692,13 +833,13 @@ fn tcp_echo_handles_two_overlapping_clients_and_rearms_listener() {
 }
 
 #[test]
-fn threaded_runtime_tcp_echo_round_trips_reference_workload() {
+fn betelgeuse_runtime_tcp_echo_round_trips_reference_workload() {
     let payloads = vec![
-        b"threaded reference payload one".to_vec(),
-        b"threaded reference payload two".to_vec(),
+        b"Betelgeuse reference payload one".to_vec(),
+        b"Betelgeuse reference payload two".to_vec(),
     ];
     let (echoed, trace, listener_isolate) =
-        run_threaded_echo_scenario(payloads.clone(), Duration::from_secs(10));
+        run_betelgeuse_echo_scenario(payloads.clone(), Duration::from_secs(10));
     let (oracle_echoed, oracle_trace, _) =
         run_echo_scenario(payloads.clone(), false, Duration::from_secs(10));
 
@@ -729,8 +870,41 @@ fn threaded_runtime_tcp_echo_round_trips_reference_workload() {
 }
 
 #[test]
-fn threaded_runtime_surfaces_closed_mailbox_after_stop() {
-    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
+fn betelgeuse_simulated_io_drives_tina_tcp_echo_with_faulted_completion_shape() {
+    let payload = b"simulated Betelgeuse payload".to_vec();
+    let (echoed, trace) = run_simulated_betelgeuse_echo_scenario(payload.clone());
+    let (second_echoed, second_trace) = run_simulated_betelgeuse_echo_scenario(payload.clone());
+
+    assert_eq!(echoed, payload);
+    assert_eq!(second_echoed, payload);
+    assert_eq!(trace, second_trace);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpBind), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpAccept), 1);
+    assert!(count_call_completed(&trace, CallKind::TcpRead) >= 2);
+    assert!(count_call_completed(&trace, CallKind::TcpWrite) > 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpStreamClose), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpListenerClose), 1);
+    assert_eq!(count_spawned(&trace), 1);
+}
+
+#[test]
+fn betelgeuse_runtime_can_run_over_simulated_io_backend() {
+    let payload = b"threaded simulated Betelgeuse payload".to_vec();
+    let (echoed, trace) = run_threaded_simulated_betelgeuse_echo_scenario(payload.clone());
+
+    assert_eq!(echoed, payload);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpBind), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpAccept), 1);
+    assert!(count_call_completed(&trace, CallKind::TcpRead) >= 2);
+    assert!(count_call_completed(&trace, CallKind::TcpWrite) > 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpStreamClose), 1);
+    assert_eq!(count_call_completed(&trace, CallKind::TcpListenerClose), 1);
+    assert_eq!(count_spawned(&trace), 1);
+}
+
+#[test]
+fn betelgeuse_runtime_surfaces_closed_mailbox_after_stop() {
+    let runtime = BetelgeuseRuntime::new(TestShard, TestMailboxFactory);
     let listener_addr = runtime
         .register_with_capacity::<Listener, _>(
             Listener {
@@ -743,14 +917,14 @@ fn threaded_runtime_surfaces_closed_mailbox_after_stop() {
             },
             1,
         )
-        .expect("threaded register accepts");
+        .expect("Betelgeuse register accepts");
 
     runtime
         .try_send(listener_addr, ListenerEvent::IoFailed)
         .expect("stop message accepts");
 
-    wait_until(Duration::from_secs(2), "threaded stop", || {
-        let trace = runtime.trace().expect("threaded trace");
+    wait_until(Duration::from_secs(2), "Betelgeuse stop", || {
+        let trace = runtime.trace().expect("Betelgeuse trace");
         trace.iter().any(|event| {
             event.isolate() == listener_addr.isolate()
                 && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
@@ -759,8 +933,59 @@ fn threaded_runtime_surfaces_closed_mailbox_after_stop() {
 
     assert_eq!(
         runtime.send_and_observe(listener_addr, ListenerEvent::Start),
-        Err(ThreadedSendObservedError::MailboxClosed)
+        Err(BetelgeuseSendObservedError::MailboxClosed)
     );
+}
+
+#[test]
+fn betelgeuse_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
+    let runtime = BetelgeuseRuntime::new(TestShard, TestMailboxFactory);
+    let listener_addr = runtime
+        .register_with_capacity::<Listener, _>(
+            Listener {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+                bound_addr_slot: Arc::new(Mutex::new(None)),
+                max_chunk: 256,
+                target_accepts: 1,
+                accepted_count: 0,
+                listener: None,
+            },
+            8,
+        )
+        .expect("Betelgeuse register accepts");
+
+    runtime
+        .try_send(listener_addr, ListenerEvent::Start)
+        .expect("listener start handoff accepted");
+
+    wait_until(Duration::from_secs(2), "Betelgeuse accept pending", || {
+        let trace = runtime.trace().expect("Betelgeuse trace");
+        trace.iter().any(|event| {
+            event.isolate() == listener_addr.isolate()
+                && matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallDispatchAttempted {
+                        call_kind: CallKind::TcpAccept,
+                        ..
+                    }
+                )
+        }) && runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+
+    let trace = runtime.shutdown().expect("Betelgeuse shutdown");
+    assert!(trace.iter().any(|event| {
+        event.isolate() == listener_addr.isolate()
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_kind: CallKind::TcpAccept,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                    ..
+                }
+            )
+    }));
 }
 
 #[derive(Debug, Clone)]
@@ -800,11 +1025,11 @@ impl Isolate for BlockingIsolate {
 }
 
 #[test]
-fn threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() {
-    let runtime = ThreadedRuntime::with_config(
+fn betelgeuse_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() {
+    let runtime = BetelgeuseRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        ThreadedRuntimeConfig {
+        BetelgeuseRuntimeConfig {
             command_capacity: 1,
             idle_wait: Duration::from_millis(1),
         },
@@ -819,7 +1044,7 @@ fn threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() 
             },
             8,
         )
-        .expect("threaded register accepts");
+        .expect("Betelgeuse register accepts");
 
     runtime
         .try_send(blocking_addr, BlockingMsg::Park)
@@ -831,12 +1056,12 @@ fn threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() 
         .expect("first queued wake handoff accepted");
     assert_eq!(
         runtime.try_send(blocking_addr, BlockingMsg::Wake),
-        Err(ThreadedTrySendError::IngressFull)
+        Err(BetelgeuseTrySendError::IngressFull)
     );
 
     wake_tx.send(()).expect("release parked handler");
-    wait_until(Duration::from_secs(2), "threaded ingress drain", || {
-        let trace = runtime.trace().expect("threaded trace");
+    wait_until(Duration::from_secs(2), "Betelgeuse ingress drain", || {
+        let trace = runtime.trace().expect("Betelgeuse trace");
         trace
             .iter()
             .filter(|event| event.isolate() == blocking_addr.isolate())

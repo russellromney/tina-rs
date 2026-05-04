@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallKind, MailboxFactory, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-    ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
+    BetelgeuseControlError, BetelgeuseMultiShardRuntime, BetelgeuseRuntime,
+    BetelgeuseRuntimeConfig, CallCompletionRejectedReason, CallError, CallKind, CallOutcome,
+    MailboxFactory, RuntimeCall, RuntimeEvent, RuntimeEventKind, SendRejectedReason, call, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -156,12 +157,12 @@ impl Isolate for RetryWorker {
 }
 
 #[test]
-fn threaded_runtime_timer_retry_runs_without_manual_stepping() {
+fn betelgeuse_runtime_timer_retry_runs_without_manual_stepping() {
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let runtime = ThreadedRuntime::with_config(
+    let runtime = BetelgeuseRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        ThreadedRuntimeConfig {
+        BetelgeuseRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
         },
@@ -175,13 +176,13 @@ fn threaded_runtime_timer_retry_runs_without_manual_stepping() {
             },
             8,
         )
-        .expect("threaded register accepts");
+        .expect("Betelgeuse register accepts");
 
     runtime
         .try_send(worker, RetryMsg::TryWork)
         .expect("retry handoff accepted");
 
-    wait_until(Duration::from_secs(2), "threaded retry", || {
+    wait_until(Duration::from_secs(2), "Betelgeuse retry", || {
         observations.lock().expect("observations mutex").as_slice()
             == [
                 RetryObservation::Attempted(1),
@@ -192,7 +193,7 @@ fn threaded_runtime_timer_retry_runs_without_manual_stepping() {
             ]
     });
 
-    let trace = runtime.shutdown().expect("threaded shutdown");
+    let trace = runtime.shutdown().expect("Betelgeuse shutdown");
     assert_eq!(
         count_event(&trace, |kind| matches!(
             kind,
@@ -203,6 +204,91 @@ fn threaded_runtime_timer_retry_runs_without_manual_stepping() {
         )),
         1
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongTimerMsg {
+    Start,
+    Finished,
+}
+
+#[derive(Debug)]
+struct LongTimer;
+
+impl Isolate for LongTimer {
+    tina::isolate_types! {
+        message: LongTimerMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<LongTimerMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            LongTimerMsg::Start => sleep(Duration::from_secs(60)).reply(|_| LongTimerMsg::Finished),
+            LongTimerMsg::Finished => noop(),
+        }
+    }
+}
+
+#[test]
+fn betelgeuse_runtime_shutdown_rejects_outstanding_timer_completion() {
+    let runtime = BetelgeuseRuntime::with_config(
+        TestShard,
+        TestMailboxFactory,
+        BetelgeuseRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+        },
+    );
+    let timer = runtime
+        .register_with_capacity::<LongTimer, _>(LongTimer, 8)
+        .expect("timer register accepts");
+
+    runtime
+        .try_send(timer, LongTimerMsg::Start)
+        .expect("timer start handoff accepted");
+
+    wait_until(Duration::from_secs(2), "Betelgeuse timer pending", || {
+        runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+
+    let trace = runtime.shutdown().expect("Betelgeuse shutdown");
+    assert!(trace.iter().any(|event| {
+        event.isolate() == timer.isolate()
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_kind: CallKind::Sleep,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                    ..
+                }
+            )
+    }));
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PanickingMailboxFactory;
+
+impl MailboxFactory for PanickingMailboxFactory {
+    fn create<T: 'static>(&self, _capacity: usize) -> Box<dyn Mailbox<T>> {
+        panic!("test mailbox factory panic")
+    }
+}
+
+#[test]
+fn betelgeuse_runtime_worker_panic_returns_typed_handle_error() {
+    let runtime = BetelgeuseRuntime::new(TestShard, PanickingMailboxFactory);
+
+    assert_eq!(
+        runtime.register_with_capacity::<LongTimer, _>(LongTimer, 8),
+        Err(BetelgeuseControlError::WorkerStopped)
+    );
+    assert_eq!(runtime.trace(), Err(BetelgeuseControlError::WorkerStopped));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,8 +344,8 @@ impl Isolate for Sink {
 }
 
 #[test]
-fn threaded_runtime_local_mailbox_full_is_visible_in_trace() {
-    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
+fn betelgeuse_runtime_local_mailbox_full_is_visible_in_trace() {
+    let runtime = BetelgeuseRuntime::new(TestShard, TestMailboxFactory);
     let sink = runtime
         .register_with_capacity::<Sink, _>(Sink, 1)
         .expect("sink register accepts");
@@ -271,8 +357,8 @@ fn threaded_runtime_local_mailbox_full_is_visible_in_trace() {
         .try_send(driver, DriverMsg::FillTwice)
         .expect("driver handoff accepted");
 
-    wait_until(Duration::from_secs(2), "threaded local full", || {
-        let trace = runtime.trace().expect("threaded trace");
+    wait_until(Duration::from_secs(2), "Betelgeuse local full", || {
+        let trace = runtime.trace().expect("Betelgeuse trace");
         trace.iter().any(|event| {
             matches!(
                 event.kind(),
@@ -284,7 +370,7 @@ fn threaded_runtime_local_mailbox_full_is_visible_in_trace() {
         })
     });
 
-    let trace = runtime.shutdown().expect("threaded shutdown");
+    let trace = runtime.shutdown().expect("Betelgeuse shutdown");
     assert_eq!(
         count_event(&trace, |kind| matches!(
             kind,
@@ -450,11 +536,11 @@ fn has_send_accepted_between(trace: &[RuntimeEvent], from: u32, to: u32) -> bool
 }
 
 #[test]
-fn threaded_multishard_dispatcher_round_trips_between_worker_threads() {
-    let runtime = ThreadedMultiShardRuntime::with_config(
+fn betelgeuse_multishard_dispatcher_round_trips_between_worker_threads() {
+    let runtime = BetelgeuseMultiShardRuntime::with_config(
         [WorkShard(1), WorkShard(2)],
         TestMailboxFactory,
-        ThreadedRuntimeConfig {
+        BetelgeuseRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
         },
@@ -487,19 +573,20 @@ fn threaded_multishard_dispatcher_round_trips_between_worker_threads() {
 
     wait_until(
         Duration::from_secs(2),
-        "threaded multishard dispatch",
+        "Betelgeuse multishard dispatch",
         || completed.lock().expect("completed mutex").as_slice() == [(7, 42)],
     );
 
-    let trace = runtime.shutdown().expect("threaded multishard shutdown");
+    let trace = runtime.shutdown().expect("Betelgeuse multishard shutdown");
     assert!(has_send_accepted_between(&trace, 1, 2));
     assert!(has_send_accepted_between(&trace, 2, 1));
     assert_eq!(count_send_rejected_full(&trace), 0);
 }
 
 #[test]
-fn threaded_multishard_bad_remote_does_not_poison_good_remote_work() {
-    let runtime = ThreadedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
+fn betelgeuse_multishard_bad_remote_does_not_poison_good_remote_work() {
+    let runtime =
+        BetelgeuseMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
     let completed = Arc::new(Mutex::new(Vec::new()));
     let worker = runtime
         .register_with_capacity_on::<Worker, _>(ShardId::new(2), Worker, 8)
@@ -529,11 +616,11 @@ fn threaded_multishard_bad_remote_does_not_poison_good_remote_work() {
 
     wait_until(
         Duration::from_secs(2),
-        "threaded bad then good remote",
+        "Betelgeuse bad then good remote",
         || completed.lock().expect("completed mutex").as_slice() == [(11, 10)],
     );
 
-    let trace = runtime.shutdown().expect("threaded multishard shutdown");
+    let trace = runtime.shutdown().expect("Betelgeuse multishard shutdown");
     assert!(trace.iter().any(|event| {
         event.isolate() == IsolateId::new(99)
             && matches!(
@@ -545,6 +632,152 @@ fn threaded_multishard_bad_remote_does_not_poison_good_remote_work() {
             )
     }));
     assert!(has_send_accepted_between(&trace, 2, 1));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallTargetMsg {
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallReply;
+
+#[derive(Debug)]
+struct CallTarget {
+    hits: Arc<Mutex<usize>>,
+}
+
+impl Isolate for CallTarget {
+    tina::isolate_types! {
+        message: CallTargetMsg,
+        reply: CallReply,
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<CallTargetMsg>,
+        shard: WorkShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            CallTargetMsg::Ask => {
+                *self.hits.lock().expect("hits mutex") += 1;
+                reply(CallReply)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CallClientMsg {
+    Start,
+    Returned(CallOutcome<CallReply>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallObservation {
+    Replied,
+    Full,
+    Closed,
+    Timeout,
+}
+
+#[derive(Debug)]
+struct CallClient {
+    target: Address<CallTargetMsg, CallReply>,
+    observations: Arc<Mutex<Vec<CallObservation>>>,
+}
+
+impl Isolate for CallClient {
+    tina::isolate_types! {
+        message: CallClientMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<CallClientMsg>,
+        shard: WorkShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            CallClientMsg::Start => call(self.target, CallTargetMsg::Ask, Duration::from_secs(1))
+                .reply(CallClientMsg::Returned),
+            CallClientMsg::Returned(outcome) => {
+                let observation = match outcome {
+                    CallOutcome::Replied(_) => CallObservation::Replied,
+                    CallOutcome::Full => CallObservation::Full,
+                    CallOutcome::Closed => CallObservation::Closed,
+                    CallOutcome::Timeout => CallObservation::Timeout,
+                };
+                self.observations
+                    .lock()
+                    .expect("observations mutex")
+                    .push(observation);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn betelgeuse_multishard_isolate_call_rejects_cross_shard_with_typed_outcome() {
+    let runtime =
+        BetelgeuseMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
+    let target_hits = Arc::new(Mutex::new(0));
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let target = runtime
+        .register_with_capacity_on::<CallTarget, _>(
+            ShardId::new(2),
+            CallTarget {
+                hits: Arc::clone(&target_hits),
+            },
+            8,
+        )
+        .expect("target register accepts");
+    let client = runtime
+        .register_with_capacity_on::<CallClient, _>(
+            ShardId::new(1),
+            CallClient {
+                target,
+                observations: Arc::clone(&observations),
+            },
+            8,
+        )
+        .expect("client register accepts");
+
+    runtime
+        .try_send(client, CallClientMsg::Start)
+        .expect("call start handoff accepted");
+
+    wait_until(
+        Duration::from_secs(2),
+        "Betelgeuse cross-shard call reject",
+        || observations.lock().expect("observations mutex").as_slice() == [CallObservation::Closed],
+    );
+
+    let trace = runtime.shutdown().expect("Betelgeuse multishard shutdown");
+    assert_eq!(*target_hits.lock().expect("hits mutex"), 0);
+    assert!(trace.iter().any(|event| {
+        event.shard() == ShardId::new(1)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    target_shard,
+                    reason: SendRejectedReason::Closed,
+                    ..
+                } if target_shard == ShardId::new(2)
+            )
+    }));
+    assert!(trace.iter().any(|event| {
+        event.shard() == ShardId::new(1)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetClosed,
+                    ..
+                }
+            )
+    }));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -613,11 +846,11 @@ impl Isolate for RemoteBurst {
 }
 
 #[test]
-fn threaded_multishard_remote_queue_full_is_visible_at_source() {
-    let runtime = ThreadedMultiShardRuntime::with_config(
+fn betelgeuse_multishard_remote_queue_full_is_visible_at_source() {
+    let runtime = BetelgeuseMultiShardRuntime::with_config(
         [WorkShard(1), WorkShard(2)],
         TestMailboxFactory,
-        ThreadedRuntimeConfig {
+        BetelgeuseRuntimeConfig {
             command_capacity: 1,
             idle_wait: Duration::from_millis(1),
         },
@@ -652,7 +885,7 @@ fn threaded_multishard_remote_queue_full_is_visible_at_source() {
         .try_send(burst, BurstMsg::Burst)
         .expect("burst handoff accepted");
 
-    wait_until(Duration::from_secs(2), "threaded remote full", || {
+    wait_until(Duration::from_secs(2), "Betelgeuse remote full", || {
         let trace = runtime
             .trace_on(ShardId::new(1))
             .expect("source shard trace");
@@ -660,7 +893,7 @@ fn threaded_multishard_remote_queue_full_is_visible_at_source() {
     });
     wake_tx.send(()).expect("release parked target worker");
 
-    let trace = runtime.shutdown().expect("threaded multishard shutdown");
+    let trace = runtime.shutdown().expect("Betelgeuse multishard shutdown");
     assert!(trace.iter().any(|event| {
         event.shard() == ShardId::new(1)
             && matches!(

@@ -126,7 +126,7 @@ impl Isolate for Target {
 
 #[derive(Debug)]
 struct Driver {
-    target: Address<TargetMsg>,
+    target: Address<TargetMsg, Infallible>,
 }
 
 #[derive(Debug)]
@@ -499,7 +499,7 @@ struct DispatcherWorker {
 
 #[derive(Debug)]
 struct DispatcherParent {
-    registry: Address<RegistryMsg>,
+    registry: Address<RegistryMsg, Infallible>,
     completed: Rc<RefCell<Vec<IsolateId>>>,
 }
 

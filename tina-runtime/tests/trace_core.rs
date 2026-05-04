@@ -140,7 +140,7 @@ impl MailboxFactory for TestMailboxFactory {
 
 struct RuntimeHarness {
     runtime: Runtime<TestShard, TestMailboxFactory>,
-    session: Address<SessionMsg>,
+    session: Address<SessionMsg, usize>,
     handled: Rc<RefCell<usize>>,
     seen: Rc<RefCell<Vec<u8>>>,
 }

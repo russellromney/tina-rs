@@ -334,3 +334,37 @@ After review, items 1-5 were addressed on the Mercury branch:
 
 Item 6 remains future work: a distinct cross-shard outcome belongs with real
 cross-shard call reply transport.
+
+## Substrate Decision Notes
+
+Mercury inspected the current runtime substrate before implementation:
+
+- `Runtime<S, F>` is the semantic engine and remains one-thread-owned.
+- `IoBackend` is the current Betelgeuse-backed completion backend.
+- `ThreadedRuntime` and `ThreadedMultiShardRuntime` are live runner shells that
+  construct `Runtime` on worker threads and drive `step()`.
+
+Monoio can likely host Tina's substrate later, but only as a new runner/backend
+layer: one current-thread runtime per Tina shard worker, synchronous Tina
+handlers, runtime-owned TCP futures/tasks, and completion translation back into
+`CallOutput`. Replacing handlers with async code, moving raw sockets into
+isolate state, or using hidden unbounded async queues would violate the phase
+gates.
+
+Tokio current-thread is the practical comparison/adoption substrate, not the
+purest Tina core. A clean Tokio integration would keep user handlers
+synchronous, keep backend handles out of user context, let Tina own admission,
+mailbox capacity, supervision, trace, and completion routing, and use Tokio only
+for socket/timer mechanics under runtime-owned effects.
+
+Design debt found:
+
+1. `Runtime` directly owns the concrete `IoBackend`; a future substrate phase
+   may need a small backend abstraction or separate runner.
+2. The completion delivery path is already well-shaped for alternate backend
+   completions.
+3. Live cross-shard sendability needed explicit support/guards.
+4. Observed backpressure was trace-first before Mercury's observed-send path.
+
+Mercury therefore started with Tina semantics and the overload lab rather than
+a full `tina-runtime-monoio` crate.

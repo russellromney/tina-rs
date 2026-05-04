@@ -46,15 +46,15 @@ start from an honest baseline rather than from stale roadmap wording.
 
 | Claim | Current evidence | Still missing |
 |---|---|---|
-| Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `Outbound`, `ChildDefinition`, supervision policy types, and the preferred 021 authoring surface (`tina::prelude::*`, effect helpers, typed call helpers, `ctx.me()`, `ctx.send_self(...)`, and `tina::isolate_types!`). | Small call-result helper polish remains optional. |
+| Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `Outbound`, `ChildDefinition`, supervision policy types, and the preferred authoring surface (`tina::prelude::*`, `#[tina::isolate(...)]`, `#[tina_runtime::isolate(...)]`, effect helpers, typed call helpers, `ctx.me()`, and `ctx.send_self(...)`). | Small call-result helper polish remains optional. |
 | Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. Cross-shard shard-pair queues are bounded and directly proved in Galileo. | This is not a full formal proof for every capacity/interleaving/refactor. Any future MPSC fallback is not implemented. |
 | Single-shard runtime delivery | `tina-runtime` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, supervised panic restart with policy/budget config, an assertion-backed task-dispatcher proof package, and generated-history property tests. | Supervision is still narrow: panic-triggered only, runtime-lifetime budget only, and no timed budget windows. The generated-history model is bounded and does not prove arbitrary user programs. |
 | Failure isolation | Unwinding handler panics become runtime events; the panicking isolate stops and the same round continues deterministically. | This is not Tina-Odin's OS trap boundary. Rust segfault isolation, shard quarantine, and `panic = "abort"` behavior are out of scope unless a later phase explicitly designs them. |
-| Multi-shard runtime/sim | `tina-runtime` and `tina-sim` now expose multi-shard explicit-step runners with root placement, global event/call ids, bounded shard-pair queues, next-step-only remote visibility, deterministic harvest order, source-time versus destination-time delivery stages, simulator replay, user-shaped dispatcher proofs, sealed address-local remote-failure behavior, and shard-local supervision/restart ownership. Huygens added first live worker-per-shard runners with bounded live ingress and bounded live cross-shard transport. | Production-shaped runtime backend, thread pinning/topology, peer quarantine, shard-restart propagation, and cross-shard child ownership remain future work. |
+| Multi-shard runtime/sim | `tina-runtime` and `tina-sim` now expose multi-shard explicit-step runners with root placement, global event/call ids, bounded shard-pair queues, next-step-only remote visibility, deterministic harvest order, source-time versus destination-time delivery stages, simulator replay, user-shaped dispatcher proofs, sealed address-local remote-failure behavior, and shard-local supervision/restart ownership. Huygens added first live worker-per-shard runners with bounded live ingress and bounded live cross-shard transport; 025 renames that live surface to `BetelgeuseRuntime` / `BetelgeuseMultiShardRuntime`. | Thread pinning/topology, peer quarantine, shard-restart propagation, cross-shard child ownership, and live cross-shard isolate-call reply transport remain future work unless 025 explicitly chooses to add them. |
 | Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories and small generated dispatcher workloads. Trace replay proofs can reconstruct worker completions and restart outcomes from the runtime event model alone. `tina-sim` adds virtual time, replay records, seeded delays/reordering over timer-wake/local-send/TCP-completion behavior, checker failures, spawn/supervision replay, scripted TCP simulation, multi-shard replay under default and non-default seeded configs, and multi-shard checker failure replay. | Real substrate liveness faults remain future work; current explicit-step shard-liveness non-claims are sealed. |
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. Kepler pins the runtime/simulator allocation story narrowly: boxed erasure, traces, replay records, and coordinator storage may allocate, and a focused multi-shard allocation probe guards against pretending otherwise. | No broad runtime/simulator allocation-free claim is supported yet. |
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
-| Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes the first TCP call family — bind, accept, read, write, close — through Betelgeuse on nightly Rust, with caller-owned typed completion slots, runtime-assigned opaque resource ids, runtime-controlled completion translation back into ordinary `Message` values, honest `local_addr` reporting for `127.0.0.1:0` binds, accepted-stream `peer_addr`, listener re-arm through normal isolate control flow, and clean listener close. It also executes the first time call verb — `Sleep { after }` with `TimerFired` — with runtime-owned monotonic clock sampling once per step, due-timer harvest, deterministic request-order tie-break for equal deadlines, and a crate-private manual clock seam for deterministic timer tests. | A production-shaped I/O substrate decision remains: likely `monoio`/io_uring, or an explicit decision that the current threaded+Betelgeuse substrate is the tryable backend for now. The 100k-connection benchmark and broader network-server claims remain future work. |
+| Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes the first TCP call family — bind, accept, read, write, close — through Betelgeuse on nightly Rust, with caller-owned typed completion slots, runtime-assigned opaque resource ids, runtime-controlled completion translation back into ordinary `Message` values, honest `local_addr` reporting for `127.0.0.1:0` binds, accepted-stream `peer_addr`, listener re-arm through normal isolate control flow, and clean listener close. It also executes the first time call verb — `Sleep { after }` with `TimerFired` — with runtime-owned monotonic clock sampling once per step, due-timer harvest, deterministic request-order tie-break for equal deadlines, and a crate-private manual clock seam for deterministic timer tests. 025 adds a narrow Betelgeuse simulated TCP backend with seeded completion delay and partial-write pressure, then proves Tina TCP effects through it on explicit and threaded runners. | The 100k-connection benchmark, broader network-server claims, and live-substrate liveness faults remain future work. |
 
 ## Testing and proof strategy
 
@@ -135,18 +135,25 @@ phases.
 | ~~**Galileo multi-shard semantics and simulation**~~ | Delivered in `.intent/phases/020-galileo-multi-shard-semantics-and-simulation/`: multi-shard explicit-step runtime/simulator runners, cross-shard delivery, routing/placement, deterministic traces, replay, source-time vs destination-time delivery stages, seeded simulator composition proofs, and user-shaped dispatcher/TCP/supervision proof workloads. |
 | ~~**Kepler core primitive completion**~~ | Delivered in `.intent/phases/022-kepler-core-primitive-completion/`: sealed the current explicit-step liveness non-signal, proved address-local remote failures do not poison shards, sealed shard-local supervision/restart ownership, pinned ownership/buffering/allocation non-claims, added multi-shard checker/replay pressure, and added user-shaped runtime/simulator e2e proofs. |
 | ~~**Huygens DST harness and runtime substrate**~~ | Delivered in `.intent/phases/023-huygens-dst-runtime-substrate/`: composed-workload DST harnessing, TCP/timer/supervision/cross-shard replay pressure, `ThreadedRuntime`, `ThreadedMultiShardRuntime`, bounded live ingress, bounded live cross-shard transport, and user-shaped live substrate proofs. |
-| **Mercury overload lab and runtime contract** | Next. Make the Huygens substrate story concrete with an overload proof app: bounded observed send, isolate-to-isolate call with mandatory timeout, live runner lifecycle, spawned-child cross-shard proof, live supervision/restart, simulator replay, and a narrow Tokio current-thread backend for TCP/time so the same Tina-shaped workload can be compared against naive and hardened Tokio. Monoio remains the native thread-per-core backend candidate, but not the first blocker. |
-| **Gemini release story** | Deferred until Mercury makes the tryable runtime contract true. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
+| ~~**Mercury production-shaped runtime contract**~~ | Delivered in `.intent/phases/024-mercury-production-shaped-runtime-contract/`: bounded observed send, isolate-to-isolate call with mandatory timeout, live runner lifecycle, live supervision/restart, allocation probes, macros/devex cleanup, and Tokio-vs-Tina semantic comparisons. Mercury made the primitive sharper; it is not the final substrate story. |
+| ~~**Betelgeuse runtime substrate completion**~~ | Delivered in `.intent/phases/025-betelgeuse-runtime-substrate-completion/`: backend-honest `BetelgeuseRuntime` / `BetelgeuseMultiShardRuntime` names, shard-local Betelgeuse ownership, bounded ingress proof, live time/TCP completion semantics, live multi-shard bounded send, typed live cross-shard call rejection, narrow Betelgeuse simulated TCP backend with seeded delay/partial-write pressure, allocation probes, and oracle/sim/live parity tests. Tokio stays comparison/later bridge, not the main runtime story. |
+| **Tina TCP driver contract** | Planned in `.intent/phases/026-tina-driver-contract/`. Factor runtime-owned time/TCP behind a small Tina-owned driver boundary: timers, TCP submissions, completions, cancellation, shutdown, native Betelgeuse adapter, simulated Betelgeuse adapter, and proof that Tina semantics do not depend on one backend implementation. This is not a general async runtime and not a Tokio bridge. |
+| **Parallel substrate support** | Parallel/support phase in `.intent/phases/027-parallel-substrate-support/`. Polish Betelgeuse simulated I/O for possible upstreaming, add narrow substrate cost evidence, expand Tokio-vs-Tina constrained/backpressure comparisons, keep small API ergonomics honest, prepare external review prompts, research Tokio current-thread/Monoio/Glommio/Compio adapters, and refine README/story language without changing Tina core semantics. |
+| **Gemini release story** | Deferred until the Betelgeuse substrate story and Tina driver contract are true enough to explain. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
 | **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
 
 Real concurrent shard execution is a substrate story around Huygens, Mercury,
-and later runtime work, not something Galileo or Kepler quietly smuggled in.
+Betelgeuse substrate completion, the Tina driver contract, and later runtime
+work, not something Galileo or Kepler quietly smuggled in.
+
+027 is a parallel/support lane. It should not block 026 unless it finds a real
+contradiction in the substrate contract.
 Galileo and Kepler proved the multi-shard contract under one explicit global
 coordinator thread first. Huygens added the first worker-owned runtime
-substrate around that contract. Mercury decides and hardens the runtime
-contract enough that "try this for selected Tokio-shaped workloads" is a
-technical claim, not a docs claim.
+substrate around that contract. Mercury sharpened the overload/call contract.
+025 makes Betelgeuse the honest tryable runtime substrate instead of letting a
+Tokio bridge become the center of gravity by accident.
 
 ## Strategic prerequisites
 
@@ -274,59 +281,138 @@ workloads with bounded backpressure and synchronous effect-returning handlers.
 ## Phase Mercury
 > Overload lab and runtime contract. Prove Tina's primitive under constrained memory.
 
-> After: Phase Huygens · Before: Phase Gemini
+> After: Phase Huygens · Before: Phase Betelgeuse
 
 Mercury exists because Huygens proved the model and first live substrate, but
-not the proof app that makes Tina's value obvious. Do Mercury before
-release/docs polish.
+not the production-shaped overload/call contract that makes Tina's value
+obvious. Do Mercury before release/docs polish.
 
-- Build the overload lab: one stateful TCP-shaped service under tiny bounded
-  capacities, with a traffic spike, slow worker mode, recovery after overload,
-  and asserted latency/memory/backpressure outcomes.
 - Add user-visible send backpressure. App code must be able to react to
   `Accepted`, `Full`, and `Closed`, not only inspect trace after the fact.
 - Add isolate-to-isolate call with mandatory timeout for request/reply work.
 - Harden live runner lifecycle: start roots, run, drain/shutdown, worker error
   reporting, trace inspection, and bounded config.
-- Prove spawned-child cross-shard behavior on the live substrate, or add a
-  clear guard that prevents unsupported behavior.
-- Prove live supervision/restart on the threaded substrate: a worker panics,
+- Prove live supervision/restart on the Betelgeuse substrate: a worker panics,
   supervisor restarts it, and later work succeeds.
 - Run the same core Tina workload through deterministic simulator replay and
   the live runner.
-- Add a narrow Tokio current-thread backend for TCP/time only, so the overload
-  lab can run on a known, cross-platform Rust substrate without async handlers.
-- Compare against naive Tokio and hardened Tokio versions of the same workload:
-  the naive version should show the overload failure mode; the hardened version
-  should survive with explicit user discipline; Tina should survive by default
-  framework shape.
-- Keep `monoio` as the likely native thread-per-core backend candidate after
-  this proof. Do not block Mercury on a full monoio backend.
+- Compare against naive Tokio and hardened Tokio versions where useful, but do
+  not make Tokio the substrate story.
 - Pin capacity/allocation claims: either prove stronger runtime bounds or keep
   the claim explicitly narrower than Tina-Odin's no-hidden-allocation story.
-- Expose a small public-ish DST harness surface so users can test their own
-  isolate workloads under replay/checker pressure without depending on
-  crate-private test helpers.
 
 **Done when:** the repo can honestly say: "you can try replacing selected
 Tokio-shaped workloads with Tina when you want bounded queues, shard-owned
 state, timeout-based request/reply, deterministic testing, and a live
-thread-per-shard runtime path." Gemini must not start before this is true or
-explicitly narrowed.
+thread-per-shard runtime path." Betelgeuse substrate completion must not start
+from a fuzzy runtime claim.
+
+---
+
+## Phase Betelgeuse
+> Complete the real runtime substrate story.
+
+> After: Phase Mercury · Before: Phase Tina Driver Contract
+
+Betelgeuse exists because the core primitive should ride a real shard-local
+completion runtime before we talk about bridges, release polish, or broad
+adoption. The plan lives in
+`.intent/phases/025-betelgeuse-runtime-substrate-completion/plan.md`.
+
+- Treat Betelgeuse as the primary live substrate for this slice.
+- Keep the explicit-step runtime and `tina-sim` as the semantic oracle.
+- Rename or introduce backend-honest live runner names such as
+  `BetelgeuseRuntime` and `BetelgeuseMultiShardRuntime`.
+- Complete bounded ingress, shutdown, worker error, live time, live TCP, and
+  trace behavior on the Betelgeuse runner.
+- Add/use the narrow Betelgeuse simulated TCP backend for seeded substrate
+  pressure instead of inventing a second live chaos layer.
+- Prove live multi-shard bounded sends; implement or explicitly reject
+  cross-shard isolate calls on the live runner.
+- Pin allocation and cost numbers for the touched hot paths.
+- Do not build Tower/Axum, a Tokio bridge, arbitrary async handlers, or release
+  docs in this phase.
+
+**Done when:** Tina has a named Betelgeuse-backed live runtime substrate that
+runs the same synchronous-effect isolate code as the oracle/simulator, with
+bounded queues, runtime-owned time/TCP completions, seeded Betelgeuse simulated
+TCP proof for touched I/O paths, and honest non-claims where not.
+
+---
+
+## Phase Tina TCP Driver Contract
+> Own the small time/TCP substrate boundary without becoming an async runtime.
+
+> After: Phase Betelgeuse · Before: Phase Gemini
+
+This phase exists because Tina should not be accidentally coupled to one
+backend implementation. Betelgeuse is the best current substrate, but the
+Tina-owned runtime contract should be small enough that native Betelgeuse,
+simulated Betelgeuse, and later adapters can all plug in without changing
+isolate semantics.
+
+The plan lives in `.intent/phases/026-tina-driver-contract/plan.md`.
+
+- Define a narrow `Driver`-shaped boundary inside `tina-runtime` for timers,
+  TCP operations, completions, cancellation, shutdown, and wakeups.
+- Keep isolate handlers synchronous. Do not add futures, wakers, async
+  handlers, or arbitrary task spawning.
+- Preserve bounded ingress and bounded cross-shard transport as Tina semantics,
+  not backend conveniences.
+- Keep Betelgeuse as the first native adapter and Betelgeuse simulated I/O as
+  the deterministic adapter.
+- Prove the same user-shaped workloads on explicit runtime, native
+  Betelgeuse-backed runtime, and simulated-driver runtime.
+- Measure touched hot paths enough to know whether the abstraction added
+  meaningful allocation or dispatch cost.
+- Decide whether any actor-framework substrate can be reused as prior art only;
+  do not build Tina on Actix/Ractor/etc. unless they preserve explicit step,
+  bounded queues, and replay semantics.
+- Leave Tokio current-thread / Tower / Axum bridge work for Apollo unless this
+  phase discovers a tiny adapter seam that does not weaken the core contract.
+
+**Done when:** Tina has a backend-neutral runtime driver contract that is
+small, synchronous, bounded, testable with deterministic simulated I/O, and
+proved against the existing Betelgeuse path. The project can then explain its
+production path without saying "trust this one backend forever."
+
+---
+
+## Phase Parallel Substrate Support
+> Do safe support work beside the driver-contract phase.
+
+> Parallel With: Phase Tina TCP Driver Contract
+
+The plan lives in `.intent/phases/027-parallel-substrate-support/plan.md`.
+
+- Polish `betelgeuse::io::simulated` as generic Betelgeuse substrate code.
+- Add narrow allocation/performance probes for current hot paths.
+- Expand runnable Tokio-vs-Tina comparisons around constrained capacity,
+  backpressure, timeout, shutdown, and overload behavior.
+- Add only tiny API helpers/macros that preserve one preferred surface.
+- Prepare external review prompts and record review results.
+- Research Tokio current-thread, Monoio, Glommio, and Compio as possible future
+  adapters without implementing them.
+- Refine README/story language lightly while leaving full release docs for
+  Gemini.
+
+**Done when:** the support evidence helps 026 and later Apollo/Gemini without
+changing Tina core semantics or creating a second substrate direction.
 
 ---
 
 ## Phase Gemini
 > First crewed flight. Stabilize and publish the settled framework story.
 
-> After: Phase Mercury · Before: Phase Apollo
+> After: Phase Tina Driver Contract · Before: Phase Apollo
 
 - Publish a coherent `0.1.0` story for `tina`, `tina-mailbox-spsc`,
   `tina-supervisor`, `tina-runtime`, and `tina-sim`, or explicitly decide that
   the APIs are still private and not ready for semver promises. Kepler settled
   the core multi-shard primitive; Huygens proved the composed framework and
-  first runtime-substrate story; Mercury must make the tryable runtime contract
-  true before Gemini publishes or freezes it.
+  first runtime-substrate story; Mercury sharpened the overload/call contract;
+  Betelgeuse and the Tina driver contract must make the tryable runtime
+  substrate true before Gemini publishes or freezes it.
 - Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, task-dispatcher walkthrough, and TCP echo walkthrough.
 - Document the supported invariants for the core runtime/simulator model:
   delivery behavior, mailbox guarantees, supervision behavior, replayability,

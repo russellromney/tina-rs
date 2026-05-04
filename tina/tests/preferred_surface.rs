@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::convert::Infallible;
 
 use tina::{Mailbox, TrySendError, prelude::*};
 
@@ -34,17 +33,9 @@ enum ChildEvent {
 #[derive(Debug)]
 struct ChildWorker;
 
-impl Isolate for ChildWorker {
-    tina::isolate_types! {
-        message: ChildEvent,
-        reply: (),
-        send: Outbound<Infallible>,
-        spawn: Infallible,
-        call: Infallible,
-        shard: InlineShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+#[tina::isolate(message = ChildEvent, shard = InlineShard)]
+impl ChildWorker {
+    fn handle(&mut self, msg: ChildEvent, _ctx: &mut Context<'_, InlineShard>) -> Effect<Self> {
         match msg {
             ChildEvent::Begin => stop(),
         }
@@ -54,20 +45,18 @@ impl Isolate for ChildWorker {
 #[derive(Debug)]
 struct Session {
     notes: Vec<String>,
-    audit: Address<AuditEvent>,
+    audit: Address<AuditEvent, usize>,
 }
 
-impl Isolate for Session {
-    tina::isolate_types! {
-        message: Message,
-        reply: Vec<String>,
-        send: Outbound<AuditEvent>,
-        spawn: ChildDefinition<ChildWorker>,
-        call: Infallible,
-        shard: InlineShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+#[tina::isolate(
+    message = Message,
+    reply = Vec<String>,
+    send = Outbound<AuditEvent>,
+    spawn = ChildDefinition<ChildWorker>,
+    shard = InlineShard
+)]
+impl Session {
+    fn handle(&mut self, msg: Message, _ctx: &mut Context<'_, InlineShard>) -> Effect<Self> {
         match msg {
             Message::Note(note) => {
                 self.notes.push(note.clone());
@@ -126,7 +115,7 @@ impl<T> Mailbox<T> for LocalMailbox<T> {
 
 #[test]
 fn preferred_surface_helpers_build_expected_effects() {
-    let audit = Address::new(ShardId::new(3), IsolateId::new(41));
+    let audit = Address::new(ShardId::new(3), IsolateId::new(41)).with_reply::<usize>();
     let mut shard = InlineShard;
     let mut ctx = Context::new(&mut shard, IsolateId::new(7));
     let mut session = Session {
@@ -136,7 +125,7 @@ fn preferred_surface_helpers_build_expected_effects() {
 
     match session.handle(Message::Note("hello".to_owned()), &mut ctx) {
         Effect::Send(outbound) => {
-            assert_eq!(outbound.destination(), audit);
+            assert_eq!(outbound.destination(), audit.with_reply::<()>());
             assert_eq!(
                 outbound.message(),
                 &AuditEvent::Recorded("hello".to_owned())

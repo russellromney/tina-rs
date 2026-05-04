@@ -92,6 +92,10 @@ impl IoBackend {
     pub(crate) fn new() -> Self {
         let io_loop =
             io_loop(Global).expect("failed to initialise Betelgeuse IO loop for tina-runtime");
+        Self::with_io_loop(io_loop)
+    }
+
+    pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
             io_loop,
             next_listener_id: 1,
@@ -190,6 +194,15 @@ impl IoBackend {
     /// completions.
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// Drops pending backend operations during runtime shutdown.
+    ///
+    /// Tina emits requester-facing shutdown/cancel trace events from
+    /// `Runtime`; the backend only owns the substrate completion slots and
+    /// resource handles.
+    pub(crate) fn cancel_pending(&mut self) {
+        self.pending.clear();
     }
 
     #[cfg(test)]

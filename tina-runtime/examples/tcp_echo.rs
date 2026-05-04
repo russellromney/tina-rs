@@ -21,7 +21,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
@@ -31,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use tina::{Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
 use tina_runtime::{
-    CallKind, ListenerId, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    StreamId, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    CallKind, ListenerId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind, StreamId,
+    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -114,17 +113,13 @@ struct Connection {
     pending_write: Vec<u8>,
 }
 
-impl Isolate for Connection {
-    tina::isolate_types! {
-        message: ConnectionEvent,
-        reply: (),
-        send: Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<ConnectionEvent>,
-        shard: ExampleShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+#[tina_runtime::isolate(message = ConnectionEvent, shard = ExampleShard)]
+impl Connection {
+    fn handle(
+        &mut self,
+        msg: ConnectionEvent,
+        _ctx: &mut Context<'_, ExampleShard>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionEvent::Begin => read_call(self.stream, self.max_chunk),
             ConnectionEvent::Read(bytes) => {
@@ -196,17 +191,14 @@ struct Listener {
     listener: Option<ListenerId>,
 }
 
-impl Isolate for Listener {
-    tina::isolate_types! {
-        message: ListenerEvent,
-        reply: (),
-        send: Outbound<ListenerEvent>,
-        spawn: RestartableChildDefinition<Connection>,
-        call: RuntimeCall<ListenerEvent>,
-        shard: ExampleShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+#[tina_runtime::isolate(
+    message = ListenerEvent,
+    send = Outbound<ListenerEvent>,
+    spawn = RestartableChildDefinition<Connection>,
+    shard = ExampleShard
+)]
+impl Listener {
+    fn handle(&mut self, msg: ListenerEvent, ctx: &mut Context<'_, ExampleShard>) -> Effect<Self> {
         match msg {
             ListenerEvent::Start => {
                 let addr = self.bind_addr;

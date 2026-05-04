@@ -253,8 +253,8 @@ are real `tina` public-boundary changes, not just internal rename work.
     - separate `evidence.md` with diff references, or
     - PR descriptions only (weakest, not recommended).
     The "devex scorecard" in How We Will Prove It is excellent and
-    concrete. Promote it from a proof-list bullet to a required
-    closeout artifact and pin where it lives.
+    concrete. Promote it from a proof-list bullet to required final evidence
+    in `review.md`.
 
 18. **`Isolate::Spawn` associated type stays — say so explicitly.**
     `Isolate` has `type Spawn = SpawnSpec<I>;` (or `Infallible`, or
@@ -292,11 +292,11 @@ are real `tina` public-boundary changes, not just internal rename work.
   next to it (correlation ids, headers), and a future phase has to
   either grow `Envelope` to match the name or rename it again.
   Mitigation: finding 4.
-- The before/after evidence in closeout consists of three small
+- The before/after final evidence consists of three small
   snippet pairs from the named examples and a vague claim that "the
   preferred path is preferred." A real reader cannot judge whether
   Tokio readability has actually been approached. Mitigation:
-  finding 17 — promote the devex scorecard to a closeout artifact.
+  finding 17 — promote the devex scorecard to final evidence in `review.md`.
 - The downstream consumer proof was deferred under "if needed" and
   was not added; the only proof of re-export correctness is the
   in-repo examples. A user who imports only `tina::prelude` finds a
@@ -383,8 +383,8 @@ Amend the plan before implementation begins to:
 15. State that typed helpers work unchanged in `tina-sim` workloads.
 16. Acknowledge that `Runtime` will become a per-crate token; the
     prelude re-exports only one as the unqualified default.
-17. Promote the devex scorecard from a proof-list bullet to a
-    required closeout artifact and pin where it lives.
+17. Promote the devex scorecard from a proof-list bullet to required final
+    evidence in `review.md`.
 18. State that `Isolate::Spawn` associated type name stays.
 
 Findings 3, 4, 5 involve `tina` boundary changes that are real
@@ -472,11 +472,11 @@ Closed (15/18):
     Minor; the implication is fine in practice (per-crate `Runtime`
     type, `tina::prelude` re-exports the single-shard one as the
     default). Could be flagged with one line.
-17. **Devex scorecard as required closeout artifact** — partially
+17. **Devex scorecard as required final evidence** — partially
     closed. The scorecard remains a proof-list bullet, not promoted
-    to a standalone required artifact section. In combination with
-    Done Means it is effectively required, but a future closeout
-    review will have to reconstruct that combination.
+    to a standalone final evidence section in `review.md`. In combination
+    with Done Means it is effectively required, but a future review will have
+    to reconstruct that combination.
 18. **`Isolate::Spawn` associated type stays** — not explicitly
     addressed. Minor; the rename pass does not list it, and `type
     Spawn = ChildDefinition<I>` still works.
@@ -584,8 +584,8 @@ block handoff:
   (Plan Review 1 finding 15).
 - Acknowledge the per-crate `Runtime` token (Plan Review 1
   finding 16).
-- Promote the devex scorecard from a proof bullet to a required
-  closeout artifact heading (Plan Review 1 finding 17).
+- Promote the devex scorecard from a proof bullet to required final evidence
+  in `review.md` (Plan Review 1 finding 17).
 - Note that `Isolate::Spawn` associated type name itself stays (Plan
   Review 1 finding 18).
 

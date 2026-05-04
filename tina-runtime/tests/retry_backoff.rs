@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, sleep,
+    CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, sleep_then,
 };
 
 #[derive(Debug, Default)]
@@ -122,7 +122,7 @@ impl Isolate for RetryWorker {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Failed(self.attempts));
-                    sleep(self.backoff).reply(|_| RetryEvent::RetryNow)
+                    sleep_then(self.backoff, RetryEvent::RetryNow)
                 } else {
                     self.observations
                         .borrow_mut()

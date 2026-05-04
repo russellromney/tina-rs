@@ -118,6 +118,16 @@ pub enum CallCompletionRejectedReason {
     RequesterClosed,
 }
 
+/// Why a reply from a callee could not complete its original isolate call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallReplyRejectedReason {
+    /// The call was no longer pending by the time the callee replied.
+    ///
+    /// This usually means the caller's timeout already fired, or the call was
+    /// otherwise settled before the reply arrived.
+    NoPendingCall,
+}
+
 /// Why a local send could not be enqueued into the target mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SendRejectedReason {
@@ -351,6 +361,16 @@ pub enum RuntimeEventKind {
 
         /// Why the completion could not be delivered.
         reason: CallCompletionRejectedReason,
+    },
+
+    /// The runtime observed a reply from a callee, but the original
+    /// isolate-to-isolate call was no longer pending.
+    CallReplyRejected {
+        /// The runtime-assigned identifier for the original call.
+        call_id: CallId,
+
+        /// Why the reply could not settle the call.
+        reason: CallReplyRejectedReason,
     },
 }
 

@@ -195,7 +195,7 @@ The baseline is honest. Kepler can stand on those without re-proving.
     Adding the section keeps Kepler reviewable in the same
     vocabulary as prior phases.
 
-12. **Done Means lacks closeout-artifact specifics.**
+12. **Done Means lacks final-evidence specifics.**
     020's Done Means named concrete tests and SYSTEM.md
     sections. 022's Done Means says "directly proved" but
     not "via test names X, Y, Z" or "via SYSTEM.md sections
@@ -319,7 +319,7 @@ Amend the plan before implementation begins to:
 10. Add at least one concrete example to the boundary-
     change guidance lists.
 11. Add a proof-modes section using 016-020's vocabulary.
-12. Sharpen Done Means with named closeout artifacts
+12. Sharpen Done Means with named final evidence
     (test names, SYSTEM.md sections).
 13. State explicitly whether the phase frame is
     "completion" or "settlement."
@@ -341,7 +341,7 @@ simulator code. Read the implementation changes in:
 - `tina-runtime-current/tests/multishard_allocation.rs`
 - `tina-sim/src/lib.rs`
 - `.intent/SYSTEM.md`
-- `.intent/phases/022-kepler-core-primitive-completion/closeout.md`
+- final evidence section in this `review.md`
 - `CHANGELOG.md`
 
 ### Findings
@@ -409,3 +409,36 @@ Both passed on the reviewed tree.
   should fail and force the claim to be updated.
 - Real substrate liveness, peer quarantine, shard restart broadcast semantics,
   and cross-shard child placement remain deferred by design.
+
+## Final Evidence
+
+Kepler closes as settlement by sealing. No public `tina` boundary change was
+needed.
+
+Sealed rules:
+
+- no shard/peer liveness signal
+- no cross-shard child ownership
+- no broad runtime allocation-free claim
+- no broad cross-shard fault language
+
+Peer/shard liveness: a bad remote address is an address-local failure, not a
+destination-shard failure. Direct proofs include
+`cross_shard_unknown_isolate_does_not_poison_destination_shard`,
+`cross_shard_simulation_unknown_isolate_does_not_poison_destination_shard`,
+`dispatcher_worker_workload_continues_after_bad_remote_address_on_same_shard`,
+`multishard_dispatcher_workload_continues_after_bad_remote_address_on_same_shard`,
+`multishard_checker_accepts_address_local_remote_failure_then_good_traffic`,
+and `multishard_checker_failure_replays_for_address_local_liveness_bug`.
+
+Supervision boundary: root supervision routes to the owning shard. Children
+spawned by that parent belong to the parent's shard. Restart policy applies to
+direct children on that same shard. Direct proofs:
+`multishard_supervision_keeps_children_on_parent_shard` and
+`multishard_simulation_supervision_keeps_children_on_parent_shard`.
+
+Ownership and buffering: cross-shard sends move user payloads into erased
+runtime storage, then through the bounded shard-pair queue, then into the
+destination mailbox. Core cross-shard transport does not require
+user-message cloning. The allocation non-claim is pinned by
+`multishard_runtime_path_still_has_allocations_so_the_claim_stays_narrow`.

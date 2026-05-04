@@ -2310,7 +2310,7 @@ impl Isolate for ManualCallTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManualCallCallerMsg {
-    Start(Address<ManualCallRequest>),
+    Start(Address<ManualCallRequest, ManualCallReply>),
     Returned(CallOutcome<ManualCallReply>),
 }
 

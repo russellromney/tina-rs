@@ -20,7 +20,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::convert::Infallible;
 use std::panic;
 use std::rc::Rc;
 
@@ -146,17 +145,13 @@ struct Worker {
     completed: Rc<RefCell<Vec<(IsolateId, u32)>>>,
 }
 
-impl Isolate for Worker {
-    tina::isolate_types! {
-        message: WorkerEvent,
-        reply: (),
-        send: Outbound<NeverOutbound>,
-        spawn: Infallible,
-        call: Infallible,
-        shard: DemoShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+#[tina::isolate(
+    message = WorkerEvent,
+    send = Outbound<NeverOutbound>,
+    shard = DemoShard
+)]
+impl Worker {
+    fn handle(&mut self, msg: WorkerEvent, ctx: &mut Context<'_, DemoShard>) -> Effect<Self> {
         match msg {
             WorkerEvent::Run(Task::Normal(value)) => {
                 self.completed.borrow_mut().push((ctx.isolate_id(), value));
@@ -173,17 +168,14 @@ struct Dispatcher {
     completed: Rc<RefCell<Vec<(IsolateId, u32)>>>,
 }
 
-impl Isolate for Dispatcher {
-    tina::isolate_types! {
-        message: DispatcherEvent,
-        reply: (),
-        send: Outbound<RegistryEvent>,
-        spawn: RestartableChildDefinition<Worker>,
-        call: Infallible,
-        shard: DemoShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+#[tina::isolate(
+    message = DispatcherEvent,
+    send = Outbound<RegistryEvent>,
+    spawn = RestartableChildDefinition<Worker>,
+    shard = DemoShard
+)]
+impl Dispatcher {
+    fn handle(&mut self, msg: DispatcherEvent, _ctx: &mut Context<'_, DemoShard>) -> Effect<Self> {
         match msg {
             DispatcherEvent::SpawnWorker => {
                 let completed = Rc::clone(&self.completed);
@@ -206,17 +198,13 @@ struct Registry {
     addresses: HashMap<u32, Address<WorkerEvent>>,
 }
 
-impl Isolate for Registry {
-    tina::isolate_types! {
-        message: RegistryEvent,
-        reply: (),
-        send: Outbound<WorkerEvent>,
-        spawn: Infallible,
-        call: Infallible,
-        shard: DemoShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+#[tina::isolate(
+    message = RegistryEvent,
+    send = Outbound<WorkerEvent>,
+    shard = DemoShard
+)]
+impl Registry {
+    fn handle(&mut self, msg: RegistryEvent, _ctx: &mut Context<'_, DemoShard>) -> Effect<Self> {
         match msg {
             RegistryEvent::Register { slot, address } => {
                 self.addresses.insert(slot, address);

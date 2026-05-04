@@ -56,8 +56,9 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
-    EffectKind, ListenerId, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
-    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason,
+    CallReplyRejectedReason, EffectKind, ListenerId, RestartSkippedReason, RuntimeCall,
+    RuntimeCallParts, RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason,
+    SupervisionRejectedReason,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -961,7 +962,7 @@ where
     /// 016 intentionally requires spawnless isolates that use the current
     /// runtime's timer-aware call vocabulary and local `Outbound` sends.
     #[allow(private_bounds)]
-    pub fn register<I, Msg, Outbound>(&mut self, isolate: I) -> Address<Msg>
+    pub fn register<I, Msg, Outbound>(&mut self, isolate: I) -> Address<Msg, I::Reply>
     where
         I: Isolate<
                 Message = Msg,
@@ -984,7 +985,7 @@ where
         &mut self,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> Address<Msg>
+    ) -> Address<Msg, I::Reply>
     where
         I: Isolate<
                 Message = Msg,
@@ -1006,7 +1007,7 @@ where
     /// The simulator mirrors `tina-runtime`: supervision applies to
     /// direct children only, and reconfiguring a parent resets the
     /// runtime-lifetime restart budget tracker.
-    pub fn supervise<M: 'static>(&mut self, parent: Address<M>, config: SupervisorConfig) {
+    pub fn supervise<M: 'static, R>(&mut self, parent: Address<M, R>, config: SupervisorConfig) {
         let parent = self.checked_registered_address(parent, "supervise");
         let budget_state = config.budget().tracker();
 
@@ -1028,9 +1029,9 @@ where
     }
 
     /// Attempts to inject one typed message into a registered isolate.
-    pub fn try_send<M: 'static>(
+    pub fn try_send<M: 'static, R>(
         &self,
-        address: Address<M>,
+        address: Address<M, R>,
         message: M,
     ) -> Result<(), TrySendError<M>> {
         if address.shard() != self.shard.id() {
@@ -1414,8 +1415,9 @@ where
                         self.push_event(
                             isolate_id,
                             Some(cause),
-                            RuntimeEventKind::EffectObserved {
-                                effect: EffectKind::Reply,
+                            RuntimeEventKind::CallReplyRejected {
+                                call_id: context.call_id,
+                                reason: CallReplyRejectedReason::NoPendingCall,
                             },
                         );
                     }
@@ -1745,9 +1747,9 @@ where
         }
     }
 
-    fn checked_registered_address<M: 'static>(
+    fn checked_registered_address<M: 'static, R>(
         &self,
-        address: Address<M>,
+        address: Address<M, R>,
         operation: &str,
     ) -> RegisteredAddress {
         if address.shard() != self.shard.id() {
@@ -3421,7 +3423,11 @@ where
 
     /// Registers one root isolate on the requested owning shard.
     #[allow(private_bounds)]
-    pub fn register_on<I, Msg, Outbound>(&mut self, shard: ShardId, isolate: I) -> Address<Msg>
+    pub fn register_on<I, Msg, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+    ) -> Address<Msg, I::Reply>
     where
         I: Isolate<
                 Message = Msg,
@@ -3446,7 +3452,7 @@ where
         shard: ShardId,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> Address<Msg>
+    ) -> Address<Msg, I::Reply>
     where
         I: Isolate<
                 Message = Msg,
@@ -3464,14 +3470,14 @@ where
     }
 
     /// Configures a registered isolate as supervisor on its owning shard.
-    pub fn supervise<M: 'static>(&mut self, parent: Address<M>, config: SupervisorConfig) {
+    pub fn supervise<M: 'static, R>(&mut self, parent: Address<M, R>, config: SupervisorConfig) {
         self.simulator_mut(parent.shard()).supervise(parent, config);
     }
 
     /// Attempts one typed global ingress send routed strictly by target shard.
-    pub fn try_send<M: 'static>(
+    pub fn try_send<M: 'static, R>(
         &self,
-        address: Address<M>,
+        address: Address<M, R>,
         message: M,
     ) -> Result<(), TrySendError<M>> {
         self.simulator(address.shard()).try_send(address, message)

@@ -32,7 +32,7 @@ supporting real `local_addr` and `peer_addr` on the Betelgeuse-backed runtime.
 4. Update tests and example:
    - `tcp_echo.rs` returns to `127.0.0.1:0`
    - prove the returned address is the real connect target
-5. Update docs and closeout artifacts.
+5. Update docs and final evidence in `review.md`.
 
 ## Verification
 

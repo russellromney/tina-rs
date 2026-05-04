@@ -367,7 +367,7 @@ impl<M> RuntimeCall<M> {
     /// through `translator`. This preserves Tina's effect-returning handler
     /// model: the current handler turn still returns a description of work,
     /// and overload feedback comes back as an ordinary later message.
-    pub fn observed_send<T, F>(destination: Address<T>, message: T, translator: F) -> Self
+    pub fn observed_send<T, R, F>(destination: Address<T, R>, message: T, translator: F) -> Self
     where
         T: Send + 'static,
         F: FnOnce(SendOutcome) -> M + 'static,
@@ -397,7 +397,7 @@ impl<M> RuntimeCall<M> {
     /// message cannot be delivered because the requester stopped or its
     /// mailbox filled.
     pub fn isolate_call<T, R, F>(
-        destination: Address<T>,
+        destination: Address<T, R>,
         message: T,
         timeout: Duration,
         translator: F,
@@ -798,7 +798,7 @@ pub struct ObservedSend<T> {
 /// Prepared isolate-call helper returned by [`call`].
 #[doc(hidden)]
 pub struct IsolateCall<T, R> {
-    destination: Address<T>,
+    destination: Address<T, R>,
     message: T,
     timeout: Duration,
     marker: std::marker::PhantomData<fn() -> R>,
@@ -808,9 +808,9 @@ impl<T> ObservedSend<T>
 where
     T: Send + 'static,
 {
-    fn new(destination: Address<T>, message: T) -> Self {
+    fn new<R>(destination: Address<T, R>, message: T) -> Self {
         Self {
-            destination,
+            destination: destination.with_reply::<()>(),
             message,
         }
     }
@@ -837,7 +837,7 @@ where
 /// source shard accepted the message into bounded transport toward the target
 /// shard; destination-local mailbox failure is still recorded on the
 /// destination trace.
-pub fn send_observed<T>(destination: Address<T>, message: T) -> ObservedSend<T>
+pub fn send_observed<T, R>(destination: Address<T, R>, message: T) -> ObservedSend<T>
 where
     T: Send + 'static,
 {
@@ -849,7 +849,7 @@ where
     T: Send + 'static,
     R: 'static,
 {
-    fn new(destination: Address<T>, message: T, timeout: Duration) -> Self {
+    fn new(destination: Address<T, R>, message: T, timeout: Duration) -> Self {
         Self {
             destination,
             message,
@@ -881,12 +881,70 @@ where
 /// call-reply transport exists. Keep the `.reply(...)` translator pure: it may
 /// run even when the translated message is later rejected by the requester's
 /// mailbox.
-pub fn call<T, R>(destination: Address<T>, message: T, timeout: Duration) -> IsolateCall<T, R>
+///
+/// ```compile_fail
+/// use std::time::Duration;
+///
+/// use tina::{Address, IsolateId, ShardId};
+/// use tina_runtime::{call, CallOutcome};
+///
+/// enum Request {
+///     Ask,
+/// }
+/// struct CorrectReply;
+/// struct WrongReply;
+///
+/// let target: Address<Request, CorrectReply> =
+///     Address::new_with_generation(ShardId::new(0), IsolateId::new(1), tina::AddressGeneration::new(0));
+/// let _bad = call::<Request, WrongReply>(target, Request::Ask, Duration::from_millis(1));
+/// ```
+pub fn call<T, R>(destination: Address<T, R>, message: T, timeout: Duration) -> IsolateCall<T, R>
 where
     T: Send + 'static,
     R: 'static,
 {
     IsolateCall::new(destination, message, timeout)
+}
+
+/// Returns a sleep effect that ignores the infallible timer payload and
+/// delivers `message` back later.
+///
+/// This is the small common path for "wait, then continue" state machines.
+pub fn sleep_then<I, M>(after: Duration, message: M) -> tina::Effect<I>
+where
+    I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+    M: 'static,
+{
+    sleep(after).reply(move |_| message)
+}
+
+impl<T> CallOutcome<T> {
+    /// Converts a call outcome into the successful reply or a call error.
+    pub fn into_result(self) -> Result<T, CallError> {
+        match self {
+            Self::Replied(reply) => Ok(reply),
+            Self::Full => Err(CallError::TargetFull),
+            Self::Closed => Err(CallError::TargetClosed),
+            Self::Timeout => Err(CallError::Timeout),
+        }
+    }
+}
+
+impl SendOutcome {
+    /// Returns whether the send was accepted by the runtime boundary.
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+
+    /// Returns whether the send hit bounded backpressure.
+    pub const fn is_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Returns whether the target was closed or stale.
+    pub const fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
 }
 
 impl<T> TypedCall<T> {

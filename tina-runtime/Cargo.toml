@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tina = { path = "../tina" }
+tina-macros = { path = "../tina-macros" }
 tina-supervisor = { path = "../tina-supervisor" }
 # Phase Mariner substrate target. Vendored from Pekka Enberg's Betelgeuse with
 # a tiny local address-introspection patch (`local_addr` / `peer_addr`) so the

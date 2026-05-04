@@ -7,7 +7,22 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tina::{Mailbox, TrySendError, prelude::*};
-use tina_runtime::{MailboxFactory, MultiShardRuntime};
+use tina_runtime::{
+    BetelgeuseRuntime, CallOutcome, MailboxFactory, MultiShardRuntime, Runtime, RuntimeCall, call,
+};
+
+const EXPECTED_MULTISHARD_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 15,
+    reallocations: 2,
+};
+const EXPECTED_ISOLATE_CALL_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
+    allocations: 9,
+    reallocations: 1,
+};
+const EXPECTED_BETELGEUSE_INGRESS_HANDOFF: AllocationSnapshot = AllocationSnapshot {
+    allocations: 1,
+    reallocations: 0,
+};
 
 struct CountingAllocator;
 
@@ -170,6 +185,64 @@ impl Isolate for AllocationSink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallRequest {
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallReply;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallClientMsg {
+    Start(Address<CallRequest, CallReply>),
+    Returned(CallOutcome<CallReply>),
+}
+
+#[derive(Debug)]
+struct CallTarget;
+
+#[derive(Debug)]
+struct CallClient;
+
+impl Isolate for CallTarget {
+    tina::isolate_types! {
+        message: CallRequest,
+        reply: CallReply,
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<CallRequest>,
+        shard: AllocationShard,
+    }
+
+    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        reply(CallReply)
+    }
+}
+
+impl Isolate for CallClient {
+    tina::isolate_types! {
+        message: CallClientMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<CallClientMsg>,
+        shard: AllocationShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            CallClientMsg::Start(target) => call(
+                target,
+                CallRequest::Ask,
+                std::time::Duration::from_millis(10),
+            )
+            .reply(CallClientMsg::Returned),
+            CallClientMsg::Returned(_) => noop(),
+        }
+    }
+}
+
 #[test]
 fn multishard_runtime_path_still_has_allocations_so_the_claim_stays_narrow() {
     let _guard = ALLOCATION_TEST_GUARD
@@ -200,9 +273,63 @@ fn multishard_runtime_path_still_has_allocations_so_the_claim_stays_narrow() {
         runtime.step();
         runtime.step();
     });
-
-    assert!(
-        hot_path.allocations > 0 || hot_path.reallocations > 0,
-        "if the multi-shard runtime path becomes allocation-free, update the runtime allocation claim"
+    assert_eq!(
+        hot_path, EXPECTED_MULTISHARD_HOT_PATH,
+        "multi-shard hot path allocation count changed; update the runtime allocation claim"
     );
+}
+
+#[test]
+fn isolate_call_path_still_has_allocations_so_the_claim_stays_narrow() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let target = runtime.register_with_capacity::<CallTarget, Infallible>(CallTarget, 8);
+    let client = runtime.register_with_capacity::<CallClient, Infallible>(CallClient, 8);
+
+    runtime
+        .try_send(client, CallClientMsg::Start(target))
+        .unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+
+    runtime
+        .try_send(client, CallClientMsg::Start(target))
+        .unwrap();
+    let hot_path = measure_allocations(|| {
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(runtime.step(), 1);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_ISOLATE_CALL_HOT_PATH,
+        "isolate-call hot path allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn betelgeuse_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let runtime = BetelgeuseRuntime::new(AllocationShard(11), TestMailboxFactory);
+    let sink = runtime
+        .register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 8)
+        .expect("sink register accepts");
+
+    runtime.try_send(sink, AllocationEvent::Arrived).unwrap();
+    while runtime.has_in_flight_calls().unwrap() {
+        std::thread::yield_now();
+    }
+
+    let handoff = measure_allocations(|| {
+        runtime.try_send(sink, AllocationEvent::Arrived).unwrap();
+    });
+    assert_eq!(
+        handoff, EXPECTED_BETELGEUSE_INGRESS_HANDOFF,
+        "Betelgeuse ingress handoff allocation count changed; this measures the caller thread only"
+    );
+    let _ = runtime.shutdown();
 }

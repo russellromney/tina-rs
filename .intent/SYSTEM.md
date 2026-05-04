@@ -25,7 +25,7 @@ The big ideas are:
 `tina-rs` is not trying to replace Tokio or monoio wholesale. It is the Tina
 rule set as Rust crates: isolate state, explicit effects, bounded queues,
 supervision, deterministic simulation, and shard-owned runtime execution.
-Threaded runtime substrates must preserve those rules instead of becoming a
+Live runtime substrates must preserve those rules instead of becoming a
 generic async scheduler.
 
 ## Where this came from
@@ -57,8 +57,9 @@ The normal user path is the prelude:
 - helpers such as `send`, `reply`, `spawn`, `stop`, `batch`, and `noop`
 - context helpers such as `ctx.me()` and `ctx.send_self(...)`
 - typed runtime calls such as `sleep(...).reply(...)`
-- `tina::isolate_types! { ... }` when it removes associated-type boilerplate
-  without hiding meaning
+- `#[tina::isolate(...)]` or `#[tina_runtime::isolate(...)]` for ordinary
+  isolate impls; `tina::isolate_types! { ... }` remains the explicit low-level
+  escape hatch
 
 Low-level constructors still exist for tests and advanced consumers, but they
 are not the teaching path.
@@ -86,13 +87,22 @@ tracing, time calls, and Betelgeuse-backed TCP calls. Its `step()` is
 synchronous from the outside: the runtime collects finished owned work,
 translates completions into messages, and then handles ready mailbox work.
 
-`tina-runtime` also has a narrow live substrate: `ThreadedRuntime` for one
-shard and `ThreadedMultiShardRuntime` for a fixed shard set. Each shard runtime
+`tina-runtime` also has a narrow live substrate: `BetelgeuseRuntime` for one
+shard and `BetelgeuseMultiShardRuntime` for a fixed shard set. Each shard runtime
 is constructed and owned by one OS worker thread; handles communicate through
 bounded command queues. Live cross-shard sends move `Send + 'static` payloads
 through those bounded worker queues. This is an execution path, not a second
 semantic model: the explicit-step runtime and simulator remain the oracle.
-Peer quarantine and cross-shard child ownership are not claimed.
+Peer quarantine, cross-shard child ownership, and live cross-shard isolate-call
+reply transport are not claimed. Live cross-shard isolate calls reject with the
+same-shard-only call outcome until a later phase designs reply transport.
+
+The vendored Betelgeuse backend has a completion-driven native I/O shape that
+fits Tina, plus a narrow deterministic simulated TCP backend used for
+substrate proof. `tina-sim` remains the broad semantic oracle; the Betelgeuse
+simulated backend proves the same runtime-owned TCP effects can run through a
+seeded, step-driven substrate without OS sockets. Broader live-substrate
+liveness faults are not claimed.
 
 The shipped runtime call types are `RuntimeCall<Message>` over
 `CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep
@@ -148,7 +158,7 @@ Peer quarantine and shard-restart rules are still later design work.
 
 There is not yet a Tokio bridge, and the bridge is not the main runtime story.
 The runtime call types do not pick a backend, so the simulator, the current
-runtime, the threaded substrate, and later runtimes can share one meaning
+runtime, the Betelgeuse substrate, and later runtimes can share one meaning
 model.
 
 ## Crate boundaries that must not drift

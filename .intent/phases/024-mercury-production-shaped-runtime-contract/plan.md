@@ -261,7 +261,7 @@ overload lab and future users do not depend on private test-only glue.
      users
 11. **Closeout**
    - update SYSTEM/ROADMAP/CHANGELOG
-   - write closeout matrix
+   - write final evidence matrix in `review.md`
    - run `make verify`
 
 ## Pause Gates
@@ -314,5 +314,5 @@ Mercury is done when:
   lands; if not, their design remains pinned for the backend follow-up
 - capacity/allocation claims are honest and evidence-backed
 - a tiny public-ish DST harness exists if overload lab needs reusable glue
-- SYSTEM/ROADMAP/CHANGELOG and closeout record exact claims/non-claims
+- SYSTEM/ROADMAP/CHANGELOG and `review.md` record exact claims/non-claims
 - `make verify` passes
