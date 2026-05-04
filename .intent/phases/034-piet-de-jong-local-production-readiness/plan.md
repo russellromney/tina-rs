@@ -50,6 +50,69 @@ to Tina and it mostly works":
 
 This phase attacks those five directly.
 
+## Pinned Intended Surface
+
+Piet's preferred live app surface is `tina_runtime::LocalApp`.
+
+Expected ownership shape:
+
+- `LocalApp` lives in `tina-runtime` and is the canonical live owner for local
+  Tina services.
+- `BetelgeuseBackedRuntime` and `BetelgeuseBackedMultiShardRuntime` remain
+  lower-level backend-honest runners.
+- `tina_tokio_bridge::BridgeHost` becomes the bridge crate's wrapper around a
+  `LocalApp`-owned runtime, not a competing app owner.
+- Single-shard and multi-shard use sibling builders under one name:
+  `LocalApp::single_shard(...)` and `LocalApp::multi_shard(...)`.
+- Shutdown returns a terminal report with final lifecycle state, worker result,
+  terminal trace/sink view, cancellation/drain counts, and any worker panic.
+
+Intended single-shard shape:
+
+```rust
+let mut app = LocalApp::single_shard(AppShard, AppMailboxFactory)
+    .ingress_capacity(1024)
+    .trace_retention(TraceRetention::Bounded(4096))
+    .build();
+
+let users = app.register_root(UserService::new(), 256)?;
+let result = app.try_send(users, UserMsg::Join("llama-7".into()))?;
+assert!(result.is_accepted());
+
+let terminal = app.shutdown().drain().join()?;
+assert_eq!(terminal.state(), LocalAppState::Closed);
+```
+
+Intended multi-shard shape:
+
+```rust
+let mut app = LocalApp::multi_shard(AppMailboxFactory)
+    .shard(AppShard::Ingress)
+    .shard(AppShard::Workers)
+    .ingress_capacity(1024)
+    .shard_pair_capacity(256)
+    .trace_retention(TraceRetention::Bounded(8192))
+    .build();
+
+let ingress = app.register_root_on(AppShard::Ingress, Ingress::new(), 256)?;
+let worker = app.register_root_on(AppShard::Workers, Worker::new(), 256)?;
+app.link("ingress-to-worker", ingress, worker)?;
+```
+
+Intended bridge shape:
+
+```rust
+let mut app = LocalApp::single_shard(AppShard, AppMailboxFactory).build();
+let service = app.register_root(LlamaService::new(), 256)?;
+
+let tower_service = BridgeHost::from_app(app)
+    .register_tower_service(service, BridgeConfig::default())?;
+```
+
+These sketches are rails, not final syntax. Implementation may tighten names if
+code demands it, but it should preserve this ownership story: app owner first,
+backend runner underneath, Tower bridge at the edge.
+
 ## Rock 1: Driver-Runtime Substrate Maturity
 
 Turn the current driver-runtime contract into a boring local service substrate.
@@ -94,9 +157,19 @@ Proof:
 
 Make the bridge a useful adoption layer, not a toy edge.
 
+Pinned boundary:
+
+- Tower `Service` is the canonical bridge boundary.
+- Axum is the first proof adapter on top of Tower.
+- Tina bridge code does not chase Axum-specific routing, extraction, or response
+  features beyond what the Tower boundary can naturally support.
+- `poll_ready` reports bridge health/closed state only; bounded queue admission
+  remains a call-time fact unless Piet adds a real capacity probe.
+
 Implement or pin:
 
-- one canonical Axum/Tower service helper for "Tokio HTTP enters Tina";
+- one canonical Tower service helper for "Tokio HTTP enters Tina";
+- one Axum proof adapter that uses the Tower helper;
 - request extraction and response mapping helpers that do not hide capacity or
   timeout;
 - bridge support for services that use runtime-owned time/TCP/spawn/isolate-call
@@ -129,6 +202,19 @@ Proof:
 - compile-fail guardrails for async handler misuse, non-`Send` bridge messages,
   wrong response type, and missing timeout where the bridge can catch it.
 
+Bridge cancellation truth table:
+
+| State | Behavior |
+|---|---|
+| Before queue admission | Do not enqueue; caller observes cancel/timeout/closed. |
+| Admitted to bridge queue but not runtime queue | Drop/skip before Tina sees it; no user state mutation. |
+| In target mailbox but handler not started | `BridgeGuard` skips handler; no user state mutation. |
+| Synchronous handler running | Not preempted. Handler turn completes because Tina handlers are synchronous. |
+| Waiting for response after caller timeout/cancel | Late response is rejected/observed and metrics record it. |
+| Response already delivered | Cancellation has no effect. |
+
+The bridge must not claim stronger cancellation than this.
+
 ## Rock 3: Production Hardening
 
 Make "does this pass the real gate?" boring.
@@ -148,8 +234,16 @@ Implement or pin:
 
 Expected direction:
 
-- default CI should run a strong but reasonable workspace gate;
-- expensive stress/Miri/Loom can be nightly/manual if named and reproducible;
+- required GitHub Actions job is `.github/workflows/verify.yml` running
+  `make verify` on the supported host matrix;
+- required local mirror is `make verify`;
+- `make verify` must include the compile/doc/test gate that the repo treats as
+  ordinary correctness;
+- compile-fail/trybuild coverage is required if already part of `make verify`;
+- stress, Loom, and Miri are separate manual or nightly-only gates unless this
+  phase proves they are cheap enough for the default CI path;
+- claimed live-substrate platforms are exactly the platforms in the required CI
+  matrix; any OS not in that matrix is a non-claim;
 - no "works on my machine" production claim.
 
 Proof:
@@ -177,12 +271,18 @@ Measure and gate selected local-service paths:
 
 Implement or pin:
 
-- allocation probes for hot paths that currently have narrow claims;
-- latency/throughput microbenchmarks where wall-clock measurement is useful;
+- allocation probes use the existing global-allocator pattern from
+  `tina-runtime/tests/multishard_allocation.rs`;
+- latency/throughput measurements use a custom release-mode harness first,
+  unless implementation deliberately chooses Criterion and records why;
 - memory-under-overload scenario comparing bounded Tina behavior to an
   intentionally constrained Tokio baseline if it helps expose the contract;
-- regression thresholds only where stable enough not to create CI flakes;
-- a cost table that states what allocates and why.
+- deterministic allocation/no-growth claims may be test-gated;
+- wall-clock measurements are recorded evidence first, not default CI
+  thresholds, unless a path proves stable enough not to create flakes;
+- performance-envelope results are summarized in this phase's `review.md`
+  during implementation, with commands and raw numbers sufficient to reproduce;
+- a cost table states what allocates and why.
 
 Decision topics:
 
@@ -202,6 +302,20 @@ Proof:
 ## Rock 5: Local-Service API Completeness
 
 Make the core Tina app surface complete enough for normal local services.
+
+Support table:
+
+| Capability | Piet default |
+|---|---|
+| runtime-owned time | Supported. |
+| runtime-owned TCP | Supported. |
+| Tower bridge | Supported and canonical for HTTP-edge integration. |
+| Axum adapter/proof | Supported as first adapter on Tower. |
+| health/readiness/shutdown/metrics | Supported. |
+| live test harness | Supported. |
+| simulator/DST scenario harness | Supported where Tina semantics are simulated. |
+| DNS/TLS/UDP/file/process/signal | Jelle Zijlstra. |
+| durable state/persistence | Wim Kok. |
 
 Decide and implement the minimum supported local service set:
 
@@ -241,15 +355,14 @@ Proof:
 Build a small suite of real-ish local service workloads that exercise all five
 rocks together:
 
-- HTTP request enters through Axum/Tower bridge, calls Tina service, returns
-  typed response;
-- overloaded bridge rejects or retries within explicit budget;
-- Tina service uses runtime-owned timer and TCP internally;
-- child isolate panics and supervisor restarts it under policy/budget;
-- stale address and stopped requester behavior are visible;
-- graceful shutdown drains/cancels without leaked pending work;
-- simulator/DST equivalent proves the same service logic under seeded
-  perturbation where applicable.
+- `llama_http_bridge_service`: Tower canonical service plus Axum adapter,
+  overload, cancel/timeout, metrics, readiness, and graceful shutdown;
+- `llama_tcp_timer_service`: runtime-owned TCP plus timer in a local Tina
+  service, with cancellation and shutdown proof;
+- `llama_supervised_worker_service`: child panic, supervisor restart,
+  policy/budget, stale address rejection, and terminal trace;
+- `llama_sim_dst_parity_service`: simulator/DST proof of the same service logic
+  where the live behavior has a deterministic oracle.
 
 These are not marketing demos. They are user-shaped regression tests.
 
@@ -264,7 +377,7 @@ Pause and update the plan if any of these happen:
 - completion-slot pooling/slabbing wants unsafe code;
 - bridge adapters create hidden queues or hidden tasks;
 - MPSC fallback becomes necessary for the local service claim;
-- cross-shard live isolate calls become necessary for the bridge story.
+- cross-shard live isolate calls become necessary for the bridge story;
 - broader I/O starts expanding beyond time/TCP/bridge before the local core is
   boring; that work belongs in Jelle Zijlstra unless forced by a Piet workload.
 
@@ -280,8 +393,11 @@ Pause and update the plan if any of these happen:
 - CI exists and runs the intended workspace gate.
 - Stress/loom/miri/doc/compile-fail testing posture is named and runnable.
 - Performance/allocation envelope exists with numbers and narrow claims.
+- Performance/allocation results are summarized in this phase's `review.md`.
 - Local-service API completeness table says what is supported and deferred.
-- Cross-cutting e2e workloads prove the preferred path.
+- `llama_http_bridge_service`, `llama_tcp_timer_service`,
+  `llama_supervised_worker_service`, and `llama_sim_dst_parity_service` prove
+  the preferred path.
 - Remaining non-claims are narrower than at phase start and moved into the
   roadmap with exact homes.
 
