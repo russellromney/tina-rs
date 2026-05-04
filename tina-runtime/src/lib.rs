@@ -2575,13 +2575,13 @@ type BetelgeuseIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
 /// Lifecycle state for the canonical local Tina app owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalAppState {
-    /// The app owner has been created but has not yet accepted work.
+    /// Reserved state for app owners that expose asynchronous startup.
     Starting,
-    /// The app accepts bounded ingress.
+    /// The app owner has a live worker handle and accepts bounded ingress.
     Accepting,
-    /// Shutdown has been requested.
+    /// Reserved state for app owners that expose an observable shutdown start.
     Closing,
-    /// Shutdown is draining runtime-owned work.
+    /// Reserved state for app owners that expose an observable drain window.
     Draining,
     /// The app has closed cleanly.
     Closed,
@@ -2594,12 +2594,26 @@ pub enum LocalAppState {
 pub struct LocalAppTerminalReport {
     state: LocalAppState,
     trace: Vec<RuntimeEvent>,
+    error: Option<BetelgeuseBackedControlError>,
 }
 
 impl LocalAppTerminalReport {
     /// Creates a terminal report from final state and trace.
     pub fn new(state: LocalAppState, trace: Vec<RuntimeEvent>) -> Self {
-        Self { state, trace }
+        Self {
+            state,
+            trace,
+            error: None,
+        }
+    }
+
+    /// Creates a failed terminal report.
+    pub fn failed(error: BetelgeuseBackedControlError) -> Self {
+        Self {
+            state: LocalAppState::Failed,
+            trace: Vec::new(),
+            error: Some(error),
+        }
     }
 
     /// Final lifecycle state.
@@ -2610,6 +2624,11 @@ impl LocalAppTerminalReport {
     /// Final trace returned by the live worker.
     pub fn trace(&self) -> &[RuntimeEvent] {
         &self.trace
+    }
+
+    /// Terminal failure, if shutdown or worker execution failed.
+    pub const fn error(&self) -> Option<BetelgeuseBackedControlError> {
+        self.error
     }
 
     /// Consumes the report and returns the final trace.
@@ -2657,7 +2676,11 @@ where
         }
     }
 
-    /// Returns current lifecycle state.
+    /// Returns the owner-local lifecycle state.
+    ///
+    /// This does not synchronously probe worker health. Operations such as
+    /// registration, sending, tracing, or shutdown report worker failure with a
+    /// typed error.
     pub fn state(&self) -> LocalAppState {
         if self.runtime.is_some() {
             LocalAppState::Accepting
@@ -2810,16 +2833,24 @@ where
     }
 
     /// Joins the worker and returns its terminal report.
-    pub fn join(mut self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+    pub fn join(self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+        let report = self.join_report();
+        if let Some(error) = report.error() {
+            Err(error)
+        } else {
+            Ok(report)
+        }
+    }
+
+    /// Joins the worker and always returns the terminal lifecycle report.
+    pub fn join_report(mut self) -> LocalAppTerminalReport {
         let Some(runtime) = self.runtime.take() else {
-            return Ok(LocalAppTerminalReport::new(
-                LocalAppState::Closed,
-                Vec::new(),
-            ));
+            return LocalAppTerminalReport::new(LocalAppState::Closed, Vec::new());
         };
-        runtime
-            .shutdown()
-            .map(|trace| LocalAppTerminalReport::new(LocalAppState::Closed, trace))
+        match runtime.shutdown() {
+            Ok(trace) => LocalAppTerminalReport::new(LocalAppState::Closed, trace),
+            Err(error) => LocalAppTerminalReport::failed(error),
+        }
     }
 }
 
@@ -2971,16 +3002,24 @@ where
     }
 
     /// Joins all workers and returns a terminal report.
-    pub fn join(mut self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+    pub fn join(self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+        let report = self.join_report();
+        if let Some(error) = report.error() {
+            Err(error)
+        } else {
+            Ok(report)
+        }
+    }
+
+    /// Joins all workers and always returns the terminal lifecycle report.
+    pub fn join_report(mut self) -> LocalAppTerminalReport {
         let Some(runtime) = self.runtime.take() else {
-            return Ok(LocalAppTerminalReport::new(
-                LocalAppState::Closed,
-                Vec::new(),
-            ));
+            return LocalAppTerminalReport::new(LocalAppState::Closed, Vec::new());
         };
-        runtime
-            .shutdown()
-            .map(|trace| LocalAppTerminalReport::new(LocalAppState::Closed, trace))
+        match runtime.shutdown() {
+            Ok(trace) => LocalAppTerminalReport::new(LocalAppState::Closed, trace),
+            Err(error) => LocalAppTerminalReport::failed(error),
+        }
     }
 }
 

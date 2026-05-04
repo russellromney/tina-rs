@@ -9,13 +9,13 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use betelgeuse::io::simulated::{SimulatedIO, SimulatedPeer};
 use tina::{ChildDefinition, Mailbox, RestartableChildDefinition, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, CallInput, CallOutcome, CallOutput, ListenerId, MailboxFactory,
-    MultiShardRuntime, Runtime, RuntimeCall, StreamId, call,
+    BetelgeuseBackedRuntime, CallInput, CallOutcome, CallOutput, ListenerId, LocalApp,
+    MailboxFactory, MultiShardRuntime, Runtime, RuntimeCall, StreamId, call,
 };
 
 const EXPECTED_MULTISHARD_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
@@ -27,6 +27,10 @@ const EXPECTED_ISOLATE_CALL_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
     reallocations: 0,
 };
 const EXPECTED_BETELGEUSE_INGRESS_HANDOFF: AllocationSnapshot = AllocationSnapshot {
+    allocations: 1,
+    reallocations: 0,
+};
+const EXPECTED_LOCAL_APP_INGRESS_HANDOFF: AllocationSnapshot = AllocationSnapshot {
     allocations: 1,
     reallocations: 0,
 };
@@ -132,6 +136,17 @@ where
         }
     }
     panic!("runtime did not quiesce within bounded progress probe: {progress:?}");
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    assert!(predicate(), "condition did not become true before timeout");
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -812,6 +827,32 @@ fn betelgeuse_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
         "Betelgeuse ingress handoff allocation count changed; this measures the caller thread only"
     );
     let _ = runtime.shutdown();
+}
+
+#[test]
+fn local_app_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let app = LocalApp::single_shard(AllocationShard(11), TestMailboxFactory)
+        .ingress_capacity(8)
+        .build();
+    let sink = app
+        .register_root::<AllocationSink, Infallible>(AllocationSink, 8)
+        .expect("sink register accepts");
+
+    let warmup_trace_len = app.trace().expect("trace snapshot").len();
+    app.try_send(sink, AllocationEvent::Arrived).unwrap();
+    wait_until(|| app.trace().expect("trace snapshot").len() > warmup_trace_len);
+
+    let handoff = measure_allocations(|| {
+        app.try_send(sink, AllocationEvent::Arrived).unwrap();
+    });
+    assert_eq!(
+        handoff, EXPECTED_LOCAL_APP_INGRESS_HANDOFF,
+        "LocalApp ingress handoff allocation count changed; this measures the caller thread only"
+    );
+    let _ = app.shutdown().drain().join();
 }
 
 #[test]

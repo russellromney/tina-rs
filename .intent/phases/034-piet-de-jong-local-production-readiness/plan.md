@@ -64,20 +64,20 @@ Expected ownership shape:
   `LocalApp`-owned runtime, not a competing app owner.
 - Single-shard and multi-shard use sibling builders under one name:
   `LocalApp::single_shard(...)` and `LocalApp::multi_shard(...)`.
-- Shutdown returns a terminal report with final lifecycle state, worker result,
-  terminal trace/sink view, cancellation/drain counts, and any worker panic.
+- Shutdown returns a terminal report with final lifecycle state, terminal trace,
+  and any worker failure. Cancellation/drain details stay observable through
+  trace events until a later metrics phase adds summarized counters.
 
 Intended single-shard shape:
 
 ```rust
-let mut app = LocalApp::single_shard(AppShard, AppMailboxFactory)
+let app = LocalApp::single_shard(AppShard, AppMailboxFactory)
     .ingress_capacity(1024)
     .trace_retention(TraceRetention::Bounded(4096))
     .build();
 
 let users = app.register_root(UserService::new(), 256)?;
-let result = app.try_send(users, UserMsg::Join("llama-7".into()))?;
-assert!(result.is_accepted());
+app.try_send(users, UserMsg::Join("llama-7".into()))?;
 
 let terminal = app.shutdown().drain().join()?;
 assert_eq!(terminal.state(), LocalAppState::Closed);
@@ -86,7 +86,7 @@ assert_eq!(terminal.state(), LocalAppState::Closed);
 Intended multi-shard shape:
 
 ```rust
-let mut app = LocalApp::multi_shard(AppMailboxFactory)
+let app = LocalApp::multi_shard(AppMailboxFactory)
     .shard(AppShard::Ingress)
     .shard(AppShard::Workers)
     .ingress_capacity(1024)
@@ -94,19 +94,22 @@ let mut app = LocalApp::multi_shard(AppMailboxFactory)
     .trace_retention(TraceRetention::Bounded(8192))
     .build();
 
-let ingress = app.register_root_on(AppShard::Ingress, Ingress::new(), 256)?;
-let worker = app.register_root_on(AppShard::Workers, Worker::new(), 256)?;
-app.link("ingress-to-worker", ingress, worker)?;
+let ingress = app.register_root_on(AppShard::Ingress.id(), Ingress::new(), 256)?;
+let worker = app.register_root_on(AppShard::Workers.id(), Worker::new(), 256)?;
+app.try_send(ingress, IngressMsg::Use(worker))?;
 ```
 
 Intended bridge shape:
 
 ```rust
-let mut app = LocalApp::single_shard(AppShard, AppMailboxFactory).build();
-let service = app.register_root(LlamaService::new(), 256)?;
+let app = LocalApp::single_shard(AppShard, AppMailboxFactory).build();
 
 let tower_service = BridgeHost::from_app(app)
-    .register_tower_service(service, BridgeConfig::default())?;
+    .register_bridge::<LlamaService, LlamaRequest, LlamaReply, Infallible>(
+        LlamaService::new(),
+        256,
+        Duration::from_millis(100),
+    )?;
 ```
 
 These sketches are rails, not final syntax. Implementation may tighten names if

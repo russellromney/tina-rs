@@ -101,6 +101,86 @@ Remaining for Piet:
 - performance-envelope artifact;
 - any API tightening discovered while moving more tests to `LocalApp`.
 
+## Implementation Review 3
+
+Status: Piet lifecycle and performance-envelope rocks are now direct evidence,
+not TODO smoke.
+
+What changed:
+
+- `LocalAppShutdown::join_report()` and
+  `LocalMultiShardAppShutdown::join_report()`
+  now always return a terminal report, including worker failure.
+- `LocalAppShutdown::join()` and `LocalMultiShardAppShutdown::join()` still
+  return `Result`, but now derive that result from the terminal report.
+- `LocalAppTerminalReport` now carries an optional
+  `BetelgeuseBackedControlError` so failed shutdown is visible without losing
+  lifecycle shape.
+- Added `local_app_join_report_reports_worker_failure_terminal_state`, which
+  forces a worker-side mailbox factory panic and proves the preferred app owner
+  reports `LocalAppState::Failed` with `WorkerStopped`.
+- Added `local_app_ingress_handoff_allocation_count_is_pinned_on_caller_thread`
+  to the allocation harness. The preferred `LocalApp` ingress path is pinned at
+  one caller-thread allocation, matching lower-level `BetelgeuseBackedRuntime`
+  ingress handoff.
+
+Targeted verification:
+
+- `cargo test -p tina-runtime --test local_app`
+- `cargo test -p tina-runtime --test multishard_allocation`
+
+Both pass locally.
+
+Piet performance envelope now has a narrow, honest number:
+
+- `LocalApp::try_send` caller-thread handoff: 1 allocation, 0 reallocations.
+- This does not claim end-to-end worker hot-path cost, throughput, or Tokio
+  superiority. It only pins the canonical app owner's ingress handoff cost.
+
+## Hostile Implementation Review
+
+Verdict: Piet is closed on its own terms after fixes. No blocking findings
+remain from the hostile pass.
+
+Things grug attacked and fixed:
+
+- The report-returning shutdown method was initially named `try_join()`, while
+  `join()` was the method that returned `Result`. That inverted Rust naming
+  expectations. It is now `join_report()` for the always-reporting path and
+  `join()` for the fallible convenience path.
+- The plan sketches still showed aspirational/nonexistent syntax:
+  `register_tower_service(...)`, `app.link(...)`, and an accepted send outcome
+  from `LocalApp::try_send`. Those sketches now match the shipped ownership
+  shape: `LocalApp`, `BridgeHost::from_app(app).register_bridge(...)`, typed
+  root registration, and direct bounded ingress.
+- The plan overpromised summarized cancellation/drain counters in
+  `LocalAppTerminalReport`. Piet ships terminal state, trace, and worker error;
+  cancellation/drain facts remain trace-observable until a future metrics phase
+  adds counters.
+- `LocalApp::state()` could be misread as a synchronous worker-health probe.
+  Its docs now say owner-local state; worker failure is reported by operations
+  and shutdown.
+
+What still looks intentionally narrow, not halfwork:
+
+- `LocalAppState::{Starting, Closing, Draining}` are reserved lifecycle
+  vocabulary. The current local owner starts immediately and consumes itself for
+  shutdown, so callers normally observe `Accepting`, `Closed`, or `Failed`.
+- The allocation number is caller-thread ingress handoff only. It does not claim
+  end-to-end worker hot-path cost.
+- The Tower bridge still boxes one future per call. That is acceptable for this
+  adoption edge and remains a performance knob for a later phase.
+- Broader I/O, persistence, remoting, clustering, and broad performance claims
+  are still explicitly outside Piet.
+
+Final verification:
+
+- `cargo test -p tina-runtime --test local_app`
+- `cargo test -p tina-runtime --test multishard_allocation`
+- `make verify`
+
+All pass locally.
+
 ## Implementation Review 2
 
 Status: named workload rails are now visible in the test suite.

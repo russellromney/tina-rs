@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, LocalApp, LocalAppState, MailboxFactory, RuntimeEventKind, TraceRetention, sleep,
+    BetelgeuseBackedControlError, CallError, LocalApp, LocalAppState, MailboxFactory,
+    RuntimeEventKind, TraceRetention, sleep,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,6 +69,15 @@ struct AppMailboxFactory;
 impl MailboxFactory for AppMailboxFactory {
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
         Box::new(AppMailbox::new(capacity))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PanickingMailboxFactory;
+
+impl MailboxFactory for PanickingMailboxFactory {
+    fn create<T: 'static>(&self, _capacity: usize) -> Box<dyn Mailbox<T>> {
+        panic!("test mailbox factory panic")
     }
 }
 
@@ -245,4 +255,31 @@ fn llama_tcp_timer_service_uses_local_app_runtime_owned_time() {
             }
         )
     }));
+}
+
+#[test]
+fn local_app_join_report_reports_worker_failure_terminal_state() {
+    let app = LocalApp::single_shard(AppShard(60), PanickingMailboxFactory)
+        .ingress_capacity(8)
+        .trace_retention(TraceRetention::Bounded(16))
+        .build();
+
+    assert_eq!(app.state(), LocalAppState::Accepting);
+    assert_eq!(
+        app.register_root::<LlamaService, Infallible>(
+            LlamaService {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            },
+            8,
+        ),
+        Err(BetelgeuseBackedControlError::WorkerStopped)
+    );
+
+    let terminal = app.shutdown().drain().join_report();
+    assert_eq!(terminal.state(), LocalAppState::Failed);
+    assert_eq!(
+        terminal.error(),
+        Some(BetelgeuseBackedControlError::WorkerStopped)
+    );
+    assert!(terminal.trace().is_empty());
 }
