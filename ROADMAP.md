@@ -148,6 +148,7 @@ framework before public release-story work.
 | Phase | Purpose |
 |---|---|
 | **Piet de Jong local production readiness** | Intense pre-Gemini phase for the five remaining local-core gaps: mature the driver-runtime substrate, widen the Tokio/Tower/Axum bridge into a real adoption edge, add CI/stress hardening, produce a measured performance/allocation envelope, and complete the preferred local-service API surface. |
+| **Jelle Zijlstra runtime-owned I/O breadth** | Explicit post-Piet I/O expansion phase: decide and implement or defer DNS, TLS, UDP, file, process, and signal support with Tina-owned timeout/cancellation/shutdown semantics, simulator/DST coverage where possible, and no hidden blocking pools or unbounded queues. |
 
 ## Later capability roadmap
 
@@ -192,8 +193,10 @@ These still need answers, but each now has an intended phase home.
 2. **Trace retention.** Bounded/off modes exist now; Piet de Jong should decide
    whether they are enough for local production use or need sink/lifecycle
    polish. Home: Piet de Jong.
-3. **Runtime-owned I/O breadth.** Decide whether the first local framework
-   claim is TCP/time only or includes one more I/O family. Home: Piet de Jong.
+3. **Runtime-owned I/O breadth.** Piet de Jong should pin the first local
+   production claim around time/TCP/bridge and write the support table. Jelle
+   Zijlstra owns the broader DNS/TLS/UDP/file/process/signal implementation or
+   explicit deferrals.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
    transport is not claimed. Home: Piet de Jong if local framework completeness or
    the bridge needs it; otherwise later remoting.

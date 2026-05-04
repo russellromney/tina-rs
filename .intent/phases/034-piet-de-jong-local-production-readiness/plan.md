@@ -218,7 +218,9 @@ Decide and implement the minimum supported local service set:
 - trace retention and sink config;
 - runtime-owned time/TCP helpers;
 - explicit deferral table for DNS, TLS, UDP, file, process, signal, and durable
-  state.
+  state. DNS/TLS/UDP/file/process/signal move to Jelle Zijlstra unless a
+  cross-cutting Piet workload proves one is required now. Durable state moves
+  to Wim Kok.
 
 API discipline:
 
@@ -263,6 +265,8 @@ Pause and update the plan if any of these happen:
 - bridge adapters create hidden queues or hidden tasks;
 - MPSC fallback becomes necessary for the local service claim;
 - cross-shard live isolate calls become necessary for the bridge story.
+- broader I/O starts expanding beyond time/TCP/bridge before the local core is
+  boring; that work belongs in Jelle Zijlstra unless forced by a Piet workload.
 
 ## Done Means
 
