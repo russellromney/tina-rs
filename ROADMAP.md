@@ -1,8 +1,12 @@
 # tina-rs Roadmap
 
-A staged plan for porting Tina's discipline to Rust, structured to deliver value at each phase rather than waiting for a big-bang release.
+A staged plan for porting Tina's discipline to Rust, structured to deliver
+value at each phase rather than waiting for a big-bang release.
 
-Phases are named (not numbered) so we can insert phases later without renumbering. Names are space missions, ordered roughly chronologically by mission complexity.
+Phases are named (not numbered) so we can insert phases later without
+renumbering. Existing phase names use space missions; new forward phases use
+full names of Dutch prime ministers so the roadmap can change direction without
+renaming landed history.
 
 Completed work moves to `CHANGELOG.md`. `ROADMAP.md` is for active and future work.
 
@@ -10,14 +14,29 @@ Completed work moves to `CHANGELOG.md`. `ROADMAP.md` is for active and future wo
 
 ## Vision
 
-Bring Tina's three load-bearing ideas — synchronous effect-returning handlers, isolate-per-entity state machines, and thread-per-core scheduling with bounded mailboxes — to Rust **without** building a new runtime from scratch.
+Bring Tina's three load-bearing ideas — synchronous effect-returning handlers,
+isolate-per-entity state machines, and thread-per-core scheduling with bounded
+mailboxes — to Rust **without** building a new general-purpose async runtime
+from scratch.
 
-The deliverable is a small set of crates (`tina`, `tina-runtime-*`, `tina-sim`) that any existing Rust async codebase can adopt incrementally.
+The long-term target is a performant, shared-nothing, bounded, deterministic
+Rust concurrency framework. Actor/OTP/Akka systems are useful prior art, but
+Tina should not chase Akka feature parity for its own sake. Actor-shaped
+isolate state machines are the means; the product is safer Rust concurrency
+with visible overload, cancellation, restart, and replay behavior.
+
+The near-term deliverable is a small set of crates (`tina`, `tina-runtime`,
+`tina-mailbox-spsc`, `tina-supervisor`, and `tina-sim`) that can run real local
+server-shaped workloads with stronger boundedness and testability than ordinary
+Tokio-shaped code.
 
 ## Non-goals
 
 - A new runtime competing with Tokio/monoio. Use what exists.
 - Full feature parity with Tina-Odin. We port the *shape*, not every primitive.
+- Akka feature parity as a goal. Persistence, remoting, and clustering are
+  future capabilities only if they preserve Tina's safety/performance
+  direction.
 - "Replacing Tokio." Tokio may still matter as a bridge or comparison point,
   but it should not define Tina's core programming model.
 
@@ -141,9 +160,15 @@ phases.
 | ~~**Parallel substrate support**~~ | Delivered in `.intent/phases/027-parallel-substrate-support/`: Betelgeuse simulated I/O polish, narrow substrate cost evidence, expanded Tokio-vs-Tina constrained/backpressure comparisons, external review prompts, Tokio current-thread/Monoio/Glommio/Compio adapter research, and brief README/story refinement without changing Tina core semantics. |
 | ~~**Ranger core runtime substrate completion**~~ | Delivered in `.intent/phases/028-ranger-substrate-driver-maturity/`: documented the driver capability contract, moved TCP pending ownership to listener/read/write lanes, allowed full-duplex same-stream read/write, kept close and duplicate-lane `ResourceBusy` honest, made per-call cancel tombstone without silently closing unrelated lanes, added live worker TCP shutdown proof, pinned TCP read/write allocation counts, and recorded Betelgeuse as the near-term substrate direction. |
 | **Surveyor Betelgeuse adapter ownership** | Planned in `.intent/phases/029-surveyor-betelgeuse-adapter-ownership/`: treat Tina's live substrate as a Tina-owned implementation over Betelgeuse, with explicit completion-slot ownership, no-leak shutdown/cancel-drain, controlled simulated/native backend release proofs, and no dependence on upstream Betelgeuse growing Tina-specific guarantees first. |
-| **Gemini release story** | Release-story phase after Surveyor removes the last core substrate ownership wart. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
-| **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. |
+| **Willem Drees local production runtime** | New local-runtime hardening phase after Surveyor. Make the one-process Tina server story boring: listener/connection lifecycle, graceful shutdown, bounded overload, supervisor behavior under live TCP pressure, memory ceilings, Linux/macOS CI proof, and server-shaped assertions rather than demo logs. |
+| **Ruud Lubbers performance and memory hardening** | Measure and improve the hot paths that matter for a performant Rust concurrency framework: mailbox, send, call, TCP read/write, spawn/restart, trace pressure, boxed erasure, and allocation behavior. Keep claims narrow and numerical. |
+| **Joop den Uyl porting surface** | Make "have Codex port my small Tokio-shaped TCP/control-plane service to Tina" realistic without turning Tina into Tokio or Akka. Add only the helpers, macros, patterns, and regression tests needed for clear listener/connection/worker/supervisor code. |
+| **Gemini release story** | Release-story phase after the local production runtime, performance/memory story, and porting surface are real. Supported invariant docs, guides, examples, semver/publication decision, CI/proof gate, public positioning, and a clear adoption story. Gemini should not add new core semantics; it documents a framework that already has real proof and a runtime path. |
+| **Apollo Tokio bridge** | Preserved/weakened guarantees table, minimal bridge, and an assertion-backed Axum or similar reference adoption example. Apollo remains an adoption bridge, not the center of Tina's runtime story. |
 | **Cassini hardening** | Optional MPSC decision, benchmark suite, memory profile, docs polish, and dogfood report. |
+| **Wim Kok persistence** | Future durable-state phase: snapshots, event journal, restart recovery, durable replay artifacts, and explicit non-claims around durable mailboxes until they are designed. Not required for first local-runtime launch. |
+| **Jan Peter Balkenende remoting** | Future networked Tina-to-Tina phase: serialization, node identity, remote isolate identity, bounded remote ingress, remote `Full`/`Closed`/`Timeout`/node-down semantics, and cross-node trace causality. Not required for first local-runtime launch. |
+| **Mark Rutte clustering** | Future cluster phase after remoting is boring: membership, placement, peer quarantine, node liveness, shard migration/rebalancing if it still fits Tina's safety and performance model. Not required for first local-runtime launch. |
 
 Real concurrent shard execution is a substrate story around Huygens, Mercury,
 Betelgeuse substrate completion, the Tina driver contract, and later runtime
@@ -161,8 +186,14 @@ live substrate/driver semantics: full-duplex TCP, cancellation, shutdown,
 driver capabilities, cost, the next substrate direction, and the core/non-core
 boundary. Surveyor follows because the Betelgeuse implementation should now be
 treated as Tina-owned code over Betelgeuse primitives, with its own
-completion-ownership and no-leak shutdown contract, before Gemini freezes the
-story in release docs.
+completion-ownership and no-leak shutdown contract.
+
+After Surveyor, the roadmap deliberately stays local before release polish:
+Willem Drees makes the local server runtime production-shaped; Ruud Lubbers
+keeps performance and allocation claims honest; Joop den Uyl makes porting
+ordinary server-shaped code to Tina less fragile. Gemini only freezes and
+publishes the story after those rocks are real. Persistence, remoting, and
+clustering remain later Tina capabilities, not Akka-parity launch blockers.
 
 ## Strategic prerequisites
 
@@ -352,7 +383,7 @@ TCP proof for touched I/O paths, and honest non-claims where not.
 ## Phase Tina TCP Driver Contract
 > Own the small time/TCP substrate boundary without becoming an async runtime.
 
-> After: Phase Betelgeuse · Before: Phase Gemini
+> After: Phase Betelgeuse · Before: Phase Ranger
 
 This phase exists because Tina should not be accidentally coupled to one
 backend implementation. Betelgeuse is the best current substrate, but the
@@ -413,7 +444,7 @@ changing Tina core semantics or creating a second substrate direction.
 ## Phase Ranger
 > Finish Tina's core runtime substrate before service-framework work.
 
-> After: Phase Tina Driver Contract + Phase Parallel Substrate Support · Before: Phase Gemini
+> After: Phase Tina Driver Contract + Phase Parallel Substrate Support · Before: Phase Surveyor
 
 This phase exists because the next question is not "can we build service
 examples?" It is:
@@ -526,10 +557,110 @@ on Ranger rather than reopen core runtime/substrate semantics.
 
 ---
 
+## Phase Willem Drees
+> Local production runtime. Make one-process Tina servers boring before release polish.
+
+> After: Phase Surveyor · Before: Phase Ruud Lubbers
+
+Willem Drees exists because Tina should not launch as "Akka in Rust" or as a
+demo framework. It should first be a safe local concurrency runtime that can
+run server-shaped workloads under pressure without hiding overload or lifecycle
+bugs.
+
+- Prove listener, connection, worker, supervisor, and shutdown lifecycles under
+  live Betelgeuse runtime, Betelgeuse simulated runtime, and `tina-sim` where
+  the behavior is modeled there.
+- Build server-shaped regression workloads with assertions:
+  - many short connections
+  - slow readers and slow writers
+  - bounded overload
+  - connection isolate restart
+  - listener shutdown while accepts are pending
+  - worker pool full/closed behavior
+  - timeout-driven cleanup
+- Make graceful shutdown boring: no leaked completion slots, no hidden pending
+  calls, no late delivery after requester stop, and typed lifecycle failure
+  when the substrate cannot prove release.
+- Strengthen CI as proof, not ceremony: Linux exercises io_uring, macOS
+  exercises kqueue, and both run the same workspace verification gate.
+- Keep the phase local. Do not add remoting, clustering, persistence,
+  Tower/Axum, or arbitrary async handlers.
+
+**Done when:** a production-shaped local Tina TCP/control-plane workload can be
+run under constrained memory and bounded queues, with direct tests proving
+overload, cancellation, restart, shutdown, and replay behavior. The outcome
+should support the honest claim: "try porting a local stateful server component
+to Tina when bounded failure visibility matters."
+
+---
+
+## Phase Ruud Lubbers
+> Performance and memory hardening. Make the safety story cheap enough to use.
+
+> After: Phase Willem Drees · Before: Phase Joop den Uyl
+
+Ruud Lubbers keeps Tina from becoming a safe but slow actor toy. The target is
+not benchmark theater; the target is knowing where Tina pays and removing costs
+that fight the framework's own concurrency model.
+
+- Measure hot paths with fixed, repeatable workloads:
+  - mailbox send/recv
+  - local send
+  - isolate call/reply/timeout
+  - TCP read/write completion
+  - spawn/restart
+  - trace/event recording
+  - live ingress and cross-shard bounded transport
+- Keep the SPSC hot-path no-allocation claim protected.
+- Decide whether boxed erasure, call translators, trace storage, or completion
+  slots need arenas/pools before release.
+- Add allocation and latency counters only where they inform design decisions.
+- Do not hide costs by disabling trace/replay semantics unless a preserved-vs-
+  weakened-guarantees table says exactly what changed.
+
+**Done when:** the roadmap can state the current hot-path cost model with
+numbers, the worst avoidable costs are either fixed or explicitly deferred, and
+the local production runtime remains safe under the same tests after
+performance work.
+
+---
+
+## Phase Joop den Uyl
+> Porting surface. Make generated and human-written Tina server code hard to mess up.
+
+> After: Phase Ruud Lubbers · Before: Phase Gemini
+
+Joop den Uyl is not a docs polish phase. It is the phase that makes the
+preferred Tina shape obvious enough that a human or Codex can port a small
+Tokio-shaped TCP/control-plane service without inventing five local dialects.
+
+- Audit real Tina server-shaped code for repeated friction:
+  - listener isolate setup
+  - connection isolate setup
+  - worker pool request/reply
+  - backpressure handling
+  - timeout cleanup
+  - supervisor config
+  - shutdown choreography
+- Add only small helpers/macros that preserve one preferred API surface.
+- Keep `Effect` and runtime-owned calls explicit. Do not add async handlers or
+  arbitrary future execution.
+- Add runnable porting comparisons as tests, not demos: each comparison should
+  assert behavior under success, overload, timeout, and shutdown.
+- Improve examples only where they reveal the preferred code shape; broad docs
+  still belong to Gemini.
+
+**Done when:** the preferred way to write listener/connection/worker/supervisor
+Tina code is clear in tests, the code is not ceremony-heavy compared with the
+guarantees it buys, and new helper surface is small enough that there is still
+one obvious way to do things.
+
+---
+
 ## Phase Gemini
 > First crewed flight. Stabilize and publish the settled framework story.
 
-> After: Phase Ranger · Before: Phase Apollo
+> After: Phase Joop den Uyl · Before: Phase Apollo
 
 - Publish a coherent `0.1.0` story for `tina`, `tina-mailbox-spsc`,
   `tina-supervisor`, `tina-runtime`, and `tina-sim`, or explicitly decide that
@@ -537,8 +668,10 @@ on Ranger rather than reopen core runtime/substrate semantics.
   the core multi-shard primitive; Huygens proved the composed framework and
   first runtime-substrate story; Mercury sharpened the overload/call contract;
   Betelgeuse and the Tina driver contract made the first tryable runtime
-  substrate true; Ranger matured the substrate/driver story enough for Gemini
-  to document it instead of reopening core semantics.
+  substrate true; Ranger and Surveyor matured the substrate/driver ownership
+  story; Willem Drees, Ruud Lubbers, and Joop den Uyl make the local
+  production/runtime/porting story real enough for Gemini to document instead
+  of reopening core semantics.
 - Write the first user-facing guide set: architecture overview, getting-started guide, isolate authoring guide, simulation guide, task-dispatcher walkthrough, and TCP echo walkthrough.
 - Document the supported invariants for the core runtime/simulator model:
   delivery behavior, mailbox guarantees, supervision behavior, replayability,
@@ -612,7 +745,7 @@ can compare against a settled primitive instead of a still-moving one.
 ## Phase Cassini
 > Long mission, sustained operations. Production hardening, docs, and optional fallback primitives.
 
-> After: Phase Apollo
+> After: Phase Apollo · Before: Phase Wim Kok
 
 - `tina-mailbox-mpsc`: optional fallback for workloads where SPSC is not enough and the tradeoffs are acceptable.
 - Benchmark suite: SPSC throughput, mailbox latency p50/p99, per-core scheduling overhead, isolate spawn cost.
@@ -621,6 +754,80 @@ can compare against a settled primitive instead of a still-moving one.
 - Memory profile and benchmark documentation: report where the current design allocates, where it does not, and what remains to improve.
 
 **Done when:** the optional MPSC fallback is either shipped with clear tradeoffs or explicitly deferred; the bench suite is documented; at least one developer outside the project successfully ships a non-trivial isolate using only the published docs and reports their experience back; hardening work reports wins and losses honestly without requiring a case-study migration to another codebase.
+
+---
+
+## Phase Wim Kok
+> Persistence. Durable state only after local runtime behavior is settled.
+
+> After: Phase Cassini · Before: Phase Jan Peter Balkenende
+
+Wim Kok is the first Akka/OTP-adjacent long-arc capability, but it should be
+designed for Tina's own model rather than copied from Akka.
+
+- Decide whether persistence means snapshots, event journals, durable replay
+  artifacts, durable mailboxes, or some deliberately smaller first slice.
+- Preserve boundedness: no hidden unbounded durable queue that bypasses mailbox
+  backpressure.
+- Make recovery semantics explicit for isolate state, address generations,
+  restartable children, and pending runtime-owned calls.
+- Keep simulator/replay compatibility as a design constraint.
+- Do not add remoting or clustering in this phase.
+
+**Done when:** Tina has a directly tested durable-state story for local
+isolates, and the roadmap can honestly say which data survives process restart
+and which data does not.
+
+---
+
+## Phase Jan Peter Balkenende
+> Remoting. Tina runtime to Tina runtime over a network.
+
+> After: Phase Wim Kok · Before: Phase Mark Rutte
+
+Remoting means one Tina isolate sends or calls another Tina isolate in another
+process or machine. This is where network lies become Tina semantics rather
+than hidden library behavior.
+
+- Define node identity, remote isolate identity, and serialization boundaries.
+- Preserve boundedness across the network: local outbound queue, network
+  transport, remote inbound queue, and remote mailbox all need explicit full or
+  closed outcomes.
+- Distinguish "accepted locally", "sent on wire", "accepted remotely", and
+  "delivered to target mailbox" in trace semantics.
+- Define remote call outcomes: reply, timeout, remote full, remote closed, node
+  down, and requester stopped.
+- Keep replay/simulation in view. If real network behavior cannot replay
+  exactly, model the semantic envelope in `tina-sim`.
+- Do not add clustering/membership until point-to-point remote semantics are
+  boring.
+
+**Done when:** two Tina runtimes can communicate over a network with typed,
+bounded, traceable outcomes and tests prove failure cases without pretending
+that network send means remote delivery.
+
+---
+
+## Phase Mark Rutte
+> Clustering. Membership and placement only after remoting is boring.
+
+> After: Phase Jan Peter Balkenende
+
+Clustering is not an Akka checklist item. It is a later capability only if it
+preserves Tina's safety and performance model.
+
+- Define membership, node liveness, peer quarantine, and placement.
+- Decide whether shard migration/rebalancing belongs in Tina at all, or whether
+  static placement plus explicit restart is the safer first answer.
+- Keep backpressure explicit across node boundaries.
+- Preserve address-generation and stale-address semantics under node restart.
+- Make operational failure visible: node down, peer slow, remote queue full,
+  partitioned peer, and recovered peer should not collapse into one generic
+  error.
+
+**Done when:** a small Tina cluster can route bounded messages and calls under
+node failure with explicit semantics, and the implementation does not weaken
+the local runtime guarantees that made Tina worth building.
 
 ---
 
