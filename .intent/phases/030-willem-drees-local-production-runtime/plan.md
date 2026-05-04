@@ -86,6 +86,26 @@ The same semantic shape should be exercised through:
 Do not build remoting, clustering, persistence, Tower/Axum integration, or async
 handlers here.
 
+## Review Amendments
+
+Plan Review 2 sharpened the implementation shape:
+
+- **Audit first.** Do not write the composed workload until the existing proof
+  surface is classified in `review.md`.
+- **One workload, multiple substrates.** Prefer one canonical local-server
+  workload shape, then run equivalent slices through live Betelgeuse,
+  Betelgeuse simulated I/O, and `tina-sim`. Do not create three unrelated
+  stories that merely share vocabulary.
+- **Native and simulated claims stay separate.** Native CI proves real backend
+  ownership and ordinary TCP behavior. Simulated I/O proves slow peers, partial
+  writes, delayed completions, and exact shutdown interleavings.
+- **No server framework yet.** This phase may add tiny helpers only if they
+  preserve the existing preferred Tina surface. Bigger ergonomics belong to
+  Joop den Uyl.
+- **Backpressure must be forced.** Tests must directly hit ingress full,
+  worker/mailbox full, timeout, stale address, and requester-closed paths
+  without sleep-as-proof.
+
 ## Scope
 
 ### 1. Capability Audit
@@ -223,6 +243,26 @@ Required evidence:
 - no test is only meaningful on the developer's machine;
 - platform-specific differences are named in `review.md`.
 
+## Build Order
+
+1. **Capability audit.** Append "Implementation Audit 1" to `review.md` with
+   exact existing coverage, surrogate coverage, and missing proof.
+2. **Canonical workload sketch.** Define the one local-server workload shape
+   from the audit before writing tests.
+3. **Live runtime slice.** Add the smallest live Betelgeuse test that proves the
+   largest missing core behavior, likely bounded worker pressure or shutdown
+   under server-shaped work.
+4. **Simulated I/O slice.** Reuse the same workload shape for deterministic slow
+   peer, partial write, delayed completion, and shutdown interleaving pressure.
+5. **`tina-sim` oracle slice.** Reuse the modeled semantic subset for replay,
+   perturbation, overload, and restart proof.
+6. **Shutdown matrix.** Fill any direct accept/read/write/timer/call shutdown
+   gaps that the composed workload does not naturally hit.
+7. **Backpressure/memory guard.** Add narrow capacity/allocation checks for any
+   new buffers introduced by the workload.
+8. **Verify and review.** Run focused tests plus `make verify`; record remaining
+   non-claims in `review.md`.
+
 ## What Will Not Change
 
 - No async user handlers.
@@ -276,4 +316,3 @@ Required proof set:
 - No hidden unbounded queue was introduced.
 - No release/docs/examples phase is needed to explain away missing core runtime
   behavior.
-
