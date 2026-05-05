@@ -183,7 +183,7 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **The Metric Modest Mice lifecycle hardening** | Make the live local system boring under shutdown, lane workers, raw OS signal capture, failed shards, and long-running driver work. Scope: strict worker-held resource accounting across all lanes, bounded drain/join rules, raw signal delivery where platform-supported, shard quarantine cleanup, shutdown/live topology consistency, and DST that hammers mid-flight I/O while shutdown/failure happens. |
+| **Sadie's Ward lifecycle hardening** | Make the live local system boring under shutdown, lane workers, raw OS signal capture, failed shards, and long-running driver work. Scope: strict worker-held resource accounting across all lanes, bounded drain/join rules, raw signal delivery where platform-supported, shard quarantine cleanup, shutdown/live topology consistency, and DST that hammers mid-flight I/O while shutdown/failure happens. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 Parallel-safe side work: CI matrix planning, formatting of existing

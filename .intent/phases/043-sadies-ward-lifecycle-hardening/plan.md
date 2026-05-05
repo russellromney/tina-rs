@@ -1,4 +1,4 @@
-# Phase 043: The Metric Modest Mice Lifecycle Hardening
+# Phase 043: Sadie's Ward Lifecycle Hardening
 
 ## Goal
 
