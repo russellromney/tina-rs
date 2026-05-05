@@ -29,7 +29,7 @@
 //!
 use std::alloc::Global;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{
@@ -50,7 +50,7 @@ use betelgeuse::{
 
 use crate::call::{
     CallError, CallId, CallInput, CallOutput, FileId, FileOpenOptions, ListenerId, PathKind,
-    PathMetadata, ProcessStatus, StreamId, TlsStreamId, UdpSocketId,
+    PathMetadata, ProcessStatus, StreamId, TlsListenerId, TlsStreamId, UdpSocketId,
 };
 
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
@@ -63,6 +63,53 @@ pub(crate) const DEFAULT_PROCESS_LANE_CAPACITY: usize = 16;
 pub(crate) const DEFAULT_SIGNAL_CAPACITY: usize = 64;
 
 type TlsClientStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+type TlsServerStream = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+
+enum TlsRuntimeStream {
+    Client(TlsClientStream),
+    Server(TlsServerStream),
+}
+
+impl Read for TlsRuntimeStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Client(stream) => stream.read(buf),
+            Self::Server(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for TlsRuntimeStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Client(stream) => stream.write(buf),
+            Self::Server(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Client(stream) => stream.flush(),
+            Self::Server(stream) => stream.flush(),
+        }
+    }
+}
+
+impl TlsRuntimeStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Client(stream) => &stream.sock,
+            Self::Server(stream) => &stream.sock,
+        }
+    }
+
+    fn send_close_notify(&mut self) {
+        match self {
+            Self::Client(stream) => stream.conn.send_close_notify(),
+            Self::Server(stream) => stream.conn.send_close_notify(),
+        }
+    }
+}
 
 /// Runtime-owned substrate driver.
 ///
@@ -110,9 +157,31 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// Injects one runtime-owned signal event and appends ready completions.
     fn notify_signal(&mut self, _name: &str, _completed: &mut Vec<DriverCompletion>) {}
 
+    /// Returns the driver-owned resource inventory visible to live reports.
+    fn resource_report(&self) -> DriverResourceReport {
+        DriverResourceReport::default()
+    }
+
     #[cfg(test)]
     fn io_pending_count(&self) -> usize {
         0
+    }
+}
+
+/// Driver-owned resource inventory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DriverResourceReport {
+    pub(crate) listeners: usize,
+    pub(crate) streams: usize,
+    pub(crate) tls_streams: usize,
+    pub(crate) udp_sockets: usize,
+    pub(crate) files: usize,
+    pub(crate) pending_calls: usize,
+}
+
+impl DriverResourceReport {
+    pub(crate) const fn owned_resource_count(self) -> usize {
+        self.listeners + self.streams + self.tls_streams + self.udp_sockets + self.files
     }
 }
 
@@ -365,13 +434,21 @@ struct TlsWorkerLane {
     completions: Receiver<TlsCompletion>,
     handle: Option<JoinHandle<()>>,
     pending: Vec<TlsPending>,
+    listeners: Vec<TlsListenerEntry>,
     streams: Vec<TlsStreamEntry>,
+    next_listener_id: u64,
     next_stream_id: u64,
+}
+
+struct TlsListenerEntry {
+    id: TlsListenerId,
+    listener: Arc<TcpListener>,
+    config: Arc<rustls::ServerConfig>,
 }
 
 struct TlsStreamEntry {
     id: TlsStreamId,
-    stream: Arc<Mutex<TlsClientStream>>,
+    stream: Arc<Mutex<TlsRuntimeStream>>,
 }
 
 struct TlsPending {
@@ -385,10 +462,25 @@ struct TlsPending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TlsPendingLane {
     Connect(CallId),
+    ListenerAccept(TlsListenerId),
     Stream(TlsStreamId),
 }
 
 enum TlsCommand {
+    Bind {
+        call_id: CallId,
+        addr: SocketAddr,
+        certificate_chain: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+        cancelled: Arc<AtomicBool>,
+    },
+    Accept {
+        call_id: CallId,
+        listener: Arc<TcpListener>,
+        config: Arc<rustls::ServerConfig>,
+        timeout: Duration,
+        cancelled: Arc<AtomicBool>,
+    },
     Connect {
         call_id: CallId,
         addr: SocketAddr,
@@ -399,21 +491,21 @@ enum TlsCommand {
     },
     Read {
         call_id: CallId,
-        stream: Arc<Mutex<TlsClientStream>>,
+        stream: Arc<Mutex<TlsRuntimeStream>>,
         max_len: usize,
         timeout: Duration,
         cancelled: Arc<AtomicBool>,
     },
     Write {
         call_id: CallId,
-        stream: Arc<Mutex<TlsClientStream>>,
+        stream: Arc<Mutex<TlsRuntimeStream>>,
         bytes: Vec<u8>,
         timeout: Duration,
         cancelled: Arc<AtomicBool>,
     },
     Close {
         call_id: CallId,
-        stream: Arc<Mutex<TlsClientStream>>,
+        stream: Arc<Mutex<TlsRuntimeStream>>,
         timeout: Duration,
         cancelled: Arc<AtomicBool>,
     },
@@ -425,7 +517,9 @@ struct TlsCompletion {
 }
 
 enum TlsCompletionResult {
-    Connected(Box<Result<TlsClientStream, CallError>>),
+    Bound(Box<Result<(TcpListener, rustls::ServerConfig), CallError>>),
+    Accepted(Box<Result<(TlsRuntimeStream, SocketAddr), CallError>>),
+    Connected(Box<Result<TlsRuntimeStream, CallError>>),
     Output(CallOutput),
 }
 
@@ -575,6 +669,19 @@ impl RuntimeDriver for BetelgeuseDriver {
                 self.tls
                     .submit_connect(call_id, addr, server_name, root_certificates, timeout, now)
             }
+            CallInput::TlsBind {
+                addr,
+                certificate_chain,
+                private_key,
+            } => self
+                .tls
+                .submit_bind(call_id, addr, certificate_chain, private_key, now),
+            CallInput::TlsAccept { listener, timeout } => {
+                self.tls.submit_accept(call_id, listener, timeout, now)
+            }
+            CallInput::TlsListenerClose { listener } => {
+                self.tls.submit_listener_close(call_id, listener)
+            }
             CallInput::TlsRead {
                 stream,
                 max_len,
@@ -678,6 +785,25 @@ impl RuntimeDriver for BetelgeuseDriver {
                 call_id: entry.call_id,
                 result: CallOutput::SignalReceived { name: entry.name },
             });
+        }
+    }
+
+    fn resource_report(&self) -> DriverResourceReport {
+        let tcp = self.tcp.resource_report();
+        let tls = self.tls.resource_report();
+        DriverResourceReport {
+            listeners: tcp.listeners + tls.listeners,
+            streams: tcp.streams,
+            tls_streams: tls.tls_streams,
+            udp_sockets: tcp.udp_sockets,
+            files: tcp.files,
+            pending_calls: tcp.pending_calls
+                + self.storage.active_pending_count()
+                + self.dns.unresolved_pending_count()
+                + tls.pending_calls
+                + self.process.active_pending_count()
+                + self.signals.iter().filter(|entry| !entry.cancelled).count()
+                + self.timers.len(),
         }
     }
 }
@@ -799,6 +925,13 @@ impl StorageLane {
             lane.cancel_pending();
         }
     }
+
+    fn active_pending_count(&self) -> usize {
+        match self {
+            Self::Inline => 0,
+            Self::Worker(lane) => lane.active_pending_count(),
+        }
+    }
 }
 
 impl Drop for StorageLane {
@@ -848,6 +981,12 @@ impl DnsLane {
             Self::Worker(lane) => lane.cancel_pending(),
         }
     }
+
+    fn unresolved_pending_count(&self) -> usize {
+        match self {
+            Self::Worker(lane) => lane.unresolved_pending_count(),
+        }
+    }
 }
 
 impl Drop for DnsLane {
@@ -874,6 +1013,43 @@ impl TlsLane {
             Self::Worker(lane) => {
                 lane.submit_connect(call_id, addr, server_name, root_certificates, timeout, now)
             }
+        }
+    }
+
+    fn submit_bind(
+        &mut self,
+        call_id: CallId,
+        addr: SocketAddr,
+        certificate_chain: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => {
+                lane.submit_bind(call_id, addr, certificate_chain, private_key, now)
+            }
+        }
+    }
+
+    fn submit_accept(
+        &mut self,
+        call_id: CallId,
+        listener: TlsListenerId,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => lane.submit_accept(call_id, listener, timeout, now),
+        }
+    }
+
+    fn submit_listener_close(
+        &mut self,
+        call_id: CallId,
+        listener: TlsListenerId,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => lane.submit_listener_close(call_id, listener),
         }
     }
 
@@ -936,6 +1112,12 @@ impl TlsLane {
     fn cancel_pending(&mut self) {
         match self {
             Self::Worker(lane) => lane.cancel_pending(),
+        }
+    }
+
+    fn resource_report(&self) -> DriverResourceReport {
+        match self {
+            Self::Worker(lane) => lane.resource_report(),
         }
     }
 }
@@ -1261,9 +1443,95 @@ impl TlsWorkerLane {
             completions,
             handle: Some(handle),
             pending: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
+            listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            next_listener_id: 1,
             next_stream_id: 1,
         }
+    }
+
+    fn submit_bind(
+        &mut self,
+        call_id: CallId,
+        addr: SocketAddr,
+        certificate_chain: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.submit_command(
+            call_id,
+            TlsPendingLane::Connect(call_id),
+            Arc::clone(&cancelled),
+            now,
+            TlsCommand::Bind {
+                call_id,
+                addr,
+                certificate_chain,
+                private_key,
+                cancelled,
+            },
+        )
+    }
+
+    fn submit_accept(
+        &mut self,
+        call_id: CallId,
+        listener: TlsListenerId,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        let lane = TlsPendingLane::ListenerAccept(listener);
+        if self.lane_has_pending(lane) {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::ResourceBusy),
+            });
+        }
+        let Some(entry) = self.listener(listener) else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::InvalidResource),
+            });
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.submit_command(
+            call_id,
+            lane,
+            Arc::clone(&cancelled),
+            now,
+            TlsCommand::Accept {
+                call_id,
+                listener: entry.0,
+                config: entry.1,
+                timeout,
+                cancelled,
+            },
+        )
+    }
+
+    fn submit_listener_close(
+        &mut self,
+        call_id: CallId,
+        listener: TlsListenerId,
+    ) -> Option<DriverCompletion> {
+        if self.lane_has_pending(TlsPendingLane::ListenerAccept(listener)) {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::ResourceBusy),
+            });
+        }
+        let Some(index) = self.listeners.iter().position(|entry| entry.id == listener) else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::InvalidResource),
+            });
+        };
+        self.listeners.remove(index);
+        Some(DriverCompletion {
+            call_id,
+            result: CallOutput::TlsListenerClosed,
+        })
     }
 
     fn submit_connect(
@@ -1495,6 +1763,42 @@ impl TlsWorkerLane {
             return;
         }
         let result = match completion.result {
+            TlsCompletionResult::Bound(result) => match *result {
+                Ok((listener, config)) => {
+                    let id = TlsListenerId::new(self.next_listener_id);
+                    self.next_listener_id += 1;
+                    let local_addr = listener.local_addr().map_err(|_| CallError::Io);
+                    let listener = Arc::new(listener);
+                    self.listeners.push(TlsListenerEntry {
+                        id,
+                        listener,
+                        config: Arc::new(config),
+                    });
+                    match local_addr {
+                        Ok(local_addr) => CallOutput::TlsBound {
+                            listener: id,
+                            local_addr,
+                        },
+                        Err(error) => CallOutput::Failed(error),
+                    }
+                }
+                Err(error) => CallOutput::Failed(error),
+            },
+            TlsCompletionResult::Accepted(result) => match *result {
+                Ok((stream, peer_addr)) => {
+                    let id = TlsStreamId::new(self.next_stream_id);
+                    self.next_stream_id += 1;
+                    self.streams.push(TlsStreamEntry {
+                        id,
+                        stream: Arc::new(Mutex::new(stream)),
+                    });
+                    CallOutput::TlsAccepted {
+                        stream: id,
+                        peer_addr,
+                    }
+                }
+                Err(error) => CallOutput::Failed(error),
+            },
             TlsCompletionResult::Connected(result) => match *result {
                 Ok(stream) => {
                     let id = TlsStreamId::new(self.next_stream_id);
@@ -1547,6 +1851,7 @@ impl TlsWorkerLane {
         self.sender = None;
         self.drain_completion_channel();
         self.pending.clear();
+        self.listeners.clear();
         self.streams.clear();
         if self
             .handle
@@ -1563,7 +1868,7 @@ impl TlsWorkerLane {
         while self.completions.try_recv().is_ok() {}
     }
 
-    fn stream(&self, stream: TlsStreamId) -> Option<Arc<Mutex<TlsClientStream>>> {
+    fn stream(&self, stream: TlsStreamId) -> Option<Arc<Mutex<TlsRuntimeStream>>> {
         self.streams
             .iter()
             .find(|entry| entry.id == stream)
@@ -1574,6 +1879,29 @@ impl TlsWorkerLane {
         self.pending
             .iter()
             .any(|entry| entry.lane == lane && !entry.cancelled.load(Ordering::Acquire))
+    }
+
+    fn listener(
+        &self,
+        listener: TlsListenerId,
+    ) -> Option<(Arc<TcpListener>, Arc<rustls::ServerConfig>)> {
+        self.listeners
+            .iter()
+            .find(|entry| entry.id == listener)
+            .map(|entry| (Arc::clone(&entry.listener), Arc::clone(&entry.config)))
+    }
+
+    fn resource_report(&self) -> DriverResourceReport {
+        DriverResourceReport {
+            listeners: self.listeners.len(),
+            tls_streams: self.streams.len(),
+            pending_calls: self
+                .pending
+                .iter()
+                .filter(|entry| !entry.cancelled.load(Ordering::Acquire))
+                .count(),
+            ..DriverResourceReport::default()
+        }
     }
 }
 
@@ -1615,6 +1943,12 @@ impl ProcessLane {
     fn cancel_pending(&mut self) {
         match self {
             Self::Worker(lane) => lane.cancel_pending(),
+        }
+    }
+
+    fn active_pending_count(&self) -> usize {
+        match self {
+            Self::Worker(lane) => lane.active_pending_count(),
         }
     }
 }
@@ -1810,6 +2144,27 @@ fn tls_worker_loop(receiver: Receiver<TlsCommand>, completions: SyncSender<TlsCo
 
 fn execute_tls_command(command: TlsCommand) -> TlsCompletionResult {
     match command {
+        TlsCommand::Bind {
+            addr,
+            certificate_chain,
+            private_key,
+            cancelled,
+            ..
+        } => TlsCompletionResult::Bound(Box::new(bind_tls_listener(
+            addr,
+            certificate_chain,
+            private_key,
+            &cancelled,
+        ))),
+        TlsCommand::Accept {
+            listener,
+            config,
+            timeout,
+            cancelled,
+            ..
+        } => TlsCompletionResult::Accepted(Box::new(accept_tls(
+            listener, config, timeout, &cancelled,
+        ))),
         TlsCommand::Connect {
             addr,
             server_name,
@@ -1853,7 +2208,7 @@ fn connect_tls(
     root_certificates: Vec<Vec<u8>>,
     timeout: Duration,
     cancelled: &AtomicBool,
-) -> Result<TlsClientStream, CallError> {
+) -> Result<TlsRuntimeStream, CallError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     if cancelled.load(Ordering::Acquire) {
         return Err(CallError::Timeout);
@@ -1888,11 +2243,76 @@ fn connect_tls(
             .complete_io(&mut stream.sock)
             .map_err(|_| CallError::TlsHandshake)?;
     }
-    Ok(stream)
+    Ok(TlsRuntimeStream::Client(stream))
+}
+
+fn bind_tls_listener(
+    addr: SocketAddr,
+    certificate_chain: Vec<Vec<u8>>,
+    private_key: Vec<u8>,
+    cancelled: &AtomicBool,
+) -> Result<(TcpListener, rustls::ServerConfig), CallError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CallError::Timeout);
+    }
+    let certificates = certificate_chain
+        .into_iter()
+        .map(rustls::pki_types::CertificateDer::from)
+        .collect();
+    let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(private_key.into());
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|_| CallError::TlsCertificate)?;
+    let listener = TcpListener::bind(addr).map_err(|_| CallError::Io)?;
+    Ok((listener, config))
+}
+
+fn accept_tls(
+    listener: Arc<TcpListener>,
+    config: Arc<rustls::ServerConfig>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<(TlsRuntimeStream, SocketAddr), CallError> {
+    if cancelled.load(Ordering::Acquire) || timeout.is_zero() {
+        return Err(CallError::Timeout);
+    }
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| CallError::TlsClosed)?;
+    let deadline = Instant::now() + timeout;
+    let (tcp, peer_addr) = loop {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(CallError::Timeout);
+        }
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::yield_now();
+            }
+            Err(_) => return Err(CallError::Io),
+        }
+    };
+    tcp.set_nonblocking(false).map_err(|_| CallError::Io)?;
+    let _ = tcp.set_read_timeout(Some(timeout));
+    let _ = tcp.set_write_timeout(Some(timeout));
+    let connection = rustls::ServerConnection::new(config).map_err(|_| CallError::TlsHandshake)?;
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    while stream.conn.is_handshaking() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CallError::Timeout);
+        }
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|_| CallError::TlsHandshake)?;
+    }
+    Ok((TlsRuntimeStream::Server(stream), peer_addr))
 }
 
 fn read_tls(
-    stream: Arc<Mutex<TlsClientStream>>,
+    stream: Arc<Mutex<TlsRuntimeStream>>,
     max_len: usize,
     timeout: Duration,
     cancelled: &AtomicBool,
@@ -1904,7 +2324,7 @@ fn read_tls(
         Ok(guard) => guard,
         Err(_) => return CallOutput::Failed(CallError::TlsClosed),
     };
-    let _ = guard.sock.set_read_timeout(Some(timeout));
+    let _ = guard.tcp().set_read_timeout(Some(timeout));
     let mut buffer = vec![0; max_len];
     match guard.read(&mut buffer) {
         Ok(count) => {
@@ -1924,7 +2344,7 @@ fn read_tls(
 }
 
 fn write_tls(
-    stream: Arc<Mutex<TlsClientStream>>,
+    stream: Arc<Mutex<TlsRuntimeStream>>,
     bytes: &[u8],
     timeout: Duration,
     cancelled: &AtomicBool,
@@ -1936,7 +2356,7 @@ fn write_tls(
         Ok(guard) => guard,
         Err(_) => return CallOutput::Failed(CallError::TlsClosed),
     };
-    let _ = guard.sock.set_write_timeout(Some(timeout));
+    let _ = guard.tcp().set_write_timeout(Some(timeout));
     match guard.write(bytes) {
         Ok(count) => {
             if guard.flush().is_err() {
@@ -1957,7 +2377,7 @@ fn write_tls(
 }
 
 fn close_tls(
-    stream: Arc<Mutex<TlsClientStream>>,
+    stream: Arc<Mutex<TlsRuntimeStream>>,
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> CallOutput {
@@ -1968,8 +2388,8 @@ fn close_tls(
         Ok(guard) => guard,
         Err(_) => return CallOutput::Failed(CallError::TlsClosed),
     };
-    let _ = guard.sock.set_write_timeout(Some(timeout));
-    guard.conn.send_close_notify();
+    let _ = guard.tcp().set_write_timeout(Some(timeout));
+    guard.send_close_notify();
     match guard.flush() {
         Ok(()) => CallOutput::TlsClosed,
         Err(error)
@@ -2307,6 +2727,9 @@ impl BetelgeuseTcp {
                 result: CallOutput::Failed(CallError::Unsupported),
             }),
             CallInput::TlsConnect { .. }
+            | CallInput::TlsBind { .. }
+            | CallInput::TlsAccept { .. }
+            | CallInput::TlsListenerClose { .. }
             | CallInput::TlsRead { .. }
             | CallInput::TlsWrite { .. }
             | CallInput::TlsClose { .. } => Some(DriverCompletion {
@@ -2649,6 +3072,17 @@ impl BetelgeuseTcp {
     #[cfg(test)]
     fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    fn resource_report(&self) -> DriverResourceReport {
+        DriverResourceReport {
+            listeners: self.listeners.len(),
+            streams: self.streams.len(),
+            udp_sockets: self.udp_sockets.len(),
+            files: self.files.len(),
+            pending_calls: self.pending.iter().filter(|op| !op.cancelled).count(),
+            ..DriverResourceReport::default()
+        }
     }
 
     fn close_all_resources(&mut self) {
@@ -3138,7 +3572,9 @@ impl PendingKind {
 impl TlsCommand {
     fn call_id(&self) -> CallId {
         match self {
-            Self::Connect { call_id, .. }
+            Self::Bind { call_id, .. }
+            | Self::Accept { call_id, .. }
+            | Self::Connect { call_id, .. }
             | Self::Read { call_id, .. }
             | Self::Write { call_id, .. }
             | Self::Close { call_id, .. } => *call_id,
@@ -3147,7 +3583,9 @@ impl TlsCommand {
 
     fn timeout(&self) -> Duration {
         match self {
-            Self::Connect { timeout, .. }
+            Self::Bind { .. } => Duration::from_secs(86_400),
+            Self::Accept { timeout, .. }
+            | Self::Connect { timeout, .. }
             | Self::Read { timeout, .. }
             | Self::Write { timeout, .. }
             | Self::Close { timeout, .. } => *timeout,
@@ -3156,7 +3594,13 @@ impl TlsCommand {
 
     fn set_cancelled(&mut self, cancelled: Arc<AtomicBool>) {
         match self {
-            Self::Connect {
+            Self::Bind {
+                cancelled: slot, ..
+            }
+            | Self::Accept {
+                cancelled: slot, ..
+            }
+            | Self::Connect {
                 cancelled: slot, ..
             }
             | Self::Read {
@@ -3547,7 +3991,9 @@ mod tests {
                 cancelled: Arc::clone(&cancelled),
                 timed_out: false,
             }],
+            listeners: Vec::new(),
             streams: Vec::new(),
+            next_listener_id: 1,
             next_stream_id: 1,
         };
 

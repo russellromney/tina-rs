@@ -14,11 +14,12 @@ use tina_runtime::{
     LocalSystem, LocalSystemConfig, LocalSystemConfigError, LocalSystemState, MailboxFactory,
     PathKind, PathMetadata, PersistenceSupportLevel, ResourceExecutionShape, ResourceSupport,
     RuntimeEventKind, ShutdownSupport, SnapshotImage, StreamId, ThreadedRuntimeError,
-    ThreadedTrySendError, TlsStreamId, TraceRetention, UdpSocketId, call, dns_lookup, file_close,
-    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, signal_wait, sleep,
-    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    ThreadedTrySendError, TlsListenerId, TlsStreamId, TraceRetention, UdpSocketId, call,
+    dns_lookup, file_close, file_create, file_fsync, file_read, file_size, file_write,
+    journal_append, journal_replay, path_metadata, process_run, read_dir, remove_file,
+    rename_replace, signal_wait, sleep, snapshot_load, sync_parent, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write, tls_accept, tls_bind, tls_close,
+    tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
     udp_recv_from, udp_send_to,
 };
 
@@ -494,6 +495,91 @@ impl TlsClientService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum TlsServerMsg {
+    Start,
+    Bound(Result<(TlsListenerId, SocketAddr), CallError>),
+    Accepted(Result<(TlsStreamId, SocketAddr), CallError>, TlsListenerId),
+    Read(Result<Vec<u8>, CallError>, TlsListenerId, TlsStreamId),
+    Wrote(Result<usize, CallError>, TlsListenerId, TlsStreamId),
+    StreamClosed(Result<(), CallError>, TlsListenerId),
+    ListenerClosed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct TlsServerService {
+    observed: Arc<Mutex<Vec<String>>>,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+}
+
+#[tina_runtime::isolate(message = TlsServerMsg, shard = AppShard)]
+impl TlsServerService {
+    fn handle(&mut self, msg: TlsServerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            TlsServerMsg::Start => tls_bind(
+                "127.0.0.1:0".parse().expect("loopback"),
+                vec![self.cert_der.clone()],
+                self.key_der.clone(),
+            )
+            .reply(TlsServerMsg::Bound),
+            TlsServerMsg::Bound(Ok((listener, local_addr))) => {
+                self.observed
+                    .lock()
+                    .expect("tls server observed lock")
+                    .push(format!("bound:{local_addr}"));
+                tls_accept(listener, Duration::from_secs(2))
+                    .reply(move |result| TlsServerMsg::Accepted(result, listener))
+            }
+            TlsServerMsg::Accepted(Ok((stream, peer)), listener) => {
+                self.observed
+                    .lock()
+                    .expect("tls server observed lock")
+                    .push(format!("accepted:{peer}"));
+                tls_read(stream, 4, Duration::from_secs(2))
+                    .reply(move |result| TlsServerMsg::Read(result, listener, stream))
+            }
+            TlsServerMsg::Read(Ok(bytes), listener, stream) if bytes == b"ping" => {
+                tls_write(stream, b"pong".to_vec(), Duration::from_secs(2))
+                    .reply(move |result| TlsServerMsg::Wrote(result, listener, stream))
+            }
+            TlsServerMsg::Wrote(Ok(4), listener, stream) => {
+                tls_close(stream, Duration::from_secs(2))
+                    .reply(move |result| TlsServerMsg::StreamClosed(result, listener))
+            }
+            TlsServerMsg::StreamClosed(Ok(()), listener) => {
+                tls_close_listener(listener).reply(TlsServerMsg::ListenerClosed)
+            }
+            TlsServerMsg::ListenerClosed(Ok(())) => {
+                self.observed
+                    .lock()
+                    .expect("tls server observed lock")
+                    .push("closed".to_string());
+                noop()
+            }
+            TlsServerMsg::Bound(Err(error))
+            | TlsServerMsg::Accepted(Err(error), _)
+            | TlsServerMsg::Read(Err(error), _, _)
+            | TlsServerMsg::Wrote(Err(error), _, _)
+            | TlsServerMsg::StreamClosed(Err(error), _)
+            | TlsServerMsg::ListenerClosed(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("tls server observed lock")
+                    .push(format!("failed:{error:?}"));
+                noop()
+            }
+            TlsServerMsg::Read(Ok(_), _, _) | TlsServerMsg::Wrote(Ok(_), _, _) => {
+                self.observed
+                    .lock()
+                    .expect("tls server observed lock")
+                    .push("failed:unexpected-shape".to_string());
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SignalUnsupportedMsg {
     Start,
     Done(Result<String, CallError>),
@@ -721,6 +807,17 @@ struct FileService {
     seen: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeldFileMsg {
+    Start(PathBuf),
+    Opened(Result<FileId, CallError>),
+}
+
+#[derive(Debug)]
+struct HeldFileService {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
 const FILE_SERVICE_PAYLOAD: &[u8] = b"local system file";
 
 #[tina_runtime::isolate(message = FileMsg, shard = AppShard)]
@@ -792,6 +889,29 @@ impl FileService {
                     .lock()
                     .expect("file seen lock")
                     .push("failed".to_string());
+                noop()
+            }
+        }
+    }
+}
+
+#[tina_runtime::isolate(message = HeldFileMsg, shard = AppShard)]
+impl HeldFileService {
+    fn handle(&mut self, msg: HeldFileMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            HeldFileMsg::Start(path) => file_create(path).reply(HeldFileMsg::Opened),
+            HeldFileMsg::Opened(Ok(_file)) => {
+                self.seen
+                    .lock()
+                    .expect("held file seen lock")
+                    .push("opened".to_string());
+                noop()
+            }
+            HeldFileMsg::Opened(Err(error)) => {
+                self.seen
+                    .lock()
+                    .expect("held file seen lock")
+                    .push(format!("failed:{error:?}"));
                 noop()
             }
         }
@@ -1558,6 +1678,116 @@ fn local_system_tls_rail_connects_writes_reads_and_closes() {
         CallKind::TlsWrite,
         CallKind::TlsRead,
         CallKind::TlsClose,
+    ] {
+        assert!(
+            terminal.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+                )
+            }),
+            "missing {expected:?} completion in trace: {:?}",
+            terminal.trace()
+        );
+    }
+}
+
+#[test]
+fn local_system_tls_server_accepts_reads_writes_and_closes() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(43), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<TlsServerService, Infallible>(
+            TlsServerService {
+                observed: Arc::clone(&observed),
+                cert_der: cert_der.clone(),
+                key_der,
+            },
+            8,
+        )
+        .expect("register tls server service");
+
+    app.try_send(address, TlsServerMsg::Start)
+        .expect("start tls server service");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("tls server observed lock")
+            .iter()
+            .any(|entry| entry.starts_with("bound:"))
+    });
+    let addr: SocketAddr = observed
+        .lock()
+        .expect("tls server observed lock")
+        .iter()
+        .find_map(|entry| entry.strip_prefix("bound:").map(str::to_string))
+        .expect("bound addr")
+        .parse()
+        .expect("parse bound addr");
+    wait_until(|| {
+        app.topology()
+            .shard(ShardId::new(43))
+            .expect("tls server shard")
+            .owned_resource_count()
+            >= 1
+    });
+
+    let client = thread::spawn(move || {
+        let tcp = TcpStream::connect(addr).expect("connect tls server");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(cert_der))
+            .expect("add root cert");
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let connection =
+            rustls::ClientConnection::new(Arc::new(config), server_name).expect("client conn");
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        while stream.conn.is_handshaking() {
+            stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .expect("client handshake");
+        }
+        stream.write_all(b"ping").expect("write ping");
+        stream.flush().expect("flush ping");
+        let mut response = [0_u8; 4];
+        stream.read_exact(&mut response).expect("read pong");
+        assert_eq!(&response, b"pong");
+    });
+
+    wait_until(|| {
+        let entries = observed.lock().expect("tls server observed lock");
+        entries.len() == 3
+            && entries[0] == format!("bound:{addr}")
+            && entries[1].starts_with("accepted:")
+            && entries[2] == "closed"
+    });
+
+    client.join().expect("tls client thread");
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    for expected in [
+        CallKind::TlsBind,
+        CallKind::TlsAccept,
+        CallKind::TlsRead,
+        CallKind::TlsWrite,
+        CallKind::TlsClose,
+        CallKind::TlsListenerClose,
     ] {
         assert!(
             terminal.trace().iter().any(|event| {
@@ -2825,6 +3055,54 @@ fn local_system_service_uses_runtime_owned_file_io() {
             "expected {expected:?} completion in local system trace"
         );
     }
+}
+
+#[test]
+fn local_system_reports_live_owned_resources_and_shutdown_cleanup() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let path = unique_dir("local-app-held-file").with_extension("txt");
+    let app = LocalSystem::single_shard(AppShard(52), AppMailboxFactory)
+        .ingress_capacity(8)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<HeldFileService, Infallible>(
+            HeldFileService {
+                seen: Arc::clone(&seen),
+            },
+            8,
+        )
+        .expect("register held file root");
+
+    app.try_send(address, HeldFileMsg::Start(path.clone()))
+        .expect("held file start handoff");
+    wait_until(|| seen.lock().expect("held file seen lock").as_slice() == ["opened"]);
+
+    let live_topology = app.topology();
+    assert_eq!(
+        live_topology
+            .shard(ShardId::new(52))
+            .expect("held file shard")
+            .owned_resource_count(),
+        1
+    );
+
+    let terminal = app.shutdown().drain().join().expect("held file shutdown");
+    let _ = fs::remove_file(path);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
+    assert_eq!(
+        terminal.shutdown_report().remaining_owned_resource_count(),
+        0
+    );
+    assert_eq!(
+        terminal
+            .topology()
+            .expect("terminal topology")
+            .shard(ShardId::new(52))
+            .expect("terminal held file shard")
+            .owned_resource_count(),
+        0
+    );
 }
 
 #[test]

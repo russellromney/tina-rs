@@ -13,10 +13,10 @@ use tina::{
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
     FileOpenOptions, ListenerId, PathKind, ProcessRunResult, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, StreamId, TlsStreamId, UdpSocketId, dns_lookup, file_close, file_create,
-    file_write, mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace,
-    signal_wait, sync_parent, tls_close, tls_connect, tls_read, tls_write, udp_bind,
-    udp_close_socket, udp_recv_from, udp_send_to,
+    RuntimeEventKind, StreamId, TlsListenerId, TlsStreamId, UdpSocketId, dns_lookup, file_close,
+    file_create, file_write, mkdir, path_metadata, process_run, read_dir, remove_file,
+    rename_replace, signal_wait, sync_parent, tls_accept, tls_bind, tls_close, tls_close_listener,
+    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact, ScriptedDnsConfig,
@@ -540,6 +540,61 @@ impl Isolate for TlsProbe {
                 self.observed
                     .borrow_mut()
                     .push(format!("tls-close-err:{error:?}"));
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TlsServerProbeMsg {
+    Bind,
+    Bound(Result<(TlsListenerId, SocketAddr), CallError>),
+    Accepted(Result<(TlsStreamId, SocketAddr), CallError>, TlsListenerId),
+    ClosedStream(Result<(), CallError>, TlsListenerId),
+    ClosedListener(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct TlsServerProbe {
+    observed: Rc<RefCell<Vec<String>>>,
+}
+
+impl Isolate for TlsServerProbe {
+    type Message = TlsServerProbeMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<TlsServerProbeMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            TlsServerProbeMsg::Bind => {
+                tls_bind(local_addr(0), Vec::new(), Vec::new()).reply(TlsServerProbeMsg::Bound)
+            }
+            TlsServerProbeMsg::Bound(Ok((listener, addr))) => {
+                self.observed.borrow_mut().push(format!("bound:{addr}"));
+                tls_accept(listener, Duration::from_millis(50))
+                    .reply(move |result| TlsServerProbeMsg::Accepted(result, listener))
+            }
+            TlsServerProbeMsg::Accepted(Ok((stream, _peer)), listener) => {
+                self.observed.borrow_mut().push("accepted".to_string());
+                tls_close(stream, Duration::from_millis(50))
+                    .reply(move |result| TlsServerProbeMsg::ClosedStream(result, listener))
+            }
+            TlsServerProbeMsg::ClosedStream(Ok(()), listener) => {
+                tls_close_listener(listener).reply(TlsServerProbeMsg::ClosedListener)
+            }
+            TlsServerProbeMsg::ClosedListener(Ok(())) => {
+                self.observed.borrow_mut().push("closed".to_string());
+                Effect::Noop
+            }
+            TlsServerProbeMsg::Bound(Err(error))
+            | TlsServerProbeMsg::Accepted(Err(error), _)
+            | TlsServerProbeMsg::ClosedStream(Err(error), _)
+            | TlsServerProbeMsg::ClosedListener(Err(error)) => {
+                self.observed.borrow_mut().push(format!("err:{error:?}"));
                 Effect::Noop
             }
         }
@@ -2397,6 +2452,50 @@ fn scripted_tls_connect_read_write_close_and_replays() {
                 timeout: Duration::from_millis(50),
             },
         )
+        .unwrap();
+    replay.run_until_quiescent();
+    assert_eq!(
+        first.event_record(),
+        replay.replay_artifact().event_record()
+    );
+}
+
+#[test]
+fn scripted_tls_server_bind_accept_close_and_replays() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, SimulatorConfig::default());
+    let probe = sim.register(TlsServerProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(probe, TlsServerProbeMsg::Bind).unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        *observed.borrow(),
+        vec![
+            "bound:127.0.0.1:40001".to_string(),
+            "accepted".to_string(),
+            "closed".to_string(),
+        ]
+    );
+    for expected in [
+        CallKind::TlsBind,
+        CallKind::TlsAccept,
+        CallKind::TlsClose,
+        CallKind::TlsListenerClose,
+    ] {
+        assert_eq!(count_call_completed(sim.trace(), expected), 1);
+    }
+
+    let first = sim.replay_artifact();
+    let replay_observed = Rc::new(RefCell::new(Vec::new()));
+    let mut replay = Simulator::new(TestShard, SimulatorConfig::default());
+    let replay_probe = replay.register(TlsServerProbe {
+        observed: Rc::clone(&replay_observed),
+    });
+    replay
+        .try_send(replay_probe, TlsServerProbeMsg::Bind)
         .unwrap();
     replay.run_until_quiescent();
     assert_eq!(

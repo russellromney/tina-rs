@@ -372,3 +372,49 @@ Verification:
 - `cargo fmt --all`
 - `cargo +nightly clippy -p tina-runtime -p tina-sim --all-targets -- -D warnings`
 - `make verify`
+
+# Implementation Review 3
+
+Verdict: the two remaining Victor review findings are fixed in the continuation
+slice.
+
+What landed:
+
+- Native inbound TLS server rail: `TlsListenerId`, `tls_bind(...)`,
+  `tls_accept(...)`, `tls_close_listener(...)`, plus existing
+  `tls_read`/`tls_write`/`tls_close`.
+- Live runtime TLS server e2e: bind with a static cert/key, accept a real rustls
+  client, read `ping`, write `pong`, close stream, close listener, and assert
+  the TLS call trace.
+- Simulator TLS server oracle: bind/accept/close outcomes replay
+  deterministically. The sim models TLS outcomes, not cryptography.
+- Live resource inventory: terminal shutdown reports now sum live driver-owned
+  resources instead of hardcoding zero.
+- Resource inventory covers TCP listeners/streams, TLS listeners/streams, UDP
+  sockets, files, and active pending driver calls. A held-file test pins live
+  count and shutdown cleanup. The TLS server test pins live TLS listener count.
+
+Important honesty:
+
+- Victor's TLS server rail is a native TLS listener lane, not raw `StreamId` to
+  `TlsStreamId` upgrade. Betelgeuse sockets do not expose the `Read`/`Write`
+  stream rustls needs for that shape. Raw TCP-to-TLS owner transfer remains a
+  later rock if the project wants it.
+- The simulator TLS accept creates deterministic TLS stream outcomes. It is an
+  oracle for Tina resource semantics, not a crypto test.
+
+Bug found and fixed during review:
+
+- Resource accounting initially summed TCP listeners but forgot TLS listeners.
+  Fixed the aggregate and added a live TLS listener count assertion.
+
+Verification:
+
+- `cargo +nightly test -p tina-runtime --test local_system local_system_tls_server_accepts_reads_writes_and_closes -- --nocapture`
+- `cargo +nightly test -p tina-runtime --test local_system local_system_reports_live_owned_resources_and_shutdown_cleanup -- --nocapture`
+- `cargo +nightly test -p tina-runtime --test local_system -- --nocapture`
+- `cargo +nightly test -p tina-sim --test io_simulation scripted_tls_server_bind_accept_close_and_replays -- --nocapture`
+- `cargo +nightly test -p tina-sim --test io_simulation -- --nocapture`
+- `cargo +nightly check --workspace`
+- `cargo +nightly clippy -p tina-runtime -p tina-sim --all-targets -- -D warnings`
+- `make verify`

@@ -122,6 +122,22 @@ impl TlsStreamId {
     }
 }
 
+/// Runtime-owned identifier for a TLS listener resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TlsListenerId(u64);
+
+impl TlsListenerId {
+    /// Creates a TLS listener identifier from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw listener identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Runtime-owned identifier for an opened file resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(u64);
@@ -402,6 +418,30 @@ pub enum CallInput {
         timeout: Duration,
     },
 
+    /// Bind one server TLS listener to `addr`.
+    TlsBind {
+        /// Local socket address.
+        addr: SocketAddr,
+        /// Certificate chain in DER form.
+        certificate_chain: Vec<Vec<u8>>,
+        /// Private key in DER form.
+        private_key: Vec<u8>,
+    },
+
+    /// Accept one inbound TLS stream from a TLS listener.
+    TlsAccept {
+        /// TLS listener to accept from.
+        listener: TlsListenerId,
+        /// Maximum time for TCP accept and TLS handshake.
+        timeout: Duration,
+    },
+
+    /// Close one TLS listener.
+    TlsListenerClose {
+        /// TLS listener to close.
+        listener: TlsListenerId,
+    },
+
     /// Read decrypted bytes from a TLS stream.
     TlsRead {
         /// TLS stream to read from.
@@ -615,6 +655,9 @@ impl CallInput {
             Self::UdpRecvFrom { .. } => crate::trace::CallKind::UdpRecvFrom,
             Self::UdpSocketClose { .. } => crate::trace::CallKind::UdpSocketClose,
             Self::TlsConnect { .. } => crate::trace::CallKind::TlsConnect,
+            Self::TlsBind { .. } => crate::trace::CallKind::TlsBind,
+            Self::TlsAccept { .. } => crate::trace::CallKind::TlsAccept,
+            Self::TlsListenerClose { .. } => crate::trace::CallKind::TlsListenerClose,
             Self::TlsRead { .. } => crate::trace::CallKind::TlsRead,
             Self::TlsWrite { .. } => crate::trace::CallKind::TlsWrite,
             Self::TlsClose { .. } => crate::trace::CallKind::TlsClose,
@@ -756,6 +799,22 @@ pub enum CallOutput {
         stream: TlsStreamId,
     },
 
+    /// A TLS listener was bound and is ready to accept.
+    TlsBound {
+        /// Runtime-assigned TLS listener id.
+        listener: TlsListenerId,
+        /// Actual bound address.
+        local_addr: SocketAddr,
+    },
+
+    /// A TLS server stream was accepted and handshaken.
+    TlsAccepted {
+        /// Runtime-assigned TLS stream id.
+        stream: TlsStreamId,
+        /// Remote peer address.
+        peer_addr: SocketAddr,
+    },
+
     /// A TLS stream read decrypted bytes.
     TlsRead {
         /// Decrypted bytes.
@@ -770,6 +829,9 @@ pub enum CallOutput {
 
     /// A TLS stream was closed.
     TlsClosed,
+
+    /// A TLS listener was closed.
+    TlsListenerClosed,
 
     /// A DNS lookup resolved to one or more socket addresses.
     DnsResolved {
@@ -1562,6 +1624,27 @@ impl CallOutput {
         }
     }
 
+    /// Extracts the successful TLS bind result.
+    pub fn into_tls_bound(self) -> Result<(TlsListenerId, SocketAddr), CallError> {
+        match self {
+            Self::TlsBound {
+                listener,
+                local_addr,
+            } => Ok((listener, local_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsBound", &other),
+        }
+    }
+
+    /// Extracts the successful TLS accept result.
+    pub fn into_tls_accepted(self) -> Result<(TlsStreamId, SocketAddr), CallError> {
+        match self {
+            Self::TlsAccepted { stream, peer_addr } => Ok((stream, peer_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsAccepted", &other),
+        }
+    }
+
     /// Extracts the successful TLS read payload.
     pub fn into_tls_read(self) -> Result<Vec<u8>, CallError> {
         match self {
@@ -1586,6 +1669,15 @@ impl CallOutput {
             Self::TlsClosed => Ok(()),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsClosed", &other),
+        }
+    }
+
+    /// Extracts the successful TLS listener close completion.
+    pub fn into_tls_listener_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::TlsListenerClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsListenerClosed", &other),
         }
     }
 
@@ -2070,6 +2162,41 @@ pub fn tls_connect(
             timeout,
         },
         CallOutput::into_tls_connected,
+    )
+}
+
+/// Returns a typed TLS server bind helper with explicit DER cert/key.
+pub fn tls_bind(
+    addr: SocketAddr,
+    certificate_chain: Vec<Vec<u8>>,
+    private_key: Vec<u8>,
+) -> TypedCall<(TlsListenerId, SocketAddr)> {
+    TypedCall::new(
+        CallInput::TlsBind {
+            addr,
+            certificate_chain,
+            private_key,
+        },
+        CallOutput::into_tls_bound,
+    )
+}
+
+/// Returns a typed TLS server accept helper.
+pub fn tls_accept(
+    listener: TlsListenerId,
+    timeout: Duration,
+) -> TypedCall<(TlsStreamId, SocketAddr)> {
+    TypedCall::new(
+        CallInput::TlsAccept { listener, timeout },
+        CallOutput::into_tls_accepted,
+    )
+}
+
+/// Returns a typed TLS listener close helper.
+pub fn tls_close_listener(listener: TlsListenerId) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::TlsListenerClose { listener },
+        CallOutput::into_tls_listener_closed,
     )
 }
 

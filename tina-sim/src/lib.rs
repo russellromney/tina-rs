@@ -59,8 +59,8 @@ use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
     CallReplyRejectedReason, EffectKind, ListenerId, PathKind, PathMetadata, PersistenceTraceInfo,
     ProcessStatus, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
-    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason, TlsStreamId,
-    UdpSocketId,
+    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason, TlsListenerId,
+    TlsStreamId, UdpSocketId,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -1401,6 +1401,7 @@ enum TcpResourceKey {
     UdpRecv(UdpSocketId),
     Dns(CallId),
     TlsConnect(CallId),
+    TlsAccept(TlsListenerId),
     TlsStream(TlsStreamId),
     Signal(CallId),
     Process(CallId),
@@ -1422,7 +1423,10 @@ impl TcpResourceKey {
     }
 
     fn is_tls(self) -> bool {
-        matches!(self, Self::TlsConnect(_) | Self::TlsStream(_))
+        matches!(
+            self,
+            Self::TlsConnect(_) | Self::TlsAccept(_) | Self::TlsStream(_)
+        )
     }
 
     fn is_process(self) -> bool {
@@ -1516,6 +1520,13 @@ struct TlsStreamState {
     writes: VecDeque<ScriptedTlsWriteResult>,
     closed: bool,
     pending_connect_call: Option<CallId>,
+}
+
+#[derive(Debug)]
+struct TlsListenerState {
+    id: TlsListenerId,
+    local_addr: SocketAddr,
+    closed: bool,
 }
 
 #[derive(Debug)]
@@ -1982,6 +1993,7 @@ where
     next_listener_id: u64,
     next_stream_id: u64,
     next_udp_socket_id: u64,
+    next_tls_listener_id: u64,
     next_tls_stream_id: u64,
     next_file_id: u64,
     ids: IdSource,
@@ -1996,6 +2008,7 @@ where
     listeners: Vec<ListenerState>,
     streams: Vec<StreamState>,
     udp_sockets: Vec<UdpSocketState>,
+    tls_listeners: Vec<TlsListenerState>,
     tls_streams: Vec<TlsStreamState>,
     files: Vec<FileState>,
     file_storage: BTreeMap<PathBuf, Vec<u8>>,
@@ -2032,6 +2045,7 @@ where
             next_listener_id: 1,
             next_stream_id: 1,
             next_udp_socket_id: 1,
+            next_tls_listener_id: 1,
             next_tls_stream_id: 1,
             next_file_id: 1,
             ids,
@@ -2046,6 +2060,7 @@ where
             listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             udp_sockets: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            tls_listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             tls_streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             files: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             file_storage: BTreeMap::new(),
@@ -3132,6 +3147,13 @@ where
                 root_certificates,
                 timeout,
             } => self.handle_tls_connect(call_id, addr, server_name, root_certificates, timeout),
+            CallInput::TlsBind { addr, .. } => self.handle_tls_bind(call_id, addr),
+            CallInput::TlsAccept { listener, timeout } => {
+                self.handle_tls_accept(call_id, listener, timeout)
+            }
+            CallInput::TlsListenerClose { listener } => {
+                self.handle_tls_listener_close(call_id, listener)
+            }
             CallInput::TlsRead {
                 stream,
                 max_len,
@@ -3905,6 +3927,110 @@ where
         );
     }
 
+    fn handle_tls_bind(&mut self, call_id: CallId, addr: SocketAddr) {
+        if self
+            .tls_listeners
+            .iter()
+            .any(|listener| listener.local_addr == addr && !listener.closed)
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        let listener = TlsListenerId::new(self.next_tls_listener_id);
+        self.next_tls_listener_id += 1;
+        let local_addr = if addr.port() == 0 {
+            SocketAddr::new(addr.ip(), 40_000 + listener.get() as u16)
+        } else {
+            addr
+        };
+        self.tls_listeners.push(TlsListenerState {
+            id: listener,
+            local_addr,
+            closed: false,
+        });
+        self.deliver_completion(
+            call_id,
+            CallOutput::TlsBound {
+                listener,
+                local_addr,
+            },
+        );
+    }
+
+    fn handle_tls_accept(&mut self, call_id: CallId, listener: TlsListenerId, timeout: Duration) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+        let Some(listener_index) = self.tls_listener_index(listener) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.tls_listeners[listener_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::TlsClosed));
+            return;
+        }
+        let resource = TcpResourceKey::TlsAccept(listener);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        if self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| completion.resource.is_tls())
+            .count()
+            >= self.config.tls.pending_completion_capacity
+        {
+            self.schedule_tls_completion(
+                call_id,
+                resource,
+                self.step_ordinal + 1,
+                CallOutput::Failed(CallError::TlsFull),
+            );
+            return;
+        }
+        let stream = TlsStreamId::new(self.next_tls_stream_id);
+        self.next_tls_stream_id += 1;
+        self.tls_streams.push(TlsStreamState {
+            id: stream,
+            reads: VecDeque::new(),
+            writes: VecDeque::new(),
+            closed: false,
+            pending_connect_call: Some(call_id),
+        });
+        self.schedule_tls_completion(
+            call_id,
+            resource,
+            self.step_ordinal + 1,
+            CallOutput::TlsAccepted {
+                stream,
+                peer_addr: "127.0.0.1:50000".parse().expect("scripted peer addr"),
+            },
+        );
+    }
+
+    fn handle_tls_listener_close(&mut self, call_id: CallId, listener: TlsListenerId) {
+        let Some(listener_index) = self.tls_listener_index(listener) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.tls_listeners[listener_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::TlsClosed));
+            return;
+        }
+        if self.resource_has_active_pending(TcpResourceKey::TlsAccept(listener)) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        self.tls_listeners[listener_index].closed = true;
+        self.deliver_completion(call_id, CallOutput::TlsListenerClosed);
+    }
+
     fn handle_tls_read(
         &mut self,
         call_id: CallId,
@@ -4588,6 +4714,7 @@ where
             | TcpResourceKey::UdpSend(_)
             | TcpResourceKey::Dns(_)
             | TcpResourceKey::TlsConnect(_)
+            | TcpResourceKey::TlsAccept(_)
             | TcpResourceKey::TlsStream(_)
             | TcpResourceKey::Signal(_)
             | TcpResourceKey::Process(_)
@@ -4622,6 +4749,12 @@ where
 
     fn tls_stream_index(&self, stream: TlsStreamId) -> Option<usize> {
         self.tls_streams.iter().position(|state| state.id == stream)
+    }
+
+    fn tls_listener_index(&self, listener: TlsListenerId) -> Option<usize> {
+        self.tls_listeners
+            .iter()
+            .position(|state| state.id == listener)
     }
 
     fn file_has_active_pending(&self, file: tina_runtime::FileId) -> bool {
@@ -5080,8 +5213,14 @@ where
         let mut batch_offset = 0;
         let mut last_registration_index = None;
         for completion in ready {
-            if let CallOutput::TlsConnected { stream } = &completion.result {
-                if let Some(stream_index) = self.tls_stream_index(*stream) {
+            let completed_tls_stream = match &completion.result {
+                CallOutput::TlsConnected { stream } | CallOutput::TlsAccepted { stream, .. } => {
+                    Some(*stream)
+                }
+                _ => None,
+            };
+            if let Some(stream) = completed_tls_stream {
+                if let Some(stream_index) = self.tls_stream_index(stream) {
                     if self.tls_streams[stream_index].pending_connect_call
                         == Some(completion.call_id)
                     {
@@ -6050,6 +6189,9 @@ fn call_kind(request: &CallInput) -> CallKind {
         CallInput::UdpSocketClose { .. } => CallKind::UdpSocketClose,
         CallInput::DnsLookup { .. } => CallKind::DnsLookup,
         CallInput::TlsConnect { .. } => CallKind::TlsConnect,
+        CallInput::TlsBind { .. } => CallKind::TlsBind,
+        CallInput::TlsAccept { .. } => CallKind::TlsAccept,
+        CallInput::TlsListenerClose { .. } => CallKind::TlsListenerClose,
         CallInput::TlsRead { .. } => CallKind::TlsRead,
         CallInput::TlsWrite { .. } => CallKind::TlsWrite,
         CallInput::TlsClose { .. } => CallKind::TlsClose,

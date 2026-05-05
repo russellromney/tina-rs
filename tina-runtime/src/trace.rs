@@ -111,6 +111,15 @@ pub enum CallKind {
     /// A TLS connect and handshake.
     TlsConnect,
 
+    /// A TLS listener bind.
+    TlsBind,
+
+    /// A TLS server accept and handshake.
+    TlsAccept,
+
+    /// A TLS listener close.
+    TlsListenerClose,
+
     /// A TLS read.
     TlsRead,
 

@@ -61,13 +61,14 @@ pub use call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
     IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
     PathKind, PathMetadata, PersistenceTraceInfo, ProcessRunResult, ProcessStatus, RuntimeCall,
-    RuntimeCallParts, SendOutcome, SnapshotImage, StreamId, TlsStreamId, TypedCall, UdpSocketId,
-    call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read, file_read_at,
-    file_size, file_write, file_write_at, journal_append, journal_replay, mkdir, path_metadata,
-    process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait, sleep,
-    sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_close, tls_connect,
-    tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    RuntimeCallParts, SendOutcome, SnapshotImage, StreamId, TlsListenerId, TlsStreamId, TypedCall,
+    UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
+    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
+    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
+    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
+    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
@@ -701,6 +702,10 @@ where
     #[cfg(test)]
     fn io_pending_count(&self) -> usize {
         self.driver.io_pending_count()
+    }
+
+    fn owned_resource_count(&self) -> usize {
+        self.driver.resource_report().owned_resource_count()
     }
 
     /// Returns a shared reference to the shard.
@@ -3299,6 +3304,7 @@ struct LiveShardMetrics {
     ingress: LiveQueueMetrics,
     storage_lane: LiveQueueMetrics,
     trace_retention: TraceRetention,
+    owned_resource_count: AtomicUsize,
 }
 
 impl LiveShardMetrics {
@@ -3310,6 +3316,7 @@ impl LiveShardMetrics {
             ingress: LiveQueueMetrics::new(config.command_capacity),
             storage_lane: LiveQueueMetrics::new(config.storage_lane_capacity),
             trace_retention: config.trace_retention,
+            owned_resource_count: AtomicUsize::new(0),
         }
     }
 
@@ -3326,6 +3333,10 @@ impl LiveShardMetrics {
         self.state.store(raw, Ordering::Release);
     }
 
+    fn set_owned_resource_count(&self, count: usize) {
+        self.owned_resource_count.store(count, Ordering::Release);
+    }
+
     fn report(&self) -> LiveShardReport {
         LiveShardReport {
             shard: self.shard,
@@ -3335,6 +3346,7 @@ impl LiveShardMetrics {
             storage_lane: LiveQueueReport::unmeasured(self.storage_lane.capacity),
             trace_retention: self.trace_retention,
             trace_dropped: None,
+            owned_resource_count: self.owned_resource_count.load(Ordering::Acquire),
         }
     }
 }
@@ -3349,6 +3361,7 @@ pub struct LiveShardReport {
     storage_lane: LiveQueueReport,
     trace_retention: TraceRetention,
     trace_dropped: Option<u64>,
+    owned_resource_count: usize,
 }
 
 impl LiveShardReport {
@@ -3385,6 +3398,11 @@ impl LiveShardReport {
     /// Dropped trace count when available without probing the worker.
     pub const fn trace_dropped(&self) -> Option<u64> {
         self.trace_dropped
+    }
+
+    /// Live driver-owned resource handles known to this worker.
+    pub const fn owned_resource_count(&self) -> usize {
+        self.owned_resource_count
     }
 }
 
@@ -3512,6 +3530,15 @@ impl LocalSystemShutdownReport {
                     .collect()
             })
             .unwrap_or_default();
+        let remaining_owned_resource_count = topology
+            .map(|topology| {
+                topology
+                    .shards()
+                    .iter()
+                    .map(LiveShardReport::owned_resource_count)
+                    .sum()
+            })
+            .unwrap_or_default();
         Self {
             final_state: state,
             clean: error.is_none() && state == LocalSystemState::Closed,
@@ -3519,7 +3546,7 @@ impl LocalSystemShutdownReport {
             tombstoned_count: summary.call_reply_rejected,
             rejected_after_drain_count: summary.send_rejected,
             failed_shards,
-            remaining_owned_resource_count: 0,
+            remaining_owned_resource_count,
         }
     }
 
@@ -4231,10 +4258,18 @@ where
             config,
         ));
         let io_loop_factory: ThreadedIoLoopFactory = Box::new(io_loop_factory);
+        let worker_metrics = Arc::clone(&metrics);
         let handle = thread::Builder::new()
             .name(worker_name)
             .spawn(move || {
-                threaded_worker_loop(shard, mailbox_factory, receiver, config, io_loop_factory)
+                threaded_worker_loop(
+                    shard,
+                    mailbox_factory,
+                    receiver,
+                    config,
+                    io_loop_factory,
+                    worker_metrics,
+                )
             })
             .expect("failed to spawn Tina threaded worker");
 
@@ -4504,6 +4539,7 @@ fn threaded_worker_loop<S, F>(
     receiver: std::sync::mpsc::Receiver<ThreadedCommand<S, F>>,
     config: ThreadedRuntimeConfig,
     io_loop_factory: ThreadedIoLoopFactory,
+    metrics: Arc<LiveShardMetrics>,
 ) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError>
 where
     S: Shard,
@@ -4522,6 +4558,7 @@ where
     runtime.set_trace_retention(config.trace_retention);
 
     loop {
+        metrics.set_owned_resource_count(runtime.owned_resource_count());
         match receiver.try_recv() {
             Ok(ThreadedCommand::Run(command)) => {
                 command(&mut runtime);
@@ -4554,6 +4591,7 @@ where
     runtime
         .cancel_in_flight_calls_for_shutdown()
         .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
+    metrics.set_owned_resource_count(runtime.owned_resource_count());
     Ok(runtime.trace().to_vec())
 }
 
@@ -4682,6 +4720,11 @@ where
             let shard_id = shard.id();
             let remote_receivers = remote_receivers.remove(&shard_id).unwrap_or_default();
             let remote_metrics_for_worker = remote_metrics.clone();
+            let shard_metrics_for_worker = Arc::clone(
+                shard_metrics
+                    .get(&shard_id)
+                    .expect("shard metrics exist for worker"),
+            );
             handles.push((
                 shard_id,
                 thread::Builder::new()
@@ -4709,6 +4752,7 @@ where
                             remote_senders,
                             remote_receivers,
                             remote_metrics_for_worker,
+                            shard_metrics_for_worker,
                         )
                     })
                     .expect("failed to spawn Tina threaded shard worker"),
@@ -4933,6 +4977,7 @@ fn threaded_worker_loop_with_remote<S, F>(
         std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
     )>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
+    shard_metrics: Arc<LiveShardMetrics>,
 ) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError>
 where
     S: Shard,
@@ -4940,6 +4985,7 @@ where
 {
     let source_shard = runtime.shard().id();
     loop {
+        shard_metrics.set_owned_resource_count(runtime.owned_resource_count());
         let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
             let target_shard = envelope.target_shard();
             let Some(sender) = remote_senders.get(&(source_shard, target_shard)) else {
@@ -5007,6 +5053,7 @@ where
     runtime
         .cancel_in_flight_calls_for_shutdown()
         .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
+    shard_metrics.set_owned_resource_count(runtime.owned_resource_count());
     Ok(runtime.trace().to_vec())
 }
 

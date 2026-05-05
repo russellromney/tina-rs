@@ -178,11 +178,17 @@ Use existing `call(...).reply(...)`. No second cross-shard call API.
 
 ## Rock 7: Inbound TLS
 
-Add the smallest honest server-side TLS rail: raw TCP accept, server handshake
-with static cert/key, `TlsStreamId`, existing TLS read/write/close helpers, safe
-per-stream pending-op ownership, typed cert/config/handshake/timeout/full/closed
-errors, deterministic local cert tests, and simulator scripts that model
-outcomes, not cryptography.
+Add the smallest honest server-side TLS rail: a runtime-owned TLS listener,
+server accept/handshake with static cert/key, `TlsStreamId`, existing TLS
+read/write/close helpers, TLS listener close, safe per-stream pending-op
+ownership, typed cert/config/handshake/timeout/full/closed errors,
+deterministic local cert tests, and simulator scripts that model outcomes, not
+cryptography.
+
+This is not raw `StreamId` to `TlsStreamId` upgrade yet. Betelgeuse's socket
+shape does not expose the `Read`/`Write` stream rustls needs. If raw accepted
+TCP stream upgrade is needed later, it is a separate owner-transfer rock, not a
+hidden claim in Victor.
 
 No client auth, ALPN/SNI routing, cert reload, or system trust-store policy.
 Pause if this wants a large cert-policy framework. Do not fake secure hosting.
