@@ -59,7 +59,7 @@ use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
     CallReplyRejectedReason, EffectKind, ListenerId, PersistenceTraceInfo, RestartSkippedReason,
     RuntimeCall, RuntimeCallParts, RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason,
-    SupervisionRejectedReason,
+    SupervisionRejectedReason, UdpSocketId,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -75,6 +75,9 @@ pub struct SimulatorConfig {
 
     /// Scripted TCP configuration for this run.
     pub tcp: ScriptedTcpConfig,
+
+    /// Scripted UDP configuration for this run.
+    pub udp: ScriptedUdpConfig,
 
     /// Scripted simulator-only storage faults for persistence recovery tests.
     pub storage: ScriptedStorageFaultConfig,
@@ -289,6 +292,45 @@ pub struct ScriptedTcpConfig {
     pub listeners: Vec<ScriptedListenerConfig>,
 }
 
+/// Scripted UDP configuration for one simulator run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedUdpConfig {
+    /// Maximum number of async UDP completions that may be pending.
+    pub pending_completion_capacity: usize,
+
+    /// Socket scripts available to `UdpBind`.
+    pub sockets: Vec<ScriptedUdpSocketConfig>,
+}
+
+/// Scripted UDP socket configuration for one bindable address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedUdpSocketConfig {
+    /// The address isolates request in `CallInput::UdpBind`.
+    pub bind_addr: SocketAddr,
+
+    /// The local address returned through `CallOutput::UdpBound`.
+    pub local_addr: SocketAddr,
+
+    /// Maximum datagrams buffered before a pending receive consumes them.
+    pub recv_capacity: usize,
+
+    /// Scripted inbound datagrams.
+    pub inbound_datagrams: Vec<ScriptedUdpDatagramConfig>,
+}
+
+/// Scripted inbound UDP datagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedUdpDatagramConfig {
+    /// First simulator step on which this datagram may be received.
+    pub deliver_after_step: u64,
+
+    /// Sender address reported to the isolate.
+    pub peer_addr: SocketAddr,
+
+    /// Datagram bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Simulator-only deterministic storage fault configuration.
 ///
 /// These faults mutate the simulator durable image or completion result. They
@@ -320,6 +362,15 @@ impl Default for ScriptedTcpConfig {
         Self {
             pending_completion_capacity: usize::MAX,
             listeners: Vec::new(),
+        }
+    }
+}
+
+impl Default for ScriptedUdpConfig {
+    fn default() -> Self {
+        Self {
+            pending_completion_capacity: usize::MAX,
+            sockets: Vec::new(),
         }
     }
 }
@@ -1092,11 +1143,19 @@ enum TcpResourceKey {
     ListenerAccept(ListenerId),
     StreamRead(tina_runtime::StreamId),
     StreamWrite(tina_runtime::StreamId),
+    UdpSend(CallId),
+    UdpRecv(UdpSocketId),
     FileRead(tina_runtime::FileId),
     FileWrite(tina_runtime::FileId),
     FileFsync(tina_runtime::FileId),
     FileSize(tina_runtime::FileId),
     Mkdir(CallId),
+}
+
+impl TcpResourceKey {
+    fn is_udp(self) -> bool {
+        matches!(self, Self::UdpSend(_) | Self::UdpRecv(_))
+    }
 }
 
 #[derive(Debug)]
@@ -1154,6 +1213,32 @@ struct StreamState {
     output_capacity: usize,
     output: Vec<u8>,
     closed: bool,
+}
+
+#[derive(Debug)]
+struct ScriptedUdpDatagramState {
+    deliver_after_step: u64,
+    peer_addr: SocketAddr,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct UdpSocketState {
+    id: UdpSocketId,
+    bind_addr: SocketAddr,
+    local_addr: SocketAddr,
+    recv_capacity: usize,
+    future_datagrams: VecDeque<ScriptedUdpDatagramState>,
+    ready_datagrams: VecDeque<ScriptedUdpDatagramState>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct PendingUdpRecv {
+    call_id: CallId,
+    socket: UdpSocketId,
+    max_len: usize,
+    insertion_order: u64,
 }
 
 #[derive(Debug)]
@@ -1563,6 +1648,7 @@ where
     next_isolate_id: u64,
     next_listener_id: u64,
     next_stream_id: u64,
+    next_udp_socket_id: u64,
     next_file_id: u64,
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
@@ -1575,11 +1661,13 @@ where
     next_storage_ordinal: u64,
     listeners: Vec<ListenerState>,
     streams: Vec<StreamState>,
+    udp_sockets: Vec<UdpSocketState>,
     files: Vec<FileState>,
     file_storage: BTreeMap<PathBuf, Vec<u8>>,
     directories: Vec<PathBuf>,
     pending_accepts: Vec<PendingAccept>,
     pending_connects: Vec<PendingConnect>,
+    pending_udp_recvs: Vec<PendingUdpRecv>,
     pending_tcp_completions: Vec<PendingTcpCompletion>,
     in_flight_calls: Vec<InFlightCall>,
     translators: Vec<StoredTranslator>,
@@ -1608,6 +1696,7 @@ where
             next_isolate_id: 1,
             next_listener_id: 1,
             next_stream_id: 1,
+            next_udp_socket_id: 1,
             next_file_id: 1,
             ids,
             trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
@@ -1620,11 +1709,13 @@ where
             next_storage_ordinal: 0,
             listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            udp_sockets: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             files: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             file_storage: BTreeMap::new(),
             directories: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             pending_accepts: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_connects: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_udp_recvs: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_tcp_completions: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             in_flight_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             translators: Vec::with_capacity(INITIAL_CALL_CAPACITY),
@@ -1658,6 +1749,7 @@ where
             || !self.pending_tcp_completions.is_empty()
             || !self.pending_accepts.is_empty()
             || !self.pending_connects.is_empty()
+            || !self.pending_udp_recvs.is_empty()
             || !self.pending_isolate_calls.is_empty()
     }
 
@@ -2636,12 +2728,16 @@ where
                 self.handle_tcp_listener_close(call_id, listener)
             }
             CallInput::TcpStreamClose { stream } => self.handle_tcp_stream_close(call_id, stream),
-            CallInput::UdpBind { .. }
-            | CallInput::UdpSendTo { .. }
-            | CallInput::UdpRecvFrom { .. }
-            | CallInput::UdpSocketClose { .. } => {
-                self.deliver_completion(call_id, CallOutput::Failed(CallError::Unsupported));
+            CallInput::UdpBind { addr } => self.handle_udp_bind(call_id, addr),
+            CallInput::UdpSendTo {
+                socket,
+                peer,
+                bytes,
+            } => self.handle_udp_send_to(call_id, socket, peer, bytes),
+            CallInput::UdpRecvFrom { socket, max_len } => {
+                self.handle_udp_recv_from(call_id, socket, max_len)
             }
+            CallInput::UdpSocketClose { socket } => self.handle_udp_socket_close(call_id, socket),
             CallInput::FileOpen { path, options } => self.handle_file_open(call_id, path, options),
             CallInput::FileReadAt { file, len, offset } => {
                 self.handle_file_read_at(call_id, file, len, offset)
@@ -3064,6 +3160,167 @@ where
         self.deliver_completion(call_id, CallOutput::TcpStreamClosed);
     }
 
+    fn handle_udp_bind(&mut self, call_id: CallId, addr: SocketAddr) {
+        if self
+            .udp_sockets
+            .iter()
+            .any(|socket| socket.bind_addr == addr && !socket.closed)
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+
+        let Some(script) = self
+            .config
+            .udp
+            .sockets
+            .iter()
+            .find(|socket| socket.bind_addr == addr)
+            .cloned()
+        else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        };
+
+        let ready_len = script
+            .inbound_datagrams
+            .iter()
+            .filter(|datagram| datagram.deliver_after_step <= self.step_ordinal)
+            .count();
+        if ready_len > script.recv_capacity {
+            panic!(
+                "scripted UDP socket {} exceeds recv_capacity {} with {} ready datagrams",
+                script.local_addr, script.recv_capacity, ready_len
+            );
+        }
+
+        let socket = UdpSocketState {
+            id: UdpSocketId::new(self.next_udp_socket_id),
+            bind_addr: script.bind_addr,
+            local_addr: script.local_addr,
+            recv_capacity: script.recv_capacity,
+            future_datagrams: script
+                .inbound_datagrams
+                .into_iter()
+                .map(|datagram| ScriptedUdpDatagramState {
+                    deliver_after_step: datagram.deliver_after_step,
+                    peer_addr: datagram.peer_addr,
+                    bytes: datagram.bytes,
+                })
+                .collect(),
+            ready_datagrams: VecDeque::new(),
+            closed: false,
+        };
+        self.next_udp_socket_id += 1;
+        let socket_id = socket.id;
+        let local_addr = socket.local_addr;
+        self.udp_sockets.push(socket);
+        self.deliver_completion(
+            call_id,
+            CallOutput::UdpBound {
+                socket: socket_id,
+                local_addr,
+            },
+        );
+    }
+
+    fn handle_udp_send_to(
+        &mut self,
+        call_id: CallId,
+        socket: UdpSocketId,
+        peer: SocketAddr,
+        bytes: Vec<u8>,
+    ) {
+        let Some(source_index) = self.udp_socket_index(socket) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.udp_sockets[source_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+
+        let source_addr = self.udp_sockets[source_index].local_addr;
+        if let Some(target_index) = self
+            .udp_sockets
+            .iter()
+            .position(|entry| !entry.closed && entry.local_addr == peer)
+        {
+            if self.udp_sockets[target_index].ready_datagrams.len()
+                + self.udp_sockets[target_index].future_datagrams.len()
+                >= self.udp_sockets[target_index].recv_capacity
+            {
+                self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+                return;
+            }
+
+            self.udp_sockets[target_index]
+                .future_datagrams
+                .push_back(ScriptedUdpDatagramState {
+                    deliver_after_step: self.step_ordinal + 1,
+                    peer_addr: source_addr,
+                    bytes: bytes.clone(),
+                });
+        }
+
+        self.schedule_udp_completion(
+            call_id,
+            TcpResourceKey::UdpSend(call_id),
+            CallOutput::UdpSent { count: bytes.len() },
+        );
+    }
+
+    fn handle_udp_recv_from(&mut self, call_id: CallId, socket: UdpSocketId, max_len: usize) {
+        let Some(socket_index) = self.udp_socket_index(socket) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.udp_sockets[socket_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+
+        let resource = TcpResourceKey::UdpRecv(socket);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        self.promote_ready_udp_datagrams(socket_index);
+        if let Some(result) = self.udp_recv_result(socket_index, max_len) {
+            self.schedule_udp_completion(call_id, resource, result);
+            return;
+        }
+
+        let insertion_order = self.next_tcp_completion_ordinal;
+        self.next_tcp_completion_ordinal += 1;
+        self.pending_udp_recvs.push(PendingUdpRecv {
+            call_id,
+            socket,
+            max_len,
+            insertion_order,
+        });
+    }
+
+    fn handle_udp_socket_close(&mut self, call_id: CallId, socket: UdpSocketId) {
+        let Some(socket_index) = self.udp_socket_index(socket) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.udp_sockets[socket_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        if self.resource_has_active_pending(TcpResourceKey::UdpRecv(socket)) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        self.udp_sockets[socket_index].closed = true;
+        self.pending_udp_recvs
+            .retain(|pending| pending.socket != socket);
+        self.deliver_completion(call_id, CallOutput::UdpSocketClosed);
+    }
+
     fn handle_file_open(
         &mut self,
         call_id: CallId,
@@ -3390,9 +3647,14 @@ where
                 .pending_accepts
                 .iter()
                 .any(|pending| pending.listener == listener),
+            TcpResourceKey::UdpRecv(socket) => self
+                .pending_udp_recvs
+                .iter()
+                .any(|pending| pending.socket == socket),
             TcpResourceKey::TcpConnect(_)
             | TcpResourceKey::StreamRead(_)
             | TcpResourceKey::StreamWrite(_)
+            | TcpResourceKey::UdpSend(_)
             | TcpResourceKey::FileRead(_)
             | TcpResourceKey::FileWrite(_)
             | TcpResourceKey::FileFsync(_)
@@ -3409,6 +3671,10 @@ where
     fn stream_has_active_pending(&self, stream: tina_runtime::StreamId) -> bool {
         self.resource_has_active_pending(TcpResourceKey::StreamRead(stream))
             || self.resource_has_active_pending(TcpResourceKey::StreamWrite(stream))
+    }
+
+    fn udp_socket_index(&self, socket: UdpSocketId) -> Option<usize> {
+        self.udp_sockets.iter().position(|state| state.id == socket)
     }
 
     fn file_index(&self, file: tina_runtime::FileId) -> Option<usize> {
@@ -3430,7 +3696,12 @@ where
         resource: TcpResourceKey,
         result: CallOutput,
     ) {
-        if self.pending_tcp_completions.len() >= self.config.tcp.pending_completion_capacity {
+        let pending_non_udp = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| !completion.resource.is_udp())
+            .count();
+        if pending_non_udp >= self.config.tcp.pending_completion_capacity {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
         }
@@ -3450,6 +3721,33 @@ where
         self.pending_tcp_completions.push(PendingTcpCompletion {
             call_id,
             ready_at_step,
+            insertion_order,
+            resource,
+            result,
+        });
+    }
+
+    fn schedule_udp_completion(
+        &mut self,
+        call_id: CallId,
+        resource: TcpResourceKey,
+        result: CallOutput,
+    ) {
+        let pending_udp = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| completion.resource.is_udp())
+            .count();
+        if pending_udp >= self.config.udp.pending_completion_capacity {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+
+        let insertion_order = self.next_tcp_completion_ordinal;
+        self.next_tcp_completion_ordinal += 1;
+        self.pending_tcp_completions.push(PendingTcpCompletion {
+            call_id,
+            ready_at_step: self.step_ordinal + 1,
             insertion_order,
             resource,
             result,
@@ -3626,6 +3924,36 @@ where
         Some(CallOutput::TcpWrote { count })
     }
 
+    fn promote_ready_udp_datagrams(&mut self, socket_index: usize) {
+        let current_step = self.step_ordinal;
+        while self.udp_sockets[socket_index]
+            .future_datagrams
+            .front()
+            .is_some_and(|datagram| datagram.deliver_after_step <= current_step)
+            && self.udp_sockets[socket_index].ready_datagrams.len()
+                < self.udp_sockets[socket_index].recv_capacity
+        {
+            let datagram = self.udp_sockets[socket_index]
+                .future_datagrams
+                .pop_front()
+                .unwrap_or_else(|| panic!("UDP future datagram disappeared"));
+            self.udp_sockets[socket_index]
+                .ready_datagrams
+                .push_back(datagram);
+        }
+    }
+
+    fn udp_recv_result(&mut self, socket_index: usize, max_len: usize) -> Option<CallOutput> {
+        let datagram = self.udp_sockets[socket_index].ready_datagrams.pop_front()?;
+        let truncated = datagram.bytes.len() > max_len;
+        let bytes = datagram.bytes.into_iter().take(max_len).collect();
+        Some(CallOutput::UdpReceived {
+            peer_addr: datagram.peer_addr,
+            bytes,
+            truncated,
+        })
+    }
+
     fn fail_pending_accepts(&mut self, listener: ListenerId) {
         let mut survivors = Vec::new();
         for pending in std::mem::take(&mut self.pending_accepts) {
@@ -3644,6 +3972,7 @@ where
     fn harvest_tcp(&mut self) {
         self.activate_pending_connects();
         self.activate_pending_accepts();
+        self.activate_pending_udp_recvs();
 
         let mut ready = Vec::new();
         let mut still_pending = Vec::new();
@@ -3745,6 +4074,39 @@ where
             }
         }
         self.pending_connects = survivors;
+    }
+
+    fn activate_pending_udp_recvs(&mut self) {
+        let mut survivors = Vec::new();
+        let mut pending = std::mem::take(&mut self.pending_udp_recvs);
+        pending.sort_by_key(|entry| entry.insertion_order);
+        for pending_recv in pending {
+            let Some(socket_index) = self.udp_socket_index(pending_recv.socket) else {
+                self.deliver_completion(
+                    pending_recv.call_id,
+                    CallOutput::Failed(CallError::InvalidResource),
+                );
+                continue;
+            };
+            if self.udp_sockets[socket_index].closed {
+                self.deliver_completion(
+                    pending_recv.call_id,
+                    CallOutput::Failed(CallError::InvalidResource),
+                );
+                continue;
+            }
+            self.promote_ready_udp_datagrams(socket_index);
+            if let Some(result) = self.udp_recv_result(socket_index, pending_recv.max_len) {
+                self.schedule_udp_completion(
+                    pending_recv.call_id,
+                    TcpResourceKey::UdpRecv(pending_recv.socket),
+                    result,
+                );
+            } else {
+                survivors.push(pending_recv);
+            }
+        }
+        self.pending_udp_recvs = survivors;
     }
 
     fn order_ready_tcp_completions(&self, ready: &mut [PendingTcpCompletion]) {
@@ -4474,6 +4836,8 @@ where
         self.pending_accepts
             .retain(|pending| pending.call_id != call_id);
         self.pending_connects
+            .retain(|pending| pending.call_id != call_id);
+        self.pending_udp_recvs
             .retain(|pending| pending.call_id != call_id);
         self.pending_tcp_completions
             .retain(|completion| completion.call_id != call_id);

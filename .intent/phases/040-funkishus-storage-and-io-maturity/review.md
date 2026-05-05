@@ -418,6 +418,52 @@ First slice implemented:
   supported completion-backed; local persistence/storage supported as
   lane-backed blocking with visible capacity; DNS/UDP/process/signal
   unsupported for now; TLS adapter-only.
+
+## Implementation Audit 2
+
+UDP live rail landed in `tina-runtime`.
+
+What is true now:
+
+- `UdpBind`, `UdpSendTo`, `UdpRecvFrom`, and `UdpSocketClose` are runtime-owned
+  calls with typed helper constructors in `tina-runtime`.
+- Live UDP uses nonblocking `std::net::UdpSocket` behind the driver boundary.
+- Duplicate pending recv on one socket returns `ResourceBusy`.
+- Close while recv is pending returns `ResourceBusy`.
+- Requester stop cancels/tombstones pending recv work through existing call
+  ownership.
+- Loopback e2e proves send/recv/truncation/close through `LocalSystem`.
+- Capability reports now mark UDP supported on the local live runtime.
+
+Review note:
+
+- UDP protocol loss remains UDP protocol loss. Tina makes runtime-owned lane
+  pressure and truncation visible; it does not pretend the OS can report remote
+  UDP delivery.
+
+## Implementation Audit 3
+
+Scripted simulator UDP landed after live UDP.
+
+What is true now:
+
+- `SimulatorConfig` now has scripted UDP sockets and scripted inbound datagrams.
+- Simulator `UdpBind`, `UdpSendTo`, `UdpRecvFrom`, and `UdpSocketClose` mirror
+  the live call/output/trace vocabulary.
+- Scripted UDP loopback is deterministic and replayed byte-for-byte.
+- Delayed inbound datagrams wake pending recvs through explicit simulator
+  steps.
+- Duplicate recv, close-while-pending, requester-stop cancellation, and
+  receive-queue-full are direct negative tests.
+- UDP and TCP completion capacity accounting is lane-specific even though the
+  simulator still harvests completions through one ordered internal queue.
+
+Review note:
+
+- The internal queue name still says `pending_tcp_completions`; that name is now
+  historically stale because it also harvests UDP and file completions. It is a
+  naming cleanup opportunity, not a semantic bug after the lane-specific
+  capacity fix.
 - Direct integration test pins supported and unsupported resource families
   through the canonical `LocalSystem` path.
 

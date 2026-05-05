@@ -8,15 +8,17 @@ use std::time::Duration;
 
 use tina::{
     Address, Context, Effect, Isolate, IsolateId, Outbound, RestartBudget, RestartPolicy,
-    RestartableChildDefinition, Shard, ShardId,
+    RestartableChildDefinition, Shard, ShardId, batch,
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
     FileOpenOptions, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
+    UdpSocketId, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact,
-    ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, Simulator, SimulatorConfig,
+    ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, ScriptedUdpConfig,
+    ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig, Simulator, SimulatorConfig,
     TcpCompletionFaultMode,
     dst::{DstRun, History, InvariantSuite, assert_replays},
 };
@@ -315,6 +317,151 @@ impl Isolate for FileClient {
             | FileClientMsg::Sized(Err(_))
             | FileClientMsg::Read(Err(_))
             | FileClientMsg::Closed(Err(_)) => Effect::Stop,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UdpClientMsg {
+    Start,
+    BoundReceiver(Result<(UdpSocketId, SocketAddr), CallError>),
+    BoundSender(Result<(UdpSocketId, SocketAddr), CallError>),
+    Received(Result<(SocketAddr, Vec<u8>, bool), CallError>),
+    Sent(Result<usize, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct UdpClient {
+    receiver_addr: SocketAddr,
+    sender_addr: SocketAddr,
+    receiver: Option<UdpSocketId>,
+    sender: Option<UdpSocketId>,
+    observed: Rc<RefCell<Vec<String>>>,
+}
+
+impl Isolate for UdpClient {
+    type Message = UdpClientMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<UdpClientMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            UdpClientMsg::Start => udp_bind(self.receiver_addr).reply(UdpClientMsg::BoundReceiver),
+            UdpClientMsg::BoundReceiver(Ok((socket, _addr))) => {
+                self.receiver = Some(socket);
+                udp_bind(self.sender_addr).reply(UdpClientMsg::BoundSender)
+            }
+            UdpClientMsg::BoundSender(Ok((socket, _addr))) => {
+                self.sender = Some(socket);
+                batch([
+                    udp_recv_from(self.receiver.expect("receiver"), 4)
+                        .reply(UdpClientMsg::Received),
+                    udp_send_to(socket, self.receiver_addr, b"alpaca".to_vec())
+                        .reply(UdpClientMsg::Sent),
+                ])
+            }
+            UdpClientMsg::Sent(Ok(count)) => {
+                self.observed.borrow_mut().push(format!("sent:{count}"));
+                udp_close_socket(self.sender.expect("sender")).reply(UdpClientMsg::Closed)
+            }
+            UdpClientMsg::Received(Ok((_peer, bytes, truncated))) => {
+                self.observed.borrow_mut().push(format!(
+                    "recv:{}:{truncated}",
+                    String::from_utf8(bytes).expect("utf8")
+                ));
+                udp_close_socket(self.receiver.expect("receiver")).reply(UdpClientMsg::Closed)
+            }
+            UdpClientMsg::Closed(Ok(())) => {
+                self.observed.borrow_mut().push("closed".to_string());
+                Effect::Noop
+            }
+            UdpClientMsg::BoundReceiver(Err(_))
+            | UdpClientMsg::BoundSender(Err(_))
+            | UdpClientMsg::Received(Err(_))
+            | UdpClientMsg::Sent(Err(_))
+            | UdpClientMsg::Closed(Err(_)) => {
+                self.observed.borrow_mut().push("failed".to_string());
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UdpProbeMsg {
+    Bind,
+    Bound(Result<(UdpSocketId, SocketAddr), CallError>),
+    RecvOne(UdpSocketId),
+    RecvTwo(UdpSocketId),
+    Close(UdpSocketId),
+    Done(Result<(SocketAddr, Vec<u8>, bool), CallError>),
+    Closed(Result<(), CallError>),
+    Stop,
+}
+
+#[derive(Debug)]
+struct UdpProbe {
+    bind_addr: SocketAddr,
+    observed: Rc<RefCell<Vec<String>>>,
+}
+
+impl Isolate for UdpProbe {
+    type Message = UdpProbeMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<UdpProbeMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            UdpProbeMsg::Bind => udp_bind(self.bind_addr).reply(UdpProbeMsg::Bound),
+            UdpProbeMsg::Bound(Ok((socket, _))) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("bound:{}", socket.get()));
+                Effect::Noop
+            }
+            UdpProbeMsg::RecvOne(socket) => udp_recv_from(socket, 8).reply(UdpProbeMsg::Done),
+            UdpProbeMsg::RecvTwo(socket) => batch([
+                udp_recv_from(socket, 8).reply(UdpProbeMsg::Done),
+                udp_recv_from(socket, 8).reply(UdpProbeMsg::Done),
+            ]),
+            UdpProbeMsg::Close(socket) => udp_close_socket(socket).reply(UdpProbeMsg::Closed),
+            UdpProbeMsg::Done(Ok((_peer, bytes, truncated))) => {
+                self.observed.borrow_mut().push(format!(
+                    "recv:{}:{truncated}",
+                    String::from_utf8(bytes).expect("utf8")
+                ));
+                Effect::Noop
+            }
+            UdpProbeMsg::Done(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("recv-err:{error:?}"));
+                Effect::Noop
+            }
+            UdpProbeMsg::Closed(Ok(())) => {
+                self.observed.borrow_mut().push("closed".to_string());
+                Effect::Noop
+            }
+            UdpProbeMsg::Closed(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("close-err:{error:?}"));
+                Effect::Noop
+            }
+            UdpProbeMsg::Bound(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("bind-err:{error:?}"));
+                Effect::Noop
+            }
+            UdpProbeMsg::Stop => Effect::Stop,
         }
     }
 }
@@ -1022,6 +1169,31 @@ fn peer_script(
     }
 }
 
+fn udp_socket_script(
+    bind_addr: SocketAddr,
+    local_addr: SocketAddr,
+    inbound_datagrams: Vec<ScriptedUdpDatagramConfig>,
+) -> ScriptedUdpSocketConfig {
+    ScriptedUdpSocketConfig {
+        bind_addr,
+        local_addr,
+        recv_capacity: inbound_datagrams.len().max(4),
+        inbound_datagrams,
+    }
+}
+
+fn udp_datagram(
+    deliver_after_step: u64,
+    peer_addr: SocketAddr,
+    bytes: &[u8],
+) -> ScriptedUdpDatagramConfig {
+    ScriptedUdpDatagramConfig {
+        deliver_after_step,
+        peer_addr,
+        bytes: bytes.to_vec(),
+    }
+}
+
 fn run_echo_scenario(
     peers: Vec<ScriptedPeerConfig>,
     max_chunk: usize,
@@ -1067,6 +1239,287 @@ fn run_echo_scenario(
         },
         listener.isolate(),
     )
+}
+
+fn udp_sim_config() -> SimulatorConfig {
+    SimulatorConfig {
+        udp: ScriptedUdpConfig {
+            pending_completion_capacity: 16,
+            sockets: vec![
+                udp_socket_script(local_addr(48000), local_addr(48000), Vec::new()),
+                udp_socket_script(local_addr(48001), local_addr(48001), Vec::new()),
+                udp_socket_script(
+                    local_addr(48002),
+                    local_addr(48002),
+                    vec![udp_datagram(3, peer_addr(58100), b"scripted")],
+                ),
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn scripted_udp_loopback_replays_send_recv_truncation_and_close() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, udp_sim_config());
+    let client = sim.register(UdpClient {
+        receiver_addr: local_addr(48000),
+        sender_addr: local_addr(48001),
+        receiver: None,
+        sender: None,
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(client, UdpClientMsg::Start).unwrap();
+    sim.run_until_quiescent();
+
+    assert!(observed.borrow().iter().any(|entry| entry == "sent:6"));
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "recv:alpa:true")
+    );
+    assert_eq!(
+        observed
+            .borrow()
+            .iter()
+            .filter(|entry| entry.as_str() == "closed")
+            .count(),
+        2
+    );
+    assert_eq!(count_call_completed(sim.trace(), CallKind::UdpBind), 2);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::UdpSendTo), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::UdpRecvFrom), 1);
+    assert_eq!(
+        count_call_completed(sim.trace(), CallKind::UdpSocketClose),
+        2
+    );
+
+    let first = sim.replay_artifact();
+    let mut replay = Simulator::new(TestShard, udp_sim_config());
+    let observed_replay = Rc::new(RefCell::new(Vec::new()));
+    let client = replay.register(UdpClient {
+        receiver_addr: local_addr(48000),
+        sender_addr: local_addr(48001),
+        receiver: None,
+        sender: None,
+        observed: observed_replay,
+    });
+    replay.try_send(client, UdpClientMsg::Start).unwrap();
+    replay.run_until_quiescent();
+    assert_eq!(
+        first.event_record(),
+        replay.replay_artifact().event_record()
+    );
+}
+
+#[test]
+fn scripted_udp_negative_paths_are_visible_and_cancelable() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            udp: ScriptedUdpConfig {
+                pending_completion_capacity: 16,
+                sockets: vec![udp_socket_script(
+                    local_addr(48002),
+                    local_addr(48002),
+                    Vec::new(),
+                )],
+            },
+            ..Default::default()
+        },
+    );
+    let probe = sim.register(UdpProbe {
+        bind_addr: local_addr(48002),
+        observed: Rc::clone(&observed),
+    });
+    sim.try_send(probe, UdpProbeMsg::Bind).unwrap();
+    sim.run_until_quiescent();
+    assert!(observed.borrow().iter().any(|entry| entry == "bound:1"));
+
+    let socket = UdpSocketId::new(1);
+    sim.try_send(probe, UdpProbeMsg::RecvTwo(socket)).unwrap();
+    sim.step();
+    sim.step();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "recv-err:ResourceBusy")
+    );
+
+    sim.try_send(probe, UdpProbeMsg::Close(socket)).unwrap();
+    sim.step();
+    sim.step();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "close-err:ResourceBusy")
+    );
+
+    sim.try_send(probe, UdpProbeMsg::Stop).unwrap();
+    sim.step();
+    assert!(!sim.has_in_flight_calls());
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::UdpRecvFrom,
+                reason: CallCompletionRejectedReason::RequesterClosed,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn scripted_udp_pending_recv_completes_when_datagram_becomes_ready() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, udp_sim_config());
+    let probe = sim.register(UdpProbe {
+        bind_addr: local_addr(48002),
+        observed: Rc::clone(&observed),
+    });
+    sim.try_send(probe, UdpProbeMsg::Bind).unwrap();
+    sim.run_until_quiescent();
+
+    let socket = UdpSocketId::new(1);
+    sim.try_send(probe, UdpProbeMsg::RecvOne(socket)).unwrap();
+    sim.run_until_quiescent();
+
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "recv:scripted:false")
+    );
+    assert_eq!(count_call_completed(sim.trace(), CallKind::UdpRecvFrom), 1);
+    assert!(!sim.has_in_flight_calls());
+}
+
+#[test]
+fn scripted_udp_loopback_recv_capacity_full_is_visible() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            udp: ScriptedUdpConfig {
+                pending_completion_capacity: 16,
+                sockets: vec![
+                    ScriptedUdpSocketConfig {
+                        bind_addr: local_addr(48020),
+                        local_addr: local_addr(48020),
+                        recv_capacity: 1,
+                        inbound_datagrams: vec![udp_datagram(99, peer_addr(58120), b"held")],
+                    },
+                    udp_socket_script(local_addr(48021), local_addr(48021), Vec::new()),
+                ],
+            },
+            ..Default::default()
+        },
+    );
+    let client = sim.register(UdpClient {
+        receiver_addr: local_addr(48020),
+        sender_addr: local_addr(48021),
+        receiver: None,
+        sender: None,
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(client, UdpClientMsg::Start).unwrap();
+    sim.run_until_quiescent();
+
+    assert!(
+        observed.borrow().iter().any(|entry| entry == "failed"),
+        "full scripted UDP receive queue should surface as call failure"
+    );
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::UdpSendTo,
+                reason: CallError::ResourceBusy,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn scripted_udp_completion_capacity_is_separate_from_tcp_completion_capacity() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 0,
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 1,
+                    steps: 8,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 1,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48030),
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(
+                        1,
+                        peer_addr(58130),
+                        vec![b"tcp".to_vec()],
+                        None,
+                        8,
+                    )],
+                }],
+            },
+            udp: ScriptedUdpConfig {
+                pending_completion_capacity: 1,
+                sockets: vec![
+                    udp_socket_script(local_addr(48031), local_addr(48031), Vec::new()),
+                    udp_socket_script(local_addr(48032), local_addr(48032), Vec::new()),
+                ],
+            },
+            storage: Default::default(),
+        },
+    );
+
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (stream, _) = accept_stream(&mut sim, listener);
+    let read_log = Rc::new(RefCell::new(Vec::new()));
+    let reader = sim.register(ReadProbe {
+        stream,
+        max_len: 8,
+        log: Rc::clone(&read_log),
+    });
+    sim.try_send(reader, ReadProbeMsg::StartRead).unwrap();
+    sim.step();
+
+    let client = sim.register(UdpClient {
+        receiver_addr: local_addr(48031),
+        sender_addr: local_addr(48032),
+        receiver: None,
+        sender: None,
+        observed: Rc::clone(&observed),
+    });
+    sim.try_send(client, UdpClientMsg::Start).unwrap();
+    sim.run_until_quiescent();
+
+    assert!(
+        observed.borrow().iter().any(|entry| entry == "sent:6"),
+        "one pending TCP completion must not exhaust the UDP completion lane"
+    );
+    assert!(
+        read_log
+            .borrow()
+            .iter()
+            .any(|entry| entry == &ReadProbeMsg::ReadCompleted(b"tcp".to_vec()))
+    );
 }
 
 fn bind_listener(
@@ -1463,6 +1916,7 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
                 }],
             },
             storage: Default::default(),
+            udp: Default::default(),
         },
     );
 
@@ -1585,6 +2039,7 @@ fn closed_stream_id_surfaces_invalid_resource() {
                 }],
             },
             storage: Default::default(),
+            udp: Default::default(),
         },
     );
 
@@ -1642,6 +2097,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
                 }],
             },
             storage: Default::default(),
+            udp: Default::default(),
         },
     );
 
@@ -1713,6 +2169,7 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
                 }],
             },
             storage: Default::default(),
+            udp: Default::default(),
         },
     );
 
@@ -2259,6 +2716,7 @@ fn run_seeded_cancellation_case(history: &History<CancellationOp>) -> DstRun<(),
                 }],
             },
             storage: Default::default(),
+            udp: Default::default(),
         },
     );
 
@@ -2575,6 +3033,7 @@ fn tcp_checker_failure_replays_under_ready_reordering() {
             ],
         },
         storage: Default::default(),
+        udp: Default::default(),
     };
 
     let mut sim = Simulator::new(TestShard, config);
