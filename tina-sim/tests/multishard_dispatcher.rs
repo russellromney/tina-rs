@@ -1219,6 +1219,7 @@ fn run_durable_batch_tcp_multishard_workload(
                 }],
             },
             storage: Default::default(),
+            ..Default::default()
         },
         MultiShardSimulatorConfig {
             shard_pair_capacity: 16,
@@ -1673,6 +1674,7 @@ fn multishard_tcp_workload_composes_with_seeded_tcp_completion_faults() {
                 }],
             },
             storage: Default::default(),
+            ..Default::default()
         },
         MultiShardSimulatorConfig {
             shard_pair_capacity: 8,
@@ -1752,6 +1754,7 @@ fn multishard_tcp_persistence_service_replays_under_seeded_dst_faults() {
             }],
         },
         storage: Default::default(),
+        ..Default::default()
     };
 
     let first = run_durable_tcp_multishard_workload(config.clone());

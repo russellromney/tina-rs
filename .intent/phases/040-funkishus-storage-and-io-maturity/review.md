@@ -581,8 +581,8 @@ UDP first slice implemented with a Tina-owned nonblocking driver rail:
 - datagram truncation is visible as a boolean in `CallOutput::UdpReceived`;
 - `RuntimeCapabilities` now reports UDP as `Supported` with
   `PollBacked` execution, not Betelgeuse completion-backed;
-- `tina-sim` currently returns typed `Unsupported` for UDP until the simulator
-  UDP rail lands later in this phase.
+- `tina-sim` now scripts UDP bind/send/recv/close, loopback, truncation,
+  receive capacity pressure, and requester-stop cancellation.
 
 Targeted proof:
 
@@ -590,8 +590,98 @@ Targeted proof:
 - `cargo +nightly test -p tina-runtime --test local_system local_system_udp_loopback_surfaces_send_recv_truncation_and_close`
 - `cargo +nightly test -p tina-runtime driver::tests::udp_recv_lane_rejects_duplicate_and_close_until_cancelled`
 
-Open next rock:
+Follow-up rock completed later in this phase:
 
-- add simulator UDP packet scripting so live-vs-sim does not diverge on the
-  final Funkishus contract;
-- add UDP requester-stop-before-packet proof from the user-facing path.
+- simulator UDP packet scripting landed;
+- UDP requester-stop-before-packet proof landed from the user-facing path.
+
+## Implementation Audit 8
+
+Signal rail landed with simulator-first honesty.
+
+What is true now:
+
+- `SignalWait`, `SignalReceived`, `CallKind::SignalWait`, `CallError::SignalFull`,
+  and `signal_wait(name, timeout)` exist in `tina-runtime`.
+- Live `LocalSystem` returns typed `Unsupported` for signal waits and does not
+  install global process signal handlers.
+- `tina-sim` scripts signal delivery, failure, timeout, lane-full pressure, and
+  requester-stop cancellation.
+- Signal waits enter the normal Tina call/completion trace path; stopped
+  requesters remove the pending wait and trace `RequesterClosed`.
+- The DST resource matrix now mixes DNS, process, UDP, and signal operations.
+
+Review note:
+
+- This is not OS-signal support. It is the simulator-owned signal injection
+  rail promised by Funkishus, plus a typed live non-claim. A later live signal
+  phase needs a runtime-owned registry with deterministic shutdown behavior
+  before it can claim platform signals.
+
+Targeted proof:
+
+- `cargo +nightly test -p tina-runtime --test local_system local_system_signal_rail_is_typed_unsupported_without_global_handler`
+- `cargo +nightly test -p tina-sim --test io_simulation scripted_signal`
+- `cargo +nightly test -p tina-sim --test io_simulation dst_resource_rails_replay_and_delete_shrink_timeout_cases`
+
+## Full-Phase Review
+
+### Positive Review
+
+Funkishus now materially improves Tina's production-shaped core:
+
+- capability reports name live support, simulated-only support, adapter-only
+  TLS, bounded lanes, cancellation shape, shutdown shape, and platform
+  durability limits;
+- UDP is live and simulated, with visible `ResourceBusy`, truncation, close,
+  and requester-stop behavior;
+- DNS is honest: typed live `Unsupported`, scripted simulator success/failure/
+  timeout/full;
+- process is bounded: command-plus-args, null stdin, bounded captured output,
+  timeout kill/reap, lane full/closed, sim parity;
+- signal is simulator-first and live-unsupported without global-handler lies;
+- composed live proof covers UDP + process + journal in one service;
+- DST mixes resource rails and shrinks a failure predicate.
+
+### Blast-Radius Review
+
+The new `SimulatorConfig::signal` field initially broke older explicit config
+initializers, and new `CallError` variants broke one exhaustive comparison
+match. Both were fixed by adding default signal config to older tests and
+teaching the comparison suite the new errors.
+
+The shared call vocabulary changes affect:
+
+- `tina-runtime` call/output/error/trace surfaces;
+- `tina-sim` scripted resource config and call dispatcher;
+- downstream tests with exhaustive `CallError` matches.
+
+The blast radius is now covered by:
+
+- full `tina-runtime`, `tina-sim`, and `tina-tokio-bridge` test suites;
+- direct local-system capability and unsupported-signal tests;
+- direct simulator signal/UDP/DNS/process tests;
+- DST resource rail matrix.
+
+### Hostile Review
+
+No release-blocking code finding remains after the final pass.
+
+Still honest non-claims:
+
+- live DNS is not implemented because system resolver cancellation/shutdown
+  cannot be honestly named yet;
+- live OS signal support is not implemented because process-global handlers
+  need registry discipline and safe deterministic tests;
+- TLS is adapter-only by capability, not native runtime TLS;
+- process execution is lane-backed blocking work, not interactive process I/O
+  and not a process-tree semantics claim;
+- the maximal single app proof does not combine TCP ingress with every new
+  rail, though separate e2e tests cover TCP+persistence and UDP+process+
+  persistence.
+
+### Review Response
+
+Accepted. Those non-claims match the plan's pinned scope. The phase closes on
+resource honesty, bounded lanes, simulator rails, and DST coverage, not on
+native DNS/TLS/signals or a full app framework claim.

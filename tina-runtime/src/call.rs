@@ -106,6 +106,22 @@ impl UdpSocketId {
     }
 }
 
+/// Runtime-owned identifier for a TLS stream resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TlsStreamId(u64);
+
+impl TlsStreamId {
+    /// Creates a TLS stream identifier from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw TLS stream identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Runtime-owned identifier for an opened file resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(u64);
@@ -155,6 +171,47 @@ pub struct ProcessRunResult {
     pub stdout_truncated: bool,
     /// Whether stderr exceeded its cap.
     pub stderr_truncated: bool,
+}
+
+/// Coarse kind of one local filesystem path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathKind {
+    /// The path does not exist.
+    Missing,
+
+    /// The path is a regular file.
+    File,
+
+    /// The path is a directory.
+    Directory,
+
+    /// The path exists, but is neither a regular file nor a directory.
+    Other,
+}
+
+/// Metadata Tina exposes for a local filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PathMetadata {
+    /// Coarse path kind.
+    pub kind: PathKind,
+
+    /// File length when the path is a regular file.
+    pub len: Option<u64>,
+}
+
+impl PathMetadata {
+    /// Returns metadata for a missing path.
+    pub const fn missing() -> Self {
+        Self {
+            kind: PathKind::Missing,
+            len: None,
+        }
+    }
+
+    /// Returns whether the path exists.
+    pub const fn exists(&self) -> bool {
+        !matches!(self.kind, PathKind::Missing)
+    }
 }
 
 impl FileOpenOptions {
@@ -331,6 +388,48 @@ pub enum CallInput {
         socket: UdpSocketId,
     },
 
+    /// Open one client TLS stream to `addr`.
+    TlsConnect {
+        /// Remote socket address.
+        addr: SocketAddr,
+        /// Server name used for certificate validation.
+        server_name: String,
+        /// Root certificates in DER form. This first native TLS slice requires
+        /// explicit trust roots instead of silently reaching into platform
+        /// stores.
+        root_certificates: Vec<Vec<u8>>,
+        /// Maximum time for TCP connect and TLS handshake.
+        timeout: Duration,
+    },
+
+    /// Read decrypted bytes from a TLS stream.
+    TlsRead {
+        /// TLS stream to read from.
+        stream: TlsStreamId,
+        /// Maximum decrypted bytes to return.
+        max_len: usize,
+        /// Maximum time for this read.
+        timeout: Duration,
+    },
+
+    /// Write decrypted bytes to a TLS stream.
+    TlsWrite {
+        /// TLS stream to write to.
+        stream: TlsStreamId,
+        /// Plaintext bytes to write through TLS.
+        bytes: Vec<u8>,
+        /// Maximum time for this write.
+        timeout: Duration,
+    },
+
+    /// Close one TLS stream.
+    TlsClose {
+        /// TLS stream to close.
+        stream: TlsStreamId,
+        /// Maximum time for TLS close-notify/flush.
+        timeout: Duration,
+    },
+
     /// Resolve one host/port pair through the runtime-owned DNS rail.
     DnsLookup {
         /// Host name or address string.
@@ -339,6 +438,19 @@ pub enum CallInput {
         port: u16,
         /// Maximum time the caller is willing to wait. Already-started
         /// platform lookups may continue in the DNS lane and be tombstoned.
+        timeout: Duration,
+    },
+
+    /// Wait for one runtime-owned signal event by name.
+    ///
+    /// Live OS-signal support is substrate-specific and currently unsupported
+    /// on the shipped local system. The deterministic simulator implements
+    /// this rail through scripted injection so signal-handling state machines
+    /// can still be tested without installing process-global handlers.
+    SignalWait {
+        /// Runtime-owned signal name.
+        name: String,
+        /// Maximum time the caller is willing to wait.
         timeout: Duration,
     },
 
@@ -410,6 +522,39 @@ pub enum CallInput {
         mode: u32,
     },
 
+    /// Query coarse metadata for a path.
+    PathMetadata {
+        /// Path to inspect.
+        path: PathBuf,
+    },
+
+    /// Rename `from` to `to`, replacing the destination where the platform
+    /// explicitly supports existing-target replacement.
+    RenameReplace {
+        /// Source path.
+        from: PathBuf,
+        /// Destination path.
+        to: PathBuf,
+    },
+
+    /// Remove one regular file.
+    RemoveFile {
+        /// File path to remove.
+        path: PathBuf,
+    },
+
+    /// Read one directory and return deterministic sorted entries.
+    ReadDir {
+        /// Directory path to list.
+        path: PathBuf,
+    },
+
+    /// Sync the parent directory for one path where the platform supports it.
+    SyncParent {
+        /// Path whose parent directory should be synced.
+        path: PathBuf,
+    },
+
     /// Commit one local snapshot.
     SnapshotCommit {
         /// Snapshot path.
@@ -469,7 +614,12 @@ impl CallInput {
             Self::UdpSendTo { .. } => crate::trace::CallKind::UdpSendTo,
             Self::UdpRecvFrom { .. } => crate::trace::CallKind::UdpRecvFrom,
             Self::UdpSocketClose { .. } => crate::trace::CallKind::UdpSocketClose,
+            Self::TlsConnect { .. } => crate::trace::CallKind::TlsConnect,
+            Self::TlsRead { .. } => crate::trace::CallKind::TlsRead,
+            Self::TlsWrite { .. } => crate::trace::CallKind::TlsWrite,
+            Self::TlsClose { .. } => crate::trace::CallKind::TlsClose,
             Self::DnsLookup { .. } => crate::trace::CallKind::DnsLookup,
+            Self::SignalWait { .. } => crate::trace::CallKind::SignalWait,
             Self::ProcessRun { .. } => crate::trace::CallKind::ProcessRun,
             Self::FileOpen { .. } => crate::trace::CallKind::FileOpen,
             Self::FileReadAt { .. } => crate::trace::CallKind::FileReadAt,
@@ -478,6 +628,11 @@ impl CallInput {
             Self::FileSize { .. } => crate::trace::CallKind::FileSize,
             Self::FileClose { .. } => crate::trace::CallKind::FileClose,
             Self::Mkdir { .. } => crate::trace::CallKind::Mkdir,
+            Self::PathMetadata { .. } => crate::trace::CallKind::PathMetadata,
+            Self::RenameReplace { .. } => crate::trace::CallKind::RenameReplace,
+            Self::RemoveFile { .. } => crate::trace::CallKind::RemoveFile,
+            Self::ReadDir { .. } => crate::trace::CallKind::ReadDir,
+            Self::SyncParent { .. } => crate::trace::CallKind::SyncParent,
             Self::SnapshotCommit { .. } => crate::trace::CallKind::SnapshotCommit,
             Self::SnapshotLoad { .. } => crate::trace::CallKind::SnapshotLoad,
             Self::JournalAppend { .. } => crate::trace::CallKind::JournalAppend,
@@ -595,10 +750,37 @@ pub enum CallOutput {
     /// A UDP socket was closed and its resources released.
     UdpSocketClosed,
 
+    /// A TLS stream completed connection and handshake.
+    TlsConnected {
+        /// The runtime-assigned TLS stream id.
+        stream: TlsStreamId,
+    },
+
+    /// A TLS stream read decrypted bytes.
+    TlsRead {
+        /// Decrypted bytes.
+        bytes: Vec<u8>,
+    },
+
+    /// A TLS stream wrote plaintext bytes.
+    TlsWrote {
+        /// Plaintext byte count accepted by the TLS stream.
+        count: usize,
+    },
+
+    /// A TLS stream was closed.
+    TlsClosed,
+
     /// A DNS lookup resolved to one or more socket addresses.
     DnsResolved {
         /// Resolved socket addresses.
         addrs: Vec<SocketAddr>,
+    },
+
+    /// A runtime-owned signal event was delivered.
+    SignalReceived {
+        /// Runtime-owned signal name.
+        name: String,
     },
 
     /// A bounded local process exited and captured output was delivered.
@@ -648,6 +830,27 @@ pub enum CallOutput {
     /// A directory was created.
     DirectoryCreated,
 
+    /// Path metadata was read.
+    PathMetadata {
+        /// Coarse metadata.
+        metadata: PathMetadata,
+    },
+
+    /// A path was renamed/replaced.
+    PathRenamed,
+
+    /// A regular file was removed.
+    FileRemoved,
+
+    /// A directory was listed.
+    DirectoryRead {
+        /// Sorted entries.
+        entries: Vec<PathBuf>,
+    },
+
+    /// A parent directory was synced.
+    ParentSynced,
+
     /// A snapshot was committed.
     SnapshotCommitted,
 
@@ -684,6 +887,9 @@ pub enum CallError {
     /// The referenced listener or stream id is not registered with the
     /// runtime.
     InvalidResource,
+
+    /// The requested path or resource does not exist.
+    NotFound,
 
     /// The runtime's underlying I/O substrate returned an error. The trace
     /// also records this; the isolate-facing variant is intentionally
@@ -740,6 +946,27 @@ pub enum CallError {
 
     /// The DNS lane was already closed when the runtime tried to submit a lookup.
     DnsClosed,
+
+    /// The bounded TLS lane was full when the runtime tried to submit TLS work.
+    TlsFull,
+
+    /// The TLS lane was already closed when the runtime tried to submit work.
+    TlsClosed,
+
+    /// TLS certificate validation failed.
+    TlsCertificate,
+
+    /// TLS server-name validation or parsing failed.
+    TlsName,
+
+    /// TLS handshake or protocol processing failed.
+    TlsHandshake,
+
+    /// The bounded signal lane was full when the runtime tried to wait.
+    SignalFull,
+
+    /// The signal lane was already closed when the runtime tried to wait.
+    SignalClosed,
 
     /// The bounded process lane was full when the runtime tried to submit work.
     ProcessFull,
@@ -1326,12 +1553,57 @@ impl CallOutput {
         }
     }
 
+    /// Extracts the successful TLS connect result.
+    pub fn into_tls_connected(self) -> Result<TlsStreamId, CallError> {
+        match self {
+            Self::TlsConnected { stream } => Ok(stream),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsConnected", &other),
+        }
+    }
+
+    /// Extracts the successful TLS read payload.
+    pub fn into_tls_read(self) -> Result<Vec<u8>, CallError> {
+        match self {
+            Self::TlsRead { bytes } => Ok(bytes),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsRead", &other),
+        }
+    }
+
+    /// Extracts the successful TLS write count.
+    pub fn into_tls_wrote(self) -> Result<usize, CallError> {
+        match self {
+            Self::TlsWrote { count } => Ok(count),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsWrote", &other),
+        }
+    }
+
+    /// Extracts the successful TLS close completion.
+    pub fn into_tls_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::TlsClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsClosed", &other),
+        }
+    }
+
     /// Extracts the successful DNS lookup result.
     pub fn into_dns_resolved(self) -> Result<Vec<SocketAddr>, CallError> {
         match self {
             Self::DnsResolved { addrs } => Ok(addrs),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("DnsResolved", &other),
+        }
+    }
+
+    /// Extracts the successful signal-wait result.
+    pub fn into_signal_received(self) -> Result<String, CallError> {
+        match self {
+            Self::SignalReceived { name } => Ok(name),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("SignalReceived", &other),
         }
     }
 
@@ -1416,6 +1688,51 @@ impl CallOutput {
             Self::DirectoryCreated => Ok(()),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("DirectoryCreated", &other),
+        }
+    }
+
+    /// Extracts the successful path metadata result.
+    pub fn into_path_metadata(self) -> Result<PathMetadata, CallError> {
+        match self {
+            Self::PathMetadata { metadata } => Ok(metadata),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("PathMetadata", &other),
+        }
+    }
+
+    /// Extracts the successful rename/replace result.
+    pub fn into_path_renamed(self) -> Result<(), CallError> {
+        match self {
+            Self::PathRenamed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("PathRenamed", &other),
+        }
+    }
+
+    /// Extracts the successful remove-file result.
+    pub fn into_file_removed(self) -> Result<(), CallError> {
+        match self {
+            Self::FileRemoved => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("FileRemoved", &other),
+        }
+    }
+
+    /// Extracts the successful read-dir result.
+    pub fn into_directory_read(self) -> Result<Vec<PathBuf>, CallError> {
+        match self {
+            Self::DirectoryRead { entries } => Ok(entries),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("DirectoryRead", &other),
+        }
+    }
+
+    /// Extracts the successful parent-directory sync result.
+    pub fn into_parent_synced(self) -> Result<(), CallError> {
+        match self {
+            Self::ParentSynced => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("ParentSynced", &other),
         }
     }
 
@@ -1739,6 +2056,56 @@ pub fn udp_close_socket(socket: UdpSocketId) -> TypedCall<()> {
     )
 }
 
+/// Returns a typed TLS connect helper with explicit DER root certificates.
+pub fn tls_connect(
+    addr: SocketAddr,
+    server_name: impl Into<String>,
+    root_certificates: Vec<Vec<u8>>,
+    timeout: Duration,
+) -> TypedCall<TlsStreamId> {
+    TypedCall::new(
+        CallInput::TlsConnect {
+            addr,
+            server_name: server_name.into(),
+            root_certificates,
+            timeout,
+        },
+        CallOutput::into_tls_connected,
+    )
+}
+
+/// Returns a typed TLS read helper.
+pub fn tls_read(stream: TlsStreamId, max_len: usize, timeout: Duration) -> TypedCall<Vec<u8>> {
+    TypedCall::new(
+        CallInput::TlsRead {
+            stream,
+            max_len,
+            timeout,
+        },
+        CallOutput::into_tls_read,
+    )
+}
+
+/// Returns a typed TLS write helper.
+pub fn tls_write(stream: TlsStreamId, bytes: Vec<u8>, timeout: Duration) -> TypedCall<usize> {
+    TypedCall::new(
+        CallInput::TlsWrite {
+            stream,
+            bytes,
+            timeout,
+        },
+        CallOutput::into_tls_wrote,
+    )
+}
+
+/// Returns a typed TLS close helper.
+pub fn tls_close(stream: TlsStreamId, timeout: Duration) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::TlsClose { stream, timeout },
+        CallOutput::into_tls_closed,
+    )
+}
+
 /// Returns a typed DNS lookup helper.
 pub fn dns_lookup(
     host: impl Into<String>,
@@ -1752,6 +2119,17 @@ pub fn dns_lookup(
             timeout,
         },
         CallOutput::into_dns_resolved,
+    )
+}
+
+/// Returns a typed signal-wait helper.
+pub fn signal_wait(name: impl Into<String>, timeout: Duration) -> TypedCall<String> {
+    TypedCall::new(
+        CallInput::SignalWait {
+            name: name.into(),
+            timeout,
+        },
+        CallOutput::into_signal_received,
     )
 }
 
@@ -1849,6 +2227,49 @@ pub fn mkdir(path: impl Into<PathBuf>, mode: u32) -> TypedCall<()> {
             mode,
         },
         CallOutput::into_directory_created,
+    )
+}
+
+/// Returns a typed path-metadata helper.
+pub fn path_metadata(path: impl Into<PathBuf>) -> TypedCall<PathMetadata> {
+    TypedCall::new(
+        CallInput::PathMetadata { path: path.into() },
+        CallOutput::into_path_metadata,
+    )
+}
+
+/// Returns a typed rename-replace helper.
+pub fn rename_replace(from: impl Into<PathBuf>, to: impl Into<PathBuf>) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::RenameReplace {
+            from: from.into(),
+            to: to.into(),
+        },
+        CallOutput::into_path_renamed,
+    )
+}
+
+/// Returns a typed remove-file helper.
+pub fn remove_file(path: impl Into<PathBuf>) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::RemoveFile { path: path.into() },
+        CallOutput::into_file_removed,
+    )
+}
+
+/// Returns a typed read-directory helper.
+pub fn read_dir(path: impl Into<PathBuf>) -> TypedCall<Vec<PathBuf>> {
+    TypedCall::new(
+        CallInput::ReadDir { path: path.into() },
+        CallOutput::into_directory_read,
+    )
+}
+
+/// Returns a typed parent-directory sync helper.
+pub fn sync_parent(path: impl Into<PathBuf>) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::SyncParent { path: path.into() },
+        CallOutput::into_parent_synced,
     )
 }
 

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -11,12 +11,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallError, CallKind, CancellationSupport, FileId, ListenerId, LiveShardState, LocalSystem,
-    LocalSystemState, MailboxFactory, PersistenceSupportLevel, ResourceExecutionShape,
-    ResourceSupport, RuntimeEventKind, ShutdownSupport, SnapshotImage, StreamId,
-    ThreadedRuntimeError, ThreadedTrySendError, TraceRetention, UdpSocketId, dns_lookup,
-    file_close, file_create, file_fsync, file_read, file_size, file_write, journal_append,
-    journal_replay, process_run, sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_read, tcp_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    LocalSystemState, MailboxFactory, PathKind, PathMetadata, PersistenceSupportLevel,
+    ResourceExecutionShape, ResourceSupport, RuntimeEventKind, ShutdownSupport, SnapshotImage,
+    StreamId, ThreadedRuntimeError, ThreadedTrySendError, TlsStreamId, TraceRetention, UdpSocketId,
+    dns_lookup, file_close, file_create, file_fsync, file_read, file_size, file_write,
+    journal_append, journal_replay, path_metadata, process_run, read_dir, remove_file,
+    rename_replace, signal_wait, sleep, snapshot_load, sync_parent, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write, tls_close, tls_connect, tls_read,
+    tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -296,34 +298,162 @@ impl UdpLoopbackService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DnsUnsupportedMsg {
+enum DnsLookupMsg {
     Start,
     Done(Result<Vec<SocketAddr>, CallError>),
 }
 
 #[derive(Debug)]
-struct DnsUnsupportedService {
+struct DnsLookupService {
     observed: Arc<Mutex<Vec<String>>>,
 }
 
-#[tina_runtime::isolate(message = DnsUnsupportedMsg, shard = AppShard)]
-impl DnsUnsupportedService {
-    fn handle(&mut self, msg: DnsUnsupportedMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+#[tina_runtime::isolate(message = DnsLookupMsg, shard = AppShard)]
+impl DnsLookupService {
+    fn handle(&mut self, msg: DnsLookupMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            DnsUnsupportedMsg::Start => dns_lookup("localhost", 80, Duration::from_millis(10))
-                .reply(DnsUnsupportedMsg::Done),
-            DnsUnsupportedMsg::Done(Ok(_)) => {
+            DnsLookupMsg::Start => {
+                dns_lookup("localhost", 80, Duration::from_secs(1)).reply(DnsLookupMsg::Done)
+            }
+            DnsLookupMsg::Done(Ok(addrs)) => {
                 self.observed
                     .lock()
                     .expect("dns observed lock")
-                    .push("resolved".to_string());
+                    .push(format!("resolved:{}", addrs.len()));
                 noop()
             }
-            DnsUnsupportedMsg::Done(Err(error)) => {
+            DnsLookupMsg::Done(Err(error)) => {
                 self.observed
                     .lock()
                     .expect("dns observed lock")
                     .push(format!("err:{error:?}"));
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TlsClientMsg {
+    Start { addr: SocketAddr, cert_der: Vec<u8> },
+    Connected(Result<TlsStreamId, CallError>),
+    Wrote(Result<usize, CallError>),
+    Read(Result<Vec<u8>, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct TlsClientService {
+    observed: Arc<Mutex<Vec<String>>>,
+    stream: Option<TlsStreamId>,
+}
+
+#[tina_runtime::isolate(message = TlsClientMsg, shard = AppShard)]
+impl TlsClientService {
+    fn handle(&mut self, msg: TlsClientMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            TlsClientMsg::Start { addr, cert_der } => {
+                tls_connect(addr, "localhost", vec![cert_der], Duration::from_secs(2))
+                    .reply(TlsClientMsg::Connected)
+            }
+            TlsClientMsg::Connected(Ok(stream)) => {
+                self.stream = Some(stream);
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push("connected".to_string());
+                tls_write(stream, b"ping".to_vec(), Duration::from_secs(2))
+                    .reply(TlsClientMsg::Wrote)
+            }
+            TlsClientMsg::Connected(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push(format!("connect-err:{error:?}"));
+                noop()
+            }
+            TlsClientMsg::Wrote(Ok(count)) => {
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push(format!("wrote:{count}"));
+                let stream = self.stream.expect("TLS stream should be remembered");
+                tls_read(stream, 4, Duration::from_secs(2)).reply(TlsClientMsg::Read)
+            }
+            TlsClientMsg::Wrote(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push(format!("write-err:{error:?}"));
+                noop()
+            }
+            TlsClientMsg::Read(Ok(bytes)) => {
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push(String::from_utf8(bytes).unwrap_or_else(|error| format!("utf8:{error}")));
+                let stream = self.stream.expect("TLS stream should be remembered");
+                tls_close(stream, Duration::from_secs(2)).reply(TlsClientMsg::Closed)
+            }
+            TlsClientMsg::Read(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push(format!("read-err:{error:?}"));
+                noop()
+            }
+            TlsClientMsg::Closed(Ok(())) => {
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push("closed".to_string());
+                noop()
+            }
+            TlsClientMsg::Closed(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("tls observed lock")
+                    .push(format!("close-err:{error:?}"));
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignalUnsupportedMsg {
+    Start,
+    Done(Result<String, CallError>),
+}
+
+#[derive(Debug)]
+struct SignalUnsupportedService {
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = SignalUnsupportedMsg, shard = AppShard)]
+impl SignalUnsupportedService {
+    fn handle(
+        &mut self,
+        msg: SignalUnsupportedMsg,
+        _ctx: &mut Context<'_, AppShard>,
+    ) -> Effect<Self> {
+        match msg {
+            SignalUnsupportedMsg::Start => {
+                signal_wait("shutdown", Duration::from_secs(60)).reply(SignalUnsupportedMsg::Done)
+            }
+            SignalUnsupportedMsg::Done(Ok(name)) => {
+                self.observed
+                    .lock()
+                    .expect("signal observed lock")
+                    .push(format!("signal:{name}"));
+                noop()
+            }
+            SignalUnsupportedMsg::Done(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("signal observed lock")
+                    .push(format!("signal-err:{error:?}"));
                 noop()
             }
         }
@@ -506,6 +636,11 @@ enum FileMsg {
     Sized(Result<u64, CallError>, PathBuf, FileId),
     Read(Result<Vec<u8>, CallError>, PathBuf, FileId),
     Closed(Result<(), CallError>, PathBuf, Vec<u8>),
+    Metadata(Result<PathMetadata, CallError>, PathBuf, Vec<u8>),
+    Renamed(Result<(), CallError>, PathBuf, Vec<u8>),
+    DirectoryRead(Result<Vec<PathBuf>, CallError>, PathBuf, Vec<u8>),
+    ParentSynced(Result<(), CallError>, PathBuf, Vec<u8>),
+    Removed(Result<(), CallError>, Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -535,8 +670,31 @@ impl FileService {
             FileMsg::Read(Ok(bytes), path, file) => {
                 file_close(file).reply(move |result| FileMsg::Closed(result, path, bytes))
             }
-            FileMsg::Closed(Ok(()), path, bytes) => {
-                let _ = fs::remove_file(path);
+            FileMsg::Closed(Ok(()), path, bytes) => path_metadata(path.clone())
+                .reply(move |result| FileMsg::Metadata(result, path, bytes)),
+            FileMsg::Metadata(Ok(metadata), path, bytes)
+                if metadata.kind == PathKind::File
+                    && metadata.len == Some(FILE_SERVICE_PAYLOAD.len() as u64) =>
+            {
+                let renamed = path.with_extension("renamed");
+                rename_replace(path, renamed.clone())
+                    .reply(move |result| FileMsg::Renamed(result, renamed, bytes))
+            }
+            FileMsg::Renamed(Ok(()), renamed, bytes) => {
+                let parent = renamed
+                    .parent()
+                    .expect("renamed file has parent")
+                    .to_path_buf();
+                read_dir(parent).reply(move |result| FileMsg::DirectoryRead(result, renamed, bytes))
+            }
+            FileMsg::DirectoryRead(Ok(entries), renamed, bytes) if entries.contains(&renamed) => {
+                sync_parent(renamed.clone())
+                    .reply(move |result| FileMsg::ParentSynced(result, renamed, bytes))
+            }
+            FileMsg::ParentSynced(Ok(()), renamed, bytes) => {
+                remove_file(renamed).reply(move |result| FileMsg::Removed(result, bytes))
+            }
+            FileMsg::Removed(Ok(()), bytes) => {
                 self.seen
                     .lock()
                     .expect("file seen lock")
@@ -549,7 +707,14 @@ impl FileService {
             | FileMsg::Synced(Err(_), _, _)
             | FileMsg::Sized(Err(_), _, _)
             | FileMsg::Read(Err(_), _, _)
-            | FileMsg::Closed(Err(_), _, _) => {
+            | FileMsg::Closed(Err(_), _, _)
+            | FileMsg::Metadata(Err(_), _, _)
+            | FileMsg::Metadata(Ok(_), _, _)
+            | FileMsg::Renamed(Err(_), _, _)
+            | FileMsg::DirectoryRead(Err(_), _, _)
+            | FileMsg::DirectoryRead(Ok(_), _, _)
+            | FileMsg::ParentSynced(Err(_), _, _)
+            | FileMsg::Removed(Err(_), _) => {
                 self.seen
                     .lock()
                     .expect("file seen lock")
@@ -1151,7 +1316,15 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
     assert_eq!(capabilities.storage_lane.capacity(), Some(7));
     assert_eq!(capabilities.local_persistence.capacity(), Some(7));
 
-    assert_eq!(capabilities.dns.support(), ResourceSupport::Unsupported);
+    assert_eq!(capabilities.dns.support(), ResourceSupport::Supported);
+    assert_eq!(
+        capabilities.dns.execution(),
+        ResourceExecutionShape::LaneBackedBlocking
+    );
+    assert_eq!(
+        capabilities.dns.cancellation(),
+        CancellationSupport::TombstonedAfterStart
+    );
     assert_eq!(capabilities.udp.support(), ResourceSupport::Supported);
     assert_eq!(
         capabilities.udp.execution(),
@@ -1162,11 +1335,19 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         capabilities.process.execution(),
         ResourceExecutionShape::LaneBackedBlocking
     );
-    assert_eq!(capabilities.signal.support(), ResourceSupport::Unsupported);
-    assert_eq!(capabilities.tls.support(), ResourceSupport::AdapterOnly);
+    assert_eq!(capabilities.signal.support(), ResourceSupport::Supported);
+    assert_eq!(
+        capabilities.signal.execution(),
+        ResourceExecutionShape::PollBacked
+    );
+    assert_eq!(capabilities.tls.support(), ResourceSupport::Supported);
     assert_eq!(
         capabilities.tls.execution(),
-        ResourceExecutionShape::ExternalAdapter
+        ResourceExecutionShape::LaneBackedBlocking
+    );
+    assert_eq!(
+        capabilities.tls.cancellation(),
+        CancellationSupport::TombstonedAfterStart
     );
 
     assert_eq!(
@@ -1192,28 +1373,28 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
 }
 
 #[test]
-fn local_system_dns_rail_is_typed_unsupported_without_fallback() {
+fn local_system_dns_rail_resolves_through_bounded_runtime_lane() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let app = LocalSystem::single_shard(AppShard(39), AppMailboxFactory)
         .trace_retention(TraceRetention::Bounded(64))
         .build();
     let address = app
-        .register_root::<DnsUnsupportedService, Infallible>(
-            DnsUnsupportedService {
+        .register_root::<DnsLookupService, Infallible>(
+            DnsLookupService {
                 observed: Arc::clone(&observed),
             },
             8,
         )
         .expect("register dns service");
 
-    app.try_send(address, DnsUnsupportedMsg::Start)
+    app.try_send(address, DnsLookupMsg::Start)
         .expect("start dns service");
     wait_until(|| {
         observed
             .lock()
             .expect("dns observed lock")
             .iter()
-            .any(|entry| entry == "err:Unsupported")
+            .any(|entry| entry.starts_with("resolved:"))
     });
 
     let terminal = app
@@ -1224,9 +1405,136 @@ fn local_system_dns_rail_is_typed_unsupported_without_fallback() {
     assert!(terminal.trace().iter().any(|event| {
         matches!(
             event.kind(),
-            RuntimeEventKind::CallFailed {
+            RuntimeEventKind::CallCompleted {
                 call_kind: CallKind::DnsLookup,
-                reason: CallError::Unsupported,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn local_system_tls_rail_connects_writes_reads_and_closes() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+    let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
+    let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_cert], server_key)
+        .expect("server config");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls test listener");
+    let addr = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let (tcp, _) = listener.accept().expect("accept tls client");
+        let connection =
+            rustls::ServerConnection::new(Arc::new(server_config)).expect("server connection");
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        let mut request = [0_u8; 4];
+        stream.read_exact(&mut request).expect("read request");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").expect("write response");
+        stream.flush().expect("flush response");
+    });
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(42), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<TlsClientService, Infallible>(
+            TlsClientService {
+                observed: Arc::clone(&observed),
+                stream: None,
+            },
+            8,
+        )
+        .expect("register tls service");
+
+    app.try_send(address, TlsClientMsg::Start { addr, cert_der })
+        .expect("start tls service");
+    wait_until(|| {
+        observed.lock().expect("tls observed lock").as_slice()
+            == ["connected", "wrote:4", "pong", "closed"]
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    server.join().expect("server thread");
+    for expected in [
+        CallKind::TlsConnect,
+        CallKind::TlsWrite,
+        CallKind::TlsRead,
+        CallKind::TlsClose,
+    ] {
+        assert!(
+            terminal.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+                )
+            }),
+            "missing {expected:?} completion in trace: {:?}",
+            terminal.trace()
+        );
+    }
+}
+
+#[test]
+fn local_system_shutdown_signal_rail_delivers_message_before_stop() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(41), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(64))
+        .build();
+    let address = app
+        .register_root::<SignalUnsupportedService, Infallible>(
+            SignalUnsupportedService {
+                observed: Arc::clone(&observed),
+            },
+            8,
+        )
+        .expect("register signal service");
+
+    app.try_send(address, SignalUnsupportedMsg::Start)
+        .expect("start signal service");
+    wait_until(|| {
+        app.trace().expect("trace snapshot").iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallDispatchAttempted {
+                    call_kind: CallKind::SignalWait,
+                    ..
+                }
+            )
+        })
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    assert!(
+        observed
+            .lock()
+            .expect("signal observed lock")
+            .iter()
+            .any(|entry| entry == "signal:shutdown")
+    );
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::SignalWait,
                 ..
             }
         )
@@ -2116,6 +2424,11 @@ fn local_system_service_uses_runtime_owned_file_io() {
         tina_runtime::CallKind::FileSize,
         tina_runtime::CallKind::FileReadAt,
         tina_runtime::CallKind::FileClose,
+        tina_runtime::CallKind::PathMetadata,
+        tina_runtime::CallKind::RenameReplace,
+        tina_runtime::CallKind::ReadDir,
+        tina_runtime::CallKind::SyncParent,
+        tina_runtime::CallKind::RemoveFile,
     ] {
         assert!(
             terminal.trace().iter().any(|event| {

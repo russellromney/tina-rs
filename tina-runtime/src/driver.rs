@@ -28,15 +28,15 @@
 //!   shutdown was clean.
 //!
 use std::alloc::Global;
-use std::io::{ErrorKind, Read};
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{
     Receiver, SyncSender, TryRecvError, TrySendError as MpscTrySendError, sync_channel,
 };
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -49,15 +49,20 @@ use betelgeuse::{
 };
 
 use crate::call::{
-    CallError, CallId, CallInput, CallOutput, FileId, FileOpenOptions, ListenerId, ProcessStatus,
-    StreamId, UdpSocketId,
+    CallError, CallId, CallInput, CallOutput, FileId, FileOpenOptions, ListenerId, PathKind,
+    PathMetadata, ProcessStatus, StreamId, TlsStreamId, UdpSocketId,
 };
 
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
 const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
 const INITIAL_DRIVER_PENDING_CAPACITY: usize = 8;
 pub(crate) const DEFAULT_STORAGE_LANE_CAPACITY: usize = 64;
+pub(crate) const DEFAULT_DNS_LANE_CAPACITY: usize = 16;
+pub(crate) const DEFAULT_TLS_LANE_CAPACITY: usize = 64;
 pub(crate) const DEFAULT_PROCESS_LANE_CAPACITY: usize = 16;
+pub(crate) const DEFAULT_SIGNAL_CAPACITY: usize = 64;
+
+type TlsClientStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
 /// Runtime-owned substrate driver.
 ///
@@ -102,6 +107,9 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// effect, such as a TCP write handed to the OS, can be undone.
     fn cancel(&mut self, call_id: CallId) -> bool;
 
+    /// Injects one runtime-owned signal event and appends ready completions.
+    fn notify_signal(&mut self, _name: &str, _completed: &mut Vec<DriverCompletion>) {}
+
     #[cfg(test)]
     fn io_pending_count(&self) -> usize {
         0
@@ -124,7 +132,10 @@ pub(crate) enum DriverShutdownError {
 pub(crate) struct BetelgeuseDriver {
     tcp: BetelgeuseTcp,
     storage: StorageLane,
+    dns: DnsLane,
+    tls: TlsLane,
     process: ProcessLane,
+    signals: Vec<SignalWaitEntry>,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
 }
@@ -135,6 +146,14 @@ struct TimerEntry {
     call_id: CallId,
     deadline: Instant,
     insertion_order: u64,
+}
+
+#[derive(Debug)]
+struct SignalWaitEntry {
+    call_id: CallId,
+    name: String,
+    deadline: Instant,
+    cancelled: bool,
 }
 
 /// Runtime-owned Betelgeuse TCP state.
@@ -235,9 +254,19 @@ enum StorageLane {
     Worker(StorageWorkerLane),
 }
 
+enum DnsLane {
+    Worker(DnsWorkerLane),
+}
+
+enum TlsLane {
+    Worker(TlsWorkerLane),
+}
+
 enum ProcessLane {
     Worker(ProcessWorkerLane),
 }
+
+type DnsResolver = Arc<dyn Fn(&str, u16) -> CallOutput + Send + Sync + 'static>;
 
 struct StorageWorkerLane {
     capacity: usize,
@@ -275,6 +304,22 @@ enum StorageJob {
     JournalReplay {
         path: PathBuf,
     },
+    PathMetadata {
+        path: PathBuf,
+    },
+    RenameReplace {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    RemoveFile {
+        path: PathBuf,
+    },
+    ReadDir {
+        path: PathBuf,
+    },
+    SyncParent {
+        path: PathBuf,
+    },
     #[cfg(test)]
     Park {
         started: SyncSender<()>,
@@ -285,6 +330,103 @@ enum StorageJob {
 struct StorageCompletion {
     call_id: CallId,
     result: CallOutput,
+}
+
+struct DnsWorkerLane {
+    capacity: usize,
+    sender: Option<SyncSender<DnsCommand>>,
+    completions: Receiver<DnsCompletion>,
+    handle: Option<JoinHandle<()>>,
+    pending: Vec<DnsPending>,
+}
+
+struct DnsPending {
+    call_id: CallId,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    timed_out: bool,
+}
+
+struct DnsCommand {
+    call_id: CallId,
+    host: String,
+    port: u16,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct DnsCompletion {
+    call_id: CallId,
+    result: CallOutput,
+}
+
+struct TlsWorkerLane {
+    capacity: usize,
+    sender: Option<SyncSender<TlsCommand>>,
+    completions: Receiver<TlsCompletion>,
+    handle: Option<JoinHandle<()>>,
+    pending: Vec<TlsPending>,
+    streams: Vec<TlsStreamEntry>,
+    next_stream_id: u64,
+}
+
+struct TlsStreamEntry {
+    id: TlsStreamId,
+    stream: Arc<Mutex<TlsClientStream>>,
+}
+
+struct TlsPending {
+    call_id: CallId,
+    lane: TlsPendingLane,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    timed_out: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsPendingLane {
+    Connect(CallId),
+    Stream(TlsStreamId),
+}
+
+enum TlsCommand {
+    Connect {
+        call_id: CallId,
+        addr: SocketAddr,
+        server_name: String,
+        root_certificates: Vec<Vec<u8>>,
+        timeout: Duration,
+        cancelled: Arc<AtomicBool>,
+    },
+    Read {
+        call_id: CallId,
+        stream: Arc<Mutex<TlsClientStream>>,
+        max_len: usize,
+        timeout: Duration,
+        cancelled: Arc<AtomicBool>,
+    },
+    Write {
+        call_id: CallId,
+        stream: Arc<Mutex<TlsClientStream>>,
+        bytes: Vec<u8>,
+        timeout: Duration,
+        cancelled: Arc<AtomicBool>,
+    },
+    Close {
+        call_id: CallId,
+        stream: Arc<Mutex<TlsClientStream>>,
+        timeout: Duration,
+        cancelled: Arc<AtomicBool>,
+    },
+}
+
+struct TlsCompletion {
+    call_id: CallId,
+    result: TlsCompletionResult,
+}
+
+enum TlsCompletionResult {
+    Connected(Box<Result<TlsClientStream, CallError>>),
+    Output(CallOutput),
 }
 
 struct ProcessWorkerLane {
@@ -326,7 +468,12 @@ impl BetelgeuseDriver {
         Self {
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::inline(),
+            dns: DnsLane::new(DEFAULT_DNS_LANE_CAPACITY),
+            tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY),
             process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
+            signals: Vec::with_capacity(
+                DEFAULT_SIGNAL_CAPACITY.min(INITIAL_DRIVER_PENDING_CAPACITY),
+            ),
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
@@ -339,7 +486,12 @@ impl BetelgeuseDriver {
         Self {
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::new(storage_lane_capacity),
+            dns: DnsLane::new(DEFAULT_DNS_LANE_CAPACITY),
+            tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY),
             process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
+            signals: Vec::with_capacity(
+                DEFAULT_SIGNAL_CAPACITY.min(INITIAL_DRIVER_PENDING_CAPACITY),
+            ),
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
@@ -394,10 +546,51 @@ impl RuntimeDriver for BetelgeuseDriver {
             CallInput::JournalReplay { path } => self
                 .storage
                 .submit(call_id, StorageJob::JournalReplay { path }),
-            CallInput::DnsLookup { .. } => Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::Unsupported),
-            }),
+            CallInput::PathMetadata { path } => self
+                .storage
+                .submit(call_id, StorageJob::PathMetadata { path }),
+            CallInput::RenameReplace { from, to } => self
+                .storage
+                .submit(call_id, StorageJob::RenameReplace { from, to }),
+            CallInput::RemoveFile { path } => self
+                .storage
+                .submit(call_id, StorageJob::RemoveFile { path }),
+            CallInput::ReadDir { path } => {
+                self.storage.submit(call_id, StorageJob::ReadDir { path })
+            }
+            CallInput::SyncParent { path } => self
+                .storage
+                .submit(call_id, StorageJob::SyncParent { path }),
+            CallInput::DnsLookup {
+                host,
+                port,
+                timeout,
+            } => self.dns.submit(call_id, host, port, timeout, now),
+            CallInput::TlsConnect {
+                addr,
+                server_name,
+                root_certificates,
+                timeout,
+            } => {
+                self.tls
+                    .submit_connect(call_id, addr, server_name, root_certificates, timeout, now)
+            }
+            CallInput::TlsRead {
+                stream,
+                max_len,
+                timeout,
+            } => self.tls.submit_read(call_id, stream, max_len, timeout, now),
+            CallInput::TlsWrite {
+                stream,
+                bytes,
+                timeout,
+            } => self.tls.submit_write(call_id, stream, bytes, timeout, now),
+            CallInput::TlsClose { stream, timeout } => {
+                self.tls.submit_close(call_id, stream, timeout, now)
+            }
+            CallInput::SignalWait { name, timeout } => {
+                self.submit_signal_wait(call_id, name, timeout, now)
+            }
             CallInput::ProcessRun {
                 command,
                 args,
@@ -423,20 +616,29 @@ impl RuntimeDriver for BetelgeuseDriver {
     fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
         self.tcp.advance(completed);
         self.storage.advance(completed);
+        self.dns.advance(now, completed);
+        self.tls.advance(now, completed);
         self.process.advance(completed);
+        self.harvest_signals(now, completed);
         self.harvest_timers(now, completed);
     }
 
     fn has_pending(&self) -> bool {
         self.tcp.has_pending()
             || self.storage.has_pending()
+            || self.dns.has_pending()
+            || self.tls.has_pending()
             || self.process.has_pending()
+            || self.signals.iter().any(|entry| !entry.cancelled)
             || !self.timers.is_empty()
     }
 
     fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
         self.timers.clear();
+        self.signals.clear();
         self.storage.cancel_pending();
+        self.dns.cancel_pending();
+        self.tls.cancel_pending();
         self.process.cancel_pending();
         self.tcp.cancel_pending()
     }
@@ -444,8 +646,13 @@ impl RuntimeDriver for BetelgeuseDriver {
     fn cancel(&mut self, call_id: CallId) -> bool {
         let before = self.timers.len();
         self.timers.retain(|entry| entry.call_id != call_id);
+        let signal_before = self.signals.len();
+        self.signals.retain(|entry| entry.call_id != call_id);
         before != self.timers.len()
+            || signal_before != self.signals.len()
             || self.storage.cancel(call_id)
+            || self.dns.cancel(call_id)
+            || self.tls.cancel(call_id)
             || self.process.cancel(call_id)
             || self.tcp.cancel(call_id)
     }
@@ -454,9 +661,78 @@ impl RuntimeDriver for BetelgeuseDriver {
     fn io_pending_count(&self) -> usize {
         self.tcp.pending_count()
     }
+
+    fn notify_signal(&mut self, name: &str, completed: &mut Vec<DriverCompletion>) {
+        let mut ready = Vec::new();
+        let mut pending = Vec::new();
+        for entry in self.signals.drain(..) {
+            if !entry.cancelled && entry.name == name {
+                ready.push(entry);
+            } else {
+                pending.push(entry);
+            }
+        }
+        self.signals = pending;
+        for entry in ready {
+            completed.push(DriverCompletion {
+                call_id: entry.call_id,
+                result: CallOutput::SignalReceived { name: entry.name },
+            });
+        }
+    }
 }
 
 impl BetelgeuseDriver {
+    fn submit_signal_wait(
+        &mut self,
+        call_id: CallId,
+        name: String,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        if timeout.is_zero() {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Timeout),
+            });
+        }
+        if self.signals.iter().filter(|entry| !entry.cancelled).count() >= DEFAULT_SIGNAL_CAPACITY {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::SignalFull),
+            });
+        }
+        self.signals.push(SignalWaitEntry {
+            call_id,
+            name,
+            deadline: now + timeout,
+            cancelled: false,
+        });
+        None
+    }
+
+    fn harvest_signals(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        let mut ready = Vec::new();
+        let mut pending = Vec::new();
+        for entry in self.signals.drain(..) {
+            if entry.cancelled {
+                continue;
+            }
+            if entry.deadline <= now {
+                ready.push(entry);
+            } else {
+                pending.push(entry);
+            }
+        }
+        self.signals = pending;
+        for entry in ready {
+            completed.push(DriverCompletion {
+                call_id: entry.call_id,
+                result: CallOutput::Failed(CallError::Timeout),
+            });
+        }
+    }
+
     fn harvest_timers(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
         while let Some(index) = self
             .timers
@@ -526,6 +802,145 @@ impl StorageLane {
 }
 
 impl Drop for StorageLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+impl DnsLane {
+    fn new(capacity: usize) -> Self {
+        Self::Worker(DnsWorkerLane::new(capacity, Arc::new(default_dns_resolver)))
+    }
+
+    fn submit(
+        &mut self,
+        call_id: CallId,
+        host: String,
+        port: u16,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => lane.submit(call_id, host, port, timeout, now),
+        }
+    }
+
+    fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        match self {
+            Self::Worker(lane) => lane.advance(now, completed),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        match self {
+            Self::Worker(lane) => lane.has_pending(),
+        }
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        match self {
+            Self::Worker(lane) => lane.cancel(call_id),
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        match self {
+            Self::Worker(lane) => lane.cancel_pending(),
+        }
+    }
+}
+
+impl Drop for DnsLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+impl TlsLane {
+    fn new(capacity: usize) -> Self {
+        Self::Worker(TlsWorkerLane::new(capacity))
+    }
+
+    fn submit_connect(
+        &mut self,
+        call_id: CallId,
+        addr: SocketAddr,
+        server_name: String,
+        root_certificates: Vec<Vec<u8>>,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => {
+                lane.submit_connect(call_id, addr, server_name, root_certificates, timeout, now)
+            }
+        }
+    }
+
+    fn submit_read(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        max_len: usize,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => lane.submit_read(call_id, stream, max_len, timeout, now),
+        }
+    }
+
+    fn submit_write(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        bytes: Vec<u8>,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => lane.submit_write(call_id, stream, bytes, timeout, now),
+        }
+    }
+
+    fn submit_close(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => lane.submit_close(call_id, stream, timeout, now),
+        }
+    }
+
+    fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        match self {
+            Self::Worker(lane) => lane.advance(now, completed),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        match self {
+            Self::Worker(lane) => lane.has_pending(),
+        }
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        match self {
+            Self::Worker(lane) => lane.cancel(call_id),
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        match self {
+            Self::Worker(lane) => lane.cancel_pending(),
+        }
+    }
+}
+
+impl Drop for TlsLane {
     fn drop(&mut self) {
         self.cancel_pending();
     }
@@ -661,6 +1076,508 @@ impl StorageWorkerLane {
 }
 
 impl Drop for StorageWorkerLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+impl DnsWorkerLane {
+    fn new(capacity: usize, resolver: DnsResolver) -> Self {
+        assert!(capacity > 0, "DNS lane capacity must be > 0");
+        let (sender, receiver) = sync_channel(capacity);
+        let (completion_sender, completions) = sync_channel(capacity.saturating_add(1));
+        let handle = thread::spawn(move || dns_worker_loop(receiver, completion_sender, resolver));
+        Self {
+            capacity,
+            sender: Some(sender),
+            completions,
+            handle: Some(handle),
+            pending: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
+        }
+    }
+
+    fn submit(
+        &mut self,
+        call_id: CallId,
+        host: String,
+        port: u16,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        if timeout.is_zero() {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Timeout),
+            });
+        }
+        let Some(sender) = &self.sender else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::DnsClosed),
+            });
+        };
+        if self.unresolved_pending_count() >= self.capacity {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::DnsFull),
+            });
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        match sender.try_send(DnsCommand {
+            call_id,
+            host,
+            port,
+            cancelled: Arc::clone(&cancelled),
+        }) {
+            Ok(()) => {
+                self.pending.push(DnsPending {
+                    call_id,
+                    deadline: now + timeout,
+                    cancelled,
+                    timed_out: false,
+                });
+                None
+            }
+            Err(MpscTrySendError::Full(command)) => Some(DriverCompletion {
+                call_id: command.call_id,
+                result: CallOutput::Failed(CallError::DnsFull),
+            }),
+            Err(MpscTrySendError::Disconnected(command)) => Some(DriverCompletion {
+                call_id: command.call_id,
+                result: CallOutput::Failed(CallError::DnsClosed),
+            }),
+        }
+    }
+
+    fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        for pending in &mut self.pending {
+            if !pending.timed_out
+                && !pending.cancelled.load(Ordering::Acquire)
+                && now >= pending.deadline
+            {
+                pending.timed_out = true;
+                pending.cancelled.store(true, Ordering::Release);
+                completed.push(DriverCompletion {
+                    call_id: pending.call_id,
+                    result: CallOutput::Failed(CallError::Timeout),
+                });
+            }
+        }
+
+        loop {
+            match self.completions.try_recv() {
+                Ok(completion) => self.finish_completion(completion, completed),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.sender = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn finish_completion(
+        &mut self,
+        completion: DnsCompletion,
+        completed: &mut Vec<DriverCompletion>,
+    ) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|entry| entry.call_id == completion.call_id)
+        else {
+            return;
+        };
+        let pending = self.pending.remove(index);
+        if pending.cancelled.load(Ordering::Acquire) || pending.timed_out {
+            return;
+        }
+        completed.push(DriverCompletion {
+            call_id: completion.call_id,
+            result: completion.result,
+        });
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| !entry.cancelled.load(Ordering::Acquire) && !entry.timed_out)
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.call_id == call_id && !entry.cancelled.load(Ordering::Acquire))
+        else {
+            return false;
+        };
+        pending.cancelled.store(true, Ordering::Release);
+        true
+    }
+
+    fn cancel_pending(&mut self) {
+        for pending in &mut self.pending {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.sender = None;
+        self.drain_completion_channel();
+        self.pending.clear();
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn drain_completion_channel(&mut self) {
+        while self.completions.try_recv().is_ok() {}
+    }
+
+    fn unresolved_pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+impl Drop for DnsWorkerLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+impl TlsWorkerLane {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "TLS lane capacity must be > 0");
+        let (sender, receiver) = sync_channel(capacity);
+        let (completion_sender, completions) = sync_channel(capacity.saturating_add(1));
+        let handle = thread::spawn(move || tls_worker_loop(receiver, completion_sender));
+        Self {
+            capacity,
+            sender: Some(sender),
+            completions,
+            handle: Some(handle),
+            pending: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
+            streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            next_stream_id: 1,
+        }
+    }
+
+    fn submit_connect(
+        &mut self,
+        call_id: CallId,
+        addr: SocketAddr,
+        server_name: String,
+        root_certificates: Vec<Vec<u8>>,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.submit_command(
+            call_id,
+            TlsPendingLane::Connect(call_id),
+            cancelled,
+            now,
+            TlsCommand::Connect {
+                call_id,
+                addr,
+                server_name,
+                root_certificates,
+                timeout,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
+
+    fn submit_close(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        let lane = TlsPendingLane::Stream(stream);
+        if self.lane_has_pending(lane) {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::ResourceBusy),
+            });
+        }
+        let Some(stream) = self.stream(stream) else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::InvalidResource),
+            });
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.submit_command(
+            call_id,
+            lane,
+            Arc::clone(&cancelled),
+            now,
+            TlsCommand::Close {
+                call_id,
+                stream,
+                timeout,
+                cancelled,
+            },
+        )
+    }
+
+    fn submit_read(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        max_len: usize,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        let lane = TlsPendingLane::Stream(stream);
+        if self.lane_has_pending(lane) {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::ResourceBusy),
+            });
+        }
+        let Some(stream) = self.stream(stream) else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::InvalidResource),
+            });
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.submit_command(
+            call_id,
+            lane,
+            Arc::clone(&cancelled),
+            now,
+            TlsCommand::Read {
+                call_id,
+                stream,
+                max_len,
+                timeout,
+                cancelled,
+            },
+        )
+    }
+
+    fn submit_write(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        bytes: Vec<u8>,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        let lane = TlsPendingLane::Stream(stream);
+        if self.lane_has_pending(lane) {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::ResourceBusy),
+            });
+        }
+        let Some(stream) = self.stream(stream) else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::InvalidResource),
+            });
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.submit_command(
+            call_id,
+            lane,
+            Arc::clone(&cancelled),
+            now,
+            TlsCommand::Write {
+                call_id,
+                stream,
+                bytes,
+                timeout,
+                cancelled,
+            },
+        )
+    }
+
+    fn submit_command(
+        &mut self,
+        call_id: CallId,
+        lane: TlsPendingLane,
+        cancelled: Arc<AtomicBool>,
+        now: Instant,
+        mut command: TlsCommand,
+    ) -> Option<DriverCompletion> {
+        let timeout = command.timeout();
+        if command.timeout().is_zero() {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Timeout),
+            });
+        }
+        let Some(sender) = &self.sender else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::TlsClosed),
+            });
+        };
+        if self.pending.len() >= self.capacity {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::TlsFull),
+            });
+        }
+        command.set_cancelled(Arc::clone(&cancelled));
+        match sender.try_send(command) {
+            Ok(()) => {
+                self.pending.push(TlsPending {
+                    call_id,
+                    lane,
+                    deadline: now + timeout,
+                    cancelled,
+                    timed_out: false,
+                });
+                None
+            }
+            Err(MpscTrySendError::Full(command)) => Some(DriverCompletion {
+                call_id: command.call_id(),
+                result: CallOutput::Failed(CallError::TlsFull),
+            }),
+            Err(MpscTrySendError::Disconnected(command)) => Some(DriverCompletion {
+                call_id: command.call_id(),
+                result: CallOutput::Failed(CallError::TlsClosed),
+            }),
+        }
+    }
+
+    fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        for pending in &mut self.pending {
+            if !pending.timed_out
+                && !pending.cancelled.load(Ordering::Acquire)
+                && now >= pending.deadline
+            {
+                pending.timed_out = true;
+                pending.cancelled.store(true, Ordering::Release);
+                completed.push(DriverCompletion {
+                    call_id: pending.call_id,
+                    result: CallOutput::Failed(CallError::Timeout),
+                });
+            }
+        }
+
+        loop {
+            match self.completions.try_recv() {
+                Ok(completion) => self.finish_completion(completion, completed),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.sender = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn finish_completion(
+        &mut self,
+        completion: TlsCompletion,
+        completed: &mut Vec<DriverCompletion>,
+    ) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|entry| entry.call_id == completion.call_id)
+        else {
+            return;
+        };
+        let pending = self.pending.remove(index);
+        if pending.cancelled.load(Ordering::Acquire) || pending.timed_out {
+            return;
+        }
+        let result = match completion.result {
+            TlsCompletionResult::Connected(result) => match *result {
+                Ok(stream) => {
+                    let id = TlsStreamId::new(self.next_stream_id);
+                    self.next_stream_id += 1;
+                    self.streams.push(TlsStreamEntry {
+                        id,
+                        stream: Arc::new(Mutex::new(stream)),
+                    });
+                    CallOutput::TlsConnected { stream: id }
+                }
+                Err(error) => CallOutput::Failed(error),
+            },
+            TlsCompletionResult::Output(output) => {
+                if matches!(output, CallOutput::TlsClosed)
+                    && let TlsPendingLane::Stream(stream) = pending.lane
+                {
+                    self.streams.retain(|entry| entry.id != stream);
+                }
+                output
+            }
+        };
+        completed.push(DriverCompletion {
+            call_id: completion.call_id,
+            result,
+        });
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| !entry.cancelled.load(Ordering::Acquire) && !entry.timed_out)
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.call_id == call_id && !entry.cancelled.load(Ordering::Acquire))
+        else {
+            return false;
+        };
+        pending.cancelled.store(true, Ordering::Release);
+        true
+    }
+
+    fn cancel_pending(&mut self) {
+        for pending in &mut self.pending {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.sender = None;
+        self.drain_completion_channel();
+        self.pending.clear();
+        self.streams.clear();
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn drain_completion_channel(&mut self) {
+        while self.completions.try_recv().is_ok() {}
+    }
+
+    fn stream(&self, stream: TlsStreamId) -> Option<Arc<Mutex<TlsClientStream>>> {
+        self.streams
+            .iter()
+            .find(|entry| entry.id == stream)
+            .map(|entry| Arc::clone(&entry.stream))
+    }
+
+    fn lane_has_pending(&self, lane: TlsPendingLane) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| entry.lane == lane && !entry.cancelled.load(Ordering::Acquire))
+    }
+}
+
+impl Drop for TlsWorkerLane {
     fn drop(&mut self) {
         self.cancel_pending();
     }
@@ -858,6 +1775,229 @@ fn storage_worker_loop(
     }
 }
 
+fn dns_worker_loop(
+    receiver: Receiver<DnsCommand>,
+    completions: SyncSender<DnsCompletion>,
+    resolver: DnsResolver,
+) {
+    while let Ok(command) = receiver.recv() {
+        let result = if command.cancelled.load(Ordering::Acquire) {
+            CallOutput::Failed(CallError::Timeout)
+        } else {
+            resolver(&command.host, command.port)
+        };
+        if completions
+            .send(DnsCompletion {
+                call_id: command.call_id,
+                result,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn tls_worker_loop(receiver: Receiver<TlsCommand>, completions: SyncSender<TlsCompletion>) {
+    while let Ok(command) = receiver.recv() {
+        let call_id = command.call_id();
+        let result = execute_tls_command(command);
+        if completions.send(TlsCompletion { call_id, result }).is_err() {
+            break;
+        }
+    }
+}
+
+fn execute_tls_command(command: TlsCommand) -> TlsCompletionResult {
+    match command {
+        TlsCommand::Connect {
+            addr,
+            server_name,
+            root_certificates,
+            timeout,
+            cancelled,
+            ..
+        } => TlsCompletionResult::Connected(Box::new(connect_tls(
+            addr,
+            &server_name,
+            root_certificates,
+            timeout,
+            &cancelled,
+        ))),
+        TlsCommand::Read {
+            stream,
+            max_len,
+            timeout,
+            cancelled,
+            ..
+        } => TlsCompletionResult::Output(read_tls(stream, max_len, timeout, &cancelled)),
+        TlsCommand::Write {
+            stream,
+            bytes,
+            timeout,
+            cancelled,
+            ..
+        } => TlsCompletionResult::Output(write_tls(stream, &bytes, timeout, &cancelled)),
+        TlsCommand::Close {
+            stream,
+            timeout,
+            cancelled,
+            ..
+        } => TlsCompletionResult::Output(close_tls(stream, timeout, &cancelled)),
+    }
+}
+
+fn connect_tls(
+    addr: SocketAddr,
+    server_name: &str,
+    root_certificates: Vec<Vec<u8>>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<TlsClientStream, CallError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CallError::Timeout);
+    }
+    if timeout.is_zero() {
+        return Err(CallError::Timeout);
+    }
+    let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|_| CallError::Io)?;
+    let _ = tcp.set_read_timeout(Some(timeout));
+    let _ = tcp.set_write_timeout(Some(timeout));
+
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in root_certificates {
+        roots
+            .add(rustls::pki_types::CertificateDer::from(certificate))
+            .map_err(|_| CallError::TlsCertificate)?;
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|_| CallError::TlsName)?;
+    let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|_| CallError::TlsName)?;
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    while stream.conn.is_handshaking() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CallError::Timeout);
+        }
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|_| CallError::TlsHandshake)?;
+    }
+    Ok(stream)
+}
+
+fn read_tls(
+    stream: Arc<Mutex<TlsClientStream>>,
+    max_len: usize,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> CallOutput {
+    if cancelled.load(Ordering::Acquire) {
+        return CallOutput::Failed(CallError::Timeout);
+    }
+    let mut guard = match stream.lock() {
+        Ok(guard) => guard,
+        Err(_) => return CallOutput::Failed(CallError::TlsClosed),
+    };
+    let _ = guard.sock.set_read_timeout(Some(timeout));
+    let mut buffer = vec![0; max_len];
+    match guard.read(&mut buffer) {
+        Ok(count) => {
+            buffer.truncate(count);
+            CallOutput::TlsRead { bytes: buffer }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+            ) =>
+        {
+            CallOutput::Failed(CallError::Timeout)
+        }
+        Err(_) => CallOutput::Failed(CallError::Io),
+    }
+}
+
+fn write_tls(
+    stream: Arc<Mutex<TlsClientStream>>,
+    bytes: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> CallOutput {
+    if cancelled.load(Ordering::Acquire) {
+        return CallOutput::Failed(CallError::Timeout);
+    }
+    let mut guard = match stream.lock() {
+        Ok(guard) => guard,
+        Err(_) => return CallOutput::Failed(CallError::TlsClosed),
+    };
+    let _ = guard.sock.set_write_timeout(Some(timeout));
+    match guard.write(bytes) {
+        Ok(count) => {
+            if guard.flush().is_err() {
+                return CallOutput::Failed(CallError::Io);
+            }
+            CallOutput::TlsWrote { count }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+            ) =>
+        {
+            CallOutput::Failed(CallError::Timeout)
+        }
+        Err(_) => CallOutput::Failed(CallError::Io),
+    }
+}
+
+fn close_tls(
+    stream: Arc<Mutex<TlsClientStream>>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> CallOutput {
+    if cancelled.load(Ordering::Acquire) {
+        return CallOutput::Failed(CallError::Timeout);
+    }
+    let mut guard = match stream.lock() {
+        Ok(guard) => guard,
+        Err(_) => return CallOutput::Failed(CallError::TlsClosed),
+    };
+    let _ = guard.sock.set_write_timeout(Some(timeout));
+    guard.conn.send_close_notify();
+    match guard.flush() {
+        Ok(()) => CallOutput::TlsClosed,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+            ) =>
+        {
+            CallOutput::Failed(CallError::Timeout)
+        }
+        Err(_) => CallOutput::Failed(CallError::Io),
+    }
+}
+
+fn default_dns_resolver(host: &str, port: u16) -> CallOutput {
+    match (host, port).to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<SocketAddr> = addrs.collect();
+            if addrs.is_empty() {
+                CallOutput::Failed(CallError::Io)
+            } else {
+                CallOutput::DnsResolved { addrs }
+            }
+        }
+        Err(_) => CallOutput::Failed(CallError::Io),
+    }
+}
+
 fn execute_storage_job(job: StorageJob) -> CallOutput {
     match job {
         StorageJob::SnapshotCommit {
@@ -884,6 +2024,23 @@ fn execute_storage_job(job: StorageJob) -> CallOutput {
             Ok(replay) => CallOutput::JournalReplayed { replay },
             Err(reason) => CallOutput::Failed(reason),
         },
+        StorageJob::PathMetadata { path } => path_metadata_output(&path),
+        StorageJob::RenameReplace { from, to } => rename_replace_output(&from, &to),
+        StorageJob::RemoveFile { path } => match std::fs::remove_file(&path) {
+            Ok(()) => CallOutput::FileRemoved,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                CallOutput::Failed(CallError::NotFound)
+            }
+            Err(_) => CallOutput::Failed(CallError::Io),
+        },
+        StorageJob::ReadDir { path } => read_dir_output(&path),
+        StorageJob::SyncParent { path } => {
+            let parent = path_parent_or_current(&path);
+            match crate::persistence::sync_parent_directory(parent) {
+                Ok(()) => CallOutput::ParentSynced,
+                Err(error) => CallOutput::Failed(error),
+            }
+        }
         #[cfg(test)]
         StorageJob::Park { started, release } => {
             let _ = started.send(());
@@ -891,6 +2048,68 @@ fn execute_storage_job(job: StorageJob) -> CallOutput {
             CallOutput::DirectoryCreated
         }
     }
+}
+
+fn path_metadata_output(path: &std::path::Path) -> CallOutput {
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let kind = if metadata.is_file() {
+                PathKind::File
+            } else if metadata.is_dir() {
+                PathKind::Directory
+            } else {
+                PathKind::Other
+            };
+            let len = matches!(kind, PathKind::File).then_some(metadata.len());
+            CallOutput::PathMetadata {
+                metadata: PathMetadata { kind, len },
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => CallOutput::PathMetadata {
+            metadata: PathMetadata::missing(),
+        },
+        Err(_) => CallOutput::Failed(CallError::Io),
+    }
+}
+
+fn rename_replace_output(from: &std::path::Path, to: &std::path::Path) -> CallOutput {
+    #[cfg(not(unix))]
+    if to.exists() {
+        return CallOutput::Failed(CallError::Unsupported);
+    }
+
+    match std::fs::rename(from, to) {
+        Ok(()) => CallOutput::PathRenamed,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            CallOutput::Failed(CallError::NotFound)
+        }
+        Err(_) => CallOutput::Failed(CallError::Io),
+    }
+}
+
+fn read_dir_output(path: &std::path::Path) -> CallOutput {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return CallOutput::Failed(CallError::NotFound);
+        }
+        Err(_) => return CallOutput::Failed(CallError::Io),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return CallOutput::Failed(CallError::Io);
+        };
+        paths.push(entry.path());
+    }
+    paths.sort();
+    CallOutput::DirectoryRead { entries: paths }
+}
+
+fn path_parent_or_current(path: &std::path::Path) -> &std::path::Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
 }
 
 fn process_worker_loop(
@@ -950,6 +2169,34 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
         }
     };
 
+    process_exited(status, stdout, stderr)
+}
+
+fn kill_and_reap(
+    mut child: std::process::Child,
+    stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
+    stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
+    fallback: CallError,
+) -> CallOutput {
+    if child.kill().is_err() {
+        return match child.try_wait() {
+            Ok(Some(status)) => process_exited(status, stdout, stderr),
+            Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
+        };
+    }
+    if child.wait().is_err() {
+        return CallOutput::Failed(CallError::KillUncertain);
+    }
+    let _ = join_drain(stdout);
+    let _ = join_drain(stderr);
+    CallOutput::Failed(fallback)
+}
+
+fn process_exited(
+    status: std::process::ExitStatus,
+    stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
+    stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
+) -> CallOutput {
     let (stdout, stdout_truncated) = join_drain(stdout);
     let (stderr, stderr_truncated) = join_drain(stderr);
     CallOutput::ProcessExited {
@@ -961,23 +2208,6 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
         stdout_truncated,
         stderr_truncated,
     }
-}
-
-fn kill_and_reap(
-    mut child: std::process::Child,
-    stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
-    stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
-    fallback: CallError,
-) -> CallOutput {
-    if child.kill().is_err() {
-        return CallOutput::Failed(CallError::KillUncertain);
-    }
-    if child.wait().is_err() {
-        return CallOutput::Failed(CallError::KillUncertain);
-    }
-    let _ = join_drain(stdout);
-    let _ = join_drain(stderr);
-    CallOutput::Failed(fallback)
 }
 
 fn spawn_drain_limited<R>(mut reader: R, limit: usize) -> JoinHandle<(Vec<u8>, bool)>
@@ -1068,7 +2298,26 @@ impl BetelgeuseTcp {
                 call_id,
                 result: CallOutput::Failed(CallError::Unsupported),
             }),
+            CallInput::SignalWait { .. } => Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Unsupported),
+            }),
             CallInput::ProcessRun { .. } => Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Unsupported),
+            }),
+            CallInput::TlsConnect { .. }
+            | CallInput::TlsRead { .. }
+            | CallInput::TlsWrite { .. }
+            | CallInput::TlsClose { .. } => Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Unsupported),
+            }),
+            CallInput::PathMetadata { .. }
+            | CallInput::RenameReplace { .. }
+            | CallInput::RemoveFile { .. }
+            | CallInput::ReadDir { .. }
+            | CallInput::SyncParent { .. } => Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::Unsupported),
             }),
@@ -1886,6 +3135,43 @@ impl PendingKind {
     }
 }
 
+impl TlsCommand {
+    fn call_id(&self) -> CallId {
+        match self {
+            Self::Connect { call_id, .. }
+            | Self::Read { call_id, .. }
+            | Self::Write { call_id, .. }
+            | Self::Close { call_id, .. } => *call_id,
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        match self {
+            Self::Connect { timeout, .. }
+            | Self::Read { timeout, .. }
+            | Self::Write { timeout, .. }
+            | Self::Close { timeout, .. } => *timeout,
+        }
+    }
+
+    fn set_cancelled(&mut self, cancelled: Arc<AtomicBool>) {
+        match self {
+            Self::Connect {
+                cancelled: slot, ..
+            }
+            | Self::Read {
+                cancelled: slot, ..
+            }
+            | Self::Write {
+                cancelled: slot, ..
+            }
+            | Self::Close {
+                cancelled: slot, ..
+            } => *slot = cancelled,
+        }
+    }
+}
+
 impl std::fmt::Debug for BetelgeuseDriver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -2002,6 +3288,311 @@ mod tests {
             thread::yield_now();
         }
         assert!(completed.is_empty());
+    }
+
+    #[test]
+    fn dns_lane_resolves_with_injected_resolver() {
+        let (done_tx, done_rx) = sync_channel(1);
+        let addr: SocketAddr = "127.0.0.1:4040".parse().expect("valid test address");
+        let mut lane = DnsWorkerLane::new(
+            1,
+            Arc::new(move |host, port| {
+                assert_eq!(host, "llama.test");
+                assert_eq!(port, 4040);
+                done_tx.send(()).expect("resolver completion observed");
+                CallOutput::DnsResolved { addrs: vec![addr] }
+            }),
+        );
+        let now = Instant::now();
+        assert!(
+            lane.submit(
+                CallId::new(1),
+                "llama.test".to_string(),
+                4040,
+                Duration::from_secs(1),
+                now,
+            )
+            .is_none()
+        );
+        done_rx.recv().expect("resolver ran");
+
+        let mut completed = Vec::new();
+        for _ in 0..64 {
+            lane.advance(now, &mut completed);
+            if !completed.is_empty() {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].call_id, CallId::new(1));
+        assert!(matches!(
+            &completed[0].result,
+            CallOutput::DnsResolved { addrs } if addrs == &vec![addr]
+        ));
+        assert!(!lane.has_pending());
+    }
+
+    #[test]
+    fn dns_lane_timeout_tombstones_and_keeps_capacity_until_late_completion() {
+        use std::sync::{Condvar, Mutex};
+
+        let started = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let started_for_resolver = Arc::clone(&started);
+        let release_for_resolver = Arc::clone(&release);
+        let finished_for_resolver = Arc::clone(&finished);
+        let mut lane = DnsWorkerLane::new(
+            1,
+            Arc::new(move |_, _| {
+                let (started_lock, started_cv) = &*started_for_resolver;
+                *started_lock.lock().expect("started lock") = true;
+                started_cv.notify_one();
+
+                let (release_lock, release_cv) = &*release_for_resolver;
+                let mut released = release_lock.lock().expect("release lock");
+                while !*released {
+                    released = release_cv.wait(released).expect("release wait");
+                }
+                let (finished_lock, finished_cv) = &*finished_for_resolver;
+                *finished_lock.lock().expect("finished lock") = true;
+                finished_cv.notify_one();
+                CallOutput::DnsResolved {
+                    addrs: vec!["127.0.0.1:55".parse().expect("valid test address")],
+                }
+            }),
+        );
+        let now = Instant::now();
+        assert!(
+            lane.submit(
+                CallId::new(1),
+                "slow.test".to_string(),
+                55,
+                Duration::from_millis(1),
+                now,
+            )
+            .is_none()
+        );
+
+        let (started_lock, started_cv) = &*started;
+        let mut started_guard = started_lock.lock().expect("started lock");
+        while !*started_guard {
+            started_guard = started_cv.wait(started_guard).expect("started wait");
+        }
+        drop(started_guard);
+
+        let mut completed = Vec::new();
+        lane.advance(now + Duration::from_millis(2), &mut completed);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].call_id, CallId::new(1));
+        assert!(matches!(
+            completed[0].result,
+            CallOutput::Failed(CallError::Timeout)
+        ));
+        assert!(!lane.has_pending());
+
+        let full = lane
+            .submit(
+                CallId::new(2),
+                "other.test".to_string(),
+                55,
+                Duration::from_secs(1),
+                now,
+            )
+            .expect("timed-out started work still occupies bounded DNS lane");
+        assert!(matches!(
+            full.result,
+            CallOutput::Failed(CallError::DnsFull)
+        ));
+
+        let (release_lock, release_cv) = &*release;
+        *release_lock.lock().expect("release lock") = true;
+        release_cv.notify_one();
+
+        let (finished_lock, finished_cv) = &*finished;
+        let mut finished_guard = finished_lock.lock().expect("finished lock");
+        while !*finished_guard {
+            finished_guard = finished_cv.wait(finished_guard).expect("finished wait");
+        }
+        drop(finished_guard);
+
+        let mut late = Vec::new();
+        for _ in 0..1024 {
+            lane.advance(now + Duration::from_millis(3), &mut late);
+            if lane.unresolved_pending_count() == 0 {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(late.is_empty());
+        assert_eq!(lane.unresolved_pending_count(), 0);
+    }
+
+    #[test]
+    fn tls_lane_connects_writes_reads_and_closes_against_local_rustls_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate local cert");
+        let cert_der = certified.cert.der().to_vec();
+        let key_der = certified.key_pair.serialize_der();
+        let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
+        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+        );
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .expect("server config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept tls client");
+            let connection =
+                rustls::ServerConnection::new(Arc::new(server_config)).expect("server conn");
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).expect("read request");
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        let mut lane = TlsWorkerLane::new(4);
+        assert!(
+            lane.submit_connect(
+                CallId::new(1),
+                addr,
+                "localhost".to_string(),
+                vec![cert_der],
+                Duration::from_secs(1),
+                Instant::now(),
+            )
+            .is_none()
+        );
+        let stream = wait_for_tls_completion(&mut lane, CallId::new(1), |output| match output {
+            CallOutput::TlsConnected { stream } => Some(stream),
+            other => panic!("unexpected TLS connect output: {other:?}"),
+        });
+
+        assert!(
+            lane.submit_write(
+                CallId::new(2),
+                stream,
+                b"ping".to_vec(),
+                Duration::from_secs(1),
+                Instant::now(),
+            )
+            .is_none()
+        );
+        let wrote = wait_for_tls_completion(&mut lane, CallId::new(2), |output| match output {
+            CallOutput::TlsWrote { count } => Some(count),
+            other => panic!("unexpected TLS write output: {other:?}"),
+        });
+        assert_eq!(wrote, 4);
+
+        assert!(
+            lane.submit_read(
+                CallId::new(3),
+                stream,
+                4,
+                Duration::from_secs(1),
+                Instant::now()
+            )
+            .is_none()
+        );
+        let read = wait_for_tls_completion(&mut lane, CallId::new(3), |output| match output {
+            CallOutput::TlsRead { bytes } => Some(bytes),
+            other => panic!("unexpected TLS read output: {other:?}"),
+        });
+        assert_eq!(read, b"pong");
+
+        assert!(
+            lane.submit_close(
+                CallId::new(4),
+                stream,
+                Duration::from_secs(1),
+                Instant::now()
+            )
+            .is_none()
+        );
+        wait_for_tls_completion(&mut lane, CallId::new(4), |output| match output {
+            CallOutput::TlsClosed => Some(()),
+            other => panic!("unexpected TLS close output: {other:?}"),
+        });
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn tls_lane_deadline_tombstones_queued_work_until_late_completion() {
+        let (command_sender, _command_receiver) = sync_channel(1);
+        let (completion_sender, completions) = sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        let mut lane = TlsWorkerLane {
+            capacity: 1,
+            sender: Some(command_sender),
+            completions,
+            handle: None,
+            pending: vec![TlsPending {
+                call_id: CallId::new(42),
+                lane: TlsPendingLane::Connect(CallId::new(42)),
+                deadline: now + Duration::from_millis(1),
+                cancelled: Arc::clone(&cancelled),
+                timed_out: false,
+            }],
+            streams: Vec::new(),
+            next_stream_id: 1,
+        };
+
+        let mut completed = Vec::new();
+        lane.advance(now + Duration::from_millis(2), &mut completed);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].call_id, CallId::new(42));
+        assert!(matches!(
+            completed[0].result,
+            CallOutput::Failed(CallError::Timeout)
+        ));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!lane.has_pending());
+        assert_eq!(lane.pending.len(), 1);
+
+        completion_sender
+            .send(TlsCompletion {
+                call_id: CallId::new(42),
+                result: TlsCompletionResult::Output(CallOutput::TlsClosed),
+            })
+            .expect("send late TLS completion");
+        completed.clear();
+        lane.advance(now + Duration::from_millis(3), &mut completed);
+        assert!(completed.is_empty());
+        assert!(lane.pending.is_empty());
+    }
+
+    fn wait_for_tls_completion<T>(
+        lane: &mut TlsWorkerLane,
+        call_id: CallId,
+        map: impl Fn(CallOutput) -> Option<T>,
+    ) -> T {
+        let mut completed = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            lane.advance(Instant::now(), &mut completed);
+            if let Some(index) = completed
+                .iter()
+                .position(|completion| completion.call_id == call_id)
+            {
+                let completion = completed.remove(index);
+                return map(completion.result).expect("mapped TLS completion");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("TLS completion {call_id:?} did not arrive");
     }
 
     #[test]

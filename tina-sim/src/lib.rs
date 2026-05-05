@@ -57,9 +57,10 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
-    CallReplyRejectedReason, EffectKind, ListenerId, PersistenceTraceInfo, ProcessStatus,
-    RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent, RuntimeEventKind,
-    SendOutcome, SendRejectedReason, SupervisionRejectedReason, UdpSocketId,
+    CallReplyRejectedReason, EffectKind, ListenerId, PathKind, PathMetadata, PersistenceTraceInfo,
+    ProcessStatus, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
+    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason, TlsStreamId,
+    UdpSocketId,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -81,6 +82,12 @@ pub struct SimulatorConfig {
 
     /// Scripted DNS configuration for this run.
     pub dns: ScriptedDnsConfig,
+
+    /// Scripted TLS configuration for this run.
+    pub tls: ScriptedTlsConfig,
+
+    /// Scripted signal configuration for this run.
+    pub signal: ScriptedSignalConfig,
 
     /// Scripted process configuration for this run.
     pub process: ScriptedProcessConfig,
@@ -376,6 +383,116 @@ pub enum ScriptedDnsResult {
     Timeout,
 }
 
+/// Scripted TLS configuration for one simulator run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedTlsConfig {
+    /// Maximum number of async TLS completions that may be pending.
+    pub pending_completion_capacity: usize,
+
+    /// TLS connect scripts.
+    pub connects: Vec<ScriptedTlsConnectConfig>,
+}
+
+/// Scripted TLS connect configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedTlsConnectConfig {
+    /// Remote address.
+    pub addr: SocketAddr,
+
+    /// Server name.
+    pub server_name: String,
+
+    /// First simulator step on which the handshake may complete.
+    pub complete_after_step: u64,
+
+    /// Scripted connect outcome.
+    pub result: ScriptedTlsConnectResult,
+}
+
+/// Scripted TLS connect outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedTlsConnectResult {
+    /// Handshake succeeds and creates a logical TLS stream.
+    Connected {
+        /// Logical read outcomes for later `TlsRead` calls.
+        reads: Vec<ScriptedTlsReadResult>,
+        /// Logical write outcomes for later `TlsWrite` calls.
+        writes: Vec<ScriptedTlsWriteResult>,
+    },
+
+    /// Handshake fails as a normal I/O error.
+    Failed,
+
+    /// Certificate validation fails.
+    Certificate,
+
+    /// Server name parsing/validation fails.
+    Name,
+
+    /// Handshake exceeds its deadline.
+    Timeout,
+}
+
+/// Scripted TLS read outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedTlsReadResult {
+    /// Read returns logical decrypted bytes.
+    Bytes(Vec<u8>),
+    /// Read observes peer close.
+    Eof,
+    /// Read fails as I/O.
+    Failed,
+    /// Read exceeds its deadline.
+    Timeout,
+}
+
+/// Scripted TLS write outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedTlsWriteResult {
+    /// Write accepts this many plaintext bytes.
+    Wrote(usize),
+    /// Write fails as I/O.
+    Failed,
+    /// Write exceeds its deadline.
+    Timeout,
+}
+
+/// Scripted signal configuration for one simulator run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedSignalConfig {
+    /// Maximum number of async signal completions that may be pending.
+    pub pending_completion_capacity: usize,
+
+    /// Signal events available to `SignalWait`.
+    pub events: Vec<ScriptedSignalEventConfig>,
+}
+
+/// Scripted signal event configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedSignalEventConfig {
+    /// Runtime-owned signal name.
+    pub name: String,
+
+    /// First simulator step on which this event may complete.
+    pub deliver_after_step: u64,
+
+    /// Scripted signal outcome.
+    pub result: ScriptedSignalResult,
+}
+
+/// Scripted signal wait outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedSignalResult {
+    /// Signal is delivered.
+    Received,
+
+    /// Signal wait fails as a normal I/O error.
+    Failed,
+
+    /// Signal wait exceeds its deadline.
+    Timeout,
+}
+
 /// Scripted process configuration for one simulator run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptedProcessConfig {
@@ -474,6 +591,24 @@ impl Default for ScriptedDnsConfig {
         Self {
             pending_completion_capacity: usize::MAX,
             lookups: Vec::new(),
+        }
+    }
+}
+
+impl Default for ScriptedTlsConfig {
+    fn default() -> Self {
+        Self {
+            pending_completion_capacity: usize::MAX,
+            connects: Vec::new(),
+        }
+    }
+}
+
+impl Default for ScriptedSignalConfig {
+    fn default() -> Self {
+        Self {
+            pending_completion_capacity: usize::MAX,
+            events: Vec::new(),
         }
     }
 }
@@ -1258,12 +1393,16 @@ enum TcpResourceKey {
     UdpSend(CallId),
     UdpRecv(UdpSocketId),
     Dns(CallId),
+    TlsConnect(CallId),
+    TlsStream(TlsStreamId),
+    Signal(CallId),
     Process(CallId),
     FileRead(tina_runtime::FileId),
     FileWrite(tina_runtime::FileId),
     FileFsync(tina_runtime::FileId),
     FileSize(tina_runtime::FileId),
     Mkdir(CallId),
+    PathOp(CallId),
 }
 
 impl TcpResourceKey {
@@ -1275,8 +1414,16 @@ impl TcpResourceKey {
         matches!(self, Self::Dns(_))
     }
 
+    fn is_tls(self) -> bool {
+        matches!(self, Self::TlsConnect(_) | Self::TlsStream(_))
+    }
+
     fn is_process(self) -> bool {
         matches!(self, Self::Process(_))
+    }
+
+    fn is_signal(self) -> bool {
+        matches!(self, Self::Signal(_))
     }
 }
 
@@ -1353,6 +1500,15 @@ struct UdpSocketState {
     future_datagrams: VecDeque<ScriptedUdpDatagramState>,
     ready_datagrams: VecDeque<ScriptedUdpDatagramState>,
     closed: bool,
+}
+
+#[derive(Debug)]
+struct TlsStreamState {
+    id: TlsStreamId,
+    reads: VecDeque<ScriptedTlsReadResult>,
+    writes: VecDeque<ScriptedTlsWriteResult>,
+    closed: bool,
+    pending_connect_call: Option<CallId>,
 }
 
 #[derive(Debug)]
@@ -1771,6 +1927,7 @@ where
     next_listener_id: u64,
     next_stream_id: u64,
     next_udp_socket_id: u64,
+    next_tls_stream_id: u64,
     next_file_id: u64,
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
@@ -1784,6 +1941,7 @@ where
     listeners: Vec<ListenerState>,
     streams: Vec<StreamState>,
     udp_sockets: Vec<UdpSocketState>,
+    tls_streams: Vec<TlsStreamState>,
     files: Vec<FileState>,
     file_storage: BTreeMap<PathBuf, Vec<u8>>,
     directories: Vec<PathBuf>,
@@ -1819,6 +1977,7 @@ where
             next_listener_id: 1,
             next_stream_id: 1,
             next_udp_socket_id: 1,
+            next_tls_stream_id: 1,
             next_file_id: 1,
             ids,
             trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
@@ -1832,6 +1991,7 @@ where
             listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             udp_sockets: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            tls_streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             files: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             file_storage: BTreeMap::new(),
             directories: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
@@ -2865,6 +3025,28 @@ where
                 port,
                 timeout,
             } => self.handle_dns_lookup(call_id, host, port, timeout),
+            CallInput::TlsConnect {
+                addr,
+                server_name,
+                root_certificates,
+                timeout,
+            } => self.handle_tls_connect(call_id, addr, server_name, root_certificates, timeout),
+            CallInput::TlsRead {
+                stream,
+                max_len,
+                timeout,
+            } => self.handle_tls_read(call_id, stream, max_len, timeout),
+            CallInput::TlsWrite {
+                stream,
+                bytes,
+                timeout,
+            } => self.handle_tls_write(call_id, stream, bytes, timeout),
+            CallInput::TlsClose { stream, timeout } => {
+                self.handle_tls_close(call_id, stream, timeout)
+            }
+            CallInput::SignalWait { name, timeout } => {
+                self.handle_signal_wait(call_id, name, timeout)
+            }
             CallInput::ProcessRun {
                 command,
                 args,
@@ -2887,6 +3069,11 @@ where
             CallInput::FileSize { file } => self.handle_file_size(call_id, file),
             CallInput::FileClose { file } => self.handle_file_close(call_id, file),
             CallInput::Mkdir { path, .. } => self.handle_mkdir(call_id, path),
+            CallInput::PathMetadata { path } => self.handle_path_metadata(call_id, path),
+            CallInput::RenameReplace { from, to } => self.handle_rename_replace(call_id, from, to),
+            CallInput::RemoveFile { path } => self.handle_remove_file(call_id, path),
+            CallInput::ReadDir { path } => self.handle_read_dir(call_id, path),
+            CallInput::SyncParent { path } => self.handle_sync_parent(call_id, path),
             CallInput::SnapshotCommit {
                 path,
                 bytes,
@@ -3496,6 +3683,257 @@ where
         );
     }
 
+    fn handle_tls_connect(
+        &mut self,
+        call_id: CallId,
+        addr: SocketAddr,
+        server_name: String,
+        _root_certificates: Vec<Vec<u8>>,
+        timeout: Duration,
+    ) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(script) = self
+            .config
+            .tls
+            .connects
+            .iter()
+            .find(|connect| connect.addr == addr && connect.server_name == server_name)
+            .cloned()
+        else {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Io),
+                self.step_ordinal + 1,
+            );
+            return;
+        };
+
+        if self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| completion.resource.is_tls())
+            .count()
+            >= self.config.tls.pending_completion_capacity
+        {
+            self.schedule_tls_completion(
+                call_id,
+                TcpResourceKey::TlsConnect(call_id),
+                self.step_ordinal + 1,
+                CallOutput::Failed(CallError::TlsFull),
+            );
+            return;
+        }
+
+        let result = match script.result {
+            ScriptedTlsConnectResult::Connected { reads, writes } => {
+                let stream = TlsStreamId::new(self.next_tls_stream_id);
+                self.next_tls_stream_id += 1;
+                self.tls_streams.push(TlsStreamState {
+                    id: stream,
+                    reads: VecDeque::from(reads),
+                    writes: VecDeque::from(writes),
+                    closed: false,
+                    pending_connect_call: Some(call_id),
+                });
+                CallOutput::TlsConnected { stream }
+            }
+            ScriptedTlsConnectResult::Failed => CallOutput::Failed(CallError::Io),
+            ScriptedTlsConnectResult::Certificate => CallOutput::Failed(CallError::TlsCertificate),
+            ScriptedTlsConnectResult::Name => CallOutput::Failed(CallError::TlsName),
+            ScriptedTlsConnectResult::Timeout => CallOutput::Failed(CallError::Timeout),
+        };
+        self.schedule_tls_completion(
+            call_id,
+            TcpResourceKey::TlsConnect(call_id),
+            script.complete_after_step.max(self.step_ordinal + 1),
+            result,
+        );
+    }
+
+    fn handle_tls_read(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        max_len: usize,
+        timeout: Duration,
+    ) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(stream_index) = self.tls_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.tls_streams[stream_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        if self.tls_streams[stream_index]
+            .pending_connect_call
+            .is_some()
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        let resource = TcpResourceKey::TlsStream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        let result = match self.tls_streams[stream_index].reads.pop_front() {
+            Some(ScriptedTlsReadResult::Bytes(bytes)) => CallOutput::TlsRead {
+                bytes: bytes.into_iter().take(max_len).collect(),
+            },
+            Some(ScriptedTlsReadResult::Eof) => CallOutput::TlsRead { bytes: Vec::new() },
+            Some(ScriptedTlsReadResult::Failed) => CallOutput::Failed(CallError::Io),
+            Some(ScriptedTlsReadResult::Timeout) => CallOutput::Failed(CallError::Timeout),
+            None => CallOutput::Failed(CallError::Io),
+        };
+        self.schedule_tls_completion(call_id, resource, self.step_ordinal + 1, result);
+    }
+
+    fn handle_tls_write(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    ) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(stream_index) = self.tls_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.tls_streams[stream_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        if self.tls_streams[stream_index]
+            .pending_connect_call
+            .is_some()
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        let resource = TcpResourceKey::TlsStream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        let result = match self.tls_streams[stream_index].writes.pop_front() {
+            Some(ScriptedTlsWriteResult::Wrote(count)) => CallOutput::TlsWrote {
+                count: count.min(bytes.len()),
+            },
+            Some(ScriptedTlsWriteResult::Failed) => CallOutput::Failed(CallError::Io),
+            Some(ScriptedTlsWriteResult::Timeout) => CallOutput::Failed(CallError::Timeout),
+            None => CallOutput::Failed(CallError::Io),
+        };
+        self.schedule_tls_completion(call_id, resource, self.step_ordinal + 1, result);
+    }
+
+    fn handle_tls_close(&mut self, call_id: CallId, stream: TlsStreamId, timeout: Duration) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(stream_index) = self.tls_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.tls_streams[stream_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        if self.tls_streams[stream_index]
+            .pending_connect_call
+            .is_some()
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        let resource = TcpResourceKey::TlsStream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        self.tls_streams[stream_index].closed = true;
+        self.schedule_tls_completion(
+            call_id,
+            resource,
+            self.step_ordinal + 1,
+            CallOutput::TlsClosed,
+        );
+    }
+
+    fn handle_signal_wait(&mut self, call_id: CallId, name: String, timeout: Duration) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(script) = self
+            .config
+            .signal
+            .events
+            .iter()
+            .find(|event| event.name == name)
+            .cloned()
+        else {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Io),
+                self.step_ordinal + 1,
+            );
+            return;
+        };
+
+        let result = match script.result {
+            ScriptedSignalResult::Received => CallOutput::SignalReceived { name: script.name },
+            ScriptedSignalResult::Failed => CallOutput::Failed(CallError::Io),
+            ScriptedSignalResult::Timeout => CallOutput::Failed(CallError::Timeout),
+        };
+        self.schedule_signal_completion(
+            call_id,
+            TcpResourceKey::Signal(call_id),
+            script.deliver_after_step.max(self.step_ordinal + 1),
+            result,
+        );
+    }
+
     fn handle_process_run(
         &mut self,
         call_id: CallId,
@@ -3741,6 +4179,115 @@ where
         );
     }
 
+    fn handle_path_metadata(&mut self, call_id: CallId, path: PathBuf) {
+        let metadata = if let Some(bytes) = self.file_storage.get(&path) {
+            PathMetadata {
+                kind: PathKind::File,
+                len: Some(bytes.len() as u64),
+            }
+        } else if self.directories.iter().any(|directory| directory == &path) {
+            PathMetadata {
+                kind: PathKind::Directory,
+                len: None,
+            }
+        } else {
+            PathMetadata::missing()
+        };
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::PathOp(call_id),
+            CallOutput::PathMetadata { metadata },
+        );
+    }
+
+    fn handle_rename_replace(&mut self, call_id: CallId, from: PathBuf, to: PathBuf) {
+        if !self.parent_directory_exists(&to) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        if let Some(bytes) = self.file_storage.remove(&from) {
+            self.file_storage.insert(to, bytes);
+            self.schedule_tcp_completion(
+                call_id,
+                TcpResourceKey::PathOp(call_id),
+                CallOutput::PathRenamed,
+            );
+            return;
+        }
+        if let Some(index) = self
+            .directories
+            .iter()
+            .position(|directory| directory == &from)
+        {
+            if self.file_storage.contains_key(&to)
+                || self.directories.iter().any(|directory| directory == &to)
+            {
+                self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+                return;
+            }
+            self.directories[index] = to;
+            self.schedule_tcp_completion(
+                call_id,
+                TcpResourceKey::PathOp(call_id),
+                CallOutput::PathRenamed,
+            );
+            return;
+        }
+        self.deliver_completion(call_id, CallOutput::Failed(CallError::NotFound));
+    }
+
+    fn handle_remove_file(&mut self, call_id: CallId, path: PathBuf) {
+        if self.file_storage.remove(&path).is_some() {
+            self.schedule_tcp_completion(
+                call_id,
+                TcpResourceKey::PathOp(call_id),
+                CallOutput::FileRemoved,
+            );
+        } else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::NotFound));
+        }
+    }
+
+    fn handle_read_dir(&mut self, call_id: CallId, path: PathBuf) {
+        if !self.directories.iter().any(|directory| directory == &path)
+            && path != std::path::Path::new("/")
+            && path != std::path::Path::new("/tmp")
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::NotFound));
+            return;
+        }
+        let mut entries = Vec::new();
+        for file in self.file_storage.keys() {
+            if file.parent() == Some(path.as_path()) {
+                entries.push(file.clone());
+            }
+        }
+        for directory in &self.directories {
+            if directory.parent() == Some(path.as_path()) {
+                entries.push(directory.clone());
+            }
+        }
+        entries.sort();
+        entries.dedup();
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::PathOp(call_id),
+            CallOutput::DirectoryRead { entries },
+        );
+    }
+
+    fn handle_sync_parent(&mut self, call_id: CallId, path: PathBuf) {
+        if self.parent_directory_exists(&path) {
+            self.schedule_tcp_completion(
+                call_id,
+                TcpResourceKey::PathOp(call_id),
+                CallOutput::ParentSynced,
+            );
+        } else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::NotFound));
+        }
+    }
+
     fn handle_snapshot_commit(
         &mut self,
         call_id: CallId,
@@ -3893,12 +4440,16 @@ where
             | TcpResourceKey::StreamWrite(_)
             | TcpResourceKey::UdpSend(_)
             | TcpResourceKey::Dns(_)
+            | TcpResourceKey::TlsConnect(_)
+            | TcpResourceKey::TlsStream(_)
+            | TcpResourceKey::Signal(_)
             | TcpResourceKey::Process(_)
             | TcpResourceKey::FileRead(_)
             | TcpResourceKey::FileWrite(_)
             | TcpResourceKey::FileFsync(_)
             | TcpResourceKey::FileSize(_)
-            | TcpResourceKey::Mkdir(_) => false,
+            | TcpResourceKey::Mkdir(_)
+            | TcpResourceKey::PathOp(_) => false,
         };
         queued_accept
             || self
@@ -3922,6 +4473,10 @@ where
             .position(|state| state.id == file && !state.closed)
     }
 
+    fn tls_stream_index(&self, stream: TlsStreamId) -> Option<usize> {
+        self.tls_streams.iter().position(|state| state.id == stream)
+    }
+
     fn file_has_active_pending(&self, file: tina_runtime::FileId) -> bool {
         self.resource_has_active_pending(TcpResourceKey::FileRead(file))
             || self.resource_has_active_pending(TcpResourceKey::FileWrite(file))
@@ -3941,6 +4496,8 @@ where
             .filter(|completion| {
                 !completion.resource.is_udp()
                     && !completion.resource.is_dns()
+                    && !completion.resource.is_tls()
+                    && !completion.resource.is_signal()
                     && !completion.resource.is_process()
             })
             .count();
@@ -4018,6 +4575,78 @@ where
                 insertion_order,
                 resource,
                 result: CallOutput::Failed(CallError::DnsFull),
+            });
+            return;
+        }
+
+        let insertion_order = self.next_tcp_completion_ordinal;
+        self.next_tcp_completion_ordinal += 1;
+        self.pending_tcp_completions.push(PendingTcpCompletion {
+            call_id,
+            ready_at_step,
+            insertion_order,
+            resource,
+            result,
+        });
+    }
+
+    fn schedule_tls_completion(
+        &mut self,
+        call_id: CallId,
+        resource: TcpResourceKey,
+        ready_at_step: u64,
+        result: CallOutput,
+    ) {
+        let pending_tls = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| completion.resource.is_tls())
+            .count();
+        if pending_tls >= self.config.tls.pending_completion_capacity {
+            let insertion_order = self.next_tcp_completion_ordinal;
+            self.next_tcp_completion_ordinal += 1;
+            self.pending_tcp_completions.push(PendingTcpCompletion {
+                call_id,
+                ready_at_step: self.step_ordinal + 1,
+                insertion_order,
+                resource,
+                result: CallOutput::Failed(CallError::TlsFull),
+            });
+            return;
+        }
+
+        let insertion_order = self.next_tcp_completion_ordinal;
+        self.next_tcp_completion_ordinal += 1;
+        self.pending_tcp_completions.push(PendingTcpCompletion {
+            call_id,
+            ready_at_step,
+            insertion_order,
+            resource,
+            result,
+        });
+    }
+
+    fn schedule_signal_completion(
+        &mut self,
+        call_id: CallId,
+        resource: TcpResourceKey,
+        ready_at_step: u64,
+        result: CallOutput,
+    ) {
+        let pending_signal = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| completion.resource.is_signal())
+            .count();
+        if pending_signal >= self.config.signal.pending_completion_capacity {
+            let insertion_order = self.next_tcp_completion_ordinal;
+            self.next_tcp_completion_ordinal += 1;
+            self.pending_tcp_completions.push(PendingTcpCompletion {
+                call_id,
+                ready_at_step: self.step_ordinal + 1,
+                insertion_order,
+                resource,
+                result: CallOutput::Failed(CallError::SignalFull),
             });
             return;
         }
@@ -4304,6 +4933,15 @@ where
         let mut batch_offset = 0;
         let mut last_registration_index = None;
         for completion in ready {
+            if let CallOutput::TlsConnected { stream } = &completion.result {
+                if let Some(stream_index) = self.tls_stream_index(*stream) {
+                    if self.tls_streams[stream_index].pending_connect_call
+                        == Some(completion.call_id)
+                    {
+                        self.tls_streams[stream_index].pending_connect_call = None;
+                    }
+                }
+            }
             let registration_index = self.requester_registration_index(completion.call_id);
             if let Some(previous) = last_registration_index {
                 if registration_index <= previous {
@@ -5154,6 +5792,8 @@ where
             .retain(|pending| pending.call_id != call_id);
         self.pending_udp_recvs
             .retain(|pending| pending.call_id != call_id);
+        self.tls_streams
+            .retain(|stream| stream.pending_connect_call != Some(call_id));
         self.pending_tcp_completions
             .retain(|completion| completion.call_id != call_id);
     }
@@ -5225,6 +5865,11 @@ fn call_kind(request: &CallInput) -> CallKind {
         CallInput::UdpRecvFrom { .. } => CallKind::UdpRecvFrom,
         CallInput::UdpSocketClose { .. } => CallKind::UdpSocketClose,
         CallInput::DnsLookup { .. } => CallKind::DnsLookup,
+        CallInput::TlsConnect { .. } => CallKind::TlsConnect,
+        CallInput::TlsRead { .. } => CallKind::TlsRead,
+        CallInput::TlsWrite { .. } => CallKind::TlsWrite,
+        CallInput::TlsClose { .. } => CallKind::TlsClose,
+        CallInput::SignalWait { .. } => CallKind::SignalWait,
         CallInput::ProcessRun { .. } => CallKind::ProcessRun,
         CallInput::FileOpen { .. } => CallKind::FileOpen,
         CallInput::FileReadAt { .. } => CallKind::FileReadAt,
@@ -5233,6 +5878,11 @@ fn call_kind(request: &CallInput) -> CallKind {
         CallInput::FileSize { .. } => CallKind::FileSize,
         CallInput::FileClose { .. } => CallKind::FileClose,
         CallInput::Mkdir { .. } => CallKind::Mkdir,
+        CallInput::PathMetadata { .. } => CallKind::PathMetadata,
+        CallInput::RenameReplace { .. } => CallKind::RenameReplace,
+        CallInput::RemoveFile { .. } => CallKind::RemoveFile,
+        CallInput::ReadDir { .. } => CallKind::ReadDir,
+        CallInput::SyncParent { .. } => CallKind::SyncParent,
         CallInput::SnapshotCommit { .. } => CallKind::SnapshotCommit,
         CallInput::SnapshotLoad { .. } => CallKind::SnapshotLoad,
         CallInput::JournalAppend { .. } => CallKind::JournalAppend,

@@ -4,6 +4,58 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Jan de Quay
+
+- Added native bounded live DNS support behind `dns_lookup`, with visible
+  `DnsFull`, `DnsClosed`, timeout, queued cancellation, and tombstoned
+  already-started resolver work.
+- Added native rustls-backed TLS support behind `tls_connect`, `tls_read`,
+  `tls_write`, and `tls_close`, with `TlsStreamId`, one pending operation per
+  TLS stream, certificate/name/handshake/I/O/full/closed/timeout outcomes, and
+  simulator TLS scripts for semantic replay.
+- Added richer runtime-owned path operations: `path_metadata`,
+  `rename_replace`, `remove_file`, `read_dir`, and `sync_parent`, with typed
+  missing/unsupported/uncertain/I/O outcomes where platform behavior matters.
+- Added runtime-owned shutdown notification through the signal rail so a live
+  runtime can deliver `"shutdown"` to waiting isolates before the worker stops.
+  Raw OS signal capture remains a non-claim.
+- Updated `RuntimeCapabilities` so DNS, TLS, path/storage, process, UDP, and
+  signal rails report their actual supported/lane-backed/poll-backed/
+  completion-backed/tombstoned/drained shapes.
+- Expanded `LocalSystem` e2e coverage for DNS, TLS, runtime-owned file/path
+  operations, shutdown notification, and composed resource workloads.
+- Expanded simulator/DST resource histories over DNS, TLS, path, signal,
+  process, UDP, and TCP combinations, with replay and delete-shrink coverage.
+
+### Phase Funkishus
+
+- Added `RuntimeCapabilities` for runtime-owned resource families, including
+  support status, execution shape, cancellation shape, shutdown shape, lane
+  capacity, and durability support.
+- Added runtime-owned UDP helpers: `UdpSocketId`, `udp_bind`,
+  `udp_send_to`, `udp_recv_from`, and `udp_close_socket`.
+- Implemented live UDP in the Tina driver with nonblocking runtime-owned
+  sockets, visible truncation, same-resource receive lane ownership,
+  `ResourceBusy` close/duplicate-receive behavior, and requester-stop
+  cancellation.
+- Added scripted simulator UDP bind/send/recv/close, loopback, truncation,
+  receive capacity pressure, completion capacity pressure, and cancellation.
+- Added DNS call vocabulary and typed helpers while keeping live DNS honestly
+  unsupported on the current substrate. Added scripted simulator DNS success,
+  failure, timeout, and bounded-lane full behavior.
+- Added bounded local process execution with command-plus-args, null stdin,
+  bounded stdout/stderr capture, timeout kill/reap, lane full/closed outcomes,
+  and simulator parity for exit/failure/timeout/kill-uncertain paths.
+- Added signal wait call vocabulary with simulator-first signal injection,
+  timeout/failure/full/cancel behavior, and typed live `Unsupported` without
+  installing process-global handlers.
+- Kept TLS as an adapter-only capability; native TLS remains an explicit
+  non-claim.
+- Added a composed live proof where one `LocalSystem` service uses UDP,
+  process execution, and journal append before committing durable state.
+- Expanded DST over DNS/process/UDP/signal histories with replay, common trace
+  invariants, and deletion shrinking.
+
 ### Naming Polish Before Funkishus
 
 - Renamed the canonical live owner from `LocalApp` to `LocalSystem`, with

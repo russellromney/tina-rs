@@ -75,7 +75,7 @@ start from an honest baseline rather than from stale roadmap wording.
 | Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories and small generated dispatcher workloads. Trace replay proofs can reconstruct worker completions and restart outcomes from the runtime event model alone. `tina-sim` adds virtual time, replay records, seeded delays/reordering over timer-wake/local-send/TCP-completion behavior, checker failures, spawn/supervision replay, scripted TCP simulation, multi-shard replay under default and non-default seeded configs, and multi-shard checker failure replay. | Real substrate liveness faults remain future work; current explicit-step shard-liveness non-claims are sealed. |
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. Ruud Lubbers pins a narrow numerical runtime cost model for selected hot paths: multi-shard send, isolate call, timer, TCP read/write, batch, spawn/restart, trace pressure, live ingress, and high-cardinality idle stepping. Runtime and simulator now reuse per-step scratch and prebuild coordinator storage where tests prove the warmed path. | No broad runtime/simulator allocation-free claim is supported yet; boxed erasure, traces, replay records, completion slots, call translators, and user payloads may still allocate. |
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
-| Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time, TCP server/client operations, and local file operations through a Tina-owned driver boundary with native Betelgeuse and simulated Betelgeuse adapters, cancellation, shutdown, and same-resource lane ownership. | DNS, TLS, UDP, process, signal, broad network-server claims, and live-substrate liveness faults remain future work. |
+| Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time, TCP server/client operations, local file/path operations, local persistence, UDP, bounded DNS, native TLS, bounded process runs, and runtime shutdown notification through Tina-owned driver rails with cancellation, shutdown, trace, and same-resource lane ownership. `tina-sim` scripts TCP, file/path, persistence, UDP, DNS, TLS, process, and signal rails for deterministic replay/DST. Capability reports name lane-backed, poll-backed, completion-backed, tombstoned, drained, and unsupported shapes. | Raw OS signal capture, broad network-server claims, live-substrate liveness faults, remoting, clustering, and general Tower/Axum middleware inside Tina remain future work. |
 | Local persistence | `tina-runtime` exposes local snapshot/journal helpers with explicit append-before-apply semantics, snapshot `last_journal_index`, journal `record_index`, visible truncated/corrupt/commit-uncertain recovery outcomes, persistence trace events, and bounded live storage-lane admission for snapshot/journal work. `tina-sim` captures `DurableImage` path-to-bytes state for replay. | This is not a database, durable mailbox, durable work queue, or exactly-once system. Directory fsync and rename-commit support remain platform/backend scoped. Already-started local filesystem work cannot be preempted; a full nonblocking storage reactor remains future work. |
 
 ## Testing and proof strategy
@@ -163,6 +163,14 @@ and reviews live under `.intent/phases/`.
   queue-pressure reports, per-shard live lifecycle states, terminal topology
   snapshots, remote-queue pressure metrics, worker-failure visibility, and
   live-vs-simulator topology/failure DST with shrinking.
+- Funkishus: runtime capability reporting, live and simulated UDP, simulator
+  DNS with typed live unsupported, bounded live and simulated process runs,
+  simulator-first signal injection with typed live unsupported, adapter-only
+  TLS status, composed UDP/process/persistence proof, and resource-rail DST.
+- Jan de Quay: native bounded live DNS, native rustls-backed TLS over
+  `TlsStreamId`, richer runtime-owned path operations, runtime shutdown
+  notification, updated capability truth, LocalSystem DNS/TLS/file/signal e2e,
+  and expanded ResourceRail DST over DNS/TLS/path/signal/process/UDP.
 
 ## Near-term roadmap
 
@@ -171,8 +179,13 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Funkishus storage and I/O maturity** | Next rock for Timmerhus exclusions: nonblocking storage reactor decision, platform durability hardening, DNS/TLS/UDP/process/signal rails, richer resource cancellation, native driver adapter policy, and bridge/adapter policy without weakening Tina semantics. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
+
+Parallel-safe side work: CI matrix planning, formatting of existing
+performance reports, README wording that adds no new claims, external review
+prompts, and research notes for future remoting/clustering. Do not parallelize
+changes to driver semantics, call vocabulary, runtime capabilities, simulator
+resource semantics, or DST resource-history core.
 
 ## Later capability roadmap
 
@@ -217,10 +230,10 @@ These still need answers, but each now has an intended phase home.
    facts trace-observable. Sink/counter polish is a later observability phase,
    not a blocker for Jelle.
 3. **Runtime-owned I/O breadth.** Time, TCP server/client operations, local file
-   I/O, and local persistence are implemented. DNS/TLS/UDP/process/signal,
-   richer file/resource cancellation, and nonblocking storage maturity belong
-   to Funkishus unless Timmerhus proves one is an immediate topology/failure
-   prerequisite.
+   and path I/O, local persistence, UDP, bounded DNS, native TLS, bounded
+   process execution, and runtime shutdown notification are implemented on the
+   live local runtime. Raw OS signal capture, broader substrate liveness faults,
+   remoting, clustering, and middleware-inside-Tina remain future work.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
    transport is not claimed. Home: Jan Peter Balkenende remoting unless a local
    workload proves it must land earlier.

@@ -12,16 +12,20 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
-    FileOpenOptions, ListenerId, ProcessRunResult, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    StreamId, UdpSocketId, dns_lookup, process_run, udp_bind, udp_close_socket, udp_recv_from,
-    udp_send_to,
+    FileOpenOptions, ListenerId, PathKind, ProcessRunResult, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, StreamId, TlsStreamId, UdpSocketId, dns_lookup, file_close, file_create,
+    file_write, mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace,
+    signal_wait, sync_parent, tls_close, tls_connect, tls_read, tls_write, udp_bind,
+    udp_close_socket, udp_recv_from, udp_send_to,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact, ScriptedDnsConfig,
     ScriptedDnsLookupConfig, ScriptedDnsResult, ScriptedListenerConfig, ScriptedPeerConfig,
-    ScriptedProcessConfig, ScriptedProcessResult, ScriptedProcessRunConfig, ScriptedTcpConfig,
-    ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig, Simulator,
-    SimulatorConfig, TcpCompletionFaultMode,
+    ScriptedProcessConfig, ScriptedProcessResult, ScriptedProcessRunConfig, ScriptedSignalConfig,
+    ScriptedSignalEventConfig, ScriptedSignalResult, ScriptedTcpConfig, ScriptedTlsConfig,
+    ScriptedTlsConnectConfig, ScriptedTlsConnectResult, ScriptedTlsReadResult,
+    ScriptedTlsWriteResult, ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig,
+    Simulator, SimulatorConfig, TcpCompletionFaultMode,
     dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink},
 };
 use tina_supervisor::SupervisorConfig;
@@ -452,6 +456,231 @@ impl Isolate for DnsProbe {
                     .push(format!("dns-err:{error:?}"));
                 Effect::Noop
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TlsProbeMsg {
+    Connect {
+        addr: SocketAddr,
+        server_name: String,
+        timeout: Duration,
+    },
+    Connected(Result<TlsStreamId, CallError>),
+    Wrote(Result<usize, CallError>),
+    ReadDone(Result<Vec<u8>, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct TlsProbe {
+    observed: Rc<RefCell<Vec<String>>>,
+    stream: Option<TlsStreamId>,
+}
+
+impl Isolate for TlsProbe {
+    type Message = TlsProbeMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<TlsProbeMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            TlsProbeMsg::Connect {
+                addr,
+                server_name,
+                timeout,
+            } => tls_connect(addr, server_name, Vec::new(), timeout).reply(TlsProbeMsg::Connected),
+            TlsProbeMsg::Connected(Ok(stream)) => {
+                self.stream = Some(stream);
+                self.observed.borrow_mut().push("tls-connected".to_string());
+                tls_write(stream, b"ping".to_vec(), Duration::from_millis(50))
+                    .reply(TlsProbeMsg::Wrote)
+            }
+            TlsProbeMsg::Connected(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("tls-connect-err:{error:?}"));
+                Effect::Noop
+            }
+            TlsProbeMsg::Wrote(Ok(count)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("tls-wrote:{count}"));
+                let stream = self.stream.expect("TLS stream should be remembered");
+                tls_read(stream, 16, Duration::from_millis(50)).reply(TlsProbeMsg::ReadDone)
+            }
+            TlsProbeMsg::Wrote(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("tls-write-err:{error:?}"));
+                Effect::Noop
+            }
+            TlsProbeMsg::ReadDone(Ok(bytes)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("tls-read:{}", String::from_utf8_lossy(&bytes)));
+                let stream = self.stream.expect("TLS stream should be remembered");
+                tls_close(stream, Duration::from_millis(50)).reply(TlsProbeMsg::Closed)
+            }
+            TlsProbeMsg::ReadDone(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("tls-read-err:{error:?}"));
+                Effect::Noop
+            }
+            TlsProbeMsg::Closed(Ok(())) => {
+                self.observed.borrow_mut().push("tls-closed".to_string());
+                Effect::Noop
+            }
+            TlsProbeMsg::Closed(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("tls-close-err:{error:?}"));
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathProbeMsg {
+    Start {
+        dir: PathBuf,
+        path: PathBuf,
+        renamed: PathBuf,
+    },
+    DirectoryMade(Result<(), CallError>, PathBuf, PathBuf),
+    Opened(Result<FileId, CallError>, PathBuf, PathBuf),
+    Wrote(Result<usize, CallError>, FileId, PathBuf, PathBuf),
+    Closed(Result<(), CallError>, PathBuf, PathBuf),
+    Metadata(
+        Result<tina_runtime::PathMetadata, CallError>,
+        PathBuf,
+        PathBuf,
+    ),
+    Renamed(Result<(), CallError>, PathBuf, PathBuf),
+    Listed(Result<Vec<PathBuf>, CallError>, PathBuf),
+    ParentSynced(Result<(), CallError>, PathBuf),
+    Removed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct PathProbe {
+    observed: Rc<RefCell<Vec<String>>>,
+}
+
+impl Isolate for PathProbe {
+    type Message = PathProbeMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<PathProbeMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            PathProbeMsg::Start { dir, path, renamed } => mkdir(dir, 0o755)
+                .reply(move |result| PathProbeMsg::DirectoryMade(result, path, renamed)),
+            PathProbeMsg::DirectoryMade(Ok(()), path, renamed) => file_create(path.clone())
+                .reply(move |result| PathProbeMsg::Opened(result, path, renamed)),
+            PathProbeMsg::Opened(Ok(file), path, renamed) => file_write(file, b"hay".to_vec())
+                .reply(move |result| PathProbeMsg::Wrote(result, file, path, renamed)),
+            PathProbeMsg::Wrote(Ok(3), file, path, renamed) => {
+                file_close(file).reply(move |result| PathProbeMsg::Closed(result, path, renamed))
+            }
+            PathProbeMsg::Closed(Ok(()), path, renamed) => path_metadata(path.clone())
+                .reply(move |result| PathProbeMsg::Metadata(result, path, renamed)),
+            PathProbeMsg::Metadata(Ok(metadata), path, renamed)
+                if metadata.kind == PathKind::File && metadata.len == Some(3) =>
+            {
+                let listed = renamed.clone();
+                rename_replace(path, renamed.clone())
+                    .reply(move |result| PathProbeMsg::Renamed(result, listed, renamed))
+            }
+            PathProbeMsg::Renamed(Ok(()), listed, renamed) => {
+                let dir = listed
+                    .parent()
+                    .expect("renamed path has parent")
+                    .to_path_buf();
+                read_dir(dir).reply(move |result| PathProbeMsg::Listed(result, renamed))
+            }
+            PathProbeMsg::Listed(Ok(entries), renamed) if entries.contains(&renamed) => {
+                sync_parent(renamed.clone())
+                    .reply(move |result| PathProbeMsg::ParentSynced(result, renamed))
+            }
+            PathProbeMsg::ParentSynced(Ok(()), renamed) => {
+                remove_file(renamed).reply(PathProbeMsg::Removed)
+            }
+            PathProbeMsg::Removed(Ok(())) => {
+                self.observed.borrow_mut().push("path-ok".to_string());
+                Effect::Noop
+            }
+            PathProbeMsg::DirectoryMade(Err(error), _, _)
+            | PathProbeMsg::Opened(Err(error), _, _)
+            | PathProbeMsg::Wrote(Err(error), _, _, _)
+            | PathProbeMsg::Closed(Err(error), _, _)
+            | PathProbeMsg::Metadata(Err(error), _, _)
+            | PathProbeMsg::Renamed(Err(error), _, _)
+            | PathProbeMsg::Listed(Err(error), _)
+            | PathProbeMsg::ParentSynced(Err(error), _)
+            | PathProbeMsg::Removed(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("path-err:{error:?}"));
+                Effect::Noop
+            }
+            PathProbeMsg::Wrote(Ok(_), _, _, _)
+            | PathProbeMsg::Metadata(Ok(_), _, _)
+            | PathProbeMsg::Listed(Ok(_), _) => {
+                self.observed
+                    .borrow_mut()
+                    .push("path-err:UnexpectedResult".to_string());
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignalProbeMsg {
+    Wait { name: String, timeout: Duration },
+    Done(Result<String, CallError>),
+    Stop,
+}
+
+#[derive(Debug)]
+struct SignalProbe {
+    observed: Rc<RefCell<Vec<String>>>,
+}
+
+impl Isolate for SignalProbe {
+    type Message = SignalProbeMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<SignalProbeMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            SignalProbeMsg::Wait { name, timeout } => {
+                signal_wait(name, timeout).reply(SignalProbeMsg::Done)
+            }
+            SignalProbeMsg::Done(Ok(name)) => {
+                self.observed.borrow_mut().push(format!("signal:{name}"));
+                Effect::Noop
+            }
+            SignalProbeMsg::Done(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("signal-err:{error:?}"));
+                Effect::Noop
+            }
+            SignalProbeMsg::Stop => Effect::Stop,
         }
     }
 }
@@ -1395,6 +1624,64 @@ fn dns_sim_config() -> SimulatorConfig {
     }
 }
 
+fn tls_sim_config() -> SimulatorConfig {
+    SimulatorConfig {
+        tls: ScriptedTlsConfig {
+            pending_completion_capacity: 2,
+            connects: vec![
+                ScriptedTlsConnectConfig {
+                    addr: local_addr(48110),
+                    server_name: "llama.local".to_string(),
+                    complete_after_step: 3,
+                    result: ScriptedTlsConnectResult::Connected {
+                        reads: vec![ScriptedTlsReadResult::Bytes(b"pong".to_vec())],
+                        writes: vec![ScriptedTlsWriteResult::Wrote(4)],
+                    },
+                },
+                ScriptedTlsConnectConfig {
+                    addr: local_addr(48111),
+                    server_name: "badcert.local".to_string(),
+                    complete_after_step: 2,
+                    result: ScriptedTlsConnectResult::Certificate,
+                },
+                ScriptedTlsConnectConfig {
+                    addr: local_addr(48112),
+                    server_name: "slow.local".to_string(),
+                    complete_after_step: 8,
+                    result: ScriptedTlsConnectResult::Timeout,
+                },
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+fn signal_sim_config() -> SimulatorConfig {
+    SimulatorConfig {
+        signal: ScriptedSignalConfig {
+            pending_completion_capacity: 2,
+            events: vec![
+                ScriptedSignalEventConfig {
+                    name: "shutdown".to_string(),
+                    deliver_after_step: 3,
+                    result: ScriptedSignalResult::Received,
+                },
+                ScriptedSignalEventConfig {
+                    name: "broken".to_string(),
+                    deliver_after_step: 2,
+                    result: ScriptedSignalResult::Failed,
+                },
+                ScriptedSignalEventConfig {
+                    name: "slow".to_string(),
+                    deliver_after_step: 2,
+                    result: ScriptedSignalResult::Timeout,
+                },
+            ],
+        },
+        ..Default::default()
+    }
+}
+
 fn process_sim_config() -> SimulatorConfig {
     SimulatorConfig {
         process: ScriptedProcessConfig {
@@ -1596,6 +1883,11 @@ enum ResourceRailOp {
     DnsOk,
     DnsFail,
     DnsTimeout,
+    TlsOk,
+    TlsCert,
+    PathOps,
+    SignalOk,
+    SignalTimeout,
     ProcessOk,
     ProcessTimeout,
     UdpLoopback,
@@ -1606,6 +1898,11 @@ fn resource_rail_history(seed: u64) -> History<ResourceRailOp> {
         ResourceRailOp::DnsOk,
         ResourceRailOp::DnsFail,
         ResourceRailOp::DnsTimeout,
+        ResourceRailOp::TlsOk,
+        ResourceRailOp::TlsCert,
+        ResourceRailOp::PathOps,
+        ResourceRailOp::SignalOk,
+        ResourceRailOp::SignalTimeout,
         ResourceRailOp::ProcessOk,
         ResourceRailOp::ProcessTimeout,
         ResourceRailOp::UdpLoopback,
@@ -1664,6 +1961,41 @@ fn resource_rail_config(seed: u64) -> SimulatorConfig {
                 },
             ],
         },
+        tls: ScriptedTlsConfig {
+            pending_completion_capacity: 4,
+            connects: vec![
+                ScriptedTlsConnectConfig {
+                    addr: local_addr(48210),
+                    server_name: "ok.local".to_string(),
+                    complete_after_step: 2,
+                    result: ScriptedTlsConnectResult::Connected {
+                        reads: vec![ScriptedTlsReadResult::Bytes(b"pong".to_vec())],
+                        writes: vec![ScriptedTlsWriteResult::Wrote(4)],
+                    },
+                },
+                ScriptedTlsConnectConfig {
+                    addr: local_addr(48211),
+                    server_name: "cert.local".to_string(),
+                    complete_after_step: 2,
+                    result: ScriptedTlsConnectResult::Certificate,
+                },
+            ],
+        },
+        signal: ScriptedSignalConfig {
+            pending_completion_capacity: 4,
+            events: vec![
+                ScriptedSignalEventConfig {
+                    name: "ok".to_string(),
+                    deliver_after_step: 2,
+                    result: ScriptedSignalResult::Received,
+                },
+                ScriptedSignalEventConfig {
+                    name: "timeout".to_string(),
+                    deliver_after_step: 2,
+                    result: ScriptedSignalResult::Timeout,
+                },
+            ],
+        },
         udp: ScriptedUdpConfig {
             pending_completion_capacity: 4,
             sockets: vec![
@@ -1686,8 +2018,15 @@ fn run_resource_rail_history(
     let process = sim.register(ProcessProbe {
         observed: Rc::clone(&observed),
     });
+    let signal = sim.register(SignalProbe {
+        observed: Rc::clone(&observed),
+    });
+    let tls = sim.register(TlsProbe {
+        observed: Rc::clone(&observed),
+        stream: None,
+    });
 
-    for op in history.operations() {
+    for (index, op) in history.operations().iter().enumerate() {
         match op {
             ResourceRailOp::DnsOk => sim
                 .try_send(
@@ -1715,6 +2054,62 @@ fn run_resource_rail_history(
                     DnsProbeMsg::Lookup {
                         host: "timeout.local".to_string(),
                         port: 8080,
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::TlsOk => sim
+                .try_send(
+                    tls,
+                    TlsProbeMsg::Connect {
+                        addr: local_addr(48210),
+                        server_name: "ok.local".to_string(),
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::TlsCert => sim
+                .try_send(
+                    tls,
+                    TlsProbeMsg::Connect {
+                        addr: local_addr(48211),
+                        server_name: "cert.local".to_string(),
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::PathOps => {
+                let path_probe = sim.register(PathProbe {
+                    observed: Rc::clone(&observed),
+                });
+                let dir = PathBuf::from(format!(
+                    "/tmp/tina-resource-rail-{}-{index}",
+                    history.seed()
+                ));
+                sim.try_send(
+                    path_probe,
+                    PathProbeMsg::Start {
+                        path: dir.join("hay.txt"),
+                        renamed: dir.join("grain.txt"),
+                        dir,
+                    },
+                )
+                .unwrap();
+            }
+            ResourceRailOp::SignalOk => sim
+                .try_send(
+                    signal,
+                    SignalProbeMsg::Wait {
+                        name: "ok".to_string(),
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::SignalTimeout => sim
+                .try_send(
+                    signal,
+                    SignalProbeMsg::Wait {
+                        name: "timeout".to_string(),
                         timeout: Duration::from_millis(50),
                     },
                 )
@@ -1774,6 +2169,7 @@ fn dst_resource_rails_replay_and_delete_shrink_timeout_cases() {
         404,
         vec![
             ResourceRailOp::DnsOk,
+            ResourceRailOp::SignalOk,
             ResourceRailOp::ProcessOk,
             ResourceRailOp::UdpLoopback,
             ResourceRailOp::ProcessTimeout,
@@ -1950,6 +2346,358 @@ fn scripted_dns_timeout_zero_and_lane_full_are_visible() {
         observed.borrow(),
         sim.trace()
     );
+}
+
+#[test]
+fn scripted_tls_connect_read_write_close_and_replays() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, tls_sim_config());
+    let probe = sim.register(TlsProbe {
+        observed: Rc::clone(&observed),
+        stream: None,
+    });
+
+    sim.try_send(
+        probe,
+        TlsProbeMsg::Connect {
+            addr: local_addr(48110),
+            server_name: "llama.local".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        *observed.borrow(),
+        vec![
+            "tls-connected".to_string(),
+            "tls-wrote:4".to_string(),
+            "tls-read:pong".to_string(),
+            "tls-closed".to_string(),
+        ]
+    );
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TlsConnect), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TlsWrite), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TlsRead), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TlsClose), 1);
+
+    let first = sim.replay_artifact();
+    let mut replay = Simulator::new(TestShard, tls_sim_config());
+    let replay_probe = replay.register(TlsProbe {
+        observed: Rc::new(RefCell::new(Vec::new())),
+        stream: None,
+    });
+    replay
+        .try_send(
+            replay_probe,
+            TlsProbeMsg::Connect {
+                addr: local_addr(48110),
+                server_name: "llama.local".to_string(),
+                timeout: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+    replay.run_until_quiescent();
+    assert_eq!(
+        first.event_record(),
+        replay.replay_artifact().event_record()
+    );
+}
+
+#[test]
+fn scripted_tls_certificate_timeout_and_lane_full_are_visible() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            tls: ScriptedTlsConfig {
+                pending_completion_capacity: 1,
+                connects: vec![
+                    ScriptedTlsConnectConfig {
+                        addr: local_addr(48111),
+                        server_name: "badcert.local".to_string(),
+                        complete_after_step: 2,
+                        result: ScriptedTlsConnectResult::Certificate,
+                    },
+                    ScriptedTlsConnectConfig {
+                        addr: local_addr(48112),
+                        server_name: "slow.local".to_string(),
+                        complete_after_step: 8,
+                        result: ScriptedTlsConnectResult::Timeout,
+                    },
+                    ScriptedTlsConnectConfig {
+                        addr: local_addr(48113),
+                        server_name: "other.local".to_string(),
+                        complete_after_step: 8,
+                        result: ScriptedTlsConnectResult::Connected {
+                            reads: Vec::new(),
+                            writes: Vec::new(),
+                        },
+                    },
+                ],
+            },
+            ..Default::default()
+        },
+    );
+    let probe = sim.register(TlsProbe {
+        observed: Rc::clone(&observed),
+        stream: None,
+    });
+
+    sim.try_send(
+        probe,
+        TlsProbeMsg::Connect {
+            addr: local_addr(48111),
+            server_name: "badcert.local".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "tls-connect-err:TlsCertificate")
+    );
+
+    let other_probe = sim.register(TlsProbe {
+        observed: Rc::clone(&observed),
+        stream: None,
+    });
+
+    sim.try_send(
+        probe,
+        TlsProbeMsg::Connect {
+            addr: local_addr(48112),
+            server_name: "slow.local".to_string(),
+            timeout: Duration::ZERO,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "tls-connect-err:Timeout")
+    );
+
+    sim.try_send(
+        probe,
+        TlsProbeMsg::Connect {
+            addr: local_addr(48112),
+            server_name: "slow.local".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        other_probe,
+        TlsProbeMsg::Connect {
+            addr: local_addr(48113),
+            server_name: "other.local".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "tls-connect-err:TlsFull"),
+        "observed TLS outcomes: {:?}; trace: {:?}",
+        observed.borrow(),
+        sim.trace()
+    );
+}
+
+#[test]
+fn scripted_signal_injection_receives_fails_times_out_and_replays() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, signal_sim_config());
+    let probe = sim.register(SignalProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(
+        probe,
+        SignalProbeMsg::Wait {
+            name: "shutdown".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        probe,
+        SignalProbeMsg::Wait {
+            name: "broken".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "signal:shutdown")
+    );
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "signal-err:Io")
+    );
+    assert_eq!(count_call_completed(sim.trace(), CallKind::SignalWait), 1);
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::SignalWait,
+                reason: CallError::Io,
+                ..
+            }
+        )
+    }));
+
+    let first = sim.replay_artifact();
+    let mut replay = Simulator::new(TestShard, signal_sim_config());
+    let replay_probe = replay.register(SignalProbe {
+        observed: Rc::new(RefCell::new(Vec::new())),
+    });
+    replay
+        .try_send(
+            replay_probe,
+            SignalProbeMsg::Wait {
+                name: "shutdown".to_string(),
+                timeout: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+    replay
+        .try_send(
+            replay_probe,
+            SignalProbeMsg::Wait {
+                name: "broken".to_string(),
+                timeout: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+    replay.run_until_quiescent();
+    assert_eq!(
+        first.event_record(),
+        replay.replay_artifact().event_record()
+    );
+}
+
+#[test]
+fn scripted_signal_zero_timeout_and_lane_full_are_visible() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            signal: ScriptedSignalConfig {
+                pending_completion_capacity: 1,
+                events: vec![
+                    ScriptedSignalEventConfig {
+                        name: "shutdown".to_string(),
+                        deliver_after_step: 8,
+                        result: ScriptedSignalResult::Received,
+                    },
+                    ScriptedSignalEventConfig {
+                        name: "slow".to_string(),
+                        deliver_after_step: 8,
+                        result: ScriptedSignalResult::Timeout,
+                    },
+                ],
+            },
+            ..Default::default()
+        },
+    );
+    let probe = sim.register(SignalProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(
+        probe,
+        SignalProbeMsg::Wait {
+            name: "shutdown".to_string(),
+            timeout: Duration::ZERO,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "signal-err:Timeout")
+    );
+
+    sim.try_send(
+        probe,
+        SignalProbeMsg::Wait {
+            name: "shutdown".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        probe,
+        SignalProbeMsg::Wait {
+            name: "slow".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "signal-err:SignalFull"),
+        "observed signal outcomes: {:?}; trace: {:?}",
+        observed.borrow(),
+        sim.trace()
+    );
+}
+
+#[test]
+fn scripted_signal_wait_is_removed_when_requester_stops() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, signal_sim_config());
+    let probe = sim.register(SignalProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(
+        probe,
+        SignalProbeMsg::Wait {
+            name: "shutdown".to_string(),
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.step();
+    sim.try_send(probe, SignalProbeMsg::Stop).unwrap();
+    sim.step();
+
+    assert!(!sim.has_in_flight_calls());
+    assert!(observed.borrow().is_empty());
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::SignalWait,
+                reason: CallCompletionRejectedReason::RequesterClosed,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]
@@ -2179,6 +2927,8 @@ fn scripted_udp_completion_capacity_is_separate_from_tcp_completion_capacity() {
                 ],
             },
             dns: Default::default(),
+            tls: Default::default(),
+            signal: Default::default(),
             process: Default::default(),
             storage: Default::default(),
         },
@@ -2613,6 +3363,8 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            tls: Default::default(),
+            signal: Default::default(),
             process: Default::default(),
         },
     );
@@ -2738,6 +3490,8 @@ fn closed_stream_id_surfaces_invalid_resource() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            tls: Default::default(),
+            signal: Default::default(),
             process: Default::default(),
         },
     );
@@ -2798,6 +3552,8 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            tls: Default::default(),
+            signal: Default::default(),
             process: Default::default(),
         },
     );
@@ -2872,6 +3628,8 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            tls: Default::default(),
+            signal: Default::default(),
             process: Default::default(),
         },
     );
@@ -3421,6 +4179,8 @@ fn run_seeded_cancellation_case(history: &History<CancellationOp>) -> DstRun<(),
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            tls: Default::default(),
+            signal: Default::default(),
             process: Default::default(),
         },
     );
@@ -3740,6 +4500,8 @@ fn tcp_checker_failure_replays_under_ready_reordering() {
         storage: Default::default(),
         udp: Default::default(),
         dns: Default::default(),
+        tls: Default::default(),
+        signal: Default::default(),
         process: Default::default(),
     };
 

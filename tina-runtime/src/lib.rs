@@ -60,13 +60,14 @@ pub use crate::persistence::{
 pub use call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
     IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
-    PersistenceTraceInfo, ProcessRunResult, ProcessStatus, RuntimeCall, RuntimeCallParts,
-    SendOutcome, SnapshotImage, StreamId, TypedCall, UdpSocketId, call, dns_lookup, file_close,
-    file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
-    file_write_at, journal_append, journal_replay, mkdir, process_run, send_observed, sleep,
-    sleep_then, snapshot_commit, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_connect, tcp_read, tcp_write, udp_bind, udp_close_socket, udp_recv_from,
-    udp_send_to,
+    PathKind, PathMetadata, PersistenceTraceInfo, ProcessRunResult, ProcessStatus, RuntimeCall,
+    RuntimeCallParts, SendOutcome, SnapshotImage, StreamId, TlsStreamId, TypedCall, UdpSocketId,
+    call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read, file_read_at,
+    file_size, file_write, file_write_at, journal_append, journal_replay, mkdir, path_metadata,
+    process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait, sleep,
+    sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_close, tls_connect,
+    tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
@@ -325,13 +326,6 @@ pub struct RuntimeCapabilities {
 impl RuntimeCapabilities {
     /// Returns the current live [`ThreadedRuntime`] capability table.
     pub const fn threaded(storage_lane_capacity: usize) -> Self {
-        let unsupported = ResourceCapability::new(
-            ResourceSupport::Unsupported,
-            ResourceExecutionShape::NotApplicable,
-            CancellationSupport::NotApplicable,
-            ShutdownSupport::NotApplicable,
-            None,
-        );
         Self {
             timers: ResourceCapability::new(
                 ResourceSupport::Supported,
@@ -368,7 +362,13 @@ impl RuntimeCapabilities {
                 ShutdownSupport::Tombstoned,
                 Some(storage_lane_capacity),
             ),
-            dns: unsupported,
+            dns: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::LaneBackedBlocking,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                Some(driver::DEFAULT_DNS_LANE_CAPACITY),
+            ),
             udp: ResourceCapability::new(
                 ResourceSupport::Supported,
                 ResourceExecutionShape::PollBacked,
@@ -377,11 +377,11 @@ impl RuntimeCapabilities {
                 None,
             ),
             tls: ResourceCapability::new(
-                ResourceSupport::AdapterOnly,
-                ResourceExecutionShape::ExternalAdapter,
-                CancellationSupport::NotApplicable,
-                ShutdownSupport::NotApplicable,
-                None,
+                ResourceSupport::Supported,
+                ResourceExecutionShape::LaneBackedBlocking,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                Some(driver::DEFAULT_TLS_LANE_CAPACITY),
             ),
             process: ResourceCapability::new(
                 ResourceSupport::Supported,
@@ -390,7 +390,13 @@ impl RuntimeCapabilities {
                 ShutdownSupport::Tombstoned,
                 Some(driver::DEFAULT_PROCESS_LANE_CAPACITY),
             ),
-            signal: unsupported,
+            signal: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::PollBacked,
+                CancellationSupport::CancelableBeforeStart,
+                ShutdownSupport::Drained,
+                Some(driver::DEFAULT_SIGNAL_CAPACITY),
+            ),
             durability: DurabilityCapability::local(),
         }
     }
@@ -749,6 +755,16 @@ where
             );
         }
         Ok(())
+    }
+
+    fn notify_signal(&mut self, name: &str) {
+        let mut completed = std::mem::take(&mut self.driver_completions);
+        completed.clear();
+        self.driver.notify_signal(name, &mut completed);
+        for op in completed.drain(..) {
+            self.deliver_completion(op.call_id, op.result);
+        }
+        self.driver_completions = completed;
     }
 
     fn cancel_driver_calls_for_requester(&mut self, requester: RegisteredAddress) {
@@ -4144,7 +4160,10 @@ where
                 command(&mut runtime);
                 continue;
             }
-            Ok(ThreadedCommand::Shutdown) => break,
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -4153,7 +4172,10 @@ where
         if delivered == 0 && !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
-                Ok(ThreadedCommand::Shutdown) => break,
+                Ok(ThreadedCommand::Shutdown) => {
+                    deliver_shutdown_signal_and_drain(&mut runtime);
+                    break;
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -4166,6 +4188,19 @@ where
         .cancel_in_flight_calls_for_shutdown()
         .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
     Ok(runtime.trace().to_vec())
+}
+
+fn deliver_shutdown_signal_and_drain<S, F>(runtime: &mut Runtime<S, F>)
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    runtime.notify_signal("shutdown");
+    for _ in 0..1024 {
+        if runtime.step() == 0 {
+            break;
+        }
+    }
 }
 
 /// One live worker-per-shard runtime over a fixed shard set.
@@ -4516,7 +4551,10 @@ where
                 command(&mut runtime);
                 continue;
             }
-            Ok(ThreadedCommand::Shutdown) => break,
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -4559,7 +4597,10 @@ where
         if delivered == 0 && !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
-                Ok(ThreadedCommand::Shutdown) => break,
+                Ok(ThreadedCommand::Shutdown) => {
+                    deliver_shutdown_signal_and_drain(&mut runtime);
+                    break;
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }

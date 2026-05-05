@@ -303,7 +303,7 @@ fn checksum(bytes: &[u8]) -> u64 {
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> Result<(), CallError> {
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<(), CallError> {
     let dir = OpenOptions::new()
         .read(true)
         .open(path)
@@ -312,7 +312,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), CallError> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<(), CallError> {
+pub(crate) fn sync_parent_directory(_path: &Path) -> Result<(), CallError> {
     Ok(())
 }
 

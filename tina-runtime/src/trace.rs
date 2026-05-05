@@ -108,8 +108,23 @@ pub enum CallKind {
     /// A UDP socket close.
     UdpSocketClose,
 
+    /// A TLS connect and handshake.
+    TlsConnect,
+
+    /// A TLS read.
+    TlsRead,
+
+    /// A TLS write.
+    TlsWrite,
+
+    /// A TLS close.
+    TlsClose,
+
     /// A DNS lookup.
     DnsLookup,
+
+    /// A runtime-owned signal wait.
+    SignalWait,
 
     /// A bounded local process run.
     ProcessRun,
@@ -134,6 +149,21 @@ pub enum CallKind {
 
     /// A directory create.
     Mkdir,
+
+    /// A path metadata query.
+    PathMetadata,
+
+    /// A rename-replace operation.
+    RenameReplace,
+
+    /// A remove-file operation.
+    RemoveFile,
+
+    /// A read-directory operation.
+    ReadDir,
+
+    /// A parent-directory sync operation.
+    SyncParent,
 
     /// A local snapshot commit.
     SnapshotCommit,

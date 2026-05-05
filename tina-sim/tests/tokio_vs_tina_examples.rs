@@ -267,13 +267,26 @@ impl Client {
                     Err(CallError::Timeout) => push(&self.events, "timeout"),
                     Err(
                         CallError::InvalidResource
+                        | CallError::NotFound
                         | CallError::Io
                         | CallError::Unsupported
                         | CallError::ResourceBusy
                         | CallError::CorruptRecord
                         | CallError::CommitUncertain
                         | CallError::StorageFull
-                        | CallError::StorageClosed,
+                        | CallError::StorageClosed
+                        | CallError::DnsFull
+                        | CallError::DnsClosed
+                        | CallError::SignalFull
+                        | CallError::SignalClosed
+                        | CallError::TlsFull
+                        | CallError::TlsClosed
+                        | CallError::TlsCertificate
+                        | CallError::TlsName
+                        | CallError::TlsHandshake
+                        | CallError::ProcessFull
+                        | CallError::ProcessClosed
+                        | CallError::KillUncertain,
                     ) => push(&self.events, "unexpected_call_error"),
                 }
                 noop()

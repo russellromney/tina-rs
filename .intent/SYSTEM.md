@@ -148,6 +148,45 @@ buffered channel slots. Running work counts against capacity until its
 completion is harvested or canceled. This keeps `StorageFull` deterministic
 under fast worker scheduling.
 
+Runtime resource capability reports are part of the Tina contract. If a
+resource family is supported, unsupported, simulator-only, adapter-only,
+lane-backed, poll-backed, completion-backed, cancelable, tombstoned, or
+shutdown-limited, that shape must be visible in `RuntimeCapabilities` rather
+than implied by docs or hidden behind an adapter.
+
+Live UDP is a Tina-owned nonblocking driver rail over runtime-owned
+`UdpSocketId`s. It is `PollBacked`, not Betelgeuse-backed. Receive lanes are
+per socket; duplicate pending receives and closes during a pending receive
+surface `ResourceBusy`. Datagram truncation is visible.
+
+Live DNS is a Tina-owned bounded blocking driver rail. DNS lane capacity is
+visible, queued work is cancelable, and already-started resolver work is
+tombstoned on timeout/cancel because standard OS resolver calls are not
+preempted by Tina. Do not claim hidden unbounded resolver queues or preemptive
+DNS cancellation.
+
+Native TLS is a Tina-owned bounded blocking driver rail over runtime-owned
+`TlsStreamId`s. It uses real TLS semantics for connect/handshake/read/write/
+close, reports certificate/name/handshake/I/O/full/closed/timeout outcomes, and
+enforces one pending TLS operation per TLS stream. Simulator TLS is semantic
+scripted I/O, not cryptography.
+
+Runtime shutdown notification is a Tina-owned signal rail: shutdown can deliver
+a bounded `"shutdown"` notification into waiting isolates before the worker
+stops. Raw OS signal capture is not claimed unless a later phase explicitly
+adds and tests a process-global signal policy.
+
+Richer local filesystem/path operations are runtime-owned calls with typed
+outcomes: metadata, rename-replace, remove-file, read-dir, and parent sync.
+Platform durability and replacement differences must remain visible as
+supported, unsupported, uncertain, or I/O failure instead of being papered over.
+
+Bounded local process execution is a lane-backed runtime call. It uses
+command-plus-args, null stdin, bounded stdout/stderr capture, timeout
+kill/reap, and visible `ProcessFull`, `ProcessClosed`, `Timeout`, and
+`KillUncertain` outcomes. It is not shell-by-default, interactive process I/O,
+or a process-tree semantics claim.
+
 `LocalSystemTerminalReport::summary()` is trace-derived terminal accounting. It
 may count completed, failed, rejected, abandoned, journaled, and recovered work
 that Tina can see in the final trace. It must not grow hidden metrics channels
