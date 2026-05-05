@@ -22,7 +22,7 @@ use tina_sim::{
     ScriptedProcessConfig, ScriptedProcessResult, ScriptedProcessRunConfig, ScriptedTcpConfig,
     ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig, Simulator,
     SimulatorConfig, TcpCompletionFaultMode,
-    dst::{DstRun, History, InvariantSuite, assert_replays},
+    dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink},
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -1588,6 +1588,211 @@ fn scripted_process_zero_timeout_and_lane_full_are_visible() {
             .borrow()
             .iter()
             .any(|entry| entry == "process-err:ProcessFull")
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceRailOp {
+    DnsOk,
+    DnsFail,
+    DnsTimeout,
+    ProcessOk,
+    ProcessTimeout,
+    UdpLoopback,
+}
+
+fn resource_rail_history(seed: u64) -> History<ResourceRailOp> {
+    let choices = [
+        ResourceRailOp::DnsOk,
+        ResourceRailOp::DnsFail,
+        ResourceRailOp::DnsTimeout,
+        ResourceRailOp::ProcessOk,
+        ResourceRailOp::ProcessTimeout,
+        ResourceRailOp::UdpLoopback,
+    ];
+    let len = 4 + (seed as usize % 4);
+    let operations = (0..len)
+        .map(|index| choices[((seed as usize) + index * 3) % choices.len()])
+        .collect();
+    History::new("resource rail matrix", seed, operations)
+}
+
+fn resource_rail_config(seed: u64) -> SimulatorConfig {
+    SimulatorConfig {
+        seed,
+        dns: ScriptedDnsConfig {
+            pending_completion_capacity: 4,
+            lookups: vec![
+                ScriptedDnsLookupConfig {
+                    host: "ok.local".to_string(),
+                    port: 8080,
+                    complete_after_step: 2,
+                    result: ScriptedDnsResult::Resolved(vec![local_addr(48200)]),
+                },
+                ScriptedDnsLookupConfig {
+                    host: "fail.local".to_string(),
+                    port: 8080,
+                    complete_after_step: 2,
+                    result: ScriptedDnsResult::Failed,
+                },
+                ScriptedDnsLookupConfig {
+                    host: "timeout.local".to_string(),
+                    port: 8080,
+                    complete_after_step: 2,
+                    result: ScriptedDnsResult::Timeout,
+                },
+            ],
+        },
+        process: ScriptedProcessConfig {
+            pending_completion_capacity: 4,
+            runs: vec![
+                ScriptedProcessRunConfig {
+                    command: "ok".to_string(),
+                    args: Vec::new(),
+                    complete_after_step: 2,
+                    result: ScriptedProcessResult::Exited {
+                        code: Some(0),
+                        stdout: b"done".to_vec(),
+                        stderr: Vec::new(),
+                    },
+                },
+                ScriptedProcessRunConfig {
+                    command: "timeout".to_string(),
+                    args: Vec::new(),
+                    complete_after_step: 2,
+                    result: ScriptedProcessResult::Timeout,
+                },
+            ],
+        },
+        udp: ScriptedUdpConfig {
+            pending_completion_capacity: 4,
+            sockets: vec![
+                udp_socket_script(local_addr(48201), local_addr(48201), Vec::new()),
+                udp_socket_script(local_addr(48202), local_addr(48202), Vec::new()),
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+fn run_resource_rail_history(
+    history: &History<ResourceRailOp>,
+) -> DstRun<Vec<String>, ReplayArtifact> {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, resource_rail_config(history.seed()));
+    let dns = sim.register(DnsProbe {
+        observed: Rc::clone(&observed),
+    });
+    let process = sim.register(ProcessProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    for op in history.operations() {
+        match op {
+            ResourceRailOp::DnsOk => sim
+                .try_send(
+                    dns,
+                    DnsProbeMsg::Lookup {
+                        host: "ok.local".to_string(),
+                        port: 8080,
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::DnsFail => sim
+                .try_send(
+                    dns,
+                    DnsProbeMsg::Lookup {
+                        host: "fail.local".to_string(),
+                        port: 8080,
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::DnsTimeout => sim
+                .try_send(
+                    dns,
+                    DnsProbeMsg::Lookup {
+                        host: "timeout.local".to_string(),
+                        port: 8080,
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::ProcessOk => sim
+                .try_send(
+                    process,
+                    ProcessProbeMsg::Run {
+                        command: "ok".to_string(),
+                        args: Vec::new(),
+                        timeout: Duration::from_millis(50),
+                        stdout_limit: 8,
+                        stderr_limit: 8,
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::ProcessTimeout => sim
+                .try_send(
+                    process,
+                    ProcessProbeMsg::Run {
+                        command: "timeout".to_string(),
+                        args: Vec::new(),
+                        timeout: Duration::from_millis(50),
+                        stdout_limit: 8,
+                        stderr_limit: 8,
+                    },
+                )
+                .unwrap(),
+            ResourceRailOp::UdpLoopback => {
+                let client = sim.register(UdpClient {
+                    receiver_addr: local_addr(48201),
+                    sender_addr: local_addr(48202),
+                    receiver: None,
+                    sender: None,
+                    observed: Rc::clone(&observed),
+                });
+                sim.try_send(client, UdpClientMsg::Start).unwrap();
+            }
+        }
+        sim.run_until_quiescent();
+    }
+
+    let output = observed.borrow().clone();
+    DstRun::new(output, sim.replay_artifact())
+}
+
+#[test]
+fn dst_resource_rails_replay_and_delete_shrink_timeout_cases() {
+    for seed in 0..16 {
+        let history = resource_rail_history(seed);
+        let run = assert_replays(&history, run_resource_rail_history);
+        InvariantSuite::standard().assert(run.artifact().event_record());
+    }
+
+    let history = History::new(
+        "resource rail timeout shrink",
+        404,
+        vec![
+            ResourceRailOp::DnsOk,
+            ResourceRailOp::ProcessOk,
+            ResourceRailOp::UdpLoopback,
+            ResourceRailOp::ProcessTimeout,
+        ],
+    );
+    let shrunk = delete_shrink(
+        &history,
+        ShrinkConfig { max_attempts: 16 },
+        "process timeout remains visible",
+        |candidate| {
+            run_resource_rail_history(candidate)
+                .output()
+                .iter()
+                .any(|entry| entry == "process-err:Timeout")
+        },
+    );
+    assert_eq!(
+        shrunk.shrunk().operations(),
+        &[ResourceRailOp::ProcessTimeout]
     );
 }
 

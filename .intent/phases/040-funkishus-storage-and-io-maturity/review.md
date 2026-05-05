@@ -532,6 +532,25 @@ Review note:
   live tests already cover TCP-plus-journal and cross-shard TCP persistence.
   The remaining full-composition gap is to combine TCP ingress with the new
   UDP/process rails if 040 needs one maximal app-shaped proof.
+
+## Implementation Audit 7
+
+DST pressure expanded over new resource rails.
+
+What is true now:
+
+- Generated histories mix DNS success/failure/timeout, process success/timeout,
+  and UDP loopback.
+- Each generated history is run twice and compared for exact replay equality.
+- Standard trace invariants run over the generated resource histories.
+- A deletion-shrink test reduces a mixed DNS/process/UDP history down to the
+  single process-timeout operation needed to preserve the failure predicate.
+
+Review note:
+
+- This is the first DST layer for the new rails, not the final one. It now has
+  replay plus deletion shrinking; later phases can add richer stateful models
+  for shutdown-with-pending and cross-shard resource pressure.
 - Direct integration test pins supported and unsupported resource families
   through the canonical `LocalSystem` path.
 
