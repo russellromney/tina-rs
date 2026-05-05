@@ -148,7 +148,7 @@ framework before public release-story work.
 | Phase | Purpose |
 |---|---|
 | **Piet de Jong local production readiness** | Intense pre-Gemini phase for the five remaining local-core gaps: mature the driver-runtime substrate, widen the Tokio/Tower/Axum bridge into a real adoption edge, add CI/stress hardening, produce a measured performance/allocation envelope, and complete the preferred local-service API surface. |
-| **Jelle Zijlstra runtime-owned I/O breadth** | Explicit post-Piet I/O expansion phase: decide and implement or defer DNS, TLS, UDP, file, process, and signal support with Tina-owned timeout/cancellation/shutdown semantics, simulator/DST coverage where possible, and no hidden blocking pools or unbounded queues. |
+| **Jelle Zijlstra runtime-owned I/O breadth** | Explicit post-Piet I/O expansion phase: finish outbound TCP connect and runtime-owned file I/O first, then record exact deferrals for DNS, TLS, UDP, process, and signal. All supported I/O keeps Tina-owned timeout/cancellation/shutdown semantics, simulator/DST coverage where possible, and no hidden blocking pools or unbounded queues. |
 
 ## Later capability roadmap
 
@@ -187,23 +187,23 @@ These should be resolved before public release or broad adoption claims:
 These still need answers, but each now has an intended phase home.
 
 1. **Supervisor budget windows.** Direct `RestartChildren` execution and
-   panic-triggered supervised restart now exist. The next supervision design
-   question is how far runtime-lifetime budgets can go before timed windows or
-   explicit deferral are required. Home: Piet de Jong.
-2. **Trace retention.** Bounded/off modes exist now; Piet de Jong should decide
-   whether they are enough for local production use or need sink/lifecycle
-   polish. Home: Piet de Jong.
-3. **Runtime-owned I/O breadth.** Piet de Jong should pin the first local
-   production claim around time/TCP/bridge and write the support table. Jelle
-   Zijlstra owns the broader DNS/TLS/UDP/file/process/signal implementation or
-   explicit deferrals.
+   panic-triggered supervised restart now exist. Runtime-lifetime budgets are
+   enough for the current local-service claim; timed windows remain a later
+   supervision polish item if real workloads need them.
+2. **Trace retention.** Bounded/off modes exist now and Piet kept lifecycle
+   facts trace-observable. Sink/counter polish is a later observability phase,
+   not a blocker for Jelle.
+3. **Runtime-owned I/O breadth.** Piet pinned the first local production claim
+   around time/TCP/bridge. Jelle now owns outbound TCP connect and file I/O as
+   accepted scope, plus exact deferrals for DNS/TLS/UDP/process/signal.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
-   transport is not claimed. Home: Piet de Jong if local framework completeness or
-   the bridge needs it; otherwise later remoting.
-5. **MPSC fallback.** Optional only. Home: Piet de Jong decision, implementation only
-   if a real workload proves SPSC is too narrow for the local framework.
+   transport is not claimed. Home: Jan Peter Balkenende remoting unless a local
+   workload proves it must land earlier.
+5. **MPSC fallback.** Optional only. Implement only if a real workload proves
+   SPSC is too narrow for the local framework.
 6. **Zero-copy / lower-allocation transport.** The current cost model is
-   honest but not final. Home: Piet de Jong.
+   honest but not final. Home: later performance phase after Jelle's new I/O
+   paths expose real pressure.
 
 ---
 
