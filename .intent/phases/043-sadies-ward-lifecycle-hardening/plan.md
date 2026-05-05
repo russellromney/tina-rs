@@ -2,143 +2,182 @@
 
 ## Goal
 
-Make Tina's live local system boring when the ugly things happen.
+Make Tina's live local system boring under shutdown, failed shards, worker-lane
+work, and OS signals.
 
-Victor gave Tina real local service shape: bounded cross-shard calls, inbound
-TLS, resource counts, health reports, and shutdown accounting. This phase makes
-that lifecycle harder to fool.
+At closeout:
 
-At closeout, Tina should be able to say:
+> Tina can stop or fail a live local system without pretending hidden work or
+> resources disappeared.
 
-> A live local Tina system can shut down, fail a shard, cancel worker-lane work,
-> report resources, and handle OS signals without pretending hidden work is
-> gone.
+No flow syntax, remoting, clustering, release docs, metrics backend, or broad
+performance claim.
 
-This is production-readiness work. It is not flow syntax, remoting, clustering,
-release docs, or a broad benchmark claim.
+## Vocabulary
 
-## Core Rules
+- **Table-owned resource:** resource id stored in runtime/driver tables:
+  TCP listener/stream, TLS listener/stream, UDP socket, file.
+- **Worker-held resource:** OS/resource handle cloned into active lane work but
+  not necessarily represented by a live table id.
+- **Pending call:** runtime-owned operation waiting for completion.
+- **Tombstoned work:** canceled work whose late completion must be swallowed and
+  traced/reported.
+- **Clean shutdown:** all shards closed and table-owned count, worker-held
+  count, and pending-call count are zero.
+
+## Rules
 
 - No hidden fallback queues.
-- No "clean" shutdown while worker-held resources remain.
-- No resource count that only counts convenient tables.
-- No signal story that depends on app code polling random globals.
-- No failed shard silently accepting work later.
-- No live behavior without a simulator/DST or direct e2e proof when the behavior
-  is semantic.
+- No clean shutdown while worker-held resources or pending calls remain.
+- Resource reports must not count only convenient tables.
+- Failed shards reject later ingress/sends/calls.
+- Health is observation, not hidden correctness state.
+- Direct tests pin known bad paths; DST combines weird paths.
 
 ## Build Order
 
-1. Audit live lifecycle after Victor in `review.md`.
-2. Harden worker-lane shutdown/resource accounting.
-3. Add bounded drain/join rules for worker lanes.
-4. Add raw OS signal capture where platform support is honest.
-5. Harden failed-shard cleanup and post-failure rejection.
-6. Expand topology/shutdown report proof.
-7. Add DST and e2e lifecycle pressure.
-8. Do positive, blast-radius, and hostile review. Fix findings.
+1. Audit current lifecycle in `review.md`.
+2. Add table-owned / worker-held / pending-call accounting.
+3. Add bounded lane shutdown rules.
+4. Add raw OS signal capture.
+5. Harden failed-shard cleanup.
+6. Expand topology/shutdown reports.
+7. Add e2e and DST pressure.
+8. Write positive, blast-radius, hostile review; fix findings.
 
 ## Rock 1: Audit
 
-Write current facts in `review.md`. Cover:
+Write facts in `review.md`. Cover storage, DNS, TLS, process, signal, and
+TCP/Betelgeuse. For each: what can block, what can cancel, what can only be
+tombstoned, what is table-owned, what is worker-held, and what shutdown reports.
 
-- worker lanes: storage, DNS, TLS, process, signal, TCP/Betelgeuse;
-- what can block after cancellation;
-- what resources are table-owned vs worker-held;
-- what shutdown can drain, cancel, tombstone, or only report;
-- what shard failure currently cancels or leaves pending;
-- which topology fields are exact and which are best-effort.
+## Rock 2: Resource Accounting
 
-## Rock 2: Worker-Held Resource Accounting
+Add or tighten these report fields:
 
-Resource reports must include resources still held by worker-lane commands after
-runtime tables stop accepting new work.
+- `owned_resource_count`
+- `worker_held_resource_count`
+- `pending_driver_call_count`
+- `shutdown_unclean_reason`
+
+Count rules:
+
+- TCP/file/UDP Betelgeuse ids count as table-owned.
+- TLS listener/stream table ids count as table-owned.
+- TLS accept/read/write/close holding cloned listener/stream counts as
+  worker-held until completion drains.
+- Process child counts as worker-held while running.
+- DNS/storage blocked worker jobs count as pending calls; count worker-held only
+  if they own a real handle.
+- Signal waits count as pending calls, not resources.
+
+No double-count after late completion drains. Remaining worker-held or pending
+work makes shutdown unclean.
+
+## Rock 3: Bounded Shutdown
+
+Add one shutdown budget in `LocalSystemConfig`:
+
+- `shutdown_lane_drain_timeout`
+- default: small, fixed, documented
+- applies per shard to lane-worker drain after cancellation
+
+Each lane must do:
+
+1. stop new work;
+2. cancel queued/pending work;
+3. drain completions until budget;
+4. join if finished;
+5. report remaining worker-held/pending work if not finished.
+
+No lane may block shutdown forever because user operation timeout was huge.
+
+## Rock 4: OS Signals
+
+Expected implementation: use `signal-hook` or similarly small sync-safe crate.
+
+Rules:
+
+- Unix: support `SIGINT` and `SIGTERM`.
+- Non-Unix: explicit unsupported capability is okay.
+- No Tokio dependency.
+- No async signal task.
+- No custom unsafe handler unless reviewed.
+- Signals become runtime-owned signal completions.
+- Signal waits are bounded, traceable, cancelable on requester stop, and
+  simulator-compatible.
+
+## Rock 5: Failed Shards
+
+A failed shard is quarantined.
+
+Priority for races:
+
+1. requester already stopped/full wins for requester-local completion;
+2. shard failed wins over later success;
+3. timeout wins if requester deadline fired before failure observed;
+4. full transport/mailbox wins only when no terminal state already exists.
 
 Required behavior:
 
-- table-owned and worker-held resource counts are distinguishable or summed
-  honestly;
-- canceled-but-not-finished lane work remains visible until finished;
-- terminal shutdown report is not clean if worker-held resources remain;
-- no double-count after late completion drains;
-- tests cover TLS, process, storage, DNS, TCP where each has a meaningful owned
-  resource or pending-work shape.
-
-## Rock 3: Bounded Drain / Join Rules
-
-Each lane gets one explicit shutdown rule:
-
-- finish quickly;
-- cancel and drain completions;
-- bounded wait;
-- tombstone and report remaining work.
-
-No lane may block runtime shutdown forever because user timeout was huge. If an
-OS operation cannot be interrupted, report it as remaining worker-held work and
-keep the lifecycle honest.
-
-## Rock 4: Raw OS Signal Capture
-
-Add live OS signal capture for the smallest useful set:
-
-- Unix: `SIGINT` and `SIGTERM` if platform support is clean;
-- non-Unix: explicit unsupported capability is acceptable.
-
-Signals must enter Tina as runtime-owned signal completions. They must be
-bounded, traceable, cancelable on requester stop, and simulator-compatible.
-
-No broad signal framework. No daemon/service-manager integration.
-
-## Rock 5: Failed-Shard Cleanup
-
-A failed shard must become a hard boundary:
-
-- ingress rejects;
-- cross-shard sends/calls reject;
+- ingress to failed shard rejects;
+- sends/calls to failed shard reject;
 - pending local driver work is canceled/tombstoned;
-- pending cross-shard request/reply work reaches one terminal outcome;
+- in-flight cross-shard request/reply gets exactly one terminal outcome;
 - healthy shards continue;
-- topology and terminal reports name the failed shard and remaining resources.
+- topology and terminal report name failed shard and remaining work.
 
-Do not add automatic shard restart unless this phase proves ownership and
-address-generation semantics. Quarantine first.
+No automatic shard restart.
 
-## Rock 6: Topology And Shutdown Proof
+## Rock 6: Reports
 
-Topology and terminal reports must be useful to operators and tests:
+Topology/shutdown reports must expose:
 
 - shard state;
 - ingress/remote pressure;
 - lane capacities;
 - configured resource capacities;
-- owned and worker-held resource counts;
+- table-owned resources;
+- worker-held resources;
+- pending driver calls;
 - dropped trace count;
 - failed shard ids;
-- clean vs unclean shutdown reason.
+- clean/unclean reason.
 
-Health is observation, not hidden correctness state.
+No Prometheus, tracing subscriber, dashboard, metrics sink, or observability
+framework.
 
-## Rock 7: DST And E2E Pressure
+## Rock 7: Proof
 
-Add tests that combine rocks:
+Proof mode table:
+
+| Behavior | Proof |
+|---|---|
+| Count rules | unit + live e2e |
+| Bounded lane drain | unit + live e2e |
+| OS signal delivery | live e2e on supported platform; unsupported test elsewhere |
+| Failed-shard race priority | live e2e + simulator/DST where modeled |
+| Topology/shutdown fields | live e2e |
+| Cross-rock weirdness | DST |
+
+Must test:
 
 - shutdown during TLS accept/handshake/read/write;
 - shutdown during storage/process/DNS work;
-- signal arrives while shutdown is draining;
-- shard fails while cross-shard call is in flight;
-- remote queue full plus requester timeout;
-- late completions after canceled work;
-- topology checked before, during, and after pressure.
+- signal during drain;
+- shard failure during cross-shard call;
+- remote full plus requester timeout;
+- late completion after cancellation;
+- topology before/during/after pressure.
 
-DST should throw weird combinations. Normal tests still pin known negative
-paths. DST does not replace boring direct tests.
+Test hooks may be crate-private/test-only. Do not turn them into user API.
 
 ## Done Means
 
 - `make verify` passes.
-- New lifecycle tests prove positive, negative, weird, and shutdown paths.
+- New tests cover positive, negative, weird, and shutdown paths.
 - `review.md` has audit plus positive/blast-radius/hostile review.
-- `SYSTEM.md`, `ROADMAP.md`, and `CHANGELOG.md` tell only landed truth.
+- `ROADMAP.md` and `CHANGELOG.md` tell only landed truth.
 
 ## Non-Goals
 
