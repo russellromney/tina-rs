@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,14 +11,16 @@ use tina::{
     RestartableChildDefinition, Shard, ShardId,
 };
 use tina_runtime::{
-    CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, ListenerId,
-    RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
+    CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
+    FileOpenOptions, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ScriptedListenerConfig,
     ScriptedPeerConfig, ScriptedTcpConfig, Simulator, SimulatorConfig, TcpCompletionFaultMode,
 };
 use tina_supervisor::SupervisorConfig;
+
+type FileObserved = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
 
 #[derive(Debug, Default)]
 struct TestShard;
@@ -73,6 +76,243 @@ impl Isolate for Connection {
                 }
             }
             ConnectionMsg::StreamClosed | ConnectionMsg::Failed => Effect::Stop,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ClientMsg {
+    Start(SocketAddr),
+    Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
+    Wrote(Result<usize, CallError>),
+    Read(Result<Vec<u8>, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct Client {
+    payload: Vec<u8>,
+    pending_write: Vec<u8>,
+    stream: Option<StreamId>,
+    observed: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl Isolate for Client {
+    type Message = ClientMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<ClientMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ClientMsg::Start(addr) => Effect::Call(RuntimeCall::new(
+                CallInput::TcpConnect { addr },
+                |result| match result {
+                    CallOutput::TcpConnected {
+                        stream,
+                        local_addr,
+                        peer_addr,
+                    } => ClientMsg::Connected(Ok((stream, local_addr, peer_addr))),
+                    CallOutput::Failed(error) => ClientMsg::Connected(Err(error)),
+                    other => panic!("unexpected connect result {other:?}"),
+                },
+            )),
+            ClientMsg::Connected(Ok((stream, _local_addr, _peer_addr))) => {
+                self.stream = Some(stream);
+                self.pending_write = self.payload.clone();
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpWrite {
+                        stream,
+                        bytes: self.pending_write.clone(),
+                    },
+                    |result| match result {
+                        CallOutput::TcpWrote { count } => ClientMsg::Wrote(Ok(count)),
+                        CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
+                        other => panic!("unexpected write result {other:?}"),
+                    },
+                ))
+            }
+            ClientMsg::Wrote(Ok(count)) => {
+                let stream = self.stream.expect("stream set after connect");
+                if count >= self.pending_write.len() {
+                    self.pending_write.clear();
+                    Effect::Call(RuntimeCall::new(
+                        CallInput::TcpRead { stream, max_len: 4 },
+                        |result| match result {
+                            CallOutput::TcpRead { bytes } => ClientMsg::Read(Ok(bytes)),
+                            CallOutput::Failed(error) => ClientMsg::Read(Err(error)),
+                            other => panic!("unexpected read result {other:?}"),
+                        },
+                    ))
+                } else {
+                    self.pending_write.drain(..count);
+                    Effect::Call(RuntimeCall::new(
+                        CallInput::TcpWrite {
+                            stream,
+                            bytes: self.pending_write.clone(),
+                        },
+                        |result| match result {
+                            CallOutput::TcpWrote { count } => ClientMsg::Wrote(Ok(count)),
+                            CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
+                            other => panic!("unexpected write result {other:?}"),
+                        },
+                    ))
+                }
+            }
+            ClientMsg::Read(Ok(bytes)) => {
+                *self.observed.lock().expect("observed mutex") = Some(bytes);
+                let stream = self.stream.expect("stream set after connect");
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpStreamClose { stream },
+                    |result| match result {
+                        CallOutput::TcpStreamClosed => ClientMsg::Closed(Ok(())),
+                        CallOutput::Failed(error) => ClientMsg::Closed(Err(error)),
+                        other => panic!("unexpected close result {other:?}"),
+                    },
+                ))
+            }
+            ClientMsg::Closed(Ok(())) => Effect::Stop,
+            ClientMsg::Connected(Err(_))
+            | ClientMsg::Wrote(Err(_))
+            | ClientMsg::Read(Err(_))
+            | ClientMsg::Closed(Err(_)) => Effect::Stop,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum FileClientMsg {
+    Start { dir: PathBuf, path: PathBuf },
+    DirectoryMade(Result<(), CallError>, PathBuf),
+    Opened(Result<FileId, CallError>),
+    Wrote(Result<usize, CallError>),
+    Synced(Result<(), CallError>),
+    Sized(Result<u64, CallError>),
+    Read(Result<Vec<u8>, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct FileClient {
+    payload: Vec<u8>,
+    file: Option<FileId>,
+    size: Option<u64>,
+    observed: FileObserved,
+}
+
+impl Isolate for FileClient {
+    type Message = FileClientMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<FileClientMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            FileClientMsg::Start { dir, path } => Effect::Call(RuntimeCall::new(
+                CallInput::Mkdir {
+                    path: dir,
+                    mode: 0o755,
+                },
+                move |result| match result {
+                    CallOutput::DirectoryCreated => FileClientMsg::DirectoryMade(Ok(()), path),
+                    CallOutput::Failed(error) => FileClientMsg::DirectoryMade(Err(error), path),
+                    other => panic!("unexpected mkdir result {other:?}"),
+                },
+            )),
+            FileClientMsg::DirectoryMade(Ok(()), path) => Effect::Call(RuntimeCall::new(
+                CallInput::FileOpen {
+                    path,
+                    options: FileOpenOptions {
+                        read: true,
+                        write: true,
+                        create: true,
+                        truncate: true,
+                    },
+                },
+                |result| match result {
+                    CallOutput::FileOpened { file } => FileClientMsg::Opened(Ok(file)),
+                    CallOutput::Failed(error) => FileClientMsg::Opened(Err(error)),
+                    other => panic!("unexpected file open result {other:?}"),
+                },
+            )),
+            FileClientMsg::Opened(Ok(file)) => {
+                self.file = Some(file);
+                Effect::Call(RuntimeCall::new(
+                    CallInput::FileWriteAt {
+                        file,
+                        bytes: self.payload.clone(),
+                        offset: 0,
+                    },
+                    |result| match result {
+                        CallOutput::FileWrote { count } => FileClientMsg::Wrote(Ok(count)),
+                        CallOutput::Failed(error) => FileClientMsg::Wrote(Err(error)),
+                        other => panic!("unexpected file write result {other:?}"),
+                    },
+                ))
+            }
+            FileClientMsg::Wrote(Ok(_)) => {
+                let file = self.file.expect("file set after open");
+                Effect::Call(RuntimeCall::new(
+                    CallInput::FileFsync { file },
+                    |result| match result {
+                        CallOutput::FileSynced => FileClientMsg::Synced(Ok(())),
+                        CallOutput::Failed(error) => FileClientMsg::Synced(Err(error)),
+                        other => panic!("unexpected file fsync result {other:?}"),
+                    },
+                ))
+            }
+            FileClientMsg::Synced(Ok(())) => {
+                let file = self.file.expect("file set after open");
+                Effect::Call(RuntimeCall::new(
+                    CallInput::FileSize { file },
+                    |result| match result {
+                        CallOutput::FileSize { size } => FileClientMsg::Sized(Ok(size)),
+                        CallOutput::Failed(error) => FileClientMsg::Sized(Err(error)),
+                        other => panic!("unexpected file size result {other:?}"),
+                    },
+                ))
+            }
+            FileClientMsg::Sized(Ok(size)) => {
+                self.size = Some(size);
+                let file = self.file.expect("file set after open");
+                Effect::Call(RuntimeCall::new(
+                    CallInput::FileReadAt {
+                        file,
+                        len: size as usize,
+                        offset: 0,
+                    },
+                    |result| match result {
+                        CallOutput::FileRead { bytes } => FileClientMsg::Read(Ok(bytes)),
+                        CallOutput::Failed(error) => FileClientMsg::Read(Err(error)),
+                        other => panic!("unexpected file read result {other:?}"),
+                    },
+                ))
+            }
+            FileClientMsg::Read(Ok(bytes)) => {
+                let size = self.size.expect("size set before read");
+                *self.observed.lock().expect("file observed mutex") = Some((size, bytes));
+                let file = self.file.expect("file set after open");
+                Effect::Call(RuntimeCall::new(
+                    CallInput::FileClose { file },
+                    |result| match result {
+                        CallOutput::FileClosed => FileClientMsg::Closed(Ok(())),
+                        CallOutput::Failed(error) => FileClientMsg::Closed(Err(error)),
+                        other => panic!("unexpected file close result {other:?}"),
+                    },
+                ))
+            }
+            FileClientMsg::Closed(Ok(())) => Effect::Stop,
+            FileClientMsg::DirectoryMade(Err(_), _)
+            | FileClientMsg::Opened(Err(_))
+            | FileClientMsg::Wrote(Err(_))
+            | FileClientMsg::Synced(Err(_))
+            | FileClientMsg::Sized(Err(_))
+            | FileClientMsg::Read(Err(_))
+            | FileClientMsg::Closed(Err(_)) => Effect::Stop,
         }
     }
 }
@@ -285,7 +525,9 @@ impl Isolate for Binder {
 enum ProbeMsg {
     StartInvalidAccept,
     StartInvalidRead,
+    StartInvalidFileOpen,
     InvalidResourceObserved,
+    FileIoObserved,
 }
 
 #[derive(Debug)]
@@ -326,10 +568,29 @@ impl Isolate for Probe {
                     other => panic!("expected invalid read failure, got {other:?}"),
                 },
             )),
+            ProbeMsg::StartInvalidFileOpen => Effect::Call(RuntimeCall::new(
+                CallInput::FileOpen {
+                    path: PathBuf::from("/tmp/tina-sim-invalid-open.txt"),
+                    options: FileOpenOptions {
+                        read: true,
+                        write: false,
+                        create: true,
+                        truncate: false,
+                    },
+                },
+                |result| match result {
+                    CallOutput::Failed(CallError::Io) => ProbeMsg::FileIoObserved,
+                    other => panic!("expected invalid file open failure, got {other:?}"),
+                },
+            )),
             ProbeMsg::InvalidResourceObserved => {
                 self.log
                     .borrow_mut()
                     .push(ProbeMsg::InvalidResourceObserved);
+                Effect::Noop
+            }
+            ProbeMsg::FileIoObserved => {
+                self.log.borrow_mut().push(ProbeMsg::FileIoObserved);
                 Effect::Noop
             }
         }
@@ -888,6 +1149,98 @@ impl Checker for FirstAcceptOrderChecker {
 }
 
 #[test]
+fn scripted_tcp_connect_client_round_trips_one_peer() {
+    let remote_addr = local_addr(42100);
+    let observed = Arc::new(Mutex::new(None));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 16,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: remote_addr,
+                    local_addr: remote_addr,
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(
+                        1,
+                        peer_addr(61001),
+                        vec![b"pong".to_vec()],
+                        Some(4),
+                        2,
+                    )],
+                }],
+            },
+            ..SimulatorConfig::default()
+        },
+    );
+    let client = sim.register(Client {
+        payload: b"ping".to_vec(),
+        pending_write: Vec::new(),
+        stream: None,
+        observed: Arc::clone(&observed),
+    });
+
+    sim.try_send(client, ClientMsg::Start(remote_addr)).unwrap();
+    sim.run_until_quiescent();
+    let artifact = sim.replay_artifact();
+
+    assert_eq!(
+        observed.lock().expect("observed mutex").as_deref(),
+        Some(&b"pong"[..])
+    );
+    assert_eq!(
+        artifact
+            .observed_peer_output()
+            .iter()
+            .map(ObservedPeerOutput::bytes)
+            .collect::<Vec<_>>(),
+        vec![b"ping".as_slice()]
+    );
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TcpConnect), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TcpWrite), 2);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TcpRead), 1);
+    assert_eq!(
+        count_call_completed(sim.trace(), CallKind::TcpStreamClose),
+        1
+    );
+}
+
+#[test]
+fn simulated_file_client_writes_syncs_reads_and_closes() {
+    let payload = b"simulated llama snapshot\n".to_vec();
+    let observed = Arc::new(Mutex::new(None));
+    let mut sim = Simulator::new(TestShard, SimulatorConfig::default());
+    let client = sim.register(FileClient {
+        payload: payload.clone(),
+        file: None,
+        size: None,
+        observed: Arc::clone(&observed),
+    });
+
+    sim.try_send(
+        client,
+        FileClientMsg::Start {
+            dir: PathBuf::from("/tmp/tina-sim"),
+            path: PathBuf::from("/tmp/tina-sim/snapshot.txt"),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        *observed.lock().expect("file observed mutex"),
+        Some((payload.len() as u64, payload))
+    );
+    assert_eq!(count_call_completed(sim.trace(), CallKind::Mkdir), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::FileOpen), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::FileWriteAt), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::FileFsync), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::FileSize), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::FileReadAt), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::FileClose), 1);
+}
+
+#[test]
 fn scripted_tcp_echo_round_trips_one_client_payload() {
     let payload = b"hello from simulated tcp".to_vec();
     let (run, listener_isolate) = run_echo_scenario(
@@ -1157,13 +1510,15 @@ fn invalid_tcp_resources_surface_failures() {
     });
     sim.try_send(probe, ProbeMsg::StartInvalidAccept).unwrap();
     sim.try_send(probe, ProbeMsg::StartInvalidRead).unwrap();
+    sim.try_send(probe, ProbeMsg::StartInvalidFileOpen).unwrap();
     sim.run_until_quiescent();
 
     assert_eq!(
         *log.borrow(),
         vec![
             ProbeMsg::InvalidResourceObserved,
-            ProbeMsg::InvalidResourceObserved
+            ProbeMsg::InvalidResourceObserved,
+            ProbeMsg::FileIoObserved,
         ]
     );
     assert!(sim.trace().iter().any(|event| {
@@ -1182,6 +1537,16 @@ fn invalid_tcp_resources_surface_failures() {
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpRead,
                 reason: CallError::InvalidResource,
+                ..
+            }
+        )
+    }));
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::FileOpen,
+                reason: CallError::Io,
                 ..
             }
         )

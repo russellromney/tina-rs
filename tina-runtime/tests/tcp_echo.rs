@@ -23,20 +23,23 @@ use std::alloc::Global;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use betelgeuse::io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO};
 use tina::{IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, BetelgeuseBackedSendObservedError,
-    BetelgeuseBackedTrySendError, CallCompletionRejectedReason, CallInput, CallKind, ListenerId,
-    MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId, tcp_accept,
-    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    BetelgeuseBackedTrySendError, CallCompletionRejectedReason, CallError, CallInput, CallKind,
+    FileId, ListenerId, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind,
+    StreamId, file_close, file_create, file_fsync, file_read, file_size, file_write, mkdir,
+    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -105,6 +108,8 @@ impl MailboxFactory for TestMailboxFactory {
 }
 
 type BoundAddr = Arc<Mutex<Option<SocketAddr>>>;
+type ClientObserved = Arc<Mutex<Option<Vec<u8>>>>;
+type FileObserved = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
 
 // ---------------------------------------------------------------------------
 // Connection handler isolate. One per accepted connection.
@@ -180,6 +185,148 @@ fn close_call(stream: StreamId) -> Effect<Connection> {
         Ok(()) => ConnectionEvent::Closed,
         Err(_) => ConnectionEvent::IoFailed,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Outbound client isolate. Tina owns the connect/write/read/close chain.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum OutboundClientEvent {
+    Start(SocketAddr),
+    Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
+    Wrote(Result<usize, CallError>),
+    Read(Result<Vec<u8>, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct OutboundClient {
+    payload: Vec<u8>,
+    pending_write: Vec<u8>,
+    stream: Option<StreamId>,
+    observed: ClientObserved,
+}
+
+impl Isolate for OutboundClient {
+    tina::isolate_types! {
+        message: OutboundClientEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<OutboundClientEvent>,
+        shard: TestShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            OutboundClientEvent::Start(addr) => {
+                tcp_connect(addr).reply(OutboundClientEvent::Connected)
+            }
+            OutboundClientEvent::Connected(Ok((stream, _local_addr, _peer_addr))) => {
+                self.stream = Some(stream);
+                self.pending_write = self.payload.clone();
+                tcp_write(stream, self.pending_write.clone()).reply(OutboundClientEvent::Wrote)
+            }
+            OutboundClientEvent::Wrote(Ok(count)) => {
+                let stream = self.stream.expect("stream set after connect");
+                if count >= self.pending_write.len() {
+                    self.pending_write.clear();
+                    tcp_read(stream, 4).reply(OutboundClientEvent::Read)
+                } else {
+                    self.pending_write.drain(..count);
+                    tcp_write(stream, self.pending_write.clone()).reply(OutboundClientEvent::Wrote)
+                }
+            }
+            OutboundClientEvent::Read(Ok(bytes)) => {
+                *self.observed.lock().expect("observed mutex") = Some(bytes);
+                let stream = self.stream.expect("stream set after connect");
+                tcp_close_stream(stream).reply(OutboundClientEvent::Closed)
+            }
+            OutboundClientEvent::Closed(Ok(())) => stop(),
+            OutboundClientEvent::Connected(Err(_))
+            | OutboundClientEvent::Wrote(Err(_))
+            | OutboundClientEvent::Read(Err(_))
+            | OutboundClientEvent::Closed(Err(_)) => stop(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File client isolate. Tina owns open/write/fsync/size/read/close.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum FileClientEvent {
+    Start { dir: PathBuf, path: PathBuf },
+    DirectoryMade(Result<(), CallError>, PathBuf),
+    Opened(Result<FileId, CallError>),
+    Wrote(Result<usize, CallError>),
+    Synced(Result<(), CallError>),
+    Sized(Result<u64, CallError>),
+    Read(Result<Vec<u8>, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct FileClient {
+    payload: Vec<u8>,
+    file: Option<FileId>,
+    size: Option<u64>,
+    observed: FileObserved,
+}
+
+impl Isolate for FileClient {
+    tina::isolate_types! {
+        message: FileClientEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<FileClientEvent>,
+        shard: TestShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            FileClientEvent::Start { dir, path } => {
+                mkdir(dir, 0o755).reply(move |result| FileClientEvent::DirectoryMade(result, path))
+            }
+            FileClientEvent::DirectoryMade(Ok(()), path) => {
+                file_create(path).reply(FileClientEvent::Opened)
+            }
+            FileClientEvent::Opened(Ok(file)) => {
+                self.file = Some(file);
+                file_write(file, self.payload.clone()).reply(FileClientEvent::Wrote)
+            }
+            FileClientEvent::Wrote(Ok(_)) => {
+                let file = self.file.expect("file set after open");
+                file_fsync(file).reply(FileClientEvent::Synced)
+            }
+            FileClientEvent::Synced(Ok(())) => {
+                let file = self.file.expect("file set after open");
+                file_size(file).reply(FileClientEvent::Sized)
+            }
+            FileClientEvent::Sized(Ok(size)) => {
+                self.size = Some(size);
+                let file = self.file.expect("file set after open");
+                file_read(file, size as usize).reply(FileClientEvent::Read)
+            }
+            FileClientEvent::Read(Ok(bytes)) => {
+                let size = self.size.expect("size set before read");
+                *self.observed.lock().expect("file observed mutex") = Some((size, bytes));
+                let file = self.file.expect("file set after open");
+                file_close(file).reply(FileClientEvent::Closed)
+            }
+            FileClientEvent::Closed(Ok(())) => stop(),
+            FileClientEvent::DirectoryMade(Err(_), _)
+            | FileClientEvent::Opened(Err(_))
+            | FileClientEvent::Wrote(Err(_))
+            | FileClientEvent::Synced(Err(_))
+            | FileClientEvent::Sized(Err(_))
+            | FileClientEvent::Read(Err(_))
+            | FileClientEvent::Closed(Err(_)) => stop(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +895,143 @@ fn run_threaded_simulated_betelgeuse_echo_scenario(
 // ---------------------------------------------------------------------------
 // Main echo test.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn tcp_connect_client_round_trips_against_local_server() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let server_addr = server.local_addr().expect("server local addr");
+    let server_thread = thread::spawn(move || {
+        let (mut stream, _) = server.accept().expect("server accepts tina client");
+        let mut request = [0_u8; 4];
+        stream
+            .read_exact(&mut request)
+            .expect("server reads request");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").expect("server writes reply");
+    });
+
+    let observed: ClientObserved = Arc::new(Mutex::new(None));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let client = runtime.register(
+        OutboundClient {
+            payload: b"ping".to_vec(),
+            pending_write: Vec::new(),
+            stream: None,
+            observed: Arc::clone(&observed),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(client, OutboundClientEvent::Start(server_addr))
+        .expect("client bootstrap accepts");
+
+    step_until(
+        &mut runtime,
+        Duration::from_secs(5),
+        "tcp connect client",
+        |runtime| {
+            observed.lock().expect("observed mutex").is_some()
+                && !runtime.has_in_flight_calls()
+                && runtime.trace().iter().any(|event| {
+                    event.isolate() == client.isolate()
+                        && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                })
+        },
+    );
+
+    server_thread.join().expect("server thread joins");
+    assert_eq!(
+        observed.lock().expect("observed mutex").as_deref(),
+        Some(&b"pong"[..])
+    );
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::TcpConnect),
+        1
+    );
+    assert_eq!(count_call_completed(runtime.trace(), CallKind::TcpWrite), 1);
+    assert_eq!(count_call_completed(runtime.trace(), CallKind::TcpRead), 1);
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::TcpStreamClose),
+        1
+    );
+}
+
+#[test]
+fn file_client_writes_syncs_reads_and_closes() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tina-runtime-file-client-{}-{unique}",
+        std::process::id()
+    ));
+    let path = dir.join("snapshot.txt");
+    let payload = b"llama config snapshot\n".to_vec();
+    let observed: FileObserved = Arc::new(Mutex::new(None));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let client = runtime.register(
+        FileClient {
+            payload: payload.clone(),
+            file: None,
+            size: None,
+            observed: Arc::clone(&observed),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(
+            client,
+            FileClientEvent::Start {
+                dir: dir.clone(),
+                path: path.clone(),
+            },
+        )
+        .expect("file client bootstrap accepts");
+
+    step_until(
+        &mut runtime,
+        Duration::from_secs(5),
+        "file client",
+        |runtime| {
+            observed.lock().expect("file observed mutex").is_some()
+                && !runtime.has_in_flight_calls()
+                && runtime.trace().iter().any(|event| {
+                    event.isolate() == client.isolate()
+                        && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                })
+        },
+    );
+
+    assert_eq!(
+        *observed.lock().expect("file observed mutex"),
+        Some((payload.len() as u64, payload.clone()))
+    );
+    assert_eq!(fs::read(&path).expect("read written file"), payload);
+    assert_eq!(count_call_completed(runtime.trace(), CallKind::Mkdir), 1);
+    assert_eq!(count_call_completed(runtime.trace(), CallKind::FileOpen), 1);
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::FileWriteAt),
+        1
+    );
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::FileFsync),
+        1
+    );
+    assert_eq!(count_call_completed(runtime.trace(), CallKind::FileSize), 1);
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::FileReadAt),
+        1
+    );
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::FileClose),
+        1
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
 
 #[test]
 fn tcp_echo_round_trips_one_client_payload() {

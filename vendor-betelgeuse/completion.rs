@@ -1,7 +1,7 @@
 //! Completion-based IO primitives shared by all backends.
 //!
 //! There is one concrete completion type per operation kind:
-//! [`AcceptCompletion`], [`RecvCompletion`], [`SendCompletion`],
+//! [`AcceptCompletion`], [`ConnectCompletion`], [`RecvCompletion`], [`SendCompletion`],
 //! [`PReadCompletion`], [`PWriteCompletion`], [`FsyncCompletion`],
 //! [`SizeCompletion`], [`MkdirCompletion`]. Each is a thin wrapper around
 //! [`CompletionInner`] (the shared state machine and operation slot) and
@@ -111,6 +111,11 @@ macro_rules! define_completion {
 define_completion!(
     /// Completion slot for an `accept(2)` operation. Yields the accepted socket.
     pub struct AcceptCompletion => io::Result<Box<dyn IOSocket>>
+);
+
+define_completion!(
+    /// Completion slot for a `connect(2)` operation.
+    pub struct ConnectCompletion => io::Result<()>
 );
 
 define_completion!(
@@ -255,6 +260,8 @@ pub enum Operation {
     Nop,
     /// Accept one connection from a listening socket.
     Accept(AcceptOp),
+    /// Connect one socket to a remote address.
+    Connect(ConnectOp),
     /// Receive bytes from a connected socket.
     Recv(RecvOp),
     /// Send bytes to a connected socket.
@@ -274,6 +281,14 @@ pub enum Operation {
 /// Payload for an `accept(2)` operation.
 pub struct AcceptOp {
     pub fd: RawFd,
+}
+
+/// Payload for a `connect(2)` operation.
+pub struct ConnectOp {
+    pub fd: RawFd,
+    pub addr: libc::sockaddr_storage,
+    pub len: libc::socklen_t,
+    pub attempted: bool,
 }
 
 /// Payload for a `recv(2)`-style operation.

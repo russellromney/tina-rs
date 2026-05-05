@@ -83,7 +83,8 @@ each restart for restartable children.
 `tina-runtime` is the explicit-step runtime. It handles same-shard sends,
 same-shard child spawn, supervision, restart, sends into the runtime from
 outside, bounded mailboxes, stale generation rejection, panic capture, abandon
-tracing, time calls, and Betelgeuse-backed TCP calls. Its `step()` is
+tracing, time calls, Betelgeuse-backed TCP calls, and runtime-owned local file
+calls. Its `step()` is
 synchronous from the outside: the runtime collects finished owned work,
 translates completions into messages, and then handles ready mailbox work.
 
@@ -105,9 +106,10 @@ seeded, step-driven substrate without OS sockets. Broader live-substrate
 liveness faults are not claimed.
 
 The shipped runtime call types are `RuntimeCall<Message>` over
-`CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep
-and TCP listener/stream operations. Sockets are runtime-owned opaque ids; raw
-sockets do not live in isolate state.
+`CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep,
+TCP listener/stream/client-connect operations, and local file operations.
+Sockets and files are runtime-owned opaque ids; raw sockets and file handles do
+not live in isolate state.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may directly cause many later events. Trace

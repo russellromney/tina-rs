@@ -30,6 +30,7 @@
 
 use std::any::Any;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tina::{Address, AddressGeneration, IsolateId, ShardId};
@@ -89,6 +90,78 @@ impl StreamId {
     }
 }
 
+/// Runtime-owned identifier for an opened file resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileId(u64);
+
+impl FileId {
+    /// Creates a file identifier from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw file identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Runtime-owned file open flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct FileOpenOptions {
+    /// Open the file for reading.
+    pub read: bool,
+    /// Open the file for writing.
+    pub write: bool,
+    /// Create the file if it does not already exist.
+    pub create: bool,
+    /// Truncate the file to zero length on open.
+    pub truncate: bool,
+}
+
+impl FileOpenOptions {
+    /// Opens an existing file for reading only.
+    pub const fn read_only() -> Self {
+        Self {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+        }
+    }
+
+    /// Opens an existing file for writing only.
+    pub const fn write_only() -> Self {
+        Self {
+            read: false,
+            write: true,
+            create: false,
+            truncate: false,
+        }
+    }
+
+    /// Opens an existing file for reading and writing.
+    pub const fn read_write() -> Self {
+        Self {
+            read: true,
+            write: true,
+            create: false,
+            truncate: false,
+        }
+    }
+
+    /// Opens a file for reading and writing, creating it if needed and
+    /// truncating any existing contents.
+    pub const fn read_write_create_truncate() -> Self {
+        Self {
+            read: true,
+            write: true,
+            create: true,
+            truncate: true,
+        }
+    }
+}
+
 /// One concrete call shape understood by `tina-runtime`.
 ///
 /// New verbs are added by extending this enum, not by adding a top-level
@@ -110,6 +183,12 @@ pub enum CallInput {
     TcpAccept {
         /// The listener to accept on.
         listener: ListenerId,
+    },
+
+    /// Connect one outbound TCP stream to `addr`.
+    TcpConnect {
+        /// The remote address to connect to.
+        addr: SocketAddr,
     },
 
     /// Read up to `max_len` bytes from a stream.
@@ -149,6 +228,60 @@ pub enum CallInput {
         stream: StreamId,
     },
 
+    /// Open a file and return a runtime-owned file id.
+    FileOpen {
+        /// Path to open.
+        path: PathBuf,
+        /// Open flags.
+        options: FileOpenOptions,
+    },
+
+    /// Read bytes from a file at `offset`.
+    FileReadAt {
+        /// The file to read.
+        file: FileId,
+        /// Maximum bytes to read.
+        len: usize,
+        /// File offset.
+        offset: u64,
+    },
+
+    /// Write bytes to a file at `offset`.
+    FileWriteAt {
+        /// The file to write.
+        file: FileId,
+        /// Bytes to write.
+        bytes: Vec<u8>,
+        /// File offset.
+        offset: u64,
+    },
+
+    /// Flush file data to stable storage.
+    FileFsync {
+        /// The file to flush.
+        file: FileId,
+    },
+
+    /// Query file size.
+    FileSize {
+        /// The file to query.
+        file: FileId,
+    },
+
+    /// Close a runtime-owned file resource.
+    FileClose {
+        /// The file to close.
+        file: FileId,
+    },
+
+    /// Create one directory.
+    Mkdir {
+        /// Directory path.
+        path: PathBuf,
+        /// Directory mode on Unix-like substrates.
+        mode: u32,
+    },
+
     /// Sleep for a relative duration.
     ///
     /// Completion fires no earlier than `armed_at + after` on a future
@@ -167,10 +300,18 @@ impl CallInput {
         match self {
             Self::TcpBind { .. } => crate::trace::CallKind::TcpBind,
             Self::TcpAccept { .. } => crate::trace::CallKind::TcpAccept,
+            Self::TcpConnect { .. } => crate::trace::CallKind::TcpConnect,
             Self::TcpRead { .. } => crate::trace::CallKind::TcpRead,
             Self::TcpWrite { .. } => crate::trace::CallKind::TcpWrite,
             Self::TcpListenerClose { .. } => crate::trace::CallKind::TcpListenerClose,
             Self::TcpStreamClose { .. } => crate::trace::CallKind::TcpStreamClose,
+            Self::FileOpen { .. } => crate::trace::CallKind::FileOpen,
+            Self::FileReadAt { .. } => crate::trace::CallKind::FileReadAt,
+            Self::FileWriteAt { .. } => crate::trace::CallKind::FileWriteAt,
+            Self::FileFsync { .. } => crate::trace::CallKind::FileFsync,
+            Self::FileSize { .. } => crate::trace::CallKind::FileSize,
+            Self::FileClose { .. } => crate::trace::CallKind::FileClose,
+            Self::Mkdir { .. } => crate::trace::CallKind::Mkdir,
             Self::Sleep { .. } => crate::trace::CallKind::Sleep,
         }
     }
@@ -197,6 +338,18 @@ pub enum CallOutput {
         peer_addr: SocketAddr,
     },
 
+    /// An outbound TCP connection completed.
+    TcpConnected {
+        /// The runtime-assigned stream identifier for the connected stream.
+        stream: StreamId,
+
+        /// The local address assigned to the stream.
+        local_addr: SocketAddr,
+
+        /// The remote peer address of the connected stream.
+        peer_addr: SocketAddr,
+    },
+
     /// A read returned `bytes`. An empty `bytes` vector means end of stream.
     TcpRead {
         /// The bytes the runtime read from the stream.
@@ -216,6 +369,39 @@ pub enum CallOutput {
 
     /// A stream was closed and its resources released.
     TcpStreamClosed,
+
+    /// A file was opened.
+    FileOpened {
+        /// The runtime-assigned file id.
+        file: FileId,
+    },
+
+    /// A positional file read completed.
+    FileRead {
+        /// The bytes read.
+        bytes: Vec<u8>,
+    },
+
+    /// A positional file write completed.
+    FileWrote {
+        /// The number of bytes written.
+        count: usize,
+    },
+
+    /// File data was flushed.
+    FileSynced,
+
+    /// File size was read.
+    FileSize {
+        /// File size in bytes.
+        size: u64,
+    },
+
+    /// A file resource was closed.
+    FileClosed,
+
+    /// A directory was created.
+    DirectoryCreated,
 
     /// A timer sleep completed and the isolate should wake.
     TimerFired,
@@ -751,6 +937,19 @@ impl CallOutput {
         }
     }
 
+    /// Extracts the successful TCP connect result.
+    pub fn into_tcp_connected(self) -> Result<(StreamId, SocketAddr, SocketAddr), CallError> {
+        match self {
+            Self::TcpConnected {
+                stream,
+                local_addr,
+                peer_addr,
+            } => Ok((stream, local_addr, peer_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpConnected", &other),
+        }
+    }
+
     /// Extracts the successful TCP read payload.
     pub fn into_tcp_read(self) -> Result<Vec<u8>, CallError> {
         match self {
@@ -784,6 +983,69 @@ impl CallOutput {
             Self::TcpStreamClosed => Ok(()),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TcpStreamClosed", &other),
+        }
+    }
+
+    /// Extracts the successful file open result.
+    pub fn into_file_opened(self) -> Result<FileId, CallError> {
+        match self {
+            Self::FileOpened { file } => Ok(file),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("FileOpened", &other),
+        }
+    }
+
+    /// Extracts the successful file read payload.
+    pub fn into_file_read(self) -> Result<Vec<u8>, CallError> {
+        match self {
+            Self::FileRead { bytes } => Ok(bytes),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("FileRead", &other),
+        }
+    }
+
+    /// Extracts the successful file write count.
+    pub fn into_file_wrote(self) -> Result<usize, CallError> {
+        match self {
+            Self::FileWrote { count } => Ok(count),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("FileWrote", &other),
+        }
+    }
+
+    /// Extracts the successful file fsync result.
+    pub fn into_file_synced(self) -> Result<(), CallError> {
+        match self {
+            Self::FileSynced => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("FileSynced", &other),
+        }
+    }
+
+    /// Extracts the successful file size result.
+    pub fn into_file_size(self) -> Result<u64, CallError> {
+        match self {
+            Self::FileSize { size } => Ok(size),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("FileSize", &other),
+        }
+    }
+
+    /// Extracts the successful file close result.
+    pub fn into_file_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::FileClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("FileClosed", &other),
+        }
+    }
+
+    /// Extracts the successful mkdir result.
+    pub fn into_directory_created(self) -> Result<(), CallError> {
+        match self {
+            Self::DirectoryCreated => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("DirectoryCreated", &other),
         }
     }
 }
@@ -994,6 +1256,15 @@ pub fn tcp_accept(listener: ListenerId) -> TypedCall<(StreamId, SocketAddr)> {
     )
 }
 
+/// Returns a typed TCP connect helper that later yields one stream id, local
+/// address, and peer address.
+pub fn tcp_connect(addr: SocketAddr) -> TypedCall<(StreamId, SocketAddr, SocketAddr)> {
+    TypedCall::new(
+        CallInput::TcpConnect { addr },
+        CallOutput::into_tcp_connected,
+    )
+}
+
 /// Returns a typed TCP read helper that later yields the bytes read.
 pub fn tcp_read(stream: StreamId, max_len: usize) -> TypedCall<Vec<u8>> {
     TypedCall::new(
@@ -1023,5 +1294,82 @@ pub fn tcp_close_stream(stream: StreamId) -> TypedCall<()> {
     TypedCall::new(
         CallInput::TcpStreamClose { stream },
         CallOutput::into_tcp_stream_closed,
+    )
+}
+
+/// Returns a typed file-open helper.
+pub fn file_open(path: impl Into<PathBuf>, options: FileOpenOptions) -> TypedCall<FileId> {
+    TypedCall::new(
+        CallInput::FileOpen {
+            path: path.into(),
+            options,
+        },
+        CallOutput::into_file_opened,
+    )
+}
+
+/// Opens a file for common snapshot-style use: read/write, create if missing,
+/// and truncate existing contents.
+pub fn file_create(path: impl Into<PathBuf>) -> TypedCall<FileId> {
+    file_open(path, FileOpenOptions::read_write_create_truncate())
+}
+
+/// Returns a typed positional file-read helper.
+pub fn file_read_at(file: FileId, len: usize, offset: u64) -> TypedCall<Vec<u8>> {
+    TypedCall::new(
+        CallInput::FileReadAt { file, len, offset },
+        CallOutput::into_file_read,
+    )
+}
+
+/// Returns a typed file-read helper at offset 0.
+pub fn file_read(file: FileId, len: usize) -> TypedCall<Vec<u8>> {
+    file_read_at(file, len, 0)
+}
+
+/// Returns a typed positional file-write helper.
+pub fn file_write_at(file: FileId, bytes: Vec<u8>, offset: u64) -> TypedCall<usize> {
+    TypedCall::new(
+        CallInput::FileWriteAt {
+            file,
+            bytes,
+            offset,
+        },
+        CallOutput::into_file_wrote,
+    )
+}
+
+/// Returns a typed file-write helper at offset 0.
+///
+/// The completion still reports the number of bytes written; callers that need
+/// full-write semantics should branch on that count and issue another
+/// runtime-owned write if needed.
+pub fn file_write(file: FileId, bytes: Vec<u8>) -> TypedCall<usize> {
+    file_write_at(file, bytes, 0)
+}
+
+/// Returns a typed file fsync helper.
+pub fn file_fsync(file: FileId) -> TypedCall<()> {
+    TypedCall::new(CallInput::FileFsync { file }, CallOutput::into_file_synced)
+}
+
+/// Returns a typed file-size helper.
+pub fn file_size(file: FileId) -> TypedCall<u64> {
+    TypedCall::new(CallInput::FileSize { file }, CallOutput::into_file_size)
+}
+
+/// Returns a typed file-close helper.
+pub fn file_close(file: FileId) -> TypedCall<()> {
+    TypedCall::new(CallInput::FileClose { file }, CallOutput::into_file_closed)
+}
+
+/// Returns a typed directory-create helper.
+pub fn mkdir(path: impl Into<PathBuf>, mode: u32) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::Mkdir {
+            path: path.into(),
+            mode,
+        },
+        CallOutput::into_directory_created,
     )
 }

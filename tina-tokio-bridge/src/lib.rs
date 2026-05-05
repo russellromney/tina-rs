@@ -404,6 +404,11 @@ impl<M, R> BridgeRequest<M, R> {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Borrows the user request without consuming the bridge responder.
+    pub fn request(&self) -> &M {
+        &self.message
+    }
+
     /// Splits the bridge request into the user message and responder.
     pub fn into_parts(self) -> (M, BridgeResponder<R>) {
         (self.message, self.responder)

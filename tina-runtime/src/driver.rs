@@ -24,10 +24,14 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use betelgeuse::{
-    AcceptCompletion, IO, IOLoop, IOLoopHandle, IOSocket, RecvCompletion, SendCompletion, io_loop,
+    AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOFile, IOLoop, IOLoopHandle,
+    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvCompletion,
+    SendCompletion, SizeCompletion, io_loop,
 };
 
-use crate::call::{CallError, CallId, CallInput, CallOutput, ListenerId, StreamId};
+use crate::call::{
+    CallError, CallId, CallInput, CallOutput, FileId, FileOpenOptions, ListenerId, StreamId,
+};
 
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
 const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
@@ -117,8 +121,10 @@ struct BetelgeuseTcp {
     io_loop: IOLoopHandle<Global>,
     next_listener_id: u64,
     next_stream_id: u64,
+    next_file_id: u64,
     listeners: Vec<ListenerEntry>,
     streams: Vec<StreamEntry>,
+    files: Vec<FileEntry>,
     pending: Vec<PendingOperation>,
 }
 
@@ -130,6 +136,11 @@ struct ListenerEntry {
 struct StreamEntry {
     id: StreamId,
     socket: Box<dyn IOSocket>,
+}
+
+struct FileEntry {
+    id: FileId,
+    file: Box<dyn IOFile>,
 }
 
 struct PendingOperation {
@@ -149,15 +160,30 @@ struct PendingOperation {
 /// stable handle used for cancellation and completion delivery.
 enum PendingKind {
     Accept(Box<AcceptCompletion>),
+    Connect {
+        completion: Box<ConnectCompletion>,
+        socket: Option<Box<dyn IOSocket>>,
+    },
     Read(Box<RecvCompletion>),
     Write(Box<SendCompletion>),
+    FileRead(Box<PReadCompletion>),
+    FileWrite(Box<PWriteCompletion>),
+    FileFsync(Box<FsyncCompletion>),
+    FileSize(Box<SizeCompletion>),
+    Mkdir(Box<MkdirCompletion>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingLane {
     ListenerAccept(ListenerId),
+    TcpConnect(CallId),
     StreamRead(StreamId),
     StreamWrite(StreamId),
+    FileRead(FileId),
+    FileWrite(FileId),
+    FileFsync(FileId),
+    FileSize(FileId),
+    Mkdir(CallId),
 }
 
 /// One completion the driver produced during [`RuntimeDriver::advance`].
@@ -260,8 +286,10 @@ impl BetelgeuseTcp {
             io_loop,
             next_listener_id: 1,
             next_stream_id: 1,
+            next_file_id: 1,
             listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            files: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             pending: Vec::with_capacity(INITIAL_DRIVER_PENDING_CAPACITY),
         }
     }
@@ -283,6 +311,117 @@ impl BetelgeuseTcp {
                 call_id,
                 result: self.do_stream_close(stream),
             }),
+            CallInput::FileOpen { path, options } => Some(DriverCompletion {
+                call_id,
+                result: self.do_file_open(&path, options),
+            }),
+            CallInput::FileClose { file } => Some(DriverCompletion {
+                call_id,
+                result: self.do_file_close(file),
+            }),
+            CallInput::Mkdir { path, mode } => {
+                let lane = PendingLane::Mkdir(call_id);
+                match self.arm_mkdir(&path, mode) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            cancelled: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
+            CallInput::FileReadAt { file, len, offset } => {
+                let lane = PendingLane::FileRead(file);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::ResourceBusy),
+                    });
+                }
+                match self.arm_file_read(file, len, offset) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            cancelled: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
+            CallInput::FileWriteAt {
+                file,
+                bytes,
+                offset,
+            } => {
+                let lane = PendingLane::FileWrite(file);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::ResourceBusy),
+                    });
+                }
+                match self.arm_file_write(file, bytes, offset) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            cancelled: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
+            CallInput::FileFsync { file } => {
+                let lane = PendingLane::FileFsync(file);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::ResourceBusy),
+                    });
+                }
+                match self.arm_file_fsync(file) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            cancelled: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
+            CallInput::FileSize { file } => {
+                let lane = PendingLane::FileSize(file);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::ResourceBusy),
+                    });
+                }
+                match self.arm_file_size(file) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            cancelled: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
             CallInput::TcpAccept { listener } => {
                 let lane = PendingLane::ListenerAccept(listener);
                 if self.lane_has_pending(lane) {
@@ -292,6 +431,21 @@ impl BetelgeuseTcp {
                     });
                 }
                 match self.arm_accept(listener) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            cancelled: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
+            CallInput::TcpConnect { addr } => {
+                let lane = PendingLane::TcpConnect(call_id);
+                match self.arm_connect(addr) {
                     Ok(pending) => {
                         self.pending.push(PendingOperation {
                             call_id,
@@ -366,6 +520,13 @@ impl BetelgeuseTcp {
     fn stream_has_active_pending(&self, stream: StreamId) -> bool {
         self.lane_has_active_pending(PendingLane::StreamRead(stream))
             || self.lane_has_active_pending(PendingLane::StreamWrite(stream))
+    }
+
+    fn file_has_active_pending(&self, file: FileId) -> bool {
+        self.lane_has_active_pending(PendingLane::FileRead(file))
+            || self.lane_has_active_pending(PendingLane::FileWrite(file))
+            || self.lane_has_active_pending(PendingLane::FileFsync(file))
+            || self.lane_has_active_pending(PendingLane::FileSize(file))
     }
 
     /// Advances Betelgeuse by one tick and harvests any pending operations
@@ -457,6 +618,7 @@ impl BetelgeuseTcp {
         for entry in std::mem::take(&mut self.streams) {
             entry.socket.close();
         }
+        self.files.clear();
     }
 
     fn drain_cancelled_pending_for_shutdown(&mut self) {
@@ -508,6 +670,39 @@ impl BetelgeuseTcp {
                     Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
+            PendingKind::Connect { completion, socket } => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("connect completion advertised a result");
+                match result {
+                    Ok(()) => {
+                        let socket = socket.take().expect("connected socket available");
+                        let local_addr = match socket.local_addr() {
+                            Ok(addr) => addr,
+                            Err(_) => return Some(CallOutput::Failed(CallError::Io)),
+                        };
+                        let peer_addr = match socket.peer_addr() {
+                            Ok(addr) => addr,
+                            Err(_) => return Some(CallOutput::Failed(CallError::Io)),
+                        };
+                        let stream_id = StreamId::new(self.next_stream_id);
+                        self.next_stream_id += 1;
+                        self.streams.push(StreamEntry {
+                            id: stream_id,
+                            socket,
+                        });
+                        Some(CallOutput::TcpConnected {
+                            stream: stream_id,
+                            local_addr,
+                            peer_addr,
+                        })
+                    }
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
             PendingKind::Read(completion) => {
                 if !completion.has_result() {
                     return None;
@@ -529,6 +724,66 @@ impl BetelgeuseTcp {
                     .expect("send completion advertised a result");
                 match result {
                     Ok(count) => Some(CallOutput::TcpWrote { count }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::FileRead(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("pread completion advertised a result");
+                match result {
+                    Ok(bytes) => Some(CallOutput::FileRead { bytes }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::FileWrite(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("pwrite completion advertised a result");
+                match result {
+                    Ok(count) => Some(CallOutput::FileWrote { count }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::FileFsync(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("fsync completion advertised a result");
+                match result {
+                    Ok(()) => Some(CallOutput::FileSynced),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::FileSize(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("size completion advertised a result");
+                match result {
+                    Ok(size) => Some(CallOutput::FileSize { size }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::Mkdir(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("mkdir completion advertised a result");
+                match result {
+                    Ok(()) => Some(CallOutput::DirectoryCreated),
                     Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
@@ -587,6 +842,37 @@ impl BetelgeuseTcp {
         }
     }
 
+    fn do_file_open(&mut self, path: &std::path::Path, options: FileOpenOptions) -> CallOutput {
+        let options = OpenOptions {
+            read: options.read,
+            write: options.write,
+            create: options.create,
+            truncate: options.truncate,
+        };
+        let file = match self.io_loop.open(path, options) {
+            Ok(file) => file,
+            Err(_) => return CallOutput::Failed(CallError::Io),
+        };
+        let id = FileId::new(self.next_file_id);
+        self.next_file_id += 1;
+        self.files.push(FileEntry { id, file });
+        CallOutput::FileOpened { file: id }
+    }
+
+    fn do_file_close(&mut self, file: FileId) -> CallOutput {
+        if self.file_has_active_pending(file) {
+            return CallOutput::Failed(CallError::ResourceBusy);
+        }
+
+        match self.files.iter().position(|entry| entry.id == file) {
+            Some(index) => {
+                self.files.remove(index);
+                CallOutput::FileClosed
+            }
+            None => CallOutput::Failed(CallError::InvalidResource),
+        }
+    }
+
     fn arm_accept(&mut self, listener: ListenerId) -> Result<PendingKind, CallOutput> {
         let entry = self
             .listeners
@@ -598,6 +884,21 @@ impl BetelgeuseTcp {
             return Err(CallOutput::Failed(CallError::Io));
         }
         Ok(PendingKind::Accept(completion))
+    }
+
+    fn arm_connect(&mut self, addr: SocketAddr) -> Result<PendingKind, CallOutput> {
+        let socket = self
+            .io_loop
+            .socket()
+            .map_err(|_| CallOutput::Failed(CallError::Io))?;
+        let mut completion = Box::new(ConnectCompletion::new());
+        if socket.connect(&mut completion, addr).is_err() {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::Connect {
+            completion,
+            socket: Some(socket),
+        })
     }
 
     fn arm_read(&mut self, stream: StreamId, max_len: usize) -> Result<PendingKind, CallOutput> {
@@ -625,14 +926,90 @@ impl BetelgeuseTcp {
         }
         Ok(PendingKind::Write(completion))
     }
+
+    fn arm_file_read(
+        &mut self,
+        file: FileId,
+        len: usize,
+        offset: u64,
+    ) -> Result<PendingKind, CallOutput> {
+        let entry = self
+            .files
+            .iter()
+            .find(|entry| entry.id == file)
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+        let mut completion = Box::new(PReadCompletion::new());
+        if entry.file.pread(&mut completion, len, offset).is_err() {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::FileRead(completion))
+    }
+
+    fn arm_file_write(
+        &mut self,
+        file: FileId,
+        bytes: Vec<u8>,
+        offset: u64,
+    ) -> Result<PendingKind, CallOutput> {
+        let entry = self
+            .files
+            .iter()
+            .find(|entry| entry.id == file)
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+        let mut completion = Box::new(PWriteCompletion::new());
+        if entry.file.pwrite(&mut completion, bytes, offset).is_err() {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::FileWrite(completion))
+    }
+
+    fn arm_file_fsync(&mut self, file: FileId) -> Result<PendingKind, CallOutput> {
+        let entry = self
+            .files
+            .iter()
+            .find(|entry| entry.id == file)
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+        let mut completion = Box::new(FsyncCompletion::new());
+        if entry.file.fsync(&mut completion).is_err() {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::FileFsync(completion))
+    }
+
+    fn arm_file_size(&mut self, file: FileId) -> Result<PendingKind, CallOutput> {
+        let entry = self
+            .files
+            .iter()
+            .find(|entry| entry.id == file)
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+        let mut completion = Box::new(SizeCompletion::new());
+        if entry.file.size(&mut completion).is_err() {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::FileSize(completion))
+    }
+
+    fn arm_mkdir(&mut self, path: &std::path::Path, mode: u32) -> Result<PendingKind, CallOutput> {
+        let mut completion = Box::new(MkdirCompletion::new());
+        if self.io_loop.mkdir(&mut completion, path, mode).is_err() {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::Mkdir(completion))
+    }
 }
 
 impl PendingKind {
     fn has_result(&self) -> bool {
         match self {
             Self::Accept(completion) => completion.has_result(),
+            Self::Connect { completion, .. } => completion.has_result(),
             Self::Read(completion) => completion.has_result(),
             Self::Write(completion) => completion.has_result(),
+            Self::FileRead(completion) => completion.has_result(),
+            Self::FileWrite(completion) => completion.has_result(),
+            Self::FileFsync(completion) => completion.has_result(),
+            Self::FileSize(completion) => completion.has_result(),
+            Self::Mkdir(completion) => completion.has_result(),
         }
     }
 }
@@ -653,6 +1030,7 @@ impl std::fmt::Debug for BetelgeuseTcp {
             .debug_struct("BetelgeuseTcp")
             .field("listeners", &self.listeners.len())
             .field("streams", &self.streams.len())
+            .field("files", &self.files.len())
             .field("pending", &self.pending.len())
             .finish_non_exhaustive()
     }

@@ -54,10 +54,11 @@ mod driver;
 mod trace;
 
 pub use call::{
-    CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, IntoErasedCall, IsolateCall,
-    ListenerId, RuntimeCall, RuntimeCallParts, SendOutcome, StreamId, TypedCall, call,
-    send_observed, sleep, sleep_then, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_read, tcp_write,
+    CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
+    IntoErasedCall, IsolateCall, ListenerId, RuntimeCall, RuntimeCallParts, SendOutcome, StreamId,
+    TypedCall, call, file_close, file_create, file_fsync, file_open, file_read, file_read_at,
+    file_size, file_write, file_write_at, mkdir, send_observed, sleep, sleep_then, tcp_accept,
+    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 use driver::DriverCompletion;
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).

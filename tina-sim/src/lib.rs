@@ -46,6 +46,7 @@ use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -438,9 +439,15 @@ struct PendingIsolateCall {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TcpResourceKey {
+    TcpConnect(CallId),
     ListenerAccept(ListenerId),
     StreamRead(tina_runtime::StreamId),
     StreamWrite(tina_runtime::StreamId),
+    FileRead(tina_runtime::FileId),
+    FileWrite(tina_runtime::FileId),
+    FileFsync(tina_runtime::FileId),
+    FileSize(tina_runtime::FileId),
+    Mkdir(CallId),
 }
 
 #[derive(Debug)]
@@ -456,6 +463,13 @@ struct PendingTcpCompletion {
 struct PendingAccept {
     call_id: CallId,
     listener: ListenerId,
+    insertion_order: u64,
+}
+
+#[derive(Debug)]
+struct PendingConnect {
+    call_id: CallId,
+    addr: SocketAddr,
     insertion_order: u64,
 }
 
@@ -490,6 +504,14 @@ struct StreamState {
     write_cap: usize,
     output_capacity: usize,
     output: Vec<u8>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct FileState {
+    id: tina_runtime::FileId,
+    path: PathBuf,
+    options: tina_runtime::FileOpenOptions,
     closed: bool,
 }
 
@@ -892,6 +914,7 @@ where
     next_isolate_id: u64,
     next_listener_id: u64,
     next_stream_id: u64,
+    next_file_id: u64,
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
     virtual_now: Duration,
@@ -902,7 +925,11 @@ where
     next_tcp_completion_ordinal: u64,
     listeners: Vec<ListenerState>,
     streams: Vec<StreamState>,
+    files: Vec<FileState>,
+    file_storage: BTreeMap<PathBuf, Vec<u8>>,
+    directories: Vec<PathBuf>,
     pending_accepts: Vec<PendingAccept>,
+    pending_connects: Vec<PendingConnect>,
     pending_tcp_completions: Vec<PendingTcpCompletion>,
     in_flight_calls: Vec<InFlightCall>,
     translators: Vec<StoredTranslator>,
@@ -931,6 +958,7 @@ where
             next_isolate_id: 1,
             next_listener_id: 1,
             next_stream_id: 1,
+            next_file_id: 1,
             ids,
             trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
             virtual_now: Duration::ZERO,
@@ -941,7 +969,11 @@ where
             next_tcp_completion_ordinal: 0,
             listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            files: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            file_storage: BTreeMap::new(),
+            directories: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             pending_accepts: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_connects: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_tcp_completions: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             in_flight_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             translators: Vec::with_capacity(INITIAL_CALL_CAPACITY),
@@ -974,6 +1006,7 @@ where
             || !self.timers.is_empty()
             || !self.pending_tcp_completions.is_empty()
             || !self.pending_accepts.is_empty()
+            || !self.pending_connects.is_empty()
             || !self.pending_isolate_calls.is_empty()
     }
 
@@ -1921,6 +1954,7 @@ where
             }
             CallInput::TcpBind { addr } => self.handle_tcp_bind(call_id, addr),
             CallInput::TcpAccept { listener } => self.handle_tcp_accept(call_id, listener),
+            CallInput::TcpConnect { addr } => self.handle_tcp_connect(call_id, addr),
             CallInput::TcpRead { stream, max_len } => {
                 self.handle_tcp_read(call_id, stream, max_len)
             }
@@ -1929,6 +1963,19 @@ where
                 self.handle_tcp_listener_close(call_id, listener)
             }
             CallInput::TcpStreamClose { stream } => self.handle_tcp_stream_close(call_id, stream),
+            CallInput::FileOpen { path, options } => self.handle_file_open(call_id, path, options),
+            CallInput::FileReadAt { file, len, offset } => {
+                self.handle_file_read_at(call_id, file, len, offset)
+            }
+            CallInput::FileWriteAt {
+                file,
+                bytes,
+                offset,
+            } => self.handle_file_write_at(call_id, file, bytes, offset),
+            CallInput::FileFsync { file } => self.handle_file_fsync(call_id, file),
+            CallInput::FileSize { file } => self.handle_file_size(call_id, file),
+            CallInput::FileClose { file } => self.handle_file_close(call_id, file),
+            CallInput::Mkdir { path, .. } => self.handle_mkdir(call_id, path),
         }
     }
 
@@ -2162,6 +2209,46 @@ where
         );
     }
 
+    fn handle_tcp_connect(&mut self, call_id: CallId, addr: SocketAddr) {
+        let Some(listener_index) = self.ensure_connect_listener(addr) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        };
+
+        if self.listeners[listener_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+
+        self.promote_ready_peers(listener_index);
+        if let Some(peer) = self.listeners[listener_index].ready_peers.pop_front() {
+            let (stream, local_addr, peer_addr) = self.open_connected_stream_from_peer(peer, addr);
+            self.schedule_tcp_completion(
+                call_id,
+                TcpResourceKey::TcpConnect(call_id),
+                CallOutput::TcpConnected {
+                    stream,
+                    local_addr,
+                    peer_addr,
+                },
+            );
+            return;
+        }
+
+        if self.listeners[listener_index].future_peers.is_empty() {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+
+        let insertion_order = self.next_tcp_completion_ordinal;
+        self.next_tcp_completion_ordinal += 1;
+        self.pending_connects.push(PendingConnect {
+            call_id,
+            addr,
+            insertion_order,
+        });
+    }
+
     fn handle_tcp_accept(&mut self, call_id: CallId, listener: ListenerId) {
         let Some(listener_index) = self.listener_index(listener) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
@@ -2286,13 +2373,218 @@ where
         self.deliver_completion(call_id, CallOutput::TcpStreamClosed);
     }
 
+    fn handle_file_open(
+        &mut self,
+        call_id: CallId,
+        path: PathBuf,
+        options: tina_runtime::FileOpenOptions,
+    ) {
+        if !options.read && !options.write {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        if (options.create || options.truncate) && !options.write {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        if !self.file_storage.contains_key(&path) && !options.create {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        if options.create && !self.parent_directory_exists(&path) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+
+        if options.truncate || !self.file_storage.contains_key(&path) {
+            self.file_storage.insert(path.clone(), Vec::new());
+        }
+        let id = tina_runtime::FileId::new(self.next_file_id);
+        self.next_file_id += 1;
+        self.files.push(FileState {
+            id,
+            path,
+            options,
+            closed: false,
+        });
+        self.deliver_completion(call_id, CallOutput::FileOpened { file: id });
+    }
+
+    fn handle_file_read_at(
+        &mut self,
+        call_id: CallId,
+        file: tina_runtime::FileId,
+        len: usize,
+        offset: u64,
+    ) {
+        let Some(index) = self.file_index(file) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.file_has_active_pending(file) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        if !self.files[index].options.read {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        let start = offset as usize;
+        let bytes = self
+            .file_storage
+            .get(&self.files[index].path)
+            .unwrap_or_else(|| panic!("open file has no simulated storage"))
+            .get(start..)
+            .unwrap_or(&[])
+            .iter()
+            .take(len)
+            .copied()
+            .collect();
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::FileRead(file),
+            CallOutput::FileRead { bytes },
+        );
+    }
+
+    fn handle_file_write_at(
+        &mut self,
+        call_id: CallId,
+        file: tina_runtime::FileId,
+        bytes: Vec<u8>,
+        offset: u64,
+    ) {
+        let Some(index) = self.file_index(file) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.file_has_active_pending(file) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        if !self.files[index].options.write {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        let path = self.files[index].path.clone();
+        let start = offset as usize;
+        let end = start.saturating_add(bytes.len());
+        let storage = self
+            .file_storage
+            .get_mut(&path)
+            .unwrap_or_else(|| panic!("open file has no simulated storage"));
+        if storage.len() < end {
+            storage.resize(end, 0);
+        }
+        storage[start..end].copy_from_slice(&bytes);
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::FileWrite(file),
+            CallOutput::FileWrote { count: bytes.len() },
+        );
+    }
+
+    fn handle_file_fsync(&mut self, call_id: CallId, file: tina_runtime::FileId) {
+        if self.file_index(file).is_none() {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        let index = self.file_index(file).expect("file checked above");
+        if !self.files[index].options.write {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        if self.file_has_active_pending(file) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::FileFsync(file),
+            CallOutput::FileSynced,
+        );
+    }
+
+    fn handle_file_size(&mut self, call_id: CallId, file: tina_runtime::FileId) {
+        let Some(index) = self.file_index(file) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.file_has_active_pending(file) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        let size = self
+            .file_storage
+            .get(&self.files[index].path)
+            .unwrap_or_else(|| panic!("open file has no simulated storage"))
+            .len() as u64;
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::FileSize(file),
+            CallOutput::FileSize { size },
+        );
+    }
+
+    fn handle_file_close(&mut self, call_id: CallId, file: tina_runtime::FileId) {
+        if self.file_has_active_pending(file) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        let Some(index) = self.file_index(file) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        self.files[index].closed = true;
+        self.deliver_completion(call_id, CallOutput::FileClosed);
+    }
+
+    fn handle_mkdir(&mut self, call_id: CallId, path: PathBuf) {
+        if self.directories.iter().any(|existing| existing == &path) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        if !self.parent_directory_exists(&path) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        self.directories.push(path);
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::Mkdir(call_id),
+            CallOutput::DirectoryCreated,
+        );
+    }
+
+    fn parent_directory_exists(&self, path: &std::path::Path) -> bool {
+        let Some(parent) = path.parent() else {
+            return true;
+        };
+        if parent.as_os_str().is_empty()
+            || parent == std::path::Path::new("/")
+            || parent == std::path::Path::new("/tmp")
+        {
+            return true;
+        }
+        self.directories
+            .iter()
+            .any(|directory| directory.as_path() == parent)
+    }
+
     fn resource_has_active_pending(&self, resource: TcpResourceKey) -> bool {
         let queued_accept = match resource {
             TcpResourceKey::ListenerAccept(listener) => self
                 .pending_accepts
                 .iter()
                 .any(|pending| pending.listener == listener),
-            TcpResourceKey::StreamRead(_) | TcpResourceKey::StreamWrite(_) => false,
+            TcpResourceKey::TcpConnect(_)
+            | TcpResourceKey::StreamRead(_)
+            | TcpResourceKey::StreamWrite(_)
+            | TcpResourceKey::FileRead(_)
+            | TcpResourceKey::FileWrite(_)
+            | TcpResourceKey::FileFsync(_)
+            | TcpResourceKey::FileSize(_)
+            | TcpResourceKey::Mkdir(_) => false,
         };
         queued_accept
             || self
@@ -2304,6 +2596,19 @@ where
     fn stream_has_active_pending(&self, stream: tina_runtime::StreamId) -> bool {
         self.resource_has_active_pending(TcpResourceKey::StreamRead(stream))
             || self.resource_has_active_pending(TcpResourceKey::StreamWrite(stream))
+    }
+
+    fn file_index(&self, file: tina_runtime::FileId) -> Option<usize> {
+        self.files
+            .iter()
+            .position(|state| state.id == file && !state.closed)
+    }
+
+    fn file_has_active_pending(&self, file: tina_runtime::FileId) -> bool {
+        self.resource_has_active_pending(TcpResourceKey::FileRead(file))
+            || self.resource_has_active_pending(TcpResourceKey::FileWrite(file))
+            || self.resource_has_active_pending(TcpResourceKey::FileFsync(file))
+            || self.resource_has_active_pending(TcpResourceKey::FileSize(file))
     }
 
     fn schedule_tcp_completion(
@@ -2342,8 +2647,70 @@ where
         self.listeners.iter().position(|state| state.id == listener)
     }
 
+    fn connect_listener_index(&self, addr: SocketAddr) -> Option<usize> {
+        self.listeners.iter().position(|state| {
+            !state.closed && (state.bind_addr == addr || state.local_addr == addr)
+        })
+    }
+
+    fn ensure_connect_listener(&mut self, addr: SocketAddr) -> Option<usize> {
+        if let Some(index) = self.connect_listener_index(addr) {
+            return Some(index);
+        }
+
+        let script = self
+            .config
+            .tcp
+            .listeners
+            .iter()
+            .find(|listener| listener.bind_addr == addr || listener.local_addr == addr)
+            .cloned()?;
+        let listener = self.listener_from_script(script);
+        let index = self.listeners.len();
+        self.listeners.push(listener);
+        Some(index)
+    }
+
     fn stream_index(&self, stream: tina_runtime::StreamId) -> Option<usize> {
         self.streams.iter().position(|state| state.id == stream)
+    }
+
+    fn listener_from_script(&mut self, script: ScriptedListenerConfig) -> ListenerState {
+        let listener = ListenerState {
+            id: ListenerId::new(self.next_listener_id),
+            bind_addr: script.bind_addr,
+            local_addr: script.local_addr,
+            backlog_capacity: script.backlog_capacity,
+            future_peers: script
+                .peers
+                .into_iter()
+                .map(|peer| {
+                    let inbound_len = peer.inbound_chunks.iter().map(Vec::len).sum::<usize>();
+                    if inbound_len > peer.inbound_capacity {
+                        panic!(
+                            "scripted peer {} exceeds inbound_capacity {} with {} bytes",
+                            peer.peer_addr, peer.inbound_capacity, inbound_len
+                        );
+                    }
+                    if peer.write_cap == 0 {
+                        panic!("scripted peer {} configured write_cap 0", peer.peer_addr);
+                    }
+                    ScriptedPeerState {
+                        accept_after_step: peer.accept_after_step,
+                        peer_addr: peer.peer_addr,
+                        inbound_chunks: VecDeque::from(peer.inbound_chunks),
+                        read_chunk_cap: peer.read_chunk_cap,
+                        write_cap: peer.write_cap,
+                        output_capacity: peer.output_capacity,
+                        output: Vec::new(),
+                    }
+                })
+                .collect(),
+            ready_peers: VecDeque::new(),
+            closed: false,
+        };
+        self.next_listener_id += 1;
+        listener
     }
 
     fn promote_ready_peers(&mut self, listener_index: usize) {
@@ -2381,6 +2748,27 @@ where
             closed: false,
         });
         (stream, peer_addr)
+    }
+
+    fn open_connected_stream_from_peer(
+        &mut self,
+        peer: ScriptedPeerState,
+        remote_addr: SocketAddr,
+    ) -> (tina_runtime::StreamId, SocketAddr, SocketAddr) {
+        let stream = tina_runtime::StreamId::new(self.next_stream_id);
+        self.next_stream_id += 1;
+        let local_addr = peer.peer_addr;
+        self.streams.push(StreamState {
+            id: stream,
+            peer_addr: remote_addr,
+            inbound_chunks: peer.inbound_chunks,
+            read_chunk_cap: peer.read_chunk_cap,
+            write_cap: peer.write_cap,
+            output_capacity: peer.output_capacity,
+            output: peer.output,
+            closed: false,
+        });
+        (stream, local_addr, remote_addr)
     }
 
     fn stream_read_result(&mut self, stream_index: usize, max_len: usize) -> Option<CallOutput> {
@@ -2441,6 +2829,7 @@ where
     }
 
     fn harvest_tcp(&mut self) {
+        self.activate_pending_connects();
         self.activate_pending_accepts();
 
         let mut ready = Vec::new();
@@ -2506,6 +2895,43 @@ where
             }
         }
         self.pending_accepts = survivors;
+    }
+
+    fn activate_pending_connects(&mut self) {
+        let mut survivors = Vec::new();
+        let mut pending = std::mem::take(&mut self.pending_connects);
+        pending.sort_by_key(|entry| entry.insertion_order);
+        for pending_connect in pending {
+            let Some(listener_index) = self.ensure_connect_listener(pending_connect.addr) else {
+                self.deliver_completion(pending_connect.call_id, CallOutput::Failed(CallError::Io));
+                continue;
+            };
+            if self.listeners[listener_index].closed {
+                self.deliver_completion(
+                    pending_connect.call_id,
+                    CallOutput::Failed(CallError::InvalidResource),
+                );
+                continue;
+            }
+
+            self.promote_ready_peers(listener_index);
+            if let Some(peer) = self.listeners[listener_index].ready_peers.pop_front() {
+                let (stream, local_addr, peer_addr) =
+                    self.open_connected_stream_from_peer(peer, pending_connect.addr);
+                self.schedule_tcp_completion(
+                    pending_connect.call_id,
+                    TcpResourceKey::TcpConnect(pending_connect.call_id),
+                    CallOutput::TcpConnected {
+                        stream,
+                        local_addr,
+                        peer_addr,
+                    },
+                );
+            } else {
+                survivors.push(pending_connect);
+            }
+        }
+        self.pending_connects = survivors;
     }
 
     fn order_ready_tcp_completions(&self, ready: &mut [PendingTcpCompletion]) {
@@ -3175,6 +3601,8 @@ where
         self.timers.retain(|timer| timer.call_id != call_id);
         self.pending_accepts
             .retain(|pending| pending.call_id != call_id);
+        self.pending_connects
+            .retain(|pending| pending.call_id != call_id);
         self.pending_tcp_completions
             .retain(|completion| completion.call_id != call_id);
     }
@@ -3236,10 +3664,18 @@ fn call_kind(request: &CallInput) -> CallKind {
     match request {
         CallInput::TcpBind { .. } => CallKind::TcpBind,
         CallInput::TcpAccept { .. } => CallKind::TcpAccept,
+        CallInput::TcpConnect { .. } => CallKind::TcpConnect,
         CallInput::TcpRead { .. } => CallKind::TcpRead,
         CallInput::TcpWrite { .. } => CallKind::TcpWrite,
         CallInput::TcpListenerClose { .. } => CallKind::TcpListenerClose,
         CallInput::TcpStreamClose { .. } => CallKind::TcpStreamClose,
+        CallInput::FileOpen { .. } => CallKind::FileOpen,
+        CallInput::FileReadAt { .. } => CallKind::FileReadAt,
+        CallInput::FileWriteAt { .. } => CallKind::FileWriteAt,
+        CallInput::FileFsync { .. } => CallKind::FileFsync,
+        CallInput::FileSize { .. } => CallKind::FileSize,
+        CallInput::FileClose { .. } => CallKind::FileClose,
+        CallInput::Mkdir { .. } => CallKind::Mkdir,
         CallInput::Sleep { .. } => CallKind::Sleep,
     }
 }

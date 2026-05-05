@@ -13,15 +13,15 @@
 use std::{
     alloc::Allocator,
     collections::{BTreeMap, VecDeque},
-    io,
+    io, mem,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
 };
 
 use crate::{
-    AcceptCompletion, AcceptOp, IO, IOFile, IOLoop, IOLoopHandle, IOSocket, OpenOptions, Operation,
-    RecvCompletion, RecvOp, SendCompletion, SendOp,
+    AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, IO, IOFile, IOLoop, IOLoopHandle,
+    IOSocket, OpenOptions, Operation, RecvCompletion, RecvOp, SendCompletion, SendOp,
 };
 
 /// Deterministic simulated I/O backend configuration.
@@ -124,6 +124,7 @@ impl SimulatedIO {
                 inbound: VecDeque::from(input),
                 peer_input_closed: true,
                 peer_output: Vec::new(),
+                peer_stream_id: None,
                 backlog: VecDeque::new(),
             },
         );
@@ -246,10 +247,17 @@ struct SimulatedSocketState {
     inbound: VecDeque<u8>,
     peer_input_closed: bool,
     peer_output: Vec<u8>,
+    peer_stream_id: Option<i32>,
     backlog: VecDeque<i32>,
 }
 
 enum SimulatedPendingOp {
+    Connect {
+        socket_id: i32,
+        addr: SocketAddr,
+        completion: usize,
+        delay: Option<u64>,
+    },
     Accept {
         socket_id: i32,
         completion: usize,
@@ -343,6 +351,39 @@ impl IOSocket for SimulatedSocket {
             .push_back(SimulatedPendingOp::Accept {
                 socket_id,
                 completion: c as *mut AcceptCompletion as usize,
+                delay: None,
+            });
+        Ok(())
+    }
+
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
+        let state = self.state.lock().expect("simulated io mutex");
+        let socket_id = *self.socket_id.lock().expect("socket id mutex");
+        let socket = state
+            .sockets
+            .get(&socket_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "socket missing"))?;
+        if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Unbound) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connect requires an unbound socket",
+            ));
+        }
+        drop(state);
+        c.inner_mut().prepare(Operation::Connect(ConnectOp {
+            fd: socket_id,
+            addr: unsafe { mem::zeroed() },
+            len: 0,
+            attempted: false,
+        }));
+        self.state
+            .lock()
+            .expect("simulated io mutex")
+            .pending
+            .push_back(SimulatedPendingOp::Connect {
+                socket_id,
+                addr,
+                completion: c as *mut ConnectCompletion as usize,
                 delay: None,
             });
         Ok(())
@@ -446,6 +487,7 @@ impl IO for SimulatedIO {
                 inbound: VecDeque::new(),
                 peer_input_closed: true,
                 peer_output: Vec::new(),
+                peer_stream_id: None,
                 backlog: VecDeque::new(),
             },
         );
@@ -518,14 +560,80 @@ impl IOLoop for SimulatedIO {
 impl SimulatedPendingOp {
     fn delay_mut(&mut self) -> &mut Option<u64> {
         match self {
-            Self::Accept { delay, .. } | Self::Recv { delay, .. } | Self::Send { delay, .. } => {
-                delay
-            }
+            Self::Connect { delay, .. }
+            | Self::Accept { delay, .. }
+            | Self::Recv { delay, .. }
+            | Self::Send { delay, .. } => delay,
         }
     }
 
     fn ready_result(&mut self, state: &mut SimulatedState) -> Option<SimulatedReadyResult> {
         match self {
+            Self::Connect {
+                socket_id, addr, ..
+            } => {
+                let listener_id = match state.listeners_by_addr.get(addr).copied() {
+                    Some(listener_id) => listener_id,
+                    None => {
+                        return Some(SimulatedReadyResult::Connect(Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "simulated listener not found",
+                        ))));
+                    }
+                };
+                let listener = state.sockets.get(&listener_id)?;
+                if listener.closed || !matches!(listener.kind, SimulatedSocketKind::Listener) {
+                    return Some(SimulatedReadyResult::Connect(Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "simulated listener closed",
+                    ))));
+                }
+
+                let client_local =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), state.allocate_peer_port());
+                let server_stream_id = state.allocate_socket_id();
+                let server_peer_addr = client_local;
+
+                let Some(client) = state.sockets.get_mut(socket_id) else {
+                    return Some(SimulatedReadyResult::Connect(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "client socket missing",
+                    ))));
+                };
+                if client.closed || !matches!(client.kind, SimulatedSocketKind::Unbound) {
+                    return Some(SimulatedReadyResult::Connect(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "client socket no longer connectable",
+                    ))));
+                }
+                client.kind = SimulatedSocketKind::Stream;
+                client.local_addr = Some(client_local);
+                client.peer_addr = Some(*addr);
+                client.peer_input_closed = false;
+                client.peer_stream_id = Some(server_stream_id);
+
+                state.sockets.insert(
+                    server_stream_id,
+                    SimulatedSocketState {
+                        kind: SimulatedSocketKind::Stream,
+                        local_addr: Some(*addr),
+                        peer_addr: Some(server_peer_addr),
+                        closed: false,
+                        inbound: VecDeque::new(),
+                        peer_input_closed: false,
+                        peer_output: Vec::new(),
+                        peer_stream_id: Some(*socket_id),
+                        backlog: VecDeque::new(),
+                    },
+                );
+                state
+                    .sockets
+                    .get_mut(&listener_id)
+                    .expect("listener checked above")
+                    .backlog
+                    .push_back(server_stream_id);
+                Some(SimulatedReadyResult::Connect(Ok(())))
+            }
             Self::Accept { socket_id, .. } => {
                 let listener = state.sockets.get_mut(socket_id)?;
                 if listener.closed {
@@ -574,7 +682,23 @@ impl SimulatedPendingOp {
                     ))));
                 }
                 let count = max_count.min(bytes.len());
-                stream.peer_output.extend_from_slice(&bytes[..count]);
+                if let Some(peer_stream_id) = stream.peer_stream_id {
+                    let Some(peer) = state.sockets.get_mut(&peer_stream_id) else {
+                        return Some(SimulatedReadyResult::Send(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "peer stream missing",
+                        ))));
+                    };
+                    if peer.closed {
+                        return Some(SimulatedReadyResult::Send(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "peer stream closed",
+                        ))));
+                    }
+                    peer.inbound.extend(bytes[..count].iter().copied());
+                } else {
+                    stream.peer_output.extend_from_slice(&bytes[..count]);
+                }
                 Some(SimulatedReadyResult::Send(Ok(count)))
             }
         }
@@ -582,6 +706,10 @@ impl SimulatedPendingOp {
 
     fn is_ready(&self, state: &SimulatedState) -> bool {
         match self {
+            Self::Connect { socket_id, .. } => match state.sockets.get(socket_id) {
+                Some(socket) if !socket.closed => true,
+                _ => true,
+            },
             Self::Accept { socket_id, .. } => match state.sockets.get(socket_id) {
                 Some(listener) if !listener.closed => !listener.backlog.is_empty(),
                 _ => true,
@@ -598,6 +726,9 @@ impl SimulatedPendingOp {
 
     fn complete(self, result: SimulatedReadyResult, state: &Arc<Mutex<SimulatedState>>) {
         match (self, result) {
+            (Self::Connect { completion, .. }, SimulatedReadyResult::Connect(result)) => unsafe {
+                (&mut *(completion as *mut ConnectCompletion)).complete(result);
+            },
             (Self::Accept { completion, .. }, SimulatedReadyResult::Accept(Ok(stream_id))) => unsafe {
                 let completion = &mut *(completion as *mut AcceptCompletion);
                 completion.complete(Ok(Box::new(SimulatedSocket {
@@ -621,6 +752,9 @@ impl SimulatedPendingOp {
     fn complete_cancelled(self) {
         let error = || io::Error::new(io::ErrorKind::Interrupted, "simulated operation cancelled");
         match self {
+            Self::Connect { completion, .. } => unsafe {
+                (&mut *(completion as *mut ConnectCompletion)).complete(Err(error()));
+            },
             Self::Accept { completion, .. } => unsafe {
                 (&mut *(completion as *mut AcceptCompletion)).complete(Err(error()));
             },
@@ -635,6 +769,7 @@ impl SimulatedPendingOp {
 }
 
 enum SimulatedReadyResult {
+    Connect(io::Result<()>),
     Accept(io::Result<i32>),
     Recv(io::Result<Vec<u8>>),
     Send(io::Result<usize>),

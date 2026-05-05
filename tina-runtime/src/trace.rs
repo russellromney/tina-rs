@@ -81,6 +81,9 @@ pub enum CallKind {
     /// A TCP listener accept.
     TcpAccept,
 
+    /// An outbound TCP connect.
+    TcpConnect,
+
     /// A TCP stream read.
     TcpRead,
 
@@ -92,6 +95,27 @@ pub enum CallKind {
 
     /// A TCP stream close.
     TcpStreamClose,
+
+    /// A file open.
+    FileOpen,
+
+    /// A positional file read.
+    FileReadAt,
+
+    /// A positional file write.
+    FileWriteAt,
+
+    /// A file fsync.
+    FileFsync,
+
+    /// A file size query.
+    FileSize,
+
+    /// A file close.
+    FileClose,
+
+    /// A directory create.
+    Mkdir,
 
     /// A one-shot relative sleep timer.
     Sleep,

@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,8 +14,8 @@ use axum::routing::get;
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, LocalApp, MailboxFactory,
-    RuntimeEventKind, sleep,
+    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, FileId, LocalApp, MailboxFactory,
+    RuntimeEventKind, file_close, file_create, file_fsync, file_read, file_size, file_write, sleep,
 };
 use tina_tokio_bridge::{
     BRIDGE_CAPABILITIES, BridgeBackpressure, BridgeError, BridgeHandle, BridgeHealth, BridgeHost,
@@ -507,6 +509,179 @@ impl ScheduledWorker {
     }
 }
 
+#[derive(Debug)]
+enum FileBridgeMsg {
+    Request(BridgeRequest<BrushRequest, BrushReply>),
+    Opened {
+        result: Result<FileId, tina_runtime::CallError>,
+        request: BridgeRequest<BrushRequest, BrushReply>,
+        path: PathBuf,
+        payload: Vec<u8>,
+    },
+    Wrote {
+        result: Result<usize, tina_runtime::CallError>,
+        request: BridgeRequest<BrushRequest, BrushReply>,
+        path: PathBuf,
+        file: FileId,
+        payload_len: usize,
+    },
+    Synced {
+        result: Result<(), tina_runtime::CallError>,
+        request: BridgeRequest<BrushRequest, BrushReply>,
+        path: PathBuf,
+        file: FileId,
+    },
+    Sized {
+        result: Result<u64, tina_runtime::CallError>,
+        request: BridgeRequest<BrushRequest, BrushReply>,
+        path: PathBuf,
+        file: FileId,
+    },
+    Read {
+        result: Result<Vec<u8>, tina_runtime::CallError>,
+        request: BridgeRequest<BrushRequest, BrushReply>,
+        path: PathBuf,
+        file: FileId,
+    },
+    Closed {
+        result: Result<(), tina_runtime::CallError>,
+        request: BridgeRequest<BrushRequest, BrushReply>,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    },
+}
+
+impl From<BridgeRequest<BrushRequest, BrushReply>> for FileBridgeMsg {
+    fn from(request: BridgeRequest<BrushRequest, BrushReply>) -> Self {
+        Self::Request(request)
+    }
+}
+
+impl BridgeMessage for FileBridgeMsg {
+    fn bridge_cancelled(&self) -> bool {
+        match self {
+            Self::Request(request)
+            | Self::Opened { request, .. }
+            | Self::Wrote { request, .. }
+            | Self::Synced { request, .. }
+            | Self::Sized { request, .. }
+            | Self::Read { request, .. }
+            | Self::Closed { request, .. } => request.is_cancelled(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FileBridgeWorker;
+
+#[tina_runtime::isolate(message = FileBridgeMsg, shard = BridgeShard)]
+impl FileBridgeWorker {
+    fn handle(&mut self, msg: FileBridgeMsg, _ctx: &mut Context<'_, BridgeShard>) -> Effect<Self> {
+        match msg {
+            FileBridgeMsg::Request(request) => {
+                let path = std::env::temp_dir().join(format!(
+                    "tina-bridge-file-{}-{}.txt",
+                    std::process::id(),
+                    request.request().llama
+                ));
+                let payload = format!("{} via file", request.request().llama).into_bytes();
+                file_create(path.clone()).reply(move |result| FileBridgeMsg::Opened {
+                    result,
+                    request,
+                    path,
+                    payload,
+                })
+            }
+            FileBridgeMsg::Opened {
+                result: Ok(file),
+                request,
+                path,
+                payload,
+            } => {
+                let payload_len = payload.len();
+                file_write(file, payload).reply(move |result| FileBridgeMsg::Wrote {
+                    result,
+                    request,
+                    path,
+                    file,
+                    payload_len,
+                })
+            }
+            FileBridgeMsg::Wrote {
+                result: Ok(count),
+                request,
+                path,
+                file,
+                payload_len,
+            } if count == payload_len => {
+                file_fsync(file).reply(move |result| FileBridgeMsg::Synced {
+                    result,
+                    request,
+                    path,
+                    file,
+                })
+            }
+            FileBridgeMsg::Synced {
+                result: Ok(()),
+                request,
+                path,
+                file,
+            } => file_size(file).reply(move |result| FileBridgeMsg::Sized {
+                result,
+                request,
+                path,
+                file,
+            }),
+            FileBridgeMsg::Sized {
+                result: Ok(size),
+                request,
+                path,
+                file,
+            } => file_read(file, size as usize).reply(move |result| FileBridgeMsg::Read {
+                result,
+                request,
+                path,
+                file,
+            }),
+            FileBridgeMsg::Read {
+                result: Ok(bytes),
+                request,
+                path,
+                file,
+            } => file_close(file).reply(move |result| FileBridgeMsg::Closed {
+                result,
+                request,
+                path,
+                bytes,
+            }),
+            FileBridgeMsg::Closed {
+                result: Ok(()),
+                request,
+                path,
+                bytes,
+            } => {
+                let _ = fs::remove_file(path);
+                let line = String::from_utf8(bytes).expect("bridge file payload utf8");
+                let (_, responder) = request.into_parts();
+                let _ = responder.respond(BrushReply { line });
+                noop()
+            }
+            FileBridgeMsg::Opened { request, .. }
+            | FileBridgeMsg::Wrote { request, .. }
+            | FileBridgeMsg::Synced { request, .. }
+            | FileBridgeMsg::Sized { request, .. }
+            | FileBridgeMsg::Read { request, .. }
+            | FileBridgeMsg::Closed { request, .. } => {
+                let (_, responder) = request.into_parts();
+                let _ = responder.respond(BrushReply {
+                    line: "file failed".to_string(),
+                });
+                noop()
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn bridge_host_can_register_runtime_call_service_message_enum() {
     let host = BridgeHost::new(
@@ -530,6 +705,36 @@ async fn bridge_host_can_register_runtime_call_service_message_enum() {
         bridge.call(BrushRequest { llama: "Tina" }).await,
         Ok(BrushReply {
             line: "Tina scheduled 1".to_string()
+        })
+    );
+
+    drop(bridge);
+    let _ = host.shutdown().expect("host shutdown");
+}
+
+#[tokio::test]
+async fn bridge_hosted_service_can_use_runtime_owned_file_io() {
+    let host = BridgeHost::new(
+        BridgeShard,
+        BridgeMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let bridge = host
+        .register_bridge::<FileBridgeWorker, BrushRequest, BrushReply, Infallible>(
+            FileBridgeWorker,
+            8,
+            Duration::from_secs(1),
+        )
+        .expect("register file bridge worker");
+
+    assert_eq!(
+        bridge.call(BrushRequest { llama: "Tina" }).await,
+        Ok(BrushReply {
+            line: "Tina via file".to_string()
         })
     );
 

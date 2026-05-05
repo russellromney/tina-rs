@@ -15,10 +15,10 @@ use io_uring::{IoUring, opcode, squeue, types};
 use log::trace;
 
 use crate::{
-    AcceptCompletion, AcceptOp, CompletionInner, FsyncCompletion, FsyncOp, IO, IOFile, IOLoop,
-    IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation, PReadCompletion, PReadOp,
-    PWriteCompletion, PWriteOp, RecvCompletion, RecvOp, SendCompletion, SendOp, SizeCompletion,
-    SizeOp,
+    AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
+    FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion, RecvOp, SendCompletion,
+    SendOp, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
@@ -111,6 +111,7 @@ impl IoUringIO {
             Operation::Accept(_) | Operation::Recv(_) | Operation::Send(_) => {
                 errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EINTR
             }
+            Operation::Connect(_) => errno == libc::EINTR,
             Operation::PRead(_)
             | Operation::PWrite(_)
             | Operation::Fsync(_)
@@ -125,6 +126,12 @@ impl IoUringIO {
                 opcode::Accept::new(types::Fd(op.fd), std::ptr::null_mut(), std::ptr::null_mut())
                     .build()
             }
+            Operation::Connect(op) => opcode::Connect::new(
+                types::Fd(op.fd),
+                (&op.addr as *const libc::sockaddr_storage).cast(),
+                op.len,
+            )
+            .build(),
             Operation::Recv(op) => {
                 opcode::Recv::new(types::Fd(op.fd), op.buf.as_mut_ptr(), op.buf.len() as u32)
                     .flags(op.flags)
@@ -179,6 +186,14 @@ impl IoUringIO {
                     }) as Box<dyn IOSocket>)
                 };
                 unsafe { AcceptCompletion::from_inner_mut(c) }.complete(r);
+            }
+            Operation::Connect(_) => {
+                let r = if result < 0 {
+                    Err(io_uring_err(result))
+                } else {
+                    Ok(())
+                };
+                unsafe { ConnectCompletion::from_inner_mut(c) }.complete(r);
             }
             Operation::Recv(_) => {
                 let r = if result < 0 {
@@ -447,6 +462,28 @@ impl IOSocket for IoUringSocket {
         };
         let inner = c.inner_mut();
         inner.prepare(Operation::Accept(AcceptOp { fd }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
+        if self.fd.borrow().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "connect called on initialized socket",
+            ));
+        }
+        let fd = IoUringIO::socket_fd(addr)?;
+        let (storage, len) = socket_addr_to_raw(addr);
+        let inner = c.inner_mut();
+        inner.prepare(Operation::Connect(ConnectOp {
+            fd: fd.raw(),
+            addr: storage,
+            len,
+            attempted: false,
+        }));
+        *self.fd.borrow_mut() = Some(fd);
+        *self.kind.borrow_mut() = Some(SocketKind::Stream);
         queue(&self.state, inner);
         Ok(())
     }

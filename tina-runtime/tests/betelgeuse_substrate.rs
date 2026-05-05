@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use betelgeuse::{
-    AcceptCompletion, AcceptOp, IO, IOFile, IOLoop, IOLoopHandle, IOSocket, OpenOptions, Operation,
-    RecvCompletion, SendCompletion, io::simulated::SimulatedIO,
+    AcceptCompletion, AcceptOp, ConnectCompletion, IO, IOFile, IOLoop, IOLoopHandle, IOSocket,
+    OpenOptions, Operation, RecvCompletion, SendCompletion, io::simulated::SimulatedIO,
 };
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
@@ -550,6 +550,10 @@ impl IOSocket for StuckReleaseSocket {
             .expect("stuck io mutex")
             .pending_completion_count += 1;
         Ok(())
+    }
+
+    fn connect(&self, _c: &mut ConnectCompletion, _addr: SocketAddr) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "stuck connect"))
     }
 
     fn recv(&self, _c: &mut RecvCompletion, _len: usize) -> io::Result<()> {

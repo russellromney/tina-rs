@@ -7,7 +7,8 @@ use std::{
 };
 
 use betelgeuse::{
-    AcceptCompletion, IO, IOLoop, MkdirCompletion, OpenOptions, RecvCompletion, SendCompletion,
+    AcceptCompletion, ConnectCompletion, IO, IOLoop, MkdirCompletion, OpenOptions, RecvCompletion,
+    SendCompletion,
     io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO},
 };
 
@@ -62,6 +63,41 @@ fn simulated_tcp_accept_recv_send_roundtrip() -> io::Result<()> {
     pump_until(&io, || send.has_result())?;
     assert_eq!(send.take_result().unwrap()?, 4);
     assert_eq!(peer.output(), b"pong");
+    Ok(())
+}
+
+#[test]
+fn simulated_tcp_connect_accept_send_recv_roundtrip() -> io::Result<()> {
+    let io = SimulatedIO::new();
+    let loop_handle = io.loop_handle(Global);
+    let listener = loop_handle.io().socket()?;
+    listener.bind(localhost(0))?;
+    let bound = listener.local_addr()?;
+    let client = loop_handle.io().socket()?;
+
+    let mut connect = ConnectCompletion::new();
+    client.connect(&mut connect, bound)?;
+    let mut accept = AcceptCompletion::new();
+    listener.accept(&mut accept)?;
+    pump_until(&io, || connect.has_result() && accept.has_result())?;
+    connect.take_result().unwrap()?;
+    let server = accept.take_result().unwrap()?;
+
+    let mut client_send = SendCompletion::new();
+    client.send(&mut client_send, b"ping".to_vec())?;
+    let mut server_recv = RecvCompletion::new();
+    server.recv(&mut server_recv, 4)?;
+    pump_until(&io, || client_send.has_result() && server_recv.has_result())?;
+    assert_eq!(client_send.take_result().unwrap()?, 4);
+    assert_eq!(&server_recv.take_result().unwrap()?, b"ping");
+
+    let mut server_send = SendCompletion::new();
+    server.send(&mut server_send, b"pong".to_vec())?;
+    let mut client_recv = RecvCompletion::new();
+    client.recv(&mut client_recv, 4)?;
+    pump_until(&io, || server_send.has_result() && client_recv.has_result())?;
+    assert_eq!(server_send.take_result().unwrap()?, 4);
+    assert_eq!(&client_recv.take_result().unwrap()?, b"pong");
     Ok(())
 }
 

@@ -1,13 +1,16 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedControlError, CallError, LocalApp, LocalAppState, MailboxFactory,
-    RuntimeEventKind, TraceRetention, sleep,
+    BetelgeuseBackedControlError, CallError, FileId, LocalApp, LocalAppState, MailboxFactory,
+    RuntimeEventKind, TraceRetention, file_close, file_create, file_fsync, file_read, file_size,
+    file_write, sleep,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -125,6 +128,67 @@ impl TimerService {
             }
             TimerMsg::Finished(Err(_)) => {
                 self.seen.lock().expect("timer seen lock").push("failed");
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileMsg {
+    Start(PathBuf),
+    Opened(Result<FileId, CallError>, PathBuf),
+    Wrote(Result<usize, CallError>, PathBuf, FileId),
+    Synced(Result<(), CallError>, PathBuf, FileId),
+    Sized(Result<u64, CallError>, PathBuf, FileId),
+    Read(Result<Vec<u8>, CallError>, PathBuf, FileId),
+    Closed(Result<(), CallError>, PathBuf, Vec<u8>),
+}
+
+#[derive(Debug)]
+struct FileService {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = FileMsg, shard = AppShard)]
+impl FileService {
+    fn handle(&mut self, msg: FileMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            FileMsg::Start(path) => {
+                file_create(path.clone()).reply(move |result| FileMsg::Opened(result, path))
+            }
+            FileMsg::Opened(Ok(file), path) => file_write(file, b"local app file".to_vec())
+                .reply(move |result| FileMsg::Wrote(result, path, file)),
+            FileMsg::Wrote(Ok(14), path, file) => {
+                file_fsync(file).reply(move |result| FileMsg::Synced(result, path, file))
+            }
+            FileMsg::Synced(Ok(()), path, file) => {
+                file_size(file).reply(move |result| FileMsg::Sized(result, path, file))
+            }
+            FileMsg::Sized(Ok(size), path, file) => file_read(file, size as usize)
+                .reply(move |result| FileMsg::Read(result, path, file)),
+            FileMsg::Read(Ok(bytes), path, file) => {
+                file_close(file).reply(move |result| FileMsg::Closed(result, path, bytes))
+            }
+            FileMsg::Closed(Ok(()), path, bytes) => {
+                let _ = fs::remove_file(path);
+                self.seen
+                    .lock()
+                    .expect("file seen lock")
+                    .push(String::from_utf8(bytes).expect("file payload utf8"));
+                noop()
+            }
+            FileMsg::Opened(Err(_), _)
+            | FileMsg::Wrote(Err(_), _, _)
+            | FileMsg::Wrote(Ok(_), _, _)
+            | FileMsg::Synced(Err(_), _, _)
+            | FileMsg::Sized(Err(_), _, _)
+            | FileMsg::Read(Err(_), _, _)
+            | FileMsg::Closed(Err(_), _, _) => {
+                self.seen
+                    .lock()
+                    .expect("file seen lock")
+                    .push("failed".to_string());
                 noop()
             }
         }
@@ -255,6 +319,57 @@ fn llama_tcp_timer_service_uses_local_app_runtime_owned_time() {
             }
         )
     }));
+}
+
+#[test]
+fn local_app_service_uses_runtime_owned_file_io() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "tina-local-app-file-{}-{unique}.txt",
+        std::process::id()
+    ));
+    let app = LocalApp::single_shard(AppShard(51), AppMailboxFactory)
+        .ingress_capacity(8)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+    let address = app
+        .register_root::<FileService, Infallible>(
+            FileService {
+                seen: Arc::clone(&seen),
+            },
+            8,
+        )
+        .expect("register file root");
+
+    app.try_send(address, FileMsg::Start(path.clone()))
+        .expect("file start handoff");
+    wait_until(|| seen.lock().expect("file seen lock").as_slice() == ["local app file"]);
+
+    let terminal = app.shutdown().drain().join().expect("file app shutdown");
+    let _ = fs::remove_file(path);
+    assert_eq!(terminal.state(), LocalAppState::Closed);
+    for expected in [
+        tina_runtime::CallKind::FileOpen,
+        tina_runtime::CallKind::FileWriteAt,
+        tina_runtime::CallKind::FileFsync,
+        tina_runtime::CallKind::FileSize,
+        tina_runtime::CallKind::FileReadAt,
+        tina_runtime::CallKind::FileClose,
+    ] {
+        assert!(
+            terminal.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+                )
+            }),
+            "expected {expected:?} completion in local app trace"
+        );
+    }
 }
 
 #[test]

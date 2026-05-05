@@ -33,9 +33,9 @@ pub mod slab;
 pub mod task;
 
 pub use completion::{
-    AcceptCompletion, AcceptOp, FsyncCompletion, FsyncOp, MkdirCompletion, MkdirOp,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion, RecvOp, SendCompletion,
-    SendOp, SizeCompletion, SizeOp,
+    AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, FsyncCompletion, FsyncOp,
+    MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion,
+    RecvOp, SendCompletion, SendOp, SizeCompletion, SizeOp,
 };
 
 pub use completion::{CompletionInner, Operation};
@@ -146,6 +146,9 @@ pub trait IOSocket {
 
     /// Accepts one inbound connection on a listening socket.
     fn accept(&self, c: &mut AcceptCompletion) -> stdio::Result<()>;
+
+    /// Connects this socket to `addr`.
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> stdio::Result<()>;
 
     /// Receives up to `len` bytes from a connected socket.
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> stdio::Result<()>;

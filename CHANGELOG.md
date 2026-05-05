@@ -4,6 +4,25 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Jelle Zijlstra
+
+- Added outbound TCP connect to the vendored Betelgeuse native and simulated
+  I/O backends.
+- Added Tina runtime-owned `tcp_connect(addr)` and trace vocabulary for
+  client-side TCP streams.
+- Added runtime-owned file I/O to `tina-runtime`: `FileId`,
+  `FileOpenOptions`, `file_open`, `file_create`, `file_read`,
+  `file_read_at`, `file_write`, `file_write_at`, `file_fsync`, `file_size`,
+  `file_close`, and `mkdir`.
+- Added deterministic `tina-sim` file behavior for config/snapshot/log-shaped
+  workloads, including replay-visible failures for invalid file resources and
+  unsupported open modes.
+- Proved live and simulated outbound TCP client flows, live and simulated file
+  read/write/fsync/close flows, LocalApp-hosted file services, and
+  Tokio-bridge-hosted file services.
+- Added future roadmap home for visible sequential workflow ergonomics without
+  hiding runtime-owned suspension points or failure policy.
+
 ### Phase Dries van Agt
 
 - Added `tina-tokio-bridge`, a narrow Tokio/Tower bridge that sends bounded

@@ -15,8 +15,9 @@ use std::{
 };
 
 use betelgeuse::{
-    AcceptCompletion, FsyncCompletion, IO, IOLoop, IOLoopHandle, MkdirCompletion, OpenOptions,
-    PReadCompletion, PWriteCompletion, RecvCompletion, SendCompletion, SizeCompletion, io_loop,
+    AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOLoop, IOLoopHandle,
+    MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvCompletion,
+    SendCompletion, SizeCompletion, io_loop,
 };
 use tempfile::TempDir;
 
@@ -331,6 +332,45 @@ io_test! {
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"pong");
+        Ok(())
+    }
+}
+
+io_test! {
+    fn connect_send_recv_echo(io_loop) -> io::Result<()> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").unwrap();
+        });
+
+        let socket = io_loop.io().socket()?;
+        let mut connect_c = ConnectCompletion::new();
+        socket.connect(&mut connect_c, addr)?;
+        while !connect_c.has_result() {
+            io_loop.step()?;
+        }
+        connect_c.take_result().unwrap()?;
+        assert_eq!(socket.peer_addr()?, addr);
+
+        let mut send_c = SendCompletion::new();
+        socket.send(&mut send_c, b"ping".to_vec())?;
+        while !send_c.has_result() {
+            io_loop.step()?;
+        }
+        assert_eq!(send_c.take_result().unwrap()?, 4);
+
+        let mut recv_c = RecvCompletion::new();
+        socket.recv(&mut recv_c, 4)?;
+        while !recv_c.has_result() {
+            io_loop.step()?;
+        }
+        assert_eq!(&recv_c.take_result().unwrap()?, b"pong");
+        server.join().unwrap();
         Ok(())
     }
 }

@@ -75,7 +75,7 @@ start from an honest baseline rather than from stale roadmap wording.
 | Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories and small generated dispatcher workloads. Trace replay proofs can reconstruct worker completions and restart outcomes from the runtime event model alone. `tina-sim` adds virtual time, replay records, seeded delays/reordering over timer-wake/local-send/TCP-completion behavior, checker failures, spawn/supervision replay, scripted TCP simulation, multi-shard replay under default and non-default seeded configs, and multi-shard checker failure replay. | Real substrate liveness faults remain future work; current explicit-step shard-liveness non-claims are sealed. |
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. Ruud Lubbers pins a narrow numerical runtime cost model for selected hot paths: multi-shard send, isolate call, timer, TCP read/write, batch, spawn/restart, trace pressure, live ingress, and high-cardinality idle stepping. Runtime and simulator now reuse per-step scratch and prebuild coordinator storage where tests prove the warmed path. | No broad runtime/simulator allocation-free claim is supported yet; boxed erasure, traces, replay records, completion slots, call translators, and user payloads may still allocate. |
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
-| Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time and TCP through a Tina-owned driver boundary with native Betelgeuse and simulated Betelgeuse adapters, cancellation, shutdown, and same-resource lane ownership. | Runtime-owned I/O breadth beyond TCP/time remains undecided. The 100k-connection benchmark, broader network-server claims, and live-substrate liveness faults remain future work. |
+| Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time, TCP server/client operations, and local file operations through a Tina-owned driver boundary with native Betelgeuse and simulated Betelgeuse adapters, cancellation, shutdown, and same-resource lane ownership. | DNS, TLS, UDP, process, signal, broad network-server claims, and live-substrate liveness faults remain future work. |
 
 ## Testing and proof strategy
 
@@ -150,6 +150,7 @@ framework before public release-story work.
 |---|---|
 | **Piet de Jong local production readiness** | Intense pre-Gemini phase for the five remaining local-core gaps: mature the driver-runtime substrate, widen the Tokio/Tower/Axum bridge into a real adoption edge, add CI/stress hardening, produce a measured performance/allocation envelope, and complete the preferred local-service API surface. |
 | **Jelle Zijlstra runtime-owned I/O breadth** | Explicit post-Piet I/O expansion phase: finish outbound TCP connect and runtime-owned file I/O first, then record exact deferrals for DNS, TLS, UDP, process, and signal. All supported I/O keeps Tina-owned timeout/cancellation/shutdown semantics, simulator/DST coverage where possible, and no hidden blocking pools or unbounded queues. |
+| **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics phase after the raw runtime-owned I/O surface is boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 ## Later capability roadmap
 
@@ -208,6 +209,11 @@ These still need answers, but each now has an intended phase home.
 6. **Zero-copy / lower-allocation transport.** The current cost model is
    honest but not final. Home: later performance phase after Jelle's new I/O
    paths expose real pressure.
+7. **Sequential-looking workflow ergonomics.** The raw Tina state-machine form
+   is honest but verbose for long I/O workflows. Home: Barend Biesheuvel. Any
+   macro must compress ceremony only: each runtime-owned suspension point stays
+   named in source and trace, failure policy is mandatory and visible, and the
+   generated code remains ordinary Tina messages and effects.
 
 ---
 

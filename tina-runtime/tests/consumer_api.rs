@@ -8,8 +8,8 @@ use std::time::Duration;
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
-    CallReplyRejectedReason, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    SendOutcome, call, send_observed, sleep,
+    CallReplyRejectedReason, FileOpenOptions, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, SendOutcome, call, send_observed, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -125,6 +125,46 @@ fn count_call_completion_rejected(
             )
         })
         .count()
+}
+
+#[test]
+fn downstream_consumer_can_name_common_file_open_modes() {
+    assert_eq!(
+        FileOpenOptions::read_only(),
+        FileOpenOptions {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+        }
+    );
+    assert_eq!(
+        FileOpenOptions::write_only(),
+        FileOpenOptions {
+            read: false,
+            write: true,
+            create: false,
+            truncate: false,
+        }
+    );
+    assert_eq!(
+        FileOpenOptions::read_write(),
+        FileOpenOptions {
+            read: true,
+            write: true,
+            create: false,
+            truncate: false,
+        }
+    );
+    assert_eq!(
+        FileOpenOptions::read_write_create_truncate(),
+        FileOpenOptions {
+            read: true,
+            write: true,
+            create: true,
+            truncate: true,
+        }
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

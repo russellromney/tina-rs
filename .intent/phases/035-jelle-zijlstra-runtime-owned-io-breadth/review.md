@@ -91,3 +91,65 @@ Remaining non-blocking risk:
 5. Close with the support table and `make verify`.
 
 Grug says: good fire. Start with connect, then files. Do not summon TLS demon.
+
+## Implementation Review 1
+
+Verdict: Jelle now has the main local I/O breadth it set out to add. No
+blocking findings after hostile pass.
+
+What landed:
+
+- Betelgeuse has native and simulated outbound TCP connect.
+- Tina runtime has `TcpConnect` / `TcpConnected` plus `tcp_connect(addr)`.
+- Tina runtime has runtime-owned file vocabulary: `FileId`,
+  `FileOpenOptions`, `file_open`, `file_read_at`, `file_write_at`,
+  `file_fsync`, `file_size`, `file_close`, and `mkdir`.
+- Live driver owns file resources and file completion lanes without exposing
+  raw OS handles.
+- `tina-sim` has deterministic in-memory file behavior for local config /
+  snapshot / log-shaped workloads.
+- User-shaped live tests prove Tina can connect to a local server, write, read,
+  and close.
+- User-shaped live tests prove Tina can mkdir, open, write, fsync, size, read,
+  and close a file.
+- Simulator tests prove the same connect and file flows replay through the
+  oracle shape.
+- `LocalApp` hosts a service that uses runtime-owned file calls end to end and
+  records the expected file call completions in the terminal trace.
+- `tina-tokio-bridge` hosts a bridge-facing service that uses runtime-owned
+  file calls before replying to Tokio.
+- Tiny file helpers landed where they remove ceremony without hiding behavior:
+  `FileOpenOptions::{read_only, write_only, read_write, read_write_create_truncate}`,
+  `file_create`, `file_read`, and `file_write`. No `write_all` helper was added
+  because full-write retry would be new control flow, not tiny sugar.
+
+Support table after this slice:
+
+| Family | Status | Reason |
+|---|---|---|
+| Time | supported | Existing runtime-owned `sleep(...)`. |
+| TCP server | supported | Existing bind/accept/read/write/close. |
+| TCP client connect | supported | Added native/simulated Betelgeuse connect and Tina `tcp_connect(...)`. |
+| File / mkdir | supported | Added runtime-owned file ids and helpers over Betelgeuse file ops plus simulator oracle. |
+| DNS | deferred | Needs resolver/cache semantics; Tina still accepts `SocketAddr`. |
+| TLS | deferred | Needs handshake state-machine design over streams. |
+| UDP | deferred | Packet semantics, multicast, and receive-buffer policy need their own phase. |
+| Process | deferred | Needs child lifecycle, pipes, cancellation, and zombie proof. |
+| Signal | deferred | Process-global and platform-specific; app edge can request shutdown for now. |
+
+Hostile notes:
+
+- Native `open` is still synchronous because Betelgeuse exposes `open` that
+  way today. This phase did not invent a hidden blocking pool.
+- Simulator file behavior is intentionally local and deterministic, not
+  durable persistence or crash recovery.
+- File write cancellation is not modeled as undo. Once a runtime-owned write
+  has been submitted, cancellation removes completion pressure; it does not
+  promise the substrate side effect can be reversed.
+- The simulator now rejects read-only `create` / `truncate` file opens so its
+  deterministic file oracle matches native Rust open-option constraints.
+
+Verification:
+
+- `cargo test --workspace` passed.
+- `make verify` passed.
