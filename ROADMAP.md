@@ -140,6 +140,12 @@ and reviews live under `.intent/phases/`.
 - Dries van Agt: backend-honest live names, bounded trace retention, narrow
   Tokio/Tower/Axum bridge, bridge production-shape fixes, bridge metrics,
   cancellation, retry semantics, and the named Tina driver-runtime contract.
+- Piet de Jong: canonical `LocalApp` owner, bridge-from-app path, lifecycle
+  terminal reports, CI/performance posture, and production-shaped local service
+  proofs.
+- Jelle Zijlstra: runtime-owned outbound TCP connect, runtime-owned local file
+  I/O, simulator file oracle, LocalApp/bridge file-service proofs, and exact
+  deferrals for DNS/TLS/UDP/process/signal.
 
 ## Near-term roadmap
 
@@ -148,8 +154,7 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Piet de Jong local production readiness** | Intense pre-Gemini phase for the five remaining local-core gaps: mature the driver-runtime substrate, widen the Tokio/Tower/Axum bridge into a real adoption edge, add CI/stress hardening, produce a measured performance/allocation envelope, and complete the preferred local-service API surface. |
-| **Jelle Zijlstra runtime-owned I/O breadth** | Explicit post-Piet I/O expansion phase: finish outbound TCP connect and runtime-owned file I/O first, then record exact deferrals for DNS, TLS, UDP, process, and signal. All supported I/O keeps Tina-owned timeout/cancellation/shutdown semantics, simulator/DST coverage where possible, and no hidden blocking pools or unbounded queues. |
+| **Wim Kok persistence** | Durable local state for full-service Tina workflows: snapshots, event journal, restart recovery, durable replay artifacts, and explicit non-claims around durable mailboxes until designed. This is the next core capability because file I/O exists now, but Tina still cannot sensibly port stateful Tokio services that need recovery after process restart. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics phase after the raw runtime-owned I/O surface is boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 ## Later capability roadmap
@@ -159,7 +164,6 @@ blockers for the first local-runtime story.
 
 | Phase | Purpose |
 |---|---|
-| **Wim Kok persistence** | Durable local state: snapshots, event journal, restart recovery, durable replay artifacts, and explicit non-claims around durable mailboxes until designed. |
 | **Jan Peter Balkenende remoting** | Tina runtime to Tina runtime over a network with typed, bounded, traceable remote outcomes. |
 | **Mark Rutte clustering** | Membership and placement after remoting is boring, without weakening local boundedness or stale-address semantics. |
 | **Gemini release story** | Prime-time readiness only after Tina is reasonably complete: guides, invariant docs, semver/publication decision, CI/proof gate, public positioning, and adoption story. |
@@ -195,9 +199,9 @@ These still need answers, but each now has an intended phase home.
 2. **Trace retention.** Bounded/off modes exist now and Piet kept lifecycle
    facts trace-observable. Sink/counter polish is a later observability phase,
    not a blocker for Jelle.
-3. **Runtime-owned I/O breadth.** Piet pinned the first local production claim
-   around time/TCP/bridge. Jelle now owns outbound TCP connect and file I/O as
-   accepted scope, plus exact deferrals for DNS/TLS/UDP/process/signal.
+3. **Runtime-owned I/O breadth.** Time, TCP server/client operations, and local
+   file I/O are implemented. DNS/TLS/UDP/process/signal remain deferred until a
+   named workload proves they belong in core instead of adapters.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
    transport is not claimed. Home: Jan Peter Balkenende remoting unless a local
    workload proves it must land earlier.

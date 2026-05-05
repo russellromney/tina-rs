@@ -4,6 +4,25 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Piet de Jong
+
+- Added `tina_runtime::LocalApp` as the canonical live app owner for local
+  Tina services, with single-shard and multi-shard builders.
+- Added lifecycle shutdown/reporting types: `LocalAppState`,
+  `LocalAppTerminalReport`, `LocalAppShutdown`, and
+  `LocalMultiShardAppShutdown`.
+- Added `BridgeHost::from_app(app)` so bridge-hosted services can start from
+  the canonical `LocalApp` path.
+- Added retry policy support with both per-attempt timeout and total policy
+  deadline.
+- Added direct lifecycle failure proof for worker-side failure surfaced through
+  `LocalAppTerminalReport`.
+- Added production-shaped local service proofs:
+  `llama_http_bridge_service`, `llama_tcp_timer_service`,
+  `llama_supervised_worker_service`, and `llama_sim_dst_parity_service`.
+- Added a narrow performance/allocation envelope for the preferred app ingress
+  path and kept broader performance claims explicit non-claims.
+
 ### Phase Jelle Zijlstra
 
 - Added outbound TCP connect to the vendored Betelgeuse native and simulated
