@@ -60,12 +60,13 @@ pub use crate::persistence::{
 pub use call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
     IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
-    PersistenceTraceInfo, RuntimeCall, RuntimeCallParts, SendOutcome, SnapshotImage, StreamId,
-    TypedCall, UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_open,
-    file_read, file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay,
-    mkdir, send_observed, sleep, sleep_then, snapshot_commit, snapshot_load, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, udp_bind,
-    udp_close_socket, udp_recv_from, udp_send_to,
+    PersistenceTraceInfo, ProcessRunResult, ProcessStatus, RuntimeCall, RuntimeCallParts,
+    SendOutcome, SnapshotImage, StreamId, TypedCall, UdpSocketId, call, dns_lookup, file_close,
+    file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
+    file_write_at, journal_append, journal_replay, mkdir, process_run, send_observed, sleep,
+    sleep_then, snapshot_commit, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
+    tcp_close_stream, tcp_connect, tcp_read, tcp_write, udp_bind, udp_close_socket, udp_recv_from,
+    udp_send_to,
 };
 use driver::DriverCompletion;
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
@@ -382,7 +383,13 @@ impl RuntimeCapabilities {
                 ShutdownSupport::NotApplicable,
                 None,
             ),
-            process: unsupported,
+            process: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::LaneBackedBlocking,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                Some(driver::DEFAULT_PROCESS_LANE_CAPACITY),
+            ),
             signal: unsupported,
             durability: DurabilityCapability::local(),
         }

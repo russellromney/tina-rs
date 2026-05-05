@@ -28,9 +28,10 @@
 //!   shutdown was clean.
 //!
 use std::alloc::Global;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{
     Receiver, SyncSender, TryRecvError, TrySendError as MpscTrySendError, sync_channel,
 };
@@ -39,7 +40,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use betelgeuse::{
     AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOFile, IOLoop, IOLoopHandle,
@@ -48,14 +49,15 @@ use betelgeuse::{
 };
 
 use crate::call::{
-    CallError, CallId, CallInput, CallOutput, FileId, FileOpenOptions, ListenerId, StreamId,
-    UdpSocketId,
+    CallError, CallId, CallInput, CallOutput, FileId, FileOpenOptions, ListenerId, ProcessStatus,
+    StreamId, UdpSocketId,
 };
 
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
 const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
 const INITIAL_DRIVER_PENDING_CAPACITY: usize = 8;
 pub(crate) const DEFAULT_STORAGE_LANE_CAPACITY: usize = 64;
+pub(crate) const DEFAULT_PROCESS_LANE_CAPACITY: usize = 16;
 
 /// Runtime-owned substrate driver.
 ///
@@ -122,6 +124,7 @@ pub(crate) enum DriverShutdownError {
 pub(crate) struct BetelgeuseDriver {
     tcp: BetelgeuseTcp,
     storage: StorageLane,
+    process: ProcessLane,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
 }
@@ -232,6 +235,10 @@ enum StorageLane {
     Worker(StorageWorkerLane),
 }
 
+enum ProcessLane {
+    Worker(ProcessWorkerLane),
+}
+
 struct StorageWorkerLane {
     capacity: usize,
     sender: Option<SyncSender<StorageCommand>>,
@@ -280,6 +287,34 @@ struct StorageCompletion {
     result: CallOutput,
 }
 
+struct ProcessWorkerLane {
+    capacity: usize,
+    sender: Option<SyncSender<ProcessCommand>>,
+    completions: Receiver<ProcessCompletion>,
+    handle: Option<JoinHandle<()>>,
+    pending: Vec<ProcessPending>,
+}
+
+struct ProcessPending {
+    call_id: CallId,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct ProcessCommand {
+    call_id: CallId,
+    command: String,
+    args: Vec<String>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct ProcessCompletion {
+    call_id: CallId,
+    result: CallOutput,
+}
+
 impl BetelgeuseDriver {
     pub(crate) fn new() -> Self {
         let io_loop =
@@ -291,6 +326,7 @@ impl BetelgeuseDriver {
         Self {
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::inline(),
+            process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
@@ -303,6 +339,7 @@ impl BetelgeuseDriver {
         Self {
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::new(storage_lane_capacity),
+            process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
@@ -361,6 +398,24 @@ impl RuntimeDriver for BetelgeuseDriver {
                 call_id,
                 result: CallOutput::Failed(CallError::Unsupported),
             }),
+            CallInput::ProcessRun {
+                command,
+                args,
+                timeout,
+                stdout_limit,
+                stderr_limit,
+            } => self.process.submit(
+                call_id,
+                ProcessCommand {
+                    call_id,
+                    command,
+                    args,
+                    timeout,
+                    stdout_limit,
+                    stderr_limit,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            ),
             other => self.tcp.submit(call_id, other),
         }
     }
@@ -368,23 +423,31 @@ impl RuntimeDriver for BetelgeuseDriver {
     fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
         self.tcp.advance(completed);
         self.storage.advance(completed);
+        self.process.advance(completed);
         self.harvest_timers(now, completed);
     }
 
     fn has_pending(&self) -> bool {
-        self.tcp.has_pending() || self.storage.has_pending() || !self.timers.is_empty()
+        self.tcp.has_pending()
+            || self.storage.has_pending()
+            || self.process.has_pending()
+            || !self.timers.is_empty()
     }
 
     fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
         self.timers.clear();
         self.storage.cancel_pending();
+        self.process.cancel_pending();
         self.tcp.cancel_pending()
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
         let before = self.timers.len();
         self.timers.retain(|entry| entry.call_id != call_id);
-        before != self.timers.len() || self.storage.cancel(call_id) || self.tcp.cancel(call_id)
+        before != self.timers.len()
+            || self.storage.cancel(call_id)
+            || self.process.cancel(call_id)
+            || self.tcp.cancel(call_id)
     }
 
     #[cfg(test)]
@@ -603,6 +666,180 @@ impl Drop for StorageWorkerLane {
     }
 }
 
+impl ProcessLane {
+    fn new(capacity: usize) -> Self {
+        Self::Worker(ProcessWorkerLane::new(capacity))
+    }
+
+    fn submit(&mut self, call_id: CallId, command: ProcessCommand) -> Option<DriverCompletion> {
+        match self {
+            Self::Worker(lane) => lane.submit(call_id, command),
+        }
+    }
+
+    fn advance(&mut self, completed: &mut Vec<DriverCompletion>) {
+        match self {
+            Self::Worker(lane) => lane.advance(completed),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        match self {
+            Self::Worker(lane) => lane.has_pending(),
+        }
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        match self {
+            Self::Worker(lane) => lane.cancel(call_id),
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        match self {
+            Self::Worker(lane) => lane.cancel_pending(),
+        }
+    }
+}
+
+impl Drop for ProcessLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+impl ProcessWorkerLane {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "process lane capacity must be > 0");
+        let (sender, receiver) = sync_channel(capacity);
+        let (completion_sender, completions) = sync_channel(capacity.saturating_add(1));
+        let handle = thread::spawn(move || process_worker_loop(receiver, completion_sender));
+        Self {
+            capacity,
+            sender: Some(sender),
+            completions,
+            handle: Some(handle),
+            pending: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
+        }
+    }
+
+    fn submit(&mut self, call_id: CallId, mut command: ProcessCommand) -> Option<DriverCompletion> {
+        let Some(sender) = &self.sender else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::ProcessClosed),
+            });
+        };
+        if self.active_pending_count() >= self.capacity {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::ProcessFull),
+            });
+        }
+
+        let cancelled = Arc::clone(&command.cancelled);
+        command.call_id = call_id;
+        match sender.try_send(command) {
+            Ok(()) => {
+                self.pending.push(ProcessPending { call_id, cancelled });
+                None
+            }
+            Err(MpscTrySendError::Full(command)) => Some(DriverCompletion {
+                call_id: command.call_id,
+                result: CallOutput::Failed(CallError::ProcessFull),
+            }),
+            Err(MpscTrySendError::Disconnected(command)) => Some(DriverCompletion {
+                call_id: command.call_id,
+                result: CallOutput::Failed(CallError::ProcessClosed),
+            }),
+        }
+    }
+
+    fn advance(&mut self, completed: &mut Vec<DriverCompletion>) {
+        loop {
+            match self.completions.try_recv() {
+                Ok(completion) => self.finish_completion(completion, completed),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.sender = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn finish_completion(
+        &mut self,
+        completion: ProcessCompletion,
+        completed: &mut Vec<DriverCompletion>,
+    ) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|entry| entry.call_id == completion.call_id)
+        else {
+            return;
+        };
+        let pending = self.pending.remove(index);
+        if pending.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        completed.push(DriverCompletion {
+            call_id: completion.call_id,
+            result: completion.result,
+        });
+    }
+
+    fn has_pending(&self) -> bool {
+        self.active_pending_count() > 0
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.call_id == call_id && !entry.cancelled.load(Ordering::Acquire))
+        else {
+            return false;
+        };
+        pending.cancelled.store(true, Ordering::Release);
+        true
+    }
+
+    fn cancel_pending(&mut self) {
+        for pending in &mut self.pending {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.sender = None;
+        if let Some(handle) = self.handle.take() {
+            while !handle.is_finished() {
+                self.drain_completion_channel();
+                thread::yield_now();
+            }
+            let _ = handle.join();
+        }
+        self.drain_completion_channel();
+        self.pending.clear();
+    }
+
+    fn drain_completion_channel(&mut self) {
+        while self.completions.try_recv().is_ok() {}
+    }
+
+    fn active_pending_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|entry| !entry.cancelled.load(Ordering::Acquire))
+            .count()
+    }
+}
+
+impl Drop for ProcessWorkerLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
 fn storage_worker_loop(
     receiver: Receiver<StorageCommand>,
     completions: SyncSender<StorageCompletion>,
@@ -656,6 +893,128 @@ fn execute_storage_job(job: StorageJob) -> CallOutput {
     }
 }
 
+fn process_worker_loop(
+    receiver: Receiver<ProcessCommand>,
+    completions: SyncSender<ProcessCompletion>,
+) {
+    while let Ok(command) = receiver.recv() {
+        if command.cancelled.load(Ordering::Acquire) {
+            continue;
+        }
+        let call_id = command.call_id;
+        let result = execute_process_command(command);
+        let completion = ProcessCompletion { call_id, result };
+        if completions.send(completion).is_err() {
+            break;
+        }
+    }
+}
+
+fn execute_process_command(command: ProcessCommand) -> CallOutput {
+    if command.timeout.is_zero() {
+        return CallOutput::Failed(CallError::Timeout);
+    }
+
+    let mut child = match Command::new(&command.command)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return CallOutput::Failed(CallError::Io),
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| spawn_drain_limited(pipe, command.stdout_limit));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| spawn_drain_limited(pipe, command.stderr_limit));
+    let started = Instant::now();
+
+    let status = loop {
+        if command.cancelled.load(Ordering::Acquire) {
+            return kill_and_reap(child, stdout, stderr, CallError::Timeout);
+        }
+        if started.elapsed() >= command.timeout {
+            return kill_and_reap(child, stdout, stderr, CallError::Timeout);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(_) => return kill_and_reap(child, stdout, stderr, CallError::KillUncertain),
+        }
+    };
+
+    let (stdout, stdout_truncated) = join_drain(stdout);
+    let (stderr, stderr_truncated) = join_drain(stderr);
+    CallOutput::ProcessExited {
+        status: ProcessStatus {
+            code: status.code(),
+        },
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    }
+}
+
+fn kill_and_reap(
+    mut child: std::process::Child,
+    stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
+    stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
+    fallback: CallError,
+) -> CallOutput {
+    if child.kill().is_err() {
+        return CallOutput::Failed(CallError::KillUncertain);
+    }
+    if child.wait().is_err() {
+        return CallOutput::Failed(CallError::KillUncertain);
+    }
+    let _ = join_drain(stdout);
+    let _ = join_drain(stderr);
+    CallOutput::Failed(fallback)
+}
+
+fn spawn_drain_limited<R>(mut reader: R, limit: usize) -> JoinHandle<(Vec<u8>, bool)>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut captured = Vec::with_capacity(limit.min(8192));
+        let mut truncated = false;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let remaining = limit.saturating_sub(captured.len());
+                    let take = remaining.min(count);
+                    captured.extend_from_slice(&buffer[..take]);
+                    if take < count {
+                        truncated = true;
+                    }
+                }
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        (captured, truncated)
+    })
+}
+
+fn join_drain(handle: Option<JoinHandle<(Vec<u8>, bool)>>) -> (Vec<u8>, bool) {
+    handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
+}
+
 impl BetelgeuseTcp {
     fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
@@ -706,6 +1065,10 @@ impl BetelgeuseTcp {
                 result: self.do_udp_close(socket),
             }),
             CallInput::DnsLookup { .. } => Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Unsupported),
+            }),
+            CallInput::ProcessRun { .. } => Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::Unsupported),
             }),

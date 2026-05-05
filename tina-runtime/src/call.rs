@@ -135,6 +135,28 @@ pub struct FileOpenOptions {
     pub truncate: bool,
 }
 
+/// Exit status for a bounded local process run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcessStatus {
+    /// Portable process exit code when the platform exposes one.
+    pub code: Option<i32>,
+}
+
+/// Result of a bounded local process run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessRunResult {
+    /// Process exit status.
+    pub status: ProcessStatus,
+    /// Captured stdout, capped by request.
+    pub stdout: Vec<u8>,
+    /// Captured stderr, capped by request.
+    pub stderr: Vec<u8>,
+    /// Whether stdout exceeded its cap.
+    pub stdout_truncated: bool,
+    /// Whether stderr exceeded its cap.
+    pub stderr_truncated: bool,
+}
+
 impl FileOpenOptions {
     /// Opens an existing file for reading only.
     pub const fn read_only() -> Self {
@@ -320,6 +342,20 @@ pub enum CallInput {
         timeout: Duration,
     },
 
+    /// Run one local process with bounded captured output.
+    ProcessRun {
+        /// Executable path or command name.
+        command: String,
+        /// Command arguments. No shell expansion is performed.
+        args: Vec<String>,
+        /// Maximum time the process may run before Tina attempts kill/reap.
+        timeout: Duration,
+        /// Maximum stdout bytes delivered to the isolate.
+        stdout_limit: usize,
+        /// Maximum stderr bytes delivered to the isolate.
+        stderr_limit: usize,
+    },
+
     /// Open a file and return a runtime-owned file id.
     FileOpen {
         /// Path to open.
@@ -434,6 +470,7 @@ impl CallInput {
             Self::UdpRecvFrom { .. } => crate::trace::CallKind::UdpRecvFrom,
             Self::UdpSocketClose { .. } => crate::trace::CallKind::UdpSocketClose,
             Self::DnsLookup { .. } => crate::trace::CallKind::DnsLookup,
+            Self::ProcessRun { .. } => crate::trace::CallKind::ProcessRun,
             Self::FileOpen { .. } => crate::trace::CallKind::FileOpen,
             Self::FileReadAt { .. } => crate::trace::CallKind::FileReadAt,
             Self::FileWriteAt { .. } => crate::trace::CallKind::FileWriteAt,
@@ -564,6 +601,20 @@ pub enum CallOutput {
         addrs: Vec<SocketAddr>,
     },
 
+    /// A bounded local process exited and captured output was delivered.
+    ProcessExited {
+        /// Process exit status.
+        status: ProcessStatus,
+        /// Captured stdout, capped by the request.
+        stdout: Vec<u8>,
+        /// Captured stderr, capped by the request.
+        stderr: Vec<u8>,
+        /// Whether stdout exceeded the cap and was drained/discarded.
+        stdout_truncated: bool,
+        /// Whether stderr exceeded the cap and was drained/discarded.
+        stderr_truncated: bool,
+    },
+
     /// A file was opened.
     FileOpened {
         /// The runtime-assigned file id.
@@ -689,6 +740,16 @@ pub enum CallError {
 
     /// The DNS lane was already closed when the runtime tried to submit a lookup.
     DnsClosed,
+
+    /// The bounded process lane was full when the runtime tried to submit work.
+    ProcessFull,
+
+    /// The process lane was already closed when the runtime tried to submit work.
+    ProcessClosed,
+
+    /// Tina attempted process kill/reap after timeout or cancel, but the
+    /// platform did not prove the child was gone.
+    KillUncertain,
 }
 
 /// User-visible outcome for an observed send.
@@ -1274,6 +1335,27 @@ impl CallOutput {
         }
     }
 
+    /// Extracts the successful bounded process result.
+    pub fn into_process_exited(self) -> Result<ProcessRunResult, CallError> {
+        match self {
+            Self::ProcessExited {
+                status,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+            } => Ok(ProcessRunResult {
+                status,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+            }),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("ProcessExited", &other),
+        }
+    }
+
     /// Extracts the successful file open result.
     pub fn into_file_opened(self) -> Result<FileId, CallError> {
         match self {
@@ -1670,6 +1752,26 @@ pub fn dns_lookup(
             timeout,
         },
         CallOutput::into_dns_resolved,
+    )
+}
+
+/// Returns a typed bounded process-run helper.
+pub fn process_run(
+    command: impl Into<String>,
+    args: Vec<String>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> TypedCall<ProcessRunResult> {
+    TypedCall::new(
+        CallInput::ProcessRun {
+            command: command.into(),
+            args,
+            timeout,
+            stdout_limit,
+            stderr_limit,
+        },
+        CallOutput::into_process_exited,
     )
 }
 

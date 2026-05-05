@@ -57,9 +57,9 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
-    CallReplyRejectedReason, EffectKind, ListenerId, PersistenceTraceInfo, RestartSkippedReason,
-    RuntimeCall, RuntimeCallParts, RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason,
-    SupervisionRejectedReason, UdpSocketId,
+    CallReplyRejectedReason, EffectKind, ListenerId, PersistenceTraceInfo, ProcessStatus,
+    RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent, RuntimeEventKind,
+    SendOutcome, SendRejectedReason, SupervisionRejectedReason, UdpSocketId,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -81,6 +81,9 @@ pub struct SimulatorConfig {
 
     /// Scripted DNS configuration for this run.
     pub dns: ScriptedDnsConfig,
+
+    /// Scripted process configuration for this run.
+    pub process: ScriptedProcessConfig,
 
     /// Scripted simulator-only storage faults for persistence recovery tests.
     pub storage: ScriptedStorageFaultConfig,
@@ -373,6 +376,55 @@ pub enum ScriptedDnsResult {
     Timeout,
 }
 
+/// Scripted process configuration for one simulator run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedProcessConfig {
+    /// Maximum number of async process completions that may be pending.
+    pub pending_completion_capacity: usize,
+
+    /// Process scripts available to `ProcessRun`.
+    pub runs: Vec<ScriptedProcessRunConfig>,
+}
+
+/// Scripted process run configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedProcessRunConfig {
+    /// Executable path or command name.
+    pub command: String,
+
+    /// Exact argument list.
+    pub args: Vec<String>,
+
+    /// First simulator step on which this run may complete.
+    pub complete_after_step: u64,
+
+    /// Scripted process outcome.
+    pub result: ScriptedProcessResult,
+}
+
+/// Scripted process outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedProcessResult {
+    /// Process exits with captured output.
+    Exited {
+        /// Portable exit code.
+        code: Option<i32>,
+        /// Captured stdout before request-level truncation.
+        stdout: Vec<u8>,
+        /// Captured stderr before request-level truncation.
+        stderr: Vec<u8>,
+    },
+
+    /// Process spawn or wait fails as I/O.
+    Failed,
+
+    /// Process exceeds its timeout.
+    Timeout,
+
+    /// Kill/reap outcome is uncertain.
+    KillUncertain,
+}
+
 /// Simulator-only deterministic storage fault configuration.
 ///
 /// These faults mutate the simulator durable image or completion result. They
@@ -422,6 +474,15 @@ impl Default for ScriptedDnsConfig {
         Self {
             pending_completion_capacity: usize::MAX,
             lookups: Vec::new(),
+        }
+    }
+}
+
+impl Default for ScriptedProcessConfig {
+    fn default() -> Self {
+        Self {
+            pending_completion_capacity: usize::MAX,
+            runs: Vec::new(),
         }
     }
 }
@@ -1197,6 +1258,7 @@ enum TcpResourceKey {
     UdpSend(CallId),
     UdpRecv(UdpSocketId),
     Dns(CallId),
+    Process(CallId),
     FileRead(tina_runtime::FileId),
     FileWrite(tina_runtime::FileId),
     FileFsync(tina_runtime::FileId),
@@ -1211,6 +1273,10 @@ impl TcpResourceKey {
 
     fn is_dns(self) -> bool {
         matches!(self, Self::Dns(_))
+    }
+
+    fn is_process(self) -> bool {
+        matches!(self, Self::Process(_))
     }
 }
 
@@ -2799,6 +2865,15 @@ where
                 port,
                 timeout,
             } => self.handle_dns_lookup(call_id, host, port, timeout),
+            CallInput::ProcessRun {
+                command,
+                args,
+                timeout,
+                stdout_limit,
+                stderr_limit,
+            } => {
+                self.handle_process_run(call_id, command, args, timeout, stdout_limit, stderr_limit)
+            }
             CallInput::FileOpen { path, options } => self.handle_file_open(call_id, path, options),
             CallInput::FileReadAt { file, len, offset } => {
                 self.handle_file_read_at(call_id, file, len, offset)
@@ -3421,6 +3496,68 @@ where
         );
     }
 
+    fn handle_process_run(
+        &mut self,
+        call_id: CallId,
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(script) = self
+            .config
+            .process
+            .runs
+            .iter()
+            .find(|run| run.command == command && run.args == args)
+            .cloned()
+        else {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Io),
+                self.step_ordinal + 1,
+            );
+            return;
+        };
+
+        let result = match script.result {
+            ScriptedProcessResult::Exited {
+                code,
+                stdout,
+                stderr,
+            } => {
+                let stdout_truncated = stdout.len() > stdout_limit;
+                let stderr_truncated = stderr.len() > stderr_limit;
+                CallOutput::ProcessExited {
+                    status: ProcessStatus { code },
+                    stdout: stdout.into_iter().take(stdout_limit).collect(),
+                    stderr: stderr.into_iter().take(stderr_limit).collect(),
+                    stdout_truncated,
+                    stderr_truncated,
+                }
+            }
+            ScriptedProcessResult::Failed => CallOutput::Failed(CallError::Io),
+            ScriptedProcessResult::Timeout => CallOutput::Failed(CallError::Timeout),
+            ScriptedProcessResult::KillUncertain => CallOutput::Failed(CallError::KillUncertain),
+        };
+        self.schedule_process_completion(
+            call_id,
+            TcpResourceKey::Process(call_id),
+            script.complete_after_step.max(self.step_ordinal + 1),
+            result,
+        );
+    }
+
     fn handle_file_open(
         &mut self,
         call_id: CallId,
@@ -3756,6 +3893,7 @@ where
             | TcpResourceKey::StreamWrite(_)
             | TcpResourceKey::UdpSend(_)
             | TcpResourceKey::Dns(_)
+            | TcpResourceKey::Process(_)
             | TcpResourceKey::FileRead(_)
             | TcpResourceKey::FileWrite(_)
             | TcpResourceKey::FileFsync(_)
@@ -3800,7 +3938,11 @@ where
         let pending_non_udp = self
             .pending_tcp_completions
             .iter()
-            .filter(|completion| !completion.resource.is_udp() && !completion.resource.is_dns())
+            .filter(|completion| {
+                !completion.resource.is_udp()
+                    && !completion.resource.is_dns()
+                    && !completion.resource.is_process()
+            })
             .count();
         if pending_non_udp >= self.config.tcp.pending_completion_capacity {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
@@ -3876,6 +4018,42 @@ where
                 insertion_order,
                 resource,
                 result: CallOutput::Failed(CallError::DnsFull),
+            });
+            return;
+        }
+
+        let insertion_order = self.next_tcp_completion_ordinal;
+        self.next_tcp_completion_ordinal += 1;
+        self.pending_tcp_completions.push(PendingTcpCompletion {
+            call_id,
+            ready_at_step,
+            insertion_order,
+            resource,
+            result,
+        });
+    }
+
+    fn schedule_process_completion(
+        &mut self,
+        call_id: CallId,
+        resource: TcpResourceKey,
+        ready_at_step: u64,
+        result: CallOutput,
+    ) {
+        let pending_process = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| completion.resource.is_process())
+            .count();
+        if pending_process >= self.config.process.pending_completion_capacity {
+            let insertion_order = self.next_tcp_completion_ordinal;
+            self.next_tcp_completion_ordinal += 1;
+            self.pending_tcp_completions.push(PendingTcpCompletion {
+                call_id,
+                ready_at_step: self.step_ordinal + 1,
+                insertion_order,
+                resource,
+                result: CallOutput::Failed(CallError::ProcessFull),
             });
             return;
         }
@@ -5047,6 +5225,7 @@ fn call_kind(request: &CallInput) -> CallKind {
         CallInput::UdpRecvFrom { .. } => CallKind::UdpRecvFrom,
         CallInput::UdpSocketClose { .. } => CallKind::UdpSocketClose,
         CallInput::DnsLookup { .. } => CallKind::DnsLookup,
+        CallInput::ProcessRun { .. } => CallKind::ProcessRun,
         CallInput::FileOpen { .. } => CallKind::FileOpen,
         CallInput::FileReadAt { .. } => CallKind::FileReadAt,
         CallInput::FileWriteAt { .. } => CallKind::FileWriteAt,

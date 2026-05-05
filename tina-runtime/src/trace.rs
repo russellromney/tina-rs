@@ -111,6 +111,9 @@ pub enum CallKind {
     /// A DNS lookup.
     DnsLookup,
 
+    /// A bounded local process run.
+    ProcessRun,
+
     /// A file open.
     FileOpen,
 

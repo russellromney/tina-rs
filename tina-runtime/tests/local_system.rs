@@ -15,7 +15,7 @@ use tina_runtime::{
     ResourceSupport, RuntimeEventKind, ShutdownSupport, SnapshotImage, StreamId,
     ThreadedRuntimeError, ThreadedTrySendError, TraceRetention, UdpSocketId, dns_lookup,
     file_close, file_create, file_fsync, file_read, file_size, file_write, journal_append,
-    journal_replay, sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
+    journal_replay, process_run, sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
     tcp_close_stream, tcp_read, tcp_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 
@@ -323,6 +323,61 @@ impl DnsUnsupportedService {
                 self.observed
                     .lock()
                     .expect("dns observed lock")
+                    .push(format!("err:{error:?}"));
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessMsg {
+    Echo,
+    Sleep,
+    Done(Result<tina_runtime::ProcessRunResult, CallError>),
+}
+
+#[derive(Debug)]
+struct ProcessService {
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = ProcessMsg, shard = AppShard)]
+impl ProcessService {
+    fn handle(&mut self, msg: ProcessMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            ProcessMsg::Echo => process_run(
+                "/bin/echo",
+                vec!["llamas".to_string()],
+                Duration::from_secs(2),
+                4,
+                16,
+            )
+            .reply(ProcessMsg::Done),
+            ProcessMsg::Sleep => process_run(
+                "/bin/sleep",
+                vec!["5".to_string()],
+                Duration::from_millis(10),
+                16,
+                16,
+            )
+            .reply(ProcessMsg::Done),
+            ProcessMsg::Done(Ok(result)) => {
+                self.observed
+                    .lock()
+                    .expect("process observed lock")
+                    .push(format!(
+                        "exit:{:?}:{}:{}",
+                        result.status.code,
+                        String::from_utf8_lossy(&result.stdout),
+                        result.stdout_truncated
+                    ));
+                noop()
+            }
+            ProcessMsg::Done(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("process observed lock")
                     .push(format!("err:{error:?}"));
                 noop()
             }
@@ -990,7 +1045,11 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         capabilities.udp.execution(),
         ResourceExecutionShape::PollBacked
     );
-    assert_eq!(capabilities.process.support(), ResourceSupport::Unsupported);
+    assert_eq!(capabilities.process.support(), ResourceSupport::Supported);
+    assert_eq!(
+        capabilities.process.execution(),
+        ResourceExecutionShape::LaneBackedBlocking
+    );
     assert_eq!(capabilities.signal.support(), ResourceSupport::Unsupported);
     assert_eq!(capabilities.tls.support(), ResourceSupport::AdapterOnly);
     assert_eq!(
@@ -1056,6 +1115,68 @@ fn local_system_dns_rail_is_typed_unsupported_without_fallback() {
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::DnsLookup,
                 reason: CallError::Unsupported,
+                ..
+            }
+        )
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn local_system_process_run_captures_truncates_and_times_out() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(40), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<ProcessService, Infallible>(
+            ProcessService {
+                observed: Arc::clone(&observed),
+            },
+            16,
+        )
+        .expect("register process service");
+
+    app.try_send(address, ProcessMsg::Echo)
+        .expect("start process echo");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("process observed lock")
+            .iter()
+            .any(|entry| entry == "exit:Some(0):llam:true")
+    });
+
+    app.try_send(address, ProcessMsg::Sleep)
+        .expect("start process sleep");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("process observed lock")
+            .iter()
+            .any(|entry| entry == "err:Timeout")
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::ProcessRun,
+                ..
+            }
+        )
+    }));
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::ProcessRun,
+                reason: CallError::Timeout,
                 ..
             }
         )

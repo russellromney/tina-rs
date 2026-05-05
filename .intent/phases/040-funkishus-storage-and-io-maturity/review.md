@@ -485,6 +485,31 @@ Review note:
 - This is a deliberate Tina-honesty choice. A future live DNS phase can add a
   bounded resolver adapter only if shutdown/cancel can be named without hiding
   an unbounded or unjoinable worker behind Tina.
+
+## Implementation Audit 5
+
+Narrow process rail landed with live and simulator coverage.
+
+What is true now:
+
+- `ProcessRun`, `ProcessStatus`, `ProcessRunResult`, and
+  `process_run(command, args, timeout, stdout_limit, stderr_limit)` exist in
+  `tina-runtime`.
+- The live process rail uses a named bounded lane, not a shell helper and not
+  an unbounded runtime fallback.
+- Live process execution uses command-plus-args, null stdin, bounded
+  stdout/stderr capture, drain-and-truncate pipe handling, timeout kill/reap,
+  and requester-stop tombstoning through call ownership.
+- `LocalSystem::capabilities()` now reports process support as
+  `LaneBackedBlocking` with bounded capacity.
+- `tina-sim` can script process exit, timeout, I/O failure, kill-uncertain, and
+  lane-full pressure with the same call/output/error vocabulary.
+
+Review note:
+
+- This is intentionally not interactive process I/O. No stdin streaming, no
+  shell-by-default helper, no process tree claim, and no broad cross-platform
+  signal/kill story beyond the typed `KillUncertain` escape hatch.
 - Direct integration test pins supported and unsupported resource families
   through the canonical `LocalSystem` path.
 

@@ -12,14 +12,16 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
-    FileOpenOptions, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
-    UdpSocketId, dns_lookup, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    FileOpenOptions, ListenerId, ProcessRunResult, RuntimeCall, RuntimeEvent, RuntimeEventKind,
+    StreamId, UdpSocketId, dns_lookup, process_run, udp_bind, udp_close_socket, udp_recv_from,
+    udp_send_to,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact, ScriptedDnsConfig,
     ScriptedDnsLookupConfig, ScriptedDnsResult, ScriptedListenerConfig, ScriptedPeerConfig,
-    ScriptedTcpConfig, ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig,
-    Simulator, SimulatorConfig, TcpCompletionFaultMode,
+    ScriptedProcessConfig, ScriptedProcessResult, ScriptedProcessRunConfig, ScriptedTcpConfig,
+    ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig, Simulator,
+    SimulatorConfig, TcpCompletionFaultMode,
     dst::{DstRun, History, InvariantSuite, assert_replays},
 };
 use tina_supervisor::SupervisorConfig;
@@ -448,6 +450,61 @@ impl Isolate for DnsProbe {
                 self.observed
                     .borrow_mut()
                     .push(format!("dns-err:{error:?}"));
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessProbeMsg {
+    Run {
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    },
+    Done(Result<ProcessRunResult, CallError>),
+}
+
+#[derive(Debug)]
+struct ProcessProbe {
+    observed: Rc<RefCell<Vec<String>>>,
+}
+
+impl Isolate for ProcessProbe {
+    type Message = ProcessProbeMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<ProcessProbeMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ProcessProbeMsg::Run {
+                command,
+                args,
+                timeout,
+                stdout_limit,
+                stderr_limit,
+            } => process_run(command, args, timeout, stdout_limit, stderr_limit)
+                .reply(ProcessProbeMsg::Done),
+            ProcessProbeMsg::Done(Ok(result)) => {
+                self.observed.borrow_mut().push(format!(
+                    "process:{:?}:{}:{}:{}",
+                    result.status.code,
+                    String::from_utf8_lossy(&result.stdout),
+                    result.stdout_truncated,
+                    result.stderr_truncated
+                ));
+                Effect::Noop
+            }
+            ProcessProbeMsg::Done(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("process-err:{error:?}"));
                 Effect::Noop
             }
         }
@@ -1338,6 +1395,202 @@ fn dns_sim_config() -> SimulatorConfig {
     }
 }
 
+fn process_sim_config() -> SimulatorConfig {
+    SimulatorConfig {
+        process: ScriptedProcessConfig {
+            pending_completion_capacity: 1,
+            runs: vec![
+                ScriptedProcessRunConfig {
+                    command: "llama-echo".to_string(),
+                    args: vec!["feed".to_string()],
+                    complete_after_step: 3,
+                    result: ScriptedProcessResult::Exited {
+                        code: Some(0),
+                        stdout: b"llamafeed".to_vec(),
+                        stderr: Vec::new(),
+                    },
+                },
+                ScriptedProcessRunConfig {
+                    command: "llama-sleep".to_string(),
+                    args: Vec::new(),
+                    complete_after_step: 6,
+                    result: ScriptedProcessResult::Timeout,
+                },
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn scripted_process_exits_truncates_times_out_and_replays() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, process_sim_config());
+    let probe = sim.register(ProcessProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(
+        probe,
+        ProcessProbeMsg::Run {
+            command: "llama-echo".to_string(),
+            args: vec!["feed".to_string()],
+            timeout: Duration::from_millis(50),
+            stdout_limit: 5,
+            stderr_limit: 4,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "process:Some(0):llama:true:false")
+    );
+    assert_eq!(count_call_completed(sim.trace(), CallKind::ProcessRun), 1);
+
+    sim.try_send(
+        probe,
+        ProcessProbeMsg::Run {
+            command: "llama-sleep".to_string(),
+            args: Vec::new(),
+            timeout: Duration::from_millis(50),
+            stdout_limit: 5,
+            stderr_limit: 4,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "process-err:Timeout")
+    );
+
+    let first = sim.replay_artifact();
+    let mut replay = Simulator::new(TestShard, process_sim_config());
+    let replay_probe = replay.register(ProcessProbe {
+        observed: Rc::new(RefCell::new(Vec::new())),
+    });
+    replay
+        .try_send(
+            replay_probe,
+            ProcessProbeMsg::Run {
+                command: "llama-echo".to_string(),
+                args: vec!["feed".to_string()],
+                timeout: Duration::from_millis(50),
+                stdout_limit: 5,
+                stderr_limit: 4,
+            },
+        )
+        .unwrap();
+    replay.run_until_quiescent();
+    replay
+        .try_send(
+            replay_probe,
+            ProcessProbeMsg::Run {
+                command: "llama-sleep".to_string(),
+                args: Vec::new(),
+                timeout: Duration::from_millis(50),
+                stdout_limit: 5,
+                stderr_limit: 4,
+            },
+        )
+        .unwrap();
+    replay.run_until_quiescent();
+    assert_eq!(
+        first.event_record(),
+        replay.replay_artifact().event_record()
+    );
+}
+
+#[test]
+fn scripted_process_zero_timeout_and_lane_full_are_visible() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            process: ScriptedProcessConfig {
+                pending_completion_capacity: 1,
+                runs: vec![
+                    ScriptedProcessRunConfig {
+                        command: "llama-echo".to_string(),
+                        args: vec!["feed".to_string()],
+                        complete_after_step: 99,
+                        result: ScriptedProcessResult::Exited {
+                            code: Some(0),
+                            stdout: b"llamafeed".to_vec(),
+                            stderr: Vec::new(),
+                        },
+                    },
+                    ScriptedProcessRunConfig {
+                        command: "llama-sleep".to_string(),
+                        args: Vec::new(),
+                        complete_after_step: 99,
+                        result: ScriptedProcessResult::Timeout,
+                    },
+                ],
+            },
+            ..Default::default()
+        },
+    );
+    let probe = sim.register(ProcessProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(
+        probe,
+        ProcessProbeMsg::Run {
+            command: "llama-echo".to_string(),
+            args: vec!["feed".to_string()],
+            timeout: Duration::ZERO,
+            stdout_limit: 5,
+            stderr_limit: 4,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "process-err:Timeout")
+    );
+
+    sim.try_send(
+        probe,
+        ProcessProbeMsg::Run {
+            command: "llama-echo".to_string(),
+            args: vec!["feed".to_string()],
+            timeout: Duration::from_millis(50),
+            stdout_limit: 5,
+            stderr_limit: 4,
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        probe,
+        ProcessProbeMsg::Run {
+            command: "llama-sleep".to_string(),
+            args: Vec::new(),
+            timeout: Duration::from_millis(50),
+            stdout_limit: 5,
+            stderr_limit: 4,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "process-err:ProcessFull")
+    );
+}
+
 #[test]
 fn scripted_dns_resolves_fails_times_out_and_replays() {
     let observed = Rc::new(RefCell::new(Vec::new()));
@@ -1721,6 +1974,7 @@ fn scripted_udp_completion_capacity_is_separate_from_tcp_completion_capacity() {
                 ],
             },
             dns: Default::default(),
+            process: Default::default(),
             storage: Default::default(),
         },
     );
@@ -2154,6 +2408,7 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            process: Default::default(),
         },
     );
 
@@ -2278,6 +2533,7 @@ fn closed_stream_id_surfaces_invalid_resource() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            process: Default::default(),
         },
     );
 
@@ -2337,6 +2593,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            process: Default::default(),
         },
     );
 
@@ -2410,6 +2667,7 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            process: Default::default(),
         },
     );
 
@@ -2958,6 +3216,7 @@ fn run_seeded_cancellation_case(history: &History<CancellationOp>) -> DstRun<(),
             storage: Default::default(),
             udp: Default::default(),
             dns: Default::default(),
+            process: Default::default(),
         },
     );
 
@@ -3276,6 +3535,7 @@ fn tcp_checker_failure_replays_under_ready_reordering() {
         storage: Default::default(),
         udp: Default::default(),
         dns: Default::default(),
+        process: Default::default(),
     };
 
     let mut sim = Simulator::new(TestShard, config);
