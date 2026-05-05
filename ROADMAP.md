@@ -46,7 +46,8 @@ Following the abstraction-vs-implementation rule (capability traits live in thei
 
 - `tina` — trait crate. `Isolate`, `Effect`, `Mailbox`, `Shard`, plus any small policy types that truly belong at the abstraction boundary. **No impls.**
 - `tina-mailbox-spsc` — SPSC ring buffer impl
-- `tina-mailbox-mpsc` — MPSC fallback impl
+- `tina-mailbox-mpsc` — possible future bounded multi-producer mailbox impl,
+  only if a named workload proves the producer model needs it
 - `tina-supervisor` — supervision tree mechanism
 - `tina-runtime` — current explicit-step, simulated-driver, and
   Betelgeuse-backed threaded runtime implementation
@@ -67,7 +68,7 @@ start from an honest baseline rather than from stale roadmap wording.
 | Claim | Current evidence | Still missing |
 |---|---|---|
 | Trait/API discipline | `tina` exposes `Isolate`, closed `Effect`, typed `Address`, `Outbound`, `ChildDefinition`, supervision policy types, and the preferred authoring surface (`tina::prelude::*`, `#[tina::isolate(...)]`, `#[tina_runtime::isolate(...)]`, effect helpers, typed call helpers, `ctx.me()`, and `ctx.send_self(...)`). | Small call-result helper polish remains optional. |
-| Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. Cross-shard shard-pair queues are bounded and directly proved in Galileo. | This is not a full formal proof for every capacity/interleaving/refactor. Any future MPSC fallback is not implemented. |
+| Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. Cross-shard shard-pair queues are bounded and directly proved in Galileo. | This is not a full formal proof for every capacity/interleaving/refactor. Any future multi-producer mailbox support must preserve the same bounded contract and is not implemented. |
 | Single-shard runtime delivery | `tina-runtime` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, supervised panic restart with policy/budget config, an assertion-backed task-dispatcher proof package, and generated-history property tests. | Supervision is still narrow: panic-triggered only, runtime-lifetime budget only, and no timed budget windows. The generated-history model is bounded and does not prove arbitrary user programs. |
 | Failure isolation | Unwinding handler panics become runtime events; the panicking isolate stops and the same round continues deterministically. | This is not Tina-Odin's OS trap boundary. Rust segfault isolation, shard quarantine, and `panic = "abort"` behavior are out of scope unless a later phase explicitly designs them. |
 | Multi-shard runtime/sim | `tina-runtime` and `tina-sim` expose multi-shard explicit-step runners with root placement, global event/call ids, bounded shard-pair queues, next-step-only remote visibility, deterministic harvest order, source-time versus destination-time delivery stages, simulator replay, user-shaped dispatcher proofs, sealed address-local remote-failure behavior, and shard-local supervision/restart ownership. The live Betelgeuse multi-shard runner has bounded ingress and bounded cross-shard transport. | Thread pinning/topology, peer quarantine, shard-restart propagation, cross-shard child ownership, and live cross-shard isolate-call reply transport remain future work. |
@@ -199,8 +200,11 @@ These still need answers, but each now has an intended phase home.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
    transport is not claimed. Home: Jan Peter Balkenende remoting unless a local
    workload proves it must land earlier.
-5. **MPSC fallback.** Optional only. Implement only if a real workload proves
-   SPSC is too narrow for the local framework.
+5. **Mailbox producer model.** Current decision: one mailbox contract, no
+   alternate escape path. Add bounded multi-producer mailbox support only if a
+   named workload proves the current producer model is too narrow, and only
+   with the same visible `Full`/`Closed`, FIFO rules, no hidden blocking, and
+   no unbounded internal queue.
 6. **Zero-copy / lower-allocation transport.** The current cost model is
    honest but not final. Home: later performance phase after Jelle's new I/O
    paths expose real pressure.

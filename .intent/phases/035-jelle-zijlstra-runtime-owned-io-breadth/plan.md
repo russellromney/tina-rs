@@ -97,6 +97,10 @@ workloads, pause and amend the plan before expanding scope.
   resource lanes.
 - Closing a resource with an active lane fails visibly with
   `CallError::ResourceBusy`, unless a stronger and tested semantic is chosen.
+- No alternate mailbox escape path. Jelle must keep the existing bounded
+  mailbox contract; if outbound TCP or file I/O appears to require
+  multi-producer mailbox support, pause and name the workload instead of adding
+  a hidden second route.
 - Simulator semantics may be smaller than native semantics, but they must be
   honest and deterministic.
 - No hidden blocking pool, no unbounded queue, no arbitrary async future inside
@@ -169,6 +173,8 @@ Pause and update the plan if:
 - file API needs path sandbox/security policy decisions beyond local test
   files;
 - TLS/DNS/process/signal become necessary to prove the accepted workloads;
+- outbound TCP or file I/O seems to require a multi-producer mailbox
+  implementation;
 - allocation cost shows a structural problem caused by the new resource model;
 - any new I/O needs a hidden blocking pool or unbounded queue.
 

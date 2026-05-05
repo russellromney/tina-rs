@@ -44,6 +44,39 @@ random production theater.
    DNS/TLS/UDP/process/signal should not slide in because they sound
    production-ish. They land only if accepted workloads prove need.
 
+5. **Mailbox fallback language is now fixed, but must stay fixed.**
+   The roadmap no longer says `MPSC fallback`; it says mailbox producer model
+   decision. That matters. A fallback path hides "main path did not work."
+   Jelle must not add a second mailbox route while implementing I/O unless a
+   named workload proves the current producer model cannot express the service.
+   If multi-producer support ever lands, it must be a first-class bounded
+   mailbox implementation with the same visible `Full`/`Closed` contract, not a
+   secret escape hatch.
+
+## Hostile Review After Mailbox Wording Fix
+
+Verdict: plan still ready. The fallback smell is removed from both the roadmap
+and Jelle rails.
+
+What hostile grug tried to break:
+
+- **"Fallback" hides failure.** Fixed. The roadmap now says one mailbox
+  contract and only a possible future bounded multi-producer implementation.
+- **Jelle might sneak in MPSC while building file/connect.** Fixed. The plan now
+  has a design rule and pause gate: if I/O seems to require multi-producer
+  mailbox support, pause and name the workload.
+- **Too many mailbox concepts for users.** Still okay because this is not a new
+  user surface. The current user promise remains bounded mailbox semantics with
+  visible `Full`/`Closed`; implementation choices stay below that contract.
+- **Could this block 035?** No. Outbound TCP connect and file I/O should not
+  require MPSC. If they do, that is a discovery worth stopping for.
+
+Remaining non-blocking risk:
+
+- The crate layout still lists `tina-mailbox-mpsc` as possible future shape.
+  That is acceptable now because it is no longer a fallback and is explicitly
+  gated by a named workload.
+
 ## Launch Guidance
 
 1. Start with a concrete code audit of `vendor-betelgeuse` socket/file traits,
