@@ -3317,7 +3317,8 @@ mod tests {
         done_rx.recv().expect("resolver ran");
 
         let mut completed = Vec::new();
-        for _ in 0..64 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
             lane.advance(now, &mut completed);
             if !completed.is_empty() {
                 break;

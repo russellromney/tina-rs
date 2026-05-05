@@ -10,15 +10,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, CallKind, CancellationSupport, FileId, ListenerId, LiveShardState, LocalSystem,
-    LocalSystemState, MailboxFactory, PathKind, PathMetadata, PersistenceSupportLevel,
-    ResourceExecutionShape, ResourceSupport, RuntimeEventKind, ShutdownSupport, SnapshotImage,
-    StreamId, ThreadedRuntimeError, ThreadedTrySendError, TlsStreamId, TraceRetention, UdpSocketId,
-    dns_lookup, file_close, file_create, file_fsync, file_read, file_size, file_write,
-    journal_append, journal_replay, path_metadata, process_run, read_dir, remove_file,
-    rename_replace, signal_wait, sleep, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write, tls_close, tls_connect, tls_read,
-    tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    CallError, CallKind, CallOutcome, CancellationSupport, FileId, ListenerId, LiveShardState,
+    LocalSystem, LocalSystemConfig, LocalSystemConfigError, LocalSystemState, MailboxFactory,
+    PathKind, PathMetadata, PersistenceSupportLevel, ResourceExecutionShape, ResourceSupport,
+    RuntimeEventKind, ShutdownSupport, SnapshotImage, StreamId, ThreadedRuntimeError,
+    ThreadedTrySendError, TlsStreamId, TraceRetention, UdpSocketId, call, dns_lookup, file_close,
+    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
+    path_metadata, process_run, read_dir, remove_file, rename_replace, signal_wait, sleep,
+    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+    tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    udp_recv_from, udp_send_to,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -122,6 +123,78 @@ impl LlamaService {
         match msg {
             LlamaMsg::Feed(value) => {
                 self.seen.lock().expect("seen lock").push(value);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrossShardCallWorkerMsg {
+    Echo(Vec<u8>),
+    NoReply,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrossShardCallReply(Vec<u8>);
+
+#[derive(Debug)]
+struct CrossShardCallWorker;
+
+#[tina_runtime::isolate(
+    message = CrossShardCallWorkerMsg,
+    reply = CrossShardCallReply,
+    shard = AppShard
+)]
+impl CrossShardCallWorker {
+    fn handle(
+        &mut self,
+        msg: CrossShardCallWorkerMsg,
+        _ctx: &mut Context<'_, AppShard>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossShardCallWorkerMsg::Echo(bytes) => reply(CrossShardCallReply(bytes)),
+            CrossShardCallWorkerMsg::NoReply => noop(),
+            CrossShardCallWorkerMsg::Stop => stop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CrossShardCallClientMsg {
+    Start(Address<CrossShardCallWorkerMsg, CrossShardCallReply>),
+    StartTimeout(Address<CrossShardCallWorkerMsg, CrossShardCallReply>),
+    Returned(CallOutcome<CrossShardCallReply>),
+}
+
+#[derive(Debug)]
+struct CrossShardCallClient {
+    outcomes: Arc<Mutex<Vec<CallOutcome<CrossShardCallReply>>>>,
+}
+
+#[tina_runtime::isolate(message = CrossShardCallClientMsg, shard = AppShard)]
+impl CrossShardCallClient {
+    fn handle(
+        &mut self,
+        msg: CrossShardCallClientMsg,
+        _ctx: &mut Context<'_, AppShard>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossShardCallClientMsg::Start(worker) => call(
+                worker,
+                CrossShardCallWorkerMsg::Echo(b"llama".to_vec()),
+                Duration::from_secs(2),
+            )
+            .reply(CrossShardCallClientMsg::Returned),
+            CrossShardCallClientMsg::StartTimeout(worker) => call(
+                worker,
+                CrossShardCallWorkerMsg::NoReply,
+                Duration::from_millis(20),
+            )
+            .reply(CrossShardCallClientMsg::Returned),
+            CrossShardCallClientMsg::Returned(outcome) => {
+                self.outcomes.lock().expect("outcomes lock").push(outcome);
                 noop()
             }
         }
@@ -1267,6 +1340,16 @@ fn local_system_topology_report_before_and_after_shutdown() {
 
     let terminal = app.shutdown().drain().join().expect("shutdown app");
     assert_eq!(terminal.state(), LocalSystemState::Closed);
+    assert_eq!(
+        terminal.shutdown_report().final_state(),
+        LocalSystemState::Closed
+    );
+    assert!(terminal.shutdown_report().clean());
+    assert_eq!(terminal.shutdown_report().failed_shards(), []);
+    assert_eq!(
+        terminal.shutdown_report().remaining_owned_resource_count(),
+        0
+    );
     let terminal_topology = terminal.topology().expect("terminal topology");
     assert_eq!(
         terminal_topology
@@ -1812,6 +1895,303 @@ fn local_system_multi_shard_uses_same_entry_name_for_topology() {
 }
 
 #[test]
+fn local_system_config_manifest_rejects_zero_capacities_before_start() {
+    for (config, expected) in [
+        (
+            LocalSystemConfig {
+                ingress_capacity: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroIngressCapacity,
+        ),
+        (
+            LocalSystemConfig {
+                shard_pair_capacity: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroShardPairCapacity,
+        ),
+        (
+            LocalSystemConfig {
+                storage_lane_capacity: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroStorageLaneCapacity,
+        ),
+        (
+            LocalSystemConfig {
+                dns_lane_capacity: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroDnsLaneCapacity,
+        ),
+        (
+            LocalSystemConfig {
+                tls_lane_capacity: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroTlsLaneCapacity,
+        ),
+        (
+            LocalSystemConfig {
+                process_lane_capacity: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroProcessLaneCapacity,
+        ),
+        (
+            LocalSystemConfig {
+                signal_capacity: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroSignalCapacity,
+        ),
+    ] {
+        assert_eq!(config.validate(), Err(expected));
+    }
+}
+
+#[test]
+fn live_cross_shard_isolate_call_round_trips_reply_to_requester_shard() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(45))
+        .shard(AppShard(46))
+        .ingress_capacity(8)
+        .shard_pair_capacity(8)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(46),
+            CrossShardCallWorker,
+            8,
+        )
+        .expect("register cross shard worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(45),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register cross shard client");
+
+    app.try_send(client, CrossShardCallClientMsg::Start(worker))
+        .expect("start cross shard call");
+
+    wait_until(|| {
+        outcomes
+            .lock()
+            .expect("outcomes lock")
+            .iter()
+            .any(|outcome| {
+                matches!(
+                    outcome,
+                    CallOutcome::Replied(CrossShardCallReply(bytes)) if bytes == b"llama"
+                )
+            })
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("shutdown cross shard call app");
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(45)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+    }));
+    assert!(!terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallReplyRejected { .. }
+                | RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+        )
+    }));
+}
+
+#[test]
+fn live_cross_shard_isolate_call_timeout_settles_on_requester_shard() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(47))
+        .shard(AppShard(48))
+        .ingress_capacity(8)
+        .shard_pair_capacity(8)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(48),
+            CrossShardCallWorker,
+            8,
+        )
+        .expect("register timeout worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(47),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register timeout client");
+
+    app.try_send(client, CrossShardCallClientMsg::StartTimeout(worker))
+        .expect("start cross shard timeout call");
+
+    wait_until(|| {
+        outcomes
+            .lock()
+            .expect("timeout outcomes lock")
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Timeout))
+    });
+
+    let terminal = app.shutdown().drain().join().expect("shutdown timeout app");
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(47)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::Timeout,
+                    ..
+                }
+            )
+    }));
+}
+
+#[test]
+fn live_cross_shard_isolate_call_destination_full_returns_typed_full() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(49))
+        .shard(AppShard(50))
+        .ingress_capacity(8)
+        .shard_pair_capacity(8)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(50),
+            CrossShardCallWorker,
+            0,
+        )
+        .expect("register full worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(49),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register full client");
+
+    app.try_send(client, CrossShardCallClientMsg::Start(worker))
+        .expect("start full cross shard call");
+
+    wait_until(|| {
+        outcomes
+            .lock()
+            .expect("full outcomes lock")
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Full))
+    });
+
+    let terminal = app.shutdown().drain().join().expect("shutdown full app");
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(49)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetFull,
+                    ..
+                }
+            )
+    }));
+}
+
+#[test]
+fn live_cross_shard_isolate_call_destination_closed_returns_typed_closed() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(51))
+        .shard(AppShard(52))
+        .ingress_capacity(8)
+        .shard_pair_capacity(8)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(52),
+            CrossShardCallWorker,
+            8,
+        )
+        .expect("register closable worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(51),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register closed client");
+
+    app.try_send(worker, CrossShardCallWorkerMsg::Stop)
+        .expect("stop cross shard worker");
+    wait_until(|| {
+        app.trace().expect("trace snapshot").iter().any(|event| {
+            event.shard() == ShardId::new(52)
+                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+        })
+    });
+    app.try_send(client, CrossShardCallClientMsg::Start(worker))
+        .expect("start closed cross shard call");
+
+    wait_until(|| {
+        outcomes
+            .lock()
+            .expect("closed outcomes lock")
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Closed))
+    });
+
+    let terminal = app.shutdown().drain().join().expect("shutdown closed app");
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(51)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetClosed,
+                    ..
+                }
+            )
+    }));
+}
+
+#[test]
 fn remote_queue_pressure_reports_capacity_and_full_counter() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let entered = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1819,7 +2199,7 @@ fn remote_queue_pressure_reports_capacity_and_full_counter() {
     let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
         .shard(AppShard(43))
         .shard(AppShard(44))
-        .ingress_capacity(1)
+        .ingress_capacity(8)
         .shard_pair_capacity(1)
         .trace_retention(TraceRetention::Bounded(128))
         .build();
@@ -1864,6 +2244,11 @@ fn remote_queue_pressure_reports_capacity_and_full_counter() {
     assert_eq!(remote.queue().depth(), None);
     assert_eq!(remote.queue().accepted(), Some(1));
     assert_eq!(remote.queue().rejected_full(), Some(1));
+    let target_shard = topology
+        .shard(ShardId::new(44))
+        .expect("target shard topology");
+    assert_eq!(target_shard.ingress().capacity(), 8);
+    assert_eq!(target_shard.ingress().rejected_full(), Some(0));
 
     release_flag(&release);
     wait_until(|| seen.lock().expect("blocking seen lock").as_slice() == [1]);
@@ -2462,6 +2847,11 @@ fn local_system_join_report_reports_worker_failure_terminal_state() {
 
     let terminal = app.shutdown().drain().join_report();
     assert_eq!(terminal.state(), LocalSystemState::Failed);
+    assert_eq!(
+        terminal.shutdown_report().final_state(),
+        LocalSystemState::Failed
+    );
+    assert!(!terminal.shutdown_report().clean());
     assert_eq!(terminal.summary(), Default::default());
     assert_eq!(terminal.error(), Some(ThreadedRuntimeError::WorkerStopped));
     assert!(terminal.trace().is_empty());

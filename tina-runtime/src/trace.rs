@@ -210,6 +210,12 @@ pub enum CallReplyRejectedReason {
     /// This usually means the caller's timeout already fired, or the call was
     /// otherwise settled before the reply arrived.
     NoPendingCall,
+
+    /// The bounded reply transport path back to the requester was full.
+    ReplyPathFull,
+
+    /// The requester shard was closed or failed before the reply could be routed.
+    RequesterShardClosed,
 }
 
 /// Why a local send could not be enqueued into the target mailbox.

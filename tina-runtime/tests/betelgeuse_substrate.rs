@@ -17,7 +17,7 @@ use betelgeuse::{
 };
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
+    CallCompletionRejectedReason, CallInput, CallKind, CallOutcome, CallOutput,
     DriverRuntimeRequirement, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
     RuntimeEventKind, SendRejectedReason, TINA_DRIVER_RUNTIME_CONTRACT, ThreadedMultiShardRuntime,
     ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, TraceRetention, call, sleep,
@@ -1123,7 +1123,7 @@ impl Isolate for CallClient {
 }
 
 #[test]
-fn threaded_multishard_isolate_call_rejects_cross_shard_with_typed_outcome() {
+fn threaded_multishard_isolate_call_round_trips_cross_shard_with_typed_outcome() {
     let runtime = ThreadedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
     let target_hits = Arc::new(Mutex::new(0));
     let observations = Arc::new(Mutex::new(Vec::new()));
@@ -1153,33 +1153,34 @@ fn threaded_multishard_isolate_call_rejects_cross_shard_with_typed_outcome() {
 
     wait_until(
         Duration::from_secs(2),
-        "Betelgeuse cross-shard call reject",
-        || observations.lock().expect("observations mutex").as_slice() == [CallObservation::Closed],
+        "Betelgeuse cross-shard call reply",
+        || {
+            observations.lock().expect("observations mutex").as_slice()
+                == [CallObservation::Replied]
+        },
     );
 
     let trace = runtime.shutdown().expect("Betelgeuse multishard shutdown");
-    assert_eq!(*target_hits.lock().expect("hits mutex"), 0);
+    assert_eq!(*target_hits.lock().expect("hits mutex"), 1);
     assert!(trace.iter().any(|event| {
         event.shard() == ShardId::new(1)
             && matches!(
                 event.kind(),
-                RuntimeEventKind::SendRejected {
-                    target_shard,
-                    reason: SendRejectedReason::Closed,
-                    ..
-                } if target_shard == ShardId::new(2)
-            )
-    }));
-    assert!(trace.iter().any(|event| {
-        event.shard() == ShardId::new(1)
-            && matches!(
-                event.kind(),
-                RuntimeEventKind::CallFailed {
+                RuntimeEventKind::CallCompleted {
                     call_kind: CallKind::IsolateCall,
-                    reason: CallError::TargetClosed,
                     ..
                 }
             )
+    }));
+    assert!(!trace.iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallReplyRejected { .. }
+                | RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+        )
     }));
 }
 
@@ -1255,6 +1256,7 @@ fn threaded_multishard_remote_queue_full_is_visible_at_source() {
         TestMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 1,
+            shard_pair_capacity: 1,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },

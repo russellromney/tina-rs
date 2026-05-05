@@ -455,8 +455,15 @@ impl Clock for Rc<ManualClock> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MessageCallContext {
-    call_id: CallId,
+enum MessageCallContext {
+    Local {
+        call_id: CallId,
+    },
+    Remote {
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: CauseId,
+    },
 }
 
 struct DeliveredMessage {
@@ -948,18 +955,30 @@ where
     /// The return value is the number of handlers that ran in this round.
     pub fn step(&mut self) -> usize {
         let shard_id = self.shard.id();
-        self.step_with_remote(&mut |_source_shard, send, _cause| {
-            panic!(
-                "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",
-                send.target_shard.get(),
-                shard_id.get(),
-            );
+        self.step_with_remote(&mut |_source_shard, envelope| {
+            let target_shard = envelope.target_shard();
+            match envelope {
+                QueuedRemoteEnvelope::Send(queued) => {
+                panic!(
+                    "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",
+                    queued.send.target_shard.get(),
+                    shard_id.get(),
+                );
+                }
+                QueuedRemoteEnvelope::CallReply(_) => {
+                panic!(
+                    "cross-shard call reply is out of scope in this slice: requester shard {} != runtime shard {}",
+                    target_shard.get(),
+                    shard_id.get(),
+                );
+                }
+            }
         })
     }
 
     fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
     where
-        FR: FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
+        FR: FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     {
         let now = self.clock.now();
         self.advance_driver(now);
@@ -1066,7 +1085,7 @@ where
         effect: ErasedEffect<S, F>,
         call_context: Option<MessageCallContext>,
         round_messages: &mut [Option<DeliveredMessage>],
-        route_remote: &mut impl FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) -> bool {
         let isolate_id = self.entries[index].id;
         match effect {
@@ -1091,7 +1110,14 @@ where
                 let delivery = if target_shard == self.shard.id() {
                     self.dispatch_local_send(send)
                 } else {
-                    route_remote(self.shard.id(), send, attempted.into())
+                    route_remote(
+                        self.shard.id(),
+                        QueuedRemoteEnvelope::Send(QueuedRemoteSend {
+                            send,
+                            call_context: None,
+                            cause: attempted.into(),
+                        }),
+                    )
                 };
 
                 match delivery {
@@ -1162,19 +1188,53 @@ where
             }
             ErasedEffect::Reply(reply) => {
                 if let Some(context) = call_context {
-                    if !self.complete_isolate_call(
-                        context.call_id,
-                        cause,
-                        CallOutcome::Replied(reply.into_any()),
-                    ) {
-                        self.push_event(
-                            isolate_id,
-                            Some(cause),
-                            RuntimeEventKind::CallReplyRejected {
-                                call_id: context.call_id,
-                                reason: CallReplyRejectedReason::NoPendingCall,
-                            },
-                        );
+                    match context {
+                        MessageCallContext::Local { call_id } => {
+                            if !self.complete_isolate_call(
+                                call_id,
+                                cause,
+                                CallOutcome::Replied(reply.into_any()),
+                            ) {
+                                self.push_event(
+                                    isolate_id,
+                                    Some(cause),
+                                    RuntimeEventKind::CallReplyRejected {
+                                        call_id,
+                                        reason: CallReplyRejectedReason::NoPendingCall,
+                                    },
+                                );
+                            }
+                        }
+                        MessageCallContext::Remote {
+                            call_id,
+                            requester,
+                            cause: request_cause,
+                        } => {
+                            let reply = RemoteCallReply {
+                                call_id,
+                                requester,
+                                cause: request_cause,
+                                outcome: RemoteCallOutcome::Replied(reply),
+                            };
+                            if let Err(reason) = route_remote(
+                                self.shard.id(),
+                                QueuedRemoteEnvelope::CallReply(reply),
+                            ) {
+                                let reason = match reason {
+                                    SendRejectedReason::Full => {
+                                        CallReplyRejectedReason::ReplyPathFull
+                                    }
+                                    SendRejectedReason::Closed => {
+                                        CallReplyRejectedReason::RequesterShardClosed
+                                    }
+                                };
+                                self.push_event(
+                                    isolate_id,
+                                    Some(cause),
+                                    RuntimeEventKind::CallReplyRejected { call_id, reason },
+                                );
+                            }
+                        }
                     }
                 } else {
                     self.push_event(
@@ -1210,7 +1270,7 @@ where
         call: ErasedCall,
         requester: RegisteredAddress,
         cause: CauseId,
-        route_remote: &mut impl FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let call_id = self.ids.next_call_id();
         let call_kind = match &call.kind {
@@ -1261,6 +1321,7 @@ where
                     send,
                     timeout,
                     translator,
+                    route_remote,
                 );
             }
         }
@@ -1310,7 +1371,7 @@ where
         cause: CauseId,
         send: ErasedSend,
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
-        route_remote: &mut impl FnMut(ShardId, ErasedSend, CauseId) -> Result<(), SendRejectedReason>,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let target_shard = send.target_shard;
         let target_isolate = send.target_isolate;
@@ -1328,7 +1389,14 @@ where
         let delivery = if target_shard == self.shard.id() {
             self.dispatch_local_send(send)
         } else {
-            route_remote(self.shard.id(), send, send_attempted.into())
+            route_remote(
+                self.shard.id(),
+                QueuedRemoteEnvelope::Send(QueuedRemoteSend {
+                    send,
+                    call_context: None,
+                    cause: send_attempted.into(),
+                }),
+            )
         };
 
         let outcome = match delivery {
@@ -1435,6 +1503,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_isolate_call(
         &mut self,
         call_id: CallId,
@@ -1443,6 +1512,7 @@ where
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let target_shard = send.target_shard;
         let target_isolate = send.target_isolate;
@@ -1457,29 +1527,28 @@ where
             },
         );
 
-        if target_shard != self.shard.id() {
-            self.push_event(
-                requester.isolate,
-                Some(send_attempted.into()),
-                RuntimeEventKind::SendRejected {
-                    target_shard,
-                    target_isolate,
-                    target_generation,
-                    reason: SendRejectedReason::Closed,
-                },
-            );
-            self.deliver_isolate_call_outcome(
+        let call_context = if target_shard == self.shard.id() {
+            MessageCallContext::Local { call_id }
+        } else {
+            MessageCallContext::Remote {
                 call_id,
                 requester,
                 cause,
-                CallOutcome::Closed,
-                translator,
-            );
-            return;
-        }
+            }
+        };
 
-        let delivery =
-            self.dispatch_local_send_with_context(send, Some(MessageCallContext { call_id }));
+        let delivery = if target_shard == self.shard.id() {
+            self.dispatch_local_send_with_context(send, Some(call_context))
+        } else {
+            route_remote(
+                self.shard.id(),
+                QueuedRemoteEnvelope::Send(QueuedRemoteSend {
+                    send,
+                    call_context: Some(call_context),
+                    cause: send_attempted.into(),
+                }),
+            )
+        };
 
         match delivery {
             Ok(()) => {
@@ -2221,7 +2290,20 @@ where
             })
     }
 
-    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) {
+    fn harvest_remote_envelope(
+        &mut self,
+        queued: QueuedRemoteEnvelope,
+    ) -> Option<QueuedRemoteEnvelope> {
+        match queued {
+            QueuedRemoteEnvelope::Send(send) => self.harvest_remote_send(send),
+            QueuedRemoteEnvelope::CallReply(reply) => {
+                self.harvest_remote_call_reply(reply);
+                None
+            }
+        }
+    }
+
+    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) -> Option<QueuedRemoteEnvelope> {
         // Cross-shard transport admission already happened on the source shard.
         // What we record here is destination-local harvest outcome, not a
         // retroactive change to the source-side send result.
@@ -2241,7 +2323,7 @@ where
                     reason: SendRejectedReason::Closed,
                 },
             );
-            return;
+            return remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Closed);
         };
         let entry = &self.entries[entry_index];
 
@@ -2256,16 +2338,18 @@ where
                     reason: SendRejectedReason::Closed,
                 },
             );
-            return;
+            return remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Closed);
         }
 
-        match self.enqueue_entry_message(entry_index, send.message.into_any(), None) {
+        match self.enqueue_entry_message(entry_index, send.message.into_any(), queued.call_context)
+        {
             Ok(()) => {
                 self.push_event(
                     send.target_isolate,
                     Some(queued.cause),
                     RuntimeEventKind::MailboxAccepted,
                 );
+                None
             }
             Err(TrySendError::Full(_)) => {
                 self.push_event(
@@ -2278,6 +2362,7 @@ where
                         reason: SendRejectedReason::Full,
                     },
                 );
+                remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Full)
             }
             Err(TrySendError::Closed(_)) => {
                 self.push_event(
@@ -2290,7 +2375,52 @@ where
                         reason: SendRejectedReason::Closed,
                     },
                 );
+                remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Closed)
             }
+        }
+    }
+
+    fn harvest_remote_call_reply(&mut self, reply: RemoteCallReply) {
+        match reply.outcome {
+            RemoteCallOutcome::Replied(message) => {
+                if !self.complete_isolate_call(
+                    reply.call_id,
+                    reply.cause,
+                    CallOutcome::Replied(message.into_any()),
+                ) {
+                    self.push_event(
+                        reply.requester.isolate,
+                        Some(reply.cause),
+                        RuntimeEventKind::CallReplyRejected {
+                            call_id: reply.call_id,
+                            reason: CallReplyRejectedReason::NoPendingCall,
+                        },
+                    );
+                }
+            }
+            RemoteCallOutcome::Full => {
+                self.complete_remote_isolate_call(reply, CallOutcome::Full);
+            }
+            RemoteCallOutcome::Closed => {
+                self.complete_remote_isolate_call(reply, CallOutcome::Closed);
+            }
+        }
+    }
+
+    fn complete_remote_isolate_call(
+        &mut self,
+        reply: RemoteCallReply,
+        outcome: CallOutcome<Box<dyn Any>>,
+    ) {
+        if !self.complete_isolate_call(reply.call_id, reply.cause, outcome) {
+            self.push_event(
+                reply.requester.isolate,
+                Some(reply.cause),
+                RuntimeEventKind::CallReplyRejected {
+                    call_id: reply.call_id,
+                    reason: CallReplyRejectedReason::NoPendingCall,
+                },
+            );
         }
     }
 
@@ -2555,7 +2685,7 @@ where
 }
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
-type RemoteQueues = Vec<VecDeque<QueuedRemoteSend>>;
+type RemoteQueues = Vec<VecDeque<QueuedRemoteEnvelope>>;
 
 /// Deterministic explicit-step coordinator over a fixed set of shard runtimes.
 ///
@@ -2771,30 +2901,46 @@ where
                     )
                 });
                 while let Some(queued) = remote_queues[queue_index].pop_front() {
-                    runtimes[index].harvest_remote_send(queued);
+                    if let Some(outbound) = runtimes[index].harvest_remote_envelope(queued) {
+                        let target_shard = outbound.target_shard();
+                        let key = (destination, target_shard);
+                        let queue_index =
+                            remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
+                                panic!(
+                                    "multi-shard runtime missing queue from shard {} to shard {}",
+                                    destination.get(),
+                                    target_shard.get()
+                                )
+                            });
+                        let queue = &mut next_remote_queues[queue_index];
+                        if queue.len() < config.shard_pair_capacity {
+                            queue.push_back(outbound);
+                        }
+                    }
                 }
             }
-            delivered += runtimes[index].step_with_remote(&mut |source_shard, send, cause| {
-                if !shard_indexes.contains_key(&send.target_shard) {
+            delivered += runtimes[index].step_with_remote(&mut |source_shard, envelope| {
+                let target_shard = envelope.target_shard();
+                if !shard_indexes.contains_key(&target_shard) {
                     panic!(
                         "multi-shard runtime targeted unknown destination shard {}",
-                        send.target_shard.get()
+                        target_shard.get()
                     );
                 }
 
-                let key = (source_shard, send.target_shard);
+                let key = (source_shard, target_shard);
                 let queue_index = remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
                     panic!(
                         "multi-shard runtime missing queue from shard {} to shard {}",
                         source_shard.get(),
-                        send.target_shard.get()
+                        target_shard.get()
                     )
                 });
                 let queue = &mut next_remote_queues[queue_index];
                 if queue.len() >= config.shard_pair_capacity {
                     return Err(SendRejectedReason::Full);
                 }
-                queue.push_back(QueuedRemoteSend { send, cause });
+                queue.push_back(envelope);
                 Ok(())
             });
         }
@@ -2857,6 +3003,9 @@ pub struct ThreadedRuntimeConfig {
     /// Capacity of the bounded control/ingress queue feeding the shard worker.
     pub command_capacity: usize,
 
+    /// Capacity of each live source-shard -> destination-shard transport.
+    pub shard_pair_capacity: usize,
+
     /// Capacity of the bounded storage lane used for local persistence work.
     pub storage_lane_capacity: usize,
 
@@ -2872,11 +3021,113 @@ impl Default for ThreadedRuntimeConfig {
     fn default() -> Self {
         Self {
             command_capacity: 64,
+            shard_pair_capacity: 64,
             storage_lane_capacity: driver::DEFAULT_STORAGE_LANE_CAPACITY,
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
         }
     }
+}
+
+/// Preferred public bounded-shape config for local Tina systems.
+///
+/// `ThreadedRuntimeConfig` remains the lower-level worker config. This type is
+/// the user-facing manifest: every bounded live resource family is either
+/// configurable here or named as a fixed capability in [`RuntimeCapabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSystemConfig {
+    /// Capacity of the bounded control/ingress queue feeding each shard worker.
+    pub ingress_capacity: usize,
+    /// Capacity of each local source-shard -> destination-shard transport.
+    pub shard_pair_capacity: usize,
+    /// Capacity of the bounded storage lane used for local filesystem and
+    /// persistence work.
+    pub storage_lane_capacity: usize,
+    /// Capacity of the bounded DNS lane.
+    pub dns_lane_capacity: usize,
+    /// Capacity of the bounded TLS lane.
+    pub tls_lane_capacity: usize,
+    /// Capacity of the bounded process lane.
+    pub process_lane_capacity: usize,
+    /// Capacity of runtime-owned signal waits.
+    pub signal_capacity: usize,
+    /// Trace retention for worker-owned runtimes.
+    pub trace_retention: TraceRetention,
+    /// How long an idle worker may park before checking runtime-owned work.
+    pub idle_wait: Duration,
+}
+
+impl Default for LocalSystemConfig {
+    fn default() -> Self {
+        Self {
+            ingress_capacity: ThreadedRuntimeConfig::default().command_capacity,
+            shard_pair_capacity: ThreadedRuntimeConfig::default().command_capacity,
+            storage_lane_capacity: driver::DEFAULT_STORAGE_LANE_CAPACITY,
+            dns_lane_capacity: driver::DEFAULT_DNS_LANE_CAPACITY,
+            tls_lane_capacity: driver::DEFAULT_TLS_LANE_CAPACITY,
+            process_lane_capacity: driver::DEFAULT_PROCESS_LANE_CAPACITY,
+            signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
+            trace_retention: TraceRetention::Full,
+            idle_wait: Duration::from_millis(1),
+        }
+    }
+}
+
+impl LocalSystemConfig {
+    /// Validates that no bounded resource silently starts with zero capacity.
+    pub fn validate(&self) -> Result<(), LocalSystemConfigError> {
+        if self.ingress_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroIngressCapacity);
+        }
+        if self.shard_pair_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroShardPairCapacity);
+        }
+        if self.storage_lane_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroStorageLaneCapacity);
+        }
+        if self.dns_lane_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroDnsLaneCapacity);
+        }
+        if self.tls_lane_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroTlsLaneCapacity);
+        }
+        if self.process_lane_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroProcessLaneCapacity);
+        }
+        if self.signal_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroSignalCapacity);
+        }
+        Ok(())
+    }
+
+    fn threaded_runtime_config(self) -> ThreadedRuntimeConfig {
+        ThreadedRuntimeConfig {
+            command_capacity: self.ingress_capacity,
+            shard_pair_capacity: self.shard_pair_capacity,
+            storage_lane_capacity: self.storage_lane_capacity,
+            trace_retention: self.trace_retention,
+            idle_wait: self.idle_wait,
+        }
+    }
+}
+
+/// Invalid local system bounded-shape config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSystemConfigError {
+    /// Ingress capacity must be greater than zero.
+    ZeroIngressCapacity,
+    /// Shard-pair capacity must be greater than zero.
+    ZeroShardPairCapacity,
+    /// Storage-lane capacity must be greater than zero.
+    ZeroStorageLaneCapacity,
+    /// DNS-lane capacity must be greater than zero.
+    ZeroDnsLaneCapacity,
+    /// TLS-lane capacity must be greater than zero.
+    ZeroTlsLaneCapacity,
+    /// Process-lane capacity must be greater than zero.
+    ZeroProcessLaneCapacity,
+    /// Signal capacity must be greater than zero.
+    ZeroSignalCapacity,
 }
 
 /// Error returned by setup/control operations on [`ThreadedRuntime`].
@@ -3228,6 +3479,84 @@ pub struct LocalSystemTerminalReport {
     trace: Vec<RuntimeEvent>,
     error: Option<ThreadedRuntimeError>,
     topology: Option<LiveTopologyReport>,
+    shutdown: LocalSystemShutdownReport,
+}
+
+/// Terminal shutdown accounting for a local Tina system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSystemShutdownReport {
+    final_state: LocalSystemState,
+    clean: bool,
+    canceled_count: usize,
+    tombstoned_count: usize,
+    rejected_after_drain_count: usize,
+    failed_shards: Vec<ShardId>,
+    remaining_owned_resource_count: usize,
+}
+
+impl LocalSystemShutdownReport {
+    fn from_parts(
+        state: LocalSystemState,
+        trace: &[RuntimeEvent],
+        error: Option<ThreadedRuntimeError>,
+        topology: Option<&LiveTopologyReport>,
+    ) -> Self {
+        let summary = terminal_summary(trace);
+        let failed_shards = topology
+            .map(|topology| {
+                topology
+                    .shards()
+                    .iter()
+                    .filter(|shard| shard.state() == LiveShardState::Failed)
+                    .map(LiveShardReport::shard)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            final_state: state,
+            clean: error.is_none() && state == LocalSystemState::Closed,
+            canceled_count: summary.call_completion_rejected,
+            tombstoned_count: summary.call_reply_rejected,
+            rejected_after_drain_count: summary.send_rejected,
+            failed_shards,
+            remaining_owned_resource_count: 0,
+        }
+    }
+
+    /// Final lifecycle state.
+    pub const fn final_state(&self) -> LocalSystemState {
+        self.final_state
+    }
+
+    /// Whether shutdown completed cleanly before any terminal failure.
+    pub const fn clean(&self) -> bool {
+        self.clean
+    }
+
+    /// Count of canceled completion deliveries visible in the terminal trace.
+    pub const fn canceled_count(&self) -> usize {
+        self.canceled_count
+    }
+
+    /// Count of tombstoned late replies visible in the terminal trace.
+    pub const fn tombstoned_count(&self) -> usize {
+        self.tombstoned_count
+    }
+
+    /// Count of send rejections visible after shutdown/drain accounting.
+    pub const fn rejected_after_drain_count(&self) -> usize {
+        self.rejected_after_drain_count
+    }
+
+    /// Failed shard ids named by the final topology snapshot.
+    pub fn failed_shards(&self) -> &[ShardId] {
+        &self.failed_shards
+    }
+
+    /// Remaining owned runtime resources known to the terminal report.
+    pub const fn remaining_owned_resource_count(&self) -> usize {
+        self.remaining_owned_resource_count
+    }
 }
 
 /// Counted terminal work visible in a [`LocalSystemTerminalReport`] trace.
@@ -3262,21 +3591,26 @@ pub struct LocalSystemTerminalSummary {
 impl LocalSystemTerminalReport {
     /// Creates a terminal report from final state and trace.
     pub fn new(state: LocalSystemState, trace: Vec<RuntimeEvent>) -> Self {
+        let shutdown = LocalSystemShutdownReport::from_parts(state, &trace, None, None);
         Self {
             state,
             trace,
             error: None,
             topology: None,
+            shutdown,
         }
     }
 
     /// Creates a failed terminal report.
     pub fn failed(error: ThreadedRuntimeError) -> Self {
+        let shutdown =
+            LocalSystemShutdownReport::from_parts(LocalSystemState::Failed, &[], Some(error), None);
         Self {
             state: LocalSystemState::Failed,
             trace: Vec::new(),
             error: Some(error),
             topology: None,
+            shutdown,
         }
     }
 
@@ -3286,21 +3620,30 @@ impl LocalSystemTerminalReport {
         trace: Vec<RuntimeEvent>,
         topology: LiveTopologyReport,
     ) -> Self {
+        let shutdown = LocalSystemShutdownReport::from_parts(state, &trace, None, Some(&topology));
         Self {
             state,
             trace,
             error: None,
             topology: Some(topology),
+            shutdown,
         }
     }
 
     /// Creates a failed terminal report with the final live topology snapshot.
     pub fn failed_with_topology(error: ThreadedRuntimeError, topology: LiveTopologyReport) -> Self {
+        let shutdown = LocalSystemShutdownReport::from_parts(
+            LocalSystemState::Failed,
+            &[],
+            Some(error),
+            Some(&topology),
+        );
         Self {
             state: LocalSystemState::Failed,
             trace: Vec::new(),
             error: Some(error),
             topology: Some(topology),
+            shutdown,
         }
     }
 
@@ -3327,6 +3670,11 @@ impl LocalSystemTerminalReport {
     /// Final topology snapshot if the owner could still report it.
     pub fn topology(&self) -> Option<&LiveTopologyReport> {
         self.topology.as_ref()
+    }
+
+    /// Terminal shutdown accounting.
+    pub const fn shutdown_report(&self) -> &LocalSystemShutdownReport {
+        &self.shutdown
     }
 
     /// Consumes the report and returns the final trace.
@@ -3383,7 +3731,7 @@ where
         LocalSystemSingleShardBuilder {
             shard,
             mailbox_factory,
-            config: ThreadedRuntimeConfig::default(),
+            config: LocalSystemConfig::default(),
         }
     }
 
@@ -3395,7 +3743,7 @@ where
         LocalSystemMultiShardBuilder {
             shards: Vec::new(),
             mailbox_factory,
-            config: ThreadedRuntimeConfig::default(),
+            config: LocalSystemConfig::default(),
         }
     }
 
@@ -3505,7 +3853,7 @@ where
 {
     shard: S,
     mailbox_factory: F,
-    config: ThreadedRuntimeConfig,
+    config: LocalSystemConfig,
 }
 
 impl<S, F> LocalSystemSingleShardBuilder<S, F>
@@ -3515,7 +3863,8 @@ where
 {
     /// Sets bounded ingress command capacity.
     pub const fn ingress_capacity(mut self, capacity: usize) -> Self {
-        self.config.command_capacity = capacity;
+        self.config.ingress_capacity = capacity;
+        self.config.shard_pair_capacity = capacity;
         self
     }
 
@@ -3531,6 +3880,12 @@ where
         self
     }
 
+    /// Sets the whole bounded-shape config.
+    pub const fn config(mut self, config: LocalSystemConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Sets idle wait duration for the live worker.
     pub const fn idle_wait(mut self, idle_wait: Duration) -> Self {
         self.config.idle_wait = idle_wait;
@@ -3539,11 +3894,14 @@ where
 
     /// Builds the local app and starts its worker.
     pub fn build(self) -> LocalSystem<S, F> {
+        self.config
+            .validate()
+            .expect("invalid LocalSystemConfig for single-shard system");
         LocalSystem {
             runtime: Some(ThreadedRuntime::with_config(
                 self.shard,
                 self.mailbox_factory,
-                self.config,
+                self.config.threaded_runtime_config(),
             )),
         }
     }
@@ -3607,7 +3965,7 @@ where
 {
     shards: Vec<S>,
     mailbox_factory: F,
-    config: ThreadedRuntimeConfig,
+    config: LocalSystemConfig,
 }
 
 impl<S, F> LocalSystemMultiShardBuilder<S, F>
@@ -3623,7 +3981,7 @@ where
 
     /// Sets bounded ingress command capacity.
     pub const fn ingress_capacity(mut self, capacity: usize) -> Self {
-        self.config.command_capacity = capacity;
+        self.config.ingress_capacity = capacity;
         self
     }
 
@@ -3634,7 +3992,7 @@ where
     /// capacity as [`ingress_capacity`](Self::ingress_capacity) until a
     /// dedicated live shard-pair queue exists.
     pub const fn shard_pair_capacity(mut self, capacity: usize) -> Self {
-        self.config.command_capacity = capacity;
+        self.config.shard_pair_capacity = capacity;
         self
     }
 
@@ -3650,13 +4008,22 @@ where
         self
     }
 
+    /// Sets the whole bounded-shape config.
+    pub const fn config(mut self, config: LocalSystemConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Builds the multi-shard local app and starts one worker per shard.
     pub fn build(self) -> LocalMultiShardSystem<S, F> {
+        self.config
+            .validate()
+            .expect("invalid LocalSystemConfig for multi-shard system");
         LocalMultiShardSystem {
             runtime: Some(ThreadedMultiShardRuntime::with_config(
                 self.shards,
                 self.mailbox_factory,
-                self.config,
+                self.config.threaded_runtime_config(),
             )),
         }
     }
@@ -4245,6 +4612,9 @@ where
         if config.storage_lane_capacity == 0 {
             panic!("ThreadedMultiShardRuntime requires storage lane capacity > 0");
         }
+        if config.shard_pair_capacity == 0 {
+            panic!("ThreadedMultiShardRuntime requires shard-pair capacity > 0");
+        }
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
@@ -4277,12 +4647,27 @@ where
             receivers.push((shard.id(), receiver));
         }
         let mut remote_metrics = BTreeMap::new();
+        let mut remote_senders = BTreeMap::new();
+        let mut remote_receivers: BTreeMap<
+            ShardId,
+            Vec<(
+                ShardId,
+                std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+            )>,
+        > = BTreeMap::new();
         for source in &shards {
             for target in &shards {
                 if source.id() != target.id() {
+                    let (sender, receiver) =
+                        std::sync::mpsc::sync_channel(config.shard_pair_capacity);
+                    remote_senders.insert((source.id(), target.id()), sender);
+                    remote_receivers
+                        .entry(target.id())
+                        .or_default()
+                        .push((source.id(), receiver));
                     remote_metrics.insert(
                         (source.id(), target.id()),
-                        Arc::new(LiveQueueMetrics::new(config.command_capacity)),
+                        Arc::new(LiveQueueMetrics::new(config.shard_pair_capacity)),
                     );
                 }
             }
@@ -4293,8 +4678,9 @@ where
         for (shard, (_shard_id, receiver)) in shards.into_iter().zip(receivers) {
             let factory = mailbox_factory.clone();
             let ids = ids.clone();
-            let remote_senders = commands.clone();
+            let remote_senders = remote_senders.clone();
             let shard_id = shard.id();
+            let remote_receivers = remote_receivers.remove(&shard_id).unwrap_or_default();
             let remote_metrics_for_worker = remote_metrics.clone();
             handles.push((
                 shard_id,
@@ -4321,6 +4707,7 @@ where
                             receiver,
                             config,
                             remote_senders,
+                            remote_receivers,
                             remote_metrics_for_worker,
                         )
                     })
@@ -4537,7 +4924,14 @@ fn threaded_worker_loop_with_remote<S, F>(
     mut runtime: Runtime<S, F>,
     receiver: std::sync::mpsc::Receiver<ThreadedCommand<S, F>>,
     config: ThreadedRuntimeConfig,
-    remote_senders: BTreeMap<ShardId, std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>>,
+    remote_senders: BTreeMap<
+        (ShardId, ShardId),
+        std::sync::mpsc::SyncSender<SendableQueuedRemoteEnvelope>,
+    >,
+    remote_receivers: Vec<(
+        ShardId,
+        std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+    )>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
 ) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError>
 where
@@ -4546,33 +4940,17 @@ where
 {
     let source_shard = runtime.shard().id();
     loop {
-        match receiver.try_recv() {
-            Ok(ThreadedCommand::Run(command)) => {
-                command(&mut runtime);
-                continue;
-            }
-            Ok(ThreadedCommand::Shutdown) => {
-                deliver_shutdown_signal_and_drain(&mut runtime);
-                break;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-
-        let delivered = runtime.step_with_remote(&mut |_, send, cause| {
-            let target_shard = send.target_shard;
-            let Some(sender) = remote_senders.get(&target_shard) else {
+        let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
+            let target_shard = envelope.target_shard();
+            let Some(sender) = remote_senders.get(&(source_shard, target_shard)) else {
                 panic!(
                     "ThreadedMultiShardRuntime targeted unknown destination shard {}",
                     target_shard.get()
                 );
             };
-            let queued = SendableQueuedRemoteSend::new(send, cause);
-            let command = ThreadedCommand::Run(Box::new(move |runtime| {
-                runtime.harvest_remote_send(queued.into_queued_remote_send());
-            }));
+            let envelope = SendableQueuedRemoteEnvelope::new(envelope);
             let metrics = remote_metrics.get(&(source_shard, target_shard));
-            match sender.try_send(command) {
+            match sender.try_send(envelope) {
                 Ok(()) => {
                     if let Some(metrics) = metrics {
                         metrics.accepted();
@@ -4592,7 +4970,24 @@ where
                     Err(SendRejectedReason::Closed)
                 }
             }
-        });
+        };
+        if drain_remote_inbound(&mut runtime, &remote_receivers, &route_remote) > 0 {
+            continue;
+        }
+        match receiver.try_recv() {
+            Ok(ThreadedCommand::Run(command)) => {
+                command(&mut runtime);
+                continue;
+            }
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
 
         if delivered == 0 && !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
@@ -4613,6 +5008,38 @@ where
         .cancel_in_flight_calls_for_shutdown()
         .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
     Ok(runtime.trace().to_vec())
+}
+
+fn drain_remote_inbound<S, F>(
+    runtime: &mut Runtime<S, F>,
+    remote_receivers: &[(
+        ShardId,
+        std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+    )],
+    route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+) -> usize
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    let mut delivered = 0;
+    for (_, receiver) in remote_receivers {
+        loop {
+            match receiver.try_recv() {
+                Ok(envelope) => {
+                    delivered += 1;
+                    if let Some(outbound) =
+                        runtime.harvest_remote_envelope(envelope.into_queued_remote_envelope())
+                    {
+                        let _ = route_remote(outbound);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+    delivered
 }
 
 trait ErasedMailbox {
@@ -4979,8 +5406,43 @@ pub(crate) struct ErasedSend {
     pub(crate) message: ErasedMessage,
 }
 
+enum QueuedRemoteEnvelope {
+    Send(QueuedRemoteSend),
+    CallReply(RemoteCallReply),
+}
+
+impl QueuedRemoteEnvelope {
+    fn target_shard(&self) -> ShardId {
+        match self {
+            Self::Send(send) => send.send.target_shard,
+            Self::CallReply(reply) => reply.requester.shard,
+        }
+    }
+}
+
+fn remote_call_outcome_envelope(
+    context: Option<MessageCallContext>,
+    outcome: RemoteCallOutcome,
+) -> Option<QueuedRemoteEnvelope> {
+    let Some(MessageCallContext::Remote {
+        call_id,
+        requester,
+        cause,
+    }) = context
+    else {
+        return None;
+    };
+    Some(QueuedRemoteEnvelope::CallReply(RemoteCallReply {
+        call_id,
+        requester,
+        cause,
+        outcome,
+    }))
+}
+
 struct QueuedRemoteSend {
     send: ErasedSend,
+    call_context: Option<MessageCallContext>,
     cause: CauseId,
 }
 
@@ -4989,16 +5451,18 @@ struct SendableQueuedRemoteSend {
     target_isolate: IsolateId,
     target_generation: AddressGeneration,
     message: Box<dyn Any + Send>,
+    call_context: Option<MessageCallContext>,
     cause: CauseId,
 }
 
 impl SendableQueuedRemoteSend {
-    fn new(send: ErasedSend, cause: CauseId) -> Self {
+    fn new(send: ErasedSend, call_context: Option<MessageCallContext>, cause: CauseId) -> Self {
         Self {
             target_shard: send.target_shard,
             target_isolate: send.target_isolate,
             target_generation: send.target_generation,
             message: send.message.into_sendable(),
+            call_context,
             cause,
         }
     }
@@ -5011,9 +5475,106 @@ impl SendableQueuedRemoteSend {
                 target_generation: self.target_generation,
                 message: ErasedMessage::Sendable(self.message),
             },
+            call_context: self.call_context,
             cause: self.cause,
         }
     }
+}
+
+enum SendableQueuedRemoteEnvelope {
+    Send(SendableQueuedRemoteSend),
+    CallReply(SendableRemoteCallReply),
+}
+
+impl SendableQueuedRemoteEnvelope {
+    fn new(envelope: QueuedRemoteEnvelope) -> Self {
+        match envelope {
+            QueuedRemoteEnvelope::Send(send) => Self::Send(SendableQueuedRemoteSend::new(
+                send.send,
+                send.call_context,
+                send.cause,
+            )),
+            QueuedRemoteEnvelope::CallReply(reply) => {
+                Self::CallReply(SendableRemoteCallReply::new(reply))
+            }
+        }
+    }
+
+    fn into_queued_remote_envelope(self) -> QueuedRemoteEnvelope {
+        match self {
+            Self::Send(send) => QueuedRemoteEnvelope::Send(send.into_queued_remote_send()),
+            Self::CallReply(reply) => {
+                QueuedRemoteEnvelope::CallReply(reply.into_remote_call_reply())
+            }
+        }
+    }
+}
+
+struct RemoteCallReply {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    cause: CauseId,
+    outcome: RemoteCallOutcome,
+}
+
+enum RemoteCallOutcome {
+    Replied(ErasedMessage),
+    Full,
+    Closed,
+}
+
+struct SendableRemoteCallReply {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    cause: CauseId,
+    outcome: SendableRemoteCallOutcome,
+}
+
+impl SendableRemoteCallReply {
+    fn new(reply: RemoteCallReply) -> Self {
+        match reply.outcome {
+            RemoteCallOutcome::Replied(message) => Self {
+                call_id: reply.call_id,
+                requester: reply.requester,
+                cause: reply.cause,
+                outcome: SendableRemoteCallOutcome::Replied(message.into_sendable()),
+            },
+            RemoteCallOutcome::Full => Self {
+                call_id: reply.call_id,
+                requester: reply.requester,
+                cause: reply.cause,
+                outcome: SendableRemoteCallOutcome::Full,
+            },
+            RemoteCallOutcome::Closed => Self {
+                call_id: reply.call_id,
+                requester: reply.requester,
+                cause: reply.cause,
+                outcome: SendableRemoteCallOutcome::Closed,
+            },
+        }
+    }
+
+    fn into_remote_call_reply(self) -> RemoteCallReply {
+        let outcome = match self.outcome {
+            SendableRemoteCallOutcome::Replied(reply) => {
+                RemoteCallOutcome::Replied(ErasedMessage::Sendable(reply))
+            }
+            SendableRemoteCallOutcome::Full => RemoteCallOutcome::Full,
+            SendableRemoteCallOutcome::Closed => RemoteCallOutcome::Closed,
+        };
+        RemoteCallReply {
+            call_id: self.call_id,
+            requester: self.requester,
+            cause: self.cause,
+            outcome,
+        }
+    }
+}
+
+enum SendableRemoteCallOutcome {
+    Replied(Box<dyn Any + Send>),
+    Full,
+    Closed,
 }
 
 pub(crate) enum ErasedMessage {

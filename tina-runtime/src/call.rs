@@ -1110,9 +1110,9 @@ impl<M> RuntimeCall<M> {
     /// that handler later returns [`tina::reply`], the reply becomes
     /// [`CallOutcome::Replied`] for the requester. The timeout is mandatory.
     ///
-    /// This slice supports same-shard calls only. A cross-shard destination is
-    /// reported as [`CallOutcome::Closed`] until Tina grows call-reply
-    /// transport between shards.
+    /// Same-shard calls complete inside one shard runtime. Live local
+    /// multi-shard systems route cross-shard requests and replies through
+    /// bounded shard-pair paths.
     ///
     /// Keep `translator` pure: the runtime may run it even when the resulting
     /// message cannot be delivered because the requester stopped or its
@@ -1869,11 +1869,10 @@ where
 
 /// Returns a helper that calls another isolate and requires a timeout.
 ///
-/// Current runtime/simulator support is same-shard only. Calling a target on
-/// another shard resolves as [`CallOutcome::Closed`] until cross-shard
-/// call-reply transport exists. Keep the `.reply(...)` translator pure: it may
-/// run even when the translated message is later rejected by the requester's
-/// mailbox.
+/// Same-shard calls complete inside one shard runtime. Live local multi-shard
+/// systems route cross-shard requests and replies through bounded shard-pair
+/// paths. Keep the `.reply(...)` translator pure: it may run even when the
+/// translated message is later rejected by the requester's mailbox.
 ///
 /// ```compile_fail
 /// use std::time::Duration;

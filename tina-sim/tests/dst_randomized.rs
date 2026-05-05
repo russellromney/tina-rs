@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{Address, IsolateId, prelude::*};
-use tina_runtime::{CallKind, RuntimeEventKind, SendRejectedReason, sleep};
+use tina_runtime::{CallKind, CallOutcome, RuntimeEventKind, SendRejectedReason, call, sleep};
 use tina_sim::{
     FaultConfig, FaultMode, LocalSendFaultMode, MultiShardReplayArtifact, MultiShardSimulator,
     MultiShardSimulatorConfig, ReplayArtifact, Simulator, SimulatorConfig,
@@ -297,6 +297,100 @@ enum RemoteWorkerMsg {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrossCallReply(u8);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrossCallWorkerMsg {
+    Reply(u8),
+    NoReply,
+    Stop,
+}
+
+#[derive(Debug)]
+struct CrossCallWorker;
+
+#[tina_runtime::isolate(
+    message = CrossCallWorkerMsg,
+    reply = CrossCallReply,
+    shard = RandomShard
+)]
+impl CrossCallWorker {
+    fn handle(
+        &mut self,
+        msg: CrossCallWorkerMsg,
+        _ctx: &mut Context<'_, RandomShard>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossCallWorkerMsg::Reply(value) => reply(CrossCallReply(value.wrapping_add(1))),
+            CrossCallWorkerMsg::NoReply => noop(),
+            CrossCallWorkerMsg::Stop => stop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrossCallClientMsg {
+    Ask(u8),
+    Burst(u8),
+    NoReply(u8),
+    StopWorker,
+    Returned(CallOutcome<CrossCallReply>),
+}
+
+#[derive(Debug)]
+struct CrossCallClient {
+    worker: Address<CrossCallWorkerMsg, CrossCallReply>,
+    outcomes: Rc<RefCell<Vec<CallOutcome<CrossCallReply>>>>,
+}
+
+#[tina_runtime::isolate(
+    message = CrossCallClientMsg,
+    send = Outbound<CrossCallWorkerMsg>,
+    shard = RandomShard
+)]
+impl CrossCallClient {
+    fn handle(
+        &mut self,
+        msg: CrossCallClientMsg,
+        _ctx: &mut Context<'_, RandomShard>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossCallClientMsg::Ask(value) => call(
+                self.worker,
+                CrossCallWorkerMsg::Reply(value),
+                Duration::from_millis(8),
+            )
+            .reply(CrossCallClientMsg::Returned),
+            CrossCallClientMsg::Burst(value) => batch([
+                call(
+                    self.worker,
+                    CrossCallWorkerMsg::Reply(value),
+                    Duration::from_millis(8),
+                )
+                .reply(CrossCallClientMsg::Returned),
+                call(
+                    self.worker,
+                    CrossCallWorkerMsg::Reply(value.wrapping_add(1)),
+                    Duration::from_millis(8),
+                )
+                .reply(CrossCallClientMsg::Returned),
+            ]),
+            CrossCallClientMsg::NoReply(value) => call(
+                self.worker,
+                CrossCallWorkerMsg::NoReply,
+                Duration::from_millis(1 + u64::from(value % 3)),
+            )
+            .reply(CrossCallClientMsg::Returned),
+            CrossCallClientMsg::StopWorker => send(self.worker, CrossCallWorkerMsg::Stop),
+            CrossCallClientMsg::Returned(outcome) => {
+                self.outcomes.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RemoteWorker;
 
@@ -330,6 +424,16 @@ enum MultiOp {
     RunUntilIdle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrossCallOp {
+    Ask(u8),
+    Burst(u8),
+    NoReply(u8),
+    StopWorker,
+    Step,
+    RunUntilIdle,
+}
+
 fn random_multi_ops(seed: u64, len: usize) -> Vec<MultiOp> {
     let mut state = seed ^ 0xd1b5_4a32_d192_ed03;
     let mut ops = Vec::with_capacity(len);
@@ -343,6 +447,24 @@ fn random_multi_ops(seed: u64, len: usize) -> Vec<MultiOp> {
             6 => MultiOp::BadRemote,
             7 => MultiOp::Step,
             _ => MultiOp::RunUntilIdle,
+        });
+    }
+    ops
+}
+
+fn random_cross_call_ops(seed: u64, len: usize) -> Vec<CrossCallOp> {
+    let mut state = seed ^ 0xa11c_e57e_dcab_4001;
+    let mut ops = Vec::with_capacity(len);
+    for _ in 0..len {
+        state = xorshift64(state);
+        let value = (state >> 13) as u8;
+        ops.push(match state % 10 {
+            0..=2 => CrossCallOp::Ask(value),
+            3 | 4 => CrossCallOp::Burst(value),
+            5 | 6 => CrossCallOp::NoReply(value),
+            7 => CrossCallOp::StopWorker,
+            8 => CrossCallOp::Step,
+            _ => CrossCallOp::RunUntilIdle,
         });
     }
     ops
@@ -367,7 +489,7 @@ fn run_random_multishard_history(
             ..Default::default()
         },
         MultiShardSimulatorConfig {
-            shard_pair_capacity: 2,
+            shard_pair_capacity: 1,
         },
     );
     let worker = sim
@@ -412,6 +534,76 @@ fn run_random_multishard_history(
     sim.run_until_quiescent();
 
     DstRun::new(observed.borrow().clone(), sim.replay_artifact())
+}
+
+fn run_random_cross_shard_call_history(
+    seed: u64,
+    ops: &[CrossCallOp],
+) -> DstRun<Vec<CallOutcome<CrossCallReply>>, MultiShardReplayArtifact> {
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = MultiShardSimulator::with_config(
+        [RandomShard(373), RandomShard(374)],
+        SimulatorConfig {
+            seed,
+            faults: FaultConfig {
+                local_send: LocalSendFaultMode::DelayByRounds {
+                    one_in: 2,
+                    rounds: 1,
+                },
+                timer_wake: FaultMode::DelayBy {
+                    one_in: 2,
+                    by: Duration::from_millis(2),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        MultiShardSimulatorConfig {
+            shard_pair_capacity: 1,
+        },
+    );
+    let worker = sim
+        .register_with_capacity_on::<CrossCallWorker, CrossCallWorkerMsg, Infallible>(
+            ShardId::new(374),
+            CrossCallWorker,
+            2,
+        )
+        .with_reply::<CrossCallReply>();
+    let client = sim
+        .register_with_capacity_on::<CrossCallClient, CrossCallClientMsg, CrossCallWorkerMsg>(
+            ShardId::new(373),
+            CrossCallClient {
+                worker,
+                outcomes: Rc::clone(&outcomes),
+            },
+            8,
+        );
+
+    for op in ops {
+        match *op {
+            CrossCallOp::Ask(value) => {
+                let _ = sim.try_send(client, CrossCallClientMsg::Ask(value));
+            }
+            CrossCallOp::Burst(value) => {
+                let _ = sim.try_send(client, CrossCallClientMsg::Burst(value));
+            }
+            CrossCallOp::NoReply(value) => {
+                let _ = sim.try_send(client, CrossCallClientMsg::NoReply(value));
+            }
+            CrossCallOp::StopWorker => {
+                let _ = sim.try_send(client, CrossCallClientMsg::StopWorker);
+            }
+            CrossCallOp::Step => {
+                sim.step();
+            }
+            CrossCallOp::RunUntilIdle => {
+                sim.run_until_quiescent();
+            }
+        }
+    }
+    sim.run_until_quiescent();
+
+    DstRun::new(outcomes.borrow().clone(), sim.replay_artifact())
 }
 
 #[test]
@@ -568,6 +760,121 @@ fn seeded_random_multishard_histories_replay_and_keep_remote_pressure_visible() 
 }
 
 #[test]
+fn seeded_random_cross_shard_call_histories_replay_and_cover_reply_paths() {
+    let mut saw_replied = false;
+    let mut saw_timeout = false;
+    let mut saw_full = false;
+    let mut saw_closed = false;
+    let mut saw_completed = false;
+    let mut saw_failed = false;
+
+    for seed in 0..32 {
+        let history = History::new(
+            "cross-shard call random",
+            seed,
+            random_cross_call_ops(seed, 96),
+        );
+        let first = assert_replays(&history, |history| {
+            run_random_cross_shard_call_history(history.seed(), history.operations())
+        });
+
+        for outcome in first.output() {
+            match outcome {
+                CallOutcome::Replied(_) => saw_replied = true,
+                CallOutcome::Timeout => saw_timeout = true,
+                CallOutcome::Full => saw_full = true,
+                CallOutcome::Closed => saw_closed = true,
+            }
+        }
+
+        let trace = first.artifact().event_record();
+        InvariantSuite::standard()
+            .check(trace)
+            .unwrap_or_else(|violation| {
+                panic!(
+                    "cross-shard call seed {seed} violated {} near {:?}: {}",
+                    violation.invariant(),
+                    violation.event_id(),
+                    violation.reason()
+                )
+            });
+        saw_completed |= trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        });
+        saw_failed |= trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        });
+    }
+
+    assert!(saw_replied, "cross-shard call DST should hit Replied");
+    assert!(saw_timeout, "cross-shard call DST should hit Timeout");
+    assert!(saw_full, "cross-shard call DST should hit bounded Full");
+    assert!(saw_closed, "cross-shard call DST should hit Closed");
+    assert!(
+        saw_completed,
+        "cross-shard call DST should trace completions"
+    );
+    assert!(saw_failed, "cross-shard call DST should trace failures");
+}
+
+#[test]
+fn cross_shard_call_transport_full_shrinks_to_small_reproducer() {
+    let noisy = History::new(
+        "cross-shard call full shrink",
+        4242,
+        vec![
+            CrossCallOp::Ask(1),
+            CrossCallOp::Burst(10),
+            CrossCallOp::RunUntilIdle,
+            CrossCallOp::Ask(99),
+            CrossCallOp::Step,
+        ],
+    );
+
+    fn has_full(history: &History<CrossCallOp>) -> bool {
+        run_random_cross_shard_call_history(history.seed(), history.operations())
+            .artifact()
+            .event_record()
+            .iter()
+            .any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::SendRejected {
+                        reason: SendRejectedReason::Full,
+                        ..
+                    }
+                )
+            })
+    }
+
+    assert!(has_full(&noisy));
+    let shrunk = delete_shrink(
+        &noisy,
+        ShrinkConfig::default(),
+        "cross-shard call bounded transport full survives",
+        has_full,
+    );
+    assert!(
+        shrunk.shrunk().len() < noisy.len(),
+        "shrinker should remove cross-shard call noise: {:?}",
+        shrunk.shrunk().operations()
+    );
+    assert!(has_full(shrunk.shrunk()));
+}
+
+#[test]
 fn dst_long_seed_sweep_replays_when_enabled() {
     if std::env::var_os("TINA_DST_LONG").is_none() {
         return;
@@ -585,5 +892,15 @@ fn dst_long_seed_sweep_replays_when_enabled() {
             run_random_multishard_history(history.seed(), history.operations())
         });
         InvariantSuite::standard().assert(multi_run.artifact().event_record());
+
+        let calls = History::new(
+            "long cross-shard call random",
+            seed,
+            random_cross_call_ops(seed, 112),
+        );
+        let call_run = assert_replays(&calls, |history| {
+            run_random_cross_shard_call_history(history.seed(), history.operations())
+        });
+        InvariantSuite::standard().assert(call_run.artifact().event_record());
     }
 }

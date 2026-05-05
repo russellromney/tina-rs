@@ -179,6 +179,7 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
+| **Victor Marijnen live service semantics** | Make Tina's live local runtime behave like a real service substrate under overload, shutdown, shard failure, resource pressure, and cross-shard request/reply work. Scope: runtime config manifest, health snapshot, resource ownership cleanup, graceful drain, live cross-shard isolate calls, inbound TLS/server-side TLS, shard failure/quarantine semantics, typed acceptor/service pattern, call/reply type-safety tightening, and e2e/DST service lifecycle pressure. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 Parallel-safe side work: CI matrix planning, formatting of existing
@@ -234,9 +235,9 @@ These still need answers, but each now has an intended phase home.
    process execution, and runtime shutdown notification are implemented on the
    live local runtime. Raw OS signal capture, broader substrate liveness faults,
    remoting, clustering, and middleware-inside-Tina remain future work.
-4. **Live cross-shard isolate calls.** Current live cross-shard call reply
-   transport is not claimed. Home: Jan Peter Balkenende remoting unless a local
-   workload proves it must land earlier.
+4. **Live cross-shard isolate calls.** Local live cross-shard call/reply
+   transport is Victor Marijnen work. Network remoting remains Jan Peter
+   Balkenende.
 5. **Mailbox producer model.** Current decision: one mailbox contract, no
    alternate escape path. Add bounded multi-producer mailbox support only if a
    named workload proves the current producer model is too narrow, and only

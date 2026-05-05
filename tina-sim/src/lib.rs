@@ -1366,8 +1366,15 @@ struct TimerEntry {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MessageCallContext {
-    call_id: CallId,
+enum MessageCallContext {
+    Local {
+        call_id: CallId,
+    },
+    Remote {
+        call_id: CallId,
+        requester: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+    },
 }
 
 struct DeliveredMessage {
@@ -1835,7 +1842,55 @@ struct ErasedSend {
 
 struct QueuedRemoteSend {
     send: ErasedSend,
+    call_context: Option<MessageCallContext>,
     cause: tina_runtime::CauseId,
+}
+
+enum QueuedRemoteEnvelope {
+    Send(QueuedRemoteSend),
+    CallReply(RemoteCallReply),
+}
+
+impl QueuedRemoteEnvelope {
+    fn target_shard(&self) -> ShardId {
+        match self {
+            Self::Send(queued) => queued.send.target_shard,
+            Self::CallReply(reply) => reply.requester.shard,
+        }
+    }
+}
+
+fn remote_call_outcome_envelope(
+    context: Option<MessageCallContext>,
+    outcome: RemoteCallOutcome,
+) -> Option<QueuedRemoteEnvelope> {
+    let Some(MessageCallContext::Remote {
+        call_id,
+        requester,
+        cause,
+    }) = context
+    else {
+        return None;
+    };
+    Some(QueuedRemoteEnvelope::CallReply(RemoteCallReply {
+        call_id,
+        requester,
+        reply: outcome,
+        cause,
+    }))
+}
+
+struct RemoteCallReply {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    reply: RemoteCallOutcome,
+    cause: tina_runtime::CauseId,
+}
+
+enum RemoteCallOutcome {
+    Replied(Box<dyn Any>),
+    Full,
+    Closed,
 }
 
 struct ErasedCall {
@@ -2184,18 +2239,30 @@ where
     /// delivery chance in registration order.
     pub fn step(&mut self) -> usize {
         let shard_id = self.shard.id();
-        self.step_with_remote(&mut |_source_shard, send, _cause| {
-            panic!(
-                "cross-shard simulation is out of scope in this slice: target shard {} != simulator shard {}",
-                send.target_shard.get(),
-                shard_id.get(),
-            );
+        self.step_with_remote(&mut |_source_shard, envelope| {
+            let target_shard = envelope.target_shard();
+            match envelope {
+                QueuedRemoteEnvelope::Send(queued) => {
+                    panic!(
+                        "cross-shard send is out of scope in this slice: target shard {} != simulator shard {}",
+                        queued.send.target_shard.get(),
+                        shard_id.get(),
+                    );
+                }
+                QueuedRemoteEnvelope::CallReply(_) => {
+                    panic!(
+                        "cross-shard call reply is out of scope in this slice: requester shard {} != simulator shard {}",
+                        target_shard.get(),
+                        shard_id.get(),
+                    );
+                }
+            }
         })
     }
 
     fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
     where
-        FR: FnMut(ShardId, ErasedSend, tina_runtime::CauseId) -> Result<(), SendRejectedReason>,
+        FR: FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     {
         self.step_ordinal += 1;
         let now = self.virtual_now;
@@ -2405,11 +2472,7 @@ where
         effect: ErasedEffect<S>,
         call_context: Option<MessageCallContext>,
         round_messages: &mut [Option<DeliveredMessage>],
-        route_remote: &mut impl FnMut(
-            ShardId,
-            ErasedSend,
-            tina_runtime::CauseId,
-        ) -> Result<(), SendRejectedReason>,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) -> bool {
         let isolate_id = self.entries[index].id;
         match effect {
@@ -2433,7 +2496,14 @@ where
                 let delivery = if target_shard == self.shard.id() {
                     self.dispatch_local_send(send)
                 } else {
-                    route_remote(self.shard.id(), send, attempted.into())
+                    route_remote(
+                        self.shard.id(),
+                        QueuedRemoteEnvelope::Send(QueuedRemoteSend {
+                            send,
+                            call_context: None,
+                            cause: attempted.into(),
+                        }),
+                    )
                 };
 
                 match delivery {
@@ -2500,19 +2570,53 @@ where
             }
             ErasedEffect::Reply(reply) => {
                 if let Some(context) = call_context {
-                    if !self.complete_isolate_call(
-                        context.call_id,
-                        cause,
-                        CallOutcome::Replied(reply),
-                    ) {
-                        self.push_event(
-                            isolate_id,
-                            Some(cause),
-                            RuntimeEventKind::CallReplyRejected {
-                                call_id: context.call_id,
-                                reason: CallReplyRejectedReason::NoPendingCall,
-                            },
-                        );
+                    match context {
+                        MessageCallContext::Local { call_id } => {
+                            if !self.complete_isolate_call(
+                                call_id,
+                                cause,
+                                CallOutcome::Replied(reply),
+                            ) {
+                                self.push_event(
+                                    isolate_id,
+                                    Some(cause),
+                                    RuntimeEventKind::CallReplyRejected {
+                                        call_id,
+                                        reason: CallReplyRejectedReason::NoPendingCall,
+                                    },
+                                );
+                            }
+                        }
+                        MessageCallContext::Remote {
+                            call_id,
+                            requester,
+                            cause: call_cause,
+                        } => {
+                            let remote_reply = RemoteCallReply {
+                                call_id,
+                                requester,
+                                reply: RemoteCallOutcome::Replied(reply),
+                                cause: call_cause,
+                            };
+                            if let Err(reason) = route_remote(
+                                self.shard.id(),
+                                QueuedRemoteEnvelope::CallReply(remote_reply),
+                            ) {
+                                let reason = match reason {
+                                    SendRejectedReason::Full => {
+                                        CallReplyRejectedReason::ReplyPathFull
+                                    }
+                                    SendRejectedReason::Closed => {
+                                        CallReplyRejectedReason::RequesterShardClosed
+                                    }
+                                };
+                                self.push_event(
+                                    isolate_id,
+                                    Some(cause),
+                                    RuntimeEventKind::CallReplyRejected { call_id, reason },
+                                );
+                            }
+                        }
                     }
                 } else {
                     self.push_event(
@@ -2904,11 +3008,7 @@ where
         call: ErasedCall,
         requester: RegisteredAddress,
         cause: tina_runtime::CauseId,
-        route_remote: &mut impl FnMut(
-            ShardId,
-            ErasedSend,
-            tina_runtime::CauseId,
-        ) -> Result<(), SendRejectedReason>,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let call_id = self.ids.next_call_id();
         let call_kind = match &call.kind {
@@ -2953,6 +3053,7 @@ where
                 send,
                 timeout,
                 translator,
+                route_remote,
             ),
         }
     }
@@ -3096,11 +3197,7 @@ where
         cause: tina_runtime::CauseId,
         send: ErasedSend,
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
-        route_remote: &mut impl FnMut(
-            ShardId,
-            ErasedSend,
-            tina_runtime::CauseId,
-        ) -> Result<(), SendRejectedReason>,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let target_shard = send.target_shard;
         let target_isolate = send.target_isolate;
@@ -3118,7 +3215,14 @@ where
         let delivery = if target_shard == self.shard.id() {
             self.dispatch_local_send(send)
         } else {
-            route_remote(self.shard.id(), send, send_attempted.into())
+            route_remote(
+                self.shard.id(),
+                QueuedRemoteEnvelope::Send(QueuedRemoteSend {
+                    send,
+                    call_context: None,
+                    cause: send_attempted.into(),
+                }),
+            )
         };
 
         let outcome = match delivery {
@@ -3155,6 +3259,7 @@ where
         self.deliver_observed_send_outcome(call_id, requester, cause, outcome, translator);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_isolate_call(
         &mut self,
         call_id: CallId,
@@ -3163,6 +3268,7 @@ where
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let target_shard = send.target_shard;
         let target_isolate = send.target_isolate;
@@ -3178,29 +3284,70 @@ where
         );
 
         if target_shard != self.shard.id() {
-            self.push_event(
-                requester.isolate,
-                Some(send_attempted.into()),
-                RuntimeEventKind::SendRejected {
-                    target_shard,
-                    target_isolate,
-                    target_generation,
-                    reason: SendRejectedReason::Closed,
-                },
-            );
-            self.deliver_isolate_call_outcome(
+            let call_context = MessageCallContext::Remote {
                 call_id,
                 requester,
                 cause,
-                CallOutcome::Closed,
-                translator,
-                self.step_ordinal,
-            );
+            };
+            match route_remote(
+                self.shard.id(),
+                QueuedRemoteEnvelope::Send(QueuedRemoteSend {
+                    send,
+                    call_context: Some(call_context),
+                    cause: send_attempted.into(),
+                }),
+            ) {
+                Ok(()) => {
+                    self.push_event(
+                        requester.isolate,
+                        Some(send_attempted.into()),
+                        RuntimeEventKind::SendAccepted {
+                            target_shard,
+                            target_isolate,
+                            target_generation,
+                        },
+                    );
+                    let insertion_order = self.next_isolate_call_ordinal;
+                    self.next_isolate_call_ordinal += 1;
+                    self.pending_isolate_calls.push(PendingIsolateCall {
+                        call_id,
+                        requester,
+                        cause,
+                        deadline: self.virtual_now + timeout,
+                        insertion_order,
+                        translator: Some(translator),
+                    });
+                }
+                Err(reason) => {
+                    self.push_event(
+                        requester.isolate,
+                        Some(send_attempted.into()),
+                        RuntimeEventKind::SendRejected {
+                            target_shard,
+                            target_isolate,
+                            target_generation,
+                            reason,
+                        },
+                    );
+                    let outcome = match reason {
+                        SendRejectedReason::Full => CallOutcome::Full,
+                        SendRejectedReason::Closed => CallOutcome::Closed,
+                    };
+                    self.deliver_isolate_call_outcome(
+                        call_id,
+                        requester,
+                        cause,
+                        outcome,
+                        translator,
+                        self.step_ordinal,
+                    );
+                }
+            }
             return;
         }
 
-        let delivery =
-            self.dispatch_local_send_with_context(send, Some(MessageCallContext { call_id }));
+        let delivery = self
+            .dispatch_local_send_with_context(send, Some(MessageCallContext::Local { call_id }));
 
         match delivery {
             Ok(()) => {
@@ -5601,7 +5748,20 @@ where
             })
     }
 
-    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) {
+    fn harvest_remote_envelope(
+        &mut self,
+        queued: QueuedRemoteEnvelope,
+    ) -> Option<QueuedRemoteEnvelope> {
+        match queued {
+            QueuedRemoteEnvelope::Send(send) => self.harvest_remote_send(send),
+            QueuedRemoteEnvelope::CallReply(reply) => {
+                self.harvest_remote_call_reply(reply);
+                None
+            }
+        }
+    }
+
+    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) -> Option<QueuedRemoteEnvelope> {
         // Cross-shard transport admission already happened on the source shard.
         // What we record here is destination-local harvest outcome, not a
         // retroactive change to the source-side send result.
@@ -5621,7 +5781,7 @@ where
                     reason: SendRejectedReason::Closed,
                 },
             );
-            return;
+            return remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Closed);
         };
 
         if entry.generation != send.target_generation || entry.stopped.get() {
@@ -5635,16 +5795,20 @@ where
                     reason: SendRejectedReason::Closed,
                 },
             );
-            return;
+            return remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Closed);
         }
 
-        match entry.inbox.push(send.message, self.step_ordinal + 1, None) {
+        match entry
+            .inbox
+            .push(send.message, self.step_ordinal + 1, queued.call_context)
+        {
             Ok(()) => {
                 self.push_event(
                     send.target_isolate,
                     Some(queued.cause),
                     RuntimeEventKind::MailboxAccepted,
                 );
+                None
             }
             Err(TrySendError::Full(_)) => {
                 self.push_event(
@@ -5657,6 +5821,7 @@ where
                         reason: SendRejectedReason::Full,
                     },
                 );
+                remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Full)
             }
             Err(TrySendError::Closed(_)) => {
                 self.push_event(
@@ -5669,7 +5834,26 @@ where
                         reason: SendRejectedReason::Closed,
                     },
                 );
+                remote_call_outcome_envelope(queued.call_context, RemoteCallOutcome::Closed)
             }
+        }
+    }
+
+    fn harvest_remote_call_reply(&mut self, reply: RemoteCallReply) {
+        let outcome = match reply.reply {
+            RemoteCallOutcome::Replied(reply) => CallOutcome::Replied(reply),
+            RemoteCallOutcome::Full => CallOutcome::Full,
+            RemoteCallOutcome::Closed => CallOutcome::Closed,
+        };
+        if !self.complete_isolate_call(reply.call_id, reply.cause, outcome) {
+            self.push_event(
+                reply.requester.isolate,
+                Some(reply.cause),
+                RuntimeEventKind::CallReplyRejected {
+                    call_id: reply.call_id,
+                    reason: CallReplyRejectedReason::NoPendingCall,
+                },
+            );
         }
     }
 
@@ -6031,7 +6215,7 @@ where
 }
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
-type RemoteQueues = Vec<VecDeque<QueuedRemoteSend>>;
+type RemoteQueues = Vec<VecDeque<QueuedRemoteEnvelope>>;
 
 /// Deterministic explicit-step coordinator over a fixed set of shard simulators.
 ///
@@ -6242,7 +6426,14 @@ where
         let Some(next_deadline) = self
             .simulators
             .iter()
-            .flat_map(|simulator| simulator.timers.iter().map(|entry| entry.deadline))
+            .flat_map(|simulator| {
+                simulator.timers.iter().map(|entry| entry.deadline).chain(
+                    simulator
+                        .pending_isolate_calls
+                        .iter()
+                        .map(|entry| entry.deadline),
+                )
+            })
             .min()
         else {
             return false;
@@ -6289,30 +6480,46 @@ where
                     )
                 });
                 while let Some(queued) = remote_queues[queue_index].pop_front() {
-                    simulators[index].harvest_remote_send(queued);
+                    if let Some(outbound) = simulators[index].harvest_remote_envelope(queued) {
+                        let target_shard = outbound.target_shard();
+                        let key = (destination, target_shard);
+                        let queue_index =
+                            remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
+                                panic!(
+                                    "multi-shard simulator missing queue from shard {} to shard {}",
+                                    destination.get(),
+                                    target_shard.get()
+                                )
+                            });
+                        let queue = &mut next_remote_queues[queue_index];
+                        if queue.len() < config.shard_pair_capacity {
+                            queue.push_back(outbound);
+                        }
+                    }
                 }
             }
-            delivered += simulators[index].step_with_remote(&mut |source_shard, send, cause| {
-                if !shard_indexes.contains_key(&send.target_shard) {
+            delivered += simulators[index].step_with_remote(&mut |source_shard, envelope| {
+                let target_shard = envelope.target_shard();
+                if !shard_indexes.contains_key(&target_shard) {
                     panic!(
                         "multi-shard simulator targeted unknown destination shard {}",
-                        send.target_shard.get()
+                        target_shard.get()
                     );
                 }
 
-                let key = (source_shard, send.target_shard);
+                let key = (source_shard, target_shard);
                 let queue_index = remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
                     panic!(
                         "multi-shard simulator missing queue from shard {} to shard {}",
                         source_shard.get(),
-                        send.target_shard.get()
+                        target_shard.get()
                     )
                 });
                 let queue = &mut next_remote_queues[queue_index];
                 if queue.len() >= config.shard_pair_capacity {
                     return Err(SendRejectedReason::Full);
                 }
-                queue.push_back(QueuedRemoteSend { send, cause });
+                queue.push_back(envelope);
                 Ok(())
             });
         }
