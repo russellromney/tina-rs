@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
-use tina_runtime::{BetelgeuseBackedRuntimeConfig, MailboxFactory};
+use tina_runtime::{MailboxFactory, ThreadedRuntimeConfig};
 use tina_tokio_bridge::{BridgeHost, BridgeRequest};
 
 #[derive(Debug, Clone, Copy)]
@@ -106,7 +106,7 @@ fn main() {
     let host = BridgeHost::new(
         BarnShard,
         BarnMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
             ..Default::default()

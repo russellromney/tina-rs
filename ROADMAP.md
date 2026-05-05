@@ -50,7 +50,7 @@ Following the abstraction-vs-implementation rule (capability traits live in thei
   only if a named workload proves the producer model needs it
 - `tina-supervisor` — supervision tree mechanism
 - `tina-runtime` — current explicit-step, simulated-driver, and
-  Betelgeuse-backed threaded runtime implementation
+  `ThreadedRuntime` implementation over the Betelgeuse backend
 - `tina-runtime-monoio` — possible future multi-shard runtime on monoio
   (io_uring), only if it preserves Tina's semantics better than the current
   driver path
@@ -131,7 +131,7 @@ and reviews live under `.intent/phases/`.
 - Galileo / 021 / Kepler: multi-shard explicit-step semantics, devex/call
   ergonomics, and core primitive completion.
 - Huygens / Mercury / Betelgeuse / Tina TCP Driver Contract: live threaded
-  substrate, observed backpressure, isolate calls, Betelgeuse live runner, and
+  substrate, observed backpressure, isolate calls, ThreadedRuntime, and
   Tina-owned driver boundary.
 - Parallel Substrate Support / Ranger / Surveyor: substrate research/support,
   mature TCP driver ownership/cancellation/shutdown, and Tina-owned
@@ -141,14 +141,14 @@ and reviews live under `.intent/phases/`.
 - Dries van Agt: backend-honest live names, bounded trace retention, narrow
   Tokio/Tower/Axum bridge, bridge production-shape fixes, bridge metrics,
   cancellation, retry semantics, and the named Tina driver-runtime contract.
-- Piet de Jong: canonical `LocalApp` owner, bridge-from-app path, lifecycle
+- Piet de Jong: canonical `LocalSystem` owner, bridge-from-app path, lifecycle
   terminal reports, CI/performance posture, and production-shaped local service
   proofs.
 - Jelle Zijlstra: runtime-owned outbound TCP connect, runtime-owned local file
-  I/O, simulator file oracle, LocalApp/bridge file-service proofs, and exact
+  I/O, simulator file oracle, LocalSystem/bridge file-service proofs, and exact
   deferrals for DNS/TLS/UDP/process/signal.
 - Wim Kok: local snapshot/journal persistence, restart recovery, durable
-  simulator image, LocalApp/bridge recovery proof, and explicit durable mailbox
+  simulator image, LocalSystem/bridge recovery proof, and explicit durable mailbox
   non-claims.
 - Johan Rudolph Thorbecke: bounded live storage lane, live storage overload and
   cancellation visibility, multi-shard/thread-per-core service proof, composed

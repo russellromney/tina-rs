@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use betelgeuse::io::simulated::{SimulatedIO, SimulatedPeer};
 use tina::{ChildDefinition, Mailbox, RestartableChildDefinition, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, CallInput, CallOutcome, CallOutput, ListenerId, LocalApp,
-    LocalAppState, LocalAppTerminalReport, MailboxFactory, MultiShardRuntime, Runtime, RuntimeCall,
-    StreamId, call,
+    CallInput, CallOutcome, CallOutput, ListenerId, LocalSystem, LocalSystemState,
+    LocalSystemTerminalReport, MailboxFactory, MultiShardRuntime, Runtime, RuntimeCall, StreamId,
+    ThreadedRuntime, call,
 };
 
 const EXPECTED_MULTISHARD_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
@@ -771,7 +771,7 @@ fn terminal_summary_scans_trace_without_allocating() {
         runtime.try_send(sink, AllocationEvent::Arrived).unwrap();
         assert_eq!(runtime.step(), 1);
     }
-    let report = LocalAppTerminalReport::new(LocalAppState::Closed, runtime.trace().to_vec());
+    let report = LocalSystemTerminalReport::new(LocalSystemState::Closed, runtime.trace().to_vec());
 
     let warmup = report.summary();
     assert_eq!(warmup.message_abandoned, 0);
@@ -840,7 +840,7 @@ fn betelgeuse_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
     let _guard = ALLOCATION_TEST_GUARD
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let runtime = BetelgeuseBackedRuntime::new(AllocationShard(11), TestMailboxFactory);
+    let runtime = ThreadedRuntime::new(AllocationShard(11), TestMailboxFactory);
     let sink = runtime
         .register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 8)
         .expect("sink register accepts");
@@ -861,11 +861,11 @@ fn betelgeuse_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
 }
 
 #[test]
-fn local_app_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
+fn local_system_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
     let _guard = ALLOCATION_TEST_GUARD
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let app = LocalApp::single_shard(AllocationShard(11), TestMailboxFactory)
+    let app = LocalSystem::single_shard(AllocationShard(11), TestMailboxFactory)
         .ingress_capacity(8)
         .build();
     let sink = app
@@ -881,7 +881,7 @@ fn local_app_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
     });
     assert_eq!(
         handoff, EXPECTED_LOCAL_APP_INGRESS_HANDOFF,
-        "LocalApp ingress handoff allocation count changed; this measures the caller thread only"
+        "LocalSystem ingress handoff allocation count changed; this measures the caller thread only"
     );
     let _ = app.shutdown().drain().join();
 }

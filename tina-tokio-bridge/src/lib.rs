@@ -6,7 +6,7 @@
 //!
 //! The bridge does not make Tina handlers async and does not add a hidden
 //! executor queue. Tokio code sends one bounded request into a
-//! [`BetelgeuseBackedRuntime`], then
+//! [`ThreadedRuntime`], then
 //! waits for a oneshot response with an explicit timeout.
 //!
 //! ```compile_fail
@@ -33,9 +33,9 @@ use std::time::Duration;
 
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
 use tina_runtime::{
-    BetelgeuseBackedControlError, BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig,
-    BetelgeuseBackedSendObservedError, BetelgeuseBackedTrySendError, CallError, IntoErasedCall,
-    LocalApp, MailboxFactory, RuntimeEvent, SendRejectedReason,
+    CallError, IntoErasedCall, LocalSystem, MailboxFactory, RuntimeEvent, SendRejectedReason,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedSendObservedError,
+    ThreadedTrySendError,
 };
 use tokio::sync::oneshot;
 use tower_service::Service;
@@ -320,22 +320,24 @@ where
     }
 }
 
-impl From<BetelgeuseBackedTrySendError> for BridgeError {
-    fn from(error: BetelgeuseBackedTrySendError) -> Self {
+impl From<ThreadedTrySendError> for BridgeError {
+    fn from(error: ThreadedTrySendError) -> Self {
         match error {
-            BetelgeuseBackedTrySendError::IngressFull => Self::Full,
-            BetelgeuseBackedTrySendError::WorkerStopped => Self::Closed,
+            ThreadedTrySendError::IngressFull => Self::Full,
+            ThreadedTrySendError::WorkerStopped => Self::Closed,
         }
     }
 }
 
-impl From<BetelgeuseBackedSendObservedError> for BridgeError {
-    fn from(error: BetelgeuseBackedSendObservedError) -> Self {
+impl From<ThreadedSendObservedError> for BridgeError {
+    fn from(error: ThreadedSendObservedError) -> Self {
         match error {
-            BetelgeuseBackedSendObservedError::IngressFull
-            | BetelgeuseBackedSendObservedError::MailboxFull => Self::Full,
-            BetelgeuseBackedSendObservedError::MailboxClosed
-            | BetelgeuseBackedSendObservedError::WorkerStopped => Self::Closed,
+            ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::MailboxFull => {
+                Self::Full
+            }
+            ThreadedSendObservedError::MailboxClosed | ThreadedSendObservedError::WorkerStopped => {
+                Self::Closed
+            }
         }
     }
 }
@@ -463,13 +465,13 @@ impl<R> BridgeResponder<R> {
 pub type RegisteredBridgeHandle<M, R, S, F, I> =
     BridgeHandle<M, R, S, F, <I as Isolate>::Reply, <I as Isolate>::Message>;
 
-/// Owns one Betelgeuse-backed Tina runtime for bridge-hosted services.
+/// Owns one threaded Tina runtime for bridge-hosted services.
 pub struct BridgeHost<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    runtime: Option<Arc<BetelgeuseBackedRuntime<S, F>>>,
+    runtime: Option<Arc<ThreadedRuntime<S, F>>>,
 }
 
 impl<S, F> BridgeHost<S, F>
@@ -478,9 +480,9 @@ where
     F: MailboxFactory + Send + 'static,
 {
     /// Starts a bridge host over one shard-owned Tina runtime.
-    pub fn new(shard: S, mailbox_factory: F, config: BetelgeuseBackedRuntimeConfig) -> Self {
+    pub fn new(shard: S, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self {
         Self {
-            runtime: Some(Arc::new(BetelgeuseBackedRuntime::with_config(
+            runtime: Some(Arc::new(ThreadedRuntime::with_config(
                 shard,
                 mailbox_factory,
                 config,
@@ -489,14 +491,14 @@ where
     }
 
     /// Builds a bridge host from the canonical local app owner.
-    pub fn from_app(app: LocalApp<S, F>) -> Self {
+    pub fn from_app(app: LocalSystem<S, F>) -> Self {
         Self {
-            runtime: Some(Arc::new(app.into_betelgeuse_runtime())),
+            runtime: Some(Arc::new(app.into_threaded_runtime())),
         }
     }
 
     /// Returns the hosted Tina runtime.
-    pub fn runtime(&self) -> &Arc<BetelgeuseBackedRuntime<S, F>> {
+    pub fn runtime(&self) -> &Arc<ThreadedRuntime<S, F>> {
         self.runtime
             .as_ref()
             .expect("bridge host runtime is unavailable after shutdown")
@@ -508,7 +510,7 @@ where
         isolate: I,
         mailbox_capacity: usize,
         timeout: Duration,
-    ) -> Result<RegisteredBridgeHandle<M, R, S, F, I>, BetelgeuseBackedControlError>
+    ) -> Result<RegisteredBridgeHandle<M, R, S, F, I>, ThreadedRuntimeError>
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>, Spawn = Infallible> + Send + 'static,
         I::Message: BridgeMessage + From<BridgeRequest<M, R>> + Send + 'static,
@@ -568,7 +570,7 @@ pub enum BridgeShutdownError {
     /// Some bridge handles still hold the runtime.
     StillShared,
     /// The hosted runtime failed during shutdown.
-    Runtime(BetelgeuseBackedControlError),
+    Runtime(ThreadedRuntimeError),
 }
 
 /// Cloneable bounded bridge handle for Tokio/Tower callers.
@@ -577,7 +579,7 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    runtime: Arc<BetelgeuseBackedRuntime<S, F>>,
+    runtime: Arc<ThreadedRuntime<S, F>>,
     address: Address<TM, AR>,
     timeout: Duration,
     state: Arc<BridgeState>,
@@ -612,7 +614,7 @@ where
 {
     /// Builds a bridge handle to an already-registered Tina isolate.
     pub fn new(
-        runtime: Arc<BetelgeuseBackedRuntime<S, F>>,
+        runtime: Arc<ThreadedRuntime<S, F>>,
         address: Address<BridgeRequest<M, R>, AR>,
         timeout: Duration,
     ) -> Self {
@@ -639,7 +641,7 @@ where
     /// Builds a bridge handle that maps bridge requests into a larger Tina
     /// service message type.
     pub fn with_message(
-        runtime: Arc<BetelgeuseBackedRuntime<S, F>>,
+        runtime: Arc<ThreadedRuntime<S, F>>,
         address: Address<TM, AR>,
         timeout: Duration,
         into_message: impl Fn(BridgeRequest<M, R>) -> TM + Send + Sync + 'static,
@@ -764,7 +766,7 @@ where
                 |message| {
                     message
                         .bridge_cancelled()
-                        .then_some(BetelgeuseBackedSendObservedError::MailboxClosed)
+                        .then_some(ThreadedSendObservedError::MailboxClosed)
                 },
                 move |result| {
                     let result = result.map_err(BridgeError::from);

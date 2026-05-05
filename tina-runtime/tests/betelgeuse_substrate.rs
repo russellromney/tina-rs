@@ -17,11 +17,10 @@ use betelgeuse::{
 };
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedControlError, BetelgeuseBackedMultiShardRuntime, BetelgeuseBackedRuntime,
-    BetelgeuseBackedRuntimeConfig, CallCompletionRejectedReason, CallError, CallInput, CallKind,
-    CallOutcome, CallOutput, DriverRuntimeRequirement, ListenerId, MailboxFactory, RuntimeCall,
-    RuntimeEvent, RuntimeEventKind, SendRejectedReason, TINA_DRIVER_RUNTIME_CONTRACT,
-    TraceRetention, call, sleep,
+    CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
+    DriverRuntimeRequirement, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, SendRejectedReason, TINA_DRIVER_RUNTIME_CONTRACT, ThreadedMultiShardRuntime,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, TraceRetention, call, sleep,
 };
 
 #[derive(Debug, Default)]
@@ -204,12 +203,12 @@ impl Isolate for RetryWorker {
 }
 
 #[test]
-fn betelgeuse_runtime_timer_retry_runs_without_manual_stepping() {
+fn threaded_runtime_timer_retry_runs_without_manual_stepping() {
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseBackedRuntime::with_config(
+    let runtime = ThreadedRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -255,12 +254,12 @@ fn betelgeuse_runtime_timer_retry_runs_without_manual_stepping() {
 }
 
 #[test]
-fn betelgeuse_backed_runtime_honors_bounded_trace_retention() {
+fn threaded_runtime_honors_bounded_trace_retention() {
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseBackedRuntime::with_config(
+    let runtime = ThreadedRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             trace_retention: TraceRetention::Bounded(5),
             idle_wait: Duration::from_millis(1),
@@ -323,11 +322,11 @@ impl Isolate for LongTimer {
 }
 
 #[test]
-fn betelgeuse_runtime_shutdown_rejects_outstanding_timer_completion() {
-    let runtime = BetelgeuseBackedRuntime::with_config(
+fn threaded_runtime_shutdown_rejects_outstanding_timer_completion() {
+    let runtime = ThreadedRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -432,16 +431,16 @@ impl Isolate for TcpAcceptWorker {
 }
 
 #[test]
-fn betelgeuse_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
+fn threaded_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
     let simulated_io = SimulatedIO::new();
     let published = Arc::new(Mutex::new(None));
     let observed = Arc::new(Mutex::new(Vec::new()));
     let runtime = {
         let simulated_io = simulated_io.clone();
-        BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
+        ThreadedRuntime::with_config_and_io_loop_factory(
             TestShard,
             TestMailboxFactory,
-            BetelgeuseBackedRuntimeConfig {
+            ThreadedRuntimeConfig {
                 command_capacity: 8,
                 idle_wait: Duration::from_millis(1),
                 ..Default::default()
@@ -615,13 +614,13 @@ impl IOLoop for StuckReleaseIo {
 }
 
 #[test]
-fn betelgeuse_runtime_shutdown_reports_driver_release_failure() {
+fn threaded_runtime_shutdown_reports_driver_release_failure() {
     let stuck_io = StuckReleaseIo::default();
     let io_for_worker = stuck_io.clone();
-    let runtime = BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
+    let runtime = ThreadedRuntime::with_config_and_io_loop_factory(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -659,7 +658,7 @@ fn betelgeuse_runtime_shutdown_reports_driver_release_failure() {
 
     assert_eq!(
         runtime.shutdown(),
-        Err(BetelgeuseBackedControlError::DriverShutdownFailed)
+        Err(ThreadedRuntimeError::DriverShutdownFailed)
     );
 }
 
@@ -673,17 +672,14 @@ impl MailboxFactory for PanickingMailboxFactory {
 }
 
 #[test]
-fn betelgeuse_runtime_worker_panic_returns_typed_handle_error() {
-    let runtime = BetelgeuseBackedRuntime::new(TestShard, PanickingMailboxFactory);
+fn threaded_runtime_worker_panic_returns_typed_handle_error() {
+    let runtime = ThreadedRuntime::new(TestShard, PanickingMailboxFactory);
 
     assert_eq!(
         runtime.register_with_capacity::<LongTimer, _>(LongTimer, 8),
-        Err(BetelgeuseBackedControlError::WorkerStopped)
+        Err(ThreadedRuntimeError::WorkerStopped)
     );
-    assert_eq!(
-        runtime.trace(),
-        Err(BetelgeuseBackedControlError::WorkerStopped)
-    );
+    assert_eq!(runtime.trace(), Err(ThreadedRuntimeError::WorkerStopped));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -739,8 +735,8 @@ impl Isolate for Sink {
 }
 
 #[test]
-fn betelgeuse_runtime_local_mailbox_full_is_visible_in_trace() {
-    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
+fn threaded_runtime_local_mailbox_full_is_visible_in_trace() {
+    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
     let sink = runtime
         .register_with_capacity::<Sink, _>(Sink, 1)
         .expect("sink register accepts");
@@ -931,11 +927,11 @@ fn has_send_accepted_between(trace: &[RuntimeEvent], from: u32, to: u32) -> bool
 }
 
 #[test]
-fn betelgeuse_multishard_dispatcher_round_trips_between_worker_threads() {
-    let runtime = BetelgeuseBackedMultiShardRuntime::with_config(
+fn threaded_multishard_dispatcher_round_trips_between_worker_threads() {
+    let runtime = ThreadedMultiShardRuntime::with_config(
         [WorkShard(1), WorkShard(2)],
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -981,11 +977,11 @@ fn betelgeuse_multishard_dispatcher_round_trips_between_worker_threads() {
 
 #[test]
 #[should_panic(expected = "storage lane capacity > 0")]
-fn betelgeuse_multishard_rejects_zero_storage_lane_capacity() {
-    let _runtime = BetelgeuseBackedMultiShardRuntime::with_config(
+fn threaded_multishard_rejects_zero_storage_lane_capacity() {
+    let _runtime = ThreadedMultiShardRuntime::with_config(
         [WorkShard(1), WorkShard(2)],
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             storage_lane_capacity: 0,
             ..Default::default()
         },
@@ -993,9 +989,8 @@ fn betelgeuse_multishard_rejects_zero_storage_lane_capacity() {
 }
 
 #[test]
-fn betelgeuse_multishard_bad_remote_does_not_poison_good_remote_work() {
-    let runtime =
-        BetelgeuseBackedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
+fn threaded_multishard_bad_remote_does_not_poison_good_remote_work() {
+    let runtime = ThreadedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
     let completed = Arc::new(Mutex::new(Vec::new()));
     let worker = runtime
         .register_with_capacity_on::<Worker, _>(ShardId::new(2), Worker, 8)
@@ -1128,9 +1123,8 @@ impl Isolate for CallClient {
 }
 
 #[test]
-fn betelgeuse_multishard_isolate_call_rejects_cross_shard_with_typed_outcome() {
-    let runtime =
-        BetelgeuseBackedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
+fn threaded_multishard_isolate_call_rejects_cross_shard_with_typed_outcome() {
+    let runtime = ThreadedMultiShardRuntime::new([WorkShard(1), WorkShard(2)], TestMailboxFactory);
     let target_hits = Arc::new(Mutex::new(0));
     let observations = Arc::new(Mutex::new(Vec::new()));
     let target = runtime
@@ -1255,11 +1249,11 @@ impl Isolate for RemoteBurst {
 }
 
 #[test]
-fn betelgeuse_multishard_remote_queue_full_is_visible_at_source() {
-    let runtime = BetelgeuseBackedMultiShardRuntime::with_config(
+fn threaded_multishard_remote_queue_full_is_visible_at_source() {
+    let runtime = ThreadedMultiShardRuntime::with_config(
         [WorkShard(1), WorkShard(2)],
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 1,
             idle_wait: Duration::from_millis(1),
             ..Default::default()

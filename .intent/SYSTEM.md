@@ -83,13 +83,13 @@ each restart for restartable children.
 `tina-runtime` is the explicit-step runtime. It handles same-shard sends,
 same-shard child spawn, supervision, restart, sends into the runtime from
 outside, bounded mailboxes, stale generation rejection, panic capture, abandon
-tracing, time calls, Betelgeuse-backed TCP calls, runtime-owned local file
+tracing, time calls, ThreadedRuntime TCP calls over Betelgeuse, runtime-owned local file
 calls, and local snapshot/journal persistence calls. Its `step()` is
 synchronous from the outside: the runtime collects finished owned work,
 translates completions into messages, and then handles ready mailbox work.
 
-`tina-runtime` also has a narrow live substrate: `BetelgeuseBackedRuntime` for
-one shard and `BetelgeuseBackedMultiShardRuntime` for a fixed shard set. Each
+`tina-runtime` also has a narrow live substrate: `ThreadedRuntime` for
+one shard and `ThreadedMultiShardRuntime` for a fixed shard set. Each
 shard runtime is constructed and owned by one OS worker thread; handles
 communicate through bounded command queues. Live cross-shard sends move
 `Send + 'static` payloads through those bounded worker queues. This is an
@@ -140,15 +140,15 @@ exactly-once semantics.
 
 The explicit-step runtime remains the semantic oracle: its snapshot/journal
 helpers complete inline when the driver is stepped directly. The bounded
-storage worker lane belongs to the preferred live `BetelgeuseBackedRuntime` and
-live `BetelgeuseBackedMultiShardRuntime` paths.
+storage worker lane belongs to the preferred live `ThreadedRuntime` and
+live `ThreadedMultiShardRuntime` paths.
 
 Storage lane capacity means total accepted pending storage work, not only
 buffered channel slots. Running work counts against capacity until its
 completion is harvested or canceled. This keeps `StorageFull` deterministic
 under fast worker scheduling.
 
-`LocalAppTerminalReport::summary()` is trace-derived terminal accounting. It
+`LocalSystemTerminalReport::summary()` is trace-derived terminal accounting. It
 may count completed, failed, rejected, abandoned, journaled, and recovered work
 that Tina can see in the final trace. It must not grow hidden metrics channels
 that disagree with trace truth.

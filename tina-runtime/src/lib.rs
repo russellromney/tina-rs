@@ -362,7 +362,7 @@ where
     ///
     /// This is the narrow substrate seam used by deterministic simulated I/O
     /// tests and alternate Betelgeuse loop implementations. Normal live code
-    /// should use [`Runtime::new`] or [`BetelgeuseBackedRuntime`].
+    /// should use [`Runtime::new`] or [`ThreadedRuntime`].
     pub fn with_betelgeuse_io_loop(
         shard: S,
         mailbox_factory: F,
@@ -2585,9 +2585,9 @@ fn build_remote_queue_storage(shard_ids: &[ShardId], shard_pair_capacity: usize)
     queues
 }
 
-/// Configuration for [`BetelgeuseBackedRuntime`].
+/// Configuration for [`ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BetelgeuseBackedRuntimeConfig {
+pub struct ThreadedRuntimeConfig {
     /// Capacity of the bounded control/ingress queue feeding the shard worker.
     pub command_capacity: usize,
 
@@ -2602,7 +2602,7 @@ pub struct BetelgeuseBackedRuntimeConfig {
     pub idle_wait: Duration,
 }
 
-impl Default for BetelgeuseBackedRuntimeConfig {
+impl Default for ThreadedRuntimeConfig {
     fn default() -> Self {
         Self {
             command_capacity: 64,
@@ -2613,9 +2613,9 @@ impl Default for BetelgeuseBackedRuntimeConfig {
     }
 }
 
-/// Error returned by setup/control operations on [`BetelgeuseBackedRuntime`].
+/// Error returned by setup/control operations on [`ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BetelgeuseBackedControlError {
+pub enum ThreadedRuntimeError {
     /// The worker thread stopped before it could accept or answer the command.
     WorkerStopped,
     /// The worker could not prove backend completion-slot ownership was
@@ -2623,9 +2623,9 @@ pub enum BetelgeuseBackedControlError {
     DriverShutdownFailed,
 }
 
-/// Error returned by [`BetelgeuseBackedRuntime::try_send`].
+/// Error returned by [`ThreadedRuntime::try_send`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BetelgeuseBackedTrySendError {
+pub enum ThreadedTrySendError {
     /// The bounded worker ingress queue is full.
     IngressFull,
 
@@ -2633,9 +2633,9 @@ pub enum BetelgeuseBackedTrySendError {
     WorkerStopped,
 }
 
-/// Error returned by [`BetelgeuseBackedRuntime::send_and_observe`].
+/// Error returned by [`ThreadedRuntime::send_and_observe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BetelgeuseBackedSendObservedError {
+pub enum ThreadedSendObservedError {
     /// The bounded worker ingress queue is full.
     IngressFull,
 
@@ -2785,11 +2785,7 @@ struct LiveShardMetrics {
 }
 
 impl LiveShardMetrics {
-    fn new(
-        shard: ShardId,
-        worker_name: Option<String>,
-        config: BetelgeuseBackedRuntimeConfig,
-    ) -> Self {
+    fn new(shard: ShardId, worker_name: Option<String>, config: ThreadedRuntimeConfig) -> Self {
         Self {
             shard,
             worker_name,
@@ -2938,13 +2934,13 @@ impl LiveTopologyReport {
     }
 }
 
-type BetelgeuseCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
-type BetelgeuseIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
-type BetelgeuseWorkerJoin = JoinHandle<Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>>;
+type ThreadedCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
+type ThreadedIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
+type ThreadedWorkerJoin = JoinHandle<Result<Vec<RuntimeEvent>, ThreadedRuntimeError>>;
 
 /// Lifecycle state for the canonical local Tina app owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalAppState {
+pub enum LocalSystemState {
     /// Reserved state for app owners that expose asynchronous startup.
     Starting,
     /// The app owner has a live worker handle and accepts bounded ingress.
@@ -2959,22 +2955,22 @@ pub enum LocalAppState {
     Failed,
 }
 
-/// Terminal report returned by [`LocalApp`] and [`LocalMultiShardApp`] shutdown.
+/// Terminal report returned by [`LocalSystem`] and [`LocalMultiShardSystem`] shutdown.
 #[derive(Debug)]
-pub struct LocalAppTerminalReport {
-    state: LocalAppState,
+pub struct LocalSystemTerminalReport {
+    state: LocalSystemState,
     trace: Vec<RuntimeEvent>,
-    error: Option<BetelgeuseBackedControlError>,
+    error: Option<ThreadedRuntimeError>,
     topology: Option<LiveTopologyReport>,
 }
 
-/// Counted terminal work visible in a [`LocalAppTerminalReport`] trace.
+/// Counted terminal work visible in a [`LocalSystemTerminalReport`] trace.
 ///
 /// This is accounting from Tina's public trace, not a hidden runtime metrics
 /// channel. It is meant to answer the shutdown question: what completed,
 /// failed, was rejected, or was abandoned in the work Tina can see?
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LocalAppTerminalSummary {
+pub struct LocalSystemTerminalSummary {
     /// Successful runtime-owned call completions delivered to requesters.
     pub call_completed: usize,
     /// Runtime-owned calls that produced typed failure outcomes.
@@ -2997,9 +2993,9 @@ pub struct LocalAppTerminalSummary {
     pub recovery_failed: usize,
 }
 
-impl LocalAppTerminalReport {
+impl LocalSystemTerminalReport {
     /// Creates a terminal report from final state and trace.
-    pub fn new(state: LocalAppState, trace: Vec<RuntimeEvent>) -> Self {
+    pub fn new(state: LocalSystemState, trace: Vec<RuntimeEvent>) -> Self {
         Self {
             state,
             trace,
@@ -3009,9 +3005,9 @@ impl LocalAppTerminalReport {
     }
 
     /// Creates a failed terminal report.
-    pub fn failed(error: BetelgeuseBackedControlError) -> Self {
+    pub fn failed(error: ThreadedRuntimeError) -> Self {
         Self {
-            state: LocalAppState::Failed,
+            state: LocalSystemState::Failed,
             trace: Vec::new(),
             error: Some(error),
             topology: None,
@@ -3020,7 +3016,7 @@ impl LocalAppTerminalReport {
 
     /// Creates a terminal report with the final live topology snapshot.
     pub fn new_with_topology(
-        state: LocalAppState,
+        state: LocalSystemState,
         trace: Vec<RuntimeEvent>,
         topology: LiveTopologyReport,
     ) -> Self {
@@ -3033,12 +3029,9 @@ impl LocalAppTerminalReport {
     }
 
     /// Creates a failed terminal report with the final live topology snapshot.
-    pub fn failed_with_topology(
-        error: BetelgeuseBackedControlError,
-        topology: LiveTopologyReport,
-    ) -> Self {
+    pub fn failed_with_topology(error: ThreadedRuntimeError, topology: LiveTopologyReport) -> Self {
         Self {
-            state: LocalAppState::Failed,
+            state: LocalSystemState::Failed,
             trace: Vec::new(),
             error: Some(error),
             topology: Some(topology),
@@ -3046,7 +3039,7 @@ impl LocalAppTerminalReport {
     }
 
     /// Final lifecycle state.
-    pub const fn state(&self) -> LocalAppState {
+    pub const fn state(&self) -> LocalSystemState {
         self.state
     }
 
@@ -3056,12 +3049,12 @@ impl LocalAppTerminalReport {
     }
 
     /// Summarizes terminal work visible in the final trace.
-    pub fn summary(&self) -> LocalAppTerminalSummary {
+    pub fn summary(&self) -> LocalSystemTerminalSummary {
         terminal_summary(&self.trace)
     }
 
     /// Terminal failure, if shutdown or worker execution failed.
-    pub const fn error(&self) -> Option<BetelgeuseBackedControlError> {
+    pub const fn error(&self) -> Option<ThreadedRuntimeError> {
         self.error
     }
 
@@ -3076,8 +3069,8 @@ impl LocalAppTerminalReport {
     }
 }
 
-fn terminal_summary(trace: &[RuntimeEvent]) -> LocalAppTerminalSummary {
-    let mut summary = LocalAppTerminalSummary::default();
+fn terminal_summary(trace: &[RuntimeEvent]) -> LocalSystemTerminalSummary {
+    let mut summary = LocalSystemTerminalSummary::default();
     for event in trace {
         match event.kind() {
             RuntimeEventKind::CallCompleted { .. } => summary.call_completed += 1,
@@ -3103,40 +3096,40 @@ fn terminal_summary(trace: &[RuntimeEvent]) -> LocalAppTerminalSummary {
 
 /// Canonical live app owner for one local Tina shard.
 ///
-/// `LocalApp` is the preferred user-facing owner for local live services.
-/// [`BetelgeuseBackedRuntime`] remains the lower-level backend-honest runner
+/// `LocalSystem` is the preferred user-facing owner for local live services.
+/// [`ThreadedRuntime`] remains the lower-level backend-honest runner
 /// underneath it.
-pub struct LocalApp<S, F>
+pub struct LocalSystem<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    runtime: Option<BetelgeuseBackedRuntime<S, F>>,
+    runtime: Option<ThreadedRuntime<S, F>>,
 }
 
-impl<S, F> LocalApp<S, F>
+impl<S, F> LocalSystem<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
     /// Starts configuring one single-shard local app.
-    pub fn single_shard(shard: S, mailbox_factory: F) -> LocalAppSingleShardBuilder<S, F> {
-        LocalAppSingleShardBuilder {
+    pub fn single_shard(shard: S, mailbox_factory: F) -> LocalSystemSingleShardBuilder<S, F> {
+        LocalSystemSingleShardBuilder {
             shard,
             mailbox_factory,
-            config: BetelgeuseBackedRuntimeConfig::default(),
+            config: ThreadedRuntimeConfig::default(),
         }
     }
 
     /// Starts configuring one multi-shard local app.
-    pub fn multi_shard(mailbox_factory: F) -> LocalAppMultiShardBuilder<S, F>
+    pub fn multi_shard(mailbox_factory: F) -> LocalSystemMultiShardBuilder<S, F>
     where
         F: Clone,
     {
-        LocalAppMultiShardBuilder {
+        LocalSystemMultiShardBuilder {
             shards: Vec::new(),
             mailbox_factory,
-            config: BetelgeuseBackedRuntimeConfig::default(),
+            config: ThreadedRuntimeConfig::default(),
         }
     }
 
@@ -3145,11 +3138,11 @@ where
     /// This does not synchronously probe worker health. Operations such as
     /// registration, sending, tracing, or shutdown report worker failure with a
     /// typed error.
-    pub fn state(&self) -> LocalAppState {
+    pub fn state(&self) -> LocalSystemState {
         if self.runtime.is_some() {
-            LocalAppState::Accepting
+            LocalSystemState::Accepting
         } else {
-            LocalAppState::Closed
+            LocalSystemState::Closed
         }
     }
 
@@ -3164,7 +3157,7 @@ where
         &self,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> Result<Address<I::Message, I::Reply>, BetelgeuseBackedControlError>
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
         I::Message: 'static,
@@ -3182,7 +3175,7 @@ where
         &self,
         parent: Address<M, R>,
         config: SupervisorConfig,
-    ) -> Result<(), BetelgeuseBackedControlError> {
+    ) -> Result<(), ThreadedRuntimeError> {
         self.runtime().supervise(parent, config)
     }
 
@@ -3191,7 +3184,7 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), BetelgeuseBackedTrySendError> {
+    ) -> Result<(), ThreadedTrySendError> {
         self.runtime().try_send(address, message)
     }
 
@@ -3200,51 +3193,51 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), BetelgeuseBackedSendObservedError> {
+    ) -> Result<(), ThreadedSendObservedError> {
         self.runtime().send_and_observe(address, message)
     }
 
     /// Returns a trace snapshot.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.runtime().trace()
     }
 
     /// Begins graceful shutdown.
-    pub fn shutdown(self) -> LocalAppShutdown<S, F> {
-        LocalAppShutdown {
+    pub fn shutdown(self) -> LocalSystemShutdown<S, F> {
+        LocalSystemShutdown {
             runtime: self.runtime,
         }
     }
 
-    /// Consumes the app and returns its lower-level Betelgeuse-backed runtime.
+    /// Consumes the app and returns its lower-level ThreadedRuntime.
     ///
     /// This is for bridge/adapters that need to share the backend runner behind
-    /// an `Arc` while preserving `LocalApp` as the preferred construction path.
-    pub fn into_betelgeuse_runtime(mut self) -> BetelgeuseBackedRuntime<S, F> {
+    /// an `Arc` while preserving `LocalSystem` as the preferred construction path.
+    pub fn into_threaded_runtime(mut self) -> ThreadedRuntime<S, F> {
         self.runtime
             .take()
             .expect("local app runtime is unavailable after shutdown")
     }
 
-    fn runtime(&self) -> &BetelgeuseBackedRuntime<S, F> {
+    fn runtime(&self) -> &ThreadedRuntime<S, F> {
         self.runtime
             .as_ref()
             .expect("local app runtime is unavailable after shutdown")
     }
 }
 
-/// Builder for a single-shard [`LocalApp`].
-pub struct LocalAppSingleShardBuilder<S, F>
+/// Builder for a single-shard [`LocalSystem`].
+pub struct LocalSystemSingleShardBuilder<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
     shard: S,
     mailbox_factory: F,
-    config: BetelgeuseBackedRuntimeConfig,
+    config: ThreadedRuntimeConfig,
 }
 
-impl<S, F> LocalAppSingleShardBuilder<S, F>
+impl<S, F> LocalSystemSingleShardBuilder<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
@@ -3274,9 +3267,9 @@ where
     }
 
     /// Builds the local app and starts its worker.
-    pub fn build(self) -> LocalApp<S, F> {
-        LocalApp {
-            runtime: Some(BetelgeuseBackedRuntime::with_config(
+    pub fn build(self) -> LocalSystem<S, F> {
+        LocalSystem {
+            runtime: Some(ThreadedRuntime::with_config(
                 self.shard,
                 self.mailbox_factory,
                 self.config,
@@ -3285,16 +3278,16 @@ where
     }
 }
 
-/// Graceful shutdown handle for [`LocalApp`].
-pub struct LocalAppShutdown<S, F>
+/// Graceful shutdown handle for [`LocalSystem`].
+pub struct LocalSystemShutdown<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    runtime: Option<BetelgeuseBackedRuntime<S, F>>,
+    runtime: Option<ThreadedRuntime<S, F>>,
 }
 
-impl<S, F> LocalAppShutdown<S, F>
+impl<S, F> LocalSystemShutdown<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
@@ -3308,7 +3301,7 @@ where
     }
 
     /// Joins the worker and returns its terminal report.
-    pub fn join(self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+    pub fn join(self) -> Result<LocalSystemTerminalReport, ThreadedRuntimeError> {
         let report = self.join_report();
         if let Some(error) = report.error() {
             Err(error)
@@ -3318,33 +3311,35 @@ where
     }
 
     /// Joins the worker and always returns the terminal lifecycle report.
-    pub fn join_report(mut self) -> LocalAppTerminalReport {
+    pub fn join_report(mut self) -> LocalSystemTerminalReport {
         let Some(mut runtime) = self.runtime.take() else {
-            return LocalAppTerminalReport::new(LocalAppState::Closed, Vec::new());
+            return LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new());
         };
         match runtime.shutdown_inner() {
-            Ok(trace) => LocalAppTerminalReport::new_with_topology(
-                LocalAppState::Closed,
+            Ok(trace) => LocalSystemTerminalReport::new_with_topology(
+                LocalSystemState::Closed,
                 trace,
                 runtime.topology(),
             ),
-            Err(error) => LocalAppTerminalReport::failed_with_topology(error, runtime.topology()),
+            Err(error) => {
+                LocalSystemTerminalReport::failed_with_topology(error, runtime.topology())
+            }
         }
     }
 }
 
 /// Builder for a multi-shard local app.
-pub struct LocalAppMultiShardBuilder<S, F>
+pub struct LocalSystemMultiShardBuilder<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
     shards: Vec<S>,
     mailbox_factory: F,
-    config: BetelgeuseBackedRuntimeConfig,
+    config: ThreadedRuntimeConfig,
 }
 
-impl<S, F> LocalAppMultiShardBuilder<S, F>
+impl<S, F> LocalSystemMultiShardBuilder<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
@@ -3385,9 +3380,9 @@ where
     }
 
     /// Builds the multi-shard local app and starts one worker per shard.
-    pub fn build(self) -> LocalMultiShardApp<S, F> {
-        LocalMultiShardApp {
-            runtime: Some(BetelgeuseBackedMultiShardRuntime::with_config(
+    pub fn build(self) -> LocalMultiShardSystem<S, F> {
+        LocalMultiShardSystem {
+            runtime: Some(ThreadedMultiShardRuntime::with_config(
                 self.shards,
                 self.mailbox_factory,
                 self.config,
@@ -3397,15 +3392,15 @@ where
 }
 
 /// Canonical live app owner for a local multi-shard Tina service.
-pub struct LocalMultiShardApp<S, F>
+pub struct LocalMultiShardSystem<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
-    runtime: Option<BetelgeuseBackedMultiShardRuntime<S, F>>,
+    runtime: Option<ThreadedMultiShardRuntime<S, F>>,
 }
 
-impl<S, F> LocalMultiShardApp<S, F>
+impl<S, F> LocalMultiShardSystem<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
@@ -3417,7 +3412,7 @@ where
         shard: ShardId,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> Result<Address<I::Message, I::Reply>, BetelgeuseBackedControlError>
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
         I::Message: 'static,
@@ -3435,7 +3430,7 @@ where
         &self,
         parent: Address<M, R>,
         config: SupervisorConfig,
-    ) -> Result<(), BetelgeuseBackedControlError> {
+    ) -> Result<(), ThreadedRuntimeError> {
         self.runtime().supervise(parent, config)
     }
 
@@ -3444,12 +3439,12 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), BetelgeuseBackedTrySendError> {
+    ) -> Result<(), ThreadedTrySendError> {
         self.runtime().try_send(address, message)
     }
 
     /// Returns a globally sorted trace snapshot.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.runtime().trace()
     }
 
@@ -3459,29 +3454,29 @@ where
     }
 
     /// Begins graceful shutdown.
-    pub fn shutdown(self) -> LocalMultiShardAppShutdown<S, F> {
-        LocalMultiShardAppShutdown {
+    pub fn shutdown(self) -> LocalMultiShardSystemShutdown<S, F> {
+        LocalMultiShardSystemShutdown {
             runtime: self.runtime,
         }
     }
 
-    fn runtime(&self) -> &BetelgeuseBackedMultiShardRuntime<S, F> {
+    fn runtime(&self) -> &ThreadedMultiShardRuntime<S, F> {
         self.runtime
             .as_ref()
             .expect("local multi-shard app runtime is unavailable after shutdown")
     }
 }
 
-/// Graceful shutdown handle for [`LocalMultiShardApp`].
-pub struct LocalMultiShardAppShutdown<S, F>
+/// Graceful shutdown handle for [`LocalMultiShardSystem`].
+pub struct LocalMultiShardSystemShutdown<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
-    runtime: Option<BetelgeuseBackedMultiShardRuntime<S, F>>,
+    runtime: Option<ThreadedMultiShardRuntime<S, F>>,
 }
 
-impl<S, F> LocalMultiShardAppShutdown<S, F>
+impl<S, F> LocalMultiShardSystemShutdown<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
@@ -3492,7 +3487,7 @@ where
     }
 
     /// Joins all workers and returns a terminal report.
-    pub fn join(self) -> Result<LocalAppTerminalReport, BetelgeuseBackedControlError> {
+    pub fn join(self) -> Result<LocalSystemTerminalReport, ThreadedRuntimeError> {
         let report = self.join_report();
         if let Some(error) = report.error() {
             Err(error)
@@ -3502,27 +3497,29 @@ where
     }
 
     /// Joins all workers and always returns the terminal lifecycle report.
-    pub fn join_report(mut self) -> LocalAppTerminalReport {
+    pub fn join_report(mut self) -> LocalSystemTerminalReport {
         let Some(mut runtime) = self.runtime.take() else {
-            return LocalAppTerminalReport::new(LocalAppState::Closed, Vec::new());
+            return LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new());
         };
         match runtime.shutdown_inner() {
-            Ok(trace) => LocalAppTerminalReport::new_with_topology(
-                LocalAppState::Closed,
+            Ok(trace) => LocalSystemTerminalReport::new_with_topology(
+                LocalSystemState::Closed,
                 trace,
                 runtime.topology(),
             ),
-            Err(error) => LocalAppTerminalReport::failed_with_topology(error, runtime.topology()),
+            Err(error) => {
+                LocalSystemTerminalReport::failed_with_topology(error, runtime.topology())
+            }
         }
     }
 }
 
-enum BetelgeuseCommand<S, F>
+enum ThreadedCommand<S, F>
 where
     S: Shard,
     F: MailboxFactory,
 {
-    Run(BetelgeuseCommandFn<S, F>),
+    Run(ThreadedCommandFn<S, F>),
     Shutdown,
 }
 
@@ -3534,36 +3531,28 @@ where
 /// backlog. This is the Betelgeuse live substrate shape; the
 /// explicit-step [`Runtime`] and [`MultiShardRuntime`] remain the semantic
 /// oracle.
-pub struct BetelgeuseBackedRuntime<S, F>
+pub struct ThreadedRuntime<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    commands: std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>,
-    handle: Option<JoinHandle<Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>>>,
+    commands: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>,
+    handle: Option<JoinHandle<Result<Vec<RuntimeEvent>, ThreadedRuntimeError>>>,
     metrics: Arc<LiveShardMetrics>,
 }
 
-impl<S, F> BetelgeuseBackedRuntime<S, F>
+impl<S, F> ThreadedRuntime<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
     /// Starts one worker thread for one shard runtime.
     pub fn new(shard: S, mailbox_factory: F) -> Self {
-        Self::with_config(
-            shard,
-            mailbox_factory,
-            BetelgeuseBackedRuntimeConfig::default(),
-        )
+        Self::with_config(shard, mailbox_factory, ThreadedRuntimeConfig::default())
     }
 
     /// Starts one worker thread with explicit bounded-command configuration.
-    pub fn with_config(
-        shard: S,
-        mailbox_factory: F,
-        config: BetelgeuseBackedRuntimeConfig,
-    ) -> Self {
+    pub fn with_config(shard: S, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self {
         Self::with_config_and_io_loop_factory(shard, mailbox_factory, config, || {
             io_loop(Global).expect("failed to initialise Betelgeuse IO loop for tina-runtime")
         })
@@ -3577,17 +3566,17 @@ where
     pub fn with_config_and_io_loop_factory<G>(
         shard: S,
         mailbox_factory: F,
-        config: BetelgeuseBackedRuntimeConfig,
+        config: ThreadedRuntimeConfig,
         io_loop_factory: G,
     ) -> Self
     where
         G: FnOnce() -> IOLoopHandle<Global> + Send + 'static,
     {
         if config.command_capacity == 0 {
-            panic!("Betelgeuse-backed runtime requires command capacity > 0");
+            panic!("ThreadedRuntime requires command capacity > 0");
         }
         if config.storage_lane_capacity == 0 {
-            panic!("Betelgeuse-backed runtime requires storage lane capacity > 0");
+            panic!("ThreadedRuntime requires storage lane capacity > 0");
         }
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
@@ -3598,13 +3587,13 @@ where
             Some(worker_name.clone()),
             config,
         ));
-        let io_loop_factory: BetelgeuseIoLoopFactory = Box::new(io_loop_factory);
+        let io_loop_factory: ThreadedIoLoopFactory = Box::new(io_loop_factory);
         let handle = thread::Builder::new()
             .name(worker_name)
             .spawn(move || {
-                betelgeuse_worker_loop(shard, mailbox_factory, receiver, config, io_loop_factory)
+                threaded_worker_loop(shard, mailbox_factory, receiver, config, io_loop_factory)
             })
-            .expect("failed to spawn Tina Betelgeuse-backed worker");
+            .expect("failed to spawn Tina threaded worker");
 
         Self {
             commands,
@@ -3619,7 +3608,7 @@ where
         &self,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> Result<Address<I::Message, I::Reply>, BetelgeuseBackedControlError>
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
         I::Message: 'static,
@@ -3638,7 +3627,7 @@ where
         &self,
         parent: Address<M, R>,
         config: SupervisorConfig,
-    ) -> Result<(), BetelgeuseBackedControlError> {
+    ) -> Result<(), ThreadedRuntimeError> {
         self.call(move |runtime| runtime.supervise(parent, config))
     }
 
@@ -3652,8 +3641,8 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), BetelgeuseBackedTrySendError> {
-        let command = BetelgeuseCommand::Run(Box::new(move |runtime| {
+    ) -> Result<(), ThreadedTrySendError> {
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let _ = runtime.try_send(address, message);
         }));
 
@@ -3664,12 +3653,12 @@ where
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.metrics.ingress.rejected_full();
-                Err(BetelgeuseBackedTrySendError::IngressFull)
+                Err(ThreadedTrySendError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.metrics.ingress.rejected_closed();
                 self.metrics.set_state(LiveShardState::Failed);
-                Err(BetelgeuseBackedTrySendError::WorkerStopped)
+                Err(ThreadedTrySendError::WorkerStopped)
             }
         }
     }
@@ -3684,14 +3673,14 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), BetelgeuseBackedSendObservedError> {
+    ) -> Result<(), ThreadedSendObservedError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        let command = BetelgeuseCommand::Run(Box::new(move |runtime| {
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let result = runtime
                 .try_send(address, message)
                 .map_err(|error| match error {
-                    TrySendError::Full(_) => BetelgeuseBackedSendObservedError::MailboxFull,
-                    TrySendError::Closed(_) => BetelgeuseBackedSendObservedError::MailboxClosed,
+                    TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                    TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
                 });
             let _ = reply_tx.send(result);
         }));
@@ -3701,16 +3690,16 @@ where
                 self.metrics.ingress.accepted();
                 reply_rx
                     .recv()
-                    .unwrap_or(Err(BetelgeuseBackedSendObservedError::WorkerStopped))
+                    .unwrap_or(Err(ThreadedSendObservedError::WorkerStopped))
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.metrics.ingress.rejected_full();
-                Err(BetelgeuseBackedSendObservedError::IngressFull)
+                Err(ThreadedSendObservedError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.metrics.ingress.rejected_closed();
                 self.metrics.set_state(LiveShardState::Failed);
-                Err(BetelgeuseBackedSendObservedError::WorkerStopped)
+                Err(ThreadedSendObservedError::WorkerStopped)
             }
         }
     }
@@ -3729,11 +3718,11 @@ where
         address: Address<M, R>,
         message: M,
         observer: O,
-    ) -> Result<(), BetelgeuseBackedTrySendError>
+    ) -> Result<(), ThreadedTrySendError>
     where
         M: Send + 'static,
         R: 'static,
-        O: FnOnce(Result<(), BetelgeuseBackedSendObservedError>) + Send + 'static,
+        O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
         self.try_send_and_observe_with_preflight(address, message, |_| None, observer)
     }
@@ -3749,14 +3738,14 @@ where
         message: M,
         preflight: P,
         observer: O,
-    ) -> Result<(), BetelgeuseBackedTrySendError>
+    ) -> Result<(), ThreadedTrySendError>
     where
         M: Send + 'static,
         R: 'static,
-        P: FnOnce(&M) -> Option<BetelgeuseBackedSendObservedError> + Send + 'static,
-        O: FnOnce(Result<(), BetelgeuseBackedSendObservedError>) + Send + 'static,
+        P: FnOnce(&M) -> Option<ThreadedSendObservedError> + Send + 'static,
+        O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
-        let command = BetelgeuseCommand::Run(Box::new(move |runtime| {
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
             if let Some(error) = preflight(&message) {
                 observer(Err(error));
                 return;
@@ -3766,8 +3755,8 @@ where
                 runtime
                     .try_send(address, message)
                     .map_err(|error| match error {
-                        TrySendError::Full(_) => BetelgeuseBackedSendObservedError::MailboxFull,
-                        TrySendError::Closed(_) => BetelgeuseBackedSendObservedError::MailboxClosed,
+                        TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                        TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
                     }),
             );
         }));
@@ -3779,23 +3768,23 @@ where
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.metrics.ingress.rejected_full();
-                Err(BetelgeuseBackedTrySendError::IngressFull)
+                Err(ThreadedTrySendError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.metrics.ingress.rejected_closed();
                 self.metrics.set_state(LiveShardState::Failed);
-                Err(BetelgeuseBackedTrySendError::WorkerStopped)
+                Err(ThreadedTrySendError::WorkerStopped)
             }
         }
     }
 
     /// Returns a snapshot of the worker trace.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.call(|runtime| runtime.trace().to_vec())
     }
 
     /// Returns whether the worker still has runtime-owned work pending.
-    pub fn has_in_flight_calls(&self) -> Result<bool, BetelgeuseBackedControlError> {
+    pub fn has_in_flight_calls(&self) -> Result<bool, ThreadedRuntimeError> {
         self.call(|runtime| runtime.has_in_flight_calls())
     }
 
@@ -3805,35 +3794,35 @@ where
     }
 
     /// Requests shutdown and joins the worker, returning its final trace.
-    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.shutdown_inner()
     }
 
-    fn call<R, C>(&self, command: C) -> Result<R, BetelgeuseBackedControlError>
+    fn call<R, C>(&self, command: C) -> Result<R, ThreadedRuntimeError>
     where
         R: Send + 'static,
         C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
     {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.commands
-            .send(BetelgeuseCommand::Run(Box::new(move |runtime| {
+            .send(ThreadedCommand::Run(Box::new(move |runtime| {
                 let _ = reply_tx.send(command(runtime));
             })))
             .map_err(|_| {
                 self.metrics.set_state(LiveShardState::Failed);
-                BetelgeuseBackedControlError::WorkerStopped
+                ThreadedRuntimeError::WorkerStopped
             })?;
         reply_rx.recv().map_err(|_| {
             self.metrics.set_state(LiveShardState::Failed);
-            BetelgeuseBackedControlError::WorkerStopped
+            ThreadedRuntimeError::WorkerStopped
         })
     }
 
-    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         let Some(handle) = self.handle.take() else {
             return Ok(Vec::new());
         };
-        let _ = self.commands.send(BetelgeuseCommand::Shutdown);
+        let _ = self.commands.send(ThreadedCommand::Shutdown);
         match handle.join() {
             Ok(Ok(trace)) => {
                 self.metrics.set_state(LiveShardState::Stopped);
@@ -3845,13 +3834,13 @@ where
             }
             Err(_) => {
                 self.metrics.set_state(LiveShardState::Failed);
-                Err(BetelgeuseBackedControlError::WorkerStopped)
+                Err(ThreadedRuntimeError::WorkerStopped)
             }
         }
     }
 }
 
-impl<S, F> Drop for BetelgeuseBackedRuntime<S, F>
+impl<S, F> Drop for ThreadedRuntime<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
@@ -3861,13 +3850,13 @@ where
     }
 }
 
-fn betelgeuse_worker_loop<S, F>(
+fn threaded_worker_loop<S, F>(
     shard: S,
     mailbox_factory: F,
-    receiver: std::sync::mpsc::Receiver<BetelgeuseCommand<S, F>>,
-    config: BetelgeuseBackedRuntimeConfig,
-    io_loop_factory: BetelgeuseIoLoopFactory,
-) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>
+    receiver: std::sync::mpsc::Receiver<ThreadedCommand<S, F>>,
+    config: ThreadedRuntimeConfig,
+    io_loop_factory: ThreadedIoLoopFactory,
+) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError>
 where
     S: Shard,
     F: MailboxFactory,
@@ -3886,11 +3875,11 @@ where
 
     loop {
         match receiver.try_recv() {
-            Ok(BetelgeuseCommand::Run(command)) => {
+            Ok(ThreadedCommand::Run(command)) => {
                 command(&mut runtime);
                 continue;
             }
-            Ok(BetelgeuseCommand::Shutdown) => break,
+            Ok(ThreadedCommand::Shutdown) => break,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -3898,8 +3887,8 @@ where
         let delivered = runtime.step();
         if delivered == 0 && !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
-                Ok(BetelgeuseCommand::Run(command)) => command(&mut runtime),
-                Ok(BetelgeuseCommand::Shutdown) => break,
+                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::Shutdown) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -3910,7 +3899,7 @@ where
 
     runtime
         .cancel_in_flight_calls_for_shutdown()
-        .map_err(|_| BetelgeuseBackedControlError::DriverShutdownFailed)?;
+        .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
     Ok(runtime.trace().to_vec())
 }
 
@@ -3921,18 +3910,18 @@ where
 /// worker queues, and preserves the explicit-step runtime/simulator as the
 /// semantic oracle. Live cross-shard payloads must be `Send` because they move
 /// between worker threads.
-pub struct BetelgeuseBackedMultiShardRuntime<S, F>
+pub struct ThreadedMultiShardRuntime<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
-    commands: BTreeMap<ShardId, std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>>,
-    handles: Vec<(ShardId, BetelgeuseWorkerJoin)>,
+    commands: BTreeMap<ShardId, std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>>,
+    handles: Vec<(ShardId, ThreadedWorkerJoin)>,
     shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
 }
 
-impl<S, F> BetelgeuseBackedMultiShardRuntime<S, F>
+impl<S, F> ThreadedMultiShardRuntime<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
@@ -3942,38 +3931,30 @@ where
     where
         I: IntoIterator<Item = S>,
     {
-        Self::with_config(
-            shards,
-            mailbox_factory,
-            BetelgeuseBackedRuntimeConfig::default(),
-        )
+        Self::with_config(shards, mailbox_factory, ThreadedRuntimeConfig::default())
     }
 
     /// Starts one live worker thread per shard with explicit queue config.
-    pub fn with_config<I>(
-        shards: I,
-        mailbox_factory: F,
-        config: BetelgeuseBackedRuntimeConfig,
-    ) -> Self
+    pub fn with_config<I>(shards: I, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self
     where
         I: IntoIterator<Item = S>,
     {
         if config.command_capacity == 0 {
-            panic!("Betelgeuse-backed multi-shard runtime requires command capacity > 0");
+            panic!("ThreadedMultiShardRuntime requires command capacity > 0");
         }
         if config.storage_lane_capacity == 0 {
-            panic!("Betelgeuse-backed multi-shard runtime requires storage lane capacity > 0");
+            panic!("ThreadedMultiShardRuntime requires storage lane capacity > 0");
         }
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
-            panic!("Betelgeuse-backed multi-shard runtime requires at least one shard");
+            panic!("ThreadedMultiShardRuntime requires at least one shard");
         }
         shards.sort_by_key(Shard::id);
         for pair in shards.windows(2) {
             if pair[0].id() == pair[1].id() {
                 panic!(
-                    "Betelgeuse-backed multi-shard runtime received duplicate shard id {}",
+                    "ThreadedMultiShardRuntime received duplicate shard id {}",
                     pair[0].id().get()
                 );
             }
@@ -4035,7 +4016,7 @@ where
                         );
                         let mut runtime = runtime;
                         runtime.set_trace_retention(config.trace_retention);
-                        betelgeuse_worker_loop_with_remote(
+                        threaded_worker_loop_with_remote(
                             runtime,
                             receiver,
                             config,
@@ -4043,7 +4024,7 @@ where
                             remote_metrics_for_worker,
                         )
                     })
-                    .expect("failed to spawn Tina Betelgeuse-backed shard worker"),
+                    .expect("failed to spawn Tina threaded shard worker"),
             ));
         }
 
@@ -4062,7 +4043,7 @@ where
         shard: ShardId,
         isolate: I,
         mailbox_capacity: usize,
-    ) -> Result<Address<I::Message, I::Reply>, BetelgeuseBackedControlError>
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
     where
         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
         I::Message: 'static,
@@ -4081,7 +4062,7 @@ where
         &self,
         parent: Address<M, R>,
         config: SupervisorConfig,
-    ) -> Result<(), BetelgeuseBackedControlError> {
+    ) -> Result<(), ThreadedRuntimeError> {
         self.call_on(parent.shard(), move |runtime| {
             runtime.supervise(parent, config)
         })
@@ -4092,14 +4073,14 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), BetelgeuseBackedTrySendError> {
+    ) -> Result<(), ThreadedTrySendError> {
         let Some(sender) = self.commands.get(&address.shard()) else {
             panic!(
-                "Betelgeuse-backed multi-shard runtime targeted unknown shard {}",
+                "ThreadedMultiShardRuntime targeted unknown shard {}",
                 address.shard().get()
             );
         };
-        let command = BetelgeuseCommand::Run(Box::new(move |runtime| {
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let _ = runtime.try_send(address, message);
         }));
         match sender.try_send(command) {
@@ -4113,20 +4094,20 @@ where
                 if let Some(metrics) = self.shard_metrics.get(&address.shard()) {
                     metrics.ingress.rejected_full();
                 }
-                Err(BetelgeuseBackedTrySendError::IngressFull)
+                Err(ThreadedTrySendError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 if let Some(metrics) = self.shard_metrics.get(&address.shard()) {
                     metrics.ingress.rejected_closed();
                     metrics.set_state(LiveShardState::Failed);
                 }
-                Err(BetelgeuseBackedTrySendError::WorkerStopped)
+                Err(ThreadedTrySendError::WorkerStopped)
             }
         }
     }
 
     /// Returns a globally sorted trace snapshot across all worker shards.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         let mut events = Vec::new();
         for shard in self.commands.keys() {
             events.extend(self.call_on(*shard, |runtime| runtime.trace().to_vec())?);
@@ -4136,10 +4117,7 @@ where
     }
 
     /// Returns a trace snapshot from one worker shard.
-    pub fn trace_on(
-        &self,
-        shard: ShardId,
-    ) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    pub fn trace_on(&self, shard: ShardId) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.call_on(shard, |runtime| runtime.trace().to_vec())
     }
 
@@ -4163,43 +4141,43 @@ where
     }
 
     /// Requests shutdown and joins every worker.
-    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.shutdown_inner()
     }
 
-    fn call_on<R, C>(&self, shard: ShardId, command: C) -> Result<R, BetelgeuseBackedControlError>
+    fn call_on<R, C>(&self, shard: ShardId, command: C) -> Result<R, ThreadedRuntimeError>
     where
         R: Send + 'static,
         C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
     {
         let Some(sender) = self.commands.get(&shard) else {
             panic!(
-                "Betelgeuse-backed multi-shard runtime targeted unknown shard {}",
+                "ThreadedMultiShardRuntime targeted unknown shard {}",
                 shard.get()
             );
         };
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         sender
-            .send(BetelgeuseCommand::Run(Box::new(move |runtime| {
+            .send(ThreadedCommand::Run(Box::new(move |runtime| {
                 let _ = reply_tx.send(command(runtime));
             })))
             .map_err(|_| {
                 if let Some(metrics) = self.shard_metrics.get(&shard) {
                     metrics.set_state(LiveShardState::Failed);
                 }
-                BetelgeuseBackedControlError::WorkerStopped
+                ThreadedRuntimeError::WorkerStopped
             })?;
         reply_rx.recv().map_err(|_| {
             if let Some(metrics) = self.shard_metrics.get(&shard) {
                 metrics.set_state(LiveShardState::Failed);
             }
-            BetelgeuseBackedControlError::WorkerStopped
+            ThreadedRuntimeError::WorkerStopped
         })
     }
 
-    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
+    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         for sender in self.commands.values() {
-            let _ = sender.send(BetelgeuseCommand::Shutdown);
+            let _ = sender.send(ThreadedCommand::Shutdown);
         }
 
         let mut events = Vec::new();
@@ -4222,7 +4200,7 @@ where
                     if let Some(metrics) = self.shard_metrics.get(&shard) {
                         metrics.set_state(LiveShardState::Failed);
                     }
-                    failure = Some(BetelgeuseBackedControlError::WorkerStopped);
+                    failure = Some(ThreadedRuntimeError::WorkerStopped);
                 }
             }
         }
@@ -4234,7 +4212,7 @@ where
     }
 }
 
-impl<S, F> Drop for BetelgeuseBackedMultiShardRuntime<S, F>
+impl<S, F> Drop for ThreadedMultiShardRuntime<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
@@ -4244,13 +4222,13 @@ where
     }
 }
 
-fn betelgeuse_worker_loop_with_remote<S, F>(
+fn threaded_worker_loop_with_remote<S, F>(
     mut runtime: Runtime<S, F>,
-    receiver: std::sync::mpsc::Receiver<BetelgeuseCommand<S, F>>,
-    config: BetelgeuseBackedRuntimeConfig,
-    remote_senders: BTreeMap<ShardId, std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>>,
+    receiver: std::sync::mpsc::Receiver<ThreadedCommand<S, F>>,
+    config: ThreadedRuntimeConfig,
+    remote_senders: BTreeMap<ShardId, std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
-) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>
+) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4258,11 +4236,11 @@ where
     let source_shard = runtime.shard().id();
     loop {
         match receiver.try_recv() {
-            Ok(BetelgeuseCommand::Run(command)) => {
+            Ok(ThreadedCommand::Run(command)) => {
                 command(&mut runtime);
                 continue;
             }
-            Ok(BetelgeuseCommand::Shutdown) => break,
+            Ok(ThreadedCommand::Shutdown) => break,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -4271,12 +4249,12 @@ where
             let target_shard = send.target_shard;
             let Some(sender) = remote_senders.get(&target_shard) else {
                 panic!(
-                    "Betelgeuse-backed multi-shard runtime targeted unknown destination shard {}",
+                    "ThreadedMultiShardRuntime targeted unknown destination shard {}",
                     target_shard.get()
                 );
             };
             let queued = SendableQueuedRemoteSend::new(send, cause);
-            let command = BetelgeuseCommand::Run(Box::new(move |runtime| {
+            let command = ThreadedCommand::Run(Box::new(move |runtime| {
                 runtime.harvest_remote_send(queued.into_queued_remote_send());
             }));
             let metrics = remote_metrics.get(&(source_shard, target_shard));
@@ -4304,8 +4282,8 @@ where
 
         if delivered == 0 && !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
-                Ok(BetelgeuseCommand::Run(command)) => command(&mut runtime),
-                Ok(BetelgeuseCommand::Shutdown) => break,
+                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::Shutdown) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -4316,7 +4294,7 @@ where
 
     runtime
         .cancel_in_flight_calls_for_shutdown()
-        .map_err(|_| BetelgeuseBackedControlError::DriverShutdownFailed)?;
+        .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
     Ok(runtime.trace().to_vec())
 }
 

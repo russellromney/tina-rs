@@ -14,8 +14,8 @@ use axum::routing::get;
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, FileId, LocalApp, MailboxFactory,
-    RuntimeEventKind, file_close, file_create, file_fsync, file_read, file_size, file_write, sleep,
+    FileId, LocalSystem, MailboxFactory, RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
+    file_close, file_create, file_fsync, file_read, file_size, file_write, sleep,
 };
 use tina_tokio_bridge::{
     BRIDGE_CAPABILITIES, BridgeBackpressure, BridgeError, BridgeHandle, BridgeHealth, BridgeHost,
@@ -154,10 +154,10 @@ async fn brush(State(bridge): State<LlamaBridge>) -> (StatusCode, String) {
 
 #[tokio::test]
 async fn llama_http_bridge_service_routes_axum_to_tower_bridge() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -205,7 +205,7 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
     let mut host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -235,7 +235,7 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
     let mut host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -253,8 +253,8 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
 }
 
 #[tokio::test]
-async fn bridge_host_can_be_built_from_canonical_local_app() {
-    let app = LocalApp::single_shard(BridgeShard, BridgeMailboxFactory)
+async fn bridge_host_can_be_built_from_canonical_local_system() {
+    let app = LocalSystem::single_shard(BridgeShard, BridgeMailboxFactory)
         .ingress_capacity(8)
         .build();
     let mut host = BridgeHost::from_app(app);
@@ -264,7 +264,7 @@ async fn bridge_host_can_be_built_from_canonical_local_app() {
             8,
             Duration::from_secs(1),
         )
-        .expect("register bridge service from local app");
+        .expect("register bridge service from local system");
 
     assert_eq!(
         bridge.call(BrushRequest { llama: "Tina" }).await,
@@ -287,10 +287,10 @@ async fn bridge_host_can_be_built_from_canonical_local_app() {
 
 #[tokio::test]
 async fn bridge_close_health_and_metrics_are_visible() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -321,10 +321,10 @@ async fn bridge_close_health_and_metrics_are_visible() {
 
 #[tokio::test]
 async fn bridge_reports_target_mailbox_full_without_waiting_for_timeout() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -357,10 +357,10 @@ async fn bridge_reports_target_mailbox_full_without_waiting_for_timeout() {
 
 #[tokio::test]
 async fn bridge_retry_policy_is_bounded_and_explicit() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -394,10 +394,10 @@ async fn bridge_retry_policy_is_bounded_and_explicit() {
 
 #[tokio::test]
 async fn bridge_retry_policy_can_have_total_deadline() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -687,7 +687,7 @@ async fn bridge_host_can_register_runtime_call_service_message_enum() {
     let host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -717,7 +717,7 @@ async fn bridge_hosted_service_can_use_runtime_owned_file_io() {
     let host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -768,10 +768,10 @@ impl BlockingWorker {
 
 #[tokio::test]
 async fn bridge_records_worker_preflight_cancel_after_caller_timeout() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -841,7 +841,7 @@ async fn bridge_host_skips_cancelled_queued_request_before_user_state_mutates() 
     let host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -899,10 +899,10 @@ async fn bridge_host_skips_cancelled_queued_request_before_user_state_mutates() 
 
 #[tokio::test]
 async fn bridge_timeout_is_explicit_when_tina_keeps_responder_open() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -951,10 +951,10 @@ impl CapturingWorker {
 
 #[tokio::test]
 async fn bridge_caller_timeout_closes_responder_and_counts_late_response() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 8,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -1027,10 +1027,10 @@ impl GateWorker {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bridge_ingress_full_is_visible_without_hidden_tokio_queue() {
-    let runtime = Arc::new(BetelgeuseBackedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 1,
             idle_wait: Duration::from_millis(1),
             ..Default::default()

@@ -192,7 +192,7 @@ This repo is a Cargo workspace with six crates:
 - **`tina-mailbox-spsc`**: bounded single-producer/single-consumer mailbox.
 - **`tina-supervisor`**: supervisor config.
 - **`tina-runtime`**: explicit-step runtime, multi-shard runner,
-  Betelgeuse-backed threaded runtime, runtime-owned TCP/time, observed
+  `ThreadedRuntime` over the Betelgeuse backend, runtime-owned TCP/time, observed
   backpressure, isolate calls with mandatory timeout, local snapshot/journal
   persistence helpers, and a named `TINA_DRIVER_RUNTIME_CONTRACT`.
 - **`tina-sim`**: deterministic simulator with virtual time, seeded faults,

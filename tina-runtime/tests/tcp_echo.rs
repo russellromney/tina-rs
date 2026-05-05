@@ -35,11 +35,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use betelgeuse::io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO};
 use tina::{IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, BetelgeuseBackedSendObservedError,
-    BetelgeuseBackedTrySendError, CallCompletionRejectedReason, CallError, CallInput, CallKind,
-    FileId, ListenerId, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    StreamId, file_close, file_create, file_fsync, file_read, file_size, file_write, mkdir,
-    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    CallCompletionRejectedReason, CallError, CallInput, CallKind, FileId, ListenerId,
+    MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError, ThreadedTrySendError,
+    file_close, file_create, file_fsync, file_read, file_size, file_write, mkdir, tcp_accept,
+    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -679,10 +679,10 @@ fn run_betelgeuse_echo_scenario(
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
     let bound: BoundAddr = Arc::new(Mutex::new(None));
 
-    let runtime = BetelgeuseBackedRuntime::with_config(
+    let runtime = ThreadedRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -832,10 +832,10 @@ fn run_threaded_simulated_betelgeuse_echo_scenario(
         max_send_chunk: Some(3),
     });
     let io_for_worker = simulated_io.clone();
-    let runtime = BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
+    let runtime = ThreadedRuntime::with_config_and_io_loop_factory(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -1119,7 +1119,7 @@ fn tcp_echo_handles_two_overlapping_clients_and_rearms_listener() {
 }
 
 #[test]
-fn betelgeuse_runtime_tcp_echo_round_trips_reference_workload() {
+fn threaded_runtime_tcp_echo_round_trips_reference_workload() {
     let payloads = vec![
         b"Betelgeuse reference payload one".to_vec(),
         b"Betelgeuse reference payload two".to_vec(),
@@ -1174,7 +1174,7 @@ fn betelgeuse_simulated_io_drives_tina_tcp_echo_with_faulted_completion_shape() 
 }
 
 #[test]
-fn betelgeuse_runtime_can_run_over_simulated_io_backend() {
+fn threaded_runtime_can_run_over_simulated_io_backend() {
     let payload = b"threaded simulated Betelgeuse payload".to_vec();
     let (echoed, trace) = run_threaded_simulated_betelgeuse_echo_scenario(payload.clone());
 
@@ -1189,8 +1189,8 @@ fn betelgeuse_runtime_can_run_over_simulated_io_backend() {
 }
 
 #[test]
-fn betelgeuse_runtime_surfaces_closed_mailbox_after_stop() {
-    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
+fn threaded_runtime_surfaces_closed_mailbox_after_stop() {
+    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
     let listener_addr = runtime
         .register_with_capacity::<Listener, _>(
             Listener {
@@ -1219,13 +1219,13 @@ fn betelgeuse_runtime_surfaces_closed_mailbox_after_stop() {
 
     assert_eq!(
         runtime.send_and_observe(listener_addr, ListenerEvent::Start),
-        Err(BetelgeuseBackedSendObservedError::MailboxClosed)
+        Err(ThreadedSendObservedError::MailboxClosed)
     );
 }
 
 #[test]
-fn betelgeuse_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
-    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
+fn threaded_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
+    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
     let listener_addr = runtime
         .register_with_capacity::<Listener, _>(
             Listener {
@@ -1311,11 +1311,11 @@ impl Isolate for BlockingIsolate {
 }
 
 #[test]
-fn betelgeuse_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() {
-    let runtime = BetelgeuseBackedRuntime::with_config(
+fn threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() {
+    let runtime = ThreadedRuntime::with_config(
         TestShard,
         TestMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 1,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -1343,7 +1343,7 @@ fn betelgeuse_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker(
         .expect("first queued wake handoff accepted");
     assert_eq!(
         runtime.try_send(blocking_addr, BlockingMsg::Wake),
-        Err(BetelgeuseBackedTrySendError::IngressFull)
+        Err(ThreadedTrySendError::IngressFull)
     );
 
     wake_tx.send(()).expect("release parked handler");

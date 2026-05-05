@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, SendRejectedReason, sleep_then,
+    CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind,
+    SendRejectedReason, ThreadedRuntime, sleep_then,
 };
 use tina_sim::{Simulator, SimulatorConfig, dst::assert_projection_eq};
 
@@ -214,7 +214,7 @@ fn run_simulator() -> (Vec<RetryObservation>, Vec<RuntimeEvent>) {
 
 fn run_betelgeuse() -> (Vec<RetryObservation>, Vec<RuntimeEvent>) {
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
+    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
     let worker = runtime
         .register_with_capacity::<RetryWorker, RetryMsg>(
             RetryWorker {
@@ -398,7 +398,7 @@ fn run_send_stop_simulator() -> (Vec<u8>, Vec<RuntimeEvent>) {
 
 fn run_send_stop_betelgeuse() -> (Vec<u8>, Vec<RuntimeEvent>) {
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
+    let runtime = ThreadedRuntime::new(TestShard, TestMailboxFactory);
     let target = runtime
         .register_with_capacity::<ParityTarget, Infallible>(
             ParityTarget {

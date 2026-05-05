@@ -15,10 +15,10 @@ use betelgeuse::IOLoop;
 use betelgeuse::io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO};
 use tina::{Address, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedRuntime, BetelgeuseBackedRuntimeConfig, CallCompletionRejectedReason,
-    CallError, CallKind, CallOutcome, ListenerId, MailboxFactory, Runtime, RuntimeEvent,
-    RuntimeEventKind, SendOutcome, SendRejectedReason, StreamId, call, send_observed, sleep,
-    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    CallCompletionRejectedReason, CallError, CallKind, CallOutcome, ListenerId, MailboxFactory,
+    Runtime, RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason, StreamId,
+    ThreadedRuntime, ThreadedRuntimeConfig, call, send_observed, sleep, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -673,8 +673,8 @@ fn step_until<F>(
     }
 }
 
-fn runtime_config(capacities: ServiceCapacities) -> BetelgeuseBackedRuntimeConfig {
-    BetelgeuseBackedRuntimeConfig {
+fn runtime_config(capacities: ServiceCapacities) -> ThreadedRuntimeConfig {
+    ThreadedRuntimeConfig {
         command_capacity: capacities.command_queue,
         idle_wait: Duration::from_millis(1),
         ..Default::default()
@@ -724,7 +724,7 @@ fn assert_observed(observations: &[ServerObservation], expected: ServerObservati
 }
 
 fn assert_listener_stopped_and_idle(
-    runtime: &BetelgeuseBackedRuntime<LocalShard, LocalMailboxFactory>,
+    runtime: &ThreadedRuntime<LocalShard, LocalMailboxFactory>,
     listener: Address<ListenerMsg>,
     label: &str,
 ) {
@@ -772,7 +772,7 @@ fn assert_dispatch_attempts_have_terminal_outcomes(trace: &[RuntimeEvent]) {
 }
 
 fn start_supervised_worker(
-    runtime: &BetelgeuseBackedRuntime<LocalShard, LocalMailboxFactory>,
+    runtime: &ThreadedRuntime<LocalShard, LocalMailboxFactory>,
     observations: &Observations,
     addresses: &WorkerAddresses,
     capacities: ServiceCapacities,
@@ -840,11 +840,8 @@ fn live_local_server_routes_tcp_through_bounded_worker_pressure() {
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));
     let bound_addr = Arc::new(Mutex::new(None));
-    let runtime = BetelgeuseBackedRuntime::with_config(
-        LocalShard,
-        LocalMailboxFactory,
-        runtime_config(capacities),
-    );
+    let runtime =
+        ThreadedRuntime::with_config(LocalShard, LocalMailboxFactory, runtime_config(capacities));
     let (_parent, worker) =
         start_supervised_worker(&runtime, &observations, &worker_addresses, capacities);
     let listener = runtime
@@ -1215,7 +1212,7 @@ fn simulated_io_local_server_keeps_partial_slow_peer_semantics_through_threaded_
         max_send_chunk: Some(2),
     });
     let io_for_worker = simulated_io.clone();
-    let runtime = BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
+    let runtime = ThreadedRuntime::with_config_and_io_loop_factory(
         LocalShard,
         LocalMailboxFactory,
         runtime_config(capacities),
@@ -1289,11 +1286,8 @@ fn llama_supervised_worker_service_restarts_worker_and_rejects_stale_address() {
     let capacities = ServiceCapacities::default();
     let observations = Arc::new(Mutex::new(Vec::new()));
     let worker_addresses = Arc::new(Mutex::new(Vec::new()));
-    let runtime = BetelgeuseBackedRuntime::with_config(
-        LocalShard,
-        LocalMailboxFactory,
-        runtime_config(capacities),
-    );
+    let runtime =
+        ThreadedRuntime::with_config(LocalShard, LocalMailboxFactory, runtime_config(capacities));
     let (_parent, first_worker) =
         start_supervised_worker(&runtime, &observations, &worker_addresses, capacities);
 
@@ -1372,7 +1366,7 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
         max_send_chunk: Some(2),
     });
     let io_for_worker = simulated_io.clone();
-    let runtime = BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
+    let runtime = ThreadedRuntime::with_config_and_io_loop_factory(
         LocalShard,
         LocalMailboxFactory,
         runtime_config(capacities),
@@ -1488,7 +1482,7 @@ fn local_server_shutdown_cancels_pending_write_work() {
         max_send_chunk: Some(2),
     });
     let io_for_worker = simulated_io.clone();
-    let runtime = BetelgeuseBackedRuntime::with_config_and_io_loop_factory(
+    let runtime = ThreadedRuntime::with_config_and_io_loop_factory(
         LocalShard,
         LocalMailboxFactory,
         runtime_config(capacities),

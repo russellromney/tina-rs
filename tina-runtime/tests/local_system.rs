@@ -10,11 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedControlError, BetelgeuseBackedTrySendError, CallError, FileId, ListenerId,
-    LiveShardState, LocalApp, LocalAppState, MailboxFactory, RuntimeEventKind, SnapshotImage,
-    StreamId, TraceRetention, file_close, file_create, file_fsync, file_read, file_size,
-    file_write, journal_append, journal_replay, sleep, snapshot_load, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    CallError, FileId, ListenerId, LiveShardState, LocalSystem, LocalSystemState, MailboxFactory,
+    RuntimeEventKind, SnapshotImage, StreamId, ThreadedRuntimeError, ThreadedTrySendError,
+    TraceRetention, file_close, file_create, file_fsync, file_read, file_size, file_write,
+    journal_append, journal_replay, sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
+    tcp_close_stream, tcp_read, tcp_write,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -229,6 +229,8 @@ struct FileService {
     seen: Arc<Mutex<Vec<String>>>,
 }
 
+const FILE_SERVICE_PAYLOAD: &[u8] = b"local system file";
+
 #[tina_runtime::isolate(message = FileMsg, shard = AppShard)]
 impl FileService {
     fn handle(&mut self, msg: FileMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
@@ -236,9 +238,9 @@ impl FileService {
             FileMsg::Start(path) => {
                 file_create(path.clone()).reply(move |result| FileMsg::Opened(result, path))
             }
-            FileMsg::Opened(Ok(file), path) => file_write(file, b"local app file".to_vec())
+            FileMsg::Opened(Ok(file), path) => file_write(file, FILE_SERVICE_PAYLOAD.to_vec())
                 .reply(move |result| FileMsg::Wrote(result, path, file)),
-            FileMsg::Wrote(Ok(14), path, file) => {
+            FileMsg::Wrote(Ok(count), path, file) if count == FILE_SERVICE_PAYLOAD.len() => {
                 file_fsync(file).reply(move |result| FileMsg::Synced(result, path, file))
             }
             FileMsg::Synced(Ok(()), path, file) => {
@@ -743,14 +745,14 @@ fn unique_dir(label: &str) -> PathBuf {
 }
 
 #[test]
-fn local_app_single_shard_is_canonical_live_owner() {
+fn local_system_single_shard_is_canonical_live_owner() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let app = LocalApp::single_shard(AppShard(34), AppMailboxFactory)
+    let app = LocalSystem::single_shard(AppShard(34), AppMailboxFactory)
         .ingress_capacity(8)
         .trace_retention(TraceRetention::Bounded(64))
         .build();
 
-    assert_eq!(app.state(), LocalAppState::Accepting);
+    assert_eq!(app.state(), LocalSystemState::Accepting);
     let address = app
         .register_root::<LlamaService, Infallible>(
             LlamaService {
@@ -764,8 +766,12 @@ fn local_app_single_shard_is_canonical_live_owner() {
         .expect("bounded handoff");
     wait_until(|| seen.lock().expect("seen lock").as_slice() == [7]);
 
-    let terminal = app.shutdown().drain().join().expect("local app shutdown");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     assert!(terminal.trace().iter().any(|event| {
         matches!(
             event.kind(),
@@ -777,9 +783,9 @@ fn local_app_single_shard_is_canonical_live_owner() {
 }
 
 #[test]
-fn local_app_topology_report_before_and_after_shutdown() {
+fn local_system_topology_report_before_and_after_shutdown() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let app = LocalApp::single_shard(AppShard(35), AppMailboxFactory)
+    let app = LocalSystem::single_shard(AppShard(35), AppMailboxFactory)
         .ingress_capacity(3)
         .storage_lane_capacity(2)
         .trace_retention(TraceRetention::Bounded(64))
@@ -811,7 +817,7 @@ fn local_app_topology_report_before_and_after_shutdown() {
     wait_until(|| seen.lock().expect("seen lock").as_slice() == [11]);
 
     let terminal = app.shutdown().drain().join().expect("shutdown app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     let terminal_topology = terminal.topology().expect("terminal topology");
     assert_eq!(
         terminal_topology
@@ -827,7 +833,7 @@ fn live_ingress_pressure_reports_capacity_and_full_counter() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let entered = Arc::new((Mutex::new(false), Condvar::new()));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let app = LocalApp::single_shard(AppShard(36), AppMailboxFactory)
+    let app = LocalSystem::single_shard(AppShard(36), AppMailboxFactory)
         .ingress_capacity(1)
         .trace_retention(TraceRetention::Bounded(64))
         .build();
@@ -850,7 +856,7 @@ fn live_ingress_pressure_reports_capacity_and_full_counter() {
         .expect("first queued handoff fills ingress");
     assert_eq!(
         app.try_send(address, BlockingMsg::Note(2)),
-        Err(BetelgeuseBackedTrySendError::IngressFull)
+        Err(ThreadedTrySendError::IngressFull)
     );
 
     let pressure = app.topology();
@@ -866,14 +872,14 @@ fn live_ingress_pressure_reports_capacity_and_full_counter() {
     release_flag(&release);
     wait_until(|| seen.lock().expect("blocking seen lock").as_slice() == [1]);
     let terminal = app.shutdown().drain().join().expect("shutdown app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
 }
 
 #[test]
-fn local_app_multi_shard_uses_same_entry_name_for_topology() {
+fn local_system_multi_shard_uses_same_entry_name_for_topology() {
     let left_seen = Arc::new(Mutex::new(Vec::new()));
     let right_seen = Arc::new(Mutex::new(Vec::new()));
-    let app = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
         .shard(AppShard(41))
         .shard(AppShard(42))
         .ingress_capacity(8)
@@ -912,8 +918,8 @@ fn local_app_multi_shard_uses_same_entry_name_for_topology() {
         .shutdown()
         .drain()
         .join()
-        .expect("multi-shard local app shutdown");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+        .expect("multi-shard local system shutdown");
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     assert!(terminal.trace().len() >= 2);
 }
 
@@ -922,7 +928,7 @@ fn remote_queue_pressure_reports_capacity_and_full_counter() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let entered = Arc::new((Mutex::new(false), Condvar::new()));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let app = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
         .shard(AppShard(43))
         .shard(AppShard(44))
         .ingress_capacity(1)
@@ -974,7 +980,7 @@ fn remote_queue_pressure_reports_capacity_and_full_counter() {
     release_flag(&release);
     wait_until(|| seen.lock().expect("blocking seen lock").as_slice() == [1]);
     let terminal = app.shutdown().drain().join().expect("shutdown app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     assert!(terminal.trace().iter().any(|event| {
         matches!(
             event.kind(),
@@ -990,7 +996,7 @@ fn remote_queue_pressure_reports_capacity_and_full_counter() {
 #[test]
 fn failed_worker_marks_one_shard_failed_and_rejects_later_work() {
     let right_seen = Arc::new(Mutex::new(Vec::new()));
-    let app = LocalApp::<AppShard, CapacityPanicMailboxFactory>::multi_shard(
+    let app = LocalSystem::<AppShard, CapacityPanicMailboxFactory>::multi_shard(
         CapacityPanicMailboxFactory { panic_capacity: 13 },
     )
     .shard(AppShard(45))
@@ -1016,7 +1022,7 @@ fn failed_worker_marks_one_shard_failed_and_rejects_later_work() {
             },
             13,
         ),
-        Err(BetelgeuseBackedControlError::WorkerStopped)
+        Err(ThreadedRuntimeError::WorkerStopped)
     );
 
     let topology = app.topology();
@@ -1040,11 +1046,8 @@ fn failed_worker_marks_one_shard_failed_and_rejects_later_work() {
     wait_until(|| right_seen.lock().expect("right seen lock").as_slice() == [99]);
 
     let terminal = app.shutdown().drain().join_report();
-    assert_eq!(terminal.state(), LocalAppState::Failed);
-    assert_eq!(
-        terminal.error(),
-        Some(BetelgeuseBackedControlError::WorkerStopped)
-    );
+    assert_eq!(terminal.state(), LocalSystemState::Failed);
+    assert_eq!(terminal.error(), Some(ThreadedRuntimeError::WorkerStopped));
     let terminal_topology = terminal.topology().expect("terminal topology");
     assert_eq!(
         terminal_topology
@@ -1063,14 +1066,14 @@ fn failed_worker_marks_one_shard_failed_and_rejects_later_work() {
 }
 
 #[test]
-fn local_app_end_to_end_service_routes_cross_shard_persists_and_recovers() {
+fn local_system_end_to_end_service_routes_cross_shard_persists_and_recovers() {
     let dir = unique_dir("local-app-e2e");
     fs::create_dir_all(&dir).expect("create e2e dir");
     let snapshot_path = dir.join("state.snapshot");
     let journal_path = dir.join("state.journal");
     let observed = Arc::new(Mutex::new(Vec::new()));
 
-    let app = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
         .shard(AppShard(71))
         .shard(AppShard(72))
         .ingress_capacity(8)
@@ -1104,7 +1107,7 @@ fn local_app_end_to_end_service_routes_cross_shard_persists_and_recovers() {
     });
 
     let terminal = app.shutdown().drain().join().expect("shutdown e2e app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     let summary = terminal.summary();
     assert_eq!(summary.journal_appended, 1);
     assert_eq!(summary.persistence_failed, 0);
@@ -1126,7 +1129,7 @@ fn local_app_end_to_end_service_routes_cross_shard_persists_and_recovers() {
     }));
 
     let recovered = Arc::new(Mutex::new(Vec::new()));
-    let fresh = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+    let fresh = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
         .shard(AppShard(71))
         .shard(AppShard(72))
         .ingress_capacity(8)
@@ -1156,7 +1159,7 @@ fn local_app_end_to_end_service_routes_cross_shard_persists_and_recovers() {
         .drain()
         .join()
         .expect("shutdown recovered app");
-    assert_eq!(fresh_terminal.state(), LocalAppState::Closed);
+    assert_eq!(fresh_terminal.state(), LocalSystemState::Closed);
     let fresh_summary = fresh_terminal.summary();
     assert_eq!(fresh_summary.recovery_finished, 2);
     assert_eq!(fresh_summary.recovery_failed, 0);
@@ -1170,14 +1173,14 @@ fn local_app_end_to_end_service_routes_cross_shard_persists_and_recovers() {
 }
 
 #[test]
-fn local_app_tcp_service_journals_before_replying_to_client() {
+fn local_system_tcp_service_journals_before_replying_to_client() {
     let dir = unique_dir("local-app-tcp-journal");
     fs::create_dir_all(&dir).expect("create tcp journal dir");
     let journal_path = dir.join("tcp.journal");
     let published = Arc::new(Mutex::new(None));
     let observed = Arc::new(Mutex::new(Vec::new()));
 
-    let app = LocalApp::single_shard(AppShard(73), AppMailboxFactory)
+    let app = LocalSystem::single_shard(AppShard(73), AppMailboxFactory)
         .ingress_capacity(8)
         .storage_lane_capacity(4)
         .trace_retention(TraceRetention::Bounded(512))
@@ -1224,7 +1227,7 @@ fn local_app_tcp_service_journals_before_replying_to_client() {
     });
 
     let terminal = app.shutdown().drain().join().expect("shutdown tcp app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     let summary = terminal.summary();
     assert_eq!(summary.call_completed, 7);
     assert_eq!(summary.call_failed, 0);
@@ -1261,13 +1264,13 @@ fn local_app_tcp_service_journals_before_replying_to_client() {
 }
 
 #[test]
-fn local_app_storage_lane_full_is_user_visible_without_sleep_as_proof() {
+fn local_system_storage_lane_full_is_user_visible_without_sleep_as_proof() {
     let dir = unique_dir("local-app-storage-full");
     fs::create_dir_all(&dir).expect("create storage full dir");
     let journal_path = dir.join("pressure.journal");
     let observed = Arc::new(Mutex::new(Vec::new()));
 
-    let app = LocalApp::single_shard(AppShard(74), AppMailboxFactory)
+    let app = LocalSystem::single_shard(AppShard(74), AppMailboxFactory)
         .ingress_capacity(8)
         .storage_lane_capacity(1)
         .trace_retention(TraceRetention::Bounded(512))
@@ -1297,7 +1300,7 @@ fn local_app_storage_lane_full_is_user_visible_without_sleep_as_proof() {
         .drain()
         .join()
         .expect("shutdown pressure app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     let summary = terminal.summary();
     assert_eq!(summary.journal_appended, 1);
     assert_eq!(summary.persistence_failed, 1);
@@ -1331,14 +1334,14 @@ fn local_app_storage_lane_full_is_user_visible_without_sleep_as_proof() {
 }
 
 #[test]
-fn local_app_cross_shard_tcp_request_persists_before_client_reply() {
+fn local_system_cross_shard_tcp_request_persists_before_client_reply() {
     let dir = unique_dir("local-app-cross-shard-tcp-persist");
     fs::create_dir_all(&dir).expect("create cross shard tcp dir");
     let journal_path = dir.join("cross-shard-tcp.journal");
     let published = Arc::new(Mutex::new(None));
     let observed = Arc::new(Mutex::new(Vec::new()));
 
-    let app = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
         .shard(AppShard(81))
         .shard(AppShard(82))
         .ingress_capacity(8)
@@ -1408,7 +1411,7 @@ fn local_app_cross_shard_tcp_request_persists_before_client_reply() {
         .drain()
         .join()
         .expect("shutdown cross shard tcp app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     let summary = terminal.summary();
     assert_eq!(summary.journal_appended, 1);
     assert_eq!(summary.persistence_failed, 0);
@@ -1463,9 +1466,9 @@ fn local_app_cross_shard_tcp_request_persists_before_client_reply() {
 }
 
 #[test]
-fn llama_tcp_timer_service_uses_local_app_runtime_owned_time() {
+fn llama_tcp_timer_service_uses_local_system_runtime_owned_time() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let app = LocalApp::single_shard(AppShard(50), AppMailboxFactory)
+    let app = LocalSystem::single_shard(AppShard(50), AppMailboxFactory)
         .ingress_capacity(8)
         .trace_retention(TraceRetention::Bounded(128))
         .build();
@@ -1483,7 +1486,7 @@ fn llama_tcp_timer_service_uses_local_app_runtime_owned_time() {
     wait_until(|| seen.lock().expect("timer seen lock").as_slice() == ["finished"]);
 
     let terminal = app.shutdown().drain().join().expect("timer app shutdown");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     assert!(terminal.trace().iter().any(|event| {
         matches!(
             event.kind(),
@@ -1496,7 +1499,7 @@ fn llama_tcp_timer_service_uses_local_app_runtime_owned_time() {
 }
 
 #[test]
-fn local_app_service_uses_runtime_owned_file_io() {
+fn local_system_service_uses_runtime_owned_file_io() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1506,7 +1509,7 @@ fn local_app_service_uses_runtime_owned_file_io() {
         "tina-local-app-file-{}-{unique}.txt",
         std::process::id()
     ));
-    let app = LocalApp::single_shard(AppShard(51), AppMailboxFactory)
+    let app = LocalSystem::single_shard(AppShard(51), AppMailboxFactory)
         .ingress_capacity(8)
         .trace_retention(TraceRetention::Bounded(256))
         .build();
@@ -1521,11 +1524,11 @@ fn local_app_service_uses_runtime_owned_file_io() {
 
     app.try_send(address, FileMsg::Start(path.clone()))
         .expect("file start handoff");
-    wait_until(|| seen.lock().expect("file seen lock").as_slice() == ["local app file"]);
+    wait_until(|| seen.lock().expect("file seen lock").as_slice() == ["local system file"]);
 
     let terminal = app.shutdown().drain().join().expect("file app shutdown");
     let _ = fs::remove_file(path);
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     for expected in [
         tina_runtime::CallKind::FileOpen,
         tina_runtime::CallKind::FileWriteAt,
@@ -1541,19 +1544,19 @@ fn local_app_service_uses_runtime_owned_file_io() {
                     RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
                 )
             }),
-            "expected {expected:?} completion in local app trace"
+            "expected {expected:?} completion in local system trace"
         );
     }
 }
 
 #[test]
-fn local_app_join_report_reports_worker_failure_terminal_state() {
-    let app = LocalApp::single_shard(AppShard(60), PanickingMailboxFactory)
+fn local_system_join_report_reports_worker_failure_terminal_state() {
+    let app = LocalSystem::single_shard(AppShard(60), PanickingMailboxFactory)
         .ingress_capacity(8)
         .trace_retention(TraceRetention::Bounded(16))
         .build();
 
-    assert_eq!(app.state(), LocalAppState::Accepting);
+    assert_eq!(app.state(), LocalSystemState::Accepting);
     assert_eq!(
         app.register_root::<LlamaService, Infallible>(
             LlamaService {
@@ -1561,15 +1564,12 @@ fn local_app_join_report_reports_worker_failure_terminal_state() {
             },
             8,
         ),
-        Err(BetelgeuseBackedControlError::WorkerStopped)
+        Err(ThreadedRuntimeError::WorkerStopped)
     );
 
     let terminal = app.shutdown().drain().join_report();
-    assert_eq!(terminal.state(), LocalAppState::Failed);
+    assert_eq!(terminal.state(), LocalSystemState::Failed);
     assert_eq!(terminal.summary(), Default::default());
-    assert_eq!(
-        terminal.error(),
-        Some(BetelgeuseBackedControlError::WorkerStopped)
-    );
+    assert_eq!(terminal.error(), Some(ThreadedRuntimeError::WorkerStopped));
     assert!(terminal.trace().is_empty());
 }

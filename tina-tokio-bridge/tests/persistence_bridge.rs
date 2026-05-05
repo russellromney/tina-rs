@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedRuntimeConfig, CallError, JournalReplay, MailboxFactory, SnapshotImage,
-    journal_append, journal_replay, snapshot_load,
+    CallError, JournalReplay, MailboxFactory, SnapshotImage, ThreadedRuntimeConfig, journal_append,
+    journal_replay, snapshot_load,
 };
 use tina_tokio_bridge::{BridgeHost, BridgeMessage, BridgeRequest, BridgeResponder};
 
@@ -273,7 +273,7 @@ async fn tokio_bridge_request_persists_and_fresh_host_recovers() {
     let mut host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
@@ -326,7 +326,7 @@ async fn tokio_bridge_request_persists_and_fresh_host_recovers() {
     let mut fresh_host = BridgeHost::new(
         BridgeShard,
         BridgeMailboxFactory,
-        BetelgeuseBackedRuntimeConfig {
+        ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
             ..Default::default()

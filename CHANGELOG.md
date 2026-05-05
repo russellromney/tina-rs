@@ -4,16 +4,29 @@ This file records completed work.
 
 ## Unreleased
 
+### Naming Polish Before Funkishus
+
+- Renamed the canonical live owner from `LocalApp` to `LocalSystem`, with
+  matching `LocalMultiShardSystem`, `LocalSystemState`,
+  `LocalSystemTerminalReport`, `LocalSystemShutdown`, and builder names.
+- Renamed the user-facing live threaded runner from
+  `BetelgeuseBackedRuntime` to `ThreadedRuntime`, with matching
+  `ThreadedMultiShardRuntime`, `ThreadedRuntimeConfig`,
+  `ThreadedRuntimeError`, `ThreadedTrySendError`, and
+  `ThreadedSendObservedError`.
+- Kept Betelgeuse as the named backend/driver implementation detail where the
+  code is specifically talking about the completion backend.
+
 ### Phase Timmerhus
 
 - Added first-class live topology reporting for the canonical local app path:
   `LiveTopologyReport`, `LiveShardReport`, `LiveQueueReport`,
   `LiveRemoteQueueReport`, and `LiveShardState`.
-- Added `LocalApp::topology()` and `LocalMultiShardApp::topology()` so users
+- Added `LocalSystem::topology()` and `LocalMultiShardSystem::topology()` so users
   can inspect shard ownership, worker names, lifecycle state, ingress capacity,
   remote queue capacity, storage-lane capacity, and honest pressure counters
   without scraping logs.
-- Added terminal topology snapshots to `LocalAppTerminalReport` so graceful
+- Added terminal topology snapshots to `LocalSystemTerminalReport` so graceful
   shutdown and failed worker termination remain visible after the app owner is
   consumed.
 - Kept queue pressure honest: exact depth is `None` unless exact by
@@ -22,7 +35,7 @@ This file records completed work.
 - Named live shard worker threads as `tina-shard-{id}` and tracked
   per-shard lifecycle as `Running`, `Stopped`, or `Failed`.
 - Added per-shard and source/target remote-queue metrics for
-  Betelgeuse-backed multi-shard runtimes.
+  threaded multi-shard runtimes.
 - Added user-shaped live tests for topology before/after shutdown, bounded
   ingress full, bounded remote queue full, and one failed worker while another
   shard continues and then stops cleanly.
@@ -60,7 +73,7 @@ This file records completed work.
   persistence helpers no longer execute synchronously inside the shard worker
   on the preferred live path.
 - Added `BetelgeuseBackedRuntimeConfig::storage_lane_capacity` plus
-  `LocalApp` single-shard and multi-shard builder knobs for that bounded lane.
+  `LocalSystem` single-shard and multi-shard builder knobs for that bounded lane.
 - Added `CallError::StorageFull` and `CallError::StorageClosed` as named
   runtime-owned storage admission/lifecycle outcomes.
 - Kept direct explicit-step runtime storage inline while using the bounded

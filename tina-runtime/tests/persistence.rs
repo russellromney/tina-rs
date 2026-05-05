@@ -8,9 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, CallKind, JournalReplay, JournalReplayWarning, LOCAL_PERSISTENCE_SUPPORT, LocalApp,
-    LocalAppState, MailboxFactory, PersistenceSupportLevel, Runtime, RuntimeEventKind,
-    SnapshotImage, TraceRetention, journal_append, journal_replay, snapshot_commit, snapshot_load,
+    CallError, CallKind, JournalReplay, JournalReplayWarning, LOCAL_PERSISTENCE_SUPPORT,
+    LocalSystem, LocalSystemState, MailboxFactory, PersistenceSupportLevel, Runtime,
+    RuntimeEventKind, SnapshotImage, TraceRetention, journal_append, journal_replay,
+    snapshot_commit, snapshot_load,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -559,13 +560,13 @@ fn failed_journal_append_is_visible_and_does_not_mutate_state() {
 }
 
 #[test]
-fn local_app_persists_recovers_and_exposes_persistence_trace() {
+fn local_system_persists_recovers_and_exposes_persistence_trace() {
     let dir = unique_dir("local-app-persistence");
     let snapshot = dir.join("state.snapshot");
     let journal = dir.join("state.journal");
     let observed = Arc::new(Mutex::new(Vec::new()));
 
-    let app = LocalApp::single_shard(PersistShard, TestMailboxFactory)
+    let app = LocalSystem::single_shard(PersistShard, TestMailboxFactory)
         .ingress_capacity(16)
         .trace_retention(TraceRetention::Bounded(512))
         .build();
@@ -592,7 +593,7 @@ fn local_app_persists_recovers_and_exposes_persistence_trace() {
             .contains(&"hay,oats".to_owned())
     });
     let terminal = app.shutdown().drain().join().expect("shutdown app");
-    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert_eq!(terminal.state(), LocalSystemState::Closed);
     assert!(
         terminal
             .trace()
@@ -600,7 +601,7 @@ fn local_app_persists_recovers_and_exposes_persistence_trace() {
             .any(|event| { matches!(event.kind(), RuntimeEventKind::JournalAppended { .. }) })
     );
 
-    let fresh = LocalApp::single_shard(PersistShard, TestMailboxFactory)
+    let fresh = LocalSystem::single_shard(PersistShard, TestMailboxFactory)
         .ingress_capacity(16)
         .trace_retention(TraceRetention::Bounded(512))
         .build();
@@ -623,7 +624,7 @@ fn local_app_persists_recovers_and_exposes_persistence_trace() {
             >= 2
     });
     let fresh_terminal = fresh.shutdown().drain().join().expect("shutdown fresh app");
-    assert_eq!(fresh_terminal.state(), LocalAppState::Closed);
+    assert_eq!(fresh_terminal.state(), LocalSystemState::Closed);
     assert!(
         fresh_terminal
             .trace()

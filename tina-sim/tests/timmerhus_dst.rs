@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    LiveShardState, LocalApp, MailboxFactory, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-    TraceRetention,
+    LiveShardState, LocalSystem, MailboxFactory, RuntimeEvent, RuntimeEventKind,
+    SendRejectedReason, TraceRetention,
 };
 use tina_sim::dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink};
 use tina_sim::{
@@ -283,7 +283,7 @@ fn run_topology_history(
 
 fn run_live_topology_history(history: &History<TopologyOp>) -> TopologyProjection {
     let values = Arc::new(Mutex::new(Vec::new()));
-    let app = LocalApp::<DstShard, LiveMailboxFactory>::multi_shard(LiveMailboxFactory)
+    let app = LocalSystem::<DstShard, LiveMailboxFactory>::multi_shard(LiveMailboxFactory)
         .shard(DstShard(1))
         .shard(DstShard(2))
         .ingress_capacity(8)
