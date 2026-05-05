@@ -96,6 +96,18 @@ pub enum CallKind {
     /// A TCP stream close.
     TcpStreamClose,
 
+    /// A UDP socket bind.
+    UdpBind,
+
+    /// A UDP datagram send.
+    UdpSendTo,
+
+    /// A UDP datagram receive.
+    UdpRecvFrom,
+
+    /// A UDP socket close.
+    UdpSocketClose,
+
     /// A file open.
     FileOpen,
 

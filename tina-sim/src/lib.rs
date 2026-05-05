@@ -2636,6 +2636,12 @@ where
                 self.handle_tcp_listener_close(call_id, listener)
             }
             CallInput::TcpStreamClose { stream } => self.handle_tcp_stream_close(call_id, stream),
+            CallInput::UdpBind { .. }
+            | CallInput::UdpSendTo { .. }
+            | CallInput::UdpRecvFrom { .. }
+            | CallInput::UdpSocketClose { .. } => {
+                self.deliver_completion(call_id, CallOutput::Failed(CallError::Unsupported));
+            }
             CallInput::FileOpen { path, options } => self.handle_file_open(call_id, path, options),
             CallInput::FileReadAt { file, len, offset } => {
                 self.handle_file_read_at(call_id, file, len, offset)
@@ -4535,6 +4541,10 @@ fn call_kind(request: &CallInput) -> CallKind {
         CallInput::TcpWrite { .. } => CallKind::TcpWrite,
         CallInput::TcpListenerClose { .. } => CallKind::TcpListenerClose,
         CallInput::TcpStreamClose { .. } => CallKind::TcpStreamClose,
+        CallInput::UdpBind { .. } => CallKind::UdpBind,
+        CallInput::UdpSendTo { .. } => CallKind::UdpSendTo,
+        CallInput::UdpRecvFrom { .. } => CallKind::UdpRecvFrom,
+        CallInput::UdpSocketClose { .. } => CallKind::UdpSocketClose,
         CallInput::FileOpen { .. } => CallKind::FileOpen,
         CallInput::FileReadAt { .. } => CallKind::FileReadAt,
         CallInput::FileWriteAt { .. } => CallKind::FileWriteAt,

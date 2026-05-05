@@ -61,10 +61,11 @@ pub use call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
     IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
     PersistenceTraceInfo, RuntimeCall, RuntimeCallParts, SendOutcome, SnapshotImage, StreamId,
-    TypedCall, call, file_close, file_create, file_fsync, file_open, file_read, file_read_at,
-    file_size, file_write, file_write_at, journal_append, journal_replay, mkdir, send_observed,
-    sleep, sleep_then, snapshot_commit, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    TypedCall, UdpSocketId, call, file_close, file_create, file_fsync, file_open, file_read,
+    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
+    send_observed, sleep, sleep_then, snapshot_commit, snapshot_load, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, udp_bind,
+    udp_close_socket, udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
@@ -145,6 +146,248 @@ pub const TINA_DRIVER_RUNTIME_CONTRACT: TinaDriverRuntimeContract = TinaDriverRu
     hidden_executor_tasks: DriverRuntimeRequirement::Forbidden,
     general_async_executor: DriverRuntimeRequirement::NotClaimed,
 };
+
+/// Support status for one runtime-owned resource family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceSupport {
+    /// Tina can execute this resource family on the current live runtime.
+    Supported,
+    /// Tina cannot honestly execute this resource family on the current live runtime.
+    Unsupported,
+    /// Tina can model this resource family in the deterministic simulator only.
+    SimulatedOnly,
+    /// Tina expects an explicit user adapter or service isolate for this family.
+    AdapterOnly,
+}
+
+/// Execution shape for one resource family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceExecutionShape {
+    /// Small runtime bookkeeping completes inline.
+    Inline,
+    /// Work completes through caller-owned completion slots.
+    CompletionBacked,
+    /// Nonblocking resource work is polled by the Tina driver step.
+    PollBacked,
+    /// Blocking work runs on a bounded named lane, away from shard handlers.
+    LaneBackedBlocking,
+    /// Work is delegated to an explicit user adapter or service isolate.
+    ExternalAdapter,
+    /// No execution shape exists because the resource is unsupported.
+    NotApplicable,
+}
+
+/// Cancellation shape for one resource family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationSupport {
+    /// Accepted work can be canceled before it starts.
+    CancelableBeforeStart,
+    /// Started work may finish, but its completion is tombstoned.
+    TombstonedAfterStart,
+    /// Cancellation requires closing the owned resource.
+    ResourceCloseOnly,
+    /// Tina cannot cancel this resource family on this runtime.
+    NotCancelable,
+    /// No cancellation shape exists because the resource is unsupported.
+    NotApplicable,
+}
+
+/// Shutdown shape for one resource family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownSupport {
+    /// Shutdown drains pending work to a settled terminal state.
+    Drained,
+    /// Shutdown cancels pending work.
+    Canceled,
+    /// Shutdown tombstones late completions.
+    Tombstoned,
+    /// Shutdown cannot manage this resource family.
+    Unsupported,
+    /// No shutdown shape exists because the resource is unsupported.
+    NotApplicable,
+}
+
+/// Capability report for one runtime-owned resource family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceCapability {
+    support: ResourceSupport,
+    execution: ResourceExecutionShape,
+    cancellation: CancellationSupport,
+    shutdown: ShutdownSupport,
+    capacity: Option<usize>,
+}
+
+impl ResourceCapability {
+    /// Creates one capability row.
+    pub const fn new(
+        support: ResourceSupport,
+        execution: ResourceExecutionShape,
+        cancellation: CancellationSupport,
+        shutdown: ShutdownSupport,
+        capacity: Option<usize>,
+    ) -> Self {
+        Self {
+            support,
+            execution,
+            cancellation,
+            shutdown,
+            capacity,
+        }
+    }
+
+    /// Resource support status.
+    pub const fn support(&self) -> ResourceSupport {
+        self.support
+    }
+
+    /// Resource execution shape.
+    pub const fn execution(&self) -> ResourceExecutionShape {
+        self.execution
+    }
+
+    /// Resource cancellation shape.
+    pub const fn cancellation(&self) -> CancellationSupport {
+        self.cancellation
+    }
+
+    /// Resource shutdown shape.
+    pub const fn shutdown(&self) -> ShutdownSupport {
+        self.shutdown
+    }
+
+    /// Configured bounded capacity, when this resource owns a bounded lane.
+    pub const fn capacity(&self) -> Option<usize> {
+        self.capacity
+    }
+}
+
+/// Durability capability details for local persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurabilityCapability {
+    /// Whether snapshot commits write a temp file before rename.
+    pub temp_write_before_rename: PersistenceSupportLevel,
+    /// Whether snapshot commit rename replacement is claimed on this platform.
+    pub rename_commit: PersistenceSupportLevel,
+    /// Whether data file fsync is claimed on this platform.
+    pub file_fsync: PersistenceSupportLevel,
+    /// Whether parent-directory fsync after rename is claimed on this platform.
+    pub directory_fsync_after_rename: PersistenceSupportLevel,
+    /// Whether commit-uncertain is a possible visible outcome.
+    pub commit_uncertain_possible: bool,
+    /// Whether journal replay validates checksums.
+    pub checksum_validation: PersistenceSupportLevel,
+    /// Whether truncated journal tails are visible warnings.
+    pub truncated_tail_warning: PersistenceSupportLevel,
+}
+
+impl DurabilityCapability {
+    const fn local() -> Self {
+        Self {
+            temp_write_before_rename: LOCAL_PERSISTENCE_SUPPORT.temp_write_before_rename,
+            rename_commit: LOCAL_PERSISTENCE_SUPPORT.rename_commit,
+            file_fsync: LOCAL_PERSISTENCE_SUPPORT.file_fsync,
+            directory_fsync_after_rename: LOCAL_PERSISTENCE_SUPPORT.directory_fsync_after_rename,
+            commit_uncertain_possible: true,
+            checksum_validation: LOCAL_PERSISTENCE_SUPPORT.checksum_validation,
+            truncated_tail_warning: LOCAL_PERSISTENCE_SUPPORT.truncated_tail_warning,
+        }
+    }
+}
+
+/// Structured live-runtime capability table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCapabilities {
+    /// Runtime-owned timer support.
+    pub timers: ResourceCapability,
+    /// Runtime-owned TCP support.
+    pub tcp: ResourceCapability,
+    /// Runtime-owned local file support.
+    pub local_file: ResourceCapability,
+    /// Runtime-owned local persistence support.
+    pub local_persistence: ResourceCapability,
+    /// Shared storage lane used by blocking storage and persistence work.
+    pub storage_lane: ResourceCapability,
+    /// Runtime-owned DNS support.
+    pub dns: ResourceCapability,
+    /// Runtime-owned UDP support.
+    pub udp: ResourceCapability,
+    /// Runtime-owned TLS support.
+    pub tls: ResourceCapability,
+    /// Runtime-owned process support.
+    pub process: ResourceCapability,
+    /// Runtime-owned signal support.
+    pub signal: ResourceCapability,
+    /// Platform durability support details.
+    pub durability: DurabilityCapability,
+}
+
+impl RuntimeCapabilities {
+    /// Returns the current live [`ThreadedRuntime`] capability table.
+    pub const fn threaded(storage_lane_capacity: usize) -> Self {
+        let unsupported = ResourceCapability::new(
+            ResourceSupport::Unsupported,
+            ResourceExecutionShape::NotApplicable,
+            CancellationSupport::NotApplicable,
+            ShutdownSupport::NotApplicable,
+            None,
+        );
+        Self {
+            timers: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::Inline,
+                CancellationSupport::CancelableBeforeStart,
+                ShutdownSupport::Canceled,
+                None,
+            ),
+            tcp: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::CompletionBacked,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                None,
+            ),
+            local_file: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::CompletionBacked,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                None,
+            ),
+            local_persistence: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::LaneBackedBlocking,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                Some(storage_lane_capacity),
+            ),
+            storage_lane: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::LaneBackedBlocking,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                Some(storage_lane_capacity),
+            ),
+            dns: unsupported,
+            udp: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::PollBacked,
+                CancellationSupport::CancelableBeforeStart,
+                ShutdownSupport::Canceled,
+                None,
+            ),
+            tls: ResourceCapability::new(
+                ResourceSupport::AdapterOnly,
+                ResourceExecutionShape::ExternalAdapter,
+                CancellationSupport::NotApplicable,
+                ShutdownSupport::NotApplicable,
+                None,
+            ),
+            process: unsupported,
+            signal: unsupported,
+            durability: DurabilityCapability::local(),
+        }
+    }
+}
 
 /// Runtime-owned clock abstraction.
 ///
@@ -3151,6 +3394,11 @@ where
         self.runtime().topology()
     }
 
+    /// Returns the live runtime capability table for this app.
+    pub fn capabilities(&self) -> RuntimeCapabilities {
+        self.runtime().capabilities()
+    }
+
     /// Registers one root isolate with a runtime-allocated mailbox.
     #[allow(private_bounds)]
     pub fn register_root<I, Outbound>(
@@ -3451,6 +3699,11 @@ where
     /// Returns a live topology snapshot for this app.
     pub fn topology(&self) -> LiveTopologyReport {
         self.runtime().topology()
+    }
+
+    /// Returns the live runtime capability table for this app.
+    pub fn capabilities(&self) -> RuntimeCapabilities {
+        self.runtime().capabilities()
     }
 
     /// Begins graceful shutdown.
@@ -3791,6 +4044,11 @@ where
     /// Returns a handle-owned topology snapshot without probing the worker.
     pub fn topology(&self) -> LiveTopologyReport {
         LiveTopologyReport::single(self.metrics.report())
+    }
+
+    /// Returns the live runtime capability table for this worker.
+    pub fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::threaded(self.metrics.storage_lane.capacity)
     }
 
     /// Requests shutdown and joins the worker, returning its final trace.
@@ -4138,6 +4396,17 @@ where
             })
             .collect();
         LiveTopologyReport::new(shards, remote_queues)
+    }
+
+    /// Returns the live runtime capability table shared by each worker.
+    pub fn capabilities(&self) -> RuntimeCapabilities {
+        let capacity = self
+            .shard_metrics
+            .values()
+            .next()
+            .map(|metrics| metrics.storage_lane.capacity)
+            .unwrap_or(driver::DEFAULT_STORAGE_LANE_CAPACITY);
+        RuntimeCapabilities::threaded(capacity)
     }
 
     /// Requests shutdown and joins every worker.

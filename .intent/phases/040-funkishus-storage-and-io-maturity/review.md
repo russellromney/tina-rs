@@ -374,3 +374,91 @@ What changed:
   equivalent.
 
 Updated verdict: ready to execute after the initial implementation audit.
+
+## Implementation Audit 1
+
+Funkishus starts from these exact live semantics after the naming polish commit
+`84b805f`:
+
+- timers are runtime-owned and inline in the driver; cancellation removes the
+  pending timer by `CallId`;
+- TCP bind/close are inline-safe; TCP accept/connect/read/write are
+  Betelgeuse completion-backed with caller-owned completion slots;
+- TCP read/write may be full-duplex, but duplicate work on the same lane
+  returns `ResourceBusy`;
+- local file open/close are inline-safe; file read/write/fsync/size and mkdir
+  are Betelgeuse completion-backed;
+- snapshot/journal work is already off the shard worker on live paths through
+  a bounded storage lane;
+- storage lane admission is bounded and returns `StorageFull`/`StorageClosed`;
+- storage cancellation tombstones accepted work, skips canceled queued work,
+  and swallows late completions;
+- shutdown cancels timers, cancels/tombstones storage, calls Betelgeuse
+  completion cancellation, closes TCP/file resources, and refuses clean
+  shutdown if backend completion slots remain owned;
+- `LocalSystem`/`LocalMultiShardSystem` expose topology, but before this
+  implementation slice did not expose a structured resource capability table;
+- DNS, UDP, TLS, process, and signal had no runtime call vocabulary yet.
+
+First implementation decision:
+
+- Add a structured capability table before adding new rails. This gives tests
+  and users an honest answer for supported, unsupported, adapter-only,
+  lane-backed, completion-backed, and tombstoned shapes. It also prevents later
+  rails from closing on vague prose.
+
+First slice implemented:
+
+- `ResourceSupport`, `ResourceExecutionShape`, `CancellationSupport`,
+  `ShutdownSupport`, `ResourceCapability`, `DurabilityCapability`, and
+  `RuntimeCapabilities` landed in `tina-runtime`.
+- `ThreadedRuntime`, `ThreadedMultiShardRuntime`, `LocalSystem`, and
+  `LocalMultiShardSystem` now expose `capabilities()`.
+- Current live capabilities say: timers supported inline; TCP and local files
+  supported completion-backed; local persistence/storage supported as
+  lane-backed blocking with visible capacity; DNS/UDP/process/signal
+  unsupported for now; TLS adapter-only.
+- Direct integration test pins supported and unsupported resource families
+  through the canonical `LocalSystem` path.
+
+Targeted proof:
+
+- `cargo +nightly check -p tina-runtime`
+- `cargo +nightly test -p tina-runtime --test local_system local_system_capabilities_name_supported_and_unsupported_resource_families`
+
+## Implementation Audit 2
+
+Betelgeuse does not expose UDP, DNS, process, or signal primitives. Its README
+and `lib.rs` confirm the current backend scope is completion-shaped TCP/files,
+with no runtime and no hidden tasks. That means Funkishus must not pretend UDP
+is "Betelgeuse-backed" today.
+
+UDP first slice implemented with a Tina-owned nonblocking driver rail:
+
+- `UdpSocketId` is runtime-owned, like `ListenerId` and `StreamId`;
+- `udp_bind`, `udp_send_to`, `udp_recv_from`, and `udp_close_socket` are typed
+  helpers in `tina-runtime`;
+- live UDP sockets are `std::net::UdpSocket` resources owned inside the
+  driver, set nonblocking, and polled only from driver `advance`;
+- `UdpRecvFrom` occupies a per-socket pending receive lane and duplicate
+  receives return `ResourceBusy`;
+- requester stop/cancel removes pending UDP receive responsibility without
+  closing unrelated resources;
+- close while a live recv lane is active returns `ResourceBusy`;
+- datagram truncation is visible as a boolean in `CallOutput::UdpReceived`;
+- `RuntimeCapabilities` now reports UDP as `Supported` with
+  `PollBacked` execution, not Betelgeuse completion-backed;
+- `tina-sim` currently returns typed `Unsupported` for UDP until the simulator
+  UDP rail lands later in this phase.
+
+Targeted proof:
+
+- `cargo +nightly check -p tina-runtime -p tina-sim -p tina-tokio-bridge`
+- `cargo +nightly test -p tina-runtime --test local_system local_system_udp_loopback_surfaces_send_recv_truncation_and_close`
+- `cargo +nightly test -p tina-runtime driver::tests::udp_recv_lane_rejects_duplicate_and_close_until_cancelled`
+
+Open next rock:
+
+- add simulator UDP packet scripting so live-vs-sim does not diverge on the
+  final Funkishus contract;
+- add UDP requester-stop-before-packet proof from the user-facing path.

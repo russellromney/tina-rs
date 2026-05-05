@@ -10,11 +10,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, FileId, ListenerId, LiveShardState, LocalSystem, LocalSystemState, MailboxFactory,
-    RuntimeEventKind, SnapshotImage, StreamId, ThreadedRuntimeError, ThreadedTrySendError,
-    TraceRetention, file_close, file_create, file_fsync, file_read, file_size, file_write,
-    journal_append, journal_replay, sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_read, tcp_write,
+    CallError, CallKind, CancellationSupport, FileId, ListenerId, LiveShardState, LocalSystem,
+    LocalSystemState, MailboxFactory, PersistenceSupportLevel, ResourceExecutionShape,
+    ResourceSupport, RuntimeEventKind, ShutdownSupport, SnapshotImage, StreamId,
+    ThreadedRuntimeError, ThreadedTrySendError, TraceRetention, UdpSocketId, file_close,
+    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
+    sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
+    tcp_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -207,6 +209,86 @@ impl TimerService {
             }
             TimerMsg::Finished(Err(_)) => {
                 self.seen.lock().expect("timer seen lock").push("failed");
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UdpLoopbackMsg {
+    Start,
+    ReceiverBound(Result<(UdpSocketId, SocketAddr), CallError>),
+    SenderBound(Result<(UdpSocketId, SocketAddr), CallError>),
+    Received(Result<(SocketAddr, Vec<u8>, bool), CallError>),
+    Sent(Result<usize, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct UdpLoopbackService {
+    receiver: Option<UdpSocketId>,
+    sender: Option<UdpSocketId>,
+    receiver_addr: Option<SocketAddr>,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = UdpLoopbackMsg, shard = AppShard)]
+impl UdpLoopbackService {
+    fn handle(&mut self, msg: UdpLoopbackMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            UdpLoopbackMsg::Start => udp_bind("127.0.0.1:0".parse().expect("loopback addr"))
+                .reply(UdpLoopbackMsg::ReceiverBound),
+            UdpLoopbackMsg::ReceiverBound(Ok((socket, addr))) => {
+                self.receiver = Some(socket);
+                self.receiver_addr = Some(addr);
+                udp_bind("127.0.0.1:0".parse().expect("loopback addr"))
+                    .reply(UdpLoopbackMsg::SenderBound)
+            }
+            UdpLoopbackMsg::SenderBound(Ok((socket, _addr))) => {
+                self.sender = Some(socket);
+                let receiver = self.receiver.expect("receiver socket");
+                let receiver_addr = self.receiver_addr.expect("receiver addr");
+                batch(vec![
+                    udp_recv_from(receiver, 4).reply(UdpLoopbackMsg::Received),
+                    udp_send_to(socket, receiver_addr, b"llamas".to_vec())
+                        .reply(UdpLoopbackMsg::Sent),
+                ])
+            }
+            UdpLoopbackMsg::Sent(Ok(count)) => {
+                self.observed
+                    .lock()
+                    .expect("udp observed lock")
+                    .push(format!("sent:{count}"));
+                udp_close_socket(self.sender.expect("sender socket")).reply(UdpLoopbackMsg::Closed)
+            }
+            UdpLoopbackMsg::Received(Ok((_peer, bytes, truncated))) => {
+                self.observed
+                    .lock()
+                    .expect("udp observed lock")
+                    .push(format!(
+                        "recv:{}:{truncated}",
+                        String::from_utf8(bytes).expect("utf8 udp payload")
+                    ));
+                udp_close_socket(self.receiver.expect("receiver socket"))
+                    .reply(UdpLoopbackMsg::Closed)
+            }
+            UdpLoopbackMsg::Closed(Ok(())) => {
+                self.observed
+                    .lock()
+                    .expect("udp observed lock")
+                    .push("closed".to_string());
+                noop()
+            }
+            UdpLoopbackMsg::ReceiverBound(Err(_))
+            | UdpLoopbackMsg::SenderBound(Err(_))
+            | UdpLoopbackMsg::Received(Err(_))
+            | UdpLoopbackMsg::Sent(Err(_))
+            | UdpLoopbackMsg::Closed(Err(_)) => {
+                self.observed
+                    .lock()
+                    .expect("udp observed lock")
+                    .push("failed".to_string());
                 noop()
             }
         }
@@ -826,6 +908,132 @@ fn local_system_topology_report_before_and_after_shutdown() {
             .state(),
         LiveShardState::Stopped
     );
+}
+
+#[test]
+fn local_system_capabilities_name_supported_and_unsupported_resource_families() {
+    let app = LocalSystem::single_shard(AppShard(37), AppMailboxFactory)
+        .storage_lane_capacity(7)
+        .build();
+
+    let capabilities = app.capabilities();
+    assert_eq!(capabilities.timers.support(), ResourceSupport::Supported);
+    assert_eq!(
+        capabilities.timers.execution(),
+        ResourceExecutionShape::Inline
+    );
+    assert_eq!(
+        capabilities.timers.cancellation(),
+        CancellationSupport::CancelableBeforeStart
+    );
+    assert_eq!(capabilities.timers.shutdown(), ShutdownSupport::Canceled);
+
+    assert_eq!(capabilities.tcp.support(), ResourceSupport::Supported);
+    assert_eq!(
+        capabilities.tcp.execution(),
+        ResourceExecutionShape::CompletionBacked
+    );
+    assert_eq!(
+        capabilities.tcp.cancellation(),
+        CancellationSupport::TombstonedAfterStart
+    );
+
+    assert_eq!(
+        capabilities.local_file.execution(),
+        ResourceExecutionShape::CompletionBacked
+    );
+    assert_eq!(
+        capabilities.storage_lane.execution(),
+        ResourceExecutionShape::LaneBackedBlocking
+    );
+    assert_eq!(capabilities.storage_lane.capacity(), Some(7));
+    assert_eq!(capabilities.local_persistence.capacity(), Some(7));
+
+    assert_eq!(capabilities.dns.support(), ResourceSupport::Unsupported);
+    assert_eq!(capabilities.udp.support(), ResourceSupport::Supported);
+    assert_eq!(
+        capabilities.udp.execution(),
+        ResourceExecutionShape::PollBacked
+    );
+    assert_eq!(capabilities.process.support(), ResourceSupport::Unsupported);
+    assert_eq!(capabilities.signal.support(), ResourceSupport::Unsupported);
+    assert_eq!(capabilities.tls.support(), ResourceSupport::AdapterOnly);
+    assert_eq!(
+        capabilities.tls.execution(),
+        ResourceExecutionShape::ExternalAdapter
+    );
+
+    assert_eq!(
+        capabilities.durability.file_fsync,
+        PersistenceSupportLevel::Supported
+    );
+    assert!(capabilities.durability.commit_uncertain_possible);
+    #[cfg(unix)]
+    assert_eq!(
+        capabilities.durability.directory_fsync_after_rename,
+        PersistenceSupportLevel::Supported
+    );
+    #[cfg(not(unix))]
+    assert_eq!(
+        capabilities.durability.directory_fsync_after_rename,
+        PersistenceSupportLevel::NotClaimed
+    );
+
+    app.shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+}
+
+#[test]
+fn local_system_udp_loopback_surfaces_send_recv_truncation_and_close() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(38), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<UdpLoopbackService, Infallible>(
+            UdpLoopbackService {
+                receiver: None,
+                sender: None,
+                receiver_addr: None,
+                observed: Arc::clone(&observed),
+            },
+            16,
+        )
+        .expect("register udp service");
+
+    app.try_send(address, UdpLoopbackMsg::Start)
+        .expect("start udp service");
+    wait_until(|| {
+        let observed = observed.lock().expect("udp observed lock");
+        observed.iter().any(|entry| entry == "sent:6")
+            && observed.iter().any(|entry| entry == "recv:llam:true")
+            && observed
+                .iter()
+                .filter(|entry| entry.as_str() == "closed")
+                .count()
+                == 2
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    for expected in [
+        CallKind::UdpBind,
+        CallKind::UdpSendTo,
+        CallKind::UdpRecvFrom,
+        CallKind::UdpSocketClose,
+    ] {
+        assert!(terminal.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+            )
+        }));
+    }
 }
 
 #[test]

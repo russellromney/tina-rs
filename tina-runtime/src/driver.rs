@@ -28,7 +28,8 @@
 //!   shutdown was clean.
 //!
 use std::alloc::Global;
-use std::net::SocketAddr;
+use std::io::ErrorKind;
+use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::mpsc::{
     Receiver, SyncSender, TryRecvError, TrySendError as MpscTrySendError, sync_channel,
@@ -48,6 +49,7 @@ use betelgeuse::{
 
 use crate::call::{
     CallError, CallId, CallInput, CallOutput, FileId, FileOpenOptions, ListenerId, StreamId,
+    UdpSocketId,
 };
 
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
@@ -140,9 +142,11 @@ struct BetelgeuseTcp {
     io_loop: IOLoopHandle<Global>,
     next_listener_id: u64,
     next_stream_id: u64,
+    next_udp_socket_id: u64,
     next_file_id: u64,
     listeners: Vec<ListenerEntry>,
     streams: Vec<StreamEntry>,
+    udp_sockets: Vec<UdpSocketEntry>,
     files: Vec<FileEntry>,
     pending: Vec<PendingOperation>,
 }
@@ -155,6 +159,11 @@ struct ListenerEntry {
 struct StreamEntry {
     id: StreamId,
     socket: Box<dyn IOSocket>,
+}
+
+struct UdpSocketEntry {
+    id: UdpSocketId,
+    socket: UdpSocket,
 }
 
 struct FileEntry {
@@ -185,6 +194,11 @@ enum PendingKind {
     },
     Read(Box<RecvCompletion>),
     Write(Box<SendCompletion>),
+    UdpRecv {
+        socket: UdpSocketId,
+        max_len: usize,
+        buffer: Vec<u8>,
+    },
     FileRead(Box<PReadCompletion>),
     FileWrite(Box<PWriteCompletion>),
     FileFsync(Box<FsyncCompletion>),
@@ -198,6 +212,7 @@ enum PendingLane {
     TcpConnect(CallId),
     StreamRead(StreamId),
     StreamWrite(StreamId),
+    UdpRecv(UdpSocketId),
     FileRead(FileId),
     FileWrite(FileId),
     FileFsync(FileId),
@@ -643,9 +658,11 @@ impl BetelgeuseTcp {
             io_loop,
             next_listener_id: 1,
             next_stream_id: 1,
+            next_udp_socket_id: 1,
             next_file_id: 1,
             listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            udp_sockets: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             files: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             pending: Vec::with_capacity(INITIAL_DRIVER_PENDING_CAPACITY),
         }
@@ -668,6 +685,48 @@ impl BetelgeuseTcp {
                 call_id,
                 result: self.do_stream_close(stream),
             }),
+            CallInput::UdpBind { addr } => Some(DriverCompletion {
+                call_id,
+                result: self.do_udp_bind(addr),
+            }),
+            CallInput::UdpSendTo {
+                socket,
+                peer,
+                bytes,
+            } => Some(DriverCompletion {
+                call_id,
+                result: self.do_udp_send_to(socket, peer, &bytes),
+            }),
+            CallInput::UdpSocketClose { socket } => Some(DriverCompletion {
+                call_id,
+                result: self.do_udp_close(socket),
+            }),
+            CallInput::UdpRecvFrom { socket, max_len } => {
+                let lane = PendingLane::UdpRecv(socket);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::ResourceBusy),
+                    });
+                }
+                if !self.udp_sockets.iter().any(|entry| entry.id == socket) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::InvalidResource),
+                    });
+                }
+                self.pending.push(PendingOperation {
+                    call_id,
+                    kind: PendingKind::UdpRecv {
+                        socket,
+                        max_len,
+                        buffer: vec![0; max_len.saturating_add(1)],
+                    },
+                    lane,
+                    cancelled: false,
+                });
+                None
+            }
             CallInput::FileOpen { path, options } => Some(DriverCompletion {
                 call_id,
                 result: self.do_file_open(&path, options),
@@ -904,7 +963,7 @@ impl BetelgeuseTcp {
         while index < self.pending.len() {
             let mut op = self.pending.remove(index);
             if op.cancelled {
-                if op.kind.has_result() {
+                if op.kind.has_result() || op.kind.drops_on_cancel() {
                     continue;
                 }
                 self.pending.insert(index, op);
@@ -979,6 +1038,7 @@ impl BetelgeuseTcp {
         for entry in std::mem::take(&mut self.streams) {
             entry.socket.close();
         }
+        self.udp_sockets.clear();
         self.files.clear();
     }
 
@@ -993,7 +1053,9 @@ impl BetelgeuseTcp {
             let _ = self.io_loop.step();
             let mut index = 0;
             while index < self.pending.len() {
-                if self.pending[index].kind.has_result() {
+                if self.pending[index].kind.has_result()
+                    || self.pending[index].kind.drops_on_cancel()
+                {
                     self.pending.remove(index);
                 } else {
                     index += 1;
@@ -1085,6 +1147,26 @@ impl BetelgeuseTcp {
                     .expect("send completion advertised a result");
                 match result {
                     Ok(count) => Some(CallOutput::TcpWrote { count }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::UdpRecv {
+                socket,
+                max_len,
+                buffer,
+            } => {
+                let entry = self.udp_sockets.iter().find(|entry| entry.id == *socket)?;
+                match entry.socket.recv_from(buffer) {
+                    Ok((count, peer_addr)) => {
+                        let truncated = count > *max_len;
+                        let delivered = count.min(*max_len);
+                        Some(CallOutput::UdpReceived {
+                            peer_addr,
+                            bytes: buffer[..delivered].to_vec(),
+                            truncated,
+                        })
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => None,
                     Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
@@ -1198,6 +1280,59 @@ impl BetelgeuseTcp {
                 let entry = self.streams.remove(index);
                 entry.socket.close();
                 CallOutput::TcpStreamClosed
+            }
+            None => CallOutput::Failed(CallError::InvalidResource),
+        }
+    }
+
+    fn do_udp_bind(&mut self, addr: SocketAddr) -> CallOutput {
+        let socket = match UdpSocket::bind(addr) {
+            Ok(socket) => socket,
+            Err(_) => return CallOutput::Failed(CallError::Io),
+        };
+        if socket.set_nonblocking(true).is_err() {
+            return CallOutput::Failed(CallError::Io);
+        }
+        let local_addr = match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(_) => return CallOutput::Failed(CallError::Io),
+        };
+
+        let id = UdpSocketId::new(self.next_udp_socket_id);
+        self.next_udp_socket_id += 1;
+        self.udp_sockets.push(UdpSocketEntry { id, socket });
+        CallOutput::UdpBound {
+            socket: id,
+            local_addr,
+        }
+    }
+
+    fn do_udp_send_to(
+        &mut self,
+        socket: UdpSocketId,
+        peer: SocketAddr,
+        bytes: &[u8],
+    ) -> CallOutput {
+        let Some(entry) = self.udp_sockets.iter().find(|entry| entry.id == socket) else {
+            return CallOutput::Failed(CallError::InvalidResource);
+        };
+        match entry.socket.send_to(bytes, peer) {
+            Ok(count) => CallOutput::UdpSent { count },
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                CallOutput::Failed(CallError::ResourceBusy)
+            }
+            Err(_) => CallOutput::Failed(CallError::Io),
+        }
+    }
+
+    fn do_udp_close(&mut self, socket: UdpSocketId) -> CallOutput {
+        if self.lane_has_active_pending(PendingLane::UdpRecv(socket)) {
+            return CallOutput::Failed(CallError::ResourceBusy);
+        }
+        match self.udp_sockets.iter().position(|entry| entry.id == socket) {
+            Some(index) => {
+                self.udp_sockets.remove(index);
+                CallOutput::UdpSocketClosed
             }
             None => CallOutput::Failed(CallError::InvalidResource),
         }
@@ -1366,12 +1501,17 @@ impl PendingKind {
             Self::Connect { completion, .. } => completion.has_result(),
             Self::Read(completion) => completion.has_result(),
             Self::Write(completion) => completion.has_result(),
+            Self::UdpRecv { .. } => false,
             Self::FileRead(completion) => completion.has_result(),
             Self::FileWrite(completion) => completion.has_result(),
             Self::FileFsync(completion) => completion.has_result(),
             Self::FileSize(completion) => completion.has_result(),
             Self::Mkdir(completion) => completion.has_result(),
         }
+    }
+
+    fn drops_on_cancel(&self) -> bool {
+        matches!(self, Self::UdpRecv { .. })
     }
 }
 
@@ -1391,6 +1531,7 @@ impl std::fmt::Debug for BetelgeuseTcp {
             .debug_struct("BetelgeuseTcp")
             .field("listeners", &self.listeners.len())
             .field("streams", &self.streams.len())
+            .field("udp_sockets", &self.udp_sockets.len())
             .field("files", &self.files.len())
             .field("pending", &self.pending.len())
             .finish_non_exhaustive()
@@ -1533,5 +1674,70 @@ mod tests {
             queued_started_rx.try_recv().is_err(),
             "queued storage work must not start after shutdown cancellation"
         );
+    }
+
+    #[test]
+    fn udp_recv_lane_rejects_duplicate_and_close_until_cancelled() {
+        let io_loop =
+            io_loop(Global).expect("failed to initialise Betelgeuse IO loop for driver test");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        let bound = driver
+            .submit(
+                CallId::new(1),
+                CallInput::UdpBind {
+                    addr: "127.0.0.1:0".parse().expect("loopback addr"),
+                },
+                Instant::now(),
+            )
+            .expect("udp bind completes inline");
+        let socket = match bound.result {
+            CallOutput::UdpBound { socket, .. } => socket,
+            other => panic!("unexpected udp bind output {other:?}"),
+        };
+
+        assert!(
+            driver
+                .submit(
+                    CallId::new(2),
+                    CallInput::UdpRecvFrom { socket, max_len: 8 },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+
+        let duplicate = driver
+            .submit(
+                CallId::new(3),
+                CallInput::UdpRecvFrom { socket, max_len: 8 },
+                Instant::now(),
+            )
+            .expect("duplicate udp recv rejected inline");
+        assert!(matches!(
+            duplicate.result,
+            CallOutput::Failed(CallError::ResourceBusy)
+        ));
+
+        let close_busy = driver
+            .submit(
+                CallId::new(4),
+                CallInput::UdpSocketClose { socket },
+                Instant::now(),
+            )
+            .expect("busy udp close rejected inline");
+        assert!(matches!(
+            close_busy.result,
+            CallOutput::Failed(CallError::ResourceBusy)
+        ));
+
+        assert!(driver.cancel(CallId::new(2)));
+        assert!(!driver.has_pending());
+        let closed = driver
+            .submit(
+                CallId::new(5),
+                CallInput::UdpSocketClose { socket },
+                Instant::now(),
+            )
+            .expect("udp close succeeds after cancel");
+        assert!(matches!(closed.result, CallOutput::UdpSocketClosed));
     }
 }

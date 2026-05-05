@@ -90,6 +90,22 @@ impl StreamId {
     }
 }
 
+/// Runtime-owned identifier for a UDP socket resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UdpSocketId(u64);
+
+impl UdpSocketId {
+    /// Creates a UDP socket identifier from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw UDP socket identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Runtime-owned identifier for an opened file resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(u64);
@@ -263,6 +279,36 @@ pub enum CallInput {
         stream: StreamId,
     },
 
+    /// Bind a UDP socket to `addr`.
+    UdpBind {
+        /// The address the UDP socket should bind to.
+        addr: SocketAddr,
+    },
+
+    /// Send one UDP datagram.
+    UdpSendTo {
+        /// The UDP socket to send from.
+        socket: UdpSocketId,
+        /// Destination address.
+        peer: SocketAddr,
+        /// Datagram payload.
+        bytes: Vec<u8>,
+    },
+
+    /// Receive one UDP datagram.
+    UdpRecvFrom {
+        /// The UDP socket to receive from.
+        socket: UdpSocketId,
+        /// Maximum payload bytes to deliver.
+        max_len: usize,
+    },
+
+    /// Close a UDP socket and release its resources.
+    UdpSocketClose {
+        /// The UDP socket to close.
+        socket: UdpSocketId,
+    },
+
     /// Open a file and return a runtime-owned file id.
     FileOpen {
         /// Path to open.
@@ -372,6 +418,10 @@ impl CallInput {
             Self::TcpWrite { .. } => crate::trace::CallKind::TcpWrite,
             Self::TcpListenerClose { .. } => crate::trace::CallKind::TcpListenerClose,
             Self::TcpStreamClose { .. } => crate::trace::CallKind::TcpStreamClose,
+            Self::UdpBind { .. } => crate::trace::CallKind::UdpBind,
+            Self::UdpSendTo { .. } => crate::trace::CallKind::UdpSendTo,
+            Self::UdpRecvFrom { .. } => crate::trace::CallKind::UdpRecvFrom,
+            Self::UdpSocketClose { .. } => crate::trace::CallKind::UdpSocketClose,
             Self::FileOpen { .. } => crate::trace::CallKind::FileOpen,
             Self::FileReadAt { .. } => crate::trace::CallKind::FileReadAt,
             Self::FileWriteAt { .. } => crate::trace::CallKind::FileWriteAt,
@@ -468,6 +518,33 @@ pub enum CallOutput {
 
     /// A stream was closed and its resources released.
     TcpStreamClosed,
+
+    /// A UDP socket was bound.
+    UdpBound {
+        /// The runtime-assigned UDP socket id.
+        socket: UdpSocketId,
+        /// The local address reported by the OS.
+        local_addr: SocketAddr,
+    },
+
+    /// One UDP datagram was sent.
+    UdpSent {
+        /// Number of bytes sent.
+        count: usize,
+    },
+
+    /// One UDP datagram was received.
+    UdpReceived {
+        /// Sender address.
+        peer_addr: SocketAddr,
+        /// Payload bytes delivered to the isolate.
+        bytes: Vec<u8>,
+        /// Whether the datagram was truncated to the requested maximum length.
+        truncated: bool,
+    },
+
+    /// A UDP socket was closed and its resources released.
+    UdpSocketClosed,
 
     /// A file was opened.
     FileOpened {
@@ -1124,6 +1201,46 @@ impl CallOutput {
         }
     }
 
+    /// Extracts the successful UDP bind result.
+    pub fn into_udp_bound(self) -> Result<(UdpSocketId, SocketAddr), CallError> {
+        match self {
+            Self::UdpBound { socket, local_addr } => Ok((socket, local_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UdpBound", &other),
+        }
+    }
+
+    /// Extracts the successful UDP send count.
+    pub fn into_udp_sent(self) -> Result<usize, CallError> {
+        match self {
+            Self::UdpSent { count } => Ok(count),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UdpSent", &other),
+        }
+    }
+
+    /// Extracts the successful UDP receive payload.
+    pub fn into_udp_received(self) -> Result<(SocketAddr, Vec<u8>, bool), CallError> {
+        match self {
+            Self::UdpReceived {
+                peer_addr,
+                bytes,
+                truncated,
+            } => Ok((peer_addr, bytes, truncated)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UdpReceived", &other),
+        }
+    }
+
+    /// Extracts the successful UDP socket close completion.
+    pub fn into_udp_socket_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::UdpSocketClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UdpSocketClosed", &other),
+        }
+    }
+
     /// Extracts the successful file open result.
     pub fn into_file_opened(self) -> Result<FileId, CallError> {
         match self {
@@ -1468,6 +1585,42 @@ pub fn tcp_close_stream(stream: StreamId) -> TypedCall<()> {
     TypedCall::new(
         CallInput::TcpStreamClose { stream },
         CallOutput::into_tcp_stream_closed,
+    )
+}
+
+/// Returns a typed UDP bind helper.
+pub fn udp_bind(addr: SocketAddr) -> TypedCall<(UdpSocketId, SocketAddr)> {
+    TypedCall::new(CallInput::UdpBind { addr }, CallOutput::into_udp_bound)
+}
+
+/// Returns a typed UDP send helper.
+pub fn udp_send_to(socket: UdpSocketId, peer: SocketAddr, bytes: Vec<u8>) -> TypedCall<usize> {
+    TypedCall::new(
+        CallInput::UdpSendTo {
+            socket,
+            peer,
+            bytes,
+        },
+        CallOutput::into_udp_sent,
+    )
+}
+
+/// Returns a typed UDP receive helper.
+pub fn udp_recv_from(
+    socket: UdpSocketId,
+    max_len: usize,
+) -> TypedCall<(SocketAddr, Vec<u8>, bool)> {
+    TypedCall::new(
+        CallInput::UdpRecvFrom { socket, max_len },
+        CallOutput::into_udp_received,
+    )
+}
+
+/// Returns a typed UDP close helper.
+pub fn udp_close_socket(socket: UdpSocketId) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::UdpSocketClose { socket },
+        CallOutput::into_udp_socket_closed,
     )
 }
 
