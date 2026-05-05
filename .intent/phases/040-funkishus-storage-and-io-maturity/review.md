@@ -510,6 +510,28 @@ Review note:
 - This is intentionally not interactive process I/O. No stdin streaming, no
   shell-by-default helper, no process tree claim, and no broad cross-platform
   signal/kill story beyond the typed `KillUncertain` escape hatch.
+
+## Implementation Audit 6
+
+Composed local I/O proof landed.
+
+What is true now:
+
+- A single live `LocalSystem` service performs UDP loopback, bounded process
+  execution, and journal append in one user-shaped state machine.
+- The service mutates durable state only after UDP receive and process output
+  both succeed.
+- The test replays the resulting journal from disk and asserts the exact
+  committed bytes.
+- Trace assertions prove `UdpBind`, `UdpSendTo`, `UdpRecvFrom`, `ProcessRun`,
+  and `JournalAppend` all completed as runtime-owned Tina calls.
+
+Review note:
+
+- This does not yet include TCP ingress in the same single service; separate
+  live tests already cover TCP-plus-journal and cross-shard TCP persistence.
+  The remaining full-composition gap is to combine TCP ingress with the new
+  UDP/process rails if 040 needs one maximal app-shaped proof.
 - Direct integration test pins supported and unsupported resource families
   through the canonical `LocalSystem` path.
 

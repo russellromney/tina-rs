@@ -385,6 +385,118 @@ impl ProcessService {
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComposedIoMsg {
+    Start(PathBuf),
+    ReceiverBound(Result<(UdpSocketId, SocketAddr), CallError>),
+    SenderBound(Result<(UdpSocketId, SocketAddr), CallError>),
+    Received(Result<(SocketAddr, Vec<u8>, bool), CallError>),
+    Sent(Result<usize, CallError>),
+    Processed(Result<tina_runtime::ProcessRunResult, CallError>),
+    Journaled(Result<(), CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ComposedIoService {
+    journal: Option<PathBuf>,
+    receiver: Option<UdpSocketId>,
+    sender: Option<UdpSocketId>,
+    receiver_addr: Option<SocketAddr>,
+    udp_payload: Option<Vec<u8>>,
+    closed: usize,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(unix)]
+#[tina_runtime::isolate(message = ComposedIoMsg, shard = AppShard)]
+impl ComposedIoService {
+    fn handle(&mut self, msg: ComposedIoMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            ComposedIoMsg::Start(path) => {
+                self.journal = Some(path);
+                udp_bind("127.0.0.1:0".parse().expect("loopback"))
+                    .reply(ComposedIoMsg::ReceiverBound)
+            }
+            ComposedIoMsg::ReceiverBound(Ok((socket, addr))) => {
+                self.receiver = Some(socket);
+                self.receiver_addr = Some(addr);
+                udp_bind("127.0.0.1:0".parse().expect("loopback")).reply(ComposedIoMsg::SenderBound)
+            }
+            ComposedIoMsg::SenderBound(Ok((socket, _))) => {
+                self.sender = Some(socket);
+                batch(vec![
+                    udp_recv_from(self.receiver.expect("receiver"), 16)
+                        .reply(ComposedIoMsg::Received),
+                    udp_send_to(
+                        socket,
+                        self.receiver_addr.expect("receiver addr"),
+                        b"llama".to_vec(),
+                    )
+                    .reply(ComposedIoMsg::Sent),
+                ])
+            }
+            ComposedIoMsg::Sent(Ok(count)) => {
+                self.observed
+                    .lock()
+                    .expect("composed observed lock")
+                    .push(format!("udp-sent:{count}"));
+                noop()
+            }
+            ComposedIoMsg::Received(Ok((_peer, bytes, truncated))) => {
+                self.observed
+                    .lock()
+                    .expect("composed observed lock")
+                    .push(format!("udp-recv:{truncated}"));
+                self.udp_payload = Some(bytes);
+                process_run(
+                    "/bin/echo",
+                    vec!["fed".to_string()],
+                    Duration::from_secs(2),
+                    16,
+                    16,
+                )
+                .reply(ComposedIoMsg::Processed)
+            }
+            ComposedIoMsg::Processed(Ok(result)) => {
+                let mut bytes = self.udp_payload.take().expect("udp before process");
+                bytes.extend_from_slice(&result.stdout);
+                journal_append(self.journal.clone().expect("journal path"), 1, bytes)
+                    .reply(ComposedIoMsg::Journaled)
+            }
+            ComposedIoMsg::Journaled(Ok(())) => batch(vec![
+                udp_close_socket(self.receiver.expect("receiver")).reply(ComposedIoMsg::Closed),
+                udp_close_socket(self.sender.expect("sender")).reply(ComposedIoMsg::Closed),
+            ]),
+            ComposedIoMsg::Closed(Ok(())) => {
+                self.closed += 1;
+                if self.closed == 2 {
+                    self.observed
+                        .lock()
+                        .expect("composed observed lock")
+                        .push("committed".to_string());
+                }
+                noop()
+            }
+            ComposedIoMsg::ReceiverBound(Err(error))
+            | ComposedIoMsg::SenderBound(Err(error))
+            | ComposedIoMsg::Received(Err(error))
+            | ComposedIoMsg::Sent(Err(error))
+            | ComposedIoMsg::Processed(Err(error))
+            | ComposedIoMsg::Journaled(Err(error))
+            | ComposedIoMsg::Closed(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("composed observed lock")
+                    .push(format!("failed:{error:?}"));
+                noop()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileMsg {
     Start(PathBuf),
@@ -1181,6 +1293,68 @@ fn local_system_process_run_captures_truncates_and_times_out() {
             }
         )
     }));
+}
+
+#[cfg(unix)]
+#[test]
+fn local_system_composed_io_service_udp_process_and_journal_commit() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(41), AppMailboxFactory)
+        .storage_lane_capacity(4)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+    let journal_path = unique_dir("composed-io").with_extension("journal");
+    let _ = fs::remove_file(&journal_path);
+    let address = app
+        .register_root::<ComposedIoService, Infallible>(
+            ComposedIoService {
+                journal: None,
+                receiver: None,
+                sender: None,
+                receiver_addr: None,
+                udp_payload: None,
+                closed: 0,
+                observed: Arc::clone(&observed),
+            },
+            32,
+        )
+        .expect("register composed io service");
+
+    app.try_send(address, ComposedIoMsg::Start(journal_path.clone()))
+        .expect("start composed io service");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("composed observed lock")
+            .iter()
+            .any(|entry| entry == "committed")
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    for expected in [
+        CallKind::UdpBind,
+        CallKind::UdpSendTo,
+        CallKind::UdpRecvFrom,
+        CallKind::ProcessRun,
+        CallKind::JournalAppend,
+    ] {
+        assert!(terminal.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+            )
+        }));
+    }
+
+    let replay =
+        tina_runtime::persistence::replay_journal(&journal_path).expect("composed journal replays");
+    assert_eq!(replay.records.len(), 1);
+    assert_eq!(replay.records[0].index, 1);
+    assert_eq!(replay.records[0].bytes, b"llamafed\n".to_vec());
 }
 
 #[test]
