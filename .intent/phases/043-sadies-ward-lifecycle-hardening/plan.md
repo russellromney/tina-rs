@@ -13,6 +13,17 @@ At closeout:
 No flow syntax, remoting, clustering, release docs, metrics backend, or broad
 performance claim.
 
+## Handoff Rules
+
+- Execute the rocks in order.
+- After each rock, run the narrow tests for that rock and review the diff for
+  bugs before moving on.
+- Ask before changing public Tina vocabulary beyond fields named here.
+- Ask before adding a dependency other than `signal-hook`.
+- Ask before adding unsafe code.
+- Ask before weakening a test because live timing is inconvenient.
+- Do not skip a rock and call the phase done.
+
 ## Vocabulary
 
 - **Table-owned resource:** resource id stored in runtime/driver tables:
@@ -60,6 +71,15 @@ Add or tighten these report fields:
 - `pending_driver_call_count`
 - `shutdown_unclean_reason`
 
+Expected public shape:
+
+- `LiveShardReport::{owned_resource_count, worker_held_resource_count,
+  pending_driver_call_count}`
+- `LocalSystemShutdownReport::{remaining_owned_resource_count,
+  remaining_worker_held_resource_count, remaining_pending_driver_call_count,
+  unclean_reason}`
+- `ShutdownUncleanReason` or similarly named enum, not a stringly value.
+
 Count rules:
 
 - TCP/file/UDP Betelgeuse ids count as table-owned.
@@ -79,7 +99,7 @@ work makes shutdown unclean.
 Add one shutdown budget in `LocalSystemConfig`:
 
 - `shutdown_lane_drain_timeout`
-- default: small, fixed, documented
+- default: `Duration::from_millis(100)`
 - applies per shard to lane-worker drain after cancellation
 
 Each lane must do:
@@ -91,6 +111,8 @@ Each lane must do:
 5. report remaining worker-held/pending work if not finished.
 
 No lane may block shutdown forever because user operation timeout was huge.
+If a lane cannot stop inside the budget, shutdown still returns with an
+unclean report.
 
 ## Rock 4: OS Signals
 
@@ -128,6 +150,9 @@ Required behavior:
 - topology and terminal report name failed shard and remaining work.
 
 No automatic shard restart.
+
+Do not invent peer liveness, remoting, membership, or network failure
+semantics. This is local worker-thread failure only.
 
 ## Rock 6: Reports
 
@@ -169,6 +194,19 @@ Must test:
 - remote full plus requester timeout;
 - late completion after cancellation;
 - topology before/during/after pressure.
+
+Minimum named tests to add or update:
+
+- one unit test per lane count rule where practical;
+- one live LocalSystem test for in-flight TLS shutdown;
+- one live LocalSystem test for in-flight process shutdown;
+- one live LocalSystem test for DNS/storage pending-call accounting using
+  crate-private hooks if needed;
+- one live signal test on Unix, one unsupported/capability test on non-Unix;
+- one live failed-shard cross-shard call test for each priority class that can
+  be forced deterministically;
+- one DST history that combines shutdown, late completion, and topology;
+- one DST history that combines shard failure, remote full, and timeout.
 
 Test hooks may be crate-private/test-only. Do not turn them into user API.
 

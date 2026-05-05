@@ -111,3 +111,21 @@ The plan now pins the load-bearing bits:
 
 Remaining implementation caution: keep test hooks crate-private/test-only. Do
 not let lifecycle hardening turn into public observability framework.
+
+# Plan Review 3
+
+Verdict: Claude-handoff ready.
+
+Extra pins added:
+
+- execution rules: rock order, narrow tests after each rock, review before
+  next rock;
+- stop/ask rules for public vocabulary, dependencies beyond `signal-hook`,
+  unsafe code, weakened tests, or skipped rocks;
+- exact shutdown drain default: `Duration::from_millis(100)`;
+- expected public report accessors and `ShutdownUncleanReason` enum shape;
+- local-worker-only failure scope;
+- minimum named test classes for lane counts, TLS/process/DNS/storage shutdown,
+  signals, failed-shard race priorities, and DST combinations.
+
+No remaining plan blocker seen.
