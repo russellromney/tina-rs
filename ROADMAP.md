@@ -167,8 +167,8 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Timmerhus live topology and failure domains** | Production-runtime hardening after DST rails exist: thread pinning/topology, live shard ownership reporting, peer/shard liveness vocabulary, peer quarantine decision, shard-restart propagation rules, and whether local cross-shard isolate-call reply transport belongs before remoting. |
-| **Funkishus storage and I/O maturity** | Mature runtime-owned I/O/storage where named workloads prove the need: nonblocking storage reactor decision, platform durability support, DNS/TLS/UDP/process/signal rails, and bridge/adapter policy without weakening Tina semantics. |
+| **Timmerhus live topology and failure domains** | Local live runtime completion under Stuga rails: first-class topology reports, shard lifecycle states, worker panic vs graceful shutdown, queue-pressure reports, cross-shard sends under stopped/failed/full targets, local cross-shard isolate-call reply transport decision, and native/live DST differential stress. |
+| **Funkishus storage and I/O maturity** | Next rock for Timmerhus exclusions: nonblocking storage reactor decision, platform durability hardening, DNS/TLS/UDP/process/signal rails, richer resource cancellation, native driver adapter policy, and bridge/adapter policy without weakening Tina semantics. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 ## Later capability roadmap
@@ -213,9 +213,11 @@ These still need answers, but each now has an intended phase home.
 2. **Trace retention.** Bounded/off modes exist now and Piet kept lifecycle
    facts trace-observable. Sink/counter polish is a later observability phase,
    not a blocker for Jelle.
-3. **Runtime-owned I/O breadth.** Time, TCP server/client operations, and local
-   file I/O are implemented. DNS/TLS/UDP/process/signal remain deferred until a
-   named workload proves they belong in core instead of adapters.
+3. **Runtime-owned I/O breadth.** Time, TCP server/client operations, local file
+   I/O, and local persistence are implemented. DNS/TLS/UDP/process/signal,
+   richer file/resource cancellation, and nonblocking storage maturity belong
+   to Funkishus unless Timmerhus proves one is an immediate topology/failure
+   prerequisite.
 4. **Live cross-shard isolate calls.** Current live cross-shard call reply
    transport is not claimed. Home: Jan Peter Balkenende remoting unless a local
    workload proves it must land earlier.
