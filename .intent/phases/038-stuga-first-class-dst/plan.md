@@ -382,3 +382,27 @@ Pause and discuss if:
 - Bridge model DST is not Tokio determinism.
 - Gemini remains blocked until the local core and ergonomics are ready enough
   for real migration attempts.
+
+## Implementation Notes
+
+Stuga landed the first reusable DST surface:
+
+- `tina_sim::dst::History`, `DstRun`, `assert_replays`,
+  `run_twice_same_history`, `ShrinkConfig`, `ShrunkFailure`, and
+  `delete_shrink`;
+- `InvariantSuite` plus reusable checks for monotonic event ids, causal links,
+  send settlement, call settlement, no handler after stop/panic, and no
+  untraced abandonment;
+- durable-image journal replay helper, visible-pressure helper, and semantic
+  projection equality helper;
+- simulator-only `ScriptedStorageFaultConfig` for journal append failure,
+  snapshot commit failure, truncated journal tail, corrupt journal record, and
+  commit-uncertain snapshot result;
+- `dst_randomized.rs`, persistence matrix, TCP cancellation matrix, bridge
+  ingress model, and live-vs-sim parity now use the shared harness/projection
+  shape where it fits;
+- `dst_long_seed_sweep_replays_when_enabled` gives local/manual CI a
+  deterministic longer sweep behind `TINA_DST_LONG=1`.
+
+This phase intentionally did not add `serde`, external fuzzing crates, a public
+artifact file format, or live filesystem crash-consistency claims.

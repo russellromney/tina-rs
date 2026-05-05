@@ -14,5 +14,6 @@ tower-service = "0.3"
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+tina-sim = { path = "../tina-sim" }
 tokio = { version = "1.48.0", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }

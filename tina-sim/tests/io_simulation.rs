@@ -15,8 +15,10 @@ use tina_runtime::{
     FileOpenOptions, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
 };
 use tina_sim::{
-    Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ScriptedListenerConfig,
-    ScriptedPeerConfig, ScriptedTcpConfig, Simulator, SimulatorConfig, TcpCompletionFaultMode,
+    Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact,
+    ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, Simulator, SimulatorConfig,
+    TcpCompletionFaultMode,
+    dst::{DstRun, History, InvariantSuite, assert_replays},
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -1460,6 +1462,7 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
                     )],
                 }],
             },
+            storage: Default::default(),
         },
     );
 
@@ -1581,6 +1584,7 @@ fn closed_stream_id_surfaces_invalid_resource() {
                     )],
                 }],
             },
+            storage: Default::default(),
         },
     );
 
@@ -1637,6 +1641,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
                     ],
                 }],
             },
+            storage: Default::default(),
         },
     );
 
@@ -1707,6 +1712,7 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
                     )],
                 }],
             },
+            storage: Default::default(),
         },
     );
 
@@ -2208,7 +2214,24 @@ fn stopped_requester_rejects_pending_write_completion() {
     }));
 }
 
-fn run_seeded_cancellation_case(seed: u64) -> tina_sim::ReplayArtifact {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancellationOp {
+    Accept,
+    Read,
+    Write,
+}
+
+fn cancellation_history(seed: u64) -> History<CancellationOp> {
+    let op = match seed % 3 {
+        0 => CancellationOp::Accept,
+        1 => CancellationOp::Read,
+        _ => CancellationOp::Write,
+    };
+    History::new("tcp cancellation matrix", seed, vec![op])
+}
+
+fn run_seeded_cancellation_case(history: &History<CancellationOp>) -> DstRun<(), ReplayArtifact> {
+    let seed = history.seed();
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
@@ -2235,54 +2258,57 @@ fn run_seeded_cancellation_case(seed: u64) -> tina_sim::ReplayArtifact {
                     )],
                 }],
             },
+            storage: Default::default(),
         },
     );
 
     let (listener, _) = bind_listener(&mut sim, bind_addr());
-    match seed % 3 {
-        0 => {
-            let log = Rc::new(RefCell::new(Vec::new()));
-            let waiter = sim.register(Waiter {
-                listener,
-                log: Rc::clone(&log),
-            });
-            sim.try_send(waiter, WaiterMsg::StartAccept).unwrap();
-            sim.step();
-            sim.try_send(waiter, WaiterMsg::StopNow).unwrap();
-            sim.step();
-            sim.advance_time(Duration::from_millis(20));
-            sim.run_until_quiescent();
-            assert!(log.borrow().is_empty());
-        }
-        1 => {
-            let (stream, _) = accept_stream(&mut sim, listener);
-            let log = Rc::new(RefCell::new(Vec::new()));
-            let reader = sim.register(ReadProbe {
-                stream,
-                max_len: 8,
-                log: Rc::clone(&log),
-            });
-            sim.try_send(reader, ReadProbeMsg::StartRead).unwrap();
-            sim.step();
-            sim.try_send(reader, ReadProbeMsg::StopNow).unwrap();
-            sim.step();
-            sim.run_until_quiescent();
-            assert!(log.borrow().is_empty());
-        }
-        _ => {
-            let (stream, _) = accept_stream(&mut sim, listener);
-            let log = Rc::new(RefCell::new(Vec::new()));
-            let writer = sim.register(WriteProbe {
-                stream,
-                bytes: b"cancelled-output".to_vec(),
-                log: Rc::clone(&log),
-            });
-            sim.try_send(writer, WriteProbeMsg::StartWrite).unwrap();
-            sim.step();
-            sim.try_send(writer, WriteProbeMsg::StopNow).unwrap();
-            sim.step();
-            sim.run_until_quiescent();
-            assert!(log.borrow().is_empty());
+    for op in history.operations() {
+        match op {
+            CancellationOp::Accept => {
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let waiter = sim.register(Waiter {
+                    listener,
+                    log: Rc::clone(&log),
+                });
+                sim.try_send(waiter, WaiterMsg::StartAccept).unwrap();
+                sim.step();
+                sim.try_send(waiter, WaiterMsg::StopNow).unwrap();
+                sim.step();
+                sim.advance_time(Duration::from_millis(20));
+                sim.run_until_quiescent();
+                assert!(log.borrow().is_empty());
+            }
+            CancellationOp::Read => {
+                let (stream, _) = accept_stream(&mut sim, listener);
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let reader = sim.register(ReadProbe {
+                    stream,
+                    max_len: 8,
+                    log: Rc::clone(&log),
+                });
+                sim.try_send(reader, ReadProbeMsg::StartRead).unwrap();
+                sim.step();
+                sim.try_send(reader, ReadProbeMsg::StopNow).unwrap();
+                sim.step();
+                sim.run_until_quiescent();
+                assert!(log.borrow().is_empty());
+            }
+            CancellationOp::Write => {
+                let (stream, _) = accept_stream(&mut sim, listener);
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let writer = sim.register(WriteProbe {
+                    stream,
+                    bytes: b"cancelled-output".to_vec(),
+                    log: Rc::clone(&log),
+                });
+                sim.try_send(writer, WriteProbeMsg::StartWrite).unwrap();
+                sim.step();
+                sim.try_send(writer, WriteProbeMsg::StopNow).unwrap();
+                sim.step();
+                sim.run_until_quiescent();
+                assert!(log.borrow().is_empty());
+            }
         }
     }
 
@@ -2290,21 +2316,17 @@ fn run_seeded_cancellation_case(seed: u64) -> tina_sim::ReplayArtifact {
         !sim.has_in_flight_calls(),
         "seed {seed} left tombstoned work in flight"
     );
-    sim.replay_artifact()
+    DstRun::new((), sim.replay_artifact())
 }
 
 #[test]
 fn seeded_tcp_cancellation_matrix_replays_and_tombstones_late_completions() {
     for seed in 0..18 {
-        let first = run_seeded_cancellation_case(seed);
-        let second = run_seeded_cancellation_case(seed);
-        assert_eq!(
-            first.event_record(),
-            second.event_record(),
-            "TCP cancellation replay drift for seed {seed}"
-        );
+        let history = cancellation_history(seed);
+        let first = assert_replays(&history, run_seeded_cancellation_case);
+        InvariantSuite::standard().assert(first.artifact().event_record());
         assert!(
-            first.event_record().iter().any(|event| {
+            first.artifact().event_record().iter().any(|event| {
                 matches!(
                     event.kind(),
                     RuntimeEventKind::CallCompletionRejected {
@@ -2552,6 +2574,7 @@ fn tcp_checker_failure_replays_under_ready_reordering() {
                 },
             ],
         },
+        storage: Default::default(),
     };
 
     let mut sim = Simulator::new(TestShard, config);

@@ -4,10 +4,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{Address, IsolateId, prelude::*};
-use tina_runtime::{CallKind, CauseId, RuntimeEvent, RuntimeEventKind, SendRejectedReason, sleep};
+use tina_runtime::{CallKind, RuntimeEventKind, SendRejectedReason, sleep};
 use tina_sim::{
     FaultConfig, FaultMode, LocalSendFaultMode, MultiShardReplayArtifact, MultiShardSimulator,
     MultiShardSimulatorConfig, ReplayArtifact, Simulator, SimulatorConfig,
+    dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,12 +116,6 @@ enum RandomOp {
     RunUntilIdle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RandomRun {
-    observed: Vec<u8>,
-    artifact: ReplayArtifact,
-}
-
 fn xorshift64(mut state: u64) -> u64 {
     state ^= state << 13;
     state ^= state >> 7;
@@ -147,7 +142,7 @@ fn random_ops(seed: u64, len: usize) -> Vec<RandomOp> {
     ops
 }
 
-fn run_random_history(seed: u64, ops: &[RandomOp]) -> RandomRun {
+fn run_random_history(seed: u64, ops: &[RandomOp]) -> DstRun<Vec<u8>, ReplayArtifact> {
     let observed = Rc::new(RefCell::new(Vec::new()));
     let mut sim = Simulator::new(
         DstShard,
@@ -207,109 +202,7 @@ fn run_random_history(seed: u64, ops: &[RandomOp]) -> RandomRun {
     }
     sim.run_until_quiescent();
 
-    RandomRun {
-        observed: observed.borrow().clone(),
-        artifact: sim.replay_artifact(),
-    }
-}
-
-fn shrink_history<T: Clone>(ops: &[T], mut still_fails: impl FnMut(&[T]) -> bool) -> Vec<T> {
-    let mut current = ops.to_vec();
-    let mut index = 0;
-    while index < current.len() {
-        let mut candidate = current.clone();
-        candidate.remove(index);
-        if still_fails(&candidate) {
-            current = candidate;
-            index = 0;
-        } else {
-            index += 1;
-        }
-    }
-    current
-}
-
-fn assert_trace_is_causally_well_formed(trace: &[RuntimeEvent]) {
-    for (index, event) in trace.iter().enumerate() {
-        assert_eq!(event.id().get(), (index + 1) as u64);
-        if let Some(cause) = event.cause() {
-            assert!(
-                cause.event() < event.id(),
-                "cause {:?} must point before event {:?}",
-                cause,
-                event.id()
-            );
-            assert!(
-                trace
-                    .iter()
-                    .any(|candidate| candidate.id() == cause.event()),
-                "cause {:?} must point at an existing event",
-                cause
-            );
-        }
-    }
-}
-
-fn assert_send_attempts_have_visible_outcomes(trace: &[RuntimeEvent]) {
-    for event in trace {
-        let RuntimeEventKind::SendDispatchAttempted {
-            target_shard,
-            target_isolate,
-            target_generation,
-        } = event.kind()
-        else {
-            continue;
-        };
-        let cause = Some(CauseId::new(event.id()));
-
-        assert!(
-            trace.iter().any(|candidate| {
-                candidate.cause() == cause
-                    && matches!(
-                        candidate.kind(),
-                        RuntimeEventKind::SendAccepted {
-                            target_shard: accepted_shard,
-                            target_isolate: accepted_isolate,
-                            target_generation: accepted_generation,
-                        } if accepted_shard == target_shard
-                            && accepted_isolate == target_isolate
-                            && accepted_generation == target_generation
-                    )
-                    || candidate.cause() == cause
-                        && matches!(
-                            candidate.kind(),
-                            RuntimeEventKind::SendRejected {
-                                target_shard: rejected_shard,
-                                target_isolate: rejected_isolate,
-                                target_generation: rejected_generation,
-                                reason: SendRejectedReason::Full | SendRejectedReason::Closed,
-                            } if rejected_shard == target_shard
-                                && rejected_isolate == target_isolate
-                                && rejected_generation == target_generation
-                        )
-            }),
-            "send attempt {:?} must have accepted/rejected outcome",
-            event.id()
-        );
-    }
-}
-
-fn assert_stopped_isolates_do_not_handle_again(trace: &[RuntimeEvent]) {
-    let mut stopped = Vec::new();
-    for event in trace {
-        let identity = (event.shard(), event.isolate());
-        if matches!(event.kind(), RuntimeEventKind::HandlerStarted) {
-            assert!(
-                !stopped.contains(&identity),
-                "stopped isolate {:?} on shard {:?} handled again",
-                event.isolate(),
-                event.shard()
-            );
-        }
-        if matches!(event.kind(), RuntimeEventKind::IsolateStopped) {
-            stopped.push(identity);
-        }
-    }
+    DstRun::new(observed.borrow().clone(), sim.replay_artifact())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,12 +330,6 @@ enum MultiOp {
     RunUntilIdle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MultiRun {
-    observed: Vec<u8>,
-    artifact: MultiShardReplayArtifact,
-}
-
 fn random_multi_ops(seed: u64, len: usize) -> Vec<MultiOp> {
     let mut state = seed ^ 0xd1b5_4a32_d192_ed03;
     let mut ops = Vec::with_capacity(len);
@@ -461,7 +348,10 @@ fn random_multi_ops(seed: u64, len: usize) -> Vec<MultiOp> {
     ops
 }
 
-fn run_random_multishard_history(seed: u64, ops: &[MultiOp]) -> MultiRun {
+fn run_random_multishard_history(
+    seed: u64,
+    ops: &[MultiOp],
+) -> DstRun<Vec<u8>, MultiShardReplayArtifact> {
     let observed = Rc::new(RefCell::new(Vec::new()));
     let mut sim = MultiShardSimulator::with_config(
         [RandomShard(371), RandomShard(372)],
@@ -521,25 +411,20 @@ fn run_random_multishard_history(seed: u64, ops: &[MultiOp]) -> MultiRun {
     }
     sim.run_until_quiescent();
 
-    MultiRun {
-        observed: observed.borrow().clone(),
-        artifact: sim.replay_artifact(),
-    }
+    DstRun::new(observed.borrow().clone(), sim.replay_artifact())
 }
 
 #[test]
 fn seeded_random_single_shard_histories_replay_and_keep_trace_invariants() {
     for seed in 0..32 {
-        let ops = random_ops(seed, 80);
-        let first = run_random_history(seed, &ops);
-        let second = run_random_history(seed, &ops);
+        let history = History::new("single-shard random", seed, random_ops(seed, 80));
+        let first = assert_replays(&history, |history| {
+            run_random_history(history.seed(), history.operations())
+        });
 
-        assert_eq!(first, second, "same seed/history should replay for {seed}");
-        assert_trace_is_causally_well_formed(first.artifact.event_record());
-        assert_send_attempts_have_visible_outcomes(first.artifact.event_record());
-        assert_stopped_isolates_do_not_handle_again(first.artifact.event_record());
+        InvariantSuite::standard().assert(first.artifact().event_record());
         assert!(
-            first.artifact.event_record().iter().any(|event| {
+            first.artifact().event_record().iter().any(|event| {
                 matches!(
                     event.kind(),
                     RuntimeEventKind::CallCompleted {
@@ -555,19 +440,23 @@ fn seeded_random_single_shard_histories_replay_and_keep_trace_invariants() {
 
 #[test]
 fn dst_history_shrinker_keeps_replayable_failure_but_removes_noise() {
-    let noisy = vec![
-        RandomOp::TimerAfter(1),
-        RandomOp::DriverSend(2),
-        RandomOp::Step,
-        RandomOp::StopTarget,
-        RandomOp::RunUntilIdle,
-        RandomOp::DriverSend(9),
-        RandomOp::RunUntilIdle,
-        RandomOp::TimerAfter(10),
-    ];
-    fn has_closed_rejection(ops: &[RandomOp]) -> bool {
-        run_random_history(123, ops)
-            .artifact
+    let noisy = History::new(
+        "closed-rejection shrink",
+        123,
+        vec![
+            RandomOp::TimerAfter(1),
+            RandomOp::DriverSend(2),
+            RandomOp::Step,
+            RandomOp::StopTarget,
+            RandomOp::RunUntilIdle,
+            RandomOp::DriverSend(9),
+            RandomOp::RunUntilIdle,
+            RandomOp::TimerAfter(10),
+        ],
+    );
+    fn has_closed_rejection(history: &History<RandomOp>) -> bool {
+        run_random_history(history.seed(), history.operations())
+            .artifact()
             .event_record()
             .iter()
             .any(|event| {
@@ -582,31 +471,35 @@ fn dst_history_shrinker_keeps_replayable_failure_but_removes_noise() {
     }
     assert!(has_closed_rejection(&noisy));
 
-    let shrunk = shrink_history(&noisy, has_closed_rejection);
-    assert!(shrunk.len() < noisy.len(), "shrinker should remove noise");
-    assert!(has_closed_rejection(&shrunk));
+    let shrunk = delete_shrink(
+        &noisy,
+        ShrinkConfig::default(),
+        "closed rejection survives",
+        has_closed_rejection,
+    );
     assert!(
-        shrunk.len() <= 4,
-        "small closed-rejection reproducer should stay readable: {shrunk:?}"
+        shrunk.shrunk().len() < noisy.len(),
+        "shrinker should remove noise"
+    );
+    assert!(has_closed_rejection(shrunk.shrunk()));
+    assert!(
+        shrunk.shrunk().len() <= 4,
+        "small closed-rejection reproducer should stay readable: {:?}",
+        shrunk.shrunk().operations()
     );
 }
 
 #[test]
 fn seeded_random_multishard_histories_replay_and_keep_remote_pressure_visible() {
     for seed in 0..32 {
-        let ops = random_multi_ops(seed, 80);
-        let first = run_random_multishard_history(seed, &ops);
-        let second = run_random_multishard_history(seed, &ops);
+        let history = History::new("multi-shard random", seed, random_multi_ops(seed, 80));
+        let first = assert_replays(&history, |history| {
+            run_random_multishard_history(history.seed(), history.operations())
+        });
 
-        assert_eq!(
-            first, second,
-            "same multi-shard history should replay for {seed}"
-        );
-        assert_trace_is_causally_well_formed(first.artifact.event_record());
-        assert_send_attempts_have_visible_outcomes(first.artifact.event_record());
-        assert_stopped_isolates_do_not_handle_again(first.artifact.event_record());
+        InvariantSuite::standard().assert(first.artifact().event_record());
         assert!(
-            first.artifact.event_record().iter().any(|event| {
+            first.artifact().event_record().iter().any(|event| {
                 matches!(
                     event.kind(),
                     RuntimeEventKind::SendRejected {
@@ -617,5 +510,26 @@ fn seeded_random_multishard_histories_replay_and_keep_remote_pressure_visible() 
             }),
             "seed {seed} should exercise visible remote pressure or stale target rejection"
         );
+    }
+}
+
+#[test]
+fn dst_long_seed_sweep_replays_when_enabled() {
+    if std::env::var_os("TINA_DST_LONG").is_none() {
+        return;
+    }
+
+    for seed in 0..512 {
+        let single = History::new("long single-shard random", seed, random_ops(seed, 96));
+        let single_run = assert_replays(&single, |history| {
+            run_random_history(history.seed(), history.operations())
+        });
+        InvariantSuite::standard().assert(single_run.artifact().event_record());
+
+        let multi = History::new("long multi-shard random", seed, random_multi_ops(seed, 96));
+        let multi_run = assert_replays(&multi, |history| {
+            run_random_multishard_history(history.seed(), history.operations())
+        });
+        InvariantSuite::standard().assert(multi_run.artifact().event_record());
     }
 }

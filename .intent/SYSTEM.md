@@ -174,6 +174,16 @@ local-send delivery, timer wake delivery, and TCP completion order can shift in
 controlled seeded ways. These shifts are there to find ordering bugs, not to
 create a second meaning for the program.
 
+`tina_sim::dst` is the reusable deterministic-simulation-testing surface.
+Generated histories are data: they must carry enough seed/history information
+to replay the same run. DST failures should shrink by deleting irrelevant
+operations, or the test must explain why shrinking does not apply. Common trace
+invariants live in one place so tests do not silently copy weaker checkers.
+Simulator storage faults are simulator-only durable-image faults; they are not
+native filesystem crash-consistency claims. Live-vs-sim differential tests
+compare semantic projections rather than raw trace identity unless a test
+explicitly claims byte-identical replay.
+
 `tina-runtime` and `tina-sim` now both expose multi-shard runners. A
 multi-shard runner is still an explicit-step model, not real parallel shard
 execution. It owns several shard-local runtimes/simulators, routes roots by

@@ -155,6 +155,10 @@ and reviews live under `.intent/phases/`.
   live TCP plus persistence proof, terminal trace summaries, and expanded DST
   pressure over persistence, TCP cancellation, bridge ingress, and live-vs-sim
   parity.
+- Stuga: reusable deterministic-simulation-testing harness, history-as-data
+  replay checks, deletion shrinking, common trace invariants, simulator storage
+  fault injection, bridge model DST, long-run seed rails, and live-vs-sim
+  semantic projection helpers.
 
 ## Near-term roadmap
 
@@ -163,7 +167,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Stuga first-class DST** | Turn Tina's deterministic simulation testing from bespoke hard tests into a reusable framework capability: history-as-data, replay artifacts, common invariants, deletion shrinking, simulator storage fault injection, bridge model DST, and live-vs-sim semantic differential rails. |
 | **Timmerhus live topology and failure domains** | Production-runtime hardening after DST rails exist: thread pinning/topology, live shard ownership reporting, peer/shard liveness vocabulary, peer quarantine decision, shard-restart propagation rules, and whether local cross-shard isolate-call reply transport belongs before remoting. |
 | **Funkishus storage and I/O maturity** | Mature runtime-owned I/O/storage where named workloads prove the need: nonblocking storage reactor decision, platform durability support, DNS/TLS/UDP/process/signal rails, and bridge/adapter policy without weakening Tina semantics. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |

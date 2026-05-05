@@ -502,6 +502,7 @@ fn run_local_server_oracle(seed: u64) -> LocalServerOracleRun {
                     ],
                 }],
             },
+            storage: Default::default(),
         },
     );
     let parent = sim.register_with_mailbox_capacity(

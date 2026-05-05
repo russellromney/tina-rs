@@ -8,7 +8,10 @@ use tina_runtime::{
     CallError, CallKind, JournalReplay, JournalReplayWarning, RuntimeEventKind, SnapshotImage,
     journal_append, journal_replay, snapshot_commit, snapshot_load,
 };
-use tina_sim::{DurableImage, Simulator, SimulatorConfig};
+use tina_sim::{
+    DurableImage, ScriptedStorageFaultConfig, Simulator, SimulatorConfig,
+    dst::{DstRun, History, InvariantSuite, assert_replays, persistence_image_replays},
+};
 use tina_supervisor::SupervisorConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -443,12 +446,6 @@ enum PersistenceOp {
     RunUntilIdle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PersistenceRun {
-    observed: Vec<String>,
-    artifact: tina_sim::ReplayArtifact,
-}
-
 fn xorshift64(mut state: u64) -> u64 {
     state ^= state << 13;
     state ^= state >> 7;
@@ -474,7 +471,7 @@ fn persistence_ops(seed: u64, len: usize) -> Vec<PersistenceOp> {
     ops
 }
 
-fn run_persistence_ops(seed: u64, ops: &[PersistenceOp]) -> PersistenceRun {
+fn run_persistence_ops(seed: u64, ops: &[PersistenceOp]) -> DstRun<Vec<String>> {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(
         SimShard,
@@ -512,26 +509,23 @@ fn run_persistence_ops(seed: u64, ops: &[PersistenceOp]) -> PersistenceRun {
     }
     sim.run_until_quiescent();
 
-    PersistenceRun {
-        observed: observed.lock().expect("observed mutex").clone(),
-        artifact: sim.replay_artifact(),
-    }
+    DstRun::new(
+        observed.lock().expect("observed mutex").clone(),
+        sim.replay_artifact(),
+    )
 }
 
 #[test]
 fn simulator_random_persistence_matrix_replays_and_keeps_journal_recoverable() {
     for seed in 0..24 {
-        let ops = persistence_ops(seed, 48);
-        let first = run_persistence_ops(seed, &ops);
-        let second = run_persistence_ops(seed, &ops);
-
-        assert_eq!(
-            first, second,
-            "persistence DST replay drift for seed {seed}"
-        );
+        let history = History::new("persistence fault matrix", seed, persistence_ops(seed, 48));
+        let first = assert_replays(&history, |history| {
+            run_persistence_ops(history.seed(), history.operations())
+        });
+        InvariantSuite::standard().assert(first.artifact().event_record());
 
         let mut fresh = Simulator::new(SimShard, SimulatorConfig::default());
-        fresh.load_durable_image(first.artifact.durable_image().clone());
+        fresh.load_durable_image(first.artifact().durable_image().clone());
         let recovered_observed = Arc::new(Mutex::new(Vec::new()));
         let recovered = fresh
             .register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
@@ -556,7 +550,15 @@ fn simulator_random_persistence_matrix_replays_and_keeps_journal_recoverable() {
             }),
             "seed {seed} produced an unrecoverable durable image"
         );
-        assert!(first.artifact.event_record().iter().any(|event| {
+        if first
+            .artifact()
+            .durable_image()
+            .get(journal_path())
+            .is_some()
+        {
+            persistence_image_replays(first.artifact().durable_image(), journal_path()).unwrap();
+        }
+        assert!(first.artifact().event_record().iter().any(|event| {
             matches!(
                 event.kind(),
                 RuntimeEventKind::JournalAppended { .. }
@@ -565,6 +567,99 @@ fn simulator_random_persistence_matrix_replays_and_keeps_journal_recoverable() {
                     | RuntimeEventKind::RecoveryFinished
             )
         }));
+    }
+}
+
+#[test]
+fn persistence_history_replays_and_recovers_after_fault_injection() {
+    let cases = [
+        ScriptedStorageFaultConfig {
+            fail_journal_append_at: Some(0),
+            ..Default::default()
+        },
+        ScriptedStorageFaultConfig {
+            truncate_journal_tail_at: Some(0),
+            ..Default::default()
+        },
+        ScriptedStorageFaultConfig {
+            corrupt_journal_record_at: Some(0),
+            ..Default::default()
+        },
+        ScriptedStorageFaultConfig {
+            fail_snapshot_commit_at: Some(1),
+            ..Default::default()
+        },
+        ScriptedStorageFaultConfig {
+            commit_uncertain_snapshot_at: Some(1),
+            ..Default::default()
+        },
+    ];
+
+    for (case_index, storage) in cases.into_iter().enumerate() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut sim = Simulator::new(
+            SimShard,
+            SimulatorConfig {
+                storage,
+                ..Default::default()
+            },
+        );
+        let service = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
+            PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
+            16,
+        );
+
+        sim.try_send(service, PersistMsg::Mutate(format!("case-{case_index}")))
+            .unwrap();
+        sim.run_until_quiescent();
+        sim.try_send(service, PersistMsg::CommitSnapshot).unwrap();
+        sim.run_until_quiescent();
+        sim.try_send(service, PersistMsg::Recover).unwrap();
+        sim.run_until_quiescent();
+
+        let artifact = sim.replay_artifact();
+        InvariantSuite::standard().assert(artifact.event_record());
+        match case_index {
+            0 => assert!(artifact.event_record().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::JournalAppendFailed {
+                        reason: CallError::Io,
+                        ..
+                    }
+                )
+            })),
+            1 => assert!(
+                artifact
+                    .event_record()
+                    .iter()
+                    .any(|event| { matches!(event.kind(), RuntimeEventKind::RecoveryFinished) })
+            ),
+            2 => assert!(artifact.event_record().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::RecoveryFailed {
+                        reason: CallError::CorruptRecord
+                    }
+                )
+            })),
+            3 => assert!(artifact.event_record().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::SnapshotCommitFailed {
+                        reason: CallError::Io
+                    }
+                )
+            })),
+            _ => assert!(artifact.event_record().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::SnapshotCommitFailed {
+                        reason: CallError::CommitUncertain
+                    }
+                )
+            })),
+        }
     }
 }
 

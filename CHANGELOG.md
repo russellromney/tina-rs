@@ -4,6 +4,25 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Stuga
+
+- Added `tina_sim::dst` with reusable `History`, `DstRun`, replay assertion,
+  deletion shrinking, shrink reports, trace invariant suite, persistence-image
+  replay helper, visible-pressure helper, and semantic projection comparison.
+- Refactored randomized single-shard and multi-shard DST tests onto the shared
+  harness and added an optional `TINA_DST_LONG=1` long seed sweep.
+- Added harness self-tests proving replay equality, deletion shrinking,
+  causality failure detection, and accepted settled-send fixtures.
+- Added simulator-only `ScriptedStorageFaultConfig` for deterministic
+  journal/snapshot failure, truncate, corrupt, and commit-uncertain durable
+  image faults.
+- Reworked persistence and TCP cancellation matrices into history-shaped DST
+  runs using shared replay and invariant checks.
+- Reworked bridge ingress model DST to use shared histories and deletion
+  shrinking while keeping it explicitly model-only.
+- Added live-vs-sim projection comparison helper and used it for oracle,
+  simulator, and Betelgeuse runner parity checks.
+
 ### Phase Johan Rudolph Thorbecke
 
 - Added a bounded live storage lane for snapshot/journal persistence work so

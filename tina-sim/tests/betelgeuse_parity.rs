@@ -9,7 +9,7 @@ use tina_runtime::{
     BetelgeuseBackedRuntime, CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
     RuntimeEventKind, SendRejectedReason, sleep_then,
 };
-use tina_sim::{Simulator, SimulatorConfig};
+use tina_sim::{Simulator, SimulatorConfig, dst::assert_projection_eq};
 
 #[derive(Debug, Clone, Copy)]
 struct TestShard;
@@ -254,11 +254,25 @@ fn retry_timer_workload_matches_oracle_simulator_and_betelgeuse_runner() {
     let (betelgeuse_observations, betelgeuse_trace) = run_betelgeuse();
 
     assert_eq!(oracle_observations, expected_observations());
-    assert_eq!(sim_observations, oracle_observations);
-    assert_eq!(betelgeuse_observations, oracle_observations);
-    assert_eq!(count_sleep_completed(&oracle_trace), 1);
-    assert_eq!(count_sleep_completed(&sim_trace), 1);
-    assert_eq!(count_sleep_completed(&betelgeuse_trace), 1);
+    assert_projection_eq("oracle", &oracle_observations, "sim", &sim_observations);
+    assert_projection_eq(
+        "oracle",
+        &oracle_observations,
+        "betelgeuse",
+        &betelgeuse_observations,
+    );
+    assert_projection_eq(
+        "oracle sleep completions",
+        &count_sleep_completed(&oracle_trace),
+        "sim sleep completions",
+        &count_sleep_completed(&sim_trace),
+    );
+    assert_projection_eq(
+        "oracle sleep completions",
+        &count_sleep_completed(&oracle_trace),
+        "betelgeuse sleep completions",
+        &count_sleep_completed(&betelgeuse_trace),
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,9 +440,23 @@ fn send_stop_workload_matches_oracle_simulator_and_betelgeuse_runner() {
     let (betelgeuse_observed, betelgeuse_trace) = run_send_stop_betelgeuse();
 
     assert_eq!(oracle_observed, vec![1, 2]);
-    assert_eq!(sim_observed, oracle_observed);
-    assert_eq!(betelgeuse_observed, oracle_observed);
-    assert_eq!(closed_rejections(&oracle_trace), 2);
-    assert_eq!(closed_rejections(&sim_trace), 2);
-    assert_eq!(closed_rejections(&betelgeuse_trace), 2);
+    assert_projection_eq("oracle", &oracle_observed, "sim", &sim_observed);
+    assert_projection_eq(
+        "oracle",
+        &oracle_observed,
+        "betelgeuse",
+        &betelgeuse_observed,
+    );
+    assert_projection_eq(
+        "oracle closed rejections",
+        &closed_rejections(&oracle_trace),
+        "sim closed rejections",
+        &closed_rejections(&sim_trace),
+    );
+    assert_projection_eq(
+        "oracle closed rejections",
+        &closed_rejections(&oracle_trace),
+        "betelgeuse closed rejections",
+        &closed_rejections(&betelgeuse_trace),
+    );
 }

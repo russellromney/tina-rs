@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use tina_sim::dst::{DstRun, History, ShrinkConfig, assert_replays, delete_shrink};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelOp {
     Submit(u64),
@@ -101,9 +103,9 @@ fn random_ops(seed: u64) -> Vec<ModelOp> {
     ops
 }
 
-fn run_model(ops: &[ModelOp]) -> Vec<ModelEvent> {
+fn run_model(history: &History<ModelOp>) -> DstRun<Vec<ModelEvent>, Vec<ModelEvent>> {
     let mut model = BridgeModel::new(3);
-    for op in ops {
+    for op in history.operations() {
         match *op {
             ModelOp::Submit(id) => model.submit(id),
             ModelOp::TimeoutOldest => model.timeout_oldest(),
@@ -114,18 +116,17 @@ fn run_model(ops: &[ModelOp]) -> Vec<ModelEvent> {
     while !model.queue.is_empty() {
         model.worker_step();
     }
-    model.events
+    DstRun::new(model.events.clone(), model.events)
 }
 
 #[test]
 fn bridge_ingress_model_dst_keeps_timeout_from_mutating_service_state() {
     for seed in 0..64 {
-        let ops = random_ops(seed);
-        let first = run_model(&ops);
-        let second = run_model(&ops);
-        assert_eq!(first, second, "bridge model replay drift for seed {seed}");
+        let history = History::new("bridge ingress model", seed, random_ops(seed));
+        let first = assert_replays(&history, run_model);
 
         let timed_out: Vec<u64> = first
+            .output()
             .iter()
             .filter_map(|event| match event {
                 ModelEvent::TimedOut(id) => Some(*id),
@@ -134,13 +135,44 @@ fn bridge_ingress_model_dst_keeps_timeout_from_mutating_service_state() {
             .collect();
         for id in timed_out {
             assert!(
-                first.contains(&ModelEvent::SkippedCancelled(id)),
+                first.output().contains(&ModelEvent::SkippedCancelled(id)),
                 "timed-out request {id} should be skipped by worker"
             );
             assert!(
-                !first.contains(&ModelEvent::Mutated(id)),
+                !first.output().contains(&ModelEvent::Mutated(id)),
                 "timed-out request {id} must not mutate service state"
             );
         }
     }
+}
+
+#[test]
+fn bridge_history_shrinks_cancelled_mutation_failure_model() {
+    let history = History::new(
+        "bridge cancelled mutation shrink",
+        0,
+        vec![
+            ModelOp::Submit(1),
+            ModelOp::Submit(2),
+            ModelOp::TimeoutOldest,
+            ModelOp::WorkerStep,
+            ModelOp::WorkerStep,
+            ModelOp::Close,
+        ],
+    );
+    let still_has_cancel_skip = |candidate: &History<ModelOp>| {
+        run_model(candidate)
+            .output()
+            .contains(&ModelEvent::SkippedCancelled(1))
+    };
+    assert!(still_has_cancel_skip(&history));
+
+    let shrunk = delete_shrink(
+        &history,
+        ShrinkConfig::default(),
+        "cancelled request still skipped",
+        still_has_cancel_skip,
+    );
+    assert!(shrunk.shrunk().len() < history.len());
+    assert!(still_has_cancel_skip(shrunk.shrunk()));
 }
