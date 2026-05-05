@@ -758,3 +758,26 @@ This file records completed work.
   stateful session/control-plane shape with local audit send.
 - Kept helper surface test-local for now; no public application builder,
   router, registry, or macro was added.
+
+### Phase Victor Marijnen
+
+- Made `LocalSystemConfig` the live bounded-shape manifest for ingress,
+  shard-pair transport, storage, DNS, TLS, process, signal, trace retention,
+  and idle wait.
+- Added live local cross-shard isolate calls with requester-shard-owned pending
+  state, bounded request/reply transport, typed success/full/closed/timeout
+  outcomes, and DST coverage for reply paths.
+- Split live source-to-destination remote transport from worker command ingress
+  so shard-pair capacity is a real bounded queue, not a soft metric.
+- Added native inbound TLS server support with `TlsListenerId`, `tls_bind`,
+  `tls_accept`, `tls_close_listener`, existing TLS read/write/close, static
+  cert/key scope, total accept/handshake deadline, and negative-path tests for
+  invalid key, failed handshake, lane full, timeout, and shutdown.
+- Added live resource inventory and terminal shutdown accounting for TCP
+  listeners/streams, TLS listeners/streams, UDP sockets, files, and pending
+  driver work. Shutdown `clean` now requires no remaining owned resources.
+- Added and updated LocalSystem e2e proofs for topology, resource accounting,
+  cross-shard calls, TLS server hosting, configured lane capacities, worker
+  failure visibility, and shutdown behavior.
+- Updated `tina-sim` TLS scripts to model server bind/accept/close outcomes
+  deterministically without pretending to test cryptography.

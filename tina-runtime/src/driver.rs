@@ -205,6 +205,7 @@ pub(crate) struct BetelgeuseDriver {
     tls: TlsLane,
     process: ProcessLane,
     signals: Vec<SignalWaitEntry>,
+    signal_capacity: usize,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
 }
@@ -568,24 +569,28 @@ impl BetelgeuseDriver {
             signals: Vec::with_capacity(
                 DEFAULT_SIGNAL_CAPACITY.min(INITIAL_DRIVER_PENDING_CAPACITY),
             ),
+            signal_capacity: DEFAULT_SIGNAL_CAPACITY,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
     }
 
-    pub(crate) fn with_io_loop_and_storage_capacity(
+    pub(crate) fn with_io_loop_and_capacities(
         io_loop: IOLoopHandle<Global>,
         storage_lane_capacity: usize,
+        dns_lane_capacity: usize,
+        tls_lane_capacity: usize,
+        process_lane_capacity: usize,
+        signal_capacity: usize,
     ) -> Self {
         Self {
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::new(storage_lane_capacity),
-            dns: DnsLane::new(DEFAULT_DNS_LANE_CAPACITY),
-            tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY),
-            process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
-            signals: Vec::with_capacity(
-                DEFAULT_SIGNAL_CAPACITY.min(INITIAL_DRIVER_PENDING_CAPACITY),
-            ),
+            dns: DnsLane::new(dns_lane_capacity),
+            tls: TlsLane::new(tls_lane_capacity),
+            process: ProcessLane::new(process_lane_capacity),
+            signals: Vec::with_capacity(signal_capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
+            signal_capacity,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
@@ -822,7 +827,7 @@ impl BetelgeuseDriver {
                 result: CallOutput::Failed(CallError::Timeout),
             });
         }
-        if self.signals.iter().filter(|entry| !entry.cancelled).count() >= DEFAULT_SIGNAL_CAPACITY {
+        if self.signals.iter().filter(|entry| !entry.cancelled).count() >= self.signal_capacity {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::SignalFull),
@@ -1845,14 +1850,12 @@ impl TlsWorkerLane {
     }
 
     fn cancel_pending(&mut self) {
+        let had_pending = !self.pending.is_empty();
         for pending in &mut self.pending {
             pending.cancelled.store(true, Ordering::Release);
         }
         self.sender = None;
         self.drain_completion_channel();
-        self.pending.clear();
-        self.listeners.clear();
-        self.streams.clear();
         if self
             .handle
             .as_ref()
@@ -1861,6 +1864,13 @@ impl TlsWorkerLane {
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
+            self.pending.clear();
+            self.listeners.clear();
+            self.streams.clear();
+        } else if !had_pending {
+            self.pending.clear();
+            self.listeners.clear();
+            self.streams.clear();
         }
     }
 
@@ -2281,7 +2291,9 @@ fn accept_tls(
     listener
         .set_nonblocking(true)
         .map_err(|_| CallError::TlsClosed)?;
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(CallError::Timeout)?;
     let (tcp, peer_addr) = loop {
         if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err(CallError::Timeout);
@@ -2295,20 +2307,41 @@ fn accept_tls(
         }
     };
     tcp.set_nonblocking(false).map_err(|_| CallError::Io)?;
-    let _ = tcp.set_read_timeout(Some(timeout));
-    let _ = tcp.set_write_timeout(Some(timeout));
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(CallError::Timeout)?;
+    let _ = tcp.set_read_timeout(Some(remaining));
+    let _ = tcp.set_write_timeout(Some(remaining));
     let connection = rustls::ServerConnection::new(config).map_err(|_| CallError::TlsHandshake)?;
     let mut stream = rustls::StreamOwned::new(connection, tcp);
     while stream.conn.is_handshaking() {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err(CallError::Timeout);
         }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(CallError::Timeout)?;
+        let _ = stream.sock.set_read_timeout(Some(remaining));
+        let _ = stream.sock.set_write_timeout(Some(remaining));
         stream
             .conn
             .complete_io(&mut stream.sock)
-            .map_err(|_| CallError::TlsHandshake)?;
+            .map_err(tls_handshake_error)?;
     }
     Ok((TlsRuntimeStream::Server(stream), peer_addr))
+}
+
+fn tls_handshake_error(error: std::io::Error) -> CallError {
+    if matches!(
+        error.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+    ) {
+        CallError::Timeout
+    } else {
+        CallError::TlsHandshake
+    }
 }
 
 fn read_tls(

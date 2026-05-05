@@ -418,3 +418,40 @@ Verification:
 - `cargo +nightly check --workspace`
 - `cargo +nightly clippy -p tina-runtime -p tina-sim --all-targets -- -D warnings`
 - `make verify`
+
+# Implementation Review 4
+
+Verdict: Victor is boring enough to close. The hostile review findings were
+real and are now fixed.
+
+Fixes:
+
+- TLS shutdown no longer clears listener/stream tables while cancelled in-flight
+  TLS work may still hold cloned resources in the worker. If work is still
+  alive, terminal resource accounting stays non-zero instead of lying.
+- Terminal shutdown `clean` now requires zero remaining owned resources, not
+  merely "worker returned without a typed error."
+- TLS accept uses one total deadline across TCP accept and server handshake.
+  Handshake I/O timeout now reports `CallError::Timeout` instead of generic
+  `TlsHandshake`.
+- `LocalSystemConfig` DNS/TLS/process/signal capacities now actually flow into
+  the live driver. Before this fix, only storage capacity reached the worker.
+- Runtime capability reports now reflect configured DNS/TLS/process/signal
+  capacities instead of default constants.
+
+New regression proofs:
+
+- Invalid TLS key fails as `TlsCertificate` and leaks no resource.
+- Failed inbound TLS handshake closes the listener and leaks no `TlsStreamId`.
+- Shutdown during an in-flight TLS handshake reports remaining owned resources
+  and is not clean.
+- Configured `tls_lane_capacity = 1` produces visible `TlsFull`.
+- Capability report test pins custom DNS/TLS/process/signal capacities.
+
+Focused verification:
+
+- `cargo +nightly test -p tina-runtime --test local_system local_system_tls -- --nocapture`
+- `cargo +nightly test -p tina-runtime --test local_system local_system_shutdown_reports_in_flight_tls_handshake_resource -- --nocapture`
+- `cargo +nightly test -p tina-runtime --test local_system local_system_capabilities_name_supported_and_unsupported_resource_families -- --nocapture`
+- `cargo +nightly test -p tina-runtime --lib driver::tests::tls_lane_deadline_tombstones_queued_work_until_late_completion -- --nocapture`
+- `cargo +nightly check --workspace`

@@ -556,9 +556,21 @@ impl TlsServerService {
                     .push("closed".to_string());
                 noop()
             }
-            TlsServerMsg::Bound(Err(error))
-            | TlsServerMsg::Accepted(Err(error), _)
-            | TlsServerMsg::Read(Err(error), _, _)
+            TlsServerMsg::Bound(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("tls server observed lock")
+                    .push(format!("failed:{error:?}"));
+                noop()
+            }
+            TlsServerMsg::Accepted(Err(error), listener) => {
+                self.observed
+                    .lock()
+                    .expect("tls server observed lock")
+                    .push(format!("failed:{error:?}"));
+                tls_close_listener(listener).reply(TlsServerMsg::ListenerClosed)
+            }
+            TlsServerMsg::Read(Err(error), _, _)
             | TlsServerMsg::Wrote(Err(error), _, _)
             | TlsServerMsg::StreamClosed(Err(error), _)
             | TlsServerMsg::ListenerClosed(Err(error)) => {
@@ -1482,8 +1494,16 @@ fn local_system_topology_report_before_and_after_shutdown() {
 
 #[test]
 fn local_system_capabilities_name_supported_and_unsupported_resource_families() {
+    let config = LocalSystemConfig {
+        storage_lane_capacity: 7,
+        dns_lane_capacity: 3,
+        tls_lane_capacity: 5,
+        process_lane_capacity: 2,
+        signal_capacity: 4,
+        ..LocalSystemConfig::default()
+    };
     let app = LocalSystem::single_shard(AppShard(37), AppMailboxFactory)
-        .storage_lane_capacity(7)
+        .config(config)
         .build();
 
     let capabilities = app.capabilities();
@@ -1528,6 +1548,7 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         capabilities.dns.cancellation(),
         CancellationSupport::TombstonedAfterStart
     );
+    assert_eq!(capabilities.dns.capacity(), Some(3));
     assert_eq!(capabilities.udp.support(), ResourceSupport::Supported);
     assert_eq!(
         capabilities.udp.execution(),
@@ -1538,11 +1559,13 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         capabilities.process.execution(),
         ResourceExecutionShape::LaneBackedBlocking
     );
+    assert_eq!(capabilities.process.capacity(), Some(2));
     assert_eq!(capabilities.signal.support(), ResourceSupport::Supported);
     assert_eq!(
         capabilities.signal.execution(),
         ResourceExecutionShape::PollBacked
     );
+    assert_eq!(capabilities.signal.capacity(), Some(4));
     assert_eq!(capabilities.tls.support(), ResourceSupport::Supported);
     assert_eq!(
         capabilities.tls.execution(),
@@ -1552,6 +1575,7 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         capabilities.tls.cancellation(),
         CancellationSupport::TombstonedAfterStart
     );
+    assert_eq!(capabilities.tls.capacity(), Some(5));
 
     assert_eq!(
         capabilities.durability.file_fsync,
@@ -1800,6 +1824,264 @@ fn local_system_tls_server_accepts_reads_writes_and_closes() {
             terminal.trace()
         );
     }
+}
+
+#[test]
+fn local_system_tls_bind_rejects_invalid_key_without_leaking_resources() {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(44), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<TlsServerService, Infallible>(
+            TlsServerService {
+                observed: Arc::clone(&observed),
+                cert_der,
+                key_der: b"not-a-private-key".to_vec(),
+            },
+            8,
+        )
+        .expect("register tls server service");
+
+    app.try_send(address, TlsServerMsg::Start)
+        .expect("start tls server service");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("tls invalid key observed lock")
+            .iter()
+            .any(|entry| entry == "failed:TlsCertificate")
+    });
+    assert_eq!(
+        app.topology()
+            .shard(ShardId::new(44))
+            .expect("invalid key shard")
+            .owned_resource_count(),
+        0
+    );
+
+    let terminal = app.shutdown().drain().join().expect("invalid key shutdown");
+    assert_eq!(
+        terminal.shutdown_report().remaining_owned_resource_count(),
+        0
+    );
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TlsBind,
+                reason: CallError::TlsCertificate,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn local_system_tls_failed_handshake_closes_listener_and_leaks_no_stream() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(45), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<TlsServerService, Infallible>(
+            TlsServerService {
+                observed: Arc::clone(&observed),
+                cert_der,
+                key_der,
+            },
+            8,
+        )
+        .expect("register tls server service");
+
+    app.try_send(address, TlsServerMsg::Start)
+        .expect("start tls server service");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("tls failed handshake observed lock")
+            .iter()
+            .any(|entry| entry.starts_with("bound:"))
+    });
+    let addr: SocketAddr = observed
+        .lock()
+        .expect("tls failed handshake observed lock")
+        .iter()
+        .find_map(|entry| entry.strip_prefix("bound:").map(str::to_string))
+        .expect("bound addr")
+        .parse()
+        .expect("parse bound addr");
+
+    let mut raw = TcpStream::connect(addr).expect("connect raw tcp to tls listener");
+    raw.write_all(b"not tls").expect("write invalid tls bytes");
+    raw.shutdown(Shutdown::Both).expect("shutdown raw tcp");
+
+    wait_until(|| {
+        let entries = observed.lock().expect("tls failed handshake observed lock");
+        entries
+            .iter()
+            .any(|entry| entry == "failed:TlsHandshake" || entry == "failed:Timeout")
+            && entries.iter().any(|entry| entry == "closed")
+    });
+    wait_until(|| {
+        app.topology()
+            .shard(ShardId::new(45))
+            .expect("failed handshake shard")
+            .owned_resource_count()
+            == 0
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("failed handshake shutdown");
+    assert_eq!(
+        terminal.shutdown_report().remaining_owned_resource_count(),
+        0
+    );
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TlsAccept,
+                reason: CallError::TlsHandshake | CallError::Timeout,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn local_system_shutdown_reports_in_flight_tls_handshake_resource() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(46), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let address = app
+        .register_root::<TlsServerService, Infallible>(
+            TlsServerService {
+                observed: Arc::clone(&observed),
+                cert_der,
+                key_der,
+            },
+            8,
+        )
+        .expect("register tls server service");
+
+    app.try_send(address, TlsServerMsg::Start)
+        .expect("start tls server service");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("tls in-flight observed lock")
+            .iter()
+            .any(|entry| entry.starts_with("bound:"))
+    });
+    let addr: SocketAddr = observed
+        .lock()
+        .expect("tls in-flight observed lock")
+        .iter()
+        .find_map(|entry| entry.strip_prefix("bound:").map(str::to_string))
+        .expect("bound addr")
+        .parse()
+        .expect("parse bound addr");
+    let raw = TcpStream::connect(addr).expect("connect raw tcp to tls listener");
+
+    let terminal = app.shutdown().drain().join_report();
+    assert!(!terminal.shutdown_report().clean());
+    assert!(
+        terminal.shutdown_report().remaining_owned_resource_count() >= 1,
+        "shutdown must not claim zero while TLS worker still owns accept/handshake resource"
+    );
+    drop(raw);
+}
+
+#[test]
+fn local_system_tls_lane_full_is_visible_with_configured_capacity() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let first_seen = Arc::new(Mutex::new(Vec::new()));
+    let second_seen = Arc::new(Mutex::new(Vec::new()));
+    let config = LocalSystemConfig {
+        tls_lane_capacity: 1,
+        ..LocalSystemConfig::default()
+    };
+    let app = LocalSystem::single_shard(AppShard(47), AppMailboxFactory)
+        .config(config)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let first = app
+        .register_root::<TlsServerService, Infallible>(
+            TlsServerService {
+                observed: Arc::clone(&first_seen),
+                cert_der: cert_der.clone(),
+                key_der: key_der.clone(),
+            },
+            8,
+        )
+        .expect("register first tls server service");
+    let second = app
+        .register_root::<TlsServerService, Infallible>(
+            TlsServerService {
+                observed: Arc::clone(&second_seen),
+                cert_der,
+                key_der,
+            },
+            8,
+        )
+        .expect("register second tls server service");
+
+    app.try_send(first, TlsServerMsg::Start)
+        .expect("start first tls server");
+    wait_until(|| {
+        first_seen
+            .lock()
+            .expect("first tls seen lock")
+            .iter()
+            .any(|entry| entry.starts_with("bound:"))
+    });
+    app.try_send(second, TlsServerMsg::Start)
+        .expect("start second tls server");
+    wait_until(|| {
+        second_seen
+            .lock()
+            .expect("second tls seen lock")
+            .iter()
+            .any(|entry| entry == "failed:TlsFull")
+    });
+
+    let terminal = app.shutdown().drain().join_report();
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::TlsBind,
+                reason: CallError::TlsFull,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]

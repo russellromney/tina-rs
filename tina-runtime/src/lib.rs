@@ -327,6 +327,23 @@ pub struct RuntimeCapabilities {
 impl RuntimeCapabilities {
     /// Returns the current live [`ThreadedRuntime`] capability table.
     pub const fn threaded(storage_lane_capacity: usize) -> Self {
+        Self::threaded_with_capacities(
+            storage_lane_capacity,
+            driver::DEFAULT_DNS_LANE_CAPACITY,
+            driver::DEFAULT_TLS_LANE_CAPACITY,
+            driver::DEFAULT_PROCESS_LANE_CAPACITY,
+            driver::DEFAULT_SIGNAL_CAPACITY,
+        )
+    }
+
+    /// Returns the current live capability table with explicit bounded lane capacities.
+    pub const fn threaded_with_capacities(
+        storage_lane_capacity: usize,
+        dns_lane_capacity: usize,
+        tls_lane_capacity: usize,
+        process_lane_capacity: usize,
+        signal_capacity: usize,
+    ) -> Self {
         Self {
             timers: ResourceCapability::new(
                 ResourceSupport::Supported,
@@ -368,7 +385,7 @@ impl RuntimeCapabilities {
                 ResourceExecutionShape::LaneBackedBlocking,
                 CancellationSupport::TombstonedAfterStart,
                 ShutdownSupport::Tombstoned,
-                Some(driver::DEFAULT_DNS_LANE_CAPACITY),
+                Some(dns_lane_capacity),
             ),
             udp: ResourceCapability::new(
                 ResourceSupport::Supported,
@@ -382,21 +399,21 @@ impl RuntimeCapabilities {
                 ResourceExecutionShape::LaneBackedBlocking,
                 CancellationSupport::TombstonedAfterStart,
                 ShutdownSupport::Tombstoned,
-                Some(driver::DEFAULT_TLS_LANE_CAPACITY),
+                Some(tls_lane_capacity),
             ),
             process: ResourceCapability::new(
                 ResourceSupport::Supported,
                 ResourceExecutionShape::LaneBackedBlocking,
                 CancellationSupport::TombstonedAfterStart,
                 ShutdownSupport::Tombstoned,
-                Some(driver::DEFAULT_PROCESS_LANE_CAPACITY),
+                Some(process_lane_capacity),
             ),
             signal: ResourceCapability::new(
                 ResourceSupport::Supported,
                 ResourceExecutionShape::PollBacked,
                 CancellationSupport::CancelableBeforeStart,
                 ShutdownSupport::Drained,
-                Some(driver::DEFAULT_SIGNAL_CAPACITY),
+                Some(signal_capacity),
             ),
             durability: DurabilityCapability::local(),
         }
@@ -3014,6 +3031,18 @@ pub struct ThreadedRuntimeConfig {
     /// Capacity of the bounded storage lane used for local persistence work.
     pub storage_lane_capacity: usize,
 
+    /// Capacity of the bounded DNS lane.
+    pub dns_lane_capacity: usize,
+
+    /// Capacity of the bounded TLS lane.
+    pub tls_lane_capacity: usize,
+
+    /// Capacity of the bounded process lane.
+    pub process_lane_capacity: usize,
+
+    /// Capacity of runtime-owned signal waits.
+    pub signal_capacity: usize,
+
     /// Trace retention for the worker-owned runtime.
     pub trace_retention: TraceRetention,
 
@@ -3028,6 +3057,10 @@ impl Default for ThreadedRuntimeConfig {
             command_capacity: 64,
             shard_pair_capacity: 64,
             storage_lane_capacity: driver::DEFAULT_STORAGE_LANE_CAPACITY,
+            dns_lane_capacity: driver::DEFAULT_DNS_LANE_CAPACITY,
+            tls_lane_capacity: driver::DEFAULT_TLS_LANE_CAPACITY,
+            process_lane_capacity: driver::DEFAULT_PROCESS_LANE_CAPACITY,
+            signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
         }
@@ -3110,6 +3143,10 @@ impl LocalSystemConfig {
             command_capacity: self.ingress_capacity,
             shard_pair_capacity: self.shard_pair_capacity,
             storage_lane_capacity: self.storage_lane_capacity,
+            dns_lane_capacity: self.dns_lane_capacity,
+            tls_lane_capacity: self.tls_lane_capacity,
+            process_lane_capacity: self.process_lane_capacity,
+            signal_capacity: self.signal_capacity,
             trace_retention: self.trace_retention,
             idle_wait: self.idle_wait,
         }
@@ -3300,6 +3337,7 @@ impl LiveQueueMetrics {
 struct LiveShardMetrics {
     shard: ShardId,
     worker_name: Option<String>,
+    config: ThreadedRuntimeConfig,
     state: AtomicU8,
     ingress: LiveQueueMetrics,
     storage_lane: LiveQueueMetrics,
@@ -3312,6 +3350,7 @@ impl LiveShardMetrics {
         Self {
             shard,
             worker_name,
+            config,
             state: AtomicU8::new(LiveShardState::RUNNING),
             ingress: LiveQueueMetrics::new(config.command_capacity),
             storage_lane: LiveQueueMetrics::new(config.storage_lane_capacity),
@@ -3541,7 +3580,9 @@ impl LocalSystemShutdownReport {
             .unwrap_or_default();
         Self {
             final_state: state,
-            clean: error.is_none() && state == LocalSystemState::Closed,
+            clean: error.is_none()
+                && state == LocalSystemState::Closed
+                && remaining_owned_resource_count == 0,
             canceled_count: summary.call_completion_rejected,
             tombstoned_count: summary.call_reply_rejected,
             rejected_after_drain_count: summary.send_rejected,
@@ -4473,7 +4514,13 @@ where
 
     /// Returns the live runtime capability table for this worker.
     pub fn capabilities(&self) -> RuntimeCapabilities {
-        RuntimeCapabilities::threaded(self.metrics.storage_lane.capacity)
+        RuntimeCapabilities::threaded_with_capacities(
+            self.metrics.config.storage_lane_capacity,
+            self.metrics.config.dns_lane_capacity,
+            self.metrics.config.tls_lane_capacity,
+            self.metrics.config.process_lane_capacity,
+            self.metrics.config.signal_capacity,
+        )
     }
 
     /// Requests shutdown and joins the worker, returning its final trace.
@@ -4550,9 +4597,13 @@ where
         mailbox_factory,
         Box::new(MonotonicClock),
         IdSource::new(),
-        Box::new(BetelgeuseDriver::with_io_loop_and_storage_capacity(
+        Box::new(BetelgeuseDriver::with_io_loop_and_capacities(
             io_loop_factory(),
             config.storage_lane_capacity,
+            config.dns_lane_capacity,
+            config.tls_lane_capacity,
+            config.process_lane_capacity,
+            config.signal_capacity,
         )),
     );
     runtime.set_trace_retention(config.trace_retention);
@@ -4738,9 +4789,13 @@ where
                             factory,
                             Box::new(MonotonicClock),
                             ids,
-                            Box::new(BetelgeuseDriver::with_io_loop_and_storage_capacity(
+                            Box::new(BetelgeuseDriver::with_io_loop_and_capacities(
                                 io_loop,
                                 config.storage_lane_capacity,
+                                config.dns_lane_capacity,
+                                config.tls_lane_capacity,
+                                config.process_lane_capacity,
+                                config.signal_capacity,
                             )),
                         );
                         let mut runtime = runtime;
@@ -4873,13 +4928,19 @@ where
 
     /// Returns the live runtime capability table shared by each worker.
     pub fn capabilities(&self) -> RuntimeCapabilities {
-        let capacity = self
+        let config = self
             .shard_metrics
             .values()
             .next()
-            .map(|metrics| metrics.storage_lane.capacity)
-            .unwrap_or(driver::DEFAULT_STORAGE_LANE_CAPACITY);
-        RuntimeCapabilities::threaded(capacity)
+            .map(|metrics| metrics.config)
+            .unwrap_or_default();
+        RuntimeCapabilities::threaded_with_capacities(
+            config.storage_lane_capacity,
+            config.dns_lane_capacity,
+            config.tls_lane_capacity,
+            config.process_lane_capacity,
+            config.signal_capacity,
+        )
     }
 
     /// Requests shutdown and joins every worker.
