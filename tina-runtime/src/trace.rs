@@ -117,6 +117,18 @@ pub enum CallKind {
     /// A directory create.
     Mkdir,
 
+    /// A local snapshot commit.
+    SnapshotCommit,
+
+    /// A local snapshot load.
+    SnapshotLoad,
+
+    /// A local journal append.
+    JournalAppend,
+
+    /// A local journal replay.
+    JournalReplay,
+
     /// A one-shot relative sleep timer.
     Sleep,
 
@@ -395,6 +407,41 @@ pub enum RuntimeEventKind {
 
         /// Why the reply could not settle the call.
         reason: CallReplyRejectedReason,
+    },
+
+    /// A local snapshot was committed.
+    SnapshotCommitted,
+
+    /// A local snapshot commit failed.
+    SnapshotCommitFailed {
+        /// Why the snapshot commit failed.
+        reason: CallError,
+    },
+
+    /// A local journal record was appended.
+    JournalAppended {
+        /// Appended journal record index.
+        record_index: u64,
+    },
+
+    /// A local journal append failed.
+    JournalAppendFailed {
+        /// Journal record index that failed to append.
+        record_index: u64,
+        /// Why the journal append failed.
+        reason: CallError,
+    },
+
+    /// A persistence recovery call started.
+    RecoveryStarted,
+
+    /// A persistence recovery call finished.
+    RecoveryFinished,
+
+    /// A persistence recovery call failed.
+    RecoveryFailed {
+        /// Why recovery failed.
+        reason: CallError,
     },
 }
 

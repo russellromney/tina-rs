@@ -76,6 +76,7 @@ start from an honest baseline rather than from stale roadmap wording.
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. Ruud Lubbers pins a narrow numerical runtime cost model for selected hot paths: multi-shard send, isolate call, timer, TCP read/write, batch, spawn/restart, trace pressure, live ingress, and high-cardinality idle stepping. Runtime and simulator now reuse per-step scratch and prebuild coordinator storage where tests prove the warmed path. | No broad runtime/simulator allocation-free claim is supported yet; boxed erasure, traces, replay records, completion slots, call translators, and user payloads may still allocate. |
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
 | Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time, TCP server/client operations, and local file operations through a Tina-owned driver boundary with native Betelgeuse and simulated Betelgeuse adapters, cancellation, shutdown, and same-resource lane ownership. | DNS, TLS, UDP, process, signal, broad network-server claims, and live-substrate liveness faults remain future work. |
+| Local persistence | `tina-runtime` exposes local snapshot/journal helpers with explicit append-before-apply semantics, snapshot `last_journal_index`, journal `record_index`, visible truncated/corrupt/commit-uncertain recovery outcomes, and persistence trace events. `tina-sim` captures `DurableImage` path-to-bytes state for replay. | This is not a database, durable mailbox, durable work queue, or exactly-once system. Directory fsync and rename-commit support remain platform/backend scoped. Persistence helpers currently execute synchronous local filesystem work in the driver path; a nonblocking storage reactor is future work. |
 
 ## Testing and proof strategy
 
@@ -146,6 +147,9 @@ and reviews live under `.intent/phases/`.
 - Jelle Zijlstra: runtime-owned outbound TCP connect, runtime-owned local file
   I/O, simulator file oracle, LocalApp/bridge file-service proofs, and exact
   deferrals for DNS/TLS/UDP/process/signal.
+- Wim Kok: local snapshot/journal persistence, restart recovery, durable
+  simulator image, LocalApp/bridge recovery proof, and explicit durable mailbox
+  non-claims.
 
 ## Near-term roadmap
 
@@ -154,7 +158,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Wim Kok persistence** | Durable local state for full-service Tina workflows: snapshots, event journal, restart recovery, durable replay artifacts, and explicit non-claims around durable mailboxes until designed. This is the next core capability because file I/O exists now, but Tina still cannot sensibly port stateful Tokio services that need recovery after process restart. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics phase after the raw runtime-owned I/O surface is boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 ## Later capability roadmap

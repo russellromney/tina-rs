@@ -193,10 +193,10 @@ This repo is a Cargo workspace with six crates:
 - **`tina-supervisor`**: supervisor config.
 - **`tina-runtime`**: explicit-step runtime, multi-shard runner,
   Betelgeuse-backed threaded runtime, runtime-owned TCP/time, observed
-  backpressure, isolate calls with mandatory timeout, and a named
-  `TINA_DRIVER_RUNTIME_CONTRACT`.
+  backpressure, isolate calls with mandatory timeout, local snapshot/journal
+  persistence helpers, and a named `TINA_DRIVER_RUNTIME_CONTRACT`.
 - **`tina-sim`**: deterministic simulator with virtual time, seeded faults,
-  checkers, scripted TCP, and replay.
+  checkers, scripted TCP, durable images, and replay.
 - **`tina-tokio-bridge`**: narrow bounded ingress from Tokio/Tower/Axum into a
   Tina service, with explicit health, metrics, timeout, cancellation, and
   overload policies. Bridge-hosted services can use ordinary Tina message enums,
@@ -206,7 +206,19 @@ You can write isolates against the modern surface: `Outbound`,
 `ChildDefinition`, `RestartableChildDefinition`, `RuntimeCall`, `CallInput`,
 `CallOutput`, `CallError`, `#[tina::isolate(...)]`,
 `#[tina_runtime::isolate(...)]`, `send(...)`, `reply(...)`, `stop()`,
-`batch(...)`, `sleep(...)`, `tcp_read(...)`, and `tcp_write(...)`.
+`batch(...)`, `sleep(...)`, `tcp_read(...)`, `tcp_write(...)`,
+`snapshot_commit(...)`, `snapshot_load(...)`, `journal_append(...)`, and
+`journal_replay(...)`.
+
+Local persistence has an explicit support table:
+`LOCAL_PERSISTENCE_SUPPORT` names temp-write, rename, file fsync,
+parent-directory fsync, truncated-tail warning, and checksum validation
+support for the current build. No quiet durability cosplay.
+If snapshot rename succeeds but the final durability step cannot be proven,
+Tina reports `CallError::CommitUncertain`, because disk state may already have
+changed. In this slice, persistence calls use synchronous local filesystem work
+inside the Tina-owned driver path; they are correct-first helpers, not a
+high-throughput storage reactor.
 
 The old `SendMessage`, `SpawnSpec`, `CurrentCall`, `CallRequest`,
 `CallResult`, `CallFailureReason`, and `tina-runtime-current` names are not the
@@ -218,7 +230,8 @@ public teaching surface.
 - Tokio/Tower/Axum bridge is narrow first form only;
 - the driver-runtime contract is named, but Tina is not a general Rust async
   runtime;
-- no persistence;
+- local persistence is snapshot/journal only, not a database or durable
+  mailbox;
 - no remoting or clustering;
 - no broad zero-allocation claim;
 - no general async ecosystem integration;

@@ -57,8 +57,8 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
-    CallReplyRejectedReason, EffectKind, ListenerId, RestartSkippedReason, RuntimeCall,
-    RuntimeCallParts, RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason,
+    CallReplyRejectedReason, EffectKind, ListenerId, PersistenceTraceInfo, RestartSkippedReason,
+    RuntimeCall, RuntimeCallParts, RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason,
     SupervisionRejectedReason,
 };
 use tina_supervisor::SupervisorConfig;
@@ -77,6 +77,34 @@ pub struct SimulatorConfig {
     pub tcp: ScriptedTcpConfig,
 }
 
+/// Deterministic durable file image captured by simulator replay.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DurableImage {
+    files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+impl DurableImage {
+    /// Creates an empty durable image.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts or replaces one durable file image.
+    pub fn insert(&mut self, path: impl Into<PathBuf>, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        self.files.insert(path.into(), bytes)
+    }
+
+    /// Returns one durable file image by path.
+    pub fn get(&self, path: impl AsRef<std::path::Path>) -> Option<&[u8]> {
+        self.files.get(path.as_ref()).map(Vec::as_slice)
+    }
+
+    /// Returns all durable file bytes in deterministic path order.
+    pub fn files(&self) -> &BTreeMap<PathBuf, Vec<u8>> {
+        &self.files
+    }
+}
+
 /// Captured replay data for one deterministic simulator run.
 ///
 /// Replay means rerunning the same workload under the same simulator config
@@ -89,6 +117,7 @@ pub struct ReplayArtifact {
     event_record: Vec<RuntimeEvent>,
     checker_failure: Option<CheckerFailure>,
     observed_peer_output: Vec<ObservedPeerOutput>,
+    durable_image: DurableImage,
 }
 
 impl ReplayArtifact {
@@ -116,6 +145,11 @@ impl ReplayArtifact {
     pub fn observed_peer_output(&self) -> &[ObservedPeerOutput] {
         &self.observed_peer_output
     }
+
+    /// Returns the deterministic durable image captured during the run.
+    pub fn durable_image(&self) -> &DurableImage {
+        &self.durable_image
+    }
 }
 
 /// Captured replay data for one deterministic multi-shard simulator run.
@@ -130,6 +164,7 @@ pub struct MultiShardReplayArtifact {
     event_record: Vec<RuntimeEvent>,
     checker_failure: Option<CheckerFailure>,
     observed_peer_output: Vec<ObservedPeerOutput>,
+    durable_image: DurableImage,
 }
 
 impl MultiShardReplayArtifact {
@@ -161,6 +196,11 @@ impl MultiShardReplayArtifact {
     /// Returns the peer-visible output captured during the run.
     pub fn observed_peer_output(&self) -> &[ObservedPeerOutput] {
         &self.observed_peer_output
+    }
+
+    /// Returns the deterministic durable image captured during the run.
+    pub fn durable_image(&self) -> &DurableImage {
+        &self.durable_image
     }
 }
 
@@ -375,6 +415,7 @@ struct InFlightCall {
     call_kind: CallKind,
     requester: RegisteredAddress,
     cause: tina_runtime::CauseId,
+    persistence: Option<PersistenceTraceInfo>,
 }
 
 type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
@@ -1335,6 +1376,19 @@ where
             event_record: self.trace.clone(),
             checker_failure: self.last_checker_failure.clone(),
             observed_peer_output: self.observed_peer_output(),
+            durable_image: self.durable_image(),
+        }
+    }
+
+    /// Replaces the simulator's durable file image.
+    pub fn load_durable_image(&mut self, image: DurableImage) {
+        self.file_storage = image.files;
+    }
+
+    /// Captures the simulator's deterministic durable file image.
+    pub fn durable_image(&self) -> DurableImage {
+        DurableImage {
+            files: self.file_storage.clone(),
         }
     }
 
@@ -1928,11 +1982,20 @@ where
         request: CallInput,
         translator: ErasedTranslator,
     ) {
+        let persistence = request.persistence_trace_info();
+        if persistence == Some(PersistenceTraceInfo::Recovery) {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::RecoveryStarted,
+            );
+        }
         self.in_flight_calls.push(InFlightCall {
             call_id,
             call_kind,
             requester,
             cause,
+            persistence,
         });
         self.translators.push(StoredTranslator {
             call_id,
@@ -1976,6 +2039,18 @@ where
             CallInput::FileSize { file } => self.handle_file_size(call_id, file),
             CallInput::FileClose { file } => self.handle_file_close(call_id, file),
             CallInput::Mkdir { path, .. } => self.handle_mkdir(call_id, path),
+            CallInput::SnapshotCommit {
+                path,
+                bytes,
+                last_journal_index,
+            } => self.handle_snapshot_commit(call_id, path, bytes, last_journal_index),
+            CallInput::SnapshotLoad { path } => self.handle_snapshot_load(call_id, path),
+            CallInput::JournalAppend {
+                path,
+                record_index,
+                bytes,
+            } => self.handle_journal_append(call_id, path, record_index, bytes),
+            CallInput::JournalReplay { path } => self.handle_journal_replay(call_id, path),
         }
     }
 
@@ -2553,6 +2628,97 @@ where
             call_id,
             TcpResourceKey::Mkdir(call_id),
             CallOutput::DirectoryCreated,
+        );
+    }
+
+    fn handle_snapshot_commit(
+        &mut self,
+        call_id: CallId,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        last_journal_index: u64,
+    ) {
+        if !self.parent_directory_exists(&path) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        let snapshot = tina_runtime::SnapshotImage {
+            bytes,
+            last_journal_index,
+        };
+        self.file_storage
+            .insert(path, tina_runtime::persistence::encode_snapshot(&snapshot));
+        self.deliver_completion(call_id, CallOutput::SnapshotCommitted);
+    }
+
+    fn handle_snapshot_load(&mut self, call_id: CallId, path: PathBuf) {
+        let result = match self.file_storage.get(&path) {
+            Some(bytes) => tina_runtime::persistence::decode_snapshot(bytes).map(Some),
+            None => Ok(None),
+        };
+        self.deliver_completion(
+            call_id,
+            match result {
+                Ok(snapshot) => CallOutput::SnapshotLoaded { snapshot },
+                Err(reason) => CallOutput::Failed(reason),
+            },
+        );
+    }
+
+    fn handle_journal_append(
+        &mut self,
+        call_id: CallId,
+        path: PathBuf,
+        record_index: u64,
+        bytes: Vec<u8>,
+    ) {
+        if !self.parent_directory_exists(&path) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        if let Some(existing) = self.file_storage.get(&path) {
+            let replay = match tina_runtime::persistence::replay_journal_bytes(existing) {
+                Ok(replay) => replay,
+                Err(reason) => {
+                    self.deliver_completion(call_id, CallOutput::Failed(reason));
+                    return;
+                }
+            };
+            if replay.warning.is_some()
+                || replay
+                    .records
+                    .last()
+                    .is_some_and(|last| record_index <= last.index)
+            {
+                self.deliver_completion(call_id, CallOutput::Failed(CallError::CorruptRecord));
+                return;
+            }
+        }
+        let record = tina_runtime::JournalRecord {
+            index: record_index,
+            bytes,
+        };
+        self.file_storage
+            .entry(path)
+            .or_default()
+            .extend(tina_runtime::persistence::encode_journal_record(&record));
+        self.deliver_completion(call_id, CallOutput::JournalAppended { record_index });
+    }
+
+    fn handle_journal_replay(&mut self, call_id: CallId, path: PathBuf) {
+        let result = match self.file_storage.get(&path) {
+            Some(bytes) => tina_runtime::persistence::replay_journal_bytes(bytes),
+            None => Ok(tina_runtime::JournalReplay {
+                records: Vec::new(),
+                warning: None,
+            }),
+        };
+        self.deliver_completion(
+            call_id,
+            match result {
+                Ok(replay) => CallOutput::JournalReplayed { replay },
+                Err(reason) => CallOutput::Failed(reason),
+            },
         );
     }
 
@@ -3296,6 +3462,7 @@ where
                 },
             );
         }
+        self.push_persistence_completion_events(&in_flight, &result, failure_reason);
 
         let message = translator(result);
 
@@ -3365,6 +3532,64 @@ where
                         call_kind: in_flight.call_kind,
                         reason: CallCompletionRejectedReason::RequesterClosed,
                     },
+                );
+            }
+        }
+    }
+
+    fn push_persistence_completion_events(
+        &mut self,
+        in_flight: &InFlightCall,
+        result: &CallOutput,
+        failure_reason: Option<CallError>,
+    ) {
+        let Some(persistence) = in_flight.persistence else {
+            return;
+        };
+        match (persistence, failure_reason, result) {
+            (PersistenceTraceInfo::SnapshotCommit, None, _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::SnapshotCommitted,
+                );
+            }
+            (PersistenceTraceInfo::SnapshotCommit, Some(reason), _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::SnapshotCommitFailed { reason },
+                );
+            }
+            (PersistenceTraceInfo::JournalAppend { record_index }, None, _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::JournalAppended { record_index },
+                );
+            }
+            (PersistenceTraceInfo::JournalAppend { record_index }, Some(reason), _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::JournalAppendFailed {
+                        record_index,
+                        reason,
+                    },
+                );
+            }
+            (PersistenceTraceInfo::Recovery, None, _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::RecoveryFinished,
+                );
+            }
+            (PersistenceTraceInfo::Recovery, Some(reason), _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::RecoveryFailed { reason },
                 );
             }
         }
@@ -3676,6 +3901,10 @@ fn call_kind(request: &CallInput) -> CallKind {
         CallInput::FileSize { .. } => CallKind::FileSize,
         CallInput::FileClose { .. } => CallKind::FileClose,
         CallInput::Mkdir { .. } => CallKind::Mkdir,
+        CallInput::SnapshotCommit { .. } => CallKind::SnapshotCommit,
+        CallInput::SnapshotLoad { .. } => CallKind::SnapshotLoad,
+        CallInput::JournalAppend { .. } => CallKind::JournalAppend,
+        CallInput::JournalReplay { .. } => CallKind::JournalReplay,
         CallInput::Sleep { .. } => CallKind::Sleep,
     }
 }
@@ -4196,6 +4425,13 @@ where
                 .iter()
                 .flat_map(Simulator::observed_peer_output)
                 .collect(),
+            durable_image: DurableImage {
+                files: self
+                    .simulators
+                    .iter()
+                    .flat_map(|simulator| simulator.durable_image().files.into_iter())
+                    .collect(),
+            },
         }
     }
 

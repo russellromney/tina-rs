@@ -269,7 +269,9 @@ impl Client {
                         CallError::InvalidResource
                         | CallError::Io
                         | CallError::Unsupported
-                        | CallError::ResourceBusy,
+                        | CallError::ResourceBusy
+                        | CallError::CorruptRecord
+                        | CallError::CommitUncertain,
                     ) => push(&self.events, "unexpected_call_error"),
                 }
                 noop()

@@ -334,6 +334,44 @@ impl BetelgeuseTcp {
                     Err(result) => Some(DriverCompletion { call_id, result }),
                 }
             }
+            CallInput::SnapshotCommit {
+                path,
+                bytes,
+                last_journal_index,
+            } => Some(DriverCompletion {
+                call_id,
+                result: match crate::persistence::commit_snapshot(&path, bytes, last_journal_index)
+                {
+                    Ok(()) => CallOutput::SnapshotCommitted,
+                    Err(reason) => CallOutput::Failed(reason),
+                },
+            }),
+            CallInput::SnapshotLoad { path } => Some(DriverCompletion {
+                call_id,
+                result: match crate::persistence::load_snapshot(&path) {
+                    Ok(snapshot) => CallOutput::SnapshotLoaded { snapshot },
+                    Err(reason) => CallOutput::Failed(reason),
+                },
+            }),
+            CallInput::JournalAppend {
+                path,
+                record_index,
+                bytes,
+            } => Some(DriverCompletion {
+                call_id,
+                result: match crate::persistence::append_journal_record(&path, record_index, bytes)
+                {
+                    Ok(()) => CallOutput::JournalAppended { record_index },
+                    Err(reason) => CallOutput::Failed(reason),
+                },
+            }),
+            CallInput::JournalReplay { path } => Some(DriverCompletion {
+                call_id,
+                result: match crate::persistence::replay_journal(&path) {
+                    Ok(replay) => CallOutput::JournalReplayed { replay },
+                    Err(reason) => CallOutput::Failed(reason),
+                },
+            }),
             CallInput::FileReadAt { file, len, offset } => {
                 let lane = PendingLane::FileRead(file);
                 if self.lane_has_pending(lane) {

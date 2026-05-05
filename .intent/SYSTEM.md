@@ -45,7 +45,7 @@ We are trying to carry over Tina's shape, not copy every detail one-for-one.
 ## What ships now
 
 Today the repo ships `tina`, `tina-mailbox-spsc`, `tina-supervisor`,
-`tina-runtime`, and `tina-sim`.
+`tina-runtime`, `tina-sim`, and `tina-tokio-bridge`.
 
 `tina` owns the shared words: `Isolate`, `Address`, `Context`, `Effect`,
 `Outbound`, child definitions, and supervision policy types. It does not pick
@@ -83,17 +83,18 @@ each restart for restartable children.
 `tina-runtime` is the explicit-step runtime. It handles same-shard sends,
 same-shard child spawn, supervision, restart, sends into the runtime from
 outside, bounded mailboxes, stale generation rejection, panic capture, abandon
-tracing, time calls, Betelgeuse-backed TCP calls, and runtime-owned local file
-calls. Its `step()` is
+tracing, time calls, Betelgeuse-backed TCP calls, runtime-owned local file
+calls, and local snapshot/journal persistence calls. Its `step()` is
 synchronous from the outside: the runtime collects finished owned work,
 translates completions into messages, and then handles ready mailbox work.
 
-`tina-runtime` also has a narrow live substrate: `BetelgeuseRuntime` for one
-shard and `BetelgeuseMultiShardRuntime` for a fixed shard set. Each shard runtime
-is constructed and owned by one OS worker thread; handles communicate through
-bounded command queues. Live cross-shard sends move `Send + 'static` payloads
-through those bounded worker queues. This is an execution path, not a second
-semantic model: the explicit-step runtime and simulator remain the oracle.
+`tina-runtime` also has a narrow live substrate: `BetelgeuseBackedRuntime` for
+one shard and `BetelgeuseBackedMultiShardRuntime` for a fixed shard set. Each
+shard runtime is constructed and owned by one OS worker thread; handles
+communicate through bounded command queues. Live cross-shard sends move
+`Send + 'static` payloads through those bounded worker queues. This is an
+execution path, not a second semantic model: the explicit-step runtime and
+simulator remain the oracle.
 Peer quarantine, cross-shard child ownership, and live cross-shard isolate-call
 reply transport are not claimed. Live cross-shard isolate calls reject with the
 same-shard-only call outcome until a later phase designs reply transport.
@@ -107,9 +108,30 @@ liveness faults are not claimed.
 
 The shipped runtime call types are `RuntimeCall<Message>` over
 `CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep,
-TCP listener/stream/client-connect operations, and local file operations.
-Sockets and files are runtime-owned opaque ids; raw sockets and file handles do
-not live in isolate state.
+TCP listener/stream/client-connect operations, local file operations, and local
+snapshot/journal persistence. Sockets and files are runtime-owned opaque ids;
+raw sockets and file handles do not live in isolate state.
+
+Persistence is deliberately local and domain-level. `snapshot_commit`,
+`snapshot_load`, `journal_append`, and `journal_replay` persist user-provided
+bytes with Tina metadata around them. Snapshot metadata includes
+`last_journal_index`; journal records include monotonic `record_index`.
+Append-before-apply is the intended state rule: user state mutates only after
+the durable append succeeds. Truncated journal tails are visible; complete
+checksum failures, duplicate indexes, and out-of-order indexes are corrupt
+records. If snapshot rename succeeds but the final durability step cannot be
+proven, the result is `CallError::CommitUncertain`; consumers must recover from
+disk before assuming either old or new snapshot state. This is not a database,
+durable mailbox, durable work queue, or exactly-once system.
+
+Persistence support is named by `LOCAL_PERSISTENCE_SUPPORT`, including
+temp-write, rename, file fsync, parent-directory fsync, truncated-tail warning,
+and checksum validation. Unsupported platform durability strength must remain
+visible as `NotClaimed`, not upgraded in prose.
+
+Persistence calls are runtime-owned from the isolate's point of view, but in
+this slice they execute synchronous local filesystem work in the driver path.
+Do not claim high-throughput or nonblocking storage reactor semantics for Wim.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may directly cause many later events. Trace
@@ -121,11 +143,11 @@ outside sends into the runtime reject stale known generations as closed instead
 of silently delivering to a newer incarnation.
 
 `tina-sim` is the deterministic simulator for the same model. It uses virtual
-time, scripted TCP resources, seeded delays/reordering, replay records, and
-checker failures, while keeping the live runtime event types. Replay records
-reproduce against the same workload binary and simulator version; they do not
-serialize arbitrary isolate values, spawn factories, bootstrap closures, or TCP
-scripts.
+time, scripted TCP resources, deterministic durable images, seeded
+delays/reordering, replay records, and checker failures, while keeping the live
+runtime event types. Replay records reproduce against the same workload binary
+and simulator version; they do not serialize arbitrary isolate values, spawn
+factories, bootstrap closures, or TCP scripts.
 
 The simulator can move simulator-owned events without changing the model:
 local-send delivery, timer wake delivery, and TCP completion order can shift in
@@ -158,10 +180,10 @@ or full remote target does not poison the whole destination shard. There is no
 shard-down, peer-down, shard-restarted, or peer-restarted event vocabulary yet.
 Peer quarantine and shard-restart rules are still later design work.
 
-There is not yet a Tokio bridge, and the bridge is not the main runtime story.
-The runtime call types do not pick a backend, so the simulator, the current
-runtime, the Betelgeuse substrate, and later runtimes can share one meaning
-model.
+There is a narrow Tokio/Tower bridge, but the bridge is not the main runtime
+story. Tokio owns the edge; Tina owns isolate state. The runtime call types do
+not pick a backend, so the simulator, the current runtime, the Betelgeuse
+substrate, and later runtimes can share one meaning model.
 
 ## Crate boundaries that must not drift
 

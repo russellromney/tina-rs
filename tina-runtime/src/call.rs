@@ -162,6 +162,41 @@ impl FileOpenOptions {
     }
 }
 
+/// Durable snapshot loaded by Tina's local persistence helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotImage {
+    /// Opaque user payload.
+    pub bytes: Vec<u8>,
+    /// Last journal record reflected by this snapshot.
+    pub last_journal_index: u64,
+}
+
+/// One durable domain record decoded from a journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalRecord {
+    /// Monotonic application-owned record index.
+    pub index: u64,
+    /// Opaque user payload.
+    pub bytes: Vec<u8>,
+}
+
+/// Non-fatal journal replay warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JournalReplayWarning {
+    /// The journal ended with an incomplete final record. Valid prefix records
+    /// were returned.
+    TruncatedTail,
+}
+
+/// Journal replay output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalReplay {
+    /// Valid records in durable order.
+    pub records: Vec<JournalRecord>,
+    /// Warning for a non-fatal tail condition.
+    pub warning: Option<JournalReplayWarning>,
+}
+
 /// One concrete call shape understood by `tina-runtime`.
 ///
 /// New verbs are added by extending this enum, not by adding a top-level
@@ -282,6 +317,38 @@ pub enum CallInput {
         mode: u32,
     },
 
+    /// Commit one local snapshot.
+    SnapshotCommit {
+        /// Snapshot path.
+        path: PathBuf,
+        /// Opaque user payload.
+        bytes: Vec<u8>,
+        /// Last journal record reflected by this snapshot.
+        last_journal_index: u64,
+    },
+
+    /// Load one local snapshot.
+    SnapshotLoad {
+        /// Snapshot path.
+        path: PathBuf,
+    },
+
+    /// Append one local journal record.
+    JournalAppend {
+        /// Journal path.
+        path: PathBuf,
+        /// Monotonic application-owned record index.
+        record_index: u64,
+        /// Opaque user payload.
+        bytes: Vec<u8>,
+    },
+
+    /// Replay one local journal.
+    JournalReplay {
+        /// Journal path.
+        path: PathBuf,
+    },
+
     /// Sleep for a relative duration.
     ///
     /// Completion fires no earlier than `armed_at + after` on a future
@@ -312,9 +379,41 @@ impl CallInput {
             Self::FileSize { .. } => crate::trace::CallKind::FileSize,
             Self::FileClose { .. } => crate::trace::CallKind::FileClose,
             Self::Mkdir { .. } => crate::trace::CallKind::Mkdir,
+            Self::SnapshotCommit { .. } => crate::trace::CallKind::SnapshotCommit,
+            Self::SnapshotLoad { .. } => crate::trace::CallKind::SnapshotLoad,
+            Self::JournalAppend { .. } => crate::trace::CallKind::JournalAppend,
+            Self::JournalReplay { .. } => crate::trace::CallKind::JournalReplay,
             Self::Sleep { .. } => crate::trace::CallKind::Sleep,
         }
     }
+
+    #[doc(hidden)]
+    pub const fn persistence_trace_info(&self) -> Option<PersistenceTraceInfo> {
+        match self {
+            Self::SnapshotCommit { .. } => Some(PersistenceTraceInfo::SnapshotCommit),
+            Self::SnapshotLoad { .. } | Self::JournalReplay { .. } => {
+                Some(PersistenceTraceInfo::Recovery)
+            }
+            Self::JournalAppend { record_index, .. } => Some(PersistenceTraceInfo::JournalAppend {
+                record_index: *record_index,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceTraceInfo {
+    /// Snapshot commit trace category.
+    SnapshotCommit,
+    /// Journal append trace category.
+    JournalAppend {
+        /// Application-owned record index.
+        record_index: u64,
+    },
+    /// Recovery trace category.
+    Recovery,
 }
 
 /// One concrete call completion delivered to the issuing isolate.
@@ -403,6 +502,27 @@ pub enum CallOutput {
     /// A directory was created.
     DirectoryCreated,
 
+    /// A snapshot was committed.
+    SnapshotCommitted,
+
+    /// A snapshot was loaded.
+    SnapshotLoaded {
+        /// Loaded snapshot, or `None` when no snapshot exists yet.
+        snapshot: Option<SnapshotImage>,
+    },
+
+    /// A journal record was appended.
+    JournalAppended {
+        /// Appended record index.
+        record_index: u64,
+    },
+
+    /// A journal replay completed.
+    JournalReplayed {
+        /// Replayed journal records.
+        replay: JournalReplay,
+    },
+
     /// A timer sleep completed and the isolate should wake.
     TimerFired,
 
@@ -439,6 +559,16 @@ pub enum CallError {
     /// one read and one write pending at the same time, but duplicate work on
     /// the same lane and explicit close while any lane is pending fail here.
     ResourceBusy,
+
+    /// A complete journal record had a checksum mismatch.
+    CorruptRecord,
+
+    /// Snapshot rename finished, but the runtime could not complete the final
+    /// durability step such as syncing the parent directory.
+    ///
+    /// The caller must treat the durable state as unknown and recover from
+    /// disk before applying follow-up assumptions.
+    CommitUncertain,
 
     /// The target isolate's mailbox was full when the runtime attempted an
     /// isolate-to-isolate call.
@@ -1048,6 +1178,42 @@ impl CallOutput {
             other => Self::panic_wrong_shape("DirectoryCreated", &other),
         }
     }
+
+    /// Extracts the successful snapshot commit result.
+    pub fn into_snapshot_committed(self) -> Result<(), CallError> {
+        match self {
+            Self::SnapshotCommitted => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("SnapshotCommitted", &other),
+        }
+    }
+
+    /// Extracts the successful snapshot load result.
+    pub fn into_snapshot_loaded(self) -> Result<Option<SnapshotImage>, CallError> {
+        match self {
+            Self::SnapshotLoaded { snapshot } => Ok(snapshot),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("SnapshotLoaded", &other),
+        }
+    }
+
+    /// Extracts the successful journal append result.
+    pub fn into_journal_appended(self) -> Result<(), CallError> {
+        match self {
+            Self::JournalAppended { .. } => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("JournalAppended", &other),
+        }
+    }
+
+    /// Extracts the successful journal replay result.
+    pub fn into_journal_replayed(self) -> Result<JournalReplay, CallError> {
+        match self {
+            Self::JournalReplayed { replay } => Ok(replay),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("JournalReplayed", &other),
+        }
+    }
 }
 
 /// Doc-hidden carrier used by typed call helpers like [`sleep`] and
@@ -1371,5 +1537,53 @@ pub fn mkdir(path: impl Into<PathBuf>, mode: u32) -> TypedCall<()> {
             mode,
         },
         CallOutput::into_directory_created,
+    )
+}
+
+/// Commits one snapshot with Tina's local persistence framing.
+pub fn snapshot_commit(
+    path: impl Into<PathBuf>,
+    bytes: Vec<u8>,
+    last_journal_index: u64,
+) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::SnapshotCommit {
+            path: path.into(),
+            bytes,
+            last_journal_index,
+        },
+        CallOutput::into_snapshot_committed,
+    )
+}
+
+/// Loads one snapshot committed by [`snapshot_commit`].
+pub fn snapshot_load(path: impl Into<PathBuf>) -> TypedCall<Option<SnapshotImage>> {
+    TypedCall::new(
+        CallInput::SnapshotLoad { path: path.into() },
+        CallOutput::into_snapshot_loaded,
+    )
+}
+
+/// Appends one domain record to a local journal.
+pub fn journal_append(
+    path: impl Into<PathBuf>,
+    record_index: u64,
+    bytes: Vec<u8>,
+) -> TypedCall<()> {
+    TypedCall::new(
+        CallInput::JournalAppend {
+            path: path.into(),
+            record_index,
+            bytes,
+        },
+        CallOutput::into_journal_appended,
+    )
+}
+
+/// Replays one local journal committed by [`journal_append`].
+pub fn journal_replay(path: impl Into<PathBuf>) -> TypedCall<JournalReplay> {
+    TypedCall::new(
+        CallInput::JournalReplay { path: path.into() },
+        CallOutput::into_journal_replayed,
     )
 }

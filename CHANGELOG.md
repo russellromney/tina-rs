@@ -4,6 +4,29 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Wim Kok
+
+- Added Tina local persistence helpers: `snapshot_commit`,
+  `snapshot_load`, `journal_append`, and `journal_replay`.
+- Added durable snapshot metadata with `last_journal_index`, framed journal
+  records with monotonic `record_index`, and append-before-apply recovery
+  semantics.
+- Added explicit persistence trace events for snapshot commit, journal append,
+  recovery start/finish/failure, and snapshot/journal failures.
+- Added `LOCAL_PERSISTENCE_SUPPORT` so platform durability claims are visible
+  instead of implied.
+- Added `JournalReplayWarning::TruncatedTail` for valid-prefix replay and
+  `CallError::CorruptRecord` for complete records with bad checksums or
+  unreplayable record index order.
+- Added `CallError::CommitUncertain` for snapshot commits where rename already
+  happened but the final durability step could not be proven.
+- Added simulator `DurableImage` capture/load support so durable recovery can
+  be replayed from deterministic path-to-bytes state.
+- Proved live `Runtime`, canonical `LocalApp`, deterministic `tina-sim`, and
+  Tokio bridge recovery paths for stateful services.
+- Added negative proof that failed journal append is visible and does not
+  mutate user state.
+
 ### Phase Piet de Jong
 
 - Added `tina_runtime::LocalApp` as the canonical live app owner for local

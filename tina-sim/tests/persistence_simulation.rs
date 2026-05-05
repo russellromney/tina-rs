@@ -1,0 +1,368 @@
+use std::convert::Infallible;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use tina::prelude::*;
+use tina_runtime::{
+    CallError, CallKind, JournalReplay, JournalReplayWarning, RuntimeEventKind, SnapshotImage,
+    journal_append, journal_replay, snapshot_commit, snapshot_load,
+};
+use tina_sim::{DurableImage, Simulator, SimulatorConfig};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SimShard;
+
+impl Shard for SimShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(36)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PersistMsg {
+    Recover,
+    SnapshotLoaded(Result<Option<SnapshotImage>, CallError>),
+    JournalLoaded(Result<JournalReplay, CallError>),
+    Mutate(String),
+    MutationDurable(Result<(), CallError>, u64, Vec<u8>),
+    CommitSnapshot,
+    SnapshotCommitted(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct PersistService {
+    snapshot_path: PathBuf,
+    journal_path: PathBuf,
+    values: Vec<String>,
+    last_journal_index: u64,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = PersistMsg, shard = SimShard)]
+impl PersistService {
+    fn handle(&mut self, msg: PersistMsg, _ctx: &mut Context<'_, SimShard>) -> Effect<Self> {
+        match msg {
+            PersistMsg::Recover => {
+                snapshot_load(self.snapshot_path.clone()).reply(PersistMsg::SnapshotLoaded)
+            }
+            PersistMsg::SnapshotLoaded(Ok(Some(snapshot))) => {
+                self.values = decode_values(&snapshot.bytes);
+                self.last_journal_index = snapshot.last_journal_index;
+                journal_replay(self.journal_path.clone()).reply(PersistMsg::JournalLoaded)
+            }
+            PersistMsg::SnapshotLoaded(Ok(None)) => {
+                journal_replay(self.journal_path.clone()).reply(PersistMsg::JournalLoaded)
+            }
+            PersistMsg::SnapshotLoaded(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("observed mutex")
+                    .push(format!("snapshot-error:{error:?}"));
+                stop()
+            }
+            PersistMsg::JournalLoaded(Ok(replay)) => {
+                for record in replay.records {
+                    if record.index > self.last_journal_index {
+                        self.values
+                            .push(String::from_utf8(record.bytes).expect("utf8 record"));
+                        self.last_journal_index = record.index;
+                    }
+                }
+                if replay.warning == Some(JournalReplayWarning::TruncatedTail) {
+                    self.observed
+                        .lock()
+                        .expect("observed mutex")
+                        .push("truncated-tail".to_owned());
+                }
+                self.record_state();
+                noop()
+            }
+            PersistMsg::JournalLoaded(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("observed mutex")
+                    .push(format!("journal-error:{error:?}"));
+                stop()
+            }
+            PersistMsg::Mutate(value) => {
+                let index = self.last_journal_index + 1;
+                let record = value.into_bytes();
+                journal_append(self.journal_path.clone(), index, record.clone())
+                    .reply(move |result| PersistMsg::MutationDurable(result, index, record))
+            }
+            PersistMsg::MutationDurable(Ok(()), index, record) => {
+                self.values
+                    .push(String::from_utf8(record).expect("utf8 record"));
+                self.last_journal_index = index;
+                self.record_state();
+                noop()
+            }
+            PersistMsg::MutationDurable(Err(error), _, _) => {
+                self.observed
+                    .lock()
+                    .expect("observed mutex")
+                    .push(format!("append-error:{error:?}"));
+                noop()
+            }
+            PersistMsg::CommitSnapshot => snapshot_commit(
+                self.snapshot_path.clone(),
+                encode_values(&self.values),
+                self.last_journal_index,
+            )
+            .reply(PersistMsg::SnapshotCommitted),
+            PersistMsg::SnapshotCommitted(Ok(())) => {
+                self.observed
+                    .lock()
+                    .expect("observed mutex")
+                    .push(format!("snapshot:{}", self.last_journal_index));
+                noop()
+            }
+            PersistMsg::SnapshotCommitted(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("observed mutex")
+                    .push(format!("snapshot-error:{error:?}"));
+                noop()
+            }
+        }
+    }
+}
+
+impl PersistService {
+    fn new(
+        snapshot_path: PathBuf,
+        journal_path: PathBuf,
+        observed: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            snapshot_path,
+            journal_path,
+            values: Vec::new(),
+            last_journal_index: 0,
+            observed,
+        }
+    }
+
+    fn record_state(&self) {
+        self.observed
+            .lock()
+            .expect("observed mutex")
+            .push(self.values.join(","));
+    }
+}
+
+fn encode_values(values: &[String]) -> Vec<u8> {
+    values.join("\n").into_bytes()
+}
+
+fn decode_values(bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    String::from_utf8(bytes.to_vec())
+        .expect("utf8 snapshot")
+        .split('\n')
+        .map(str::to_owned)
+        .collect()
+}
+
+fn snapshot_path() -> PathBuf {
+    PathBuf::from("/tmp/tina-persist-snapshot")
+}
+
+fn journal_path() -> PathBuf {
+    PathBuf::from("/tmp/tina-persist-journal")
+}
+
+#[test]
+fn simulator_replays_durable_recovery_from_durable_image() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+        PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
+        16,
+    );
+    sim.try_send(address, PersistMsg::Mutate("hay".to_owned()))
+        .unwrap();
+    sim.run_until_quiescent();
+    sim.try_send(address, PersistMsg::Mutate("oats".to_owned()))
+        .unwrap();
+    sim.run_until_quiescent();
+    sim.try_send(address, PersistMsg::CommitSnapshot).unwrap();
+    sim.run_until_quiescent();
+
+    let artifact = sim.replay_artifact();
+    assert!(artifact.durable_image().get(snapshot_path()).is_some());
+    assert!(artifact.durable_image().get(journal_path()).is_some());
+
+    let fresh_observed = Arc::new(Mutex::new(Vec::new()));
+    let mut fresh = Simulator::new(SimShard, SimulatorConfig::default());
+    fresh.load_durable_image(artifact.durable_image().clone());
+    let fresh_address = fresh
+        .register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+            PersistService::new(snapshot_path(), journal_path(), Arc::clone(&fresh_observed)),
+            16,
+        );
+    fresh.try_send(fresh_address, PersistMsg::Recover).unwrap();
+    fresh.run_until_quiescent();
+
+    assert_eq!(
+        fresh_observed.lock().expect("observed mutex").as_slice(),
+        &["hay,oats"]
+    );
+    assert!(
+        fresh
+            .trace()
+            .iter()
+            .any(|event| { matches!(event.kind(), RuntimeEventKind::RecoveryStarted) })
+    );
+    assert!(
+        fresh
+            .trace()
+            .iter()
+            .any(|event| { matches!(event.kind(), RuntimeEventKind::RecoveryFinished) })
+    );
+    let recovery_started = fresh
+        .trace()
+        .iter()
+        .find(|event| matches!(event.kind(), RuntimeEventKind::RecoveryStarted))
+        .expect("recovery started")
+        .id();
+    let snapshot_completed = fresh
+        .trace()
+        .iter()
+        .find(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::SnapshotLoad,
+                    ..
+                }
+            )
+        })
+        .expect("snapshot load completed")
+        .id();
+    assert!(
+        recovery_started < snapshot_completed,
+        "recovery start should be traced before the load completes"
+    );
+    assert_eq!(
+        sim.trace()
+            .iter()
+            .filter(|event| matches!(event.kind(), RuntimeEventKind::JournalAppended { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        sim.trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted {
+                        call_kind: CallKind::JournalAppend,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn simulator_visible_truncated_and_corrupt_recovery_paths() {
+    let mut image = DurableImage::new();
+    let good = tina_runtime::persistence::encode_journal_record(&tina_runtime::JournalRecord {
+        index: 1,
+        bytes: b"hay".to_vec(),
+    });
+    let mut truncated = good.clone();
+    truncated.extend_from_slice(&[0, 1, 2]);
+    image.insert(journal_path(), truncated);
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
+    sim.load_durable_image(image);
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+        PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
+        16,
+    );
+    sim.try_send(address, PersistMsg::Recover).unwrap();
+    sim.run_until_quiescent();
+    assert_eq!(
+        observed.lock().expect("observed mutex").as_slice(),
+        &["truncated-tail", "hay"]
+    );
+
+    let mut corrupt = good;
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    let mut corrupt_image = DurableImage::new();
+    corrupt_image.insert(journal_path(), corrupt);
+    let corrupt_observed = Arc::new(Mutex::new(Vec::new()));
+    let mut corrupt_sim = Simulator::new(SimShard, SimulatorConfig::default());
+    corrupt_sim.load_durable_image(corrupt_image);
+    let corrupt_address = corrupt_sim
+        .register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+            PersistService::new(
+                snapshot_path(),
+                journal_path(),
+                Arc::clone(&corrupt_observed),
+            ),
+            16,
+        );
+    corrupt_sim
+        .try_send(corrupt_address, PersistMsg::Recover)
+        .unwrap();
+    corrupt_sim.run_until_quiescent();
+    assert_eq!(
+        corrupt_observed.lock().expect("observed mutex").as_slice(),
+        &["journal-error:CorruptRecord"]
+    );
+    assert!(corrupt_sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::RecoveryFailed {
+                reason: CallError::CorruptRecord
+            }
+        )
+    }));
+}
+
+#[test]
+fn simulator_journal_append_rejects_bad_next_index_before_mutation() {
+    let mut image = DurableImage::new();
+    image.insert(
+        journal_path(),
+        tina_runtime::persistence::encode_journal_record(&tina_runtime::JournalRecord {
+            index: 2,
+            bytes: b"existing".to_vec(),
+        }),
+    );
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
+    sim.load_durable_image(image);
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+        PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
+        16,
+    );
+
+    sim.try_send(address, PersistMsg::Mutate("first".to_owned()))
+        .unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        observed.lock().expect("observed mutex").as_slice(),
+        &["append-error:CorruptRecord"]
+    );
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::JournalAppendFailed {
+                record_index: 1,
+                reason: CallError::CorruptRecord
+            }
+        )
+    }));
+}

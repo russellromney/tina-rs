@@ -51,14 +51,20 @@ use betelgeuse::{IOLoopHandle, io_loop};
 
 mod call;
 mod driver;
+pub mod persistence;
 mod trace;
 
+pub use crate::persistence::{
+    LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
+};
 pub use call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
-    IntoErasedCall, IsolateCall, ListenerId, RuntimeCall, RuntimeCallParts, SendOutcome, StreamId,
+    IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
+    PersistenceTraceInfo, RuntimeCall, RuntimeCallParts, SendOutcome, SnapshotImage, StreamId,
     TypedCall, call, file_close, file_create, file_fsync, file_open, file_read, file_read_at,
-    file_size, file_write, file_write_at, mkdir, send_observed, sleep, sleep_then, tcp_accept,
-    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    file_size, file_write, file_write_at, journal_append, journal_replay, mkdir, send_observed,
+    sleep, sleep_then, snapshot_commit, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
+    tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 use driver::DriverCompletion;
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
@@ -263,6 +269,7 @@ struct InFlightCall {
     call_kind: CallKind,
     requester: RegisteredAddress,
     cause: CauseId,
+    persistence: Option<call::PersistenceTraceInfo>,
 }
 
 type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
@@ -1002,6 +1009,14 @@ where
         request: CallInput,
         translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
     ) {
+        let persistence = request.persistence_trace_info();
+        if persistence == Some(call::PersistenceTraceInfo::Recovery) {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::RecoveryStarted,
+            );
+        }
         // Register the translator and in-flight tracking before submission
         // so a synchronous completion (bind / close on Betelgeuse) can be
         // delivered through the same path as async completions.
@@ -1010,6 +1025,7 @@ where
             call_kind,
             requester,
             cause,
+            persistence,
         });
         self.translators.push(StoredTranslator {
             call_id,
@@ -1437,6 +1453,7 @@ where
                 },
             );
         }
+        self.push_persistence_completion_events(&in_flight, &result, failure_reason);
 
         let message = translator(result);
 
@@ -1507,6 +1524,64 @@ where
                         call_kind: in_flight.call_kind,
                         reason: CallCompletionRejectedReason::RequesterClosed,
                     },
+                );
+            }
+        }
+    }
+
+    fn push_persistence_completion_events(
+        &mut self,
+        in_flight: &InFlightCall,
+        result: &CallOutput,
+        failure_reason: Option<CallError>,
+    ) {
+        let Some(persistence) = in_flight.persistence else {
+            return;
+        };
+        match (persistence, failure_reason, result) {
+            (call::PersistenceTraceInfo::SnapshotCommit, None, _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::SnapshotCommitted,
+                );
+            }
+            (call::PersistenceTraceInfo::SnapshotCommit, Some(reason), _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::SnapshotCommitFailed { reason },
+                );
+            }
+            (call::PersistenceTraceInfo::JournalAppend { record_index }, None, _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::JournalAppended { record_index },
+                );
+            }
+            (call::PersistenceTraceInfo::JournalAppend { record_index }, Some(reason), _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::JournalAppendFailed {
+                        record_index,
+                        reason,
+                    },
+                );
+            }
+            (call::PersistenceTraceInfo::Recovery, None, _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::RecoveryFinished,
+                );
+            }
+            (call::PersistenceTraceInfo::Recovery, Some(reason), _) => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::RecoveryFailed { reason },
                 );
             }
         }
