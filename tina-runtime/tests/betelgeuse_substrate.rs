@@ -264,6 +264,7 @@ fn betelgeuse_backed_runtime_honors_bounded_trace_retention() {
             command_capacity: 8,
             trace_retention: TraceRetention::Bounded(5),
             idle_wait: Duration::from_millis(1),
+            ..Default::default()
         },
     );
     let worker = runtime
@@ -976,6 +977,19 @@ fn betelgeuse_multishard_dispatcher_round_trips_between_worker_threads() {
     assert!(has_send_accepted_between(&trace, 1, 2));
     assert!(has_send_accepted_between(&trace, 2, 1));
     assert_eq!(count_send_rejected_full(&trace), 0);
+}
+
+#[test]
+#[should_panic(expected = "storage lane capacity > 0")]
+fn betelgeuse_multishard_rejects_zero_storage_lane_capacity() {
+    let _runtime = BetelgeuseBackedMultiShardRuntime::with_config(
+        [WorkShard(1), WorkShard(2)],
+        TestMailboxFactory,
+        BetelgeuseBackedRuntimeConfig {
+            storage_lane_capacity: 0,
+            ..Default::default()
+        },
+    );
 }
 
 #[test]

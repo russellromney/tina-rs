@@ -929,6 +929,7 @@ async fn bridge_timeout_is_explicit_when_tina_keeps_responder_open() {
 #[derive(Debug)]
 struct CapturingWorker {
     captured: Arc<Mutex<Option<BridgeResponder<GateReply>>>>,
+    entered: SyncSender<()>,
 }
 
 #[tina::isolate(
@@ -943,6 +944,7 @@ impl CapturingWorker {
     ) -> Effect<Self> {
         let (_request, responder) = msg.into_parts();
         *self.captured.lock().expect("captured responder lock") = Some(responder);
+        self.entered.send(()).expect("entered signal");
         noop()
     }
 }
@@ -959,18 +961,26 @@ async fn bridge_caller_timeout_closes_responder_and_counts_late_response() {
         },
     ));
     let captured = Arc::new(Mutex::new(None));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let address = runtime
         .register_with_capacity::<CapturingWorker, Infallible>(
             CapturingWorker {
                 captured: Arc::clone(&captured),
+                entered: entered_tx,
             },
             8,
         )
         .expect("register capturing worker");
     let bridge = BridgeHandle::new(Arc::clone(&runtime), address, Duration::from_millis(10));
 
+    let bridge_call = bridge.clone();
+    let call_task = tokio::spawn(async move { bridge_call.call(GateRequest("held")).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(1)))
+        .await
+        .expect("entered wait task")
+        .expect("capturing handler entered");
     assert_eq!(
-        bridge.call(GateRequest("held")).await,
+        call_task.await.expect("bridge call"),
         Err(BridgeError::Timeout)
     );
     let responder = captured

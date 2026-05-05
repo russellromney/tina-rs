@@ -1,18 +1,19 @@
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{Address, AddressGeneration, RestartBudget, RestartPolicy, prelude::*};
 use tina_runtime::{
-    CallInput, CallKind, CallOutput, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    SendRejectedReason, StreamId, sleep,
+    CallError, CallInput, CallKind, CallOutput, ListenerId, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, SendRejectedReason, StreamId, journal_append, sleep,
 };
 use tina_sim::{
-    FaultConfig, FaultMode, MultiShardReplayArtifact, MultiShardSimulator,
-    MultiShardSimulatorConfig, ObservedPeerOutput, ScriptedListenerConfig, ScriptedPeerConfig,
-    ScriptedTcpConfig, SimulatorConfig, TcpCompletionFaultMode,
+    Checker, CheckerDecision, FaultConfig, FaultMode, MultiShardReplayArtifact,
+    MultiShardSimulator, MultiShardSimulatorConfig, ObservedPeerOutput, ScriptedListenerConfig,
+    ScriptedPeerConfig, ScriptedTcpConfig, SimulatorConfig, TcpCompletionFaultMode,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -576,10 +577,462 @@ impl Isolate for TcpCoordinator {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DurableTcpFrontendMsg {
+    Start,
+    Bound { listener: ListenerId },
+    Accepted { stream: StreamId },
+    Read(Result<Vec<u8>, CallError>, StreamId),
+    Persisted(Result<(), CallError>, Vec<u8>),
+    Wrote(Result<usize, CallError>, StreamId),
+    StreamClosed(Result<(), CallError>),
+    ListenerClosed(Result<(), CallError>),
+    Failed,
+}
+
+#[derive(Debug)]
+struct DurableTcpFrontend {
+    bind_addr: SocketAddr,
+    worker: Address<DurableStoreMsg>,
+    listener: Option<ListenerId>,
+    active_stream: Option<StreamId>,
+}
+
+impl Isolate for DurableTcpFrontend {
+    tina::isolate_types! {
+        message: DurableTcpFrontendMsg,
+        reply: (),
+        send: Outbound<DurableStoreMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<DurableTcpFrontendMsg>,
+        shard: WorkShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            DurableTcpFrontendMsg::Start => Effect::Call(RuntimeCall::new(
+                CallInput::TcpBind {
+                    addr: self.bind_addr,
+                },
+                |result| match result {
+                    CallOutput::TcpBound { listener, .. } => {
+                        DurableTcpFrontendMsg::Bound { listener }
+                    }
+                    CallOutput::Failed(_) => DurableTcpFrontendMsg::Failed,
+                    other => panic!("unexpected bind result {other:?}"),
+                },
+            )),
+            DurableTcpFrontendMsg::Bound { listener } => {
+                self.listener = Some(listener);
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpAccept { listener },
+                    |result| match result {
+                        CallOutput::TcpAccepted { stream, .. } => {
+                            DurableTcpFrontendMsg::Accepted { stream }
+                        }
+                        CallOutput::Failed(_) => DurableTcpFrontendMsg::Failed,
+                        other => panic!("unexpected accept result {other:?}"),
+                    },
+                ))
+            }
+            DurableTcpFrontendMsg::Accepted { stream } => {
+                self.active_stream = Some(stream);
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpRead {
+                        stream,
+                        max_len: 64,
+                    },
+                    move |result| match result {
+                        CallOutput::TcpRead { bytes } => {
+                            DurableTcpFrontendMsg::Read(Ok(bytes), stream)
+                        }
+                        CallOutput::Failed(error) => {
+                            DurableTcpFrontendMsg::Read(Err(error), stream)
+                        }
+                        other => panic!("unexpected read result {other:?}"),
+                    },
+                ))
+            }
+            DurableTcpFrontendMsg::Read(Ok(bytes), stream) if bytes.is_empty() => {
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpStreamClose { stream },
+                    |result| match result {
+                        CallOutput::TcpStreamClosed => DurableTcpFrontendMsg::StreamClosed(Ok(())),
+                        CallOutput::Failed(error) => {
+                            DurableTcpFrontendMsg::StreamClosed(Err(error))
+                        }
+                        other => panic!("unexpected stream close result {other:?}"),
+                    },
+                ))
+            }
+            DurableTcpFrontendMsg::Read(Ok(bytes), stream) => {
+                self.active_stream = Some(stream);
+                send(
+                    self.worker,
+                    DurableStoreMsg::Append {
+                        index: 1,
+                        bytes,
+                        reply_to: ctx.me(),
+                    },
+                )
+            }
+            DurableTcpFrontendMsg::Persisted(Ok(()), bytes) => {
+                let stream = self
+                    .active_stream
+                    .expect("stream stored before durable ack");
+                let mut reply = b"stored:".to_vec();
+                reply.extend_from_slice(&bytes);
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpWrite {
+                        stream,
+                        bytes: reply,
+                    },
+                    move |result| match result {
+                        CallOutput::TcpWrote { count } => {
+                            DurableTcpFrontendMsg::Wrote(Ok(count), stream)
+                        }
+                        CallOutput::Failed(error) => {
+                            DurableTcpFrontendMsg::Wrote(Err(error), stream)
+                        }
+                        other => panic!("unexpected write result {other:?}"),
+                    },
+                ))
+            }
+            DurableTcpFrontendMsg::Wrote(Ok(_), stream) => Effect::Call(RuntimeCall::new(
+                CallInput::TcpStreamClose { stream },
+                |result| match result {
+                    CallOutput::TcpStreamClosed => DurableTcpFrontendMsg::StreamClosed(Ok(())),
+                    CallOutput::Failed(error) => DurableTcpFrontendMsg::StreamClosed(Err(error)),
+                    other => panic!("unexpected stream close result {other:?}"),
+                },
+            )),
+            DurableTcpFrontendMsg::StreamClosed(Ok(())) => {
+                let listener = self.listener.expect("listener stored before close");
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpListenerClose { listener },
+                    |result| match result {
+                        CallOutput::TcpListenerClosed => {
+                            DurableTcpFrontendMsg::ListenerClosed(Ok(()))
+                        }
+                        CallOutput::Failed(error) => {
+                            DurableTcpFrontendMsg::ListenerClosed(Err(error))
+                        }
+                        other => panic!("unexpected listener close result {other:?}"),
+                    },
+                ))
+            }
+            DurableTcpFrontendMsg::ListenerClosed(Ok(())) => stop(),
+            DurableTcpFrontendMsg::Read(Err(_), _)
+            | DurableTcpFrontendMsg::Persisted(Err(_), _)
+            | DurableTcpFrontendMsg::Wrote(Err(_), _)
+            | DurableTcpFrontendMsg::StreamClosed(Err(_))
+            | DurableTcpFrontendMsg::ListenerClosed(Err(_))
+            | DurableTcpFrontendMsg::Failed => stop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DurableStoreMsg {
+    Append {
+        index: u64,
+        bytes: Vec<u8>,
+        reply_to: Address<DurableTcpFrontendMsg>,
+    },
+    Appended(
+        Result<(), CallError>,
+        Vec<u8>,
+        Address<DurableTcpFrontendMsg>,
+    ),
+}
+
+#[derive(Debug)]
+struct DurableStore {
+    journal_path: PathBuf,
+}
+
+impl Isolate for DurableStore {
+    tina::isolate_types! {
+        message: DurableStoreMsg,
+        reply: (),
+        send: Outbound<DurableTcpFrontendMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<DurableStoreMsg>,
+        shard: WorkShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            DurableStoreMsg::Append {
+                index,
+                bytes,
+                reply_to,
+            } => journal_append(self.journal_path.clone(), index, bytes.clone())
+                .reply(move |result| DurableStoreMsg::Appended(result, bytes, reply_to)),
+            DurableStoreMsg::Appended(result, bytes, reply_to) => {
+                send(reply_to, DurableTcpFrontendMsg::Persisted(result, bytes))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DurableBatchListenerMsg {
+    Start,
+    Bound { listener: ListenerId },
+    Accepted { stream: StreamId },
+    ReArmAccept,
+    CloseListener,
+    ListenerClosed(Result<(), CallError>),
+    Failed,
+}
+
+#[derive(Debug)]
+struct DurableBatchListener {
+    bind_addr: SocketAddr,
+    worker: Address<DurableBatchStoreMsg>,
+    target_accepts: usize,
+    accepted: usize,
+    listener: Option<ListenerId>,
+}
+
+impl Isolate for DurableBatchListener {
+    tina::isolate_types! {
+        message: DurableBatchListenerMsg,
+        reply: (),
+        send: Outbound<DurableBatchListenerMsg>,
+        spawn: RestartableChildDefinition<DurableBatchConnection>,
+        call: RuntimeCall<DurableBatchListenerMsg>,
+        shard: WorkShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            DurableBatchListenerMsg::Start => Effect::Call(RuntimeCall::new(
+                CallInput::TcpBind {
+                    addr: self.bind_addr,
+                },
+                |result| match result {
+                    CallOutput::TcpBound { listener, .. } => {
+                        DurableBatchListenerMsg::Bound { listener }
+                    }
+                    CallOutput::Failed(_) => DurableBatchListenerMsg::Failed,
+                    other => panic!("unexpected bind result {other:?}"),
+                },
+            )),
+            DurableBatchListenerMsg::Bound { listener } => {
+                self.listener = Some(listener);
+                tcp_accept_batch_call(listener)
+            }
+            DurableBatchListenerMsg::Accepted { stream } => {
+                self.accepted += 1;
+                let worker = self.worker;
+                let spawn_effect = spawn(
+                    RestartableChildDefinition::new(
+                        move || DurableBatchConnection {
+                            stream,
+                            worker,
+                            pending_write: Vec::new(),
+                        },
+                        8,
+                    )
+                    .with_initial_message(|| DurableBatchConnectionMsg::Start),
+                );
+                let follow_up = if self.accepted < self.target_accepts {
+                    DurableBatchListenerMsg::ReArmAccept
+                } else {
+                    DurableBatchListenerMsg::CloseListener
+                };
+                batch([spawn_effect, ctx.send_self(follow_up)])
+            }
+            DurableBatchListenerMsg::ReArmAccept => {
+                tcp_accept_batch_call(self.listener.expect("listener stored before re-arm"))
+            }
+            DurableBatchListenerMsg::CloseListener => {
+                let listener = self.listener.expect("listener stored before close");
+                Effect::Call(RuntimeCall::new(
+                    CallInput::TcpListenerClose { listener },
+                    |result| match result {
+                        CallOutput::TcpListenerClosed => {
+                            DurableBatchListenerMsg::ListenerClosed(Ok(()))
+                        }
+                        CallOutput::Failed(error) => {
+                            DurableBatchListenerMsg::ListenerClosed(Err(error))
+                        }
+                        other => panic!("unexpected listener close result {other:?}"),
+                    },
+                ))
+            }
+            DurableBatchListenerMsg::ListenerClosed(Ok(())) => stop(),
+            DurableBatchListenerMsg::ListenerClosed(Err(_)) | DurableBatchListenerMsg::Failed => {
+                stop()
+            }
+        }
+    }
+}
+
+fn tcp_accept_batch_call(listener: ListenerId) -> Effect<DurableBatchListener> {
+    Effect::Call(RuntimeCall::new(
+        CallInput::TcpAccept { listener },
+        |result| match result {
+            CallOutput::TcpAccepted { stream, .. } => DurableBatchListenerMsg::Accepted { stream },
+            CallOutput::Failed(_) => DurableBatchListenerMsg::Failed,
+            other => panic!("unexpected accept result {other:?}"),
+        },
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DurableBatchConnectionMsg {
+    Start,
+    Read(Result<Vec<u8>, CallError>),
+    Persisted(Result<(), CallError>, Vec<u8>),
+    Wrote(Result<usize, CallError>),
+    StreamClosed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct DurableBatchConnection {
+    stream: StreamId,
+    worker: Address<DurableBatchStoreMsg>,
+    pending_write: Vec<u8>,
+}
+
+impl Isolate for DurableBatchConnection {
+    tina::isolate_types! {
+        message: DurableBatchConnectionMsg,
+        reply: (),
+        send: Outbound<DurableBatchStoreMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<DurableBatchConnectionMsg>,
+        shard: WorkShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            DurableBatchConnectionMsg::Start => durable_batch_read_call(self.stream),
+            DurableBatchConnectionMsg::Read(Ok(bytes)) if bytes.is_empty() => {
+                durable_batch_close_call(self.stream)
+            }
+            DurableBatchConnectionMsg::Read(Ok(bytes)) => send(
+                self.worker,
+                DurableBatchStoreMsg::Append {
+                    bytes,
+                    reply_to: ctx.me(),
+                },
+            ),
+            DurableBatchConnectionMsg::Persisted(Ok(()), bytes) => {
+                self.pending_write = b"stored:".to_vec();
+                self.pending_write.extend_from_slice(&bytes);
+                durable_batch_write_call(self.stream, self.pending_write.clone())
+            }
+            DurableBatchConnectionMsg::Wrote(Ok(count)) => {
+                if count >= self.pending_write.len() {
+                    self.pending_write.clear();
+                    durable_batch_read_call(self.stream)
+                } else {
+                    self.pending_write.drain(..count);
+                    durable_batch_write_call(self.stream, self.pending_write.clone())
+                }
+            }
+            DurableBatchConnectionMsg::StreamClosed(Ok(())) => stop(),
+            DurableBatchConnectionMsg::Read(Err(_))
+            | DurableBatchConnectionMsg::Persisted(Err(_), _)
+            | DurableBatchConnectionMsg::Wrote(Err(_))
+            | DurableBatchConnectionMsg::StreamClosed(Err(_)) => stop(),
+        }
+    }
+}
+
+fn durable_batch_read_call(stream: StreamId) -> Effect<DurableBatchConnection> {
+    Effect::Call(RuntimeCall::new(
+        CallInput::TcpRead {
+            stream,
+            max_len: 64,
+        },
+        |result| match result {
+            CallOutput::TcpRead { bytes } => DurableBatchConnectionMsg::Read(Ok(bytes)),
+            CallOutput::Failed(error) => DurableBatchConnectionMsg::Read(Err(error)),
+            other => panic!("unexpected read result {other:?}"),
+        },
+    ))
+}
+
+fn durable_batch_write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<DurableBatchConnection> {
+    Effect::Call(RuntimeCall::new(
+        CallInput::TcpWrite { stream, bytes },
+        |result| match result {
+            CallOutput::TcpWrote { count } => DurableBatchConnectionMsg::Wrote(Ok(count)),
+            CallOutput::Failed(error) => DurableBatchConnectionMsg::Wrote(Err(error)),
+            other => panic!("unexpected write result {other:?}"),
+        },
+    ))
+}
+
+fn durable_batch_close_call(stream: StreamId) -> Effect<DurableBatchConnection> {
+    Effect::Call(RuntimeCall::new(
+        CallInput::TcpStreamClose { stream },
+        |result| match result {
+            CallOutput::TcpStreamClosed => DurableBatchConnectionMsg::StreamClosed(Ok(())),
+            CallOutput::Failed(error) => DurableBatchConnectionMsg::StreamClosed(Err(error)),
+            other => panic!("unexpected stream close result {other:?}"),
+        },
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DurableBatchStoreMsg {
+    Append {
+        bytes: Vec<u8>,
+        reply_to: Address<DurableBatchConnectionMsg>,
+    },
+    Appended(
+        Result<(), CallError>,
+        Vec<u8>,
+        Address<DurableBatchConnectionMsg>,
+    ),
+}
+
+#[derive(Debug)]
+struct DurableBatchStore {
+    journal_path: PathBuf,
+    next_index: u64,
+}
+
+impl Isolate for DurableBatchStore {
+    tina::isolate_types! {
+        message: DurableBatchStoreMsg,
+        reply: (),
+        send: Outbound<DurableBatchConnectionMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<DurableBatchStoreMsg>,
+        shard: WorkShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            DurableBatchStoreMsg::Append { bytes, reply_to } => {
+                self.next_index += 1;
+                journal_append(self.journal_path.clone(), self.next_index, bytes.clone())
+                    .reply(move |result| DurableBatchStoreMsg::Appended(result, bytes, reply_to))
+            }
+            DurableBatchStoreMsg::Appended(result, bytes, reply_to) => send(
+                reply_to,
+                DurableBatchConnectionMsg::Persisted(result, bytes),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SavedMultiShardRun {
     artifact: MultiShardReplayArtifact,
     completed: Vec<(u64, u64)>,
+}
+
+#[derive(Debug, Clone)]
+struct SavedDurableTcpRun {
+    artifact: MultiShardReplayArtifact,
 }
 
 fn event_id(trace: &[RuntimeEvent], predicate: impl Fn(&RuntimeEvent) -> bool) -> u64 {
@@ -662,6 +1115,177 @@ fn peer_script(
         read_chunk_cap,
         write_cap,
         output_capacity: 1024,
+    }
+}
+
+fn durable_journal_path() -> PathBuf {
+    PathBuf::from("/tmp/tina-sim-durable-cross-shard-journal")
+}
+
+fn durable_batch_journal_path(seed: u64) -> PathBuf {
+    PathBuf::from(format!("/tmp/tina-sim-durable-batch-journal-{seed}"))
+}
+
+fn expected_stored_output(payload: &[u8], chunk_cap: usize) -> Vec<u8> {
+    let mut output = Vec::new();
+    for chunk in payload.chunks(chunk_cap) {
+        output.extend_from_slice(b"stored:");
+        output.extend_from_slice(chunk);
+    }
+    output
+}
+
+fn expected_journal_chunks(payloads: &[Vec<u8>], chunk_cap: usize) -> Vec<Vec<u8>> {
+    payloads
+        .iter()
+        .flat_map(|payload| payload.chunks(chunk_cap).map(<[u8]>::to_vec))
+        .collect()
+}
+
+fn run_durable_tcp_multishard_workload(config: SimulatorConfig) -> SavedDurableTcpRun {
+    let mut sim = MultiShardSimulator::with_config(
+        [WorkShard(11), WorkShard(22)],
+        config,
+        MultiShardSimulatorConfig {
+            shard_pair_capacity: 8,
+        },
+    );
+    let worker = sim
+        .register_with_capacity_on::<DurableStore, DurableStoreMsg, DurableTcpFrontendMsg>(
+            ShardId::new(22),
+            DurableStore {
+                journal_path: durable_journal_path(),
+            },
+            8,
+        );
+    let frontend = sim
+        .register_with_capacity_on::<DurableTcpFrontend, DurableTcpFrontendMsg, DurableStoreMsg>(
+            ShardId::new(11),
+            DurableTcpFrontend {
+                bind_addr: bind_addr(),
+                worker,
+                listener: None,
+                active_stream: None,
+            },
+            8,
+        );
+    let mut checker = PersistBeforeTcpWriteChecker::default();
+
+    sim.try_send(frontend, DurableTcpFrontendMsg::Start)
+        .unwrap();
+    let failure = sim.run_until_quiescent_checked(&mut checker);
+    assert_eq!(failure, None);
+
+    SavedDurableTcpRun {
+        artifact: sim.replay_artifact(),
+    }
+}
+
+fn run_durable_batch_tcp_multishard_workload(
+    seed: u64,
+    payloads: &[Vec<u8>],
+) -> SavedDurableTcpRun {
+    let mut sim = MultiShardSimulator::with_config(
+        [WorkShard(11), WorkShard(22)],
+        SimulatorConfig {
+            seed,
+            faults: FaultConfig {
+                local_send: tina_sim::LocalSendFaultMode::DelayByRounds {
+                    one_in: 2,
+                    rounds: 1,
+                },
+                tcp_completion: TcpCompletionFaultMode::ReorderReady { one_in: 2 },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 128,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(50200),
+                    backlog_capacity: payloads.len(),
+                    peers: payloads
+                        .iter()
+                        .enumerate()
+                        .map(|(index, payload)| {
+                            peer_script(
+                                1,
+                                peer_addr(61200 + index as u16),
+                                vec![payload.clone()],
+                                Some(2),
+                                3,
+                            )
+                        })
+                        .collect(),
+                }],
+            },
+        },
+        MultiShardSimulatorConfig {
+            shard_pair_capacity: 16,
+        },
+    );
+    let worker = sim.register_with_capacity_on::<
+        DurableBatchStore,
+        DurableBatchStoreMsg,
+        DurableBatchConnectionMsg,
+    >(
+        ShardId::new(22),
+        DurableBatchStore {
+            journal_path: durable_batch_journal_path(seed),
+            next_index: 0,
+        },
+        32,
+    );
+    let listener = sim.register_with_capacity_on::<
+        DurableBatchListener,
+        DurableBatchListenerMsg,
+        DurableBatchListenerMsg,
+    >(
+        ShardId::new(11),
+        DurableBatchListener {
+            bind_addr: bind_addr(),
+            worker,
+            target_accepts: payloads.len(),
+            accepted: 0,
+            listener: None,
+        },
+        16,
+    );
+    let mut checker = PersistBeforeTcpWriteChecker::default();
+
+    sim.try_send(listener, DurableBatchListenerMsg::Start)
+        .unwrap();
+    let failure = sim.run_until_quiescent_checked(&mut checker);
+    assert_eq!(failure, None);
+
+    SavedDurableTcpRun {
+        artifact: sim.replay_artifact(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct PersistBeforeTcpWriteChecker {
+    journal_appended: bool,
+}
+
+impl Checker for PersistBeforeTcpWriteChecker {
+    fn name(&self) -> &'static str {
+        "persist-before-tcp-write"
+    }
+
+    fn on_event(&mut self, event: &RuntimeEvent) -> CheckerDecision {
+        match event.kind() {
+            RuntimeEventKind::JournalAppended { .. } => {
+                self.journal_appended = true;
+                CheckerDecision::Continue
+            }
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpWrite,
+                ..
+            } if !self.journal_appended => {
+                CheckerDecision::Fail("peer reply became visible before durable append".into())
+            }
+            _ => CheckerDecision::Continue,
+        }
     }
 }
 
@@ -1093,6 +1717,226 @@ fn multishard_tcp_workload_composes_with_seeded_tcp_completion_faults() {
         }),
         "listener completion should cross shards and become visible to the coordinator"
     );
+}
+
+#[test]
+fn multishard_tcp_persistence_service_replays_under_seeded_dst_faults() {
+    let config = SimulatorConfig {
+        seed: 91,
+        faults: FaultConfig {
+            local_send: tina_sim::LocalSendFaultMode::DelayByRounds {
+                one_in: 2,
+                rounds: 1,
+            },
+            tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                one_in: 1,
+                steps: 2,
+            },
+            ..Default::default()
+        },
+        tcp: ScriptedTcpConfig {
+            pending_completion_capacity: 16,
+            listeners: vec![ScriptedListenerConfig {
+                bind_addr: bind_addr(),
+                local_addr: local_addr(50100),
+                backlog_capacity: 1,
+                peers: vec![peer_script(
+                    1,
+                    peer_addr(61100),
+                    vec![b"grain".to_vec()],
+                    None,
+                    64,
+                )],
+            }],
+        },
+    };
+
+    let first = run_durable_tcp_multishard_workload(config.clone());
+    let second = run_durable_tcp_multishard_workload(config);
+
+    assert_eq!(first.artifact, second.artifact);
+    assert_eq!(
+        first
+            .artifact
+            .observed_peer_output()
+            .iter()
+            .map(ObservedPeerOutput::bytes)
+            .collect::<Vec<_>>(),
+        vec![b"stored:grain".as_slice()]
+    );
+
+    let replay = tina_runtime::persistence::replay_journal_bytes(
+        first
+            .artifact
+            .durable_image()
+            .get(durable_journal_path())
+            .expect("durable journal exists in replay image"),
+    )
+    .expect("journal image replays");
+    assert_eq!(replay.records.len(), 1);
+    assert_eq!(replay.records[0].index, 1);
+    assert_eq!(replay.records[0].bytes, b"grain");
+
+    let trace = first.artifact.event_record();
+    let tcp_read = event_id(trace, |event| {
+        event.shard() == ShardId::new(11)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpRead,
+                    ..
+                }
+            )
+    });
+    let request_attempt = event_id(trace, |event| {
+        event.shard() == ShardId::new(11)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendDispatchAttempted {
+                    target_shard,
+                    ..
+                } if target_shard == ShardId::new(22)
+            )
+    });
+    let journal_appended = event_id(trace, |event| {
+        event.shard() == ShardId::new(22)
+            && matches!(event.kind(), RuntimeEventKind::JournalAppended { .. })
+    });
+    let ack_attempt = event_id(trace, |event| {
+        event.shard() == ShardId::new(22)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendDispatchAttempted {
+                    target_shard,
+                    ..
+                } if target_shard == ShardId::new(11)
+            )
+    });
+    let tcp_write = event_id(trace, |event| {
+        event.shard() == ShardId::new(11)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpWrite,
+                    ..
+                }
+            )
+    });
+
+    assert!(tcp_read < request_attempt);
+    assert!(request_attempt < journal_appended);
+    assert!(journal_appended < ack_attempt);
+    assert!(ack_attempt < tcp_write);
+}
+
+#[test]
+fn multishard_tcp_persistence_service_handles_overlap_partial_io_and_seed_sweep() {
+    let payloads = vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()];
+    let expected_chunks = expected_journal_chunks(&payloads, 2);
+    let mut expected_outputs = payloads
+        .iter()
+        .map(|payload| expected_stored_output(payload, 2))
+        .collect::<Vec<_>>();
+    expected_outputs.sort();
+
+    for seed in [0, 1, 7, 19, 91] {
+        let first = run_durable_batch_tcp_multishard_workload(seed, &payloads);
+        let second = run_durable_batch_tcp_multishard_workload(seed, &payloads);
+
+        assert_eq!(
+            first.artifact, second.artifact,
+            "same seed should replay exactly for seed {seed}"
+        );
+
+        let mut observed_outputs = first
+            .artifact
+            .observed_peer_output()
+            .iter()
+            .map(|output| output.bytes().to_vec())
+            .collect::<Vec<_>>();
+        observed_outputs.sort();
+        assert_eq!(observed_outputs, expected_outputs);
+
+        let replay = tina_runtime::persistence::replay_journal_bytes(
+            first
+                .artifact
+                .durable_image()
+                .get(durable_batch_journal_path(seed))
+                .expect("durable batch journal exists in replay image"),
+        )
+        .expect("batch journal image replays");
+        assert_eq!(replay.records.len(), expected_chunks.len());
+        assert_eq!(
+            replay
+                .records
+                .iter()
+                .map(|record| record.index)
+                .collect::<Vec<_>>(),
+            (1..=expected_chunks.len() as u64).collect::<Vec<_>>()
+        );
+
+        let mut observed_chunks = replay
+            .records
+            .iter()
+            .map(|record| record.bytes.clone())
+            .collect::<Vec<_>>();
+        observed_chunks.sort();
+        let mut sorted_expected_chunks = expected_chunks.clone();
+        sorted_expected_chunks.sort();
+        assert_eq!(observed_chunks, sorted_expected_chunks);
+
+        let trace = first.artifact.event_record();
+        let journal_appended_count = trace
+            .iter()
+            .filter(|event| matches!(event.kind(), RuntimeEventKind::JournalAppended { .. }))
+            .count();
+        let tcp_write_count = trace
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted {
+                        call_kind: CallKind::TcpWrite,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let request_attempts = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(11)
+                    && matches!(
+                        event.kind(),
+                        RuntimeEventKind::SendDispatchAttempted {
+                            target_shard,
+                            ..
+                        } if target_shard == ShardId::new(22)
+                    )
+            })
+            .count();
+        let ack_attempts = trace
+            .iter()
+            .filter(|event| {
+                event.shard() == ShardId::new(22)
+                    && matches!(
+                        event.kind(),
+                        RuntimeEventKind::SendDispatchAttempted {
+                            target_shard,
+                            ..
+                        } if target_shard == ShardId::new(11)
+                    )
+            })
+            .count();
+
+        assert_eq!(journal_appended_count, expected_chunks.len());
+        assert_eq!(request_attempts, expected_chunks.len());
+        assert_eq!(ack_attempts, expected_chunks.len());
+        assert!(
+            tcp_write_count > expected_chunks.len(),
+            "write cap should force partial write completions for seed {seed}"
+        );
+    }
 }
 
 #[test]

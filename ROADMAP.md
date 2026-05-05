@@ -76,7 +76,7 @@ start from an honest baseline rather than from stale roadmap wording.
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. Ruud Lubbers pins a narrow numerical runtime cost model for selected hot paths: multi-shard send, isolate call, timer, TCP read/write, batch, spawn/restart, trace pressure, live ingress, and high-cardinality idle stepping. Runtime and simulator now reuse per-step scratch and prebuild coordinator storage where tests prove the warmed path. | No broad runtime/simulator allocation-free claim is supported yet; boxed erasure, traces, replay records, completion slots, call translators, and user payloads may still allocate. |
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
 | Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time, TCP server/client operations, and local file operations through a Tina-owned driver boundary with native Betelgeuse and simulated Betelgeuse adapters, cancellation, shutdown, and same-resource lane ownership. | DNS, TLS, UDP, process, signal, broad network-server claims, and live-substrate liveness faults remain future work. |
-| Local persistence | `tina-runtime` exposes local snapshot/journal helpers with explicit append-before-apply semantics, snapshot `last_journal_index`, journal `record_index`, visible truncated/corrupt/commit-uncertain recovery outcomes, and persistence trace events. `tina-sim` captures `DurableImage` path-to-bytes state for replay. | This is not a database, durable mailbox, durable work queue, or exactly-once system. Directory fsync and rename-commit support remain platform/backend scoped. Persistence helpers currently execute synchronous local filesystem work in the driver path; a nonblocking storage reactor is future work. |
+| Local persistence | `tina-runtime` exposes local snapshot/journal helpers with explicit append-before-apply semantics, snapshot `last_journal_index`, journal `record_index`, visible truncated/corrupt/commit-uncertain recovery outcomes, persistence trace events, and bounded live storage-lane admission for snapshot/journal work. `tina-sim` captures `DurableImage` path-to-bytes state for replay. | This is not a database, durable mailbox, durable work queue, or exactly-once system. Directory fsync and rename-commit support remain platform/backend scoped. Already-started local filesystem work cannot be preempted; a full nonblocking storage reactor remains future work. |
 
 ## Testing and proof strategy
 
@@ -150,6 +150,11 @@ and reviews live under `.intent/phases/`.
 - Wim Kok: local snapshot/journal persistence, restart recovery, durable
   simulator image, LocalApp/bridge recovery proof, and explicit durable mailbox
   non-claims.
+- Johan Rudolph Thorbecke: bounded live storage lane, live storage overload and
+  cancellation visibility, multi-shard/thread-per-core service proof, composed
+  live TCP plus persistence proof, terminal trace summaries, and expanded DST
+  pressure over persistence, TCP cancellation, bridge ingress, and live-vs-sim
+  parity.
 
 ## Near-term roadmap
 
@@ -158,7 +163,10 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics phase after the raw runtime-owned I/O surface is boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
+| **Stuga first-class DST** | Turn Tina's deterministic simulation testing from bespoke hard tests into a reusable framework capability: history-as-data, replay artifacts, common invariants, deletion shrinking, simulator storage fault injection, bridge model DST, and live-vs-sim semantic differential rails. |
+| **Timmerhus live topology and failure domains** | Production-runtime hardening after DST rails exist: thread pinning/topology, live shard ownership reporting, peer/shard liveness vocabulary, peer quarantine decision, shard-restart propagation rules, and whether local cross-shard isolate-call reply transport belongs before remoting. |
+| **Funkishus storage and I/O maturity** | Mature runtime-owned I/O/storage where named workloads prove the need: nonblocking storage reactor decision, platform durability support, DNS/TLS/UDP/process/signal rails, and bridge/adapter policy without weakening Tina semantics. |
+| **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 ## Later capability roadmap
 
@@ -214,8 +222,8 @@ These still need answers, but each now has an intended phase home.
    with the same visible `Full`/`Closed`, FIFO rules, no hidden blocking, and
    no unbounded internal queue.
 6. **Zero-copy / lower-allocation transport.** The current cost model is
-   honest but not final. Home: later performance phase after Jelle's new I/O
-   paths expose real pressure.
+   honest but not final. Home: later performance phase after Thorbecke's
+   storage/live-service pressure exposes real costs.
 7. **Sequential-looking workflow ergonomics.** The raw Tina state-machine form
    is honest but verbose for long I/O workflows. Home: Barend Biesheuvel. Any
    macro must compress ceremony only: each runtime-owned suspension point stays

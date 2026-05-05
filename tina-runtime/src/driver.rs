@@ -2,7 +2,8 @@
 //!
 //! Tina keeps isolate scheduling, mailboxes, tracing, supervision, and call
 //! outcome delivery in [`crate::Runtime`]. The driver owns only substrate
-//! operations: timers, TCP resources, completion readiness, and cancellation.
+//! operations: timers, TCP resources, storage work, completion readiness, and
+//! cancellation.
 //!
 //! ## Contract with the rest of the runtime
 //!
@@ -14,6 +15,13 @@
 //! - resource ids ([`ListenerId`], [`StreamId`]) are runtime-assigned
 //!   monotonic counters, not OS file descriptors. Isolate code never sees
 //!   raw fds or `Box<dyn IOSocket>` values.
+//! - operations are classified by blocking shape:
+//!   - inline-safe: small runtime bookkeeping such as TCP close;
+//!   - driver-completion: Betelgeuse completion-shaped TCP and file calls;
+//!   - storage-lane: snapshot/journal helpers that can block on local durable
+//!     filesystem work and therefore use a bounded worker lane;
+//!   - forbidden-in-handler: direct filesystem or socket work performed by
+//!     user handlers instead of returned Tina effects.
 //! - shutdown cancellation keeps completion slots alive until the backend
 //!   reports that it no longer owns their raw pointers. A driver that cannot
 //!   prove release returns [`DriverShutdownError`] instead of pretending
@@ -21,6 +29,15 @@
 //!
 use std::alloc::Global;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::mpsc::{
+    Receiver, SyncSender, TryRecvError, TrySendError as MpscTrySendError, sync_channel,
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use betelgeuse::{
@@ -36,6 +53,7 @@ use crate::call::{
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
 const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
 const INITIAL_DRIVER_PENDING_CAPACITY: usize = 8;
+pub(crate) const DEFAULT_STORAGE_LANE_CAPACITY: usize = 64;
 
 /// Runtime-owned substrate driver.
 ///
@@ -101,6 +119,7 @@ pub(crate) enum DriverShutdownError {
 /// explicit-stepping, runtime-owned-effects discipline.
 pub(crate) struct BetelgeuseDriver {
     tcp: BetelgeuseTcp,
+    storage: StorageLane,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
 }
@@ -193,6 +212,59 @@ pub(crate) struct DriverCompletion {
     pub(crate) result: CallOutput,
 }
 
+enum StorageLane {
+    Inline,
+    Worker(StorageWorkerLane),
+}
+
+struct StorageWorkerLane {
+    capacity: usize,
+    sender: Option<SyncSender<StorageCommand>>,
+    completions: Receiver<StorageCompletion>,
+    handle: Option<JoinHandle<()>>,
+    pending: Vec<StoragePending>,
+}
+
+struct StoragePending {
+    call_id: CallId,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct StorageCommand {
+    call_id: CallId,
+    job: StorageJob,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum StorageJob {
+    SnapshotCommit {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        last_journal_index: u64,
+    },
+    SnapshotLoad {
+        path: PathBuf,
+    },
+    JournalAppend {
+        path: PathBuf,
+        record_index: u64,
+        bytes: Vec<u8>,
+    },
+    JournalReplay {
+        path: PathBuf,
+    },
+    #[cfg(test)]
+    Park {
+        started: SyncSender<()>,
+        release: Receiver<()>,
+    },
+}
+
+struct StorageCompletion {
+    call_id: CallId,
+    result: CallOutput,
+}
+
 impl BetelgeuseDriver {
     pub(crate) fn new() -> Self {
         let io_loop =
@@ -203,6 +275,19 @@ impl BetelgeuseDriver {
     pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
+            storage: StorageLane::inline(),
+            timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
+            next_timer_ordinal: 0,
+        }
+    }
+
+    pub(crate) fn with_io_loop_and_storage_capacity(
+        io_loop: IOLoopHandle<Global>,
+        storage_lane_capacity: usize,
+    ) -> Self {
+        Self {
+            tcp: BetelgeuseTcp::with_io_loop(io_loop),
+            storage: StorageLane::new(storage_lane_capacity),
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
         }
@@ -227,28 +312,60 @@ impl RuntimeDriver for BetelgeuseDriver {
                 });
                 None
             }
+            CallInput::SnapshotCommit {
+                path,
+                bytes,
+                last_journal_index,
+            } => self.storage.submit(
+                call_id,
+                StorageJob::SnapshotCommit {
+                    path,
+                    bytes,
+                    last_journal_index,
+                },
+            ),
+            CallInput::SnapshotLoad { path } => self
+                .storage
+                .submit(call_id, StorageJob::SnapshotLoad { path }),
+            CallInput::JournalAppend {
+                path,
+                record_index,
+                bytes,
+            } => self.storage.submit(
+                call_id,
+                StorageJob::JournalAppend {
+                    path,
+                    record_index,
+                    bytes,
+                },
+            ),
+            CallInput::JournalReplay { path } => self
+                .storage
+                .submit(call_id, StorageJob::JournalReplay { path }),
             other => self.tcp.submit(call_id, other),
         }
     }
 
     fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
         self.tcp.advance(completed);
+        self.storage.advance(completed);
         self.harvest_timers(now, completed);
     }
 
     fn has_pending(&self) -> bool {
-        self.tcp.has_pending() || !self.timers.is_empty()
+        self.tcp.has_pending() || self.storage.has_pending() || !self.timers.is_empty()
     }
 
     fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
         self.timers.clear();
+        self.storage.cancel_pending();
         self.tcp.cancel_pending()
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
         let before = self.timers.len();
         self.timers.retain(|entry| entry.call_id != call_id);
-        before != self.timers.len() || self.tcp.cancel(call_id)
+        before != self.timers.len() || self.storage.cancel(call_id) || self.tcp.cancel(call_id)
     }
 
     #[cfg(test)]
@@ -276,6 +393,246 @@ impl BetelgeuseDriver {
                 call_id: entry.call_id,
                 result: CallOutput::TimerFired,
             });
+        }
+    }
+}
+
+impl StorageLane {
+    fn inline() -> Self {
+        Self::Inline
+    }
+
+    fn new(capacity: usize) -> Self {
+        Self::Worker(StorageWorkerLane::new(capacity))
+    }
+
+    fn submit(&mut self, call_id: CallId, job: StorageJob) -> Option<DriverCompletion> {
+        match self {
+            Self::Inline => Some(DriverCompletion {
+                call_id,
+                result: execute_storage_job(job),
+            }),
+            Self::Worker(lane) => lane.submit(call_id, job),
+        }
+    }
+
+    fn advance(&mut self, completed: &mut Vec<DriverCompletion>) {
+        if let Self::Worker(lane) = self {
+            lane.advance(completed);
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        match self {
+            Self::Inline => false,
+            Self::Worker(lane) => lane.has_pending(),
+        }
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        match self {
+            Self::Inline => false,
+            Self::Worker(lane) => lane.cancel(call_id),
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        if let Self::Worker(lane) = self {
+            lane.cancel_pending();
+        }
+    }
+}
+
+impl Drop for StorageLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+impl StorageWorkerLane {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "storage lane capacity must be > 0");
+        let (sender, receiver) = sync_channel(capacity);
+        let (completion_sender, completions) = sync_channel(capacity.saturating_add(1));
+        let handle = thread::spawn(move || storage_worker_loop(receiver, completion_sender));
+        Self {
+            capacity,
+            sender: Some(sender),
+            completions,
+            handle: Some(handle),
+            pending: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
+        }
+    }
+
+    fn submit(&mut self, call_id: CallId, job: StorageJob) -> Option<DriverCompletion> {
+        let Some(sender) = &self.sender else {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::StorageClosed),
+            });
+        };
+        if self.active_pending_count() >= self.capacity {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::StorageFull),
+            });
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        match sender.try_send(StorageCommand {
+            call_id,
+            job,
+            cancelled: Arc::clone(&cancelled),
+        }) {
+            Ok(()) => {
+                self.pending.push(StoragePending { call_id, cancelled });
+                None
+            }
+            Err(MpscTrySendError::Full(command)) => Some(DriverCompletion {
+                call_id: command.call_id,
+                result: CallOutput::Failed(CallError::StorageFull),
+            }),
+            Err(MpscTrySendError::Disconnected(command)) => Some(DriverCompletion {
+                call_id: command.call_id,
+                result: CallOutput::Failed(CallError::StorageClosed),
+            }),
+        }
+    }
+
+    fn advance(&mut self, completed: &mut Vec<DriverCompletion>) {
+        loop {
+            match self.completions.try_recv() {
+                Ok(completion) => self.finish_completion(completion, completed),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.sender = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn finish_completion(
+        &mut self,
+        completion: StorageCompletion,
+        completed: &mut Vec<DriverCompletion>,
+    ) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|entry| entry.call_id == completion.call_id)
+        else {
+            return;
+        };
+        let pending = self.pending.remove(index);
+        if pending.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        completed.push(DriverCompletion {
+            call_id: completion.call_id,
+            result: completion.result,
+        });
+    }
+
+    fn has_pending(&self) -> bool {
+        self.active_pending_count() > 0
+    }
+
+    fn cancel(&mut self, call_id: CallId) -> bool {
+        let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.call_id == call_id && !entry.cancelled.load(Ordering::Acquire))
+        else {
+            return false;
+        };
+        pending.cancelled.store(true, Ordering::Release);
+        true
+    }
+
+    fn cancel_pending(&mut self) {
+        for pending in &mut self.pending {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.sender = None;
+        if let Some(handle) = self.handle.take() {
+            while !handle.is_finished() {
+                self.drain_completion_channel();
+                thread::yield_now();
+            }
+            let _ = handle.join();
+        }
+        self.drain_completion_channel();
+        self.pending.clear();
+    }
+
+    fn drain_completion_channel(&mut self) {
+        while self.completions.try_recv().is_ok() {}
+    }
+
+    fn active_pending_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|entry| !entry.cancelled.load(Ordering::Acquire))
+            .count()
+    }
+}
+
+impl Drop for StorageWorkerLane {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+fn storage_worker_loop(
+    receiver: Receiver<StorageCommand>,
+    completions: SyncSender<StorageCompletion>,
+) {
+    while let Ok(command) = receiver.recv() {
+        if command.cancelled.load(Ordering::Acquire) {
+            continue;
+        }
+        let completion = StorageCompletion {
+            call_id: command.call_id,
+            result: execute_storage_job(command.job),
+        };
+        if completions.send(completion).is_err() {
+            break;
+        }
+    }
+}
+
+fn execute_storage_job(job: StorageJob) -> CallOutput {
+    match job {
+        StorageJob::SnapshotCommit {
+            path,
+            bytes,
+            last_journal_index,
+        } => match crate::persistence::commit_snapshot(&path, bytes, last_journal_index) {
+            Ok(()) => CallOutput::SnapshotCommitted,
+            Err(reason) => CallOutput::Failed(reason),
+        },
+        StorageJob::SnapshotLoad { path } => match crate::persistence::load_snapshot(&path) {
+            Ok(snapshot) => CallOutput::SnapshotLoaded { snapshot },
+            Err(reason) => CallOutput::Failed(reason),
+        },
+        StorageJob::JournalAppend {
+            path,
+            record_index,
+            bytes,
+        } => match crate::persistence::append_journal_record(&path, record_index, bytes) {
+            Ok(()) => CallOutput::JournalAppended { record_index },
+            Err(reason) => CallOutput::Failed(reason),
+        },
+        StorageJob::JournalReplay { path } => match crate::persistence::replay_journal(&path) {
+            Ok(replay) => CallOutput::JournalReplayed { replay },
+            Err(reason) => CallOutput::Failed(reason),
+        },
+        #[cfg(test)]
+        StorageJob::Park { started, release } => {
+            let _ = started.send(());
+            let _ = release.recv();
+            CallOutput::DirectoryCreated
         }
     }
 }
@@ -334,44 +691,6 @@ impl BetelgeuseTcp {
                     Err(result) => Some(DriverCompletion { call_id, result }),
                 }
             }
-            CallInput::SnapshotCommit {
-                path,
-                bytes,
-                last_journal_index,
-            } => Some(DriverCompletion {
-                call_id,
-                result: match crate::persistence::commit_snapshot(&path, bytes, last_journal_index)
-                {
-                    Ok(()) => CallOutput::SnapshotCommitted,
-                    Err(reason) => CallOutput::Failed(reason),
-                },
-            }),
-            CallInput::SnapshotLoad { path } => Some(DriverCompletion {
-                call_id,
-                result: match crate::persistence::load_snapshot(&path) {
-                    Ok(snapshot) => CallOutput::SnapshotLoaded { snapshot },
-                    Err(reason) => CallOutput::Failed(reason),
-                },
-            }),
-            CallInput::JournalAppend {
-                path,
-                record_index,
-                bytes,
-            } => Some(DriverCompletion {
-                call_id,
-                result: match crate::persistence::append_journal_record(&path, record_index, bytes)
-                {
-                    Ok(()) => CallOutput::JournalAppended { record_index },
-                    Err(reason) => CallOutput::Failed(reason),
-                },
-            }),
-            CallInput::JournalReplay { path } => Some(DriverCompletion {
-                call_id,
-                result: match crate::persistence::replay_journal(&path) {
-                    Ok(replay) => CallOutput::JournalReplayed { replay },
-                    Err(reason) => CallOutput::Failed(reason),
-                },
-            }),
             CallInput::FileReadAt { file, len, offset } => {
                 let lane = PendingLane::FileRead(file);
                 if self.lane_has_pending(lane) {
@@ -538,7 +857,11 @@ impl BetelgeuseTcp {
                     Err(result) => Some(DriverCompletion { call_id, result }),
                 }
             }
-            CallInput::Sleep { .. } => Some(DriverCompletion {
+            CallInput::SnapshotCommit { .. }
+            | CallInput::SnapshotLoad { .. }
+            | CallInput::JournalAppend { .. }
+            | CallInput::JournalReplay { .. }
+            | CallInput::Sleep { .. } => Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::Unsupported),
             }),
@@ -1071,5 +1394,144 @@ impl std::fmt::Debug for BetelgeuseTcp {
             .field("files", &self.files.len())
             .field("pending", &self.pending.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_driver_storage_completes_inline_without_pending_lane() {
+        let io_loop =
+            io_loop(Global).expect("failed to initialise Betelgeuse IO loop for driver test");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        let completion = driver
+            .submit(
+                CallId::new(30),
+                CallInput::SnapshotLoad {
+                    path: PathBuf::from("missing-snapshot"),
+                },
+                Instant::now(),
+            )
+            .expect("explicit driver returns storage completion inline");
+
+        assert_eq!(completion.call_id, CallId::new(30));
+        assert!(matches!(
+            completion.result,
+            CallOutput::SnapshotLoaded { snapshot: None }
+        ));
+        assert!(!driver.has_pending());
+    }
+
+    #[test]
+    fn storage_lane_rejects_full_without_sleep_as_proof() {
+        let mut lane = StorageLane::new(1);
+        let (started_tx, started_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+
+        assert!(
+            lane.submit(
+                CallId::new(1),
+                StorageJob::Park {
+                    started: started_tx,
+                    release: release_rx,
+                },
+            )
+            .is_none()
+        );
+        started_rx.recv().expect("parked storage job started");
+
+        let full = lane
+            .submit(
+                CallId::new(2),
+                StorageJob::SnapshotLoad {
+                    path: PathBuf::from("full"),
+                },
+            )
+            .expect("second active storage job rejected");
+        assert_eq!(full.call_id, CallId::new(2));
+        assert!(matches!(
+            full.result,
+            CallOutput::Failed(CallError::StorageFull)
+        ));
+
+        release_tx.send(()).expect("release parked storage job");
+        lane.cancel_pending();
+    }
+
+    #[test]
+    fn storage_lane_cancellation_swallows_late_completion() {
+        let mut lane = StorageLane::new(1);
+        let (started_tx, started_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+
+        assert!(
+            lane.submit(
+                CallId::new(7),
+                StorageJob::Park {
+                    started: started_tx,
+                    release: release_rx,
+                },
+            )
+            .is_none()
+        );
+        started_rx.recv().expect("parked storage job started");
+        assert!(lane.cancel(CallId::new(7)));
+        assert!(!lane.has_pending());
+
+        release_tx.send(()).expect("release parked storage job");
+        let mut completed = Vec::new();
+        for _ in 0..64 {
+            lane.advance(&mut completed);
+            if !completed.is_empty() {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(completed.is_empty());
+    }
+
+    #[test]
+    fn storage_lane_shutdown_skips_buffered_work_that_never_started() {
+        let mut lane = StorageLane::new(2);
+        let (first_started_tx, first_started_rx) = sync_channel(1);
+        let (first_release_tx, first_release_rx) = sync_channel(1);
+        let (queued_started_tx, queued_started_rx) = sync_channel(1);
+        let (_queued_release_tx, queued_release_rx) = sync_channel(1);
+
+        assert!(
+            lane.submit(
+                CallId::new(11),
+                StorageJob::Park {
+                    started: first_started_tx,
+                    release: first_release_rx,
+                },
+            )
+            .is_none()
+        );
+        first_started_rx
+            .recv()
+            .expect("first parked storage job started");
+        assert!(
+            lane.submit(
+                CallId::new(12),
+                StorageJob::Park {
+                    started: queued_started_tx,
+                    release: queued_release_rx,
+                },
+            )
+            .is_none()
+        );
+
+        lane.cancel(CallId::new(12));
+        first_release_tx
+            .send(())
+            .expect("release first parked storage job");
+        lane.cancel_pending();
+        assert!(
+            queued_started_rx.try_recv().is_err(),
+            "queued storage work must not start after shutdown cancellation"
+        );
     }
 }

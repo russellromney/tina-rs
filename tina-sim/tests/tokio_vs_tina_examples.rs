@@ -271,7 +271,9 @@ impl Client {
                         | CallError::Unsupported
                         | CallError::ResourceBusy
                         | CallError::CorruptRecord
-                        | CallError::CommitUncertain,
+                        | CallError::CommitUncertain
+                        | CallError::StorageFull
+                        | CallError::StorageClosed,
                     ) => push(&self.events, "unexpected_call_error"),
                 }
                 noop()

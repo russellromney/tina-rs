@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tina::prelude::*;
+use tina::{Address, AddressGeneration, IsolateId, RestartBudget, RestartPolicy};
 use tina_runtime::{
     CallError, CallKind, JournalReplay, JournalReplayWarning, RuntimeEventKind, SnapshotImage,
     journal_append, journal_replay, snapshot_commit, snapshot_load,
 };
 use tina_sim::{DurableImage, Simulator, SimulatorConfig};
+use tina_supervisor::SupervisorConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SimShard;
@@ -24,9 +26,12 @@ enum PersistMsg {
     SnapshotLoaded(Result<Option<SnapshotImage>, CallError>),
     JournalLoaded(Result<JournalReplay, CallError>),
     Mutate(String),
+    AppendAt(u64, String),
     MutationDurable(Result<(), CallError>, u64, Vec<u8>),
     CommitSnapshot,
     SnapshotCommitted(Result<(), CallError>),
+    PanicAfterAppend(String),
+    RecoverThenPanic,
 }
 
 #[derive(Debug)]
@@ -38,9 +43,55 @@ struct PersistService {
     observed: Arc<Mutex<Vec<String>>>,
 }
 
-#[tina_runtime::isolate(message = PersistMsg, shard = SimShard)]
+#[derive(Debug, Clone)]
+enum PersistParentMsg {
+    SpawnChild,
+}
+
+#[derive(Debug)]
+struct PersistParent {
+    snapshot_path: PathBuf,
+    journal_path: PathBuf,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(
+    message = PersistParentMsg,
+    spawn = RestartableChildDefinition<PersistService>,
+    shard = SimShard
+)]
+impl PersistParent {
+    fn handle(&mut self, msg: PersistParentMsg, _ctx: &mut Context<'_, SimShard>) -> Effect<Self> {
+        match msg {
+            PersistParentMsg::SpawnChild => {
+                let snapshot_path = self.snapshot_path.clone();
+                let journal_path = self.journal_path.clone();
+                let observed = Arc::clone(&self.observed);
+                Effect::Spawn(
+                    RestartableChildDefinition::new(
+                        move || {
+                            PersistService::new(
+                                snapshot_path.clone(),
+                                journal_path.clone(),
+                                Arc::clone(&observed),
+                            )
+                        },
+                        16,
+                    )
+                    .with_initial_message(|| PersistMsg::Recover),
+                )
+            }
+        }
+    }
+}
+
+#[tina_runtime::isolate(
+    message = PersistMsg,
+    send = Outbound<PersistMsg>,
+    shard = SimShard
+)]
 impl PersistService {
-    fn handle(&mut self, msg: PersistMsg, _ctx: &mut Context<'_, SimShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: PersistMsg, ctx: &mut Context<'_, SimShard>) -> Effect<Self> {
         match msg {
             PersistMsg::Recover => {
                 snapshot_load(self.snapshot_path.clone()).reply(PersistMsg::SnapshotLoaded)
@@ -90,6 +141,11 @@ impl PersistService {
                 journal_append(self.journal_path.clone(), index, record.clone())
                     .reply(move |result| PersistMsg::MutationDurable(result, index, record))
             }
+            PersistMsg::AppendAt(index, value) => {
+                let record = value.into_bytes();
+                journal_append(self.journal_path.clone(), index, record.clone())
+                    .reply(move |result| PersistMsg::MutationDurable(result, index, record))
+            }
             PersistMsg::MutationDurable(Ok(()), index, record) => {
                 self.values
                     .push(String::from_utf8(record).expect("utf8 record"));
@@ -124,6 +180,16 @@ impl PersistService {
                     .push(format!("snapshot-error:{error:?}"));
                 noop()
             }
+            PersistMsg::PanicAfterAppend(value) => {
+                let index = self.last_journal_index + 1;
+                let record = value.into_bytes();
+                batch([
+                    journal_append(self.journal_path.clone(), index, record.clone())
+                        .reply(move |result| PersistMsg::MutationDurable(result, index, record)),
+                    Effect::Send(Outbound::new(ctx.me(), PersistMsg::RecoverThenPanic)),
+                ])
+            }
+            PersistMsg::RecoverThenPanic => panic!("persist service panic after durable append"),
         }
     }
 }
@@ -178,7 +244,7 @@ fn journal_path() -> PathBuf {
 fn simulator_replays_durable_recovery_from_durable_image() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
-    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
         PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
         16,
     );
@@ -199,7 +265,7 @@ fn simulator_replays_durable_recovery_from_durable_image() {
     let mut fresh = Simulator::new(SimShard, SimulatorConfig::default());
     fresh.load_durable_image(artifact.durable_image().clone());
     let fresh_address = fresh
-        .register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+        .register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
             PersistService::new(snapshot_path(), journal_path(), Arc::clone(&fresh_observed)),
             16,
         );
@@ -284,7 +350,7 @@ fn simulator_visible_truncated_and_corrupt_recovery_paths() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
     sim.load_durable_image(image);
-    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
         PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
         16,
     );
@@ -304,7 +370,7 @@ fn simulator_visible_truncated_and_corrupt_recovery_paths() {
     let mut corrupt_sim = Simulator::new(SimShard, SimulatorConfig::default());
     corrupt_sim.load_durable_image(corrupt_image);
     let corrupt_address = corrupt_sim
-        .register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+        .register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
             PersistService::new(
                 snapshot_path(),
                 journal_path(),
@@ -343,7 +409,7 @@ fn simulator_journal_append_rejects_bad_next_index_before_mutation() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
     sim.load_durable_image(image);
-    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, Infallible>(
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
         PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
         16,
     );
@@ -365,4 +431,206 @@ fn simulator_journal_append_rejects_bad_next_index_before_mutation() {
             }
         )
     }));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PersistenceOp {
+    Mutate(String),
+    BadAppend(u64, String),
+    Snapshot,
+    Recover,
+    Step,
+    RunUntilIdle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistenceRun {
+    observed: Vec<String>,
+    artifact: tina_sim::ReplayArtifact,
+}
+
+fn xorshift64(mut state: u64) -> u64 {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
+}
+
+fn persistence_ops(seed: u64, len: usize) -> Vec<PersistenceOp> {
+    let mut state = seed ^ 0xa91f_2d1e_37bb_19c5;
+    let mut ops = Vec::with_capacity(len);
+    for index in 0..len {
+        state = xorshift64(state);
+        let value = format!("v{seed}-{index}");
+        ops.push(match state % 9 {
+            0..=3 => PersistenceOp::Mutate(value),
+            4 => PersistenceOp::BadAppend(state % 3, value),
+            5 => PersistenceOp::Snapshot,
+            6 => PersistenceOp::Recover,
+            7 => PersistenceOp::Step,
+            _ => PersistenceOp::RunUntilIdle,
+        });
+    }
+    ops
+}
+
+fn run_persistence_ops(seed: u64, ops: &[PersistenceOp]) -> PersistenceRun {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(
+        SimShard,
+        SimulatorConfig {
+            seed,
+            ..Default::default()
+        },
+    );
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
+        PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
+        32,
+    );
+
+    for op in ops {
+        match op {
+            PersistenceOp::Mutate(value) => {
+                let _ = sim.try_send(address, PersistMsg::Mutate(value.clone()));
+            }
+            PersistenceOp::BadAppend(index, value) => {
+                let _ = sim.try_send(address, PersistMsg::AppendAt(*index, value.clone()));
+            }
+            PersistenceOp::Snapshot => {
+                let _ = sim.try_send(address, PersistMsg::CommitSnapshot);
+            }
+            PersistenceOp::Recover => {
+                let _ = sim.try_send(address, PersistMsg::Recover);
+            }
+            PersistenceOp::Step => {
+                sim.step();
+            }
+            PersistenceOp::RunUntilIdle => {
+                sim.run_until_quiescent();
+            }
+        }
+    }
+    sim.run_until_quiescent();
+
+    PersistenceRun {
+        observed: observed.lock().expect("observed mutex").clone(),
+        artifact: sim.replay_artifact(),
+    }
+}
+
+#[test]
+fn simulator_random_persistence_matrix_replays_and_keeps_journal_recoverable() {
+    for seed in 0..24 {
+        let ops = persistence_ops(seed, 48);
+        let first = run_persistence_ops(seed, &ops);
+        let second = run_persistence_ops(seed, &ops);
+
+        assert_eq!(
+            first, second,
+            "persistence DST replay drift for seed {seed}"
+        );
+
+        let mut fresh = Simulator::new(SimShard, SimulatorConfig::default());
+        fresh.load_durable_image(first.artifact.durable_image().clone());
+        let recovered_observed = Arc::new(Mutex::new(Vec::new()));
+        let recovered = fresh
+            .register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
+                PersistService::new(
+                    snapshot_path(),
+                    journal_path(),
+                    Arc::clone(&recovered_observed),
+                ),
+                16,
+            );
+        fresh.try_send(recovered, PersistMsg::Recover).unwrap();
+        fresh.run_until_quiescent();
+
+        assert!(
+            !fresh.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::RecoveryFailed {
+                        reason: CallError::CorruptRecord
+                    }
+                )
+            }),
+            "seed {seed} produced an unrecoverable durable image"
+        );
+        assert!(first.artifact.event_record().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::JournalAppended { .. }
+                    | RuntimeEventKind::JournalAppendFailed { .. }
+                    | RuntimeEventKind::SnapshotCommitted
+                    | RuntimeEventKind::RecoveryFinished
+            )
+        }));
+    }
+}
+
+#[test]
+fn simulator_supervision_persistence_recovers_after_durable_append_then_panic() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
+    let parent = sim.register_with_mailbox_capacity::<PersistParent, PersistParentMsg, Infallible>(
+        PersistParent {
+            snapshot_path: snapshot_path(),
+            journal_path: journal_path(),
+            observed: Arc::clone(&observed),
+        },
+        8,
+    );
+    sim.supervise(
+        parent,
+        SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(1)),
+    );
+    sim.try_send(parent, PersistParentMsg::SpawnChild).unwrap();
+    sim.run_until_quiescent();
+
+    let child = first_spawned_child(sim.trace()).expect("spawned persist child");
+    let child_address = persist_address(child);
+    sim.try_send(child_address, PersistMsg::Mutate("before".to_owned()))
+        .unwrap();
+    sim.run_until_quiescent();
+    sim.try_send(
+        child_address,
+        PersistMsg::PanicAfterAppend("durable".to_owned()),
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    let artifact = sim.replay_artifact();
+
+    assert_eq!(
+        observed.lock().expect("observed mutex").last(),
+        Some(&"before,durable".to_owned())
+    );
+    assert!(
+        artifact
+            .event_record()
+            .iter()
+            .any(|event| { matches!(event.kind(), RuntimeEventKind::HandlerPanicked) })
+    );
+    assert!(
+        artifact.event_record().iter().any(|event| {
+            matches!(event.kind(), RuntimeEventKind::RestartChildCompleted { .. })
+        })
+    );
+    assert!(artifact.event_record().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::JournalAppended { record_index: 2 }
+        )
+    }));
+}
+
+fn first_spawned_child(trace: &[tina_runtime::RuntimeEvent]) -> Option<IsolateId> {
+    trace.iter().find_map(|event| match event.kind() {
+        RuntimeEventKind::Spawned { child_isolate } => Some(child_isolate),
+        _ => None,
+    })
+}
+
+fn persist_address(isolate: IsolateId) -> Address<PersistMsg> {
+    Address::new_with_generation(SimShard.id(), isolate, AddressGeneration::new(0))
 }

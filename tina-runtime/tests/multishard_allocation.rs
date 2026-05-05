@@ -15,7 +15,8 @@ use betelgeuse::io::simulated::{SimulatedIO, SimulatedPeer};
 use tina::{ChildDefinition, Mailbox, RestartableChildDefinition, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseBackedRuntime, CallInput, CallOutcome, CallOutput, ListenerId, LocalApp,
-    MailboxFactory, MultiShardRuntime, Runtime, RuntimeCall, StreamId, call,
+    LocalAppState, LocalAppTerminalReport, MailboxFactory, MultiShardRuntime, Runtime, RuntimeCall,
+    StreamId, call,
 };
 
 const EXPECTED_MULTISHARD_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
@@ -63,6 +64,10 @@ const EXPECTED_TRACE_PRESSURE_HOT_PATH: AllocationSnapshot = AllocationSnapshot 
     reallocations: 0,
 };
 const EXPECTED_HIGH_CARDINALITY_IDLE_STEP: AllocationSnapshot = AllocationSnapshot {
+    allocations: 0,
+    reallocations: 0,
+};
+const EXPECTED_TERMINAL_SUMMARY_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
     allocations: 0,
     reallocations: 0,
 };
@@ -751,6 +756,32 @@ fn repeated_trace_event_growth_allocation_count_is_pinned() {
     assert_eq!(
         hot_path, EXPECTED_TRACE_PRESSURE_HOT_PATH,
         "trace pressure allocation count changed; update the runtime allocation claim"
+    );
+}
+
+#[test]
+fn terminal_summary_scans_trace_without_allocating() {
+    let _guard = ALLOCATION_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = Runtime::new(AllocationShard(11), TestMailboxFactory);
+    let sink = runtime.register_with_capacity::<AllocationSink, Infallible>(AllocationSink, 128);
+
+    for _ in 0..16 {
+        runtime.try_send(sink, AllocationEvent::Arrived).unwrap();
+        assert_eq!(runtime.step(), 1);
+    }
+    let report = LocalAppTerminalReport::new(LocalAppState::Closed, runtime.trace().to_vec());
+
+    let warmup = report.summary();
+    assert_eq!(warmup.message_abandoned, 0);
+    let hot_path = measure_allocations(|| {
+        let summary = report.summary();
+        assert_eq!(summary.message_abandoned, 0);
+    });
+    assert_eq!(
+        hot_path, EXPECTED_TERMINAL_SUMMARY_HOT_PATH,
+        "terminal summary should scan retained trace without allocating"
     );
 }
 

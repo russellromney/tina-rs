@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     BetelgeuseBackedRuntime, CallKind, MailboxFactory, Runtime, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, sleep_then,
+    RuntimeEventKind, SendRejectedReason, sleep_then,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -259,4 +259,176 @@ fn retry_timer_workload_matches_oracle_simulator_and_betelgeuse_runner() {
     assert_eq!(count_sleep_completed(&oracle_trace), 1);
     assert_eq!(count_sleep_completed(&sim_trace), 1);
     assert_eq!(count_sleep_completed(&betelgeuse_trace), 1);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParityTargetMsg {
+    Data(u8),
+    Stop,
+}
+
+#[derive(Debug)]
+struct ParityTarget {
+    observed: Arc<Mutex<Vec<u8>>>,
+}
+
+#[tina_runtime::isolate(message = ParityTargetMsg, shard = TestShard)]
+impl ParityTarget {
+    fn handle(&mut self, msg: ParityTargetMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+        match msg {
+            ParityTargetMsg::Data(value) => {
+                self.observed.lock().expect("observed mutex").push(value);
+                noop()
+            }
+            ParityTargetMsg::Stop => stop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParityDriverMsg {
+    Send(u8),
+    StopTarget,
+}
+
+#[derive(Debug)]
+struct ParityDriver {
+    target: Address<ParityTargetMsg>,
+}
+
+#[tina_runtime::isolate(
+    message = ParityDriverMsg,
+    send = Outbound<ParityTargetMsg>,
+    shard = TestShard
+)]
+impl ParityDriver {
+    fn handle(&mut self, msg: ParityDriverMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+        match msg {
+            ParityDriverMsg::Send(value) => send(self.target, ParityTargetMsg::Data(value)),
+            ParityDriverMsg::StopTarget => send(self.target, ParityTargetMsg::Stop),
+        }
+    }
+}
+
+fn parity_ops() -> [ParityDriverMsg; 5] {
+    [
+        ParityDriverMsg::Send(1),
+        ParityDriverMsg::Send(2),
+        ParityDriverMsg::StopTarget,
+        ParityDriverMsg::Send(3),
+        ParityDriverMsg::Send(4),
+    ]
+}
+
+fn closed_rejections(trace: &[RuntimeEvent]) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::Closed,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn run_send_stop_oracle() -> (Vec<u8>, Vec<RuntimeEvent>) {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let target = runtime.register_with_capacity::<ParityTarget, Infallible>(
+        ParityTarget {
+            observed: Arc::clone(&observed),
+        },
+        4,
+    );
+    let driver =
+        runtime.register_with_capacity::<ParityDriver, ParityTargetMsg>(ParityDriver { target }, 8);
+    for op in parity_ops() {
+        runtime.try_send(driver, op).unwrap();
+    }
+    for _ in 0..16 {
+        runtime.step();
+    }
+    (
+        observed.lock().expect("observed mutex").clone(),
+        runtime.trace().to_vec(),
+    )
+}
+
+fn run_send_stop_simulator() -> (Vec<u8>, Vec<RuntimeEvent>) {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, SimulatorConfig::default());
+    let target = sim.register_with_mailbox_capacity::<ParityTarget, ParityTargetMsg, Infallible>(
+        ParityTarget {
+            observed: Arc::clone(&observed),
+        },
+        4,
+    );
+    let driver = sim
+        .register_with_mailbox_capacity::<ParityDriver, ParityDriverMsg, ParityTargetMsg>(
+            ParityDriver { target },
+            8,
+        );
+    for op in parity_ops() {
+        sim.try_send(driver, op).unwrap();
+    }
+    sim.run_until_quiescent();
+    (
+        observed.lock().expect("observed mutex").clone(),
+        sim.trace().to_vec(),
+    )
+}
+
+fn run_send_stop_betelgeuse() -> (Vec<u8>, Vec<RuntimeEvent>) {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let runtime = BetelgeuseBackedRuntime::new(TestShard, TestMailboxFactory);
+    let target = runtime
+        .register_with_capacity::<ParityTarget, Infallible>(
+            ParityTarget {
+                observed: Arc::clone(&observed),
+            },
+            4,
+        )
+        .expect("target register accepts");
+    let driver = runtime
+        .register_with_capacity::<ParityDriver, ParityTargetMsg>(ParityDriver { target }, 8)
+        .expect("driver register accepts");
+    for op in parity_ops() {
+        runtime.try_send(driver, op).unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while observed.lock().expect("observed mutex").as_slice() != [1, 2]
+        || closed_rejections(&runtime.trace().unwrap_or_default()) < 2
+    {
+        if Instant::now() > deadline {
+            panic!(
+                "Betelgeuse send-stop workload did not settle: {:#?}",
+                runtime.trace()
+            );
+        }
+        thread::yield_now();
+    }
+
+    (
+        observed.lock().expect("observed mutex").clone(),
+        runtime.shutdown().expect("Betelgeuse shutdown"),
+    )
+}
+
+#[test]
+fn send_stop_workload_matches_oracle_simulator_and_betelgeuse_runner() {
+    let (oracle_observed, oracle_trace) = run_send_stop_oracle();
+    let (sim_observed, sim_trace) = run_send_stop_simulator();
+    let (betelgeuse_observed, betelgeuse_trace) = run_send_stop_betelgeuse();
+
+    assert_eq!(oracle_observed, vec![1, 2]);
+    assert_eq!(sim_observed, oracle_observed);
+    assert_eq!(betelgeuse_observed, oracle_observed);
+    assert_eq!(closed_rejections(&oracle_trace), 2);
+    assert_eq!(closed_rejections(&sim_trace), 2);
+    assert_eq!(closed_rejections(&betelgeuse_trace), 2);
 }

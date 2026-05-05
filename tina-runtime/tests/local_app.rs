@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,9 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedControlError, CallError, FileId, LocalApp, LocalAppState, MailboxFactory,
-    RuntimeEventKind, TraceRetention, file_close, file_create, file_fsync, file_read, file_size,
-    file_write, sleep,
+    BetelgeuseBackedControlError, CallError, FileId, ListenerId, LocalApp, LocalAppState,
+    MailboxFactory, RuntimeEventKind, SnapshotImage, StreamId, TraceRetention, file_close,
+    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
+    sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
+    tcp_write,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -195,6 +199,422 @@ impl FileService {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DurableWorkerMsg {
+    Recover,
+    SnapshotLoaded(Result<Option<SnapshotImage>, CallError>),
+    JournalLoaded(Result<tina_runtime::JournalReplay, CallError>),
+    Feed(String),
+    Durable(Result<(), CallError>, u64, Vec<u8>),
+}
+
+#[derive(Debug)]
+struct DurableWorker {
+    snapshot_path: PathBuf,
+    journal_path: PathBuf,
+    values: Vec<String>,
+    last_journal_index: u64,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = DurableWorkerMsg, shard = AppShard)]
+impl DurableWorker {
+    fn handle(&mut self, msg: DurableWorkerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            DurableWorkerMsg::Recover => {
+                snapshot_load(self.snapshot_path.clone()).reply(DurableWorkerMsg::SnapshotLoaded)
+            }
+            DurableWorkerMsg::SnapshotLoaded(Ok(Some(snapshot))) => {
+                self.values = decode_durable_values(&snapshot.bytes);
+                self.last_journal_index = snapshot.last_journal_index;
+                journal_replay(self.journal_path.clone()).reply(DurableWorkerMsg::JournalLoaded)
+            }
+            DurableWorkerMsg::SnapshotLoaded(Ok(None)) => {
+                journal_replay(self.journal_path.clone()).reply(DurableWorkerMsg::JournalLoaded)
+            }
+            DurableWorkerMsg::SnapshotLoaded(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("durable observed lock")
+                    .push(format!("snapshot-error:{error:?}"));
+                noop()
+            }
+            DurableWorkerMsg::JournalLoaded(Ok(replay)) => {
+                for record in replay.records {
+                    if record.index > self.last_journal_index {
+                        self.values
+                            .push(String::from_utf8(record.bytes).expect("durable journal utf8"));
+                        self.last_journal_index = record.index;
+                    }
+                }
+                self.record_state();
+                noop()
+            }
+            DurableWorkerMsg::JournalLoaded(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("durable observed lock")
+                    .push(format!("journal-error:{error:?}"));
+                noop()
+            }
+            DurableWorkerMsg::Feed(value) => {
+                let index = self.last_journal_index + 1;
+                let record = value.into_bytes();
+                journal_append(self.journal_path.clone(), index, record.clone())
+                    .reply(move |result| DurableWorkerMsg::Durable(result, index, record))
+            }
+            DurableWorkerMsg::Durable(Ok(()), index, record) => {
+                self.values
+                    .push(String::from_utf8(record).expect("durable record utf8"));
+                self.last_journal_index = index;
+                self.record_state();
+                noop()
+            }
+            DurableWorkerMsg::Durable(Err(error), _, _) => {
+                self.observed
+                    .lock()
+                    .expect("durable observed lock")
+                    .push(format!("append-error:{error:?}"));
+                noop()
+            }
+        }
+    }
+}
+
+impl DurableWorker {
+    fn new(
+        snapshot_path: PathBuf,
+        journal_path: PathBuf,
+        observed: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            snapshot_path,
+            journal_path,
+            values: Vec::new(),
+            last_journal_index: 0,
+            observed,
+        }
+    }
+
+    fn record_state(&self) {
+        self.observed
+            .lock()
+            .expect("durable observed lock")
+            .push(self.values.join(","));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FrontendMsg {
+    Feed(String),
+}
+
+#[derive(Debug)]
+struct Frontend {
+    worker: Address<DurableWorkerMsg>,
+}
+
+#[tina_runtime::isolate(
+    message = FrontendMsg,
+    send = Outbound<DurableWorkerMsg>,
+    shard = AppShard
+)]
+impl Frontend {
+    fn handle(&mut self, msg: FrontendMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            FrontendMsg::Feed(value) => send(self.worker, DurableWorkerMsg::Feed(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TcpJournalMsg {
+    Start(PathBuf),
+    Bound(Result<(ListenerId, SocketAddr), CallError>),
+    Accepted(Result<(StreamId, SocketAddr), CallError>),
+    Read(Result<Vec<u8>, CallError>, StreamId),
+    Durable(Result<(), CallError>, StreamId, Vec<u8>, u64),
+    Wrote(Result<usize, CallError>, StreamId),
+    StreamClosed(Result<(), CallError>),
+    ListenerClosed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct TcpJournalService {
+    published: Arc<Mutex<Option<SocketAddr>>>,
+    observed: Arc<Mutex<Vec<String>>>,
+    listener: Option<ListenerId>,
+    journal_path: Option<PathBuf>,
+    last_journal_index: u64,
+}
+
+#[tina_runtime::isolate(message = TcpJournalMsg, shard = AppShard)]
+impl TcpJournalService {
+    fn handle(&mut self, msg: TcpJournalMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            TcpJournalMsg::Start(journal_path) => {
+                self.journal_path = Some(journal_path);
+                tcp_bind("127.0.0.1:0".parse().expect("valid loopback")).reply(TcpJournalMsg::Bound)
+            }
+            TcpJournalMsg::Bound(Ok((listener, addr))) => {
+                self.listener = Some(listener);
+                *self.published.lock().expect("published lock") = Some(addr);
+                tcp_accept(listener).reply(TcpJournalMsg::Accepted)
+            }
+            TcpJournalMsg::Accepted(Ok((stream, _peer))) => {
+                tcp_read(stream, 64).reply(move |result| TcpJournalMsg::Read(result, stream))
+            }
+            TcpJournalMsg::Read(Ok(bytes), stream) if bytes.is_empty() => {
+                tcp_close_stream(stream).reply(TcpJournalMsg::StreamClosed)
+            }
+            TcpJournalMsg::Read(Ok(bytes), stream) => {
+                let index = self.last_journal_index + 1;
+                let journal_path = self
+                    .journal_path
+                    .clone()
+                    .expect("journal path set before read");
+                journal_append(journal_path, index, bytes.clone())
+                    .reply(move |result| TcpJournalMsg::Durable(result, stream, bytes, index))
+            }
+            TcpJournalMsg::Durable(Ok(()), stream, bytes, index) => {
+                self.last_journal_index = index;
+                self.observed
+                    .lock()
+                    .expect("observed lock")
+                    .push(String::from_utf8(bytes).expect("client payload utf8"));
+                tcp_write(stream, b"journaled\n".to_vec())
+                    .reply(move |result| TcpJournalMsg::Wrote(result, stream))
+            }
+            TcpJournalMsg::Wrote(Ok(_), stream) => {
+                tcp_close_stream(stream).reply(TcpJournalMsg::StreamClosed)
+            }
+            TcpJournalMsg::StreamClosed(Ok(())) => match self.listener.take() {
+                Some(listener) => tcp_close_listener(listener).reply(TcpJournalMsg::ListenerClosed),
+                None => stop(),
+            },
+            TcpJournalMsg::ListenerClosed(Ok(())) => {
+                self.observed
+                    .lock()
+                    .expect("observed lock")
+                    .push("closed".to_owned());
+                stop()
+            }
+            TcpJournalMsg::Bound(Err(error))
+            | TcpJournalMsg::Accepted(Err(error))
+            | TcpJournalMsg::Read(Err(error), _)
+            | TcpJournalMsg::Durable(Err(error), _, _, _)
+            | TcpJournalMsg::Wrote(Err(error), _)
+            | TcpJournalMsg::StreamClosed(Err(error))
+            | TcpJournalMsg::ListenerClosed(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("observed lock")
+                    .push(format!("failed:{error:?}"));
+                stop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoragePressureMsg {
+    Start(PathBuf),
+    First(Result<(), CallError>),
+    Second(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct StoragePressureService {
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = StoragePressureMsg, shard = AppShard)]
+impl StoragePressureService {
+    fn handle(
+        &mut self,
+        msg: StoragePressureMsg,
+        _ctx: &mut Context<'_, AppShard>,
+    ) -> Effect<Self> {
+        match msg {
+            StoragePressureMsg::Start(path) => batch(vec![
+                journal_append(path.clone(), 1, b"first".to_vec()).reply(StoragePressureMsg::First),
+                journal_append(path, 2, b"second".to_vec()).reply(StoragePressureMsg::Second),
+            ]),
+            StoragePressureMsg::First(result) => {
+                self.observed
+                    .lock()
+                    .expect("storage pressure observed lock")
+                    .push(format!("first:{result:?}"));
+                noop()
+            }
+            StoragePressureMsg::Second(result) => {
+                self.observed
+                    .lock()
+                    .expect("storage pressure observed lock")
+                    .push(format!("second:{result:?}"));
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrossShardTcpMsg {
+    Start,
+    Bound(Result<(ListenerId, SocketAddr), CallError>),
+    Accepted(Result<(StreamId, SocketAddr), CallError>),
+    Read(Result<Vec<u8>, CallError>, StreamId),
+    Persisted(Result<(), CallError>, Vec<u8>),
+    Wrote(Result<usize, CallError>, StreamId),
+    StreamClosed(Result<(), CallError>),
+    ListenerClosed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct CrossShardTcpFrontend {
+    worker: Address<CrossShardPersistMsg>,
+    published: Arc<Mutex<Option<SocketAddr>>>,
+    observed: Arc<Mutex<Vec<String>>>,
+    listener: Option<ListenerId>,
+    stream: Option<StreamId>,
+}
+
+#[tina_runtime::isolate(
+    message = CrossShardTcpMsg,
+    send = Outbound<CrossShardPersistMsg>,
+    shard = AppShard
+)]
+impl CrossShardTcpFrontend {
+    fn handle(&mut self, msg: CrossShardTcpMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            CrossShardTcpMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("valid loopback"))
+                .reply(CrossShardTcpMsg::Bound),
+            CrossShardTcpMsg::Bound(Ok((listener, addr))) => {
+                self.listener = Some(listener);
+                *self.published.lock().expect("published lock") = Some(addr);
+                tcp_accept(listener).reply(CrossShardTcpMsg::Accepted)
+            }
+            CrossShardTcpMsg::Accepted(Ok((stream, _peer))) => {
+                tcp_read(stream, 64).reply(move |result| CrossShardTcpMsg::Read(result, stream))
+            }
+            CrossShardTcpMsg::Read(Ok(bytes), stream) if bytes.is_empty() => {
+                tcp_close_stream(stream).reply(CrossShardTcpMsg::StreamClosed)
+            }
+            CrossShardTcpMsg::Read(Ok(bytes), stream) => {
+                self.stream = Some(stream);
+                send(
+                    self.worker,
+                    CrossShardPersistMsg::Persist {
+                        bytes,
+                        reply_to: ctx.me(),
+                    },
+                )
+            }
+            CrossShardTcpMsg::Persisted(Ok(()), bytes) => {
+                self.observed
+                    .lock()
+                    .expect("cross shard tcp observed lock")
+                    .push(String::from_utf8(bytes.clone()).expect("client payload utf8"));
+                let stream = self.stream.take().expect("stream pending durable ack");
+                let mut reply = b"persisted:".to_vec();
+                reply.extend(bytes);
+                reply.push(b'\n');
+                tcp_write(stream, reply)
+                    .reply(move |result| CrossShardTcpMsg::Wrote(result, stream))
+            }
+            CrossShardTcpMsg::Wrote(Ok(_), stream) => {
+                tcp_close_stream(stream).reply(CrossShardTcpMsg::StreamClosed)
+            }
+            CrossShardTcpMsg::StreamClosed(Ok(())) => match self.listener.take() {
+                Some(listener) => {
+                    tcp_close_listener(listener).reply(CrossShardTcpMsg::ListenerClosed)
+                }
+                None => stop(),
+            },
+            CrossShardTcpMsg::ListenerClosed(Ok(())) => {
+                self.observed
+                    .lock()
+                    .expect("cross shard tcp observed lock")
+                    .push("closed".to_string());
+                stop()
+            }
+            CrossShardTcpMsg::Bound(Err(error))
+            | CrossShardTcpMsg::Accepted(Err(error))
+            | CrossShardTcpMsg::Read(Err(error), _)
+            | CrossShardTcpMsg::Persisted(Err(error), _)
+            | CrossShardTcpMsg::Wrote(Err(error), _)
+            | CrossShardTcpMsg::StreamClosed(Err(error))
+            | CrossShardTcpMsg::ListenerClosed(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("cross shard tcp observed lock")
+                    .push(format!("failed:{error:?}"));
+                stop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrossShardPersistMsg {
+    Persist {
+        bytes: Vec<u8>,
+        reply_to: Address<CrossShardTcpMsg>,
+    },
+    Durable(
+        Result<(), CallError>,
+        Vec<u8>,
+        Address<CrossShardTcpMsg>,
+        u64,
+    ),
+}
+
+#[derive(Debug)]
+struct CrossShardPersistWorker {
+    journal_path: PathBuf,
+    last_journal_index: u64,
+}
+
+#[tina_runtime::isolate(
+    message = CrossShardPersistMsg,
+    send = Outbound<CrossShardTcpMsg>,
+    shard = AppShard
+)]
+impl CrossShardPersistWorker {
+    fn handle(
+        &mut self,
+        msg: CrossShardPersistMsg,
+        _ctx: &mut Context<'_, AppShard>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossShardPersistMsg::Persist { bytes, reply_to } => {
+                let index = self.last_journal_index + 1;
+                journal_append(self.journal_path.clone(), index, bytes.clone()).reply(
+                    move |result| CrossShardPersistMsg::Durable(result, bytes, reply_to, index),
+                )
+            }
+            CrossShardPersistMsg::Durable(Ok(()), bytes, reply_to, index) => {
+                self.last_journal_index = index;
+                send(reply_to, CrossShardTcpMsg::Persisted(Ok(()), bytes))
+            }
+            CrossShardPersistMsg::Durable(Err(error), bytes, reply_to, _) => {
+                send(reply_to, CrossShardTcpMsg::Persisted(Err(error), bytes))
+            }
+        }
+    }
+}
+
+fn decode_durable_values(bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    String::from_utf8(bytes.to_vec())
+        .expect("durable snapshot utf8")
+        .split('\n')
+        .map(str::to_owned)
+        .collect()
+}
+
 fn wait_until(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -204,6 +624,28 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
         thread::sleep(Duration::from_millis(5));
     }
     assert!(predicate(), "condition did not become true before timeout");
+}
+
+fn wait_for_addr(published: &Arc<Mutex<Option<SocketAddr>>>) -> SocketAddr {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(addr) = *published.lock().expect("published lock") {
+            return addr;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    published
+        .lock()
+        .expect("published lock")
+        .expect("service did not publish address before timeout")
+}
+
+fn unique_dir(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("tina-{label}-{}-{unique}", std::process::id()))
 }
 
 #[test]
@@ -286,6 +728,406 @@ fn local_app_multi_shard_uses_same_entry_name_for_topology() {
         .expect("multi-shard local app shutdown");
     assert_eq!(terminal.state(), LocalAppState::Closed);
     assert!(terminal.trace().len() >= 2);
+}
+
+#[test]
+fn local_app_end_to_end_service_routes_cross_shard_persists_and_recovers() {
+    let dir = unique_dir("local-app-e2e");
+    fs::create_dir_all(&dir).expect("create e2e dir");
+    let snapshot_path = dir.join("state.snapshot");
+    let journal_path = dir.join("state.journal");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    let app = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(71))
+        .shard(AppShard(72))
+        .ingress_capacity(8)
+        .shard_pair_capacity(8)
+        .storage_lane_capacity(4)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+
+    let worker = app
+        .register_root_on::<DurableWorker, Infallible>(
+            ShardId::new(72),
+            DurableWorker::new(
+                snapshot_path.clone(),
+                journal_path.clone(),
+                Arc::clone(&observed),
+            ),
+            8,
+        )
+        .expect("register durable worker");
+    let frontend = app
+        .register_root_on::<Frontend, DurableWorkerMsg>(ShardId::new(71), Frontend { worker }, 8)
+        .expect("register frontend");
+
+    app.try_send(frontend, FrontendMsg::Feed("llama snacks".to_owned()))
+        .expect("frontend ingress handoff");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("durable observed lock")
+            .contains(&"llama snacks".to_owned())
+    });
+
+    let terminal = app.shutdown().drain().join().expect("shutdown e2e app");
+    assert_eq!(terminal.state(), LocalAppState::Closed);
+    let summary = terminal.summary();
+    assert_eq!(summary.journal_appended, 1);
+    assert_eq!(summary.persistence_failed, 0);
+    assert_eq!(summary.call_completion_rejected, 0);
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendAccepted {
+                target_shard,
+                ..
+            } if target_shard == ShardId::new(72)
+        )
+    }));
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::JournalAppended { record_index: 1 }
+        )
+    }));
+
+    let recovered = Arc::new(Mutex::new(Vec::new()));
+    let fresh = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(71))
+        .shard(AppShard(72))
+        .ingress_capacity(8)
+        .shard_pair_capacity(8)
+        .storage_lane_capacity(4)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+    let fresh_worker = fresh
+        .register_root_on::<DurableWorker, Infallible>(
+            ShardId::new(72),
+            DurableWorker::new(snapshot_path, journal_path, Arc::clone(&recovered)),
+            8,
+        )
+        .expect("register fresh durable worker");
+    fresh
+        .try_send(fresh_worker, DurableWorkerMsg::Recover)
+        .expect("recover handoff");
+    wait_until(|| {
+        recovered
+            .lock()
+            .expect("recovered observed lock")
+            .contains(&"llama snacks".to_owned())
+    });
+
+    let fresh_terminal = fresh
+        .shutdown()
+        .drain()
+        .join()
+        .expect("shutdown recovered app");
+    assert_eq!(fresh_terminal.state(), LocalAppState::Closed);
+    let fresh_summary = fresh_terminal.summary();
+    assert_eq!(fresh_summary.recovery_finished, 2);
+    assert_eq!(fresh_summary.recovery_failed, 0);
+    assert!(
+        fresh_terminal
+            .trace()
+            .iter()
+            .any(|event| { matches!(event.kind(), RuntimeEventKind::RecoveryFinished) })
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn local_app_tcp_service_journals_before_replying_to_client() {
+    let dir = unique_dir("local-app-tcp-journal");
+    fs::create_dir_all(&dir).expect("create tcp journal dir");
+    let journal_path = dir.join("tcp.journal");
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    let app = LocalApp::single_shard(AppShard(73), AppMailboxFactory)
+        .ingress_capacity(8)
+        .storage_lane_capacity(4)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+    let service = app
+        .register_root::<TcpJournalService, Infallible>(
+            TcpJournalService {
+                published: Arc::clone(&published),
+                observed: Arc::clone(&observed),
+                listener: None,
+                journal_path: None,
+                last_journal_index: 0,
+            },
+            8,
+        )
+        .expect("register tcp journal service");
+
+    app.try_send(service, TcpJournalMsg::Start(journal_path.clone()))
+        .expect("start tcp journal service");
+    let addr = wait_for_addr(&published);
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).expect("connect tcp journal service");
+        stream.write_all(b"grain").expect("write client payload");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish client write");
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).expect("read reply");
+        reply
+    });
+
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("observed lock")
+            .contains(&"grain".to_string())
+    });
+    assert_eq!(client.join().expect("client thread joins"), "journaled\n");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("observed lock")
+            .contains(&"closed".to_string())
+    });
+
+    let terminal = app.shutdown().drain().join().expect("shutdown tcp app");
+    assert_eq!(terminal.state(), LocalAppState::Closed);
+    let summary = terminal.summary();
+    assert_eq!(summary.call_completed, 7);
+    assert_eq!(summary.call_failed, 0);
+    assert_eq!(summary.call_completion_rejected, 0);
+    assert_eq!(summary.send_rejected, 0);
+    assert_eq!(summary.journal_appended, 1);
+    assert_eq!(summary.persistence_failed, 0);
+    for expected in [
+        tina_runtime::CallKind::TcpBind,
+        tina_runtime::CallKind::TcpAccept,
+        tina_runtime::CallKind::TcpRead,
+        tina_runtime::CallKind::JournalAppend,
+        tina_runtime::CallKind::TcpWrite,
+        tina_runtime::CallKind::TcpStreamClose,
+        tina_runtime::CallKind::TcpListenerClose,
+    ] {
+        assert!(
+            terminal.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+                )
+            }),
+            "expected {expected:?} completion in tcp journal service trace"
+        );
+    }
+
+    let replay = tina_runtime::persistence::replay_journal(&journal_path)
+        .expect("tcp journal replays after app shutdown");
+    assert_eq!(replay.records.len(), 1);
+    assert_eq!(replay.records[0].index, 1);
+    assert_eq!(replay.records[0].bytes, b"grain");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn local_app_storage_lane_full_is_user_visible_without_sleep_as_proof() {
+    let dir = unique_dir("local-app-storage-full");
+    fs::create_dir_all(&dir).expect("create storage full dir");
+    let journal_path = dir.join("pressure.journal");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    let app = LocalApp::single_shard(AppShard(74), AppMailboxFactory)
+        .ingress_capacity(8)
+        .storage_lane_capacity(1)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+    let service = app
+        .register_root::<StoragePressureService, Infallible>(
+            StoragePressureService {
+                observed: Arc::clone(&observed),
+            },
+            8,
+        )
+        .expect("register storage pressure service");
+
+    app.try_send(service, StoragePressureMsg::Start(journal_path.clone()))
+        .expect("start storage pressure service");
+    wait_until(|| {
+        let observed = observed.lock().expect("storage pressure observed lock");
+        observed.len() == 2
+            && observed.iter().any(|entry| entry == "first:Ok(())")
+            && observed
+                .iter()
+                .any(|entry| entry == "second:Err(StorageFull)")
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("shutdown pressure app");
+    assert_eq!(terminal.state(), LocalAppState::Closed);
+    let summary = terminal.summary();
+    assert_eq!(summary.journal_appended, 1);
+    assert_eq!(summary.persistence_failed, 1);
+    assert_eq!(summary.call_failed, 1);
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: tina_runtime::CallKind::JournalAppend,
+                reason: CallError::StorageFull,
+                ..
+            }
+        )
+    }));
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::JournalAppendFailed {
+                record_index: 2,
+                reason: CallError::StorageFull,
+            }
+        )
+    }));
+
+    let replay = tina_runtime::persistence::replay_journal(&journal_path)
+        .expect("storage pressure journal replays");
+    assert_eq!(replay.records.len(), 1);
+    assert_eq!(replay.records[0].index, 1);
+    assert_eq!(replay.records[0].bytes, b"first");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn local_app_cross_shard_tcp_request_persists_before_client_reply() {
+    let dir = unique_dir("local-app-cross-shard-tcp-persist");
+    fs::create_dir_all(&dir).expect("create cross shard tcp dir");
+    let journal_path = dir.join("cross-shard-tcp.journal");
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    let app = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(81))
+        .shard(AppShard(82))
+        .ingress_capacity(8)
+        .shard_pair_capacity(8)
+        .storage_lane_capacity(2)
+        .trace_retention(TraceRetention::Bounded(1024))
+        .build();
+    let worker = app
+        .register_root_on::<CrossShardPersistWorker, CrossShardTcpMsg>(
+            ShardId::new(82),
+            CrossShardPersistWorker {
+                journal_path: journal_path.clone(),
+                last_journal_index: 0,
+            },
+            8,
+        )
+        .expect("register cross shard persist worker");
+    let frontend = app
+        .register_root_on::<CrossShardTcpFrontend, CrossShardPersistMsg>(
+            ShardId::new(81),
+            CrossShardTcpFrontend {
+                worker,
+                published: Arc::clone(&published),
+                observed: Arc::clone(&observed),
+                listener: None,
+                stream: None,
+            },
+            8,
+        )
+        .expect("register cross shard tcp frontend");
+
+    app.try_send(frontend, CrossShardTcpMsg::Start)
+        .expect("start cross shard tcp frontend");
+    let addr = wait_for_addr(&published);
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).expect("connect cross shard tcp frontend");
+        stream
+            .write_all(b"grain")
+            .expect("write cross shard payload");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish cross shard write");
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).expect("read reply");
+        reply
+    });
+
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("cross shard observed lock")
+            .contains(&"grain".to_string())
+    });
+    assert_eq!(
+        client.join().expect("client thread joins"),
+        "persisted:grain\n"
+    );
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("cross shard observed lock")
+            .contains(&"closed".to_string())
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("shutdown cross shard tcp app");
+    assert_eq!(terminal.state(), LocalAppState::Closed);
+    let summary = terminal.summary();
+    assert_eq!(summary.journal_appended, 1);
+    assert_eq!(summary.persistence_failed, 0);
+    assert_eq!(summary.call_failed, 0);
+    assert_eq!(summary.send_rejected, 0);
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(81)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendAccepted {
+                    target_shard,
+                    ..
+                } if target_shard == ShardId::new(82)
+            )
+    }));
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(82)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendAccepted {
+                    target_shard,
+                    ..
+                } if target_shard == ShardId::new(81)
+            )
+    }));
+    for expected in [
+        tina_runtime::CallKind::TcpBind,
+        tina_runtime::CallKind::TcpAccept,
+        tina_runtime::CallKind::TcpRead,
+        tina_runtime::CallKind::JournalAppend,
+        tina_runtime::CallKind::TcpWrite,
+        tina_runtime::CallKind::TcpStreamClose,
+        tina_runtime::CallKind::TcpListenerClose,
+    ] {
+        assert!(
+            terminal.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+                )
+            }),
+            "expected {expected:?} completion in cross-shard tcp service trace"
+        );
+    }
+
+    let replay = tina_runtime::persistence::replay_journal(&journal_path)
+        .expect("cross shard tcp journal replays");
+    assert_eq!(replay.records.len(), 1);
+    assert_eq!(replay.records[0].index, 1);
+    assert_eq!(replay.records[0].bytes, b"grain");
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -392,6 +1234,7 @@ fn local_app_join_report_reports_worker_failure_terminal_state() {
 
     let terminal = app.shutdown().drain().join_report();
     assert_eq!(terminal.state(), LocalAppState::Failed);
+    assert_eq!(terminal.summary(), Default::default());
     assert_eq!(
         terminal.error(),
         Some(BetelgeuseBackedControlError::WorkerStopped)

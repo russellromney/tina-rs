@@ -4,6 +4,46 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Johan Rudolph Thorbecke
+
+- Added a bounded live storage lane for snapshot/journal persistence work so
+  persistence helpers no longer execute synchronously inside the shard worker
+  on the preferred live path.
+- Added `BetelgeuseBackedRuntimeConfig::storage_lane_capacity` plus
+  `LocalApp` single-shard and multi-shard builder knobs for that bounded lane.
+- Added `CallError::StorageFull` and `CallError::StorageClosed` as named
+  runtime-owned storage admission/lifecycle outcomes.
+- Kept direct explicit-step runtime storage inline while using the bounded
+  storage lane on live single-shard and multi-shard worker paths.
+- Added storage-lane proofs for bounded full rejection without sleep-as-proof,
+  cancellation swallowing late completions, and shutdown skipping buffered work
+  that never started.
+- Added `local_app_end_to_end_service` proof: multi-shard `LocalApp` ingress,
+  cross-shard service routing, journal append before state apply, shutdown,
+  fresh-app recovery, and recovery trace visibility.
+- Added a composed live TCP plus persistence proof where a `LocalApp` service
+  accepts a real TCP client, journals the payload before replying, shuts down,
+  and replays the durable journal.
+- Added `LocalAppTerminalReport::summary()` as trace-derived terminal
+  accounting for completed, failed, rejected, abandoned, journaled, and
+  recovered work.
+- Pinned terminal summary accounting as zero-allocation over retained trace.
+- Tightened storage-lane capacity to mean total accepted pending work, then
+  proved a user-shaped `LocalApp` storage overload path where one journal
+  append succeeds, the next returns `StorageFull`, and replay sees only the
+  accepted record.
+- Added a full live thread-per-core service proof: real TCP ingress on one
+  shard, cross-shard durable journal append on another shard, cross-shard ack
+  back, client reply after persistence, shutdown, and journal replay.
+- Added randomized DST pressure for single-shard and multi-shard histories:
+  delayed sends, timers, stop, panic, mailbox pressure, remote queue pressure,
+  stale sends, unknown targets, replay equality, causal trace checks, and
+  no-turn-after-stop invariants.
+- Added DST pressure for persistence fault matrices, supervision plus
+  persistence recovery, TCP cancellation tombstones, bridge ingress timeout
+  cancellation, shrinker smoke proof, and live-vs-sim parity over send/stop
+  closed-rejection semantics.
+
 ### Phase Wim Kok
 
 - Added Tina local persistence helpers: `snapshot_commit`,

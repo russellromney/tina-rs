@@ -129,9 +129,29 @@ temp-write, rename, file fsync, parent-directory fsync, truncated-tail warning,
 and checksum validation. Unsupported platform durability strength must remain
 visible as `NotClaimed`, not upgraded in prose.
 
-Persistence calls are runtime-owned from the isolate's point of view, but in
-this slice they execute synchronous local filesystem work in the driver path.
-Do not claim high-throughput or nonblocking storage reactor semantics for Wim.
+Persistence calls are runtime-owned from the isolate's point of view and live
+snapshot/journal helper execution runs through a bounded storage lane instead
+of synchronously inside the shard worker. Storage-lane admission can fail
+visibly as `CallError::StorageFull` or `CallError::StorageClosed`, and canceled
+queued storage work must not start after cancellation. Already-started local
+filesystem work still cannot be preempted by Tina; do not claim a full
+nonblocking storage reactor, durable mailbox, durable work queue, or
+exactly-once semantics.
+
+The explicit-step runtime remains the semantic oracle: its snapshot/journal
+helpers complete inline when the driver is stepped directly. The bounded
+storage worker lane belongs to the preferred live `BetelgeuseBackedRuntime` and
+live `BetelgeuseBackedMultiShardRuntime` paths.
+
+Storage lane capacity means total accepted pending storage work, not only
+buffered channel slots. Running work counts against capacity until its
+completion is harvested or canceled. This keeps `StorageFull` deterministic
+under fast worker scheduling.
+
+`LocalAppTerminalReport::summary()` is trace-derived terminal accounting. It
+may count completed, failed, rejected, abandoned, journaled, and recovered work
+that Tina can see in the final trace. It must not grow hidden metrics channels
+that disagree with trace truth.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may directly cause many later events. Trace

@@ -1437,6 +1437,7 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
+            seed: 0,
             faults: FaultConfig {
                 tcp_completion: TcpCompletionFaultMode::DelayBySteps {
                     one_in: 1,
@@ -1459,7 +1460,6 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
                     )],
                 }],
             },
-            ..Default::default()
         },
     );
 
@@ -1558,6 +1558,7 @@ fn closed_stream_id_surfaces_invalid_resource() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
+            seed: 0,
             faults: FaultConfig {
                 tcp_completion: TcpCompletionFaultMode::DelayBySteps {
                     one_in: 1,
@@ -1580,7 +1581,6 @@ fn closed_stream_id_surfaces_invalid_resource() {
                     )],
                 }],
             },
-            ..Default::default()
         },
     );
 
@@ -1617,6 +1617,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
+            seed: 0,
             faults: FaultConfig {
                 tcp_completion: TcpCompletionFaultMode::DelayBySteps {
                     one_in: 1,
@@ -1636,7 +1637,6 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
                     ],
                 }],
             },
-            ..Default::default()
         },
     );
 
@@ -1684,6 +1684,7 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
+            seed: 0,
             faults: FaultConfig {
                 tcp_completion: TcpCompletionFaultMode::DelayBySteps {
                     one_in: 1,
@@ -1706,7 +1707,6 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
                     )],
                 }],
             },
-            ..Default::default()
         },
     );
 
@@ -2206,6 +2206,116 @@ fn stopped_requester_rejects_pending_write_completion() {
             }
         )
     }));
+}
+
+fn run_seeded_cancellation_case(seed: u64) -> tina_sim::ReplayArtifact {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed,
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 1,
+                    steps: 2 + (seed % 3),
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 8,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(49100 + seed as u16),
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(
+                        5,
+                        peer_addr(59100 + seed as u16),
+                        vec![b"late-input".to_vec()],
+                        Some(4),
+                        3,
+                    )],
+                }],
+            },
+        },
+    );
+
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    match seed % 3 {
+        0 => {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let waiter = sim.register(Waiter {
+                listener,
+                log: Rc::clone(&log),
+            });
+            sim.try_send(waiter, WaiterMsg::StartAccept).unwrap();
+            sim.step();
+            sim.try_send(waiter, WaiterMsg::StopNow).unwrap();
+            sim.step();
+            sim.advance_time(Duration::from_millis(20));
+            sim.run_until_quiescent();
+            assert!(log.borrow().is_empty());
+        }
+        1 => {
+            let (stream, _) = accept_stream(&mut sim, listener);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let reader = sim.register(ReadProbe {
+                stream,
+                max_len: 8,
+                log: Rc::clone(&log),
+            });
+            sim.try_send(reader, ReadProbeMsg::StartRead).unwrap();
+            sim.step();
+            sim.try_send(reader, ReadProbeMsg::StopNow).unwrap();
+            sim.step();
+            sim.run_until_quiescent();
+            assert!(log.borrow().is_empty());
+        }
+        _ => {
+            let (stream, _) = accept_stream(&mut sim, listener);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let writer = sim.register(WriteProbe {
+                stream,
+                bytes: b"cancelled-output".to_vec(),
+                log: Rc::clone(&log),
+            });
+            sim.try_send(writer, WriteProbeMsg::StartWrite).unwrap();
+            sim.step();
+            sim.try_send(writer, WriteProbeMsg::StopNow).unwrap();
+            sim.step();
+            sim.run_until_quiescent();
+            assert!(log.borrow().is_empty());
+        }
+    }
+
+    assert!(
+        !sim.has_in_flight_calls(),
+        "seed {seed} left tombstoned work in flight"
+    );
+    sim.replay_artifact()
+}
+
+#[test]
+fn seeded_tcp_cancellation_matrix_replays_and_tombstones_late_completions() {
+    for seed in 0..18 {
+        let first = run_seeded_cancellation_case(seed);
+        let second = run_seeded_cancellation_case(seed);
+        assert_eq!(
+            first.event_record(),
+            second.event_record(),
+            "TCP cancellation replay drift for seed {seed}"
+        );
+        assert!(
+            first.event_record().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompletionRejected {
+                        reason: CallCompletionRejectedReason::RequesterClosed,
+                        ..
+                    }
+                )
+            }),
+            "seed {seed} should visibly reject a cancelled completion"
+        );
+    }
 }
 
 #[test]

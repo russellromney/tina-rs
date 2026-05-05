@@ -2591,6 +2591,9 @@ pub struct BetelgeuseBackedRuntimeConfig {
     /// Capacity of the bounded control/ingress queue feeding the shard worker.
     pub command_capacity: usize,
 
+    /// Capacity of the bounded storage lane used for local persistence work.
+    pub storage_lane_capacity: usize,
+
     /// Trace retention for the worker-owned runtime.
     pub trace_retention: TraceRetention,
 
@@ -2603,6 +2606,7 @@ impl Default for BetelgeuseBackedRuntimeConfig {
     fn default() -> Self {
         Self {
             command_capacity: 64,
+            storage_lane_capacity: driver::DEFAULT_STORAGE_LANE_CAPACITY,
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
         }
@@ -2673,6 +2677,35 @@ pub struct LocalAppTerminalReport {
     error: Option<BetelgeuseBackedControlError>,
 }
 
+/// Counted terminal work visible in a [`LocalAppTerminalReport`] trace.
+///
+/// This is accounting from Tina's public trace, not a hidden runtime metrics
+/// channel. It is meant to answer the shutdown question: what completed,
+/// failed, was rejected, or was abandoned in the work Tina can see?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalAppTerminalSummary {
+    /// Successful runtime-owned call completions delivered to requesters.
+    pub call_completed: usize,
+    /// Runtime-owned calls that produced typed failure outcomes.
+    pub call_failed: usize,
+    /// Runtime-owned completions that could not be delivered.
+    pub call_completion_rejected: usize,
+    /// Late or stale isolate-call replies rejected by the runtime.
+    pub call_reply_rejected: usize,
+    /// Sends rejected by mailbox, address, or transport pressure.
+    pub send_rejected: usize,
+    /// Buffered messages abandoned because an isolate stopped.
+    pub message_abandoned: usize,
+    /// Successful journal append trace events.
+    pub journal_appended: usize,
+    /// Failed persistence trace events.
+    pub persistence_failed: usize,
+    /// Finished recovery trace events.
+    pub recovery_finished: usize,
+    /// Failed recovery trace events.
+    pub recovery_failed: usize,
+}
+
 impl LocalAppTerminalReport {
     /// Creates a terminal report from final state and trace.
     pub fn new(state: LocalAppState, trace: Vec<RuntimeEvent>) -> Self {
@@ -2702,6 +2735,11 @@ impl LocalAppTerminalReport {
         &self.trace
     }
 
+    /// Summarizes terminal work visible in the final trace.
+    pub fn summary(&self) -> LocalAppTerminalSummary {
+        terminal_summary(&self.trace)
+    }
+
     /// Terminal failure, if shutdown or worker execution failed.
     pub const fn error(&self) -> Option<BetelgeuseBackedControlError> {
         self.error
@@ -2711,6 +2749,31 @@ impl LocalAppTerminalReport {
     pub fn into_trace(self) -> Vec<RuntimeEvent> {
         self.trace
     }
+}
+
+fn terminal_summary(trace: &[RuntimeEvent]) -> LocalAppTerminalSummary {
+    let mut summary = LocalAppTerminalSummary::default();
+    for event in trace {
+        match event.kind() {
+            RuntimeEventKind::CallCompleted { .. } => summary.call_completed += 1,
+            RuntimeEventKind::CallFailed { .. } => summary.call_failed += 1,
+            RuntimeEventKind::CallCompletionRejected { .. } => {
+                summary.call_completion_rejected += 1;
+            }
+            RuntimeEventKind::CallReplyRejected { .. } => summary.call_reply_rejected += 1,
+            RuntimeEventKind::SendRejected { .. } => summary.send_rejected += 1,
+            RuntimeEventKind::MessageAbandoned => summary.message_abandoned += 1,
+            RuntimeEventKind::JournalAppended { .. } => summary.journal_appended += 1,
+            RuntimeEventKind::SnapshotCommitFailed { .. }
+            | RuntimeEventKind::JournalAppendFailed { .. } => {
+                summary.persistence_failed += 1;
+            }
+            RuntimeEventKind::RecoveryFinished => summary.recovery_finished += 1,
+            RuntimeEventKind::RecoveryFailed { .. } => summary.recovery_failed += 1,
+            _ => {}
+        }
+    }
+    summary
 }
 
 /// Canonical live app owner for one local Tina shard.
@@ -2868,6 +2931,12 @@ where
         self
     }
 
+    /// Sets bounded storage-lane capacity for local persistence work.
+    pub const fn storage_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.storage_lane_capacity = capacity;
+        self
+    }
+
     /// Sets idle wait duration for the live worker.
     pub const fn idle_wait(mut self, idle_wait: Duration) -> Self {
         self.config.idle_wait = idle_wait;
@@ -2972,6 +3041,12 @@ where
     /// Sets trace retention for worker-owned runtimes.
     pub const fn trace_retention(mut self, retention: TraceRetention) -> Self {
         self.config.trace_retention = retention;
+        self
+    }
+
+    /// Sets bounded storage-lane capacity for local persistence work.
+    pub const fn storage_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.storage_lane_capacity = capacity;
         self
     }
 
@@ -3166,6 +3241,9 @@ where
     {
         if config.command_capacity == 0 {
             panic!("Betelgeuse-backed runtime requires command capacity > 0");
+        }
+        if config.storage_lane_capacity == 0 {
+            panic!("Betelgeuse-backed runtime requires storage lane capacity > 0");
         }
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
@@ -3407,7 +3485,10 @@ where
         mailbox_factory,
         Box::new(MonotonicClock),
         IdSource::new(),
-        Box::new(BetelgeuseDriver::with_io_loop(io_loop_factory())),
+        Box::new(BetelgeuseDriver::with_io_loop_and_storage_capacity(
+            io_loop_factory(),
+            config.storage_lane_capacity,
+        )),
     );
     runtime.set_trace_retention(config.trace_retention);
 
@@ -3486,6 +3567,9 @@ where
         if config.command_capacity == 0 {
             panic!("Betelgeuse-backed multi-shard runtime requires command capacity > 0");
         }
+        if config.storage_lane_capacity == 0 {
+            panic!("Betelgeuse-backed multi-shard runtime requires storage lane capacity > 0");
+        }
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
@@ -3516,8 +3600,18 @@ where
             let ids = ids.clone();
             let remote_senders = commands.clone();
             handles.push(thread::spawn(move || {
-                let runtime =
-                    Runtime::with_clock_and_ids(shard, factory, Box::new(MonotonicClock), ids);
+                let io_loop = io_loop(Global)
+                    .expect("failed to initialise Betelgeuse IO loop for tina-runtime shard");
+                let runtime = Runtime::with_clock_and_ids_and_driver(
+                    shard,
+                    factory,
+                    Box::new(MonotonicClock),
+                    ids,
+                    Box::new(BetelgeuseDriver::with_io_loop_and_storage_capacity(
+                        io_loop,
+                        config.storage_lane_capacity,
+                    )),
+                );
                 let mut runtime = runtime;
                 runtime.set_trace_retention(config.trace_retention);
                 betelgeuse_worker_loop_with_remote(runtime, receiver, config, remote_senders)

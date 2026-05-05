@@ -570,6 +570,14 @@ pub enum CallError {
     /// disk before applying follow-up assumptions.
     CommitUncertain,
 
+    /// The bounded storage lane was full when the runtime tried to submit
+    /// local filesystem or persistence work.
+    StorageFull,
+
+    /// The storage lane was already closed when the runtime tried to submit
+    /// local filesystem or persistence work.
+    StorageClosed,
+
     /// The target isolate's mailbox was full when the runtime attempted an
     /// isolate-to-isolate call.
     TargetFull,

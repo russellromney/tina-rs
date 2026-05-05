@@ -221,7 +221,7 @@ fn decode_values(bytes: &[u8]) -> Vec<String> {
 }
 
 fn run_until_idle(runtime: &mut Runtime<PersistShard, TestMailboxFactory>) {
-    for _ in 0..64 {
+    for _ in 0..512 {
         let delivered = runtime.step();
         if delivered == 0 && !runtime.has_in_flight_calls() {
             return;
