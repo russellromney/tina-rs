@@ -13,10 +13,10 @@ use tina_runtime::{
     CallError, CallKind, CancellationSupport, FileId, ListenerId, LiveShardState, LocalSystem,
     LocalSystemState, MailboxFactory, PersistenceSupportLevel, ResourceExecutionShape,
     ResourceSupport, RuntimeEventKind, ShutdownSupport, SnapshotImage, StreamId,
-    ThreadedRuntimeError, ThreadedTrySendError, TraceRetention, UdpSocketId, file_close,
-    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
-    sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
-    tcp_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    ThreadedRuntimeError, ThreadedTrySendError, TraceRetention, UdpSocketId, dns_lookup,
+    file_close, file_create, file_fsync, file_read, file_size, file_write, journal_append,
+    journal_replay, sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener,
+    tcp_close_stream, tcp_read, tcp_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -289,6 +289,41 @@ impl UdpLoopbackService {
                     .lock()
                     .expect("udp observed lock")
                     .push("failed".to_string());
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DnsUnsupportedMsg {
+    Start,
+    Done(Result<Vec<SocketAddr>, CallError>),
+}
+
+#[derive(Debug)]
+struct DnsUnsupportedService {
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+#[tina_runtime::isolate(message = DnsUnsupportedMsg, shard = AppShard)]
+impl DnsUnsupportedService {
+    fn handle(&mut self, msg: DnsUnsupportedMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            DnsUnsupportedMsg::Start => dns_lookup("localhost", 80, Duration::from_millis(10))
+                .reply(DnsUnsupportedMsg::Done),
+            DnsUnsupportedMsg::Done(Ok(_)) => {
+                self.observed
+                    .lock()
+                    .expect("dns observed lock")
+                    .push("resolved".to_string());
+                noop()
+            }
+            DnsUnsupportedMsg::Done(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("dns observed lock")
+                    .push(format!("err:{error:?}"));
                 noop()
             }
         }
@@ -983,6 +1018,48 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         .drain()
         .join()
         .expect("local system shutdown");
+}
+
+#[test]
+fn local_system_dns_rail_is_typed_unsupported_without_fallback() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(39), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(64))
+        .build();
+    let address = app
+        .register_root::<DnsUnsupportedService, Infallible>(
+            DnsUnsupportedService {
+                observed: Arc::clone(&observed),
+            },
+            8,
+        )
+        .expect("register dns service");
+
+    app.try_send(address, DnsUnsupportedMsg::Start)
+        .expect("start dns service");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("dns observed lock")
+            .iter()
+            .any(|entry| entry == "err:Unsupported")
+    });
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::DnsLookup,
+                reason: CallError::Unsupported,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]

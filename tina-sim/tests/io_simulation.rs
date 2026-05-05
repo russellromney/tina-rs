@@ -13,13 +13,13 @@ use tina::{
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
     FileOpenOptions, ListenerId, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
-    UdpSocketId, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    UdpSocketId, dns_lookup, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 use tina_sim::{
-    Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact,
-    ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, ScriptedUdpConfig,
-    ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig, Simulator, SimulatorConfig,
-    TcpCompletionFaultMode,
+    Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact, ScriptedDnsConfig,
+    ScriptedDnsLookupConfig, ScriptedDnsResult, ScriptedListenerConfig, ScriptedPeerConfig,
+    ScriptedTcpConfig, ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig,
+    Simulator, SimulatorConfig, TcpCompletionFaultMode,
     dst::{DstRun, History, InvariantSuite, assert_replays},
 };
 use tina_supervisor::SupervisorConfig;
@@ -401,6 +401,57 @@ enum UdpProbeMsg {
     Done(Result<(SocketAddr, Vec<u8>, bool), CallError>),
     Closed(Result<(), CallError>),
     Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DnsProbeMsg {
+    Lookup {
+        host: String,
+        port: u16,
+        timeout: Duration,
+    },
+    Done(Result<Vec<SocketAddr>, CallError>),
+}
+
+#[derive(Debug)]
+struct DnsProbe {
+    observed: Rc<RefCell<Vec<String>>>,
+}
+
+impl Isolate for DnsProbe {
+    type Message = DnsProbeMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type Call = RuntimeCall<DnsProbeMsg>;
+    type Shard = TestShard;
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            DnsProbeMsg::Lookup {
+                host,
+                port,
+                timeout,
+            } => dns_lookup(host, port, timeout).reply(DnsProbeMsg::Done),
+            DnsProbeMsg::Done(Ok(addrs)) => {
+                self.observed.borrow_mut().push(format!(
+                    "resolved:{}",
+                    addrs
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+                Effect::Noop
+            }
+            DnsProbeMsg::Done(Err(error)) => {
+                self.observed
+                    .borrow_mut()
+                    .push(format!("dns-err:{error:?}"));
+                Effect::Noop
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1104,8 +1155,7 @@ fn accept_completion_order_for_two_waiters(
     });
     sim.try_send(first_binder, BinderMsg::StartBind).unwrap();
     sim.try_send(second_binder, BinderMsg::StartBind).unwrap();
-    sim.step();
-    sim.step();
+    sim.run_until_quiescent();
 
     let first_waiter = sim.register(Waiter {
         listener: first_listener
@@ -1257,6 +1307,191 @@ fn udp_sim_config() -> SimulatorConfig {
         },
         ..Default::default()
     }
+}
+
+fn dns_sim_config() -> SimulatorConfig {
+    SimulatorConfig {
+        dns: ScriptedDnsConfig {
+            pending_completion_capacity: 2,
+            lookups: vec![
+                ScriptedDnsLookupConfig {
+                    host: "llama.local".to_string(),
+                    port: 8080,
+                    complete_after_step: 3,
+                    result: ScriptedDnsResult::Resolved(vec![local_addr(48100)]),
+                },
+                ScriptedDnsLookupConfig {
+                    host: "sad.local".to_string(),
+                    port: 8080,
+                    complete_after_step: 2,
+                    result: ScriptedDnsResult::Failed,
+                },
+                ScriptedDnsLookupConfig {
+                    host: "slow.local".to_string(),
+                    port: 8080,
+                    complete_after_step: 2,
+                    result: ScriptedDnsResult::Timeout,
+                },
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn scripted_dns_resolves_fails_times_out_and_replays() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(TestShard, dns_sim_config());
+    let probe = sim.register(DnsProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(
+        probe,
+        DnsProbeMsg::Lookup {
+            host: "llama.local".to_string(),
+            port: 8080,
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        probe,
+        DnsProbeMsg::Lookup {
+            host: "sad.local".to_string(),
+            port: 8080,
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "resolved:127.0.0.1:48100")
+    );
+    assert!(observed.borrow().iter().any(|entry| entry == "dns-err:Io"));
+    assert_eq!(count_call_completed(sim.trace(), CallKind::DnsLookup), 1);
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::DnsLookup,
+                reason: CallError::Io,
+                ..
+            }
+        )
+    }));
+
+    let first = sim.replay_artifact();
+    let mut replay = Simulator::new(TestShard, dns_sim_config());
+    let replay_probe = replay.register(DnsProbe {
+        observed: Rc::new(RefCell::new(Vec::new())),
+    });
+    replay
+        .try_send(
+            replay_probe,
+            DnsProbeMsg::Lookup {
+                host: "llama.local".to_string(),
+                port: 8080,
+                timeout: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+    replay
+        .try_send(
+            replay_probe,
+            DnsProbeMsg::Lookup {
+                host: "sad.local".to_string(),
+                port: 8080,
+                timeout: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+    replay.run_until_quiescent();
+    assert_eq!(
+        first.event_record(),
+        replay.replay_artifact().event_record()
+    );
+}
+
+#[test]
+fn scripted_dns_timeout_zero_and_lane_full_are_visible() {
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            dns: ScriptedDnsConfig {
+                pending_completion_capacity: 1,
+                lookups: vec![
+                    ScriptedDnsLookupConfig {
+                        host: "llama.local".to_string(),
+                        port: 8080,
+                        complete_after_step: 8,
+                        result: ScriptedDnsResult::Resolved(vec![local_addr(48100)]),
+                    },
+                    ScriptedDnsLookupConfig {
+                        host: "slow.local".to_string(),
+                        port: 8080,
+                        complete_after_step: 8,
+                        result: ScriptedDnsResult::Timeout,
+                    },
+                ],
+            },
+            ..Default::default()
+        },
+    );
+    let probe = sim.register(DnsProbe {
+        observed: Rc::clone(&observed),
+    });
+
+    sim.try_send(
+        probe,
+        DnsProbeMsg::Lookup {
+            host: "llama.local".to_string(),
+            port: 8080,
+            timeout: Duration::ZERO,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "dns-err:Timeout")
+    );
+
+    sim.try_send(
+        probe,
+        DnsProbeMsg::Lookup {
+            host: "llama.local".to_string(),
+            port: 8080,
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        probe,
+        DnsProbeMsg::Lookup {
+            host: "slow.local".to_string(),
+            port: 8080,
+            timeout: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    assert!(
+        observed
+            .borrow()
+            .iter()
+            .any(|entry| entry == "dns-err:DnsFull"),
+        "observed DNS outcomes: {:?}; trace: {:?}",
+        observed.borrow(),
+        sim.trace()
+    );
 }
 
 #[test]
@@ -1485,6 +1720,7 @@ fn scripted_udp_completion_capacity_is_separate_from_tcp_completion_capacity() {
                     udp_socket_script(local_addr(48032), local_addr(48032), Vec::new()),
                 ],
             },
+            dns: Default::default(),
             storage: Default::default(),
         },
     );
@@ -1917,6 +2153,7 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
             },
             storage: Default::default(),
             udp: Default::default(),
+            dns: Default::default(),
         },
     );
 
@@ -2040,6 +2277,7 @@ fn closed_stream_id_surfaces_invalid_resource() {
             },
             storage: Default::default(),
             udp: Default::default(),
+            dns: Default::default(),
         },
     );
 
@@ -2098,6 +2336,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
             },
             storage: Default::default(),
             udp: Default::default(),
+            dns: Default::default(),
         },
     );
 
@@ -2170,6 +2409,7 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
             },
             storage: Default::default(),
             udp: Default::default(),
+            dns: Default::default(),
         },
     );
 
@@ -2717,6 +2957,7 @@ fn run_seeded_cancellation_case(history: &History<CancellationOp>) -> DstRun<(),
             },
             storage: Default::default(),
             udp: Default::default(),
+            dns: Default::default(),
         },
     );
 
@@ -3034,6 +3275,7 @@ fn tcp_checker_failure_replays_under_ready_reordering() {
         },
         storage: Default::default(),
         udp: Default::default(),
+        dns: Default::default(),
     };
 
     let mut sim = Simulator::new(TestShard, config);

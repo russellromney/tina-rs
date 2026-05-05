@@ -464,6 +464,27 @@ Review note:
   historically stale because it also harvests UDP and file completions. It is a
   naming cleanup opportunity, not a semantic bug after the lane-specific
   capacity fix.
+
+## Implementation Audit 4
+
+DNS rail landed as call vocabulary plus simulator semantics, with live support
+intentionally unsupported.
+
+What is true now:
+
+- `DnsLookup` and `dns_lookup(host, port, timeout)` exist in `tina-runtime`.
+- Live `ThreadedRuntime` returns typed `Unsupported` for DNS instead of using a
+  hidden system resolver worker that cannot be honestly canceled once started.
+- `LocalSystem::capabilities()` continues to report live DNS as unsupported.
+- `tina-sim` can script DNS success, failure, timeout, and lane-full pressure.
+- Simulator DNS replays byte-for-byte and uses the same `CallKind::DnsLookup`,
+  `CallOutput::DnsResolved`, and `CallError` vocabulary as the live rail.
+
+Review note:
+
+- This is a deliberate Tina-honesty choice. A future live DNS phase can add a
+  bounded resolver adapter only if shutdown/cancel can be named without hiding
+  an unbounded or unjoinable worker behind Tina.
 - Direct integration test pins supported and unsupported resource families
   through the canonical `LocalSystem` path.
 

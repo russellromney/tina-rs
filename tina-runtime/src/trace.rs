@@ -108,6 +108,9 @@ pub enum CallKind {
     /// A UDP socket close.
     UdpSocketClose,
 
+    /// A DNS lookup.
+    DnsLookup,
+
     /// A file open.
     FileOpen,
 

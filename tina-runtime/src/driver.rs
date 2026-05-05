@@ -357,6 +357,10 @@ impl RuntimeDriver for BetelgeuseDriver {
             CallInput::JournalReplay { path } => self
                 .storage
                 .submit(call_id, StorageJob::JournalReplay { path }),
+            CallInput::DnsLookup { .. } => Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Unsupported),
+            }),
             other => self.tcp.submit(call_id, other),
         }
     }
@@ -700,6 +704,10 @@ impl BetelgeuseTcp {
             CallInput::UdpSocketClose { socket } => Some(DriverCompletion {
                 call_id,
                 result: self.do_udp_close(socket),
+            }),
+            CallInput::DnsLookup { .. } => Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Unsupported),
             }),
             CallInput::UdpRecvFrom { socket, max_len } => {
                 let lane = PendingLane::UdpRecv(socket);

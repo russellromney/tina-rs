@@ -309,6 +309,17 @@ pub enum CallInput {
         socket: UdpSocketId,
     },
 
+    /// Resolve one host/port pair through the runtime-owned DNS rail.
+    DnsLookup {
+        /// Host name or address string.
+        host: String,
+        /// Service port.
+        port: u16,
+        /// Maximum time the caller is willing to wait. Already-started
+        /// platform lookups may continue in the DNS lane and be tombstoned.
+        timeout: Duration,
+    },
+
     /// Open a file and return a runtime-owned file id.
     FileOpen {
         /// Path to open.
@@ -422,6 +433,7 @@ impl CallInput {
             Self::UdpSendTo { .. } => crate::trace::CallKind::UdpSendTo,
             Self::UdpRecvFrom { .. } => crate::trace::CallKind::UdpRecvFrom,
             Self::UdpSocketClose { .. } => crate::trace::CallKind::UdpSocketClose,
+            Self::DnsLookup { .. } => crate::trace::CallKind::DnsLookup,
             Self::FileOpen { .. } => crate::trace::CallKind::FileOpen,
             Self::FileReadAt { .. } => crate::trace::CallKind::FileReadAt,
             Self::FileWriteAt { .. } => crate::trace::CallKind::FileWriteAt,
@@ -546,6 +558,12 @@ pub enum CallOutput {
     /// A UDP socket was closed and its resources released.
     UdpSocketClosed,
 
+    /// A DNS lookup resolved to one or more socket addresses.
+    DnsResolved {
+        /// Resolved socket addresses.
+        addrs: Vec<SocketAddr>,
+    },
+
     /// A file was opened.
     FileOpened {
         /// The runtime-assigned file id.
@@ -665,6 +683,12 @@ pub enum CallError {
 
     /// The target isolate did not reply before the caller's timeout elapsed.
     Timeout,
+
+    /// The bounded DNS lane was full when the runtime tried to submit a lookup.
+    DnsFull,
+
+    /// The DNS lane was already closed when the runtime tried to submit a lookup.
+    DnsClosed,
 }
 
 /// User-visible outcome for an observed send.
@@ -1241,6 +1265,15 @@ impl CallOutput {
         }
     }
 
+    /// Extracts the successful DNS lookup result.
+    pub fn into_dns_resolved(self) -> Result<Vec<SocketAddr>, CallError> {
+        match self {
+            Self::DnsResolved { addrs } => Ok(addrs),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("DnsResolved", &other),
+        }
+    }
+
     /// Extracts the successful file open result.
     pub fn into_file_opened(self) -> Result<FileId, CallError> {
         match self {
@@ -1621,6 +1654,22 @@ pub fn udp_close_socket(socket: UdpSocketId) -> TypedCall<()> {
     TypedCall::new(
         CallInput::UdpSocketClose { socket },
         CallOutput::into_udp_socket_closed,
+    )
+}
+
+/// Returns a typed DNS lookup helper.
+pub fn dns_lookup(
+    host: impl Into<String>,
+    port: u16,
+    timeout: Duration,
+) -> TypedCall<Vec<SocketAddr>> {
+    TypedCall::new(
+        CallInput::DnsLookup {
+            host: host.into(),
+            port,
+            timeout,
+        },
+        CallOutput::into_dns_resolved,
     )
 }
 

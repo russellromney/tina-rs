@@ -79,6 +79,9 @@ pub struct SimulatorConfig {
     /// Scripted UDP configuration for this run.
     pub udp: ScriptedUdpConfig,
 
+    /// Scripted DNS configuration for this run.
+    pub dns: ScriptedDnsConfig,
+
     /// Scripted simulator-only storage faults for persistence recovery tests.
     pub storage: ScriptedStorageFaultConfig,
 }
@@ -331,6 +334,45 @@ pub struct ScriptedUdpDatagramConfig {
     pub bytes: Vec<u8>,
 }
 
+/// Scripted DNS configuration for one simulator run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedDnsConfig {
+    /// Maximum number of async DNS completions that may be pending.
+    pub pending_completion_capacity: usize,
+
+    /// Lookup scripts available to `DnsLookup`.
+    pub lookups: Vec<ScriptedDnsLookupConfig>,
+}
+
+/// Scripted DNS lookup configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedDnsLookupConfig {
+    /// Host name or address string.
+    pub host: String,
+
+    /// Service port.
+    pub port: u16,
+
+    /// First simulator step on which this lookup may complete.
+    pub complete_after_step: u64,
+
+    /// Scripted lookup outcome.
+    pub result: ScriptedDnsResult,
+}
+
+/// Scripted DNS lookup outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedDnsResult {
+    /// Lookup resolves to these addresses.
+    Resolved(Vec<SocketAddr>),
+
+    /// Lookup fails as a normal I/O error.
+    Failed,
+
+    /// Lookup exceeds its deadline.
+    Timeout,
+}
+
 /// Simulator-only deterministic storage fault configuration.
 ///
 /// These faults mutate the simulator durable image or completion result. They
@@ -371,6 +413,15 @@ impl Default for ScriptedUdpConfig {
         Self {
             pending_completion_capacity: usize::MAX,
             sockets: Vec::new(),
+        }
+    }
+}
+
+impl Default for ScriptedDnsConfig {
+    fn default() -> Self {
+        Self {
+            pending_completion_capacity: usize::MAX,
+            lookups: Vec::new(),
         }
     }
 }
@@ -1145,6 +1196,7 @@ enum TcpResourceKey {
     StreamWrite(tina_runtime::StreamId),
     UdpSend(CallId),
     UdpRecv(UdpSocketId),
+    Dns(CallId),
     FileRead(tina_runtime::FileId),
     FileWrite(tina_runtime::FileId),
     FileFsync(tina_runtime::FileId),
@@ -1155,6 +1207,10 @@ enum TcpResourceKey {
 impl TcpResourceKey {
     fn is_udp(self) -> bool {
         matches!(self, Self::UdpSend(_) | Self::UdpRecv(_))
+    }
+
+    fn is_dns(self) -> bool {
+        matches!(self, Self::Dns(_))
     }
 }
 
@@ -2738,6 +2794,11 @@ where
                 self.handle_udp_recv_from(call_id, socket, max_len)
             }
             CallInput::UdpSocketClose { socket } => self.handle_udp_socket_close(call_id, socket),
+            CallInput::DnsLookup {
+                host,
+                port,
+                timeout,
+            } => self.handle_dns_lookup(call_id, host, port, timeout),
             CallInput::FileOpen { path, options } => self.handle_file_open(call_id, path, options),
             CallInput::FileReadAt { file, len, offset } => {
                 self.handle_file_read_at(call_id, file, len, offset)
@@ -3321,6 +3382,45 @@ where
         self.deliver_completion(call_id, CallOutput::UdpSocketClosed);
     }
 
+    fn handle_dns_lookup(&mut self, call_id: CallId, host: String, port: u16, timeout: Duration) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(script) = self
+            .config
+            .dns
+            .lookups
+            .iter()
+            .find(|lookup| lookup.host == host && lookup.port == port)
+            .cloned()
+        else {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Io),
+                self.step_ordinal + 1,
+            );
+            return;
+        };
+
+        let result = match script.result {
+            ScriptedDnsResult::Resolved(addrs) => CallOutput::DnsResolved { addrs },
+            ScriptedDnsResult::Failed => CallOutput::Failed(CallError::Io),
+            ScriptedDnsResult::Timeout => CallOutput::Failed(CallError::Timeout),
+        };
+        self.schedule_dns_completion(
+            call_id,
+            TcpResourceKey::Dns(call_id),
+            script.complete_after_step.max(self.step_ordinal + 1),
+            result,
+        );
+    }
+
     fn handle_file_open(
         &mut self,
         call_id: CallId,
@@ -3655,6 +3755,7 @@ where
             | TcpResourceKey::StreamRead(_)
             | TcpResourceKey::StreamWrite(_)
             | TcpResourceKey::UdpSend(_)
+            | TcpResourceKey::Dns(_)
             | TcpResourceKey::FileRead(_)
             | TcpResourceKey::FileWrite(_)
             | TcpResourceKey::FileFsync(_)
@@ -3699,7 +3800,7 @@ where
         let pending_non_udp = self
             .pending_tcp_completions
             .iter()
-            .filter(|completion| !completion.resource.is_udp())
+            .filter(|completion| !completion.resource.is_udp() && !completion.resource.is_dns())
             .count();
         if pending_non_udp >= self.config.tcp.pending_completion_capacity {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
@@ -3748,6 +3849,42 @@ where
         self.pending_tcp_completions.push(PendingTcpCompletion {
             call_id,
             ready_at_step: self.step_ordinal + 1,
+            insertion_order,
+            resource,
+            result,
+        });
+    }
+
+    fn schedule_dns_completion(
+        &mut self,
+        call_id: CallId,
+        resource: TcpResourceKey,
+        ready_at_step: u64,
+        result: CallOutput,
+    ) {
+        let pending_dns = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|completion| completion.resource.is_dns())
+            .count();
+        if pending_dns >= self.config.dns.pending_completion_capacity {
+            let insertion_order = self.next_tcp_completion_ordinal;
+            self.next_tcp_completion_ordinal += 1;
+            self.pending_tcp_completions.push(PendingTcpCompletion {
+                call_id,
+                ready_at_step: self.step_ordinal + 1,
+                insertion_order,
+                resource,
+                result: CallOutput::Failed(CallError::DnsFull),
+            });
+            return;
+        }
+
+        let insertion_order = self.next_tcp_completion_ordinal;
+        self.next_tcp_completion_ordinal += 1;
+        self.pending_tcp_completions.push(PendingTcpCompletion {
+            call_id,
+            ready_at_step,
             insertion_order,
             resource,
             result,
@@ -4909,6 +5046,7 @@ fn call_kind(request: &CallInput) -> CallKind {
         CallInput::UdpSendTo { .. } => CallKind::UdpSendTo,
         CallInput::UdpRecvFrom { .. } => CallKind::UdpRecvFrom,
         CallInput::UdpSocketClose { .. } => CallKind::UdpSocketClose,
+        CallInput::DnsLookup { .. } => CallKind::DnsLookup,
         CallInput::FileOpen { .. } => CallKind::FileOpen,
         CallInput::FileReadAt { .. } => CallKind::FileReadAt,
         CallInput::FileWriteAt { .. } => CallKind::FileWriteAt,
