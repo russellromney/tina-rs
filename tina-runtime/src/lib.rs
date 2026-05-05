@@ -37,7 +37,7 @@ use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -2649,8 +2649,298 @@ pub enum BetelgeuseBackedSendObservedError {
     WorkerStopped,
 }
 
+/// Observable lifecycle state for one live shard worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveShardState {
+    /// The shard worker is running and accepts bounded ingress.
+    Running,
+
+    /// The shard worker stopped after graceful shutdown.
+    Stopped,
+
+    /// The shard worker failed or became unreachable before clean shutdown.
+    Failed,
+}
+
+impl LiveShardState {
+    const RUNNING: u8 = 0;
+    const STOPPED: u8 = 1;
+    const FAILED: u8 = 2;
+
+    const fn from_raw(raw: u8) -> Self {
+        match raw {
+            Self::RUNNING => Self::Running,
+            Self::STOPPED => Self::Stopped,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// Snapshot of one bounded queue's visible pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveQueueReport {
+    capacity: usize,
+    depth: Option<usize>,
+    accepted: Option<usize>,
+    rejected_full: Option<usize>,
+    rejected_closed: Option<usize>,
+}
+
+impl LiveQueueReport {
+    const fn new(
+        capacity: usize,
+        depth: Option<usize>,
+        accepted: Option<usize>,
+        rejected_full: Option<usize>,
+        rejected_closed: Option<usize>,
+    ) -> Self {
+        Self {
+            capacity,
+            depth,
+            accepted,
+            rejected_full,
+            rejected_closed,
+        }
+    }
+
+    const fn unmeasured(capacity: usize) -> Self {
+        Self::new(capacity, None, None, None, None)
+    }
+
+    /// Stable configured queue capacity.
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Exact or sampled queue depth when the runtime can report it honestly.
+    pub const fn depth(&self) -> Option<usize> {
+        self.depth
+    }
+
+    /// Count of visible accepted handoffs for this queue, when measured.
+    pub const fn accepted(&self) -> Option<usize> {
+        self.accepted
+    }
+
+    /// Count of visible rejections caused by full bounded capacity, when measured.
+    pub const fn rejected_full(&self) -> Option<usize> {
+        self.rejected_full
+    }
+
+    /// Count of visible rejections caused by a stopped/closed destination, when measured.
+    pub const fn rejected_closed(&self) -> Option<usize> {
+        self.rejected_closed
+    }
+}
+
+#[derive(Debug)]
+struct LiveQueueMetrics {
+    capacity: usize,
+    accepted: AtomicUsize,
+    rejected_full: AtomicUsize,
+    rejected_closed: AtomicUsize,
+}
+
+impl LiveQueueMetrics {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            accepted: AtomicUsize::new(0),
+            rejected_full: AtomicUsize::new(0),
+            rejected_closed: AtomicUsize::new(0),
+        }
+    }
+
+    fn accepted(&self) {
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn rejected_full(&self) {
+        self.rejected_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn rejected_closed(&self) {
+        self.rejected_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn report(&self) -> LiveQueueReport {
+        LiveQueueReport::new(
+            self.capacity,
+            None,
+            Some(self.accepted.load(Ordering::Relaxed)),
+            Some(self.rejected_full.load(Ordering::Relaxed)),
+            Some(self.rejected_closed.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct LiveShardMetrics {
+    shard: ShardId,
+    worker_name: Option<String>,
+    state: AtomicU8,
+    ingress: LiveQueueMetrics,
+    storage_lane: LiveQueueMetrics,
+    trace_retention: TraceRetention,
+}
+
+impl LiveShardMetrics {
+    fn new(
+        shard: ShardId,
+        worker_name: Option<String>,
+        config: BetelgeuseBackedRuntimeConfig,
+    ) -> Self {
+        Self {
+            shard,
+            worker_name,
+            state: AtomicU8::new(LiveShardState::RUNNING),
+            ingress: LiveQueueMetrics::new(config.command_capacity),
+            storage_lane: LiveQueueMetrics::new(config.storage_lane_capacity),
+            trace_retention: config.trace_retention,
+        }
+    }
+
+    fn state(&self) -> LiveShardState {
+        LiveShardState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn set_state(&self, state: LiveShardState) {
+        let raw = match state {
+            LiveShardState::Running => LiveShardState::RUNNING,
+            LiveShardState::Stopped => LiveShardState::STOPPED,
+            LiveShardState::Failed => LiveShardState::FAILED,
+        };
+        self.state.store(raw, Ordering::Release);
+    }
+
+    fn report(&self) -> LiveShardReport {
+        LiveShardReport {
+            shard: self.shard,
+            worker_name: self.worker_name.clone(),
+            state: self.state(),
+            ingress: self.ingress.report(),
+            storage_lane: LiveQueueReport::unmeasured(self.storage_lane.capacity),
+            trace_retention: self.trace_retention,
+            trace_dropped: None,
+        }
+    }
+}
+
+/// Snapshot of one live shard worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveShardReport {
+    shard: ShardId,
+    worker_name: Option<String>,
+    state: LiveShardState,
+    ingress: LiveQueueReport,
+    storage_lane: LiveQueueReport,
+    trace_retention: TraceRetention,
+    trace_dropped: Option<u64>,
+}
+
+impl LiveShardReport {
+    /// Shard owned by this worker.
+    pub const fn shard(&self) -> ShardId {
+        self.shard
+    }
+
+    /// Worker thread name when the live substrate can name it.
+    pub fn worker_name(&self) -> Option<&str> {
+        self.worker_name.as_deref()
+    }
+
+    /// Observable lifecycle state.
+    pub const fn state(&self) -> LiveShardState {
+        self.state
+    }
+
+    /// Visible bounded ingress queue pressure.
+    pub const fn ingress(&self) -> &LiveQueueReport {
+        &self.ingress
+    }
+
+    /// Visible bounded storage lane pressure.
+    pub const fn storage_lane(&self) -> &LiveQueueReport {
+        &self.storage_lane
+    }
+
+    /// Configured trace retention.
+    pub const fn trace_retention(&self) -> TraceRetention {
+        self.trace_retention
+    }
+
+    /// Dropped trace count when available without probing the worker.
+    pub const fn trace_dropped(&self) -> Option<u64> {
+        self.trace_dropped
+    }
+}
+
+/// Snapshot of one live source-to-target shard transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRemoteQueueReport {
+    source: ShardId,
+    target: ShardId,
+    queue: LiveQueueReport,
+}
+
+impl LiveRemoteQueueReport {
+    /// Source shard for this local transport.
+    pub const fn source(&self) -> ShardId {
+        self.source
+    }
+
+    /// Target shard for this local transport.
+    pub const fn target(&self) -> ShardId {
+        self.target
+    }
+
+    /// Visible bounded transport pressure.
+    pub const fn queue(&self) -> &LiveQueueReport {
+        &self.queue
+    }
+}
+
+/// Snapshot of one local Tina live topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTopologyReport {
+    shards: Vec<LiveShardReport>,
+    remote_queues: Vec<LiveRemoteQueueReport>,
+}
+
+impl LiveTopologyReport {
+    fn single(shard: LiveShardReport) -> Self {
+        Self {
+            shards: vec![shard],
+            remote_queues: Vec::new(),
+        }
+    }
+
+    fn new(shards: Vec<LiveShardReport>, remote_queues: Vec<LiveRemoteQueueReport>) -> Self {
+        Self {
+            shards,
+            remote_queues,
+        }
+    }
+
+    /// Shard reports in stable shard order.
+    pub fn shards(&self) -> &[LiveShardReport] {
+        &self.shards
+    }
+
+    /// Remote queue reports in stable source/target order.
+    pub fn remote_queues(&self) -> &[LiveRemoteQueueReport] {
+        &self.remote_queues
+    }
+
+    /// Finds one shard report.
+    pub fn shard(&self, shard: ShardId) -> Option<&LiveShardReport> {
+        self.shards.iter().find(|report| report.shard == shard)
+    }
+}
+
 type BetelgeuseCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
 type BetelgeuseIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
+type BetelgeuseWorkerJoin = JoinHandle<Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>>;
 
 /// Lifecycle state for the canonical local Tina app owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2675,6 +2965,7 @@ pub struct LocalAppTerminalReport {
     state: LocalAppState,
     trace: Vec<RuntimeEvent>,
     error: Option<BetelgeuseBackedControlError>,
+    topology: Option<LiveTopologyReport>,
 }
 
 /// Counted terminal work visible in a [`LocalAppTerminalReport`] trace.
@@ -2713,6 +3004,7 @@ impl LocalAppTerminalReport {
             state,
             trace,
             error: None,
+            topology: None,
         }
     }
 
@@ -2722,6 +3014,34 @@ impl LocalAppTerminalReport {
             state: LocalAppState::Failed,
             trace: Vec::new(),
             error: Some(error),
+            topology: None,
+        }
+    }
+
+    /// Creates a terminal report with the final live topology snapshot.
+    pub fn new_with_topology(
+        state: LocalAppState,
+        trace: Vec<RuntimeEvent>,
+        topology: LiveTopologyReport,
+    ) -> Self {
+        Self {
+            state,
+            trace,
+            error: None,
+            topology: Some(topology),
+        }
+    }
+
+    /// Creates a failed terminal report with the final live topology snapshot.
+    pub fn failed_with_topology(
+        error: BetelgeuseBackedControlError,
+        topology: LiveTopologyReport,
+    ) -> Self {
+        Self {
+            state: LocalAppState::Failed,
+            trace: Vec::new(),
+            error: Some(error),
+            topology: Some(topology),
         }
     }
 
@@ -2743,6 +3063,11 @@ impl LocalAppTerminalReport {
     /// Terminal failure, if shutdown or worker execution failed.
     pub const fn error(&self) -> Option<BetelgeuseBackedControlError> {
         self.error
+    }
+
+    /// Final topology snapshot if the owner could still report it.
+    pub fn topology(&self) -> Option<&LiveTopologyReport> {
+        self.topology.as_ref()
     }
 
     /// Consumes the report and returns the final trace.
@@ -2826,6 +3151,11 @@ where
         } else {
             LocalAppState::Closed
         }
+    }
+
+    /// Returns a live topology snapshot for this app.
+    pub fn topology(&self) -> LiveTopologyReport {
+        self.runtime().topology()
     }
 
     /// Registers one root isolate with a runtime-allocated mailbox.
@@ -2989,12 +3319,16 @@ where
 
     /// Joins the worker and always returns the terminal lifecycle report.
     pub fn join_report(mut self) -> LocalAppTerminalReport {
-        let Some(runtime) = self.runtime.take() else {
+        let Some(mut runtime) = self.runtime.take() else {
             return LocalAppTerminalReport::new(LocalAppState::Closed, Vec::new());
         };
-        match runtime.shutdown() {
-            Ok(trace) => LocalAppTerminalReport::new(LocalAppState::Closed, trace),
-            Err(error) => LocalAppTerminalReport::failed(error),
+        match runtime.shutdown_inner() {
+            Ok(trace) => LocalAppTerminalReport::new_with_topology(
+                LocalAppState::Closed,
+                trace,
+                runtime.topology(),
+            ),
+            Err(error) => LocalAppTerminalReport::failed_with_topology(error, runtime.topology()),
         }
     }
 }
@@ -3119,6 +3453,11 @@ where
         self.runtime().trace()
     }
 
+    /// Returns a live topology snapshot for this app.
+    pub fn topology(&self) -> LiveTopologyReport {
+        self.runtime().topology()
+    }
+
     /// Begins graceful shutdown.
     pub fn shutdown(self) -> LocalMultiShardAppShutdown<S, F> {
         LocalMultiShardAppShutdown {
@@ -3164,12 +3503,16 @@ where
 
     /// Joins all workers and always returns the terminal lifecycle report.
     pub fn join_report(mut self) -> LocalAppTerminalReport {
-        let Some(runtime) = self.runtime.take() else {
+        let Some(mut runtime) = self.runtime.take() else {
             return LocalAppTerminalReport::new(LocalAppState::Closed, Vec::new());
         };
-        match runtime.shutdown() {
-            Ok(trace) => LocalAppTerminalReport::new(LocalAppState::Closed, trace),
-            Err(error) => LocalAppTerminalReport::failed(error),
+        match runtime.shutdown_inner() {
+            Ok(trace) => LocalAppTerminalReport::new_with_topology(
+                LocalAppState::Closed,
+                trace,
+                runtime.topology(),
+            ),
+            Err(error) => LocalAppTerminalReport::failed_with_topology(error, runtime.topology()),
         }
     }
 }
@@ -3198,6 +3541,7 @@ where
 {
     commands: std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>,
     handle: Option<JoinHandle<Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>>>,
+    metrics: Arc<LiveShardMetrics>,
 }
 
 impl<S, F> BetelgeuseBackedRuntime<S, F>
@@ -3247,14 +3591,25 @@ where
         }
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
+        let shard_id = shard.id();
+        let worker_name = format!("tina-shard-{}", shard_id.get());
+        let metrics = Arc::new(LiveShardMetrics::new(
+            shard_id,
+            Some(worker_name.clone()),
+            config,
+        ));
         let io_loop_factory: BetelgeuseIoLoopFactory = Box::new(io_loop_factory);
-        let handle = thread::spawn(move || {
-            betelgeuse_worker_loop(shard, mailbox_factory, receiver, config, io_loop_factory)
-        });
+        let handle = thread::Builder::new()
+            .name(worker_name)
+            .spawn(move || {
+                betelgeuse_worker_loop(shard, mailbox_factory, receiver, config, io_loop_factory)
+            })
+            .expect("failed to spawn Tina Betelgeuse-backed worker");
 
         Self {
             commands,
             handle: Some(handle),
+            metrics,
         }
     }
 
@@ -3303,11 +3658,17 @@ where
         }));
 
         match self.commands.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.metrics.ingress.accepted();
+                Ok(())
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.metrics.ingress.rejected_full();
                 Err(BetelgeuseBackedTrySendError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.metrics.ingress.rejected_closed();
+                self.metrics.set_state(LiveShardState::Failed);
                 Err(BetelgeuseBackedTrySendError::WorkerStopped)
             }
         }
@@ -3336,13 +3697,19 @@ where
         }));
 
         match self.commands.try_send(command) {
-            Ok(()) => reply_rx
-                .recv()
-                .unwrap_or(Err(BetelgeuseBackedSendObservedError::WorkerStopped)),
+            Ok(()) => {
+                self.metrics.ingress.accepted();
+                reply_rx
+                    .recv()
+                    .unwrap_or(Err(BetelgeuseBackedSendObservedError::WorkerStopped))
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.metrics.ingress.rejected_full();
                 Err(BetelgeuseBackedSendObservedError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.metrics.ingress.rejected_closed();
+                self.metrics.set_state(LiveShardState::Failed);
                 Err(BetelgeuseBackedSendObservedError::WorkerStopped)
             }
         }
@@ -3406,11 +3773,17 @@ where
         }));
 
         match self.commands.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.metrics.ingress.accepted();
+                Ok(())
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.metrics.ingress.rejected_full();
                 Err(BetelgeuseBackedTrySendError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.metrics.ingress.rejected_closed();
+                self.metrics.set_state(LiveShardState::Failed);
                 Err(BetelgeuseBackedTrySendError::WorkerStopped)
             }
         }
@@ -3424,6 +3797,11 @@ where
     /// Returns whether the worker still has runtime-owned work pending.
     pub fn has_in_flight_calls(&self) -> Result<bool, BetelgeuseBackedControlError> {
         self.call(|runtime| runtime.has_in_flight_calls())
+    }
+
+    /// Returns a handle-owned topology snapshot without probing the worker.
+    pub fn topology(&self) -> LiveTopologyReport {
+        LiveTopologyReport::single(self.metrics.report())
     }
 
     /// Requests shutdown and joins the worker, returning its final trace.
@@ -3441,10 +3819,14 @@ where
             .send(BetelgeuseCommand::Run(Box::new(move |runtime| {
                 let _ = reply_tx.send(command(runtime));
             })))
-            .map_err(|_| BetelgeuseBackedControlError::WorkerStopped)?;
-        reply_rx
-            .recv()
-            .map_err(|_| BetelgeuseBackedControlError::WorkerStopped)
+            .map_err(|_| {
+                self.metrics.set_state(LiveShardState::Failed);
+                BetelgeuseBackedControlError::WorkerStopped
+            })?;
+        reply_rx.recv().map_err(|_| {
+            self.metrics.set_state(LiveShardState::Failed);
+            BetelgeuseBackedControlError::WorkerStopped
+        })
     }
 
     fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
@@ -3452,10 +3834,20 @@ where
             return Ok(Vec::new());
         };
         let _ = self.commands.send(BetelgeuseCommand::Shutdown);
-        handle
-            .join()
-            .map_err(|_| BetelgeuseBackedControlError::WorkerStopped)
-            .and_then(std::convert::identity)
+        match handle.join() {
+            Ok(Ok(trace)) => {
+                self.metrics.set_state(LiveShardState::Stopped);
+                Ok(trace)
+            }
+            Ok(Err(error)) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                Err(error)
+            }
+            Err(_) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                Err(BetelgeuseBackedControlError::WorkerStopped)
+            }
+        }
     }
 }
 
@@ -3535,7 +3927,9 @@ where
     F: MailboxFactory + Send + Clone + 'static,
 {
     commands: BTreeMap<ShardId, std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>>,
-    handles: Vec<JoinHandle<Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>>>,
+    handles: Vec<(ShardId, BetelgeuseWorkerJoin)>,
+    shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
+    remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
 }
 
 impl<S, F> BetelgeuseBackedMultiShardRuntime<S, F>
@@ -3586,11 +3980,31 @@ where
         }
 
         let mut commands = BTreeMap::new();
+        let mut shard_metrics = BTreeMap::new();
         let mut receivers = Vec::with_capacity(shards.len());
         for shard in &shards {
             let (sender, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
             commands.insert(shard.id(), sender);
+            shard_metrics.insert(
+                shard.id(),
+                Arc::new(LiveShardMetrics::new(
+                    shard.id(),
+                    Some(format!("tina-shard-{}", shard.id().get())),
+                    config,
+                )),
+            );
             receivers.push((shard.id(), receiver));
+        }
+        let mut remote_metrics = BTreeMap::new();
+        for source in &shards {
+            for target in &shards {
+                if source.id() != target.id() {
+                    remote_metrics.insert(
+                        (source.id(), target.id()),
+                        Arc::new(LiveQueueMetrics::new(config.command_capacity)),
+                    );
+                }
+            }
         }
 
         let ids = IdSource::new();
@@ -3599,26 +4013,46 @@ where
             let factory = mailbox_factory.clone();
             let ids = ids.clone();
             let remote_senders = commands.clone();
-            handles.push(thread::spawn(move || {
-                let io_loop = io_loop(Global)
-                    .expect("failed to initialise Betelgeuse IO loop for tina-runtime shard");
-                let runtime = Runtime::with_clock_and_ids_and_driver(
-                    shard,
-                    factory,
-                    Box::new(MonotonicClock),
-                    ids,
-                    Box::new(BetelgeuseDriver::with_io_loop_and_storage_capacity(
-                        io_loop,
-                        config.storage_lane_capacity,
-                    )),
-                );
-                let mut runtime = runtime;
-                runtime.set_trace_retention(config.trace_retention);
-                betelgeuse_worker_loop_with_remote(runtime, receiver, config, remote_senders)
-            }));
+            let shard_id = shard.id();
+            let remote_metrics_for_worker = remote_metrics.clone();
+            handles.push((
+                shard_id,
+                thread::Builder::new()
+                    .name(format!("tina-shard-{}", shard_id.get()))
+                    .spawn(move || {
+                        let io_loop = io_loop(Global).expect(
+                            "failed to initialise Betelgeuse IO loop for tina-runtime shard",
+                        );
+                        let runtime = Runtime::with_clock_and_ids_and_driver(
+                            shard,
+                            factory,
+                            Box::new(MonotonicClock),
+                            ids,
+                            Box::new(BetelgeuseDriver::with_io_loop_and_storage_capacity(
+                                io_loop,
+                                config.storage_lane_capacity,
+                            )),
+                        );
+                        let mut runtime = runtime;
+                        runtime.set_trace_retention(config.trace_retention);
+                        betelgeuse_worker_loop_with_remote(
+                            runtime,
+                            receiver,
+                            config,
+                            remote_senders,
+                            remote_metrics_for_worker,
+                        )
+                    })
+                    .expect("failed to spawn Tina Betelgeuse-backed shard worker"),
+            ));
         }
 
-        Self { commands, handles }
+        Self {
+            commands,
+            handles,
+            shard_metrics,
+            remote_metrics,
+        }
     }
 
     /// Registers one root isolate on a chosen shard.
@@ -3669,11 +4103,23 @@ where
             let _ = runtime.try_send(address, message);
         }));
         match sender.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(metrics) = self.shard_metrics.get(&address.shard()) {
+                    metrics.ingress.accepted();
+                }
+                Ok(())
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                if let Some(metrics) = self.shard_metrics.get(&address.shard()) {
+                    metrics.ingress.rejected_full();
+                }
                 Err(BetelgeuseBackedTrySendError::IngressFull)
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                if let Some(metrics) = self.shard_metrics.get(&address.shard()) {
+                    metrics.ingress.rejected_closed();
+                    metrics.set_state(LiveShardState::Failed);
+                }
                 Err(BetelgeuseBackedTrySendError::WorkerStopped)
             }
         }
@@ -3697,6 +4143,25 @@ where
         self.call_on(shard, |runtime| runtime.trace().to_vec())
     }
 
+    /// Returns a handle-owned topology snapshot without probing workers.
+    pub fn topology(&self) -> LiveTopologyReport {
+        let shards = self
+            .shard_metrics
+            .values()
+            .map(|metrics| metrics.report())
+            .collect();
+        let remote_queues = self
+            .remote_metrics
+            .iter()
+            .map(|(&(source, target), metrics)| LiveRemoteQueueReport {
+                source,
+                target,
+                queue: metrics.report(),
+            })
+            .collect();
+        LiveTopologyReport::new(shards, remote_queues)
+    }
+
     /// Requests shutdown and joins every worker.
     pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
         self.shutdown_inner()
@@ -3718,10 +4183,18 @@ where
             .send(BetelgeuseCommand::Run(Box::new(move |runtime| {
                 let _ = reply_tx.send(command(runtime));
             })))
-            .map_err(|_| BetelgeuseBackedControlError::WorkerStopped)?;
-        reply_rx
-            .recv()
-            .map_err(|_| BetelgeuseBackedControlError::WorkerStopped)
+            .map_err(|_| {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                BetelgeuseBackedControlError::WorkerStopped
+            })?;
+        reply_rx.recv().map_err(|_| {
+            if let Some(metrics) = self.shard_metrics.get(&shard) {
+                metrics.set_state(LiveShardState::Failed);
+            }
+            BetelgeuseBackedControlError::WorkerStopped
+        })
     }
 
     fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError> {
@@ -3730,12 +4203,31 @@ where
         }
 
         let mut events = Vec::new();
-        for handle in std::mem::take(&mut self.handles) {
-            events.extend(
-                handle
-                    .join()
-                    .map_err(|_| BetelgeuseBackedControlError::WorkerStopped)??,
-            );
+        let mut failure = None;
+        for (shard, handle) in std::mem::take(&mut self.handles) {
+            match handle.join() {
+                Ok(Ok(trace)) => {
+                    if let Some(metrics) = self.shard_metrics.get(&shard) {
+                        metrics.set_state(LiveShardState::Stopped);
+                    }
+                    events.extend(trace);
+                }
+                Ok(Err(error)) => {
+                    if let Some(metrics) = self.shard_metrics.get(&shard) {
+                        metrics.set_state(LiveShardState::Failed);
+                    }
+                    failure = Some(error);
+                }
+                Err(_) => {
+                    if let Some(metrics) = self.shard_metrics.get(&shard) {
+                        metrics.set_state(LiveShardState::Failed);
+                    }
+                    failure = Some(BetelgeuseBackedControlError::WorkerStopped);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         events.sort_by_key(|event| event.id());
         Ok(events)
@@ -3757,11 +4249,13 @@ fn betelgeuse_worker_loop_with_remote<S, F>(
     receiver: std::sync::mpsc::Receiver<BetelgeuseCommand<S, F>>,
     config: BetelgeuseBackedRuntimeConfig,
     remote_senders: BTreeMap<ShardId, std::sync::mpsc::SyncSender<BetelgeuseCommand<S, F>>>,
+    remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
 ) -> Result<Vec<RuntimeEvent>, BetelgeuseBackedControlError>
 where
     S: Shard,
     F: MailboxFactory,
 {
+    let source_shard = runtime.shard().id();
     loop {
         match receiver.try_recv() {
             Ok(BetelgeuseCommand::Run(command)) => {
@@ -3785,10 +4279,24 @@ where
             let command = BetelgeuseCommand::Run(Box::new(move |runtime| {
                 runtime.harvest_remote_send(queued.into_queued_remote_send());
             }));
+            let metrics = remote_metrics.get(&(source_shard, target_shard));
             match sender.try_send(command) {
-                Ok(()) => Ok(()),
-                Err(std::sync::mpsc::TrySendError::Full(_)) => Err(SendRejectedReason::Full),
+                Ok(()) => {
+                    if let Some(metrics) = metrics {
+                        metrics.accepted();
+                    }
+                    Ok(())
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    if let Some(metrics) = metrics {
+                        metrics.rejected_full();
+                    }
+                    Err(SendRejectedReason::Full)
+                }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    if let Some(metrics) = metrics {
+                        metrics.rejected_closed();
+                    }
                     Err(SendRejectedReason::Closed)
                 }
             }

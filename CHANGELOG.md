@@ -4,6 +4,37 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Timmerhus
+
+- Added first-class live topology reporting for the canonical local app path:
+  `LiveTopologyReport`, `LiveShardReport`, `LiveQueueReport`,
+  `LiveRemoteQueueReport`, and `LiveShardState`.
+- Added `LocalApp::topology()` and `LocalMultiShardApp::topology()` so users
+  can inspect shard ownership, worker names, lifecycle state, ingress capacity,
+  remote queue capacity, storage-lane capacity, and honest pressure counters
+  without scraping logs.
+- Added terminal topology snapshots to `LocalAppTerminalReport` so graceful
+  shutdown and failed worker termination remain visible after the app owner is
+  consumed.
+- Kept queue pressure honest: exact depth is `None` unless exact by
+  construction, measured counters are `Some(_)`, and unmeasured storage-lane
+  counters are `None` instead of fake zeros.
+- Named live shard worker threads as `tina-shard-{id}` and tracked
+  per-shard lifecycle as `Running`, `Stopped`, or `Failed`.
+- Added per-shard and source/target remote-queue metrics for
+  Betelgeuse-backed multi-shard runtimes.
+- Added user-shaped live tests for topology before/after shutdown, bounded
+  ingress full, bounded remote queue full, and one failed worker while another
+  shard continues and then stops cleanly.
+- Added Timmerhus DST coverage: a replayable topology/failure history, true
+  live-vs-simulator projection comparison, mutation-after-rejection absence,
+  common trace invariant checks, and deletion shrinking for the failing
+  topology model.
+- Hardened Timmerhus tests so normal tests pin known negative/edge contracts
+  directly (`Closed` direct ingress after stop, bounded remote `Full`), while
+  DST sweeps prove the random histories actually exercise `Full`, `Closed`,
+  timer, and panic rocks instead of drifting back to happy paths.
+
 ### Phase Stuga
 
 - Added `tina_sim::dst` with reusable `History`, `DstRun`, replay assertion,

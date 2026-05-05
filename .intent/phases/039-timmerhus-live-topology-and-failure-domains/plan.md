@@ -111,8 +111,8 @@ clustering. Timmerhus must not smuggle those in.
    no hidden pending work, and durable/visible output.
 
 5. **Graceful and failed shutdown differ.**
-   A drained runtime and a failed runtime should not be collapsed into one
-   vague "closed" state.
+   A gracefully stopped runtime and a failed runtime should not be collapsed
+   into one vague "closed" state.
 
 6. **Do not make every runtime internal thread-safe.**
    Each shard remains owned by one worker thread. Cross-thread interaction goes
@@ -186,18 +186,39 @@ Expected rough names:
 - `LiveShardState`;
 - `LiveQueueReport`.
 
+Queue report contract:
+
+- `capacity` is required for every bounded queue the report names;
+- accepted/rejected/closed/full counters are required where those outcomes are
+  already observable by the runtime;
+- exact depth is optional and must be shaped as `Option<usize>` or a clearly
+  named sampled/last-known field;
+- no field may imply exact live depth unless exact by construction;
+- reports must be snapshots, not a promise that the value is still true after
+  the call returns.
+
 ### 3. Pin Shard Lifecycle Vocabulary
 
-Add or clarify states:
+Add or clarify states with observable transitions:
 
-- `Starting`;
 - `Running`;
-- `Draining`;
 - `Stopped`;
 - `Failed`.
 
-If current implementation cannot observe `Starting` or `Draining` honestly,
-name the narrower states and say why. Do not invent fake states.
+Expected 039 public vocabulary:
+
+- after successful construction/start, shards report `Running`;
+- after graceful shutdown completes, shards report `Stopped`;
+- after worker panic or unrecovered worker failure, the shard reports `Failed`;
+- if a drain API lands in this phase, `Draining` may be added only while the
+  runtime has actually stopped accepting new work and is finishing accepted
+  work;
+- if construction has a separately observable pre-running phase, `Starting`
+  may be added, but do not add it only because it sounds complete.
+
+Default: 039 should ship `Running`, `Stopped`, and `Failed`. `Starting` and
+`Draining` are deferred unless implementation makes them honest and directly
+tested.
 
 The distinction between graceful shutdown and worker failure must be visible in
 the final report.
@@ -207,10 +228,13 @@ the final report.
 Expose bounded pressure without racing into lies:
 
 - ingress command queue capacity;
-- current or last-known ingress depth if available;
+- exact or sampled ingress depth only if shaped honestly;
 - remote shard-pair capacity;
-- current or last-known remote depth if available;
-- storage lane capacity/current accepted pending where available.
+- exact or sampled remote depth only if shaped honestly;
+- storage lane capacity/current accepted pending where available;
+- accepted count;
+- rejected count by reason where available;
+- closed/full count where available.
 
 If exact live depth cannot be reported safely without new synchronization,
 report stable capacity plus counters for accepted/rejected/failed work. Do not
@@ -233,8 +257,8 @@ shut down cleanly.
 
 Define and test:
 
-- drain: stop accepting new ingress, finish accepted ready work as far as the
-  contract allows;
+- graceful shutdown: stop accepting new ingress, finish accepted ready work as
+  far as the contract allows;
 - hard stop/failure: reject new ingress and cancel/abandon pending owned work
   visibly;
 - shutdown report: no hidden pending runtime calls, storage work, timers, TCP
@@ -262,12 +286,15 @@ stages.
 
 This is the biggest decision in the phase.
 
-Current live cross-shard isolate calls reject. Timmerhus must either:
+Current live cross-shard isolate calls reject.
 
-1. keep rejection as the local-runtime rule and make it sharper; or
-2. implement bounded local cross-shard isolate-call reply transport.
+Default 039 direction: keep rejection as the local-runtime rule and make it
+sharper. The rejection must be typed, traced, and documented as "local
+cross-shard isolate-call reply transport is not implemented in Timmerhus."
 
-Expected direction: implement only if the bounded reply path can stay simple:
+Only switch to implementation if the initial audit proves a same-process local
+workload already needs cross-shard request/reply and the implementation can stay
+simple:
 
 - source sends call request through bounded shard-pair queue;
 - destination delivers request to target;
@@ -278,8 +305,9 @@ Expected direction: implement only if the bounded reply path can stay simple:
 - no hidden unbounded pending map;
 - simulator and live projections agree.
 
-Pause before implementation if this wants remoting-shaped complexity. Do not
-half-claim it.
+Pause before implementation if choosing transport. Amend this plan first with
+exact queue, timeout, late-reply, failure, shutdown, topology-report, and
+projection rules. Do not half-claim it.
 
 ### 9. Native/Live DST Differential Harness
 
@@ -304,6 +332,32 @@ Minimum projections:
 - durable journal/recovery result when persistence is in the workload;
 - no mutation after rejected/cancelled work.
 
+Minimum histories:
+
+- `topology_failure_history`: generated simulator history that starts shards,
+  routes work, fills at least one bounded queue, stops one shard, fails one
+  shard, and verifies visible terminal topology;
+- `live_topology_failure_history`: matching live/native history over
+  `LocalApp` or `BetelgeuseBackedMultiShardRuntime` that compares the
+  projection with simulator semantics;
+- `composed_service_history`: one user-shaped service with TCP ingress,
+  cross-shard state, storage persistence, timeout, overload, and shutdown;
+- `worker_panic_history`: worker panic on one shard while another shard either
+  continues processing or shuts down cleanly;
+- `shrinkable_topology_history`: deletion-shrink proof for a topology/failure
+  model, with the reduced history printed on failure.
+
+Projection must include:
+
+- accepted user-visible values, not only event counts;
+- rejected counts grouped by reason;
+- terminal shard state per shard;
+- queue pressure summary at terminal report;
+- pending-work-zero at shutdown;
+- durable image/journal result for persistence workloads;
+- absence of mutation after rejection, timeout, cancellation, stopped shard, or
+  failed shard.
+
 ### 10. Native Stress Suite
 
 Add live stress tests with short deterministic scripts:
@@ -319,6 +373,27 @@ Add live stress tests with short deterministic scripts:
 No sleeps-as-proof. Use barriers/channels/explicit readiness where possible.
 Wall-clock deadlines are allowed only as test failsafes.
 
+Required e2e tests:
+
+- `local_app_topology_report_before_and_after_shutdown`: report is useful while
+  running and after terminal state;
+- `live_ingress_pressure_reports_capacity_and_full_counter`: bounded ingress is
+  forced full without sleeps and the topology/report shows the pressure;
+- `remote_queue_pressure_reports_capacity_and_full_counter`: bounded
+  shard-pair queue is forced full and rejection remains visible;
+- `failed_worker_marks_one_shard_failed_and_rejects_later_work`: panic one
+  worker, prove later ingress rejects, prove topology changes, prove another
+  shard does not hang;
+- `graceful_shutdown_accounts_for_timers_tcp_storage_and_remote_queues`: user
+  workload starts all pending-work classes, then shutdown proves no hidden work;
+- `composed_tcp_state_storage_overload_live_matches_sim_projection`: user-style
+  service exercises TCP ingress, state shard, storage shard, overload, timeout,
+  and shutdown against simulator projection;
+- `cross_shard_isolate_call_rejects_with_typed_contract`: if rejection remains
+  the 039 rule, prove the exact outcome/trace from user-facing call syntax;
+- `topology_failure_history_shrinks`: Stuga deletion shrinker reduces a
+  failing topology/failure predicate to a smaller history.
+
 ### 11. Stuga Long-Run Rails
 
 Use Stuga instead of bespoke loops:
@@ -328,9 +403,10 @@ Use Stuga instead of bespoke loops:
 - make failure output include seed/history/projection mismatch;
 - add deletion shrink proof for at least one topology/failure model.
 
-### 12. Documentation And System Rules
+### 12. Documentation And Project Rules
 
-Update `SYSTEM.md` only for landed rules:
+There is no repo-local `SYSTEM.md` in this worktree. Do not invent one.
+Record landed project truths in the existing project artifacts:
 
 - live topology report meaning;
 - shard lifecycle vocabulary;
@@ -344,36 +420,57 @@ Update `CHANGELOG.md` and `ROADMAP.md` at closeout.
 
 Minimum proof before closeout:
 
+Testing rule:
+
+- normal tests must cover known positive, negative, edge, and regression rocks
+  directly; DST does not excuse happy-path-only tests;
+- DST then composes those known semantics into weird orderings and shrinks the
+  failures it finds.
+
 - `cargo test -p tina-runtime --test betelgeuse_substrate`
 - `cargo test -p tina-runtime --test local_app`
 - `cargo test -p tina-sim --test betelgeuse_parity`
-- new live topology/failure tests;
-- new native/live differential tests;
+- new live topology/failure tests listed below;
+- new native/live differential tests listed below;
 - `TINA_DST_LONG=1 cargo test -p tina-sim dst_long` if the long suite remains
   reasonable;
 - `make verify`.
 
 Expected new/updated tests:
 
-- `local_app_reports_live_topology_and_queue_pressure`;
-- `failed_shard_rejects_later_ingress_and_marks_topology`;
+- `local_app_topology_report_before_and_after_shutdown`;
+- `live_ingress_pressure_reports_capacity_and_full_counter`;
+- `remote_queue_pressure_reports_capacity_and_full_counter`;
+- `failed_worker_marks_one_shard_failed_and_rejects_later_work`;
+- `direct_send_after_stop_is_known_negative_contract`;
+- `remote_full_burst_is_known_edge_contract_and_replays`;
+- `remote_full_burst_history_shrinks`;
+- `seeded_random_single_shard_histories_replay_and_keep_trace_invariants`;
+- `seeded_random_multishard_histories_replay_and_keep_remote_pressure_visible`;
 - `cross_shard_send_to_failed_or_stopped_shard_is_visible`;
-- `shutdown_accounts_for_pending_cross_shard_timer_tcp_and_storage_work`;
+- `graceful_shutdown_accounts_for_timers_tcp_storage_and_remote_queues`;
+- `composed_tcp_state_storage_overload_live_matches_sim_projection`;
 - `live_sim_projection_matches_topology_failure_history`;
 - `native_stress_keeps_bounded_pressure_visible`;
-- `cross_shard_isolate_call_transport_is_bounded_or_rejected_by_contract`.
+- `cross_shard_isolate_call_rejects_with_typed_contract`;
+- `topology_failure_history_shrinks`.
 
 ## Done Means
 
 - Live topology and shard lifecycle are reportable from the canonical app path.
+- Queue reports expose stable capacities and honest counters/depth fields
+  without false precision.
 - Worker panic and graceful shutdown produce distinct visible terminal states.
 - Cross-shard send behavior under running/stopped/failed/full targets is
   directly tested.
-- Local cross-shard isolate-call reply transport is either implemented and
-  proved, or explicitly rejected with a sharper typed/tested contract.
+- Local cross-shard isolate-call reply transport is explicitly rejected with a
+  sharper typed/tested contract, unless the plan was paused/amended before
+  implementing bounded transport.
 - Native/live stress tests cover bounded ingress, remote queue pressure, worker
   failure, pending work, shutdown, TCP, storage, and timers.
-- Stuga histories/projections cover the new semantics.
+- Stuga histories/projections cover topology failure, composed service behavior,
+  worker panic, shrinking, terminal pressure, and mutation-after-rejection
+  absence.
 - No hidden unbounded queues are introduced.
 - `make verify` passes.
 
@@ -382,6 +479,8 @@ Expected new/updated tests:
 Pause and discuss if:
 
 - cross-shard isolate-call reply transport starts looking like remoting;
+- the initial audit argues to implement cross-shard isolate-call transport
+  instead of the default sharpened rejection;
 - topology reporting wants locks on hot paths;
 - queue depth cannot be reported without lying;
 - graceful drain requires a new public lifecycle API;

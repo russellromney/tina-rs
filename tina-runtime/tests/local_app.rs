@@ -4,17 +4,17 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    BetelgeuseBackedControlError, CallError, FileId, ListenerId, LocalApp, LocalAppState,
-    MailboxFactory, RuntimeEventKind, SnapshotImage, StreamId, TraceRetention, file_close,
-    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
-    sleep, snapshot_load, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
-    tcp_write,
+    BetelgeuseBackedControlError, BetelgeuseBackedTrySendError, CallError, FileId, ListenerId,
+    LiveShardState, LocalApp, LocalAppState, MailboxFactory, RuntimeEventKind, SnapshotImage,
+    StreamId, TraceRetention, file_close, file_create, file_fsync, file_read, file_size,
+    file_write, journal_append, journal_replay, sleep, snapshot_load, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +88,20 @@ impl MailboxFactory for PanickingMailboxFactory {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CapacityPanicMailboxFactory {
+    panic_capacity: usize,
+}
+
+impl MailboxFactory for CapacityPanicMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        if capacity == self.panic_capacity {
+            panic!("test mailbox factory panic for capacity {capacity}");
+        }
+        Box::new(AppMailbox::new(capacity))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LlamaMsg {
     Feed(u64),
@@ -106,6 +120,67 @@ impl LlamaService {
                 self.seen.lock().expect("seen lock").push(value);
                 noop()
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum BlockingMsg {
+    Hold(Arc<(Mutex<bool>, Condvar)>, Arc<(Mutex<bool>, Condvar)>),
+    Note(u64),
+}
+
+#[derive(Debug)]
+struct BlockingService {
+    seen: Arc<Mutex<Vec<u64>>>,
+}
+
+#[tina_runtime::isolate(message = BlockingMsg, shard = AppShard)]
+impl BlockingService {
+    fn handle(&mut self, msg: BlockingMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            BlockingMsg::Hold(entered, release) => {
+                let (entered_lock, entered_cv) = &*entered;
+                *entered_lock.lock().expect("entered lock") = true;
+                entered_cv.notify_all();
+
+                let (release_lock, release_cv) = &*release;
+                let mut released = release_lock.lock().expect("release lock");
+                while !*released {
+                    released = release_cv.wait(released).expect("release wait");
+                }
+                noop()
+            }
+            BlockingMsg::Note(value) => {
+                self.seen.lock().expect("blocking seen lock").push(value);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BurstMsg {
+    SendTwo,
+}
+
+#[derive(Debug)]
+struct BurstService {
+    target: Address<BlockingMsg>,
+}
+
+#[tina_runtime::isolate(
+    message = BurstMsg,
+    send = Outbound<BlockingMsg>,
+    shard = AppShard
+)]
+impl BurstService {
+    fn handle(&mut self, msg: BurstMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            BurstMsg::SendTwo => batch(vec![
+                send(self.target, BlockingMsg::Note(1)),
+                send(self.target, BlockingMsg::Note(2)),
+            ]),
         }
     }
 }
@@ -640,6 +715,25 @@ fn wait_for_addr(published: &Arc<Mutex<Option<SocketAddr>>>) -> SocketAddr {
         .expect("service did not publish address before timeout")
 }
 
+fn wait_for_flag(flag: &Arc<(Mutex<bool>, Condvar)>) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (lock, cv) = &**flag;
+    let mut guard = lock.lock().expect("flag lock");
+    while !*guard {
+        let now = Instant::now();
+        assert!(now < deadline, "flag did not become true before timeout");
+        let remaining = deadline.saturating_duration_since(now);
+        let (next, _) = cv.wait_timeout(guard, remaining).expect("flag wait");
+        guard = next;
+    }
+}
+
+fn release_flag(flag: &Arc<(Mutex<bool>, Condvar)>) {
+    let (lock, cv) = &**flag;
+    *lock.lock().expect("release flag lock") = true;
+    cv.notify_all();
+}
+
 fn unique_dir(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -680,6 +774,99 @@ fn local_app_single_shard_is_canonical_live_owner() {
             }
         )
     }));
+}
+
+#[test]
+fn local_app_topology_report_before_and_after_shutdown() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalApp::single_shard(AppShard(35), AppMailboxFactory)
+        .ingress_capacity(3)
+        .storage_lane_capacity(2)
+        .trace_retention(TraceRetention::Bounded(64))
+        .build();
+
+    let running = app.topology();
+    let shard = running
+        .shard(ShardId::new(35))
+        .expect("single shard report exists");
+    assert_eq!(shard.state(), LiveShardState::Running);
+    assert_eq!(shard.ingress().capacity(), 3);
+    assert_eq!(shard.ingress().depth(), None);
+    assert_eq!(shard.storage_lane().capacity(), 2);
+    assert_eq!(shard.storage_lane().accepted(), None);
+    assert_eq!(shard.storage_lane().rejected_full(), None);
+    assert_eq!(shard.trace_retention(), TraceRetention::Bounded(64));
+    assert_eq!(shard.worker_name(), Some("tina-shard-35"));
+
+    let address = app
+        .register_root::<LlamaService, Infallible>(
+            LlamaService {
+                seen: Arc::clone(&seen),
+            },
+            8,
+        )
+        .expect("register root");
+    app.try_send(address, LlamaMsg::Feed(11))
+        .expect("bounded handoff");
+    wait_until(|| seen.lock().expect("seen lock").as_slice() == [11]);
+
+    let terminal = app.shutdown().drain().join().expect("shutdown app");
+    assert_eq!(terminal.state(), LocalAppState::Closed);
+    let terminal_topology = terminal.topology().expect("terminal topology");
+    assert_eq!(
+        terminal_topology
+            .shard(ShardId::new(35))
+            .expect("terminal shard")
+            .state(),
+        LiveShardState::Stopped
+    );
+}
+
+#[test]
+fn live_ingress_pressure_reports_capacity_and_full_counter() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let app = LocalApp::single_shard(AppShard(36), AppMailboxFactory)
+        .ingress_capacity(1)
+        .trace_retention(TraceRetention::Bounded(64))
+        .build();
+    let address = app
+        .register_root::<BlockingService, Infallible>(
+            BlockingService {
+                seen: Arc::clone(&seen),
+            },
+            8,
+        )
+        .expect("register blocking root");
+
+    app.try_send(
+        address,
+        BlockingMsg::Hold(Arc::clone(&entered), Arc::clone(&release)),
+    )
+    .expect("hold handoff");
+    wait_for_flag(&entered);
+    app.try_send(address, BlockingMsg::Note(1))
+        .expect("first queued handoff fills ingress");
+    assert_eq!(
+        app.try_send(address, BlockingMsg::Note(2)),
+        Err(BetelgeuseBackedTrySendError::IngressFull)
+    );
+
+    let pressure = app.topology();
+    let shard = pressure
+        .shard(ShardId::new(36))
+        .expect("pressure shard report");
+    assert_eq!(shard.ingress().capacity(), 1);
+    assert_eq!(shard.ingress().depth(), None);
+    assert_eq!(shard.ingress().rejected_full(), Some(1));
+    assert_eq!(shard.ingress().rejected_closed(), Some(0));
+    assert!(shard.ingress().accepted().expect("accepted measured") >= 2);
+
+    release_flag(&release);
+    wait_until(|| seen.lock().expect("blocking seen lock").as_slice() == [1]);
+    let terminal = app.shutdown().drain().join().expect("shutdown app");
+    assert_eq!(terminal.state(), LocalAppState::Closed);
 }
 
 #[test]
@@ -728,6 +915,151 @@ fn local_app_multi_shard_uses_same_entry_name_for_topology() {
         .expect("multi-shard local app shutdown");
     assert_eq!(terminal.state(), LocalAppState::Closed);
     assert!(terminal.trace().len() >= 2);
+}
+
+#[test]
+fn remote_queue_pressure_reports_capacity_and_full_counter() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let app = LocalApp::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(43))
+        .shard(AppShard(44))
+        .ingress_capacity(1)
+        .shard_pair_capacity(1)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+
+    let target = app
+        .register_root_on::<BlockingService, Infallible>(
+            ShardId::new(44),
+            BlockingService {
+                seen: Arc::clone(&seen),
+            },
+            8,
+        )
+        .expect("register blocking target");
+    let source = app
+        .register_root_on::<BurstService, BlockingMsg>(ShardId::new(43), BurstService { target }, 8)
+        .expect("register burst source");
+
+    app.try_send(
+        target,
+        BlockingMsg::Hold(Arc::clone(&entered), Arc::clone(&release)),
+    )
+    .expect("hold target");
+    wait_for_flag(&entered);
+    app.try_send(source, BurstMsg::SendTwo)
+        .expect("trigger burst");
+    wait_until(|| {
+        let topology = app.topology();
+        topology.remote_queues().iter().any(|report| {
+            report.source() == ShardId::new(43)
+                && report.target() == ShardId::new(44)
+                && report.queue().rejected_full() == Some(1)
+        })
+    });
+
+    let topology = app.topology();
+    let remote = topology
+        .remote_queues()
+        .iter()
+        .find(|report| report.source() == ShardId::new(43) && report.target() == ShardId::new(44))
+        .expect("remote queue report");
+    assert_eq!(remote.queue().capacity(), 1);
+    assert_eq!(remote.queue().depth(), None);
+    assert_eq!(remote.queue().accepted(), Some(1));
+    assert_eq!(remote.queue().rejected_full(), Some(1));
+
+    release_flag(&release);
+    wait_until(|| seen.lock().expect("blocking seen lock").as_slice() == [1]);
+    let terminal = app.shutdown().drain().join().expect("shutdown app");
+    assert_eq!(terminal.state(), LocalAppState::Closed);
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                reason: tina_runtime::SendRejectedReason::Full,
+                target_shard,
+                ..
+            } if target_shard == ShardId::new(44)
+        )
+    }));
+}
+
+#[test]
+fn failed_worker_marks_one_shard_failed_and_rejects_later_work() {
+    let right_seen = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalApp::<AppShard, CapacityPanicMailboxFactory>::multi_shard(
+        CapacityPanicMailboxFactory { panic_capacity: 13 },
+    )
+    .shard(AppShard(45))
+    .shard(AppShard(46))
+    .ingress_capacity(4)
+    .trace_retention(TraceRetention::Bounded(128))
+    .build();
+
+    let right = app
+        .register_root_on::<LlamaService, Infallible>(
+            ShardId::new(46),
+            LlamaService {
+                seen: Arc::clone(&right_seen),
+            },
+            8,
+        )
+        .expect("register healthy shard");
+    assert_eq!(
+        app.register_root_on::<LlamaService, Infallible>(
+            ShardId::new(45),
+            LlamaService {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            },
+            13,
+        ),
+        Err(BetelgeuseBackedControlError::WorkerStopped)
+    );
+
+    let topology = app.topology();
+    assert_eq!(
+        topology
+            .shard(ShardId::new(45))
+            .expect("failed shard report")
+            .state(),
+        LiveShardState::Failed
+    );
+    assert_eq!(
+        topology
+            .shard(ShardId::new(46))
+            .expect("healthy shard report")
+            .state(),
+        LiveShardState::Running
+    );
+
+    app.try_send(right, LlamaMsg::Feed(99))
+        .expect("healthy shard still accepts ingress");
+    wait_until(|| right_seen.lock().expect("right seen lock").as_slice() == [99]);
+
+    let terminal = app.shutdown().drain().join_report();
+    assert_eq!(terminal.state(), LocalAppState::Failed);
+    assert_eq!(
+        terminal.error(),
+        Some(BetelgeuseBackedControlError::WorkerStopped)
+    );
+    let terminal_topology = terminal.topology().expect("terminal topology");
+    assert_eq!(
+        terminal_topology
+            .shard(ShardId::new(45))
+            .expect("failed shard terminal report")
+            .state(),
+        LiveShardState::Failed
+    );
+    assert_eq!(
+        terminal_topology
+            .shard(ShardId::new(46))
+            .expect("healthy shard terminal report")
+            .state(),
+        LiveShardState::Stopped
+    );
 }
 
 #[test]

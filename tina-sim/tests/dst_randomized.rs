@@ -416,26 +416,61 @@ fn run_random_multishard_history(
 
 #[test]
 fn seeded_random_single_shard_histories_replay_and_keep_trace_invariants() {
+    let mut saw_closed = false;
+    let mut saw_full = false;
+    let mut saw_panic = false;
+    let mut saw_timer = false;
+
     for seed in 0..32 {
         let history = History::new("single-shard random", seed, random_ops(seed, 80));
         let first = assert_replays(&history, |history| {
             run_random_history(history.seed(), history.operations())
         });
 
-        InvariantSuite::standard().assert(first.artifact().event_record());
-        assert!(
-            first.artifact().event_record().iter().any(|event| {
-                matches!(
-                    event.kind(),
-                    RuntimeEventKind::CallCompleted {
-                        call_kind: CallKind::Sleep,
-                        ..
-                    }
-                )
-            }),
-            "seed {seed} should exercise at least one timer completion"
-        );
+        let trace = first.artifact().event_record();
+        InvariantSuite::standard().assert(trace);
+        saw_closed |= trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::Closed,
+                    ..
+                }
+            )
+        });
+        saw_full |= trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::Full,
+                    ..
+                }
+            )
+        });
+        saw_panic |= trace
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::HandlerPanicked));
+        saw_timer |= trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        });
     }
+
+    assert!(saw_closed, "random single-shard sweep should hit Closed");
+    assert!(saw_full, "random single-shard sweep should hit Full");
+    assert!(
+        saw_panic,
+        "random single-shard sweep should hit panic capture"
+    );
+    assert!(
+        saw_timer,
+        "random single-shard sweep should hit timer completion"
+    );
 }
 
 #[test]
@@ -491,26 +526,45 @@ fn dst_history_shrinker_keeps_replayable_failure_but_removes_noise() {
 
 #[test]
 fn seeded_random_multishard_histories_replay_and_keep_remote_pressure_visible() {
+    let mut saw_remote_full = false;
+    let mut saw_remote_closed = false;
+
     for seed in 0..32 {
         let history = History::new("multi-shard random", seed, random_multi_ops(seed, 80));
         let first = assert_replays(&history, |history| {
             run_random_multishard_history(history.seed(), history.operations())
         });
 
-        InvariantSuite::standard().assert(first.artifact().event_record());
-        assert!(
-            first.artifact().event_record().iter().any(|event| {
-                matches!(
-                    event.kind(),
-                    RuntimeEventKind::SendRejected {
-                        reason: SendRejectedReason::Full | SendRejectedReason::Closed,
-                        ..
-                    }
-                )
-            }),
-            "seed {seed} should exercise visible remote pressure or stale target rejection"
-        );
+        let trace = first.artifact().event_record();
+        InvariantSuite::standard().assert(trace);
+        saw_remote_full |= trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::Full,
+                    ..
+                }
+            )
+        });
+        saw_remote_closed |= trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::Closed,
+                    ..
+                }
+            )
+        });
     }
+
+    assert!(
+        saw_remote_full,
+        "random multi-shard sweep should hit bounded remote Full"
+    );
+    assert!(
+        saw_remote_closed,
+        "random multi-shard sweep should hit stale/closed remote target"
+    );
 }
 
 #[test]
