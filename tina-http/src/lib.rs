@@ -33,9 +33,13 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod connection;
+pub mod listener;
 pub mod parse;
 pub mod types;
 
+pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
+pub use listener::{BoundAddrSlot, HttpListener, HttpListenerMsg};
 pub use parse::{ParseProgress, encode_response, parse_request_head};
 pub use types::{HttpLimits, HttpRequest, HttpResponse, RequestParseError};
 
