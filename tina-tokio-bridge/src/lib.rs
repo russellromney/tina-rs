@@ -562,6 +562,79 @@ where
     pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, BridgeShutdownError> {
         self.try_shutdown()
     }
+
+    /// Number of `BridgeHandle` clones (or other `Arc<ThreadedRuntime>`
+    /// holders) currently sharing the hosted runtime, beyond the host's own
+    /// reference.
+    ///
+    /// Use this to observe drain progress before calling
+    /// [`drain_and_shutdown`](Self::drain_and_shutdown). When this returns
+    /// `0`, [`shutdown`](Self::shutdown) and [`try_shutdown`](Self::try_shutdown)
+    /// will succeed.
+    pub fn pending_handles(&self) -> usize {
+        self.runtime
+            .as_ref()
+            .map(|runtime| Arc::strong_count(runtime).saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    /// Phase 047 Rock 7: one-call drain + shutdown that replaces the
+    /// `Arc::try_unwrap` dance Eiffel examples used to write.
+    ///
+    /// Polls until every `BridgeHandle` clone has been dropped or
+    /// `drain_timeout` elapses, then attempts to consume the
+    /// `Arc<ThreadedRuntime>` and shut down. Returns a structured
+    /// [`BridgeShutdownReport`] that names the trace plus how many
+    /// outstanding handles existed at shutdown time, so callers can
+    /// observe whether the drain completed.
+    ///
+    /// `drain_timeout` is a real wall-clock timeout. The poll cadence is
+    /// short (1ms) so tests do not need to cooperate with anything other
+    /// than dropping their `BridgeHandle` clones. If the host itself never
+    /// holds an extra clone of the runtime Arc, the drain is bounded by
+    /// when callers drop their handles.
+    pub fn drain_and_shutdown(
+        mut self,
+        drain_timeout: Duration,
+    ) -> Result<BridgeShutdownReport, BridgeShutdownError> {
+        let deadline = std::time::Instant::now() + drain_timeout;
+        loop {
+            if self.pending_handles() == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let pending = self.pending_handles();
+                // We deliberately do not call try_shutdown here; the host
+                // can be reused (drop more handles, retry) if the caller
+                // wants. Report partial drain explicitly.
+                return Ok(BridgeShutdownReport {
+                    trace: Vec::new(),
+                    outstanding_handles_at_shutdown: pending,
+                    drained_within_timeout: false,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let trace = self.try_shutdown()?;
+        Ok(BridgeShutdownReport {
+            trace,
+            outstanding_handles_at_shutdown: 0,
+            drained_within_timeout: true,
+        })
+    }
+}
+
+/// Outcome of [`BridgeHost::drain_and_shutdown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeShutdownReport {
+    /// Trace recorded by the hosted Tina runtime up to shutdown.
+    pub trace: Vec<RuntimeEvent>,
+    /// Number of `BridgeHandle` clones still alive when shutdown attempted.
+    /// When `drained_within_timeout` is `true` this is `0`.
+    pub outstanding_handles_at_shutdown: usize,
+    /// Whether every bridge handle had been dropped before
+    /// `drain_timeout` elapsed.
+    pub drained_within_timeout: bool,
 }
 
 /// Error returned by [`BridgeHost::shutdown`].
