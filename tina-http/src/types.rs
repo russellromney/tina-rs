@@ -102,9 +102,8 @@ pub enum RequestParseError {
     /// First form only supports `Content-Length`. Maps to `501 Not
     /// Implemented`.
     UnsupportedTransferEncoding,
-    /// `Content-Length` was missing on a method that requires a body
-    /// length, or was present but invalid. Maps to `411 Length Required`
-    /// or `400 Bad Request` per the underlying cause.
+    /// `Content-Length` failed to parse, was negative, or had two
+    /// conflicting values. Maps to `400 Bad Request` per RFC 7230 §3.3.2.
     InvalidContentLength,
     /// The declared body length exceeded the configured byte limit.
     /// Maps to `413 Payload Too Large`.
@@ -116,6 +115,10 @@ pub enum RequestParseError {
     /// The HTTP version on the wire was neither `HTTP/1.0` nor
     /// `HTTP/1.1`. Maps to `505 HTTP Version Not Supported`.
     UnsupportedHttpVersion,
+    /// The client did not send a complete request head before
+    /// [`HttpLimits::header_read_timeout`] elapsed. The slow-loris case.
+    /// Maps to `408 Request Timeout`.
+    HeaderReadTimeout,
 }
 
 impl RequestParseError {
@@ -127,17 +130,20 @@ impl RequestParseError {
             Self::BadRequestLine => StatusCode::BAD_REQUEST,
             Self::HeadersTooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             Self::UnsupportedTransferEncoding => StatusCode::NOT_IMPLEMENTED,
-            Self::InvalidContentLength => StatusCode::LENGTH_REQUIRED,
+            // RFC 7230 §3.3.2: conflicting/invalid Content-Length is a
+            // 400 Bad Request, not a 411 Length Required.
+            Self::InvalidContentLength => StatusCode::BAD_REQUEST,
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedRequestTarget => StatusCode::BAD_REQUEST,
             Self::UnsupportedHttpVersion => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            Self::HeaderReadTimeout => StatusCode::REQUEST_TIMEOUT,
         }
     }
 }
 
-/// Configurable byte limits for the connection isolate. These bound the
-/// memory a single connection may force the runtime to hold before the
-/// service isolate is even reached.
+/// Configurable byte and time limits for the connection isolate. These
+/// bound the memory and wall-clock duration a single connection may
+/// force the runtime to hold before the service isolate is reached.
 #[derive(Debug, Clone, Copy)]
 pub struct HttpLimits {
     /// Maximum bytes of header section (request line + headers + final
@@ -149,6 +155,13 @@ pub struct HttpLimits {
     /// Number of headers `httparse` may parse. Headers beyond this limit
     /// fail as a parse error.
     pub max_headers: usize,
+    /// Maximum wall-clock time the connection isolate will wait for the
+    /// client to finish sending the request head (status line + headers
+    /// + terminating CRLF CRLF). Slow-loris-style clients that drip-feed
+    /// bytes hit this and are rejected with
+    /// [`RequestParseError::HeaderReadTimeout`] (`408 Request Timeout`),
+    /// then the connection closes.
+    pub header_read_timeout: std::time::Duration,
 }
 
 impl Default for HttpLimits {
@@ -157,6 +170,7 @@ impl Default for HttpLimits {
             max_header_bytes: 16 * 1024,
             max_body_bytes: 1024 * 1024,
             max_headers: 64,
+            header_read_timeout: std::time::Duration::from_secs(10),
         }
     }
 }

@@ -22,14 +22,22 @@ use std::time::{Duration, Instant};
 use http::{Method, StatusCode};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
-use tina_runtime::{MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
+use tina_runtime::{
+    MailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
+};
+
+/// Single source of truth for the integration-test shard id. Each
+/// integration test binary runs in its own process so collisions between
+/// test files are not a real concern, but using a const removes the
+/// "magic number per file" smell flagged in the hostile review.
+pub const TEST_SHARD_ID: u32 = 101;
 
 #[derive(Debug, Default)]
 pub struct TestShard;
 
 impl Shard for TestShard {
     fn id(&self) -> ShardId {
-        ShardId::new(101)
+        ShardId::new(TEST_SHARD_ID)
     }
 }
 
@@ -195,12 +203,40 @@ impl TestHarness {
         }
     }
 
-    pub fn shutdown(mut self) {
+    pub fn shutdown(mut self) -> Vec<RuntimeEvent> {
         if let Some(runtime) = self.runtime.take() {
             let _ = runtime.try_send(self.listener, HttpListenerMsg::Stop);
-            let _ = runtime.shutdown();
+            runtime.shutdown().unwrap_or_default()
+        } else {
+            Vec::new()
         }
     }
+
+    /// Snapshots the runtime trace without shutting down. Used by tests
+    /// that want to inspect events mid-run; tests that only care about
+    /// final state should call `shutdown()` and read its return value.
+    pub fn snapshot_trace(&self) -> Vec<RuntimeEvent> {
+        self.runtime
+            .as_ref()
+            .map(|rt| rt.complete_trace().unwrap_or_default())
+            .unwrap_or_default()
+    }
+}
+
+/// Counts runtime events whose kind is `CallCompleted` for a TCP-read
+/// completion. Tests use this to prove a request actually exercised the
+/// multi-read accumulation path rather than landing in one chunk.
+pub fn count_tcp_read_completions(trace: &[RuntimeEvent]) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted { call_kind, .. }
+                    if matches!(call_kind, tina_runtime::CallKind::TcpRead)
+            )
+        })
+        .count()
 }
 
 impl Drop for TestHarness {

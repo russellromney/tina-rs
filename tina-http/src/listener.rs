@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{CallError, ListenerId, StreamId, tcp_accept, tcp_bind, tcp_close_listener};
+use tina_runtime::{
+    CallError, ListenerId, StreamId, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+};
 
 use crate::connection::{HttpConnection, HttpConnectionMsg};
 use crate::types::{HttpLimits, HttpRequest, HttpResponse};
@@ -42,6 +44,10 @@ pub enum HttpListenerMsg {
     Stop,
     /// `tcp_close_listener` reply.
     ListenerClosed(Result<(), CallError>),
+    /// `tcp_close_stream` reply for a stream the listener decided to
+    /// drop (typically a kernel-already-accepted connection that
+    /// arrived after `Stop`).
+    StreamClosed(Result<(), CallError>),
 }
 
 /// Listener isolate.
@@ -122,15 +128,13 @@ impl<S: Shard + 'static> Isolate for HttpListener<S> {
 
             HttpListenerMsg::Accepted(Ok((stream, _peer))) => {
                 if self.stopping {
-                    // Already stopping; drop the accepted stream by
-                    // spawning a child that just closes it. Simplest path
-                    // that doesn't require a runtime-call directly here.
-                    let listener = self.listener.expect("listener set after bind");
-                    let child = self.build_close_child(stream);
-                    return batch(vec![
-                        spawn(child),
-                        tcp_close_listener(listener).reply(HttpListenerMsg::ListenerClosed),
-                    ]);
+                    // Stop already ran; the listener socket may already
+                    // be closed (we took `self.listener` then), or the
+                    // close is in flight. The kernel may still have
+                    // queued a connection for us before our close took
+                    // effect. We close the orphan stream and do not
+                    // touch the listener again.
+                    return tcp_close_stream(stream).reply(HttpListenerMsg::StreamClosed);
                 }
                 let listener = self.listener.expect("listener set after bind");
                 let child = self.build_connection_child(stream);
@@ -158,28 +162,29 @@ impl<S: Shard + 'static> Isolate for HttpListener<S> {
                 }
             }
 
-            HttpListenerMsg::ListenerClosed(_) => stop(),
+            HttpListenerMsg::ListenerClosed(_) => {
+                // Even after the listener closes, an `Accepted(Ok)`
+                // queued before close arrives can still be processed —
+                // it routes to the orphan-close path above. We only
+                // stop self once we are confident no more accepts will
+                // arrive; in practice the runtime stops delivering
+                // accepts after the listener close completes, so this
+                // is the right place to exit the listener isolate.
+                stop()
+            }
+            HttpListenerMsg::StreamClosed(_) => {
+                // Orphan-close result. We do not stop on this — the
+                // listener stays alive until ListenerClosed arrives so
+                // any other queued Accepted(Ok) can also be drained
+                // through the orphan-close path.
+                noop()
+            }
         }
     }
 }
 
 impl<S: Shard + 'static> HttpListener<S> {
     fn build_connection_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S>> {
-        ChildDefinition::new(
-            HttpConnection::<S>::new(stream, self.service, self.limits, self.service_call_timeout),
-            self.connection_mailbox_capacity,
-        )
-        .with_initial_message(HttpConnectionMsg::Begin)
-    }
-
-    fn build_close_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S>> {
-        // Reuse the regular connection isolate but never feed it Begin —
-        // instead, jump straight to Closed. The simplest path: mark its
-        // state as already-closing and let the close call run.
-        //
-        // First form: just spawn it and let it close on its own when the
-        // peer hangs up. This is fine because we are stopping the
-        // listener.
         ChildDefinition::new(
             HttpConnection::<S>::new(stream, self.service, self.limits, self.service_call_timeout),
             self.connection_mailbox_capacity,

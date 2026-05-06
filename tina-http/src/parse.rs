@@ -73,18 +73,33 @@ impl HttpRequestHead {
     }
 }
 
+/// Number of headers we can parse without heap allocation. Anything
+/// configured beyond this in [`HttpLimits::max_headers`] falls back to a
+/// per-call `Vec`. The default limit (64) fits inline.
+const MAX_INLINE_HEADERS: usize = 64;
+
 /// Attempts to parse an HTTP/1.x request head out of `buffer`.
 ///
 /// This function is pure and does not consume `buffer`. The connection
 /// isolate calls it after each `tcp_read`; on `NeedMore`, it reads more
 /// bytes; on `Complete`, it slices the body off `buffer[head_len..]`.
+///
+/// Allocation: the common case (`max_headers <= 64`) uses a stack array
+/// for the header slot. Larger limits fall back to a heap `Vec`.
 pub fn parse_request_head(buffer: &[u8], limits: &HttpLimits) -> ParseProgress {
     if buffer.len() > limits.max_header_bytes {
         return ParseProgress::Failed(RequestParseError::HeadersTooLarge);
     }
 
-    let mut headers = vec![httparse::EMPTY_HEADER; limits.max_headers];
-    let mut req = httparse::Request::new(&mut headers);
+    let mut inline_headers = [httparse::EMPTY_HEADER; MAX_INLINE_HEADERS];
+    let mut heap_headers: Vec<httparse::Header<'_>>;
+    let header_slots: &mut [httparse::Header<'_>] = if limits.max_headers <= MAX_INLINE_HEADERS {
+        &mut inline_headers[..limits.max_headers]
+    } else {
+        heap_headers = vec![httparse::EMPTY_HEADER; limits.max_headers];
+        &mut heap_headers
+    };
+    let mut req = httparse::Request::new(header_slots);
 
     match req.parse(buffer) {
         Ok(httparse::Status::Partial) => {
@@ -171,11 +186,20 @@ fn build_head(
             }
         } else if name == http::header::CONNECTION {
             let value_str = std::str::from_utf8(header.value).unwrap_or("");
-            for token in value_str.split(',') {
-                let token = token.trim();
-                if token.eq_ignore_ascii_case("close") {
-                    connection_close = true;
-                } else if token.eq_ignore_ascii_case("keep-alive") {
+            // RFC 7230 §6.1: a `close` token anywhere in the
+            // Connection header field commits the sender to closing
+            // after the current response. `keep-alive` cannot override
+            // it, even if it appears later in the same header value.
+            let has_close = value_str
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"));
+            if has_close {
+                connection_close = true;
+            } else if !connection_close {
+                let has_keep_alive = value_str
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("keep-alive"));
+                if has_keep_alive {
                     connection_close = false;
                 }
             }
@@ -362,6 +386,111 @@ mod tests {
                 assert!(head.connection_close);
             }
             other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_close_wins_over_trailing_keep_alive() {
+        // Regression: previously the per-token loop unset connection_close
+        // when `keep-alive` followed `close`. RFC 7230 §6.1: a `close`
+        // token anywhere in the Connection header commits the sender to
+        // closing.
+        let buf = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n";
+        match parse_request_head(buf, &limits()) {
+            ParseProgress::Complete { head, .. } => {
+                assert!(
+                    head.connection_close,
+                    "close must win over a trailing keep-alive token"
+                );
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_close_wins_when_keep_alive_appears_first() {
+        let buf = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n";
+        match parse_request_head(buf, &limits()) {
+            ParseProgress::Complete { head, .. } => {
+                assert!(head.connection_close, "close must win regardless of order");
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflicting_content_length_returns_400_not_411() {
+        // RFC 7230 §3.3.2: two Content-Length headers with different
+        // values must be rejected as 400 Bad Request, not 411 Length
+        // Required. Regression for a previous mapping bug.
+        let buf =
+            b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+        match parse_request_head(buf, &limits()) {
+            ParseProgress::Failed(error @ RequestParseError::InvalidContentLength) => {
+                assert_eq!(error.status(), http::StatusCode::BAD_REQUEST);
+            }
+            other => panic!("expected InvalidContentLength + 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn equal_content_length_repeated_is_accepted() {
+        // RFC 7230 §3.3.2: two Content-Length headers carrying the same
+        // numeric value are equivalent to a single one and parse cleanly.
+        let buf =
+            b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        match parse_request_head(buf, &limits()) {
+            ParseProgress::Complete { head, .. } => {
+                assert_eq!(head.content_length, 5);
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_content_length_value_returns_400() {
+        let buf = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        match parse_request_head(buf, &limits()) {
+            ParseProgress::Failed(error @ RequestParseError::InvalidContentLength) => {
+                assert_eq!(error.status(), http::StatusCode::BAD_REQUEST);
+            }
+            other => panic!("expected InvalidContentLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_read_timeout_maps_to_408() {
+        assert_eq!(
+            RequestParseError::HeaderReadTimeout.status(),
+            http::StatusCode::REQUEST_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn parses_with_more_than_inline_headers_via_heap_path() {
+        // Regression: the inline header path uses a 64-slot stack array.
+        // When the user configures HttpLimits::max_headers > 64, the
+        // parser must fall back to a heap allocation rather than
+        // truncating. We construct a request with 80 headers and a
+        // limits override of 128.
+        let mut buf = String::from("GET / HTTP/1.1\r\nHost: x\r\n");
+        for i in 0..80 {
+            buf.push_str(&format!("X-Custom-{i}: v{i}\r\n"));
+        }
+        buf.push_str("\r\n");
+
+        let limits = HttpLimits {
+            max_headers: 128,
+            // Bump byte limit to fit the headers we just built.
+            max_header_bytes: 64 * 1024,
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf.as_bytes(), &limits) {
+            ParseProgress::Complete { head, .. } => {
+                // 81 = Host + 80 X-Custom-* headers.
+                assert_eq!(head.headers.len(), 81);
+            }
+            other => panic!("expected complete via heap path, got {other:?}"),
         }
     }
 

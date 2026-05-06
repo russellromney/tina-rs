@@ -28,9 +28,19 @@ testable on its own:
 
 | Slice | Rocks | Closes |
 |---|---|---|
-| **048a — server first form** | 1, 2, 3, 5, 6, 7, 8, 12 | The headline question: native HTTP server without a Tokio edge. Listener, connection, parser, service dispatch, overload, shutdown, example, DST, observability. |
-| **048b — HTTP client + pool** | 9, 10 | Outbound shape. The pool is a general primitive 055 native DB also needs. |
+| **048a — server first form** | 1, 2, 3, **5a**, 6, 7, 8, 12 | The headline question: native HTTP server without a Tokio edge. Listener, connection, parser, service dispatch, *typed-mapping overload* (5a), shutdown, example, DST, observability. |
+| **048b — HTTP client + pool + 5b** | 9, 10, **5b** | Outbound shape, plus rock 5b: max connection count, per-connection metrics, deterministic wire-level 503. The pool is a general primitive 055 native DB also needs and naturally produces overload scenarios. |
 | **048c — streaming and routing** | 4, 11 | Sharp-edges polish. Defer until 048a's first endpoint is proven. The plan already says rock 4 must not swallow the phase. |
+
+Rock 5 is **split** into 5a (typed-mapping overload visibility, shipped
+in 048a) and 5b (admission limits + metrics + deterministic wire-level
+503/Full coverage, shipped in 048b alongside the connection pool). The
+split is honest about the limitation that constructing
+`CallOutcome::Full` reliably on a single shard requires either a
+delayed-reply primitive Tina does not yet expose, or the 048b
+connection pool's natural overload scenarios. 048a does ship
+deterministic wire-level coverage of the *Timeout* (504) path via a
+service that never replies — that is the integration-test arm of 5a.
 
 048a closes the phase's headline. 048b lets the slice eat its own dogfood
 (client fetches from server). 048c is incremental.

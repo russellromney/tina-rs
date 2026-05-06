@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use common::{TestHarness, scripted_request};
+use common::{TestHarness, assert_status_starts_with, scripted_request};
 
 #[test]
 fn malformed_request_line_returns_400() {
@@ -63,7 +63,7 @@ fn oversized_header_section_is_rejected_either_with_431_or_connection_reset() {
     match read_outcome {
         Ok(_) => {
             // Server wrote a clean response before closing. Must be 431.
-            common::assert_status_starts_with(&response, "431");
+            assert_status_starts_with(&response, "431");
         }
         Err(error)
             if error.kind() == std::io::ErrorKind::ConnectionReset
@@ -76,6 +76,14 @@ fn oversized_header_section_is_rejected_either_with_431_or_connection_reset() {
         }
         Err(other) => panic!("unexpected client read error: {other:?}"),
     }
+
+    // Stronger property: prove the listener was not corrupted by the
+    // bad-input path. A well-formed follow-up request on a *fresh*
+    // connection must still be served. Without this assertion a future
+    // regression that crashed the connection isolate or the listener
+    // would also produce ConnectionReset above and pass the test.
+    let follow_up = scripted_request(harness.addr, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_status_starts_with(&follow_up, "200");
 
     harness.shutdown();
 }

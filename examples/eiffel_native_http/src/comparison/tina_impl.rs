@@ -13,12 +13,18 @@ use tina_runtime::{MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
 use super::{SideReport, scripted_client};
 
+/// Single shard for the Tina-side HTTP server in this comparison. Each
+/// Eiffel comparison runs in its own process, so cross-comparison id
+/// collisions are not a concern; the const just removes the
+/// magic-number-per-file smell.
+const TINA_SHARD_ID: u32 = 303;
+
 #[derive(Debug, Default)]
 struct AppShard;
 
 impl Shard for AppShard {
     fn id(&self) -> ShardId {
-        ShardId::new(303)
+        ShardId::new(TINA_SHARD_ID)
     }
 }
 
