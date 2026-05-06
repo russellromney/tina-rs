@@ -111,6 +111,18 @@ impl HttpResponse {
     pub fn service_unavailable() -> Self {
         Self::with_status(StatusCode::SERVICE_UNAVAILABLE)
     }
+
+    /// Convenience: `502 Bad Gateway`. Useful for proxy services that
+    /// receive a structured error from an upstream.
+    pub fn bad_gateway() -> Self {
+        Self::with_status(StatusCode::BAD_GATEWAY)
+    }
+
+    /// Convenience: `504 Gateway Timeout`. Mirrors the connection
+    /// isolate's mapping for a service-call timeout.
+    pub fn gateway_timeout() -> Self {
+        Self::with_status(StatusCode::GATEWAY_TIMEOUT)
+    }
 }
 
 impl HttpRequest {

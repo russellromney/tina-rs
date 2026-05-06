@@ -482,37 +482,40 @@ presets. Examples should never need to hand-roll a timeout/limit triple.
   on Tokio side, native `HttpListener` + service-shaped `HttpClient`
   on Tina side, same scripted endpoint sequence.
 
-### Connection-isolate service-shape note
+### Connection-isolate service-shape generalization (shipped)
 
-`HttpListener`'s service address remains `Address<HttpRequest,
-HttpResponse>` — sync-reply, single-variant message. Multi-turn user
-services (services that need to call upstream HTTP via the new
-`HttpClient`) can't fit that signature directly because their handler
-for `HttpRequest` would need to issue `.reply(continuation)` with a
-continuation type matching the service's own message type, which is
-fixed to `HttpRequest`. For 048b we leave the connection isolate's
-service shape unchanged and document the limitation. A flexible
-service shape — generic over user message/reply types with conversions
-to/from HTTP types — is a 048c candidate.
+`HttpListener<S, M>` and `HttpConnection<S, M>` are now generic over
+the service's message type, with the bound `M: From<HttpRequest>`.
+`M` defaults to `HttpRequest` so existing sync-reply services
+(`Address<HttpRequest, HttpResponse>`) continue to compile unchanged.
+Multi-turn services declare an enum that wraps `HttpRequest` plus
+their internal continuation variants, supply `From<HttpRequest>`, and
+do their work across multiple handler turns. The runtime preserves
+the call context through `.reply(continuation)` chains, so the final
+`Effect::Reply` reaches the connection isolate.
+
+`tina-http/tests/multi_turn_service.rs` exercises the shape via a
+proxy service that forwards inbound requests to upstream through the
+outbound `HttpClient` — happy path + a wire-level 503 chain when the
+client is overloaded.
 
 ## 048c Slice Design Notes
 
-048c lands rock 11 (tiny routing) as a sync helper. Rock 4 (streaming
-bodies) is deferred to the same shape-change slice as the multi-turn
-service support.
+048c lands rock 11 (tiny routing) as a sync helper, the connection-
+isolate service-shape generalization, and a multi-turn proxy demo
+that closes the rock 5b full chain. Rock 4 (real streaming bodies)
+remains its own slice — the shape change is necessary but not
+sufficient; chunk-source isolate design is its own surface area.
 
-### Rock 4 (streaming bodies) — deferred
+### Rock 4 (streaming bodies) — its own slice
 
-True streaming — the service produces chunks lazily without buffering
-the whole body — needs the connection-isolate service-shape change so
-the connection can call back into the service for each chunk. Without
-that, "streaming" reduces to chunked egress over a fully-buffered
-body, which does not lower memory and is just ceremony.
+The shape change is in. True streaming still needs:
+- a chunk-source isolate the connection can pull from (request side)
+- a response body that names a chunk-producer address (response side)
+- backpressure semantics between connection and chunk source
 
-048a's multi-read accumulation already covers "request body larger
-than one TCP read" up to `max_body_bytes`. That is the honest
-first-form bounded-body story. Real streaming ships with the
-shape-change slice.
+That is its own design surface. 048a's multi-read accumulation up to
+`max_body_bytes` is still the honest first-form bounded-body story.
 
 ### Rock 11 (tiny routing) — sync helper
 
@@ -529,10 +532,12 @@ reply(response)
 ```
 
 Stateless handlers only. For stateful routes the user writes a manual
-`match` in their service handler. Forwarding to other isolates is
-gated on the shape change — a route that needs to call upstream HTTP
-or a database can't fit through a `fn(&HttpRequest) -> HttpResponse`
-handler.
+`match` in their service handler. For routes that need to forward to
+another isolate, the user can now do it directly — services with the
+generalized shape can issue `call(target, ...).reply(continuation)`
+inside their handler and reply through the chain. A future Router
+variant could expose `route_to_isolate(method, path, address)` sugar
+on top of the call chain; out of scope for this slice.
 
 No middleware. No path params (defer until an example needs them).
 404 fallback baked in.
