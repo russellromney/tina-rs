@@ -13,10 +13,10 @@ use tina_runtime::{
     CallError, CallKind, CallOutcome, CancellationSupport, FileId, ListenerId, LiveShardState,
     LocalSystem, LocalSystemConfig, LocalSystemConfigError, LocalSystemState, MailboxFactory,
     PathKind, PathMetadata, PersistenceSupportLevel, ResourceExecutionShape, ResourceSupport,
-    RuntimeEventKind, ShutdownSupport, SnapshotImage, StreamId, ThreadedRuntimeError,
-    ThreadedTrySendError, TlsListenerId, TlsStreamId, TraceRetention, UdpSocketId, call,
-    dns_lookup, file_close, file_create, file_fsync, file_read, file_size, file_write,
-    journal_append, journal_replay, path_metadata, process_run, read_dir, remove_file,
+    RuntimeEventKind, ShutdownSupport, ShutdownUncleanReason, SnapshotImage, StreamId,
+    ThreadedRuntimeError, ThreadedTrySendError, TlsListenerId, TlsStreamId, TraceRetention,
+    UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_read, file_size,
+    file_write, journal_append, journal_replay, path_metadata, process_run, read_dir, remove_file,
     rename_replace, signal_wait, sleep, snapshot_load, sync_parent, tcp_accept, tcp_bind,
     tcp_close_listener, tcp_close_stream, tcp_read, tcp_write, tls_accept, tls_bind, tls_close,
     tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
@@ -1436,6 +1436,50 @@ fn local_system_single_shard_is_canonical_live_owner() {
     }));
 }
 
+// Phase 043 Rock 6/7: LocalSystem.topology() must surface every bounded
+// lane capacity, the worker-held / pending-call counts added in Rock 2,
+// and the unclean_reason on the terminal report.
+#[test]
+fn local_system_topology_report_exposes_all_lane_capacities_and_new_counts() {
+    let config = LocalSystemConfig {
+        ingress_capacity: 4,
+        shard_pair_capacity: 4,
+        storage_lane_capacity: 5,
+        dns_lane_capacity: 6,
+        tls_lane_capacity: 7,
+        process_lane_capacity: 8,
+        signal_capacity: 9,
+        ..LocalSystemConfig::default()
+    };
+    let app = LocalSystem::single_shard(AppShard(91), AppMailboxFactory)
+        .config(config)
+        .build();
+
+    let topology = app.topology();
+    let shard = topology
+        .shard(ShardId::new(91))
+        .expect("single shard report exists");
+    // All six bounded lanes must be reachable from the topology.
+    assert_eq!(shard.ingress().capacity(), 4);
+    assert_eq!(shard.storage_lane().capacity(), 5);
+    assert_eq!(shard.dns_lane().capacity(), 6);
+    assert_eq!(shard.tls_lane().capacity(), 7);
+    assert_eq!(shard.process_lane().capacity(), 8);
+    assert_eq!(shard.signal_lane().capacity(), 9);
+    // Phase 043 Rock 2 fields are populated and start at zero.
+    assert_eq!(shard.owned_resource_count(), 0);
+    assert_eq!(shard.worker_held_resource_count(), 0);
+    assert_eq!(shard.pending_driver_call_count(), 0);
+
+    let terminal = app.shutdown().drain().join().expect("clean shutdown");
+    let report = terminal.shutdown_report();
+    assert!(report.clean());
+    assert!(report.unclean_reason().is_none());
+    assert_eq!(report.remaining_owned_resource_count(), 0);
+    assert_eq!(report.remaining_worker_held_resource_count(), 0);
+    assert_eq!(report.remaining_pending_driver_call_count(), 0);
+}
+
 #[test]
 fn local_system_topology_report_before_and_after_shutdown() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2776,6 +2820,88 @@ fn remote_queue_pressure_reports_capacity_and_full_counter() {
             } if target_shard == ShardId::new(44)
         )
     }));
+}
+
+// Phase 043 Rock 5: a multi-shard system whose worker thread fails must
+// reject subsequent ingress to that shard's isolates, while healthy
+// shards keep accepting work.
+#[test]
+fn failed_shard_rejects_later_ingress_to_existing_isolate() {
+    let app = LocalSystem::<AppShard, CapacityPanicMailboxFactory>::multi_shard(
+        CapacityPanicMailboxFactory { panic_capacity: 13 },
+    )
+    .shard(AppShard(81))
+    .shard(AppShard(82))
+    .ingress_capacity(4)
+    .trace_retention(TraceRetention::Bounded(64))
+    .build();
+
+    // Register a healthy isolate on the doomed shard before the panic,
+    // so we have a real address to send to once the worker dies.
+    let doomed = app
+        .register_root_on::<LlamaService, Infallible>(
+            ShardId::new(81),
+            LlamaService {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            },
+            8,
+        )
+        .expect("register isolate on shard 81 succeeds before panic");
+
+    // Healthy reference shard for the post-failure check.
+    let healthy_seen = Arc::new(Mutex::new(Vec::new()));
+    let healthy = app
+        .register_root_on::<LlamaService, Infallible>(
+            ShardId::new(82),
+            LlamaService {
+                seen: Arc::clone(&healthy_seen),
+            },
+            8,
+        )
+        .expect("register healthy isolate");
+
+    // Trigger a worker panic on shard 81 by registering with the
+    // poisoned capacity — the mailbox factory panics inside the worker
+    // thread, taking shard 81 to LiveShardState::Failed.
+    assert_eq!(
+        app.register_root_on::<LlamaService, Infallible>(
+            ShardId::new(81),
+            LlamaService {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            },
+            13,
+        ),
+        Err(ThreadedRuntimeError::WorkerStopped),
+    );
+
+    // Shard 81's prior isolate is now unreachable: subsequent ingress
+    // must reject with WorkerStopped, not silently accept.
+    let send_outcome = app.try_send(doomed, LlamaMsg::Feed(1));
+    assert_eq!(send_outcome, Err(ThreadedTrySendError::WorkerStopped));
+
+    // The healthy shard keeps accepting work.
+    app.try_send(healthy, LlamaMsg::Feed(99))
+        .expect("healthy shard still accepts ingress");
+    wait_until(|| healthy_seen.lock().expect("healthy seen lock").as_slice() == [99]);
+
+    let terminal = app.shutdown().drain().join_report();
+    assert_eq!(terminal.state(), LocalSystemState::Failed);
+    let terminal_topology = terminal.topology().expect("terminal topology");
+    assert_eq!(
+        terminal_topology
+            .shard(ShardId::new(81))
+            .expect("failed shard terminal")
+            .state(),
+        LiveShardState::Failed,
+    );
+    assert_eq!(
+        terminal.shutdown_report().failed_shards(),
+        &[ShardId::new(81)]
+    );
+    assert_eq!(
+        terminal.shutdown_report().unclean_reason(),
+        Some(ShutdownUncleanReason::RuntimeError),
+    );
 }
 
 #[test]

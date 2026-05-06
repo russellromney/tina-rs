@@ -20,6 +20,12 @@ tina-supervisor = { path = "../tina-supervisor" }
 betelgeuse = { path = "../vendor-betelgeuse" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
+[target.'cfg(unix)'.dependencies]
+# Phase Sadie's-Ward (043) live signal capture. Used only for installing
+# flag-based handlers for SIGINT / SIGTERM. No async signal task, no
+# Tokio dependency, no custom unsafe handler.
+signal-hook = { version = "0.3", default-features = false }
+
 [dev-dependencies]
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 rcgen = "0.13"

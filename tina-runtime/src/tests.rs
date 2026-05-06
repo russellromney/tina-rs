@@ -1175,7 +1175,7 @@ impl RuntimeDriver for FakeDriver {
         !self.pending.is_empty()
     }
 
-    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
+    fn cancel_pending(&mut self, _deadline: Instant) -> Result<(), DriverShutdownError> {
         self.cancelled.set(true);
         if let Some(error) = self.shutdown_error {
             return Err(error);
@@ -2260,7 +2260,7 @@ fn runtime_shutdown_cancels_non_betelgeuse_driver_pending_call() {
     assert!(runtime.has_in_flight_calls());
 
     runtime
-        .cancel_in_flight_calls_for_shutdown()
+        .cancel_in_flight_calls_for_shutdown(Instant::now())
         .expect("fake driver shutdown succeeds");
 
     assert!(cancelled.get(), "runtime must cancel pending driver ops");
@@ -2290,7 +2290,7 @@ fn runtime_shutdown_surfaces_driver_completion_release_failure() {
     );
 
     assert_eq!(
-        runtime.cancel_in_flight_calls_for_shutdown(),
+        runtime.cancel_in_flight_calls_for_shutdown(Instant::now()),
         Err(DriverShutdownError::BackendStillOwnsCompletions)
     );
 }
@@ -2728,5 +2728,210 @@ fn retry_backoff_workload_uses_timer_path() {
         sleep_completions.len(),
         1,
         "trace must show exactly one Sleep completion for the backoff timer"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Phase 043 Rock 2: LocalSystemShutdownReport unclean_reason priority.
+//
+// `from_parts` derives the typed reason from the topology snapshot and
+// any terminal error. The priority order, highest first, is:
+//
+//   RuntimeError > FailedShards > NotClosed >
+//     WorkerHeldResourcesRemaining > PendingDriverCallsRemaining >
+//     OwnedResourcesRemaining
+//
+// `clean()` returns true iff `unclean_reason()` is `None`.
+// -----------------------------------------------------------------------
+
+fn make_shard_report(
+    shard: ShardId,
+    state: LiveShardState,
+    owned: usize,
+    worker_held: usize,
+    pending: usize,
+) -> LiveShardReport {
+    LiveShardReport {
+        shard,
+        worker_name: None,
+        state,
+        ingress: LiveQueueReport::unmeasured(8),
+        storage_lane: LiveQueueReport::unmeasured(8),
+        dns_lane: LiveQueueReport::unmeasured(8),
+        tls_lane: LiveQueueReport::unmeasured(8),
+        process_lane: LiveQueueReport::unmeasured(8),
+        signal_lane: LiveQueueReport::unmeasured(8),
+        trace_retention: TraceRetention::Full,
+        trace_dropped: None,
+        owned_resource_count: owned,
+        worker_held_resource_count: worker_held,
+        pending_driver_call_count: pending,
+    }
+}
+
+#[test]
+fn shutdown_report_clean_when_all_zero() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(0),
+        LiveShardState::Stopped,
+        0,
+        0,
+        0,
+    ));
+    let report =
+        LocalSystemShutdownReport::from_parts(LocalSystemState::Closed, &[], None, Some(&topology));
+    assert!(report.clean());
+    assert!(report.unclean_reason().is_none());
+    assert_eq!(report.remaining_owned_resource_count(), 0);
+    assert_eq!(report.remaining_worker_held_resource_count(), 0);
+    assert_eq!(report.remaining_pending_driver_call_count(), 0);
+}
+
+#[test]
+fn shutdown_report_runtime_error_outranks_other_unclean_reasons() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(0),
+        LiveShardState::Failed,
+        3,
+        2,
+        1,
+    ));
+    let report = LocalSystemShutdownReport::from_parts(
+        LocalSystemState::Closed,
+        &[],
+        Some(ThreadedRuntimeError::DriverShutdownFailed),
+        Some(&topology),
+    );
+    assert!(!report.clean());
+    assert_eq!(
+        report.unclean_reason(),
+        Some(ShutdownUncleanReason::RuntimeError),
+    );
+}
+
+#[test]
+fn shutdown_report_failed_shards_outranks_count_remainders() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(7),
+        LiveShardState::Failed,
+        3,
+        2,
+        1,
+    ));
+    let report =
+        LocalSystemShutdownReport::from_parts(LocalSystemState::Closed, &[], None, Some(&topology));
+    assert_eq!(
+        report.unclean_reason(),
+        Some(ShutdownUncleanReason::FailedShards),
+    );
+    assert_eq!(report.failed_shards(), &[ShardId::new(7)]);
+}
+
+#[test]
+fn shutdown_report_not_closed_outranks_count_remainders() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(0),
+        LiveShardState::Stopped,
+        3,
+        2,
+        1,
+    ));
+    let report = LocalSystemShutdownReport::from_parts(
+        LocalSystemState::Closing,
+        &[],
+        None,
+        Some(&topology),
+    );
+    assert_eq!(
+        report.unclean_reason(),
+        Some(ShutdownUncleanReason::NotClosed),
+    );
+}
+
+#[test]
+fn shutdown_report_worker_held_outranks_pending_and_owned() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(0),
+        LiveShardState::Stopped,
+        3,
+        2,
+        1,
+    ));
+    let report =
+        LocalSystemShutdownReport::from_parts(LocalSystemState::Closed, &[], None, Some(&topology));
+    assert_eq!(
+        report.unclean_reason(),
+        Some(ShutdownUncleanReason::WorkerHeldResourcesRemaining),
+    );
+    assert_eq!(report.remaining_worker_held_resource_count(), 2);
+}
+
+#[test]
+fn shutdown_report_pending_outranks_owned() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(0),
+        LiveShardState::Stopped,
+        3,
+        0,
+        1,
+    ));
+    let report =
+        LocalSystemShutdownReport::from_parts(LocalSystemState::Closed, &[], None, Some(&topology));
+    assert_eq!(
+        report.unclean_reason(),
+        Some(ShutdownUncleanReason::PendingDriverCallsRemaining),
+    );
+    assert_eq!(report.remaining_pending_driver_call_count(), 1);
+}
+
+#[test]
+fn shutdown_report_owned_remaining_is_lowest_priority_unclean_reason() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(0),
+        LiveShardState::Stopped,
+        3,
+        0,
+        0,
+    ));
+    let report =
+        LocalSystemShutdownReport::from_parts(LocalSystemState::Closed, &[], None, Some(&topology));
+    assert_eq!(
+        report.unclean_reason(),
+        Some(ShutdownUncleanReason::OwnedResourcesRemaining),
+    );
+    assert_eq!(report.remaining_owned_resource_count(), 3);
+}
+
+// Phase 043 Rock 6: every bounded lane capacity must be reachable from
+// the topology snapshot, not just ingress and storage.
+#[test]
+fn live_shard_report_exposes_every_lane_capacity() {
+    let report = make_shard_report(ShardId::new(1), LiveShardState::Running, 0, 0, 0);
+    // make_shard_report uses unmeasured(8) for every lane.
+    assert_eq!(report.ingress().capacity(), 8);
+    assert_eq!(report.storage_lane().capacity(), 8);
+    assert_eq!(report.dns_lane().capacity(), 8);
+    assert_eq!(report.tls_lane().capacity(), 8);
+    assert_eq!(report.process_lane().capacity(), 8);
+    assert_eq!(report.signal_lane().capacity(), 8);
+}
+
+#[test]
+fn shutdown_report_sums_counts_across_shards() {
+    let topology = LiveTopologyReport::new(
+        vec![
+            make_shard_report(ShardId::new(0), LiveShardState::Stopped, 1, 1, 2),
+            make_shard_report(ShardId::new(1), LiveShardState::Stopped, 4, 0, 3),
+        ],
+        Vec::new(),
+    );
+    let report =
+        LocalSystemShutdownReport::from_parts(LocalSystemState::Closed, &[], None, Some(&topology));
+    assert_eq!(report.remaining_owned_resource_count(), 5);
+    assert_eq!(report.remaining_worker_held_resource_count(), 1);
+    assert_eq!(report.remaining_pending_driver_call_count(), 5);
+    assert_eq!(
+        report.unclean_reason(),
+        Some(ShutdownUncleanReason::WorkerHeldResourcesRemaining),
     );
 }

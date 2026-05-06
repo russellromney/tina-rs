@@ -175,6 +175,13 @@ and reviews live under `.intent/phases/`.
   source-destination queues, live cross-shard isolate calls, inbound TLS server
   rail, configured DNS/TLS/process/signal capacities, live resource inventory,
   terminal shutdown accounting, and LocalSystem e2e/DST pressure.
+- Sadie's Ward: typed worker-held and pending-driver-call accounting across
+  every lane, bounded per-shard shutdown drain with a configurable timeout,
+  raw Unix `SIGINT`/`SIGTERM` capture via `signal-hook` (no Tokio, no async
+  signal task, no custom unsafe handler), explicit failed-shard ingress
+  rejection ahead of the channel-disconnect race, every bounded lane
+  capacity surfaced in the topology snapshot, and a typed
+  `ShutdownUncleanReason` on the terminal report.
 
 ## Near-term roadmap
 
@@ -183,7 +190,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Sadie's Ward lifecycle hardening** | Make the live local system boring under shutdown, lane workers, raw OS signal capture, failed shards, and long-running driver work. Scope: strict worker-held resource accounting across all lanes, bounded drain/join rules, raw signal delivery where platform-supported, shard quarantine cleanup, shutdown/live topology consistency, and DST that hammers mid-flight I/O while shutdown/failure happens. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 Parallel-safe side work: CI matrix planning, formatting of existing

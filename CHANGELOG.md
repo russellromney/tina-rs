@@ -4,6 +4,40 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Sadie's Ward
+
+- Added typed worker-held and pending-driver-call accounting alongside the
+  existing table-owned count: `LiveShardReport::worker_held_resource_count`
+  and `pending_driver_call_count`, plus
+  `LocalSystemShutdownReport::remaining_worker_held_resource_count`,
+  `remaining_pending_driver_call_count`, and `unclean_reason`.
+- Added `ShutdownUncleanReason` (`#[non_exhaustive]`) with a deterministic
+  priority order: runtime error > failed shards > not-closed > worker-held
+  remaining > pending-call remaining > table-owned remaining.
+- Added `shutdown_lane_drain_timeout` to `LocalSystemConfig` and
+  `ThreadedRuntimeConfig` (default `DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT`,
+  100 ms). Per-shard shutdown drains lane workers up to that budget, then
+  returns; stuck work surfaces in the terminal report rather than blocking
+  shutdown forever. The Betelgeuse TCP shutdown drain replaces its
+  64-step constant with the same deadline.
+- Added Unix `SIGINT`/`SIGTERM` capture via `signal-hook` flag handlers
+  (no Tokio dependency, no async signal task, no custom unsafe handler);
+  flagged through to runtime-owned signal completions parked by
+  `signal_wait`. Added `os_signal_capture_supported()` so non-Unix is an
+  explicit unsupported capability instead of a silent no-op.
+- Added `LiveShardReport::dns_lane`, `tls_lane`, `process_lane`, and
+  `signal_lane` so every bounded lane capacity is reachable from the
+  topology snapshot.
+- Hardened threaded `try_send` (single-shard and multi-shard) so a
+  `Failed` shard rejects ingress immediately with `WorkerStopped` instead
+  of relying on the bounded sync channel to observe `Disconnected`.
+- Added per-lane unit tests for the count rules, a unit test that the
+  storage and Betelgeuse TCP shutdowns return inside their budget when a
+  worker is stuck, a real `raise(SIGINT)` test that reaches a parked
+  `signal_wait`, a live `LocalSystem` test that a failed shard rejects
+  ingress while a healthy shard keeps running, and a live `LocalSystem`
+  topology test that exposes every new field through the public API.
+
 ### Phase Jan de Quay
 
 - Added native bounded live DNS support behind `dns_lookup`, with visible

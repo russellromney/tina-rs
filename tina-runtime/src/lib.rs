@@ -82,7 +82,8 @@ pub use trace::{
     SupervisionRejectedReason,
 };
 
-use driver::{BetelgeuseDriver, DriverShutdownError, RuntimeDriver};
+pub use driver::os_signal_capture_supported;
+use driver::{BetelgeuseDriver, DriverResourceReport, DriverShutdownError, RuntimeDriver};
 
 /// Runtime-owned mailbox factory for registered and spawned isolate mailboxes.
 ///
@@ -721,8 +722,8 @@ where
         self.driver.io_pending_count()
     }
 
-    fn owned_resource_count(&self) -> usize {
-        self.driver.resource_report().owned_resource_count()
+    fn resource_report(&self) -> DriverResourceReport {
+        self.driver.resource_report()
     }
 
     /// Returns a shared reference to the shard.
@@ -754,8 +755,11 @@ where
         self.enforce_trace_retention();
     }
 
-    fn cancel_in_flight_calls_for_shutdown(&mut self) -> Result<(), DriverShutdownError> {
-        self.driver.cancel_pending()?;
+    fn cancel_in_flight_calls_for_shutdown(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), DriverShutdownError> {
+        self.driver.cancel_pending(deadline)?;
         self.translators.clear();
 
         let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
@@ -3049,6 +3053,11 @@ pub struct ThreadedRuntimeConfig {
     /// How long an idle worker may park before checking runtime-owned work
     /// again.
     pub idle_wait: Duration,
+
+    /// Per-shard budget for draining lane workers after cancellation
+    /// during shutdown. When the budget elapses, shutdown returns even if
+    /// some lane work could not finish.
+    pub shutdown_lane_drain_timeout: Duration,
 }
 
 impl Default for ThreadedRuntimeConfig {
@@ -3063,9 +3072,13 @@ impl Default for ThreadedRuntimeConfig {
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
+            shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
         }
     }
 }
+
+/// Per-shard default budget for draining lane workers after cancellation.
+pub const DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Preferred public bounded-shape config for local Tina systems.
 ///
@@ -3093,6 +3106,12 @@ pub struct LocalSystemConfig {
     pub trace_retention: TraceRetention,
     /// How long an idle worker may park before checking runtime-owned work.
     pub idle_wait: Duration,
+    /// Per-shard budget for draining lane workers during shutdown after
+    /// cancellation. Default is
+    /// [`DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT`]. When the budget elapses,
+    /// shutdown returns even if some lane work could not finish; the
+    /// terminal report names the remaining work.
+    pub shutdown_lane_drain_timeout: Duration,
 }
 
 impl Default for LocalSystemConfig {
@@ -3107,6 +3126,7 @@ impl Default for LocalSystemConfig {
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
+            shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
         }
     }
 }
@@ -3149,6 +3169,7 @@ impl LocalSystemConfig {
             signal_capacity: self.signal_capacity,
             trace_retention: self.trace_retention,
             idle_wait: self.idle_wait,
+            shutdown_lane_drain_timeout: self.shutdown_lane_drain_timeout,
         }
     }
 }
@@ -3343,6 +3364,8 @@ struct LiveShardMetrics {
     storage_lane: LiveQueueMetrics,
     trace_retention: TraceRetention,
     owned_resource_count: AtomicUsize,
+    worker_held_resource_count: AtomicUsize,
+    pending_driver_call_count: AtomicUsize,
 }
 
 impl LiveShardMetrics {
@@ -3356,6 +3379,8 @@ impl LiveShardMetrics {
             storage_lane: LiveQueueMetrics::new(config.storage_lane_capacity),
             trace_retention: config.trace_retention,
             owned_resource_count: AtomicUsize::new(0),
+            worker_held_resource_count: AtomicUsize::new(0),
+            pending_driver_call_count: AtomicUsize::new(0),
         }
     }
 
@@ -3372,8 +3397,13 @@ impl LiveShardMetrics {
         self.state.store(raw, Ordering::Release);
     }
 
-    fn set_owned_resource_count(&self, count: usize) {
-        self.owned_resource_count.store(count, Ordering::Release);
+    fn set_resource_counts(&self, report: DriverResourceReport) {
+        self.owned_resource_count
+            .store(report.owned_resource_count(), Ordering::Release);
+        self.worker_held_resource_count
+            .store(report.worker_held_resource_count(), Ordering::Release);
+        self.pending_driver_call_count
+            .store(report.pending_driver_call_count(), Ordering::Release);
     }
 
     fn report(&self) -> LiveShardReport {
@@ -3383,9 +3413,15 @@ impl LiveShardMetrics {
             state: self.state(),
             ingress: self.ingress.report(),
             storage_lane: LiveQueueReport::unmeasured(self.storage_lane.capacity),
+            dns_lane: LiveQueueReport::unmeasured(self.config.dns_lane_capacity),
+            tls_lane: LiveQueueReport::unmeasured(self.config.tls_lane_capacity),
+            process_lane: LiveQueueReport::unmeasured(self.config.process_lane_capacity),
+            signal_lane: LiveQueueReport::unmeasured(self.config.signal_capacity),
             trace_retention: self.trace_retention,
             trace_dropped: None,
             owned_resource_count: self.owned_resource_count.load(Ordering::Acquire),
+            worker_held_resource_count: self.worker_held_resource_count.load(Ordering::Acquire),
+            pending_driver_call_count: self.pending_driver_call_count.load(Ordering::Acquire),
         }
     }
 }
@@ -3398,9 +3434,15 @@ pub struct LiveShardReport {
     state: LiveShardState,
     ingress: LiveQueueReport,
     storage_lane: LiveQueueReport,
+    dns_lane: LiveQueueReport,
+    tls_lane: LiveQueueReport,
+    process_lane: LiveQueueReport,
+    signal_lane: LiveQueueReport,
     trace_retention: TraceRetention,
     trace_dropped: Option<u64>,
     owned_resource_count: usize,
+    worker_held_resource_count: usize,
+    pending_driver_call_count: usize,
 }
 
 impl LiveShardReport {
@@ -3429,6 +3471,31 @@ impl LiveShardReport {
         &self.storage_lane
     }
 
+    /// Configured DNS lane capacity. Live depth/accept/reject counters
+    /// are not measured for this lane today; the capacity is reported
+    /// for honest topology coverage.
+    pub const fn dns_lane(&self) -> &LiveQueueReport {
+        &self.dns_lane
+    }
+
+    /// Configured TLS lane capacity. Live depth/accept/reject counters
+    /// are not measured for this lane today.
+    pub const fn tls_lane(&self) -> &LiveQueueReport {
+        &self.tls_lane
+    }
+
+    /// Configured process lane capacity. Live depth/accept/reject
+    /// counters are not measured for this lane today.
+    pub const fn process_lane(&self) -> &LiveQueueReport {
+        &self.process_lane
+    }
+
+    /// Configured signal-wait capacity. Live depth/accept/reject
+    /// counters are not measured for this lane today.
+    pub const fn signal_lane(&self) -> &LiveQueueReport {
+        &self.signal_lane
+    }
+
     /// Configured trace retention.
     pub const fn trace_retention(&self) -> TraceRetention {
         self.trace_retention
@@ -3439,9 +3506,39 @@ impl LiveShardReport {
         self.trace_dropped
     }
 
-    /// Live driver-owned resource handles known to this worker.
+    /// Live table-owned driver resource handles known to this worker.
+    ///
+    /// Counts runtime-table ids handed back to user code: TCP listeners and
+    /// streams, TLS listeners and streams, UDP sockets, files. See
+    /// [`worker_held_resource_count`](Self::worker_held_resource_count) for
+    /// in-flight ops that hold cloned OS handles, and
+    /// [`pending_driver_call_count`](Self::pending_driver_call_count) for
+    /// runtime-owned operations waiting for completion.
     pub const fn owned_resource_count(&self) -> usize {
         self.owned_resource_count
+    }
+
+    /// Worker-held resources parked inside in-flight lane work.
+    ///
+    /// Each TLS accept/handshake/read/write/close keeps cloned listener and
+    /// stream `Arc`s alive on the worker thread for the duration of the
+    /// operation. Each running process call holds a `std::process::Child`.
+    /// These do not appear in [`owned_resource_count`](Self::owned_resource_count)
+    /// because they are not represented by a runtime table id, and they may
+    /// outlive the call's table id when the table id is dropped first.
+    pub const fn worker_held_resource_count(&self) -> usize {
+        self.worker_held_resource_count
+    }
+
+    /// Runtime-owned operations waiting for completion.
+    ///
+    /// Counts every pending driver call regardless of lane: TCP/file/UDP
+    /// reads and writes, TLS ops, DNS lookups, storage jobs, process calls,
+    /// signal waits, and timers. A TLS or process op contributes to both
+    /// this count and [`worker_held_resource_count`](Self::worker_held_resource_count);
+    /// a DNS lookup contributes only here.
+    pub const fn pending_driver_call_count(&self) -> usize {
+        self.pending_driver_call_count
     }
 }
 
@@ -3539,6 +3636,37 @@ pub struct LocalSystemTerminalReport {
     shutdown: LocalSystemShutdownReport,
 }
 
+/// Why a shutdown is unclean.
+///
+/// Highest-priority reason wins, matching the order in
+/// [`LocalSystemShutdownReport::unclean_reason`]:
+/// runtime error > failed shard > final state not Closed >
+/// remaining worker-held > remaining pending call > remaining table-owned.
+///
+/// Not exhaustive: future variants may be added; pattern matches should
+/// handle the catchall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShutdownUncleanReason {
+    /// A worker thread or driver returned a terminal error before clean
+    /// shutdown completed.
+    RuntimeError,
+    /// At least one shard ended in [`LiveShardState::Failed`].
+    FailedShards,
+    /// The system did not reach [`LocalSystemState::Closed`] before the
+    /// terminal report was produced.
+    NotClosed,
+    /// One or more lanes still hold worker-side OS handles or child
+    /// processes after the shutdown drain finished.
+    WorkerHeldResourcesRemaining,
+    /// One or more pending driver calls were still outstanding after the
+    /// shutdown drain finished.
+    PendingDriverCallsRemaining,
+    /// One or more table-owned runtime resources were still alive after
+    /// shutdown.
+    OwnedResourcesRemaining,
+}
+
 /// Terminal shutdown accounting for a local Tina system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSystemShutdownReport {
@@ -3549,6 +3677,9 @@ pub struct LocalSystemShutdownReport {
     rejected_after_drain_count: usize,
     failed_shards: Vec<ShardId>,
     remaining_owned_resource_count: usize,
+    remaining_worker_held_resource_count: usize,
+    remaining_pending_driver_call_count: usize,
+    unclean_reason: Option<ShutdownUncleanReason>,
 }
 
 impl LocalSystemShutdownReport {
@@ -3559,7 +3690,7 @@ impl LocalSystemShutdownReport {
         topology: Option<&LiveTopologyReport>,
     ) -> Self {
         let summary = terminal_summary(trace);
-        let failed_shards = topology
+        let failed_shards: Vec<ShardId> = topology
             .map(|topology| {
                 topology
                     .shards()
@@ -3578,16 +3709,50 @@ impl LocalSystemShutdownReport {
                     .sum()
             })
             .unwrap_or_default();
+        let remaining_worker_held_resource_count = topology
+            .map(|topology| {
+                topology
+                    .shards()
+                    .iter()
+                    .map(LiveShardReport::worker_held_resource_count)
+                    .sum()
+            })
+            .unwrap_or_default();
+        let remaining_pending_driver_call_count = topology
+            .map(|topology| {
+                topology
+                    .shards()
+                    .iter()
+                    .map(LiveShardReport::pending_driver_call_count)
+                    .sum()
+            })
+            .unwrap_or_default();
+        let unclean_reason = if error.is_some() {
+            Some(ShutdownUncleanReason::RuntimeError)
+        } else if !failed_shards.is_empty() {
+            Some(ShutdownUncleanReason::FailedShards)
+        } else if state != LocalSystemState::Closed {
+            Some(ShutdownUncleanReason::NotClosed)
+        } else if remaining_worker_held_resource_count > 0 {
+            Some(ShutdownUncleanReason::WorkerHeldResourcesRemaining)
+        } else if remaining_pending_driver_call_count > 0 {
+            Some(ShutdownUncleanReason::PendingDriverCallsRemaining)
+        } else if remaining_owned_resource_count > 0 {
+            Some(ShutdownUncleanReason::OwnedResourcesRemaining)
+        } else {
+            None
+        };
         Self {
             final_state: state,
-            clean: error.is_none()
-                && state == LocalSystemState::Closed
-                && remaining_owned_resource_count == 0,
+            clean: unclean_reason.is_none(),
             canceled_count: summary.call_completion_rejected,
             tombstoned_count: summary.call_reply_rejected,
             rejected_after_drain_count: summary.send_rejected,
             failed_shards,
             remaining_owned_resource_count,
+            remaining_worker_held_resource_count,
+            remaining_pending_driver_call_count,
+            unclean_reason,
         }
     }
 
@@ -3621,9 +3786,29 @@ impl LocalSystemShutdownReport {
         &self.failed_shards
     }
 
-    /// Remaining owned runtime resources known to the terminal report.
+    /// Remaining table-owned runtime resources at terminal report time.
     pub const fn remaining_owned_resource_count(&self) -> usize {
         self.remaining_owned_resource_count
+    }
+
+    /// Remaining worker-held resources (TLS in-flight clones, live process
+    /// children) at terminal report time.
+    pub const fn remaining_worker_held_resource_count(&self) -> usize {
+        self.remaining_worker_held_resource_count
+    }
+
+    /// Remaining pending driver calls at terminal report time.
+    pub const fn remaining_pending_driver_call_count(&self) -> usize {
+        self.remaining_pending_driver_call_count
+    }
+
+    /// Typed reason this shutdown is unclean, if any.
+    ///
+    /// `None` iff [`clean`](Self::clean) is `true`. The reason is the
+    /// highest-priority condition observed at shutdown; see
+    /// [`ShutdownUncleanReason`] for the priority order.
+    pub const fn unclean_reason(&self) -> Option<ShutdownUncleanReason> {
+        self.unclean_reason
     }
 }
 
@@ -4361,6 +4546,13 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
+        // Phase 043 Rock 5: a Failed worker rejects ingress immediately
+        // even before the bounded sync_channel has observed Disconnected,
+        // so callers cannot enqueue work into a quarantined shard.
+        if self.metrics.state() == LiveShardState::Failed {
+            self.metrics.ingress.rejected_closed();
+            return Err(ThreadedTrySendError::WorkerStopped);
+        }
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let _ = runtime.try_send(address, message);
         }));
@@ -4609,7 +4801,7 @@ where
     runtime.set_trace_retention(config.trace_retention);
 
     loop {
-        metrics.set_owned_resource_count(runtime.owned_resource_count());
+        metrics.set_resource_counts(runtime.resource_report());
         match receiver.try_recv() {
             Ok(ThreadedCommand::Run(command)) => {
                 command(&mut runtime);
@@ -4639,10 +4831,11 @@ where
         }
     }
 
+    let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;
     runtime
-        .cancel_in_flight_calls_for_shutdown()
+        .cancel_in_flight_calls_for_shutdown(shutdown_deadline)
         .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
-    metrics.set_owned_resource_count(runtime.owned_resource_count());
+    metrics.set_resource_counts(runtime.resource_report());
     Ok(runtime.trace().to_vec())
 }
 
@@ -4866,6 +5059,16 @@ where
                 address.shard().get()
             );
         };
+        // Phase 043 Rock 5: reject ingress to a quarantined shard
+        // immediately, before the bounded sync_channel has observed
+        // Disconnected. Cross-shard senders should not race with the
+        // worker's natural exit window.
+        if let Some(metrics) = self.shard_metrics.get(&address.shard()) {
+            if metrics.state() == LiveShardState::Failed {
+                metrics.ingress.rejected_closed();
+                return Err(ThreadedTrySendError::WorkerStopped);
+            }
+        }
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let _ = runtime.try_send(address, message);
         }));
@@ -5046,7 +5249,7 @@ where
 {
     let source_shard = runtime.shard().id();
     loop {
-        shard_metrics.set_owned_resource_count(runtime.owned_resource_count());
+        shard_metrics.set_resource_counts(runtime.resource_report());
         let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
             let target_shard = envelope.target_shard();
             let Some(sender) = remote_senders.get(&(source_shard, target_shard)) else {
@@ -5111,10 +5314,11 @@ where
         }
     }
 
+    let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;
     runtime
-        .cancel_in_flight_calls_for_shutdown()
+        .cancel_in_flight_calls_for_shutdown(shutdown_deadline)
         .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
-    shard_metrics.set_owned_resource_count(runtime.owned_resource_count());
+    shard_metrics.set_resource_counts(runtime.resource_report());
     Ok(runtime.trace().to_vec())
 }
 

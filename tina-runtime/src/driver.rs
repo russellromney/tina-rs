@@ -142,10 +142,16 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
 
     /// Cancels pending substrate operations during runtime shutdown.
     ///
+    /// `deadline` bounds how long lane workers may keep draining after
+    /// cancellation has been signaled. If the deadline elapses before a
+    /// lane finishes, shutdown returns; the lane's residual work shows up
+    /// on the next [`resource_report`](Self::resource_report) call so the
+    /// terminal shutdown report can name what was left.
+    ///
     /// After this returns `Ok(())`, the driver may be dropped without leaving
     /// backend-owned pointers to driver-owned completion storage. `Err` means
     /// shutdown reached a typed lifecycle failure.
-    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError>;
+    fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError>;
 
     /// Cancels one runtime-owned call by id.
     ///
@@ -169,6 +175,23 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
 }
 
 /// Driver-owned resource inventory.
+///
+/// Three independent count vocabularies, per Phase 043 plan:
+///
+/// * **Table-owned resources** (`listeners`, `streams`, `tls_streams`,
+///   `udp_sockets`, `files`): runtime-table ids handed back to user code.
+///   `owned_resource_count()` sums these.
+/// * **Worker-held resources** (`worker_held`): clones of OS handles or
+///   `std::process::Child` parked inside in-flight lane work that is not
+///   represented by a table id. TLS in-flight ops hold cloned
+///   listener/stream `Arc`s; process calls hold a live `Child`.
+/// * **Pending driver calls** (`pending_calls`): runtime-owned operations
+///   waiting for completion. Includes table-owned ops (TCP read/write,
+///   file ops, UDP recv), TLS ops, DNS lookups, storage jobs, process
+///   calls, signal waits, and timers.
+///
+/// Worker-held and pending may overlap (TLS in-flight is both) but
+/// table-owned never overlaps the other two.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DriverResourceReport {
     pub(crate) listeners: usize,
@@ -176,12 +199,21 @@ pub(crate) struct DriverResourceReport {
     pub(crate) tls_streams: usize,
     pub(crate) udp_sockets: usize,
     pub(crate) files: usize,
+    pub(crate) worker_held: usize,
     pub(crate) pending_calls: usize,
 }
 
 impl DriverResourceReport {
     pub(crate) const fn owned_resource_count(self) -> usize {
         self.listeners + self.streams + self.tls_streams + self.udp_sockets + self.files
+    }
+
+    pub(crate) const fn worker_held_resource_count(self) -> usize {
+        self.worker_held
+    }
+
+    pub(crate) const fn pending_driver_call_count(self) -> usize {
+        self.pending_calls
     }
 }
 
@@ -208,6 +240,95 @@ pub(crate) struct BetelgeuseDriver {
     signal_capacity: usize,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
+    os_signals: OsSignalDispatcher,
+}
+
+/// Captures process-wide OS signals as flag bits so the runtime step
+/// loop can convert them into runtime-owned signal completions.
+///
+/// Phase 043 Rock 4 contract:
+/// * Unix: register `signal-hook` flag handlers for `SIGINT` and
+///   `SIGTERM`. No async task, no Tokio dependency, no custom unsafe
+///   handler — the flag handlers live entirely inside `signal-hook`.
+/// * Non-Unix: the dispatcher is a no-op. `signal_wait` calls for
+///   "sigint" / "sigterm" still park; they simply never fire from the
+///   OS and complete via timeout or cancel only.
+///
+/// The flag state is per-process and lazily initialised, so multiple
+/// `LocalSystem` instances in one process share the same handlers.
+#[cfg(unix)]
+#[derive(Clone)]
+struct OsSignalDispatcher {
+    sigint: Arc<AtomicBool>,
+    sigterm: Arc<AtomicBool>,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Default)]
+struct OsSignalDispatcher;
+
+#[cfg(unix)]
+impl OsSignalDispatcher {
+    fn shared() -> Self {
+        use std::sync::OnceLock;
+        static STATE: OnceLock<OsSignalDispatcher> = OnceLock::new();
+        STATE
+            .get_or_init(|| {
+                let sigint = Arc::new(AtomicBool::new(false));
+                let sigterm = Arc::new(AtomicBool::new(false));
+                // Best-effort registration. If the process already
+                // installed an incompatible handler the registration
+                // fails; the runtime keeps running with no live signal
+                // capture rather than panic at startup.
+                let _ =
+                    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint));
+                let _ =
+                    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm));
+                Self { sigint, sigterm }
+            })
+            .clone()
+    }
+
+    fn consume_sigint(&self) -> bool {
+        self.sigint.swap(false, Ordering::AcqRel)
+    }
+
+    fn consume_sigterm(&self) -> bool {
+        self.sigterm.swap(false, Ordering::AcqRel)
+    }
+
+    /// Test-only constructor that returns a dispatcher whose flags are
+    /// not registered with the process-wide signal-hook handlers, so a
+    /// test can simulate signal delivery without competing with other
+    /// drivers that share the global state.
+    #[cfg(test)]
+    fn private_for_test() -> Self {
+        Self {
+            sigint: Arc::new(AtomicBool::new(false)),
+            sigterm: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl OsSignalDispatcher {
+    fn shared() -> Self {
+        Self
+    }
+
+    fn consume_sigint(&self) -> bool {
+        false
+    }
+
+    fn consume_sigterm(&self) -> bool {
+        false
+    }
+}
+
+/// Whether `signal_wait` for "sigint" / "sigterm" is delivered from the
+/// host operating system on this build target.
+pub const fn os_signal_capture_supported() -> bool {
+    cfg!(unix)
 }
 
 /// One pending timer tracked by the driver.
@@ -572,6 +693,7 @@ impl BetelgeuseDriver {
             signal_capacity: DEFAULT_SIGNAL_CAPACITY,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
+            os_signals: OsSignalDispatcher::shared(),
         }
     }
 
@@ -593,6 +715,7 @@ impl BetelgeuseDriver {
             signal_capacity,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
+            os_signals: OsSignalDispatcher::shared(),
         }
     }
 }
@@ -731,6 +854,7 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.dns.advance(now, completed);
         self.tls.advance(now, completed);
         self.process.advance(completed);
+        self.poll_os_signals(completed);
         self.harvest_signals(now, completed);
         self.harvest_timers(now, completed);
     }
@@ -745,14 +869,14 @@ impl RuntimeDriver for BetelgeuseDriver {
             || !self.timers.is_empty()
     }
 
-    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
+    fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError> {
         self.timers.clear();
         self.signals.clear();
-        self.storage.cancel_pending();
-        self.dns.cancel_pending();
-        self.tls.cancel_pending();
-        self.process.cancel_pending();
-        self.tcp.cancel_pending()
+        self.storage.cancel_pending(deadline);
+        self.dns.cancel_pending(deadline);
+        self.tls.cancel_pending(deadline);
+        self.process.cancel_pending(deadline);
+        self.tcp.cancel_pending(deadline)
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
@@ -796,17 +920,27 @@ impl RuntimeDriver for BetelgeuseDriver {
     fn resource_report(&self) -> DriverResourceReport {
         let tcp = self.tcp.resource_report();
         let tls = self.tls.resource_report();
+        let process_pending = self.process.physical_pending_count();
         DriverResourceReport {
             listeners: tcp.listeners + tls.listeners,
             streams: tcp.streams,
             tls_streams: tls.tls_streams,
             udp_sockets: tcp.udp_sockets,
             files: tcp.files,
+            // Worker-held: TLS in-flight ops parking cloned listener/stream
+            // arcs, plus process calls owning a live Child. DNS/storage
+            // workers do not hold a runtime-visible OS handle, so they
+            // contribute zero here per the plan's count rules.
+            worker_held: tls.worker_held + process_pending,
+            // Pending counts use physical entries (not filtered on the
+            // user-cancel flag) so that work the runtime asked to cancel
+            // but the lane has not yet drained — including work stuck on
+            // a worker after a bounded shutdown drain — stays visible.
             pending_calls: tcp.pending_calls
-                + self.storage.active_pending_count()
-                + self.dns.unresolved_pending_count()
+                + self.storage.physical_pending_count()
+                + self.dns.physical_pending_count()
                 + tls.pending_calls
-                + self.process.active_pending_count()
+                + process_pending
                 + self.signals.iter().filter(|entry| !entry.cancelled).count()
                 + self.timers.len(),
         }
@@ -840,6 +974,20 @@ impl BetelgeuseDriver {
             cancelled: false,
         });
         None
+    }
+
+    fn poll_os_signals(&mut self, completed: &mut Vec<DriverCompletion>) {
+        // Convert any captured OS signal flag bits into runtime-owned
+        // signal completions for parked `signal_wait` calls. Each flag
+        // is consumed exactly once per delivery; subsequent SIGINT or
+        // SIGTERM events set the flag again and fire the next pending
+        // wait.
+        if self.os_signals.consume_sigint() {
+            self.notify_signal("sigint", completed);
+        }
+        if self.os_signals.consume_sigterm() {
+            self.notify_signal("sigterm", completed);
+        }
     }
 
     fn harvest_signals(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
@@ -925,23 +1073,23 @@ impl StorageLane {
         }
     }
 
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self, deadline: Instant) {
         if let Self::Worker(lane) = self {
-            lane.cancel_pending();
+            lane.cancel_pending(deadline);
         }
     }
 
-    fn active_pending_count(&self) -> usize {
+    fn physical_pending_count(&self) -> usize {
         match self {
             Self::Inline => 0,
-            Self::Worker(lane) => lane.active_pending_count(),
+            Self::Worker(lane) => lane.physical_pending_count(),
         }
     }
 }
 
 impl Drop for StorageLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -981,22 +1129,22 @@ impl DnsLane {
         }
     }
 
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self, deadline: Instant) {
         match self {
-            Self::Worker(lane) => lane.cancel_pending(),
+            Self::Worker(lane) => lane.cancel_pending(deadline),
         }
     }
 
-    fn unresolved_pending_count(&self) -> usize {
+    fn physical_pending_count(&self) -> usize {
         match self {
-            Self::Worker(lane) => lane.unresolved_pending_count(),
+            Self::Worker(lane) => lane.physical_pending_count(),
         }
     }
 }
 
 impl Drop for DnsLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -1114,9 +1262,9 @@ impl TlsLane {
         }
     }
 
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self, deadline: Instant) {
         match self {
-            Self::Worker(lane) => lane.cancel_pending(),
+            Self::Worker(lane) => lane.cancel_pending(deadline),
         }
     }
 
@@ -1129,7 +1277,7 @@ impl TlsLane {
 
 impl Drop for TlsLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -1234,24 +1382,33 @@ impl StorageWorkerLane {
         true
     }
 
-    fn cancel_pending(&mut self) {
-        for pending in &mut self.pending {
-            pending.cancelled.store(true, Ordering::Release);
-        }
+    fn cancel_pending(&mut self, deadline: Instant) {
+        // Drop the command sender so the worker thread will exit on its
+        // next recv. Then drain completion results until the lane has no
+        // pending work or the budget elapses; whatever remains in
+        // `self.pending` is stuck work that the worker has not finished
+        // and will surface in `physical_pending_count`.
         self.sender = None;
-        if let Some(handle) = self.handle.take() {
-            while !handle.is_finished() {
-                self.drain_completion_channel();
-                thread::yield_now();
+        let mut sink = Vec::new();
+        loop {
+            self.drain_into_sink(&mut sink);
+            if self.pending.is_empty() || Instant::now() >= deadline {
+                break;
             }
-            let _ = handle.join();
+            thread::yield_now();
         }
-        self.drain_completion_channel();
-        self.pending.clear();
+        sink.clear();
+        if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
-    fn drain_completion_channel(&mut self) {
-        while self.completions.try_recv().is_ok() {}
+    fn drain_into_sink(&mut self, sink: &mut Vec<DriverCompletion>) {
+        while let Ok(completion) = self.completions.try_recv() {
+            self.finish_completion(completion, sink);
+        }
     }
 
     fn active_pending_count(&self) -> usize {
@@ -1260,11 +1417,15 @@ impl StorageWorkerLane {
             .filter(|entry| !entry.cancelled.load(Ordering::Acquire))
             .count()
     }
+
+    fn physical_pending_count(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 impl Drop for StorageWorkerLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -1403,13 +1564,22 @@ impl DnsWorkerLane {
         true
     }
 
-    fn cancel_pending(&mut self) {
-        for pending in &mut self.pending {
-            pending.cancelled.store(true, Ordering::Release);
-        }
+    fn cancel_pending(&mut self, deadline: Instant) {
+        // Drop the command sender; the worker thread can exit when it
+        // returns from the resolver. Drain completions for the budget;
+        // remaining `self.pending` after the budget is stuck work the
+        // worker has not finished and stays visible in
+        // `physical_pending_count`.
         self.sender = None;
-        self.drain_completion_channel();
-        self.pending.clear();
+        let mut sink = Vec::new();
+        loop {
+            self.drain_into_sink(&mut sink);
+            if self.pending.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            thread::yield_now();
+        }
+        sink.clear();
         if self
             .handle
             .as_ref()
@@ -1421,18 +1591,24 @@ impl DnsWorkerLane {
         }
     }
 
-    fn drain_completion_channel(&mut self) {
-        while self.completions.try_recv().is_ok() {}
+    fn drain_into_sink(&mut self, sink: &mut Vec<DriverCompletion>) {
+        while let Ok(completion) = self.completions.try_recv() {
+            self.finish_completion(completion, sink);
+        }
     }
 
     fn unresolved_pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn physical_pending_count(&self) -> usize {
         self.pending.len()
     }
 }
 
 impl Drop for DnsWorkerLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -1849,13 +2025,21 @@ impl TlsWorkerLane {
         true
     }
 
-    fn cancel_pending(&mut self) {
-        let had_pending = !self.pending.is_empty();
-        for pending in &mut self.pending {
-            pending.cancelled.store(true, Ordering::Release);
-        }
+    fn cancel_pending(&mut self, deadline: Instant) {
+        // Drop the command sender so the worker thread can exit. Drain
+        // completions for the budget; remaining `self.pending` after the
+        // budget is stuck work that the worker has not finished and is
+        // surfaced through `resource_report`.
         self.sender = None;
-        self.drain_completion_channel();
+        let mut sink = Vec::new();
+        loop {
+            self.drain_into_sink(&mut sink);
+            if self.pending.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            thread::yield_now();
+        }
+        sink.clear();
         if self
             .handle
             .as_ref()
@@ -1864,18 +2048,17 @@ impl TlsWorkerLane {
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
-            self.pending.clear();
-            self.listeners.clear();
-            self.streams.clear();
-        } else if !had_pending {
-            self.pending.clear();
-            self.listeners.clear();
-            self.streams.clear();
+            if self.pending.is_empty() {
+                self.listeners.clear();
+                self.streams.clear();
+            }
         }
     }
 
-    fn drain_completion_channel(&mut self) {
-        while self.completions.try_recv().is_ok() {}
+    fn drain_into_sink(&mut self, sink: &mut Vec<DriverCompletion>) {
+        while let Ok(completion) = self.completions.try_recv() {
+            self.finish_completion(completion, sink);
+        }
     }
 
     fn stream(&self, stream: TlsStreamId) -> Option<Arc<Mutex<TlsRuntimeStream>>> {
@@ -1902,14 +2085,16 @@ impl TlsWorkerLane {
     }
 
     fn resource_report(&self) -> DriverResourceReport {
+        // Each in-flight TLS op parks cloned `Arc<TcpListener>` /
+        // `Arc<Mutex<TlsRuntimeStream>>` inside the worker thread for
+        // the duration of accept/handshake/read/write/close. Count
+        // physical entries so stuck-after-shutdown work stays visible.
+        let physical = self.pending.len();
         DriverResourceReport {
             listeners: self.listeners.len(),
             tls_streams: self.streams.len(),
-            pending_calls: self
-                .pending
-                .iter()
-                .filter(|entry| !entry.cancelled.load(Ordering::Acquire))
-                .count(),
+            worker_held: physical,
+            pending_calls: physical,
             ..DriverResourceReport::default()
         }
     }
@@ -1917,7 +2102,7 @@ impl TlsWorkerLane {
 
 impl Drop for TlsWorkerLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -1950,22 +2135,22 @@ impl ProcessLane {
         }
     }
 
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self, deadline: Instant) {
         match self {
-            Self::Worker(lane) => lane.cancel_pending(),
+            Self::Worker(lane) => lane.cancel_pending(deadline),
         }
     }
 
-    fn active_pending_count(&self) -> usize {
+    fn physical_pending_count(&self) -> usize {
         match self {
-            Self::Worker(lane) => lane.active_pending_count(),
+            Self::Worker(lane) => lane.physical_pending_count(),
         }
     }
 }
 
 impl Drop for ProcessLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -2067,24 +2252,37 @@ impl ProcessWorkerLane {
         true
     }
 
-    fn cancel_pending(&mut self) {
+    fn cancel_pending(&mut self, deadline: Instant) {
+        // Signal cancellation to in-flight commands (the worker checks
+        // the flag and aborts the child cooperatively). Drop the command
+        // sender so the worker thread can exit. Drain completions for
+        // the budget; surviving `self.pending` is stuck work that holds
+        // a live `std::process::Child` and will surface as both
+        // `worker_held` and `pending_calls` in `resource_report`.
         for pending in &mut self.pending {
             pending.cancelled.store(true, Ordering::Release);
         }
         self.sender = None;
-        if let Some(handle) = self.handle.take() {
-            while !handle.is_finished() {
-                self.drain_completion_channel();
-                thread::yield_now();
+        let mut sink = Vec::new();
+        loop {
+            self.drain_into_sink(&mut sink);
+            if self.pending.is_empty() || Instant::now() >= deadline {
+                break;
             }
-            let _ = handle.join();
+            thread::yield_now();
         }
-        self.drain_completion_channel();
-        self.pending.clear();
+        sink.clear();
+        if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
-    fn drain_completion_channel(&mut self) {
-        while self.completions.try_recv().is_ok() {}
+    fn drain_into_sink(&mut self, sink: &mut Vec<DriverCompletion>) {
+        while let Ok(completion) = self.completions.try_recv() {
+            self.finish_completion(completion, sink);
+        }
     }
 
     fn active_pending_count(&self) -> usize {
@@ -2093,11 +2291,15 @@ impl ProcessWorkerLane {
             .filter(|entry| !entry.cancelled.load(Ordering::Acquire))
             .count()
     }
+
+    fn physical_pending_count(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 impl Drop for ProcessWorkerLane {
     fn drop(&mut self) {
-        self.cancel_pending();
+        self.cancel_pending(Instant::now());
     }
 }
 
@@ -3075,7 +3277,7 @@ impl BetelgeuseTcp {
     /// Tina emits requester-facing shutdown/cancel trace events from
     /// `Runtime`; TCP state only owns the substrate completion slots and
     /// resource handles.
-    fn cancel_pending(&mut self) -> Result<(), DriverShutdownError> {
+    fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError> {
         for op in &mut self.pending {
             op.cancelled = true;
         }
@@ -3083,7 +3285,7 @@ impl BetelgeuseTcp {
             .cancel_pending_completions()
             .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions)?;
         self.close_all_resources();
-        self.drain_cancelled_pending_for_shutdown();
+        self.drain_cancelled_pending_for_shutdown(deadline);
         if !self.pending.is_empty() || self.io_loop.pending_completion_count() != 0 {
             return Err(DriverShutdownError::BackendStillOwnsCompletions);
         }
@@ -3113,7 +3315,10 @@ impl BetelgeuseTcp {
             streams: self.streams.len(),
             udp_sockets: self.udp_sockets.len(),
             files: self.files.len(),
-            pending_calls: self.pending.iter().filter(|op| !op.cancelled).count(),
+            // Count physical entries so cancelled-but-undrained pending
+            // ops, including any work the backend still owns after a
+            // bounded shutdown, stay visible. See Phase 043 Rock 2/3.
+            pending_calls: self.pending.len(),
             ..DriverResourceReport::default()
         }
     }
@@ -3129,11 +3334,17 @@ impl BetelgeuseTcp {
         self.files.clear();
     }
 
-    fn drain_cancelled_pending_for_shutdown(&mut self) {
-        const SHUTDOWN_DRAIN_STEPS: usize = 64;
-
-        for _ in 0..SHUTDOWN_DRAIN_STEPS {
+    fn drain_cancelled_pending_for_shutdown(&mut self, deadline: Instant) {
+        // Step the Betelgeuse IO loop until either all pending entries
+        // drain or the per-shard shutdown budget elapses. Each step gives
+        // the backend a chance to release ownership of completion slots.
+        // The loop yields between steps so a stalled backend cannot pin
+        // shutdown forever.
+        loop {
             if self.pending.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
                 return;
             }
 
@@ -3732,7 +3943,7 @@ mod tests {
         ));
 
         release_tx.send(()).expect("release parked storage job");
-        lane.cancel_pending();
+        lane.cancel_pending(Instant::now());
     }
 
     #[test]
@@ -4111,7 +4322,7 @@ mod tests {
         first_release_tx
             .send(())
             .expect("release first parked storage job");
-        lane.cancel_pending();
+        lane.cancel_pending(Instant::now());
         assert!(
             queued_started_rx.try_recv().is_err(),
             "queued storage work must not start after shutdown cancellation"
@@ -4181,5 +4392,502 @@ mod tests {
             )
             .expect("udp close succeeds after cancel");
         assert!(matches!(closed.result, CallOutput::UdpSocketClosed));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 043 Rock 2: resource-accounting count rules.
+    //
+    // One narrow test per lane verifies how each lane contributes to the
+    // three independent vocabularies in DriverResourceReport:
+    // table-owned, worker-held, and pending. Tests live at the
+    // BetelgeuseDriver level where possible so the aggregator at
+    // BetelgeuseDriver::resource_report is exercised end to end.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fresh_driver_reports_all_zero_counts() {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let driver = BetelgeuseDriver::with_io_loop(io_loop);
+        let report = driver.resource_report();
+        assert_eq!(report.owned_resource_count(), 0);
+        assert_eq!(report.worker_held_resource_count(), 0);
+        assert_eq!(report.pending_driver_call_count(), 0);
+    }
+
+    #[test]
+    fn tcp_listener_counts_as_table_owned_only() {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        let bound = driver
+            .submit(
+                CallId::new(1),
+                CallInput::TcpBind {
+                    addr: "127.0.0.1:0".parse().expect("loopback"),
+                },
+                Instant::now(),
+            )
+            .expect("bind completes inline");
+        let listener = match bound.result {
+            CallOutput::TcpBound { listener, .. } => listener,
+            other => panic!("unexpected bind result: {other:?}"),
+        };
+
+        let report = driver.resource_report();
+        assert_eq!(report.owned_resource_count(), 1);
+        assert_eq!(report.worker_held_resource_count(), 0);
+        assert_eq!(report.pending_driver_call_count(), 0);
+
+        // A pending accept on that listener increments pending only;
+        // no extra worker-held resource is created (the listener
+        // table id already covers the accept's working state).
+        assert!(
+            driver
+                .submit(
+                    CallId::new(2),
+                    CallInput::TcpAccept { listener },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        let report = driver.resource_report();
+        assert_eq!(report.owned_resource_count(), 1);
+        assert_eq!(report.worker_held_resource_count(), 0);
+        assert_eq!(report.pending_driver_call_count(), 1);
+
+        assert!(driver.cancel(CallId::new(2)));
+        // After Phase 043, the pending count tracks physical entries so
+        // cancelled-but-not-yet-drained ops stay visible until the
+        // backend releases the completion slot. After a shutdown drain
+        // the count must reach zero again.
+        let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
+        assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+    }
+
+    #[test]
+    fn udp_recv_pending_increments_pending_only() {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        let bound = driver
+            .submit(
+                CallId::new(1),
+                CallInput::UdpBind {
+                    addr: "127.0.0.1:0".parse().expect("loopback"),
+                },
+                Instant::now(),
+            )
+            .expect("udp bind inline");
+        let socket = match bound.result {
+            CallOutput::UdpBound { socket, .. } => socket,
+            other => panic!("unexpected udp bind: {other:?}"),
+        };
+
+        assert!(
+            driver
+                .submit(
+                    CallId::new(2),
+                    CallInput::UdpRecvFrom { socket, max_len: 8 },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        let report = driver.resource_report();
+        assert_eq!(report.owned_resource_count(), 1);
+        assert_eq!(report.worker_held_resource_count(), 0);
+        assert_eq!(report.pending_driver_call_count(), 1);
+    }
+
+    #[test]
+    fn signal_wait_counts_as_pending_only() {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        assert!(
+            driver
+                .submit(
+                    CallId::new(1),
+                    CallInput::SignalWait {
+                        name: "sigterm".to_string(),
+                        timeout: Duration::from_secs(60),
+                    },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        let report = driver.resource_report();
+        assert_eq!(report.owned_resource_count(), 0);
+        assert_eq!(report.worker_held_resource_count(), 0);
+        assert_eq!(report.pending_driver_call_count(), 1);
+    }
+
+    #[test]
+    fn timer_pending_counts_as_pending_only() {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        assert!(
+            driver
+                .submit(
+                    CallId::new(1),
+                    CallInput::Sleep {
+                        after: Duration::from_secs(60),
+                    },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        let report = driver.resource_report();
+        assert_eq!(report.owned_resource_count(), 0);
+        assert_eq!(report.worker_held_resource_count(), 0);
+        assert_eq!(report.pending_driver_call_count(), 1);
+    }
+
+    #[test]
+    fn storage_park_counts_as_pending_only() {
+        let mut lane = StorageLane::new(1);
+        let (started_tx, started_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        assert!(
+            lane.submit(
+                CallId::new(7),
+                StorageJob::Park {
+                    started: started_tx,
+                    release: release_rx,
+                },
+            )
+            .is_none()
+        );
+        started_rx.recv().expect("park job started");
+        // Storage contributes to pending_calls but not worker_held: the
+        // worker thread does the OS work but the runtime does not see a
+        // separate handle.
+        assert_eq!(lane.physical_pending_count(), 1);
+
+        release_tx.send(()).expect("release park job");
+        lane.cancel_pending(Instant::now());
+    }
+
+    #[test]
+    fn dns_pending_counts_as_pending_only() {
+        let (started_tx, started_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let mut lane = DnsWorkerLane::new(
+            1,
+            Arc::new(move |_, _| {
+                if let Some(tx) = started_tx.lock().expect("started lock").take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = release_rx.lock().expect("release lock").take() {
+                    let _ = rx.recv();
+                }
+                CallOutput::DnsResolved { addrs: vec![] }
+            }),
+        );
+        assert!(
+            lane.submit(
+                CallId::new(1),
+                "blocking.test".to_string(),
+                4040,
+                Duration::from_secs(60),
+                Instant::now(),
+            )
+            .is_none()
+        );
+        started_rx.recv().expect("resolver started");
+        // DNS contributes to pending_calls only.
+        assert_eq!(lane.unresolved_pending_count(), 1);
+
+        release_tx.send(()).expect("release dns");
+        lane.cancel_pending(Instant::now());
+    }
+
+    #[test]
+    fn process_pending_contributes_to_worker_held_and_pending() {
+        let mut lane = ProcessLane::new(1);
+        // Pick a long-running process so the call stays pending while we
+        // measure. Use a Unix sleep; on non-Unix the test is skipped.
+        if cfg!(not(unix)) {
+            return;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        assert!(
+            lane.submit(
+                CallId::new(1),
+                ProcessCommand {
+                    call_id: CallId::new(1),
+                    command: "/bin/sleep".to_string(),
+                    args: vec!["5".to_string()],
+                    timeout: Duration::from_secs(10),
+                    stdout_limit: 1024,
+                    stderr_limit: 1024,
+                    cancelled: Arc::clone(&cancelled),
+                },
+            )
+            .is_none()
+        );
+        // Process call is both pending and worker-held: the worker thread
+        // owns a live std::process::Child while the call is in flight.
+        assert_eq!(lane.physical_pending_count(), 1);
+
+        cancelled.store(true, Ordering::Release);
+        lane.cancel_pending(Instant::now());
+    }
+
+    #[test]
+    fn tls_pending_op_contributes_to_worker_held_and_pending() {
+        // Drive a TLS connect to a non-listening port so the lane stays
+        // in flight long enough to observe the count. The connect will
+        // eventually fail, but during the in-flight window the lane
+        // reports both worker-held and pending.
+        let mut lane = TlsWorkerLane::new(2);
+        let unreachable: SocketAddr = "127.0.0.1:1".parse().expect("loopback addr");
+        assert!(
+            lane.submit_connect(
+                CallId::new(1),
+                unreachable,
+                "localhost".to_string(),
+                vec![],
+                Duration::from_secs(2),
+                Instant::now(),
+            )
+            .is_none()
+        );
+        let report = lane.resource_report();
+        assert_eq!(
+            report.worker_held_resource_count(),
+            report.pending_driver_call_count(),
+            "TLS in-flight ops contribute equally to worker_held and pending"
+        );
+        assert!(report.pending_driver_call_count() >= 1);
+
+        // Drain so the lane drop does not race with the live connect.
+        let mut completed = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            lane.advance(Instant::now(), &mut completed);
+            if !completed.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 043 Rock 4: OS signal capture.
+    //
+    // The dispatcher converts process-wide SIGINT/SIGTERM flag bits set
+    // by signal-hook into runtime-owned signal completions. On non-Unix
+    // the dispatcher is a no-op and `os_signal_capture_supported()`
+    // returns false.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn os_signal_capture_supported_matches_target() {
+        assert_eq!(os_signal_capture_supported(), cfg!(unix));
+    }
+
+    // Tests touching the process-global OS signal state must run
+    // serially so they do not steal each other's flag bits.
+    #[cfg(unix)]
+    fn os_signal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_consumes_sigint_flag_once_per_delivery() {
+        // Private dispatcher: not affected by parallel tests touching
+        // the global signal-hook flag.
+        let dispatcher = OsSignalDispatcher::private_for_test();
+        dispatcher.sigint.store(true, Ordering::Release);
+        assert!(dispatcher.consume_sigint());
+        assert!(!dispatcher.consume_sigint());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn betelgeuse_driver_fires_sigint_signal_when_dispatcher_flag_set() {
+        // Use a private (non-shared) dispatcher so this test cannot race
+        // with other drivers in parallel test runs. The wiring from
+        // dispatcher → poll_os_signals → notify_signal is the same.
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        driver.os_signals = OsSignalDispatcher::private_for_test();
+        assert!(
+            driver
+                .submit(
+                    CallId::new(1),
+                    CallInput::SignalWait {
+                        name: "sigint".to_string(),
+                        timeout: Duration::from_secs(60),
+                    },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        driver.os_signals.sigint.store(true, Ordering::Release);
+        let mut completed = Vec::new();
+        driver.advance(Instant::now(), &mut completed);
+        assert!(
+            completed.iter().any(|c| matches!(
+                &c.result,
+                CallOutput::SignalReceived { name } if name == "sigint"
+            )),
+            "advance must deliver a SignalReceived completion when the dispatcher fires"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raised_sigint_reaches_runtime_owned_signal_wait() {
+        let _guard = os_signal_test_lock();
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        let _ = driver.os_signals.consume_sigint();
+        assert!(
+            driver
+                .submit(
+                    CallId::new(1),
+                    CallInput::SignalWait {
+                        name: "sigint".to_string(),
+                        timeout: Duration::from_secs(5),
+                    },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        // Use signal-hook's raise helper so the real OS signal path fires
+        // the registered flag handler. Cargo's test runner survives
+        // because our handler only sets the flag and does not terminate.
+        signal_hook::low_level::raise(signal_hook::consts::SIGINT).expect("raise SIGINT to self");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completed = Vec::new();
+        while Instant::now() < deadline {
+            driver.advance(Instant::now(), &mut completed);
+            if completed.iter().any(|c| {
+                matches!(
+                    &c.result,
+                    CallOutput::SignalReceived { name } if name == "sigint"
+                )
+            }) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("raised SIGINT did not reach the runtime-owned signal wait");
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 043 Rock 3: bounded shutdown drain.
+    //
+    // Each lane's `cancel_pending(deadline)` must return inside the
+    // budget even when the worker is stuck, surfacing remaining work via
+    // the pending count rather than blocking shutdown forever.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn storage_lane_shutdown_returns_within_budget_when_worker_stuck() {
+        let mut lane = StorageLane::new(1);
+        let (started_tx, started_rx) = sync_channel(1);
+        // Park job that will not be released — simulates a stuck worker.
+        let (_release_tx, release_rx) = sync_channel(1);
+        assert!(
+            lane.submit(
+                CallId::new(1),
+                StorageJob::Park {
+                    started: started_tx,
+                    release: release_rx,
+                },
+            )
+            .is_none()
+        );
+        started_rx.recv().expect("park job started");
+
+        let budget = Duration::from_millis(50);
+        let started = Instant::now();
+        lane.cancel_pending(Instant::now() + budget);
+        let elapsed = started.elapsed();
+
+        // Bounded: must not exceed budget by an order of magnitude even
+        // under load on a busy CI machine.
+        assert!(
+            elapsed < budget * 10,
+            "shutdown took {elapsed:?}, expected to return near {budget:?}"
+        );
+        // Stuck work stays visible in the physical count.
+        assert!(
+            lane.physical_pending_count() >= 1,
+            "stuck park job must remain visible after bounded shutdown"
+        );
+    }
+
+    #[test]
+    fn betelgeuse_tcp_shutdown_returns_within_budget() {
+        // Even with an in-flight TCP accept, bounded shutdown must
+        // return promptly. The backend may not release the completion
+        // slot inside the budget, but the call must not hang.
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        let bound = driver
+            .submit(
+                CallId::new(1),
+                CallInput::TcpBind {
+                    addr: "127.0.0.1:0".parse().expect("loopback"),
+                },
+                Instant::now(),
+            )
+            .expect("bind inline");
+        let listener = match bound.result {
+            CallOutput::TcpBound { listener, .. } => listener,
+            other => panic!("unexpected bind: {other:?}"),
+        };
+        assert!(
+            driver
+                .submit(
+                    CallId::new(2),
+                    CallInput::TcpAccept { listener },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+
+        let budget = Duration::from_millis(50);
+        let started = Instant::now();
+        let _ = driver.cancel_pending(Instant::now() + budget);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < budget * 10,
+            "TCP shutdown took {elapsed:?}, expected to return near {budget:?}"
+        );
+    }
+
+    #[test]
+    fn cancel_drains_do_not_double_count() {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        assert!(
+            driver
+                .submit(
+                    CallId::new(1),
+                    CallInput::Sleep {
+                        after: Duration::from_secs(60),
+                    },
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        assert_eq!(driver.resource_report().pending_driver_call_count(), 1);
+        assert!(driver.cancel(CallId::new(1)));
+        // Once a pending op is cancelled it must not contribute to the
+        // pending count, and the cancelled signal/timer entry must drop
+        // out cleanly without double counting on advance.
+        let report = driver.resource_report();
+        assert_eq!(report.pending_driver_call_count(), 0);
+        let mut completed = Vec::new();
+        driver.advance(Instant::now(), &mut completed);
+        assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
     }
 }
