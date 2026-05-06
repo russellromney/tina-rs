@@ -28,6 +28,19 @@ At closeout:
 - No `flow!` syntax or macro project.
 - No hidden fallback queues.
 
+## What Will Not Change
+
+- Isolate handlers stay synchronous and return effects.
+- Mailboxes stay bounded and surface `Full`/`Closed`; no hidden overflow queue.
+- Existing direct construction paths remain supported: `LocalSystem`,
+  `LocalMultiShardSystem`, and low-level `ThreadedRuntime`/current runtime.
+- Runtime capability truth does not absorb Tokio bridge semantics.
+- Isolate code does not gain async handlers, raw backend handles, or Tokio
+  tasks.
+- Cancellation does not become a preemption claim for already-started blocking
+  OS work.
+- `SYSTEM.md` is updated only after direct proof lands.
+
 ## Rules
 
 - Build missing runtime surface. Do not stop at audits.
@@ -99,6 +112,10 @@ At closeout:
    Required outcome: public/user-facing behavior for each rail is predictable
    enough that Baobab can test it from the outside.
 
+   Closure rule: changed rails need direct proof. Unchanged rails can close by
+   existing proof plus blast-radius proof. Unsupported or intentionally
+   untouched rails must be named non-claims in capability truth.
+
 4. **Resource Inventory That Users Can Trust**
    Make topology and terminal reports distinguish:
    table-owned resources, worker-held resources, pending driver calls, queued
@@ -156,6 +173,9 @@ At closeout:
    responded-late, and shutdown-retry truth where the bridge can observe them.
    Do not claim deterministic replay under Tokio.
 
+   Bridge work in 045 is adapter regression proof only. Do not let it become
+   the center of the runtime phase.
+
    Add direct public negative tests: after shard failure, `trace()` returns a
    partial snapshot naming missing shards, `complete_trace()` fails cleanly,
    and the terminal report still carries topology, resource, and error truth.
@@ -169,6 +189,11 @@ At closeout:
    roots, start listener/service isolates, wait for runtime shutdown signal,
    drain, join, and return/inspect the terminal report.
 
+   Minimum public operations: configure runtime budgets, register roots,
+   start/run, request or observe shutdown, drain/join, and return a terminal
+   report. Names should follow the existing code style; the operations must be
+   present.
+
    This should feel like Tokio's split between `#[tokio::main]` and
    `runtime::Builder`: 045 builds an explicit public `LocalSystem`
    runner/builder path now. No attribute macro in this phase. Normal users
@@ -179,14 +204,19 @@ At closeout:
    ceremony; it may not hide overload, failure, cancellation, queueing, or
    shutdown truth.
 
+   The runner must compose existing `LocalSystem` behavior. It must not add a
+   second delivery engine, hidden worker pool, hidden queue, or special service
+   path that bypasses ordinary Tina semantics.
+
    Tests must prove the public runner path directly from outside the crate and
    assert that it returns a terminal report. The service harness and non-toy
    example must use this public path unless a test is intentionally exercising
    lower-level runtime internals.
 
    Blast-radius proof: direct `LocalSystem`, `LocalMultiShardSystem`, and
-   `ThreadedRuntime` construction must still work. Add at least one new test
-   that bypasses the runner and still exercises the old low-level path.
+   low-level `ThreadedRuntime`/current runtime construction must still work.
+   Existing bridge tests must stay green. Add at least one new test that
+   bypasses the runner and still exercises the old low-level path.
 
 9. **Non-Toy Portable Service Example**
    Build a runnable example that uses the same harness shape but reads like an
@@ -200,6 +230,10 @@ At closeout:
 
    This is not marketing polish. It is a compile/run artifact that proves the
    app/service shape is legible outside a test assertion wall.
+
+   No-async-leakage proof: the example and public-runner e2e must compile and
+   run without `tokio::spawn`, async handlers, or raw backend handles in isolate
+   code. This may be proved by targeted source checks plus compile/run proof.
 
 10. **Portable Service Harness**
    Build one reusable local service harness in
@@ -234,6 +268,10 @@ At closeout:
    Prove failure domains under service load: one shard/session fails, sibling
    shard/session keeps serving, topology names the failed domain, and partial
    trace survives.
+
+   The process rail must use a deterministic portable command or a
+   platform-gated scenario. No shell-specific or environment-specific command
+   should be required for the core CI harness.
 
 11. **DST Families For Weird Rocks**
    Add new DST families with saved seeds and deterministic replay:
@@ -276,9 +314,9 @@ At closeout:
     platform-gated expectations, not silent skips.
 
 14. **Baobab Handoff**
-    Update `CHANGELOG.md`, `ROADMAP.md`, and Phase 046 Baobab plan/review with
-    only landed truth. If 045 discovers a remaining non-claim, Baobab must
-    compare that truth, not old hope.
+    Update `SYSTEM.md`, `CHANGELOG.md`, `ROADMAP.md`, and Phase 046 Baobab
+    plan/review with only landed truth after proof. If 045 discovers a
+    remaining non-claim, Baobab must compare that truth, not old hope.
 
 ## Required Proof
 
@@ -287,10 +325,12 @@ At closeout:
 - The portable capability table is executable and current.
 - Every `missing` matrix cell needed for portable runtime completeness is fixed.
 - Every `deferred-nonclaim` cell is reflected in capability truth and Baobab.
-- Every rail has positive, negative, overload/capacity, timeout/cancel or
-  `not-applicable(reason)`, shutdown/resource, and trace proof.
+- Changed rails have direct public-path proof. Unchanged rails have existing
+  proof plus blast-radius proof. Unsupported or intentionally untouched rails
+  are named `not-applicable(reason)` or non-claims.
 - Public local service runner shape exists and is tested from the outside.
-- Direct construction without the public runner still works.
+- Direct construction without the public runner still works for `LocalSystem`,
+  `LocalMultiShardSystem`, and low-level `ThreadedRuntime`/current runtime.
 - Non-toy runnable portable service example exists and uses the same app shape.
 - The portable service harness has composed happy path plus focused scary-edge
   tests.
@@ -298,6 +338,10 @@ At closeout:
   sibling progress under failure are directly proved.
 - The target workload uses ordinary Tina effects only, with no async/raw backend
   leakage inside isolates.
+- Existing bridge tests stay green, and bridge capability truth remains
+  adapter-scoped.
+- The process rail uses deterministic portable command proof or platform-gated
+  proof.
 - New DST families replay saved seeds; at least one new family shrinks.
 - Live DST/projection compares semantic facts only, not wall-clock ordering.
 - `make portable-runtime-cost` or equivalent runs and prints numbers without
