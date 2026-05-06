@@ -2,302 +2,266 @@
 
 ![tina-rs hero](tina.png)
 
-`tina-rs` is a bounded, shared-nothing concurrency framework for Rust.
+Tina is a Rust framework for writing concurrent services as small synchronous
+state machines. Each isolate owns its state, processes one message at a time,
+and returns an `Effect`. The runtime owns scheduling, time, I/O, supervision,
+and replay.
 
 It is an independent Rust implementation inspired by
-[Peter Mbanugo's Tina](https://github.com/pmbanugo/tina) and by
-thread-per-core systems like [Seastar](https://seastar.io/).
-
-You write small synchronous state machines called isolates. Each isolate owns
-its state, receives one message at a time, and returns an `Effect`: send this,
-sleep this long, read from this socket, spawn this child, reply with this value,
-or stop now.
-
-The runtime does the dangerous parts. It owns scheduling, time, I/O,
-cross-shard messages, supervision, and replay.
-
-No async handlers. No shared state by default. No hidden unbounded queues.
-
-Tina looks actor-shaped, but the goal is not another actor crate. The point is
-the whole contract: bounded mailboxes, shard-owned execution, explicit
-runtime-owned I/O, supervision, and deterministic simulation.
-
-Tina is not an I/O runtime like Tokio or monoio. It is the concurrency model
-above the runtime substrate. Today `tina-runtime` uses an explicit-step oracle,
-deterministic simulation, and a threaded runtime backed by
-[Pekka Enberg's Betelgeuse](https://github.com/penberg/betelgeuse). Future
-bridges can ride Tokio, monoio, or another shard-local substrate if they
-preserve the contract.
-
-> Tina is very experimental and in active development.
-
-The motivation comes from Mbanugo's article
+[Peter Mbanugo's Tina](https://github.com/pmbanugo/tina) and by thread-per-core
+systems like [Seastar](https://seastar.io/). The motivation comes from
+Mbanugo's article
 [The Tokio/Rayon Trap and Why Async/Await Fails Concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency).
 
-## Why
+> Tina is very experimental and in active development. The model is stable
+> enough to write services against; the public API surface is not.
 
-Rust async is powerful. It also gives you sharp knives:
+Tina provides:
 
-- unbounded channels that become memory leaks under load;
-- task migration that fights shard-local state;
-- `Arc<Mutex<_>>` because sharing state was easy;
-- forgotten timeouts;
-- failures that only reproduce when the moon is mean.
+* **Isolate-per-entity state machines.** Connections, sessions, workers, or
+  protocol roles each get a typed state machine that owns its data. No
+  `Arc<Mutex<_>>`.
+* **Synchronous handlers returning `Effect`.** Handlers don't `await`. They
+  return one of: `send`, `reply`, `stop`, `spawn`, `batch`, or a runtime call
+  like `sleep`, `tcp_read`, `tcp_write`, `snapshot_commit`, or `journal_append`.
+* **Bounded mailboxes.** Every queue has a capacity. `Full`, `Closed`, and
+  `Timeout` are normal outcomes, not exceptions.
+* **Runtime-owned I/O.** TCP, UDP, DNS, TLS, file I/O, snapshot/journal
+  persistence, signals, and process execution flow through typed runtime
+  calls. Continuations come back as ordinary messages.
+* **Supervision with restart budgets.** Parent isolates restart children
+  under `OneForOne`, `OneForAll`, or `RestForOne` policy with a finite
+  budget. Restart events are typed entries in the runtime trace.
+* **Deterministic simulation.** The same isolate code runs under the live
+  `ThreadedRuntime` and under `tina-sim` with virtual time, seeded faults,
+  and replay. Same seed, same config, same failure.
 
-Tina chooses a smaller machine.
+## A TCP echo connection
 
-Each unit of work has one owner. Each queue has a capacity. Every overload case
-is visible: `Full`, `Closed`, `Timeout`. Every side effect goes through the
-runtime. The same isolate code can run live or inside a seeded simulator.
-
-Same seed. Same config. Same failure.
-
-## What Code Looks Like
-
-Use the prelude:
+The connection isolate is a state machine over runtime-owned TCP. The
+handler is synchronous; each runtime call returns its result as a normal
+message variant.
 
 ```rust
 use tina::prelude::*;
-```
+use tina_runtime::{CallError, StreamId, tcp_close_stream, tcp_read, tcp_write};
 
-Tina is a llama. So first, one isolate owns one llama.
-
-`LlamaMsg::Fed` means someone gave Tina a snack. The isolate updates only its
-own state. It does not send anything, reply to anyone, or touch the runtime.
-That is the smallest shape:
-
-```rust
-enum LlamaMsg {
-    Fed(Snack),
+#[derive(Debug, Clone)]
+enum ConnMsg {
+    Begin,
+    Read(Result<Vec<u8>, CallError>),
+    Wrote(Result<usize, CallError>),
+    Closed(Result<(), CallError>),
 }
 
-#[tina::isolate(message = LlamaMsg, shard = AppShard)]
-impl Tina {
-    fn handle(&mut self, msg: LlamaMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+struct Connection {
+    stream: StreamId,
+}
+
+#[tina_runtime::isolate(message = ConnMsg, shard = AppShard)]
+impl Connection {
+    fn handle(&mut self, msg: ConnMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            LlamaMsg::Fed(snack) => {
-                self.snacks.push(snack);
-                noop()
+            ConnMsg::Begin => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
+            ConnMsg::Read(Ok(bytes)) if bytes.is_empty() => {
+                tcp_close_stream(self.stream).reply(ConnMsg::Closed)
             }
-        }
-    }
-}
-```
-
-If an isolate sends or replies, it names those effect types in the macro.
-Here Tina can be brushed, can tell the barn log that brushing happened, and
-can reply with her snack list. The message names are the whole protocol:
-
-- `Fed`: add a snack to local state.
-- `Brushed`: write one barn log event.
-- `SnackReport`: reply to whoever asked.
-
-```rust
-enum LlamaMsg {
-    Fed(Snack),
-    Brushed,
-    SnackReport,
-}
-
-enum BarnLogMsg {
-    TinaGotBrushed,
-}
-
-#[tina::isolate(
-    message = LlamaMsg,
-    reply = Vec<Snack>,
-    send = Outbound<BarnLogMsg>,
-    shard = AppShard
-)]
-impl Tina {
-    fn handle(&mut self, msg: LlamaMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
-        match msg {
-            LlamaMsg::Fed(snack) => {
-                self.snacks.push(snack);
-                noop()
+            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).reply(ConnMsg::Wrote),
+            ConnMsg::Wrote(Ok(_)) => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
+            ConnMsg::Read(Err(_)) | ConnMsg::Wrote(Err(_)) => {
+                tcp_close_stream(self.stream).reply(ConnMsg::Closed)
             }
-            LlamaMsg::Brushed => send(self.barn_log, BarnLogMsg::TinaGotBrushed),
-            LlamaMsg::SnackReport => reply(self.snacks.clone()),
+            ConnMsg::Closed(_) => stop(),
         }
     }
 }
 ```
 
-Runtime work comes back as normal messages too. Tina does not sleep inside the
-handler. She asks the runtime for a nap timer. Later the runtime sends a normal
-message saying the nap is over or failed.
+Tina exits the handler after each message, runs the I/O on its own driver
+rail, and re-enters with the result. The handler stays synchronous; the
+runtime owns suspension, cancellation, and shutdown.
 
-```rust
-use tina_runtime::{CallError, sleep};
+The full echo server, including the listener that spawns one connection
+isolate per accepted socket, lives in
+[`tina-runtime/examples/tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs).
 
-enum NapMsg {
-    StartNap,
-    WakeUp,
-    NapFailed(CallError),
-}
+## Architecture
 
-#[tina_runtime::isolate(
-    message = NapMsg,
-    send = Outbound<CaretakerMsg>,
-    shard = AppShard
-)]
-impl Tina {
-    fn handle(&mut self, msg: NapMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
-        match msg {
-            NapMsg::StartNap => sleep(self.nap_time).reply(|result| match result {
-                Ok(()) => NapMsg::WakeUp,
-                Err(reason) => NapMsg::NapFailed(reason),
-            }),
-            NapMsg::WakeUp => send(self.caretaker, CaretakerMsg::LlamaAwake),
-            NapMsg::NapFailed(_) => stop(),
-        }
-    }
-}
+```
+┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
+│           SHARD 0 (one core)         │  │           SHARD 1 (one core)         │
+│                                      │  │                                      │
+│  Isolate ── Effect ─→ Runtime        │  │  Isolate ── Effect ─→ Runtime        │
+│     ↑                    │           │  │     ↑                    │           │
+│     └────── Message ─────┘           │  │     └────── Message ─────┘           │
+│                                      │  │                                      │
+│  Bounded mailboxes                   │  │  Bounded mailboxes                   │
+│  Runtime-owned I/O · Time · Signals  │  │  Runtime-owned I/O · Time · Signals  │
+│  Supervision · Persistence · Trace   │  │  Supervision · Persistence · Trace   │
+│                                      │  │                                      │
+└──────────────────────┬───────────────┘  └───────────────┬──────────────────────┘
+                       │                                  │
+                       └─── Bounded shard-pair queues ────┘
 ```
 
-Tokio keeps that control flow inside an async task:
+A **shard** owns one core's worth of work: its isolates, their mailboxes, the
+runtime's driver rails for time and I/O, supervision records, and the
+shard-pair queues that connect it to other shards. Shards share no memory.
 
-```rust
-tokio::spawn(async move {
-    tokio::time::sleep(nap_time).await;
-    caretaker.send(CaretakerMsg::LlamaAwake).await?;
-});
-```
+An **isolate** is a typed struct with a synchronous `handle` method that
+returns an `Effect`. Isolates are referenced through typed `Address<M, R>`
+values, never raw pointers. Their state is private.
 
-Tina splits it into an effect and a later message:
+An **effect** is a closed enum the runtime executes. The user surface is
+`send`, `reply`, `stop`, `spawn`, `batch`, and the `tina-runtime` call
+helpers (`sleep`, `tcp_*`, `udp_*`, `dns_*`, `tls_*`, file/path helpers,
+`snapshot_*` / `journal_*`, `process_run`, `signal_wait`).
 
-```rust
-NapMsg::StartNap => sleep(self.nap_time).reply(|_| NapMsg::WakeUp),
-NapMsg::WakeUp => send(self.caretaker, CaretakerMsg::LlamaAwake),
-```
+The repository is a Cargo workspace:
 
-Tokio suspends the function. Tina returns to the runtime. The runtime owns the
-timer and sends a normal message when it completes.
-
-No `.await` in the handler. No socket read in user code. The handler describes
-work. The runtime performs it and sends the result back later.
-
-Full runnable examples:
-
-- [`task_dispatcher.rs`](tina-runtime/examples/task_dispatcher.rs)
-- [`tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs)
-- [`llama_bridge.rs`](tina-tokio-bridge/examples/llama_bridge.rs)
-
-## What Works Today
-
-This repo is a Cargo workspace with six crates:
-
-- **`tina`**: traits, effects, typed addresses, helper functions, isolate
-  macros, supervision policy types.
-- **`tina-mailbox-spsc`**: bounded single-producer/single-consumer mailbox.
-- **`tina-supervisor`**: supervisor config.
-- **`tina-runtime`**: explicit-step runtime, multi-shard runner,
-  `ThreadedRuntime` over the Betelgeuse backend, runtime-owned TCP/time, observed
-  backpressure, isolate calls with mandatory timeout, local snapshot/journal
-  persistence helpers, preferred `LocalSystem`/`LocalMultiShardSystem` app
-  owners, and a named `TINA_DRIVER_RUNTIME_CONTRACT`.
-- **`tina-sim`**: deterministic simulator with virtual time, seeded faults,
-  checkers, scripted TCP, durable images, and replay.
-- **`tina-tokio-bridge`**: narrow bounded ingress from Tokio/Tower/Axum into a
-  Tina service, with explicit health, metrics, timeout, cancellation, and
-  overload policies. Bridge-hosted services can use ordinary Tina message enums,
-  so runtime calls still fit. Tokio owns the edge. Tina owns the isolate state.
-
-You can write isolates against the modern surface: `Outbound`,
-`ChildDefinition`, `RestartableChildDefinition`, `RuntimeCall`, `CallInput`,
-`CallOutput`, `CallError`, `#[tina::isolate(...)]`,
-`#[tina_runtime::isolate(...)]`, `send(...)`, `reply(...)`, `stop()`,
-`batch(...)`, `sleep(...)`, `tcp_read(...)`, `tcp_write(...)`,
-`snapshot_commit(...)`, `snapshot_load(...)`, `journal_append(...)`, and
-`journal_replay(...)`.
-
-Local persistence has an explicit support table:
-`LOCAL_PERSISTENCE_SUPPORT` names temp-write, rename, file fsync,
-parent-directory fsync, truncated-tail warning, and checksum validation
-support for the current build. No quiet durability claim.
-If snapshot rename succeeds but the final durability step cannot be proven,
-Tina reports `CallError::CommitUncertain`, because disk state may already have
-changed. Live persistence runs through a bounded storage lane; already-started
-local filesystem work still cannot be preempted. These are correct-first
-helpers, not a high-throughput storage reactor.
-
-The canonical local-service proof is
-[`portable_service.rs`](tina-runtime/tests/portable_service.rs). It wires one
-copyable app shape: configure budgets, register router and shard-owned workers,
-route by key, apply visible backpressure, perform runtime-owned persistence
-before reply, shut down, inspect terminal truth, and replay the durable journal.
-The simulator companion
-[`portable_service_dst.rs`](tina-sim/tests/portable_service_dst.rs) runs the
-same service idea through saved-seed DST with replay and shrinking.
-
-The old `SendMessage`, `SpawnSpec`, `CurrentCall`, `CallRequest`,
-`CallResult`, `CallFailureReason`, and `tina-runtime-current` names are not the
-public teaching surface.
-
-## What Does Not Yet
-
-- not production-ready;
-- Tokio/Tower/Axum bridge is narrow first form only;
-- the driver-runtime contract is named, but Tina is not a general Rust async
-  runtime;
-- local persistence is snapshot/journal only, not a database or durable
-  mailbox;
-- no remoting or clustering;
-- no broad zero-allocation claim;
-- no general async ecosystem integration;
-- no promise that every Tokio-shaped server should be ported today.
-
-## The Rule
-
-If something can overload, Tina should make it visible.
-
-If something can fail, Tina should make it traceable.
-
-If something can race, Tina should make it replayable.
-
-## Design
-
-| Idea | What it means |
+| Crate | Purpose |
 |---|---|
-| **Isolate-per-entity** | Tenants, connections, sessions, workers, or protocol roles each get a typed state machine. |
-| **Effect-returning handlers** | Handlers are synchronous. The runtime executes the returned effect. |
-| **Bounded queues** | Mailboxes and cross-shard queues have capacity. `Full` and `Closed` are normal outcomes. |
-| **Shard-owned execution** | A shard owns its isolates, timers, runtime resources, and cross-shard queues. |
-| **Supervision** | Parent isolates can restart children with policy and budget. |
-| **Deterministic simulation** | Time, I/O, faults, and message order can be driven from a seed. |
+| [`tina`](tina/) | Traits, effects, typed addresses, supervision policy types, and the `#[tina::isolate]` / `#[tina_runtime::isolate]` macros. No implementations. |
+| [`tina-mailbox-spsc`](tina-mailbox-spsc/) | Bounded single-producer/single-consumer ring-buffer mailbox. |
+| [`tina-supervisor`](tina-supervisor/) | Supervisor configuration: `RestartPolicy`, `RestartBudget`, `SupervisorConfig`. |
+| [`tina-runtime`](tina-runtime/) | Explicit-step runtime, multi-shard runner, `ThreadedRuntime` over the [Betelgeuse](https://github.com/penberg/betelgeuse) backend, runtime-owned I/O, isolate calls, local snapshot/journal persistence. |
+| [`tina-sim`](tina-sim/) | Deterministic simulator with virtual time, seeded faults, scripted I/O, durable images, and replay. |
+| [`tina-tokio-bridge`](tina-tokio-bridge/) | Bounded ingress from a host Tokio runtime into a Tina service, for axum/Tower/Hyper integration. |
 
-None of this is new. Erlang, Akka, Seastar, TigerBeetle, FoundationDB, and
-Tina-Odin all matter here. `tina-rs` is these ideas expressed as Rust traits
-and small implementation crates.
+End consumers depend on `tina` plus one runtime or simulator crate.
 
-## Docs
+## Deterministic simulation testing
 
-- [Tina User Guide](docs/tina-user-guide/README.md): short practical pages for
-  writing isolates, using runtime calls, handling overload, testing in
-  simulation, and porting small Tokio-shaped code.
+`tina-sim` runs the same isolate code as `tina-runtime` under a deterministic
+driver. Time is virtual, I/O can be scripted or seeded, and the trace of every
+run is reproducible from a `(seed, config)` pair.
 
-## Development
+```rust
+use tina_sim::{Simulator, SimulatorConfig};
+
+let mut sim = Simulator::new(AppShard, SimulatorConfig { seed: 42, ..Default::default() });
+let counter = sim.register_with_mailbox_capacity(Counter::default(), 16);
+sim.try_send(counter, CounterMsg::Increment).unwrap();
+sim.run_until_quiescent();
+
+assert_eq!(sim.trace().len(), expected_event_count);
+```
+
+A run with the same seed and config produces a byte-identical trace. A
+different seed exercises different timer-wake ordering, send delivery
+order, and TCP completion order under bounded fault models. Live and
+simulated runs share the same handler code; the difference is the driver
+underneath.
+
+See [`tina-sim/tests/`](tina-sim/tests/) and
+[`docs/tina-user-guide/08-simulation-and-dst.md`](docs/tina-user-guide/08-simulation-and-dst.md)
+for replay, DST, and fault-injection details.
+
+## Quickstart
 
 ```bash
-make verify   # full project gate, including service/DST/bridge/cost smoke
-make portable-runtime-cost    # optional local smoke rows, not a benchmark
-make miri     # focused unsafe-memory checks for tina-mailbox-spsc
+git clone https://github.com/russellromney/tina-rs.git
+cd tina-rs
+make verify
 ```
 
-Individual targets: `make fmt`, `make check`, `make test`, `make doc`, and
-`make clippy`.
+Run a canonical example:
 
-## Prior Art
+```bash
+cargo run --example tcp_echo -p tina-runtime
+```
 
-- [Tina](https://github.com/pmbanugo/tina) by Peter Mbanugo
-- [The Tokio/Rayon Trap and Why Async/Await Fails Concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency)
-- [Seastar](https://seastar.io/)
-- [Betelgeuse](https://github.com/penberg/betelgeuse) by Pekka Enberg
-- [monoio](https://github.com/bytedance/monoio)
-- [TigerBeetle](https://tigerbeetle.com/)
-- [FoundationDB simulation testing](https://www.youtube.com/watch?v=4fFDFbi3toc)
-- [loom](https://github.com/tokio-rs/loom)
-- [Miri](https://github.com/rust-lang/miri)
+Run the paired Tokio-vs-Tina comparisons:
+
+```bash
+cargo run --manifest-path examples/eiffel_mini_keyspace/Cargo.toml -- compare
+cargo run --manifest-path examples/eiffel_supervised_worker/Cargo.toml -- compare
+cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- compare
+```
+
+`make` targets:
+
+| Command | Purpose |
+|---|---|
+| `make verify` | Full project gate: fmt, clippy, tests, miri, simulator, cost smoke. |
+| `make portable-runtime-cost` | Optional local cost-smoke rows. Not a benchmark. |
+| `make miri` | Focused unsafe-memory checks for `tina-mailbox-spsc`. |
+| `make fmt` / `make check` / `make test` / `make clippy` / `make doc` | Individual targets. |
+
+## Examples
+
+| Example | What it shows |
+|---|---|
+| [`tina-runtime/examples/task_dispatcher.rs`](tina-runtime/examples/task_dispatcher.rs) | Smallest complete service: dispatcher isolate, worker isolates, supervision. Recommended starting point. |
+| [`tina-runtime/examples/tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs) | Runtime-owned TCP from listener through connection close, including bounded multi-client overlap. |
+| [`tina-tokio-bridge/examples/llama_bridge.rs`](tina-tokio-bridge/examples/llama_bridge.rs) | Bridging an existing Tokio/axum app into a Tina-supervised core. |
+
+The [`examples/`](examples/) directory at the repo root contains **Eiffel**:
+paired Tokio-vs-Tina implementations of common service shapes (chat fanout,
+key/value store, axum counter, supervised worker, persistent counter,
+deterministic replay, outbound fetch, graceful shutdown, and more) that
+assert equivalent output between sides. Cross-cutting findings live in
+[`examples/FINDINGS.md`](examples/FINDINGS.md).
+
+## Documentation
+
+| Section | What it covers |
+|---|---|
+| [`docs/tina-user-guide/01-mental-model.md`](docs/tina-user-guide/01-mental-model.md) | The model in one page |
+| [`docs/tina-user-guide/02-first-isolate.md`](docs/tina-user-guide/02-first-isolate.md) | Writing your first isolate |
+| [`docs/tina-user-guide/03-effects-and-runtime-calls.md`](docs/tina-user-guide/03-effects-and-runtime-calls.md) | Effects and runtime calls |
+| [`docs/tina-user-guide/04-request-reply.md`](docs/tina-user-guide/04-request-reply.md) | Request/reply between isolates |
+| [`docs/tina-user-guide/05-tcp-services.md`](docs/tina-user-guide/05-tcp-services.md) | TCP services |
+| [`docs/tina-user-guide/06-boundedness-and-overload.md`](docs/tina-user-guide/06-boundedness-and-overload.md) | Boundedness and overload |
+| [`docs/tina-user-guide/07-supervision.md`](docs/tina-user-guide/07-supervision.md) | Supervision and restart budgets |
+| [`docs/tina-user-guide/08-simulation-and-dst.md`](docs/tina-user-guide/08-simulation-and-dst.md) | Simulation and DST |
+| [`docs/tina-user-guide/09-tokio-to-tina-porting.md`](docs/tina-user-guide/09-tokio-to-tina-porting.md) | Porting Tokio-shaped code |
+| [`docs/tina-user-guide/10-ergonomics-notes.md`](docs/tina-user-guide/10-ergonomics-notes.md) | Ergonomics notes |
+| [`ROADMAP.md`](ROADMAP.md) | Phases, near-term work, and explicit non-goals |
+| [`CHANGELOG.md`](CHANGELOG.md) | Completed phases |
+
+## Status and limits
+
+Implemented today: explicit-step single-shard runtime, multi-shard runner with
+bounded shard-pair queues, `ThreadedRuntime` over Betelgeuse, runtime-owned
+TCP/UDP/DNS/TLS/file/path/process/signal/persistence rails, isolate calls
+with mandatory timeout, supervision with `OneForOne`/`OneForAll`/`RestForOne`
+and runtime-lifetime restart budgets, terminal shutdown reports with
+topology and trace, `tina-sim` with virtual time / seeded faults / scripted
+I/O / replay / DST shrinking, and a narrow Tokio/Tower/Axum bridge with
+typed `Full`/`Closed`/`Timeout` outcomes.
+
+Not yet:
+
+* native HTTP / HTTP/2 / gRPC service stack (planned, see [ROADMAP.md](ROADMAP.md));
+* native database client (PG wire / SQLite); current path is the bridge to `sqlx`/`tokio-postgres`;
+* `io_uring` substrate (Linux); current backend is portable;
+* remoting or clustering;
+* time-windowed restart budgets (runtime-lifetime budgets only today);
+* production performance claim;
+* a stable public API.
+
+The repository ships an honest capability report at runtime
+(`RuntimeCapabilities`) and explicit non-claims for resources the current
+backend cannot prove.
+
+## Prior art
+
+Tina synthesises ideas that are not original to it. The list below names the
+sources, not order of discovery.
+
+| Idea | Source |
+|---|---|
+| Supervision trees, "let it crash", error kernel | Joe Armstrong — Erlang/OTP |
+| Thread-per-core, shared-nothing reactor | [Seastar](https://seastar.io/) by ScyllaDB |
+| Deterministic simulation testing | [TigerBeetle](https://tigerbeetle.com/) and [FoundationDB](https://www.youtube.com/watch?v=4fFDFbi3toc) |
+| Synchronous-handler + Effect programming model | [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina) |
+| Bounded SPSC ring buffers | LMAX Disruptor lineage |
+| Rust thread-per-core substrates | [monoio](https://github.com/bytedance/monoio), [glommio](https://github.com/DataDog/glommio), [Betelgeuse](https://github.com/penberg/betelgeuse) |
+| Concurrency model checking in Rust | [loom](https://github.com/tokio-rs/loom), [shuttle](https://github.com/awslabs/shuttle) |
+| Deterministic-simulation libraries in Rust | [madsim](https://github.com/madsim-rs/madsim), [turmoil](https://github.com/tokio-rs/turmoil) |
+| OTP-style frameworks in Rust | [ambitious](https://github.com/scrogson/ambitious), [joerl](https://github.com/am-kantox/joerl), [lunatic](https://github.com/lunatic-solutions/lunatic) |
+| Memory-safety stress | [Miri](https://github.com/rust-lang/miri) |
 
 ## License
 
