@@ -41,8 +41,12 @@
 //! - Client stub ([`Client`]) per outbound TCP stream, with bounded
 //!   in-flight multiplexing, per-request deadlines, out-of-order reply
 //!   matching, and visible failure of pending calls on close.
-//!
-//! Out of scope: simulation (Rock 6), Eiffel comparison (Rock 7).
+//! - Service topology adapters ([`SingleService`], plus [`PooledService`]
+//!   and [`ShardedService`] type-stubs reserved for later phases) so the
+//!   future `#[tina_rpc::service]` macro can pick a topology without
+//!   locking in a one-shape registry. See the [`service`] module docs
+//!   for the topology rationale: where pressure lives in each shape
+//!   and why the registry stays a lookup table, not a scheduler.
 //!
 //! # Example
 //!
@@ -86,6 +90,7 @@ mod connection;
 mod encoding;
 mod frame;
 mod registry;
+pub mod service;
 
 pub use client::{
     Client, ClientConfig, ClientInit, ClientMsg, ClientRequest, ClientResult, ClientResultMsg,
@@ -104,3 +109,4 @@ pub use frame::{
 pub use registry::{
     Registry, RegistryBuilder, RegistryConfig, RegistryMsg, ServiceCall, ServiceReply,
 };
+pub use service::{PooledService, ServiceConfig, ServiceHandler, ShardedService, SingleService};
