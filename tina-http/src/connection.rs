@@ -66,6 +66,12 @@ pub enum HttpConnectionMsg {
     /// Streaming request: service asks the connection for the next
     /// chunk of the inbound body. Replies with [`RequestChunkReply`].
     RequestBodyNext,
+    /// Streaming request: continuation from a `tcp_read` issued while
+    /// serving a `RequestBodyNext` call whose buffer was empty. The
+    /// outer call context (the service's `RequestBodyNext` call)
+    /// propagates through this continuation, so `Effect::Reply` here
+    /// answers the service.
+    BodyChunkRead(Result<Vec<u8>, CallError>),
 }
 
 impl HttpConnectionMsg {
@@ -107,12 +113,26 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     stream_bytes_remaining: usize,
     stream_call_timeout: Duration,
 
-    // Streaming-request state: holds the buffered request body and the
-    // cursor of how much has been served to the service via
-    // `RequestBodyNext` calls. Set when the dispatch path chose the
-    // streaming variant; empty otherwise.
-    inbound_body: Vec<u8>,
-    inbound_cursor: usize,
+    // Inbound streaming state.
+    //
+    // When the dispatch path chose the streaming variant, the
+    // connection lazily pulls body bytes from the socket as the service
+    // calls `RequestBodyNext`. Naming convention:
+    //
+    // - `inbound_total`: declared `Content-Length`.
+    // - `inbound_received`: bytes read from the socket so far in the
+    //   body region.
+    // - `inbound_delivered`: bytes already replied to the service.
+    // - `inbound_buffer`: bytes received from the socket but not yet
+    //   delivered to the service (received - delivered).
+    // - `inbound_chunk_size`: cap on a single chunk reply.
+    //
+    // Invariant: `inbound_received >= inbound_delivered` and
+    // `inbound_received - inbound_delivered == inbound_buffer.len()`.
+    inbound_total: usize,
+    inbound_received: usize,
+    inbound_delivered: usize,
+    inbound_buffer: Vec<u8>,
     inbound_chunk_size: usize,
 
     // Captured at the first handler turn (`start()`), used to construct
@@ -156,8 +176,10 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             stream_source: None,
             stream_bytes_remaining: 0,
             stream_call_timeout: service_call_timeout,
-            inbound_body: Vec::new(),
-            inbound_cursor: 0,
+            inbound_total: 0,
+            inbound_received: 0,
+            inbound_delivered: 0,
+            inbound_buffer: Vec::new(),
             inbound_chunk_size: 0,
             self_shard_id: None,
             self_isolate_id: None,
@@ -204,6 +226,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpConnectionMsg::StreamChunk(outcome) => self.handle_stream_chunk(outcome),
 
             HttpConnectionMsg::RequestBodyNext => self.handle_request_body_next(),
+
+            HttpConnectionMsg::BodyChunkRead(result) => self.handle_body_chunk_read(result),
 
             HttpConnectionMsg::Closed(_) => stop(),
         }
@@ -291,6 +315,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .parsed_head
             .as_ref()
             .expect("head parsed before dispatch");
+        let streaming = self.limits.inbound_stream_chunk_size.is_some() && head.content_length > 0;
+        if streaming {
+            // Streaming: dispatch as soon as the head is parsed. Body
+            // bytes are pulled lazily from the socket on demand via
+            // `RequestBodyNext` calls from the service.
+            return self.dispatch_to_service();
+        }
         let needed = self.head_len + head.content_length;
         if self.read_buf.len() < needed {
             self.read_more()
@@ -304,25 +335,31 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .parsed_head
             .take()
             .expect("head parsed before dispatch");
-        let body_end = self.head_len + head.content_length;
-        let body = self.read_buf[self.head_len..body_end].to_vec();
         self.will_close = true;
 
         // Decide buffered vs streaming dispatch based on the limits.
         let request = match self.limits.inbound_stream_chunk_size {
-            Some(chunk_size) if !body.is_empty() => {
-                // Stream: stash the body in the connection state, hand
-                // the service an address pointing at us with the
-                // streaming reply type. The service pulls chunks via
-                // `call(addr, RequestBodyNext, t).reply(...)`.
-                let content_length = body.len();
-                self.inbound_body = body;
-                self.inbound_cursor = 0;
+            Some(chunk_size) if head.content_length > 0 => {
+                // Streaming: take whatever body bytes already arrived
+                // (the read-ahead from the head-parse rounds), park
+                // them in `inbound_buffer`, and hand the service a
+                // typed self-address. Subsequent body bytes are
+                // pulled from the socket lazily as the service calls
+                // `RequestBodyNext`.
+                let prebuf_end = self.read_buf.len().min(self.head_len + head.content_length);
+                let prebuffered: Vec<u8> = if prebuf_end > self.head_len {
+                    self.read_buf[self.head_len..prebuf_end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                self.inbound_total = head.content_length;
+                self.inbound_received = prebuffered.len();
+                self.inbound_delivered = 0;
+                self.inbound_buffer = prebuffered;
                 self.inbound_chunk_size = chunk_size.max(1);
-                // Build the typed chunk-source address. Generation 0
-                // matches the first incarnation of this isolate; supervised
-                // restarts would invalidate this. First-form connections
-                // are not supervised, so this is safe.
+                // Done with the parse-time buffer; future body reads
+                // accumulate into `inbound_buffer` directly.
+                self.read_buf.clear();
                 let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
                     tina::Address::new_with_generation(
                         self.shard_id_for_self(),
@@ -330,12 +367,19 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         tina::AddressGeneration::new(0),
                     );
                 let stream = RequestStream {
-                    content_length,
+                    content_length: self.inbound_total,
                     source: me_chunk,
                 };
                 head.into_streaming_request(stream)
             }
-            _ => head.into_request(body),
+            _ => {
+                // Buffered: by the time we get here `read_buf` already
+                // holds the full body — `maybe_dispatch_or_read_more`
+                // returns to `read_more` until the buffer is full.
+                let body_end = self.head_len + head.content_length;
+                let body = self.read_buf[self.head_len..body_end].to_vec();
+                head.into_request(body)
+            }
         };
         call(self.service, M::from(request), self.service_call_timeout)
             .reply(HttpConnectionMsg::ServiceReturned)
@@ -356,16 +400,66 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .expect("isolate id captured at start()")
     }
 
+    /// Serves the next inbound body chunk to the calling service.
+    ///
+    /// - If we already have buffered bytes, drain a chunk from
+    ///   `inbound_buffer`, advance `inbound_delivered`, reply.
+    /// - If the buffer is empty but we have not received the full body
+    ///   from the socket, issue a `tcp_read` and let the
+    ///   `BodyChunkRead` continuation answer the service. The outer
+    ///   call context (this `RequestBodyNext` call) propagates through
+    ///   the `.reply(...)` chain, so a later `Effect::Reply` reaches
+    ///   this caller.
+    /// - If the buffer is empty and the full body has been delivered,
+    ///   reply `Eof`.
     fn handle_request_body_next(&mut self) -> Effect<Self> {
-        let remaining = self.inbound_body.len().saturating_sub(self.inbound_cursor);
-        if remaining == 0 {
+        if self.inbound_delivered >= self.inbound_total {
             return reply(RequestChunkReply::Eof);
         }
-        let take = self.inbound_chunk_size.min(remaining);
-        let start = self.inbound_cursor;
-        let end = start + take;
-        let chunk = self.inbound_body[start..end].to_vec();
-        self.inbound_cursor = end;
+        if !self.inbound_buffer.is_empty() {
+            return self.serve_chunk_from_buffer();
+        }
+        // Need to pull more bytes from the socket. Cap the request at
+        // what we still need so the kernel does not over-read.
+        let want = self
+            .inbound_total
+            .saturating_sub(self.inbound_received)
+            .min(READ_CHUNK);
+        if want == 0 {
+            // Defensive: nothing left to read but delivered != total.
+            // Treat as truncation — reply Eof so the service notices
+            // via received bytes < expected.
+            return reply(RequestChunkReply::Eof);
+        }
+        tcp_read(self.stream, want).reply(HttpConnectionMsg::BodyChunkRead)
+    }
+
+    fn handle_body_chunk_read(&mut self, result: Result<Vec<u8>, CallError>) -> Effect<Self> {
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            // tcp_read failure mid-body: end the stream. Service sees
+            // delivered bytes < expected and can decide what to do.
+            Err(_) => return reply(RequestChunkReply::Eof),
+        };
+        if bytes.is_empty() {
+            // Peer closed mid-body. Honest move: terminate the stream
+            // with what we have; the service will notice the short
+            // delivery via `delivered < expected`.
+            return reply(RequestChunkReply::Eof);
+        }
+        self.inbound_received += bytes.len();
+        self.inbound_buffer.extend_from_slice(&bytes);
+        self.serve_chunk_from_buffer()
+    }
+
+    fn serve_chunk_from_buffer(&mut self) -> Effect<Self> {
+        let remaining_total = self.inbound_total - self.inbound_delivered;
+        let take = self
+            .inbound_chunk_size
+            .min(self.inbound_buffer.len())
+            .min(remaining_total);
+        let chunk: Vec<u8> = self.inbound_buffer.drain(..take).collect();
+        self.inbound_delivered += take;
         reply(RequestChunkReply::Chunk(chunk))
     }
 

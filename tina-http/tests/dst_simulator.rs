@@ -402,56 +402,60 @@ fn service_full_with_concurrent_peers_replays_deterministically() {
 }
 
 /// Saved seed for a multi-peer interleaving. The fingerprint below was
-/// captured under the listed config; if the trace shape changes
-/// (intentional or otherwise), the assertion forces a conscious bump.
+/// Saved seed for a multi-peer interleaving. The pinned fingerprint
+/// below was captured under the listed config. If the trace shape
+/// changes (intentional or otherwise) this assertion fails and forces
+/// a conscious update — recapture by re-running with `--nocapture`
+/// after an explicit "yes, the trace shape changed" review.
 #[test]
 fn saved_seed_interleaving_fingerprint_is_stable() {
     const SAVED_SEED: u64 = 0xBEEF_C0DE;
+    /// Pinned trace fingerprint for `SAVED_SEED` + the config below.
+    /// Bump only after reviewing why the trace shape changed.
+    const EXPECTED_HASH: u64 = 9_645_939_483_850_450_883;
+    /// Pinned trace event count for `SAVED_SEED` + the config below.
+    const EXPECTED_LEN: usize = 95;
+
     let bind: SocketAddr = "127.0.0.1:9007".parse().unwrap();
     let peer_a: SocketAddr = "10.0.0.1:55008".parse().unwrap();
     let peer_b: SocketAddr = "10.0.0.1:55009".parse().unwrap();
 
-    let cfg = build_config(
-        SAVED_SEED,
-        bind,
-        vec![
-            multi_chunk_peer(
-                peer_a,
-                0,
-                vec![
-                    b"POST /counter HTTP/1.1\r\nHost: a\r\n".to_vec(),
-                    b"Content-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-                ],
-            ),
-            one_chunk_peer(peer_b, 1, good_request_bytes()),
-        ],
+    let make_cfg = || {
+        build_config(
+            SAVED_SEED,
+            bind,
+            vec![
+                multi_chunk_peer(
+                    peer_a,
+                    0,
+                    vec![
+                        b"POST /counter HTTP/1.1\r\nHost: a\r\n".to_vec(),
+                        b"Content-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                    ],
+                ),
+                one_chunk_peer(peer_b, 1, good_request_bytes()),
+            ],
+        )
+    };
+
+    let (hash, len) = run_pass(bind, make_cfg(), 16);
+
+    // Pin against the saved fingerprint — this is what catches drift.
+    assert_eq!(
+        hash, EXPECTED_HASH,
+        "saved-seed trace fingerprint changed; got {hash}, expected {EXPECTED_HASH}. \
+         If the change is intentional, recapture with `cargo test --test dst_simulator \
+         saved_seed -- --nocapture` and update EXPECTED_HASH + EXPECTED_LEN.",
+    );
+    assert_eq!(
+        len, EXPECTED_LEN,
+        "saved-seed trace length changed; got {len}, expected {EXPECTED_LEN}",
     );
 
-    let (hash, len) = run_pass(bind, cfg, 16);
-
-    // Self-consistency: rerun the same config and assert byte-identical.
-    let cfg2 = build_config(
-        SAVED_SEED,
-        bind,
-        vec![
-            multi_chunk_peer(
-                peer_a,
-                0,
-                vec![
-                    b"POST /counter HTTP/1.1\r\nHost: a\r\n".to_vec(),
-                    b"Content-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-                ],
-            ),
-            one_chunk_peer(peer_b, 1, good_request_bytes()),
-        ],
-    );
-    let (hash2, len2) = run_pass(bind, cfg2, 16);
-
-    assert_eq!(hash, hash2, "saved seed must replay byte-identically");
-    assert_eq!(len, len2, "saved seed must produce same trace length");
-    // Trace length sanity: the run produces a non-trivial sequence.
-    assert!(
-        len >= 10,
-        "saved seed trace should have >= 10 events; got {len}"
-    );
+    // Sanity: a second run with the same config must agree byte-for-
+    // byte. (If this ever differs from the pinned value above, the
+    // simulator itself has drifted.)
+    let (hash2, len2) = run_pass(bind, make_cfg(), 16);
+    assert_eq!(hash, hash2, "same-seed reruns must agree on fingerprint");
+    assert_eq!(len, len2, "same-seed reruns must agree on trace length");
 }
