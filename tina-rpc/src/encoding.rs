@@ -23,16 +23,16 @@
 //!
 //! Bounded allocation is preserved either way: an attacker cannot force
 //! *unbounded* memory growth — only `~factor × max_size` per request — and
-//! Rock 2 will combine this with a bounded in-flight count.
+//! the connection isolate combines this with a bounded in-flight count.
 //!
 //! # Compile-time encoding selection
 //!
-//! [`Encoding`] is intentionally not object-safe (generic methods). Rock 4
-//! (client stub) parameterizes on `E: Encoding` at the type level rather than
-//! holding `Box<dyn Encoding>`. Runtime encoding selection is out of scope
-//! for first form. If it becomes necessary later, an enum dispatch wrapper
-//! (`enum AnyEncoding { Json, Postcard }` with non-generic methods) is the
-//! boring add-on.
+//! [`Encoding`] is intentionally not object-safe (generic methods). The
+//! client stub parameterizes on `E: Encoding` at the type level rather
+//! than holding `Box<dyn Encoding>`. Runtime encoding selection is not
+//! supported; if it becomes necessary, an enum dispatch wrapper
+//! (`enum AnyEncoding { Json, Postcard }` with non-generic methods) is
+//! the boring add-on.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -44,8 +44,8 @@ use serde::de::DeserializeOwned;
 /// A payload codec.
 ///
 /// `T: DeserializeOwned` is deliberate. Borrowed deserialization
-/// (`Deserialize<'de>`) is out of scope for first form: the connection
-/// isolate hands payload bytes off as `Vec<u8>` and does not retain a
+/// (`Deserialize<'de>`) is not supported: the connection isolate
+/// hands payload bytes off as `Vec<u8>` and does not retain a
 /// borrowing buffer.
 pub trait Encoding {
     /// Encoder identifier for tracing and diagnostics. E.g. `"json"`. Stable
@@ -130,7 +130,7 @@ impl StdError for EncodingError {}
 
 /// JSON encoding via [`serde_json`].
 ///
-/// Boring and debuggable. The default first-form choice.
+/// Boring and debuggable. The default encoding.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Json;
 

@@ -1,4 +1,4 @@
-//! Client stub (Rock 4).
+//! Client stub.
 //!
 //! One client isolate owns one outbound TCP stream to a server. The user
 //! issues requests by sending [`ClientMsg::Request`]; the client encodes
@@ -91,8 +91,8 @@ pub struct ClientConfig {
 }
 
 impl Default for ClientConfig {
-    /// Conservative first-form defaults: 1 MiB frames, 64 in-flight, 30 s
-    /// idle, 8 KiB read chunks, 256 frame write queue.
+    /// Conservative defaults: 1 MiB frames, 64 in-flight, 30 s idle,
+    /// 8 KiB read chunks, 256-frame write queue.
     fn default() -> Self {
         Self {
             max_frame_size: 1024 * 1024,
@@ -111,8 +111,8 @@ impl Default for ClientConfig {
 /// notified with the corresponding variant; this is fan-out, not
 /// per-request isolation. A buggy server that emits undecodable bytes
 /// closes the connection and surfaces as [`ClientResult::ConnectionClosed`]
-/// for every pending request — first-form does not distinguish "clean
-/// half-close" from "server emitted garbage."
+/// for every pending request — clean half-close and "server emitted
+/// garbage" are not distinguished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientResult {
     /// Server returned a successful Reply frame.
@@ -121,9 +121,9 @@ pub enum ClientResult {
     ServerError(FrameError),
     /// Local deadline elapsed before any wire reply.
     Timeout,
-    /// The connection closed before a reply arrived. Includes the
-    /// "server sent undecodable bytes" case in first form; these are
-    /// not separated.
+    /// The connection closed before a reply arrived. Also covers
+    /// the "server sent undecodable bytes" case; the two are not
+    /// distinguished on the wire.
     ConnectionClosed,
     /// Client idle timeout closed the connection.
     Idle,

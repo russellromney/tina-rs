@@ -1,112 +1,65 @@
-//! Service topology adapters (phase 058 Rock 1).
+//! Service topology adapters.
 //!
-//! 052 left a deliberate question open: a "service" in `tina-rpc` is
-//! whatever isolate the [`crate::Registry`] hands traffic to via an
-//! `Address<ServiceCall, ServiceReply>`, but is that isolate
-//!
-//! - one process-wide instance,
-//! - a bounded pool of N workers, or
-//! - a sharded set keyed by some part of the request?
-//!
-//! 058 picks the answer before [`crate::Registry`] grows users that
-//! depend on the wrong one. This module sketches the three supported
-//! shapes and ships the first-form ([`SingleService`]) implementation.
-//! [`PooledService`] and [`ShardedService`] are deliberately
-//! unimplemented; their type signatures exist as a *commitment* —
-//! later phases fill in the bodies, not the surface.
+//! Picks the shape behind an `Address<ServiceCall, ServiceReply>`:
+//! one instance, a pool, or a sharded set. Ships [`SingleService`]
+//! and reserves [`PooledService`] / [`ShardedService`] as type-only
+//! commitments so the registry's contract stays the same as the
+//! topology grows.
 //!
 //! # The three shapes
 //!
 //! ## Single ([`SingleService`])
 //!
-//! - **Topology:** one [`ServiceHandler`] in one Tina isolate.
-//! - **Capacity:** one `mailbox_capacity` setting on
-//!   [`ServiceConfig`]. Pressure shows up as
-//!   `CallOutcome::Full` at the registry's `IsolateCall`, mapped to
-//!   `RouterReply::Full`, mapped to wire `Error(Full)` —
-//!   the same path 052 already proves. No new pressure surface.
-//! - **When to use:** stateful services that need linearizable access
-//!   to the same `&mut self`. Default for first form.
+//! One [`ServiceHandler`], one isolate. Pressure surfaces via the
+//! registry's `IsolateCall` → `RouterReply::Full` → wire
+//! `Error(Full)`. Use for stateful services that want linearizable
+//! `&mut self`. Default.
 //!
 //! ## Pooled ([`PooledService`], not yet implemented)
 //!
-//! - **Topology:** N identical worker isolates behind a tiny
-//!   round-robin frontend isolate. The frontend's address is what the
-//!   registry stores; the workers are children of the frontend.
-//! - **Capacity:** the frontend's mailbox is the registry-visible
-//!   queue. Each worker has its own mailbox. Pressure can show up
-//!   at *either* layer; first-form rule will be: the frontend's
-//!   mailbox is `mailbox_capacity * pool_size`, and overflow there
-//!   is the only `Full` users observe (workers internally route via
-//!   the frontend's stable backpressure).
-//! - **When to use:** stateless services where horizontal capacity
-//!   helps. The frontend keeps the registry blissfully unaware that
-//!   "service" actually means N isolates.
+//! N worker isolates behind a round-robin frontend; the frontend's
+//! address is what the registry stores. Frontend mailbox is the
+//! user-visible queue. Use for stateless services where horizontal
+//! capacity helps.
 //!
 //! ## Sharded ([`ShardedService`], not yet implemented)
 //!
-//! - **Topology:** keyed routing across N shard isolates, one shard
-//!   owning a slice of state space. Reuses 053's sharded primitives
-//!   when those land.
-//! - **Capacity:** per-shard mailbox; pressure on a hot shard is a
-//!   hot-shard `Full`, not a global `Full`. (This is the load
-//!   isolation a sharded design buys you.)
-//! - **When to use:** stateful services where state can be split by
-//!   key (per-user, per-tenant, etc.).
+//! N shard isolates keyed by part of the request. Hot-shard load
+//! shows up as a per-shard `Full`, not a global one — that's the
+//! load isolation sharding buys. Pending sharded primitive support.
 //!
-//! # The registry stays unchanged
+//! # The registry stays a lookup table
 //!
-//! All three shapes produce a single
-//! `Address<ServiceCall, ServiceReply>` that
-//! [`crate::Registry::register`] consumes the same way. The
-//! pool/shard fan-out lives *inside* the address recipient — a tiny
-//! frontend isolate that owns the workers/shards. The registry never
-//! grows a "topology" enum, never has to learn how to round-robin or
-//! hash. Topology is an adapter concern.
+//! All three shapes produce one `Address<ServiceCall,
+//! ServiceReply>`. Pool/shard fan-out lives *inside* the recipient —
+//! a frontend isolate that owns the workers. The registry never
+//! learns "topology"; it stays a name → address map.
 //!
 //! ```text
-//!   Connection isolate ─call──▶ Registry ─call──▶ Address (Service)
-//!                                                  │
-//!                            ┌─────────────────────┴───────┐
-//!                            │           │                 │
-//!                       SingleService  PooledService   ShardedService
-//!                       (1 worker)     (N workers       (N shards
-//!                                       round-robin)     by key)
+//!   Connection ─call──▶ Registry ─call──▶ Address (Service)
+//!                                            │
+//!                       ┌────────────────────┴────────────┐
+//!                       │           │                     │
+//!                   SingleService PooledService     ShardedService
+//!                   (1 worker)    (N workers          (N shards
+//!                                  round-robin)        by key)
 //! ```
 //!
-//! ## Per-hop timeout budget (a real cost, not a free lunch)
+//! ## Per-hop timeout budget
 //!
-//! "Registry stays unchanged" is true for the *type* — the
-//! registry's `IsolateCall` to its registered address still has the
-//! same signature. The cost the registry can't see: pool and
-//! sharded adapters add a *second* `IsolateCall` hop on the server
-//! (registry → frontend → worker). Today's
-//! `RegistryConfig::service_call_timeout` (default 4 s) bounds *one*
-//! hop. With a pool, that 4 s budget has to cover the frontend's
-//! enqueue + the worker's enqueue + the worker's dispatch + the
-//! return chain.
-//!
-//! The implementation phase for [`PooledService`] /
-//! [`ShardedService`] will need to either:
-//!
-//! - forward the registry-side deadline down to the frontend's own
-//!   `IsolateCall` to a worker (so the chain shares one budget); or
-//! - set the frontend's per-worker timeout to a documented fraction
-//!   of the registry timeout, accepting that some pool calls will
-//!   look like `Internal` to the client when the worker takes too
-//!   long even though the client's deadline hadn't elapsed.
-//!
-//! Rock 1 doesn't pick — it locks in the surface where the choice
-//! lives. The registry's contract stays "one hop, bounded by my
-//! configured timeout"; topology adapters that *internally* fan out
-//! own their own per-internal-hop budget.
+//! Pool/sharded adapters add a second `IsolateCall` hop on the
+//! server (registry → frontend → worker). Today's
+//! `RegistryConfig::service_call_timeout` bounds *one* hop. When
+//! pool/sharded land, they will either forward the registry
+//! deadline down to the worker call or set their own
+//! per-internal-hop budget; the surface here just locks the choice
+//! in to live on the adapter, not the registry.
 //!
 //! # Convenience-limit rule
 //!
-//! Per 058's convenience-limit section: every adapter's mailbox
-//! capacity is inspectable on [`ServiceConfig`]. A future
-//! `#[tina_rpc::service]` macro must thread that config through, not
-//! pick its own hidden default.
+//! Mailbox capacity stays inspectable on [`ServiceConfig`]. The
+//! `#[tina_rpc::service]` macro must thread it through, not pick
+//! its own hidden default.
 
 use std::convert::Infallible;
 use std::marker::PhantomData;
@@ -127,22 +80,21 @@ use crate::registry::{ServiceCall, ServiceReply};
 ///
 /// # Why sync
 ///
-/// First form: `dispatch` returns a [`ServiceReply`] synchronously.
-/// Handlers that need to do their own runtime calls (sleep, file
-/// I/O, downstream RPC) belong in a later phase — that's a
-/// substantially different shape because each handler turn would
-/// need access to Tina's effect machinery. Keeping the first form
-/// sync lets the macro stay a pure data transform: decode bytes,
-/// call user method, encode bytes.
+/// `dispatch` returns a [`ServiceReply`] synchronously. Handlers
+/// that need their own runtime calls (sleep, file I/O, downstream
+/// RPC) need a different shape with access to Tina's effect
+/// machinery — not currently supported. Keeping dispatch sync lets
+/// the macro stay a pure data transform: decode bytes, call user
+/// method, encode bytes.
 ///
 /// # Error mapping
 ///
 /// Handlers report typed errors by returning
 /// [`ServiceReply::UnknownMethod`], [`ServiceReply::Decode`], or
-/// [`ServiceReply::Internal`]. Domain errors that round-trip as
-/// payload bytes belong on the success path: encode them inside
-/// `ServiceReply::Ok(bytes)` and have the client decode. The macro
-/// (Rock 3) will codify that convention.
+/// [`ServiceReply::Internal`]. Domain errors round-trip on the
+/// success path: encode them inside `ServiceReply::Ok(bytes)` and
+/// have the client decode. The `#[tina_rpc::service]` macro
+/// codifies this convention.
 ///
 /// # The `'static` bound
 ///
@@ -202,13 +154,13 @@ impl Default for ServiceConfig {
 ///
 /// # Mailbox capacity
 ///
-/// `SingleService` does not carry a [`ServiceConfig`] in Rock 1
-/// because the mailbox bound is set at *registration time* by the
-/// runtime helper (`runtime.register_with_capacity(adapter, n)`).
+/// `SingleService` does not carry a [`ServiceConfig`] today — the
+/// mailbox bound is set at *registration time* by the runtime
+/// helper (`runtime.register_with_capacity(adapter, n)`).
 /// `ServiceConfig::mailbox_capacity` exists as a documented surface
-/// the future `#[tina_rpc::service]` macro and a
-/// `register_service` helper will thread through; it is deliberately
-/// not collected here so two ways to set one number can't drift.
+/// the `#[tina_rpc::service]` macro and a future `register_service`
+/// helper will thread through; it is deliberately not collected
+/// here so two ways to set one number can't drift.
 ///
 /// # Example
 ///
@@ -285,8 +237,8 @@ where
 // Pooled (stub)
 // ---------------------------------------------------------------------------
 
-/// Bounded service pool. **Not implemented in Rock 1**: the type
-/// shape is reserved here so the registry contract and future
+/// Bounded service pool. **Not yet implemented**: the type shape
+/// is reserved so the registry contract and the
 /// `#[tina_rpc::service]` macro can name it without locking it in.
 ///
 /// **No public constructor exists.** A user who reaches for
@@ -324,10 +276,10 @@ where
 ///   forwarding the deferred-reply call_context the same way
 ///   [`crate::Registry`] does today (it already chains through one
 ///   isolate-call hop; pool adds a second).
-/// - The implementation phase decides whether `pool_size` and
+/// - The implementation will decide whether `pool_size` and
 ///   per-worker mailbox capacity live on [`ServiceConfig`]
 ///   (single source of truth) or on the constructor (per-adapter
-///   knobs); Rock 1 deliberately does not commit either way.
+///   knobs); the choice is deliberately not pinned today.
 ///
 /// # Pressure semantics
 ///
@@ -347,8 +299,8 @@ where
     _shard: PhantomData<S>,
     // Private field with a private type prevents struct-literal
     // construction outside this module. There is no public `new`,
-    // so the only way to compile a `PooledService` is to wait for
-    // the implementation phase to add one.
+    // so a `PooledService` cannot be built until a real
+    // implementation ships.
     _seal: Sealed,
 }
 
@@ -357,8 +309,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Sharded service set keyed by some part of the request. **Not
-/// implemented in Rock 1**: depends on phase 053's sharded
-/// primitives.
+/// yet implemented**: depends on the runtime's sharded primitives.
 ///
 /// **No public constructor exists.** Like [`PooledService`], the
 /// type is a reservation, not a runtime trap. Reaching for it
@@ -391,15 +342,15 @@ where
 ///   surfaces as a per-shard `Full`, not a global one. This is
 ///   the load-isolation argument for sharding.
 ///
-/// # Why this depends on 053
+/// # Why this depends on the sharded runtime layer
 ///
-/// Phase 053 ("sharded service primitives") is supposed to land
-/// shard-id types, key extractors, and the runtime support for
-/// directing `IsolateCall`s by shard. Trying to ship `ShardedService`
-/// before those exist would either reinvent that surface or ship a
-/// half-shape that doesn't compose. The stub here exists so the
-/// `#[service]` macro can grow `#[service(shard = ...)]` syntax
-/// without locking in an implementation today.
+/// Sharded primitives (shard-id types, key extractors, runtime
+/// support for directing `IsolateCall`s by shard) are a
+/// prerequisite. Shipping `ShardedService` before they exist would
+/// either reinvent that surface or build a half-shape that doesn't
+/// compose. The stub here lets the `#[service]` macro grow
+/// `#[service(shard = ...)]` syntax without locking in an
+/// implementation today.
 pub struct ShardedService<H, S>
 where
     H: ServiceHandler<S>,

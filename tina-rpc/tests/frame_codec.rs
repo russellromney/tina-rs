@@ -1,4 +1,4 @@
-//! Codec roundtrip and edge-case tests for the phase 052 frame format.
+//! Codec roundtrip and edge-case tests for the wire frame format.
 //!
 //! Property-based roundtrip lives at the bottom under `proptest!`.
 

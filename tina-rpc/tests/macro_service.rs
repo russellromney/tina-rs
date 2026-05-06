@@ -1,11 +1,10 @@
-//! Integration tests for `#[tina_rpc::service]` (Rocks 3 + 4).
+//! Integration tests for `#[tina_rpc::service]`.
 //!
 //! Pin that the macro-generated server-side dispatcher and
-//! client-side stub round-trip through the same wire shape that
-//! 052's raw `ServiceCall` / `ServiceReply` / `ClientRequest` /
-//! `ClientResultMsg` already prove. The macro is pure expansion;
-//! these tests exercise the expansion against a small typed
-//! service.
+//! client-side stub round-trip through the same `ServiceCall` /
+//! `ServiceReply` / `ClientRequest` / `ClientResultMsg` shape the
+//! raw API uses. The macro is pure expansion; these tests
+//! exercise the expansion against a small typed service.
 
 use std::time::Duration;
 

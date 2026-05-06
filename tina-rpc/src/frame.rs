@@ -1,4 +1,4 @@
-//! Wire frame format and codec for Tina framed calls first form.
+//! Wire frame format and codec.
 //!
 //! All multi-byte integers are big-endian. Wire layout:
 //!
@@ -123,7 +123,7 @@ pub enum FrameError {
 /// cannot leak onto the wire and a peer cannot deliver one to your handler.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Frame {
-    /// Wire format version. Always [`FRAME_VERSION_V1`] in first form.
+    /// Wire format version. Always [`FRAME_VERSION_V1`] today.
     pub version: u8,
     /// Frame kind.
     pub kind: FrameKind,

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Tina framed request/reply first form (phase 052). Not gRPC. Not a general RPC framework."
+description = "Tina framed request/reply with bounded in-flight, server-reported wire errors, and visible overload. Not gRPC. Not a general RPC framework."
 repository = "https://github.com/russellromney/tina-rs"
 
 [lib]

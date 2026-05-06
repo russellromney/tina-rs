@@ -1,67 +1,48 @@
-//! Typed service dispatch core (phase 058 Rock 2).
+//! Typed service dispatch core.
 //!
-//! 058 Rock 1 picked the topology shape: a service is a
-//! [`crate::ServiceHandler`] wrapped in one of the topology adapters
-//! ([`crate::SingleService`] / [`crate::PooledService`] /
-//! [`crate::ShardedService`]). This module ships the *runtime-free*
-//! piece that sits one level below: how a single `ServiceCall` —
-//! method name plus opaque bytes — turns into a typed method invocation
-//! with size-capped decode and encode.
-//!
-//! The shape:
+//! Sits one level below the topology adapters: turns a `ServiceCall`
+//! (method name + opaque bytes) into a typed method invocation with
+//! size-capped decode and encode. Runtime-free.
 //!
 //! ```text
 //!   ServiceCall { method, payload }
 //!         │
-//!         ▼
-//!   MethodTable::dispatch
-//!         │  (lookup by name)
-//!         ▼
+//!         ▼  MethodTable::dispatch — lookup by name
 //!   Method::invoke
-//!         │  (decode bytes -> typed request)
-//!         │  (call user handler with &mut State)
-//!         │  (encode typed reply -> bytes)
+//!         │  decode bytes → typed Req
+//!         │  call user handler with &mut State
+//!         │  encode typed Resp → bytes
 //!         ▼
 //!   ServiceReply::{Ok | UnknownMethod | Decode | Internal}
 //! ```
 //!
-//! No macros, no proc-macro, no Tina runtime. The future
-//! `#[tina_rpc::service]` macro (Rock 3) is mostly syntax over the
-//! [`MethodTable`] / [`Method`] / [`Dispatch`] APIs.
+//! `#[tina_rpc::service]` is mostly syntax over [`MethodTable`] /
+//! [`Method`] / [`Dispatch`].
 //!
 //! # Wire-error mapping
 //!
-//! - **Unknown method name**: returns [`ServiceReply::UnknownMethod`].
-//!   The connection isolate maps that to wire `Error(UnknownMethod)`.
-//! - **Decode failure on the request payload**: returns
-//!   [`ServiceReply::Decode`] → wire `Error(Decode)`. Includes the
-//!   "payload exceeds `limits.max_request`" case, since the
-//!   [`Encoding`] trait rejects oversized input before
-//!   deserializing.
-//! - **Encode failure on the reply** (oversize past
-//!   `limits.max_response`, or the chosen encoding refuses the
-//!   value): returns [`ServiceReply::Internal`] → wire
-//!   `Error(Internal)`. Same code is also used for caught handler
-//!   panics. This is a server-side capability mismatch, not a peer
-//!   fault.
-//! - **Success**: [`ServiceReply::Ok(bytes)`] → wire `Reply(bytes)`.
+//! - Unknown method → [`ServiceReply::UnknownMethod`] → wire
+//!   `Error(UnknownMethod)`.
+//! - Request decode fails (including oversize past
+//!   `limits.max_request`) → [`ServiceReply::Decode`] → wire
+//!   `Error(Decode)`.
+//! - Reply encode fails (oversize past `limits.max_response`,
+//!   encoder refuses, or handler panic caught at the boundary) →
+//!   [`ServiceReply::Internal`] → wire `Error(Internal)`.
+//! - Success → [`ServiceReply::Ok(bytes)`] → wire `Reply(bytes)`.
 //!
-//! Domain-level errors (the Rust `Err(..)` value of a handler that
-//! returns a `Result<T, E>`) round-trip on the **success path**: the
-//! encoder serializes them, the bytes ride a `ServiceReply::Ok`, and
-//! the client decodes them as a `Result`. The wire `Error` codes
-//! above are reserved for transport-level / dispatch-level conditions
-//! the client cannot see from its own side.
+//! Domain `Err(..)` from a handler `Result<T, E>` rides the success
+//! path: the encoder serializes both arms, the bytes go in
+//! `ServiceReply::Ok`, the client decodes the `Result`. The wire
+//! error codes are reserved for conditions the client can't see
+//! from its side.
 //!
 //! # Size caps
 //!
-//! Every [`Method`] runs through [`Encoding::decode`] and
-//! [`Encoding::encode`] under a [`PayloadLimits`] budget that bounds
-//! the request and response sides independently. Decode rejects
-//! before the underlying serializer runs; encode caps during
-//! serialization (see the [`crate::encoding`] module for the exact
-//! semantics). [`PayloadLimits::symmetric`] is the convenient case
-//! when the two sides have similar shapes.
+//! [`Method`] runs through [`Encoding::decode`] and
+//! [`Encoding::encode`] under a [`PayloadLimits`] budget — request
+//! and response sides bound independently.
+//! [`PayloadLimits::symmetric`] when shapes are roughly the same.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -102,17 +83,20 @@ impl PayloadLimits {
 }
 
 impl Default for PayloadLimits {
-    /// 64 KiB on both sides. Comfortable for JSON payloads typical
-    /// of a first-form service; stricter than the connection's
-    /// default `max_frame_size` so the wire envelope is the looser
-    /// constraint.
+    /// 64 KiB on both sides. Comfortable for typical JSON payloads;
+    /// stricter than the connection's default `max_frame_size` so
+    /// the wire envelope is the looser constraint.
     fn default() -> Self {
         Self::symmetric(64 * 1024)
     }
 }
 
 /// The internal shape of a typed method's boxed handler closure.
-type InvokeFn<St, E> = Box<dyn Fn(&mut St, &[u8], &E, &PayloadLimits) -> ServiceReply>;
+///
+/// `Send` is required so a `Dispatch` containing the closure can be
+/// registered with `ThreadedRuntime::register_with_capacity`, which
+/// moves isolates across threads.
+type InvokeFn<St, E> = Box<dyn Fn(&mut St, &[u8], &E, &PayloadLimits) -> ServiceReply + Send>;
 
 /// One typed method entry: a method name plus a boxed closure that
 /// knows how to decode the request bytes, call the user handler with
@@ -187,7 +171,7 @@ where
     where
         Req: DeserializeOwned + 'static,
         Resp: Serialize + 'static,
-        F: Fn(&mut St, Req) -> Resp + 'static,
+        F: Fn(&mut St, Req) -> Resp + Send + 'static,
     {
         let invoke = move |state: &mut St,
                            payload: &[u8],
@@ -639,7 +623,7 @@ mod tests {
     #[test]
     fn dispatch_composes_with_single_service() {
         // End-to-end wiring: build a Dispatch, drop it into
-        // SingleService (Rock 1's first-form topology adapter),
+        // SingleService (the single-isolate topology adapter),
         // and prove the resulting Tina isolate handler routes a
         // ServiceCall to ServiceReply via Effect::Reply.
         use crate::SingleService;

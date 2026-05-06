@@ -32,9 +32,10 @@ use syn::{
 ///   Caller still owns deadline, correlator, reply_to, and the
 ///   wiring to the [`tina_rpc::Client`] isolate.
 ///
-/// First form: synchronous trait methods only, JSON encoding (the
-/// only [`tina_rpc::Encoding`] impl shipped today). Future forms
-/// will accept `#[tina_rpc::service(encoding = SomeOther)]`.
+/// Synchronous trait methods only. JSON is the default
+/// [`tina_rpc::Encoding`] (the only one shipped today); other
+/// encodings can be requested via
+/// `#[tina_rpc::service(encoding = SomeOther)]`.
 #[proc_macro_attribute]
 pub fn service(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ServiceArgs);
@@ -176,8 +177,8 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     if method.sig.asyncness.is_some() {
         return Err(Error::new_spanned(
             method.sig.asyncness,
-            "first-form service trait methods are synchronous; \
-             async-handler support is deferred to a later phase",
+            "service trait methods are synchronous; async-handler \
+             support is not yet available",
         ));
     }
     if method.sig.unsafety.is_some() {
@@ -196,7 +197,7 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     if !method.sig.generics.params.is_empty() {
         return Err(Error::new_spanned(
             &method.sig.generics,
-            "service trait methods cannot be generic in first form",
+            "service trait methods cannot be generic",
         ));
     }
     if method.default.is_some() {
@@ -334,8 +335,8 @@ fn build_dispatch_impl(
          transport-level conditions the dispatch core handles \
          automatically. A future macro form may accept \
          `#[tina_rpc::service(map_error = ...)]` for explicit \
-         opt-in to wire-error mapping; first form picks the \
-         encode-in-payload default."
+         opt-in to wire-error mapping; the default today is \
+         encode-in-payload."
     );
     let doc_service_name = format!("Wire service name (`\"{service_name_lit}\"`).");
 
@@ -478,8 +479,8 @@ fn build_client_method(encoding_ty: &Type, m: &MethodSig) -> TokenStream2 {
          JSON). **The wire shape is positional**: adding, removing, \
          or reordering args changes the payload layout and breaks \
          existing clients silently. Versioning helpers (struct-shaped \
-         payloads, named field tags) are deliberately out of scope \
-         for first form per the no-public-wire-compat rule.\n\
+         payloads, named field tags) are out of scope; the wire \
+         carries no public compatibility promise.\n\
          \n\
          Submit the result to a [`tina_rpc::Client`] via \
          `ClientMsg::Request`. The reply arrives at `reply_to` as \

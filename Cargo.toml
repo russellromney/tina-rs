@@ -6,6 +6,7 @@ members = [
     "tina-mailbox-spsc",
     "tina-rpc",
     "tina-rpc-macros",
+    "tina-rpc-tokio",
     "tina-runtime",
     "tina-sim",
     "tina-supervisor",
