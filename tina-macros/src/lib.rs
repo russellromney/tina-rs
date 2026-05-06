@@ -124,12 +124,14 @@ fn build_isolate(
             "missing required isolate option `message = ...`",
         ));
     };
-    let Some(shard) = args.shard else {
-        return Err(Error::new_spanned(
-            &item.self_ty,
-            "missing required isolate option `shard = ...`",
-        ));
-    };
+    // Phase 047 Rock 5: `shard = ...` is now optional. Single-shard
+    // programs default to `tina::SingleShard`; multi-shard programs
+    // continue to declare their own shard type explicitly. The default is
+    // a real type (not a global mutable singleton), so registration still
+    // requires the user to construct the shard at runtime startup.
+    let shard = args
+        .shard
+        .unwrap_or_else(|| syn::parse_quote!(::tina::SingleShard));
 
     let reply = args.reply.unwrap_or_else(|| syn::parse_quote!(()));
     let send = args

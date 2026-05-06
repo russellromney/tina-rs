@@ -1,78 +1,16 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
-    CallError, MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, signal_wait, sleep,
+    CallError, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, signal_wait,
+    sleep,
 };
 
 use super::{ITEM_INTERVAL_MS, SIGNAL_AFTER_MS, SideReport, TOTAL_PLANNED_ITEMS};
-
-#[derive(Debug, Default)]
-struct ShutdownShard;
-
-impl Shard for ShutdownShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(64)
-    }
-}
-
-struct ShutdownMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> ShutdownMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for ShutdownMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ShutdownMailboxFactory;
-
-impl MailboxFactory for ShutdownMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(ShutdownMailbox::new(capacity))
-    }
-}
 
 #[derive(Default)]
 struct Telemetry {
@@ -92,9 +30,9 @@ struct Consumer {
     telemetry: Arc<Telemetry>,
 }
 
-#[tina_runtime::isolate(message = ConsumerMsg, shard = ShutdownShard)]
+#[tina_runtime::isolate(message = ConsumerMsg)]
 impl Consumer {
-    fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, ShutdownShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             ConsumerMsg::Item(_n) => sleep(Duration::from_millis(1)).reply(ConsumerMsg::Done),
             ConsumerMsg::Done(result) => {
@@ -124,10 +62,9 @@ struct Producer {
 #[tina_runtime::isolate(
     message = ProducerMsg,
     send = Outbound<ConsumerMsg>,
-    shard = ShutdownShard
 )]
 impl Producer {
-    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, ShutdownShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             ProducerMsg::Tick(n) => {
                 if self.stopped || n >= self.target {
@@ -173,10 +110,9 @@ struct SignalWatcher {
 #[tina_runtime::isolate(
     message = SignalMsg,
     send = Outbound<ProducerMsg>,
-    shard = ShutdownShard
 )]
 impl SignalWatcher {
-    fn handle(&mut self, msg: SignalMsg, _ctx: &mut Context<'_, ShutdownShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: SignalMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             SignalMsg::Begin => {
                 signal_wait("sigint", Duration::from_secs(10)).reply(SignalMsg::Received)
@@ -194,8 +130,8 @@ impl SignalWatcher {
 
 pub(crate) fn run() -> SideReport {
     let runtime = ThreadedRuntime::with_config(
-        ShutdownShard,
-        ShutdownMailboxFactory,
+        SingleShard,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),

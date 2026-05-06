@@ -94,17 +94,17 @@ What was awkward or surprising:
   Tokio side has `write_all`. Tina does not, at the runtime-call
   surface. Probably correct — `write_all` hides retries — but the
   pattern is going to be in every Tina TCP client.
-- Same `Mailbox` + `MailboxFactory` boilerplate as the other four
-  comparisons. Fifth time. The ergonomics doc has noticed.
+- ~~Same `Mailbox` + `MailboxFactory` boilerplate as the other four
+  comparisons.~~ **Resolved in phase 047:** the example uses
+  `DefaultThreadedMailboxFactory`.
 - `FetchMsg` ballooned: `Begin`, `Connected`, `Wrote`, `Read`,
   `Closed`. Plus their `Ok`/`Err` arms. This is the
   "Continuation Enum Growth" sharp edge from the user guide,
   applied to a five-step protocol.
-- The driver thread waits on a shared `AtomicBool::done` flag. Same
-  flavor as `eiffel_persistent_counter`'s `op` correlation id and
-  `eiffel_supervised_worker`'s slot-generation. Three different
-  hand-rolls of "wait for the isolate to finish" because there is
-  no public "join" primitive at the threaded-runtime API surface.
+- ~~The driver thread waits on a shared `AtomicBool::done` flag.~~
+  **Resolved in phase 047:** the driver registers
+  `runtime.observe_isolate_complete(fetcher)` before kicking the isolate
+  and waits on the typed waiter instead.
 
 ### Tokio shape vs. Tina shape, in one paragraph
 

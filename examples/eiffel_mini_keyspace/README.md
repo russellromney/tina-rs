@@ -71,29 +71,26 @@ What was awkward or surprising:
   enough room for the inbound `StoreReturned` callbacks plus the trailing
   `Wrote`/`Closed` messages; we picked 16 and moved on, but a smaller number
   silently breaks the run. There is no obvious "right" default for this.
-- A custom `Mailbox` + `MailboxFactory` pair is required just to instantiate
-  `ThreadedRuntime`. The `tina-mailbox-spsc` crate exists for tests, but
-  examples still copy ~40 lines of `Rc<RefCell<VecDeque<_>>>` boilerplate. A
-  default in-process mailbox would remove the friction.
-- The bound listener address has to be smuggled out through an
-  `Arc<Mutex<Option<SocketAddr>>>` because nothing in the runtime exposes
-  "tell the outside world what port you got". For real TCP examples this is a
-  recurring papercut — every comparison so far has reinvented `BoundAddr`.
+- ~~A custom `Mailbox` + `MailboxFactory` pair is required just to instantiate
+  `ThreadedRuntime`.~~ **Resolved in phase 047:** the comparison now uses
+  `tina_runtime::DefaultThreadedMailboxFactory`. The 40-line `KeyspaceMailbox` /
+  `KeyspaceMailboxFactory` boilerplate is gone.
+- ~~The bound listener address has to be smuggled out through an
+  `Arc<Mutex<Option<SocketAddr>>>`.~~ **Resolved in phase 047:** the host now
+  calls `runtime.observe_next_bound()` and `waiter.wait(timeout)` instead. The
+  `BoundAddr` type alias, the `Arc<Mutex<Option<SocketAddr>>>` allocation, and
+  the `bound_addr` field on the `Listener` isolate are all gone.
 - Shutdown still relies on `complete_trace()` polling for a specific
   `CallKind::TcpStreamClose` event. Useful for tests, but not a story we want
-  to ship. The runtime needs a "this isolate finished cleanly" signal that
-  external code can await without scanning the trace.
-- The `#[isolate(... shard = KeyspaceShard)]` attribute requires every
-  isolate to declare a shard even when there is only one. Single-shard
-  examples should be allowed to omit it.
+  to ship. Phase 047 added operation-done waiters for narrower host waits;
+  a richer terminal/shutdown waiter is still future work.
+- ~~The `#[isolate(... shard = KeyspaceShard)]` attribute requires every
+  isolate to declare a shard even when there is only one.~~ **Resolved in
+  phase 047:** the example now omits `shard = ...` and uses `SingleShard`.
 
 ### Suggested follow-ups for Tina (recorded for the roadmap)
 
-- Provide a default `MailboxFactory` for in-process examples.
-- Provide a "wait for isolate to stop" handle so tests/examples don't
-  scrape the trace.
+- Keep improving host observation shapes for shutdown/terminal facts.
 - Consider sugar for "issue a sequence of calls then write a buffer" — the
   `next_effect()` shape will recur in nearly every connection-handling
   isolate.
-- Consider returning the bound `SocketAddr` as part of `tcp_bind`'s reply
-  in a way the spawning code can read without a side-channel mutex.

@@ -560,4 +560,508 @@ impl RuntimeEvent {
     pub const fn kind(self) -> RuntimeEventKind {
         self.kind
     }
+
+    /// Returns a deterministic 64-bit fingerprint of this runtime event.
+    ///
+    /// The hash is stable for the Tina trace semantics in this version of the
+    /// crate: same inputs (same seed, same workload) produce the same value,
+    /// and runs whose traces differ in any deterministic field (id, cause,
+    /// shard, isolate, kind, kind payload) produce different values with
+    /// extremely high probability. This is **not** a forever external wire
+    /// format. Cross-version stability is not promised; consumers that need
+    /// long-term persistence should serialize the event explicitly.
+    ///
+    /// `stable_hash` is intentionally independent of `std::hash::Hash` and
+    /// `DefaultHasher`: the variant tags are assigned explicitly so that
+    /// adding a new variant in the middle of the enum never silently changes
+    /// the fingerprint of existing variants. The hash is FNV-1a over a
+    /// canonical byte walk of every field; field order is part of the
+    /// contract.
+    pub fn stable_hash(&self) -> u64 {
+        let mut hasher = StableHasher::new();
+        self.write_stable(&mut hasher);
+        hasher.finish()
+    }
+
+    fn write_stable(&self, hasher: &mut StableHasher) {
+        hasher.write_u64(self.id.get());
+        match self.cause {
+            None => hasher.write_u8(0),
+            Some(cause) => {
+                hasher.write_u8(1);
+                hasher.write_u64(cause.event().get());
+            }
+        }
+        hasher.write_u32(self.shard.get());
+        hasher.write_u64(self.isolate.get());
+        write_kind_stable(self.kind, hasher);
+    }
+}
+
+/// Stable, allocation-free FNV-1a hasher used for trace fingerprints.
+///
+/// FNV-1a is chosen over `std::hash::DefaultHasher` because its bytewise
+/// behavior is documented and unchanging, which lets `stable_hash` be a
+/// real contract instead of an implementation detail of stdlib.
+struct StableHasher {
+    state: u64,
+}
+
+impl StableHasher {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    fn new() -> Self {
+        Self {
+            state: Self::OFFSET_BASIS,
+        }
+    }
+
+    fn write_u8(&mut self, byte: u8) {
+        self.state ^= byte as u64;
+        self.state = self.state.wrapping_mul(Self::PRIME);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        for shift in 0..4 {
+            self.write_u8((value >> (shift * 8)) as u8);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        for shift in 0..8 {
+            self.write_u8((value >> (shift * 8)) as u8);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.state
+    }
+}
+
+/// Stable variant tag for [`RestartPolicy`].
+fn restart_policy_tag(policy: RestartPolicy) -> u8 {
+    match policy {
+        RestartPolicy::OneForOne => 1,
+        RestartPolicy::OneForAll => 2,
+        RestartPolicy::RestForOne => 3,
+    }
+}
+
+/// Stable variant tag for [`EffectKind`].
+fn effect_kind_tag(effect: EffectKind) -> u8 {
+    match effect {
+        EffectKind::Noop => 1,
+        EffectKind::Reply => 2,
+        EffectKind::Send => 3,
+        EffectKind::Spawn => 4,
+        EffectKind::Stop => 5,
+        EffectKind::RestartChildren => 6,
+        EffectKind::Call => 7,
+        EffectKind::Batch => 8,
+    }
+}
+
+/// Stable variant tag for [`CallKind`].
+fn call_kind_tag(kind: CallKind) -> u8 {
+    match kind {
+        CallKind::TcpBind => 1,
+        CallKind::TcpAccept => 2,
+        CallKind::TcpConnect => 3,
+        CallKind::TcpRead => 4,
+        CallKind::TcpWrite => 5,
+        CallKind::TcpListenerClose => 6,
+        CallKind::TcpStreamClose => 7,
+        CallKind::UdpBind => 8,
+        CallKind::UdpSendTo => 9,
+        CallKind::UdpRecvFrom => 10,
+        CallKind::UdpSocketClose => 11,
+        CallKind::TlsConnect => 12,
+        CallKind::TlsBind => 13,
+        CallKind::TlsAccept => 14,
+        CallKind::TlsListenerClose => 15,
+        CallKind::TlsRead => 16,
+        CallKind::TlsWrite => 17,
+        CallKind::TlsClose => 18,
+        CallKind::DnsLookup => 19,
+        CallKind::SignalWait => 20,
+        CallKind::ProcessRun => 21,
+        CallKind::FileOpen => 22,
+        CallKind::FileReadAt => 23,
+        CallKind::FileWriteAt => 24,
+        CallKind::FileFsync => 25,
+        CallKind::FileSize => 26,
+        CallKind::FileClose => 27,
+        CallKind::Mkdir => 28,
+        CallKind::PathMetadata => 29,
+        CallKind::RenameReplace => 30,
+        CallKind::RemoveFile => 31,
+        CallKind::ReadDir => 32,
+        CallKind::SyncParent => 33,
+        CallKind::SnapshotCommit => 34,
+        CallKind::SnapshotLoad => 35,
+        CallKind::JournalAppend => 36,
+        CallKind::JournalReplay => 37,
+        CallKind::Sleep => 38,
+        CallKind::ObservedSend => 39,
+        CallKind::IsolateCall => 40,
+    }
+}
+
+/// Stable variant tag for [`CallError`].
+fn call_error_tag(error: CallError) -> u8 {
+    match error {
+        CallError::InvalidResource => 1,
+        CallError::NotFound => 2,
+        CallError::Io => 3,
+        CallError::Unsupported => 4,
+        CallError::ResourceBusy => 5,
+        CallError::CorruptRecord => 6,
+        CallError::CommitUncertain => 7,
+        CallError::StorageFull => 8,
+        CallError::StorageClosed => 9,
+        CallError::TargetFull => 10,
+        CallError::TargetClosed => 11,
+        CallError::Timeout => 12,
+        CallError::DnsFull => 13,
+        CallError::DnsClosed => 14,
+        CallError::TlsFull => 15,
+        CallError::TlsClosed => 16,
+        CallError::TlsCertificate => 17,
+        CallError::TlsName => 18,
+        CallError::TlsHandshake => 19,
+        CallError::SignalFull => 20,
+        CallError::SignalClosed => 21,
+        CallError::ProcessFull => 22,
+        CallError::ProcessClosed => 23,
+        CallError::KillUncertain => 24,
+    }
+}
+
+fn send_rejected_tag(reason: SendRejectedReason) -> u8 {
+    match reason {
+        SendRejectedReason::Full => 1,
+        SendRejectedReason::Closed => 2,
+    }
+}
+
+fn restart_skipped_tag(reason: RestartSkippedReason) -> u8 {
+    match reason {
+        RestartSkippedReason::NotRestartable => 1,
+    }
+}
+
+fn supervision_rejected_write(reason: SupervisionRejectedReason, hasher: &mut StableHasher) {
+    match reason {
+        SupervisionRejectedReason::BudgetExceeded {
+            attempted_restart,
+            max_restarts,
+        } => {
+            hasher.write_u8(1);
+            hasher.write_u32(attempted_restart);
+            hasher.write_u32(max_restarts);
+        }
+        SupervisionRejectedReason::SupervisorStopped => hasher.write_u8(2),
+    }
+}
+
+fn call_completion_rejected_tag(reason: CallCompletionRejectedReason) -> u8 {
+    match reason {
+        CallCompletionRejectedReason::MailboxFull => 1,
+        CallCompletionRejectedReason::RequesterClosed => 2,
+    }
+}
+
+fn call_reply_rejected_tag(reason: CallReplyRejectedReason) -> u8 {
+    match reason {
+        CallReplyRejectedReason::NoPendingCall => 1,
+        CallReplyRejectedReason::ReplyPathFull => 2,
+        CallReplyRejectedReason::RequesterShardClosed => 3,
+    }
+}
+
+fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
+    match kind {
+        RuntimeEventKind::MailboxAccepted => hasher.write_u8(1),
+        RuntimeEventKind::HandlerStarted => hasher.write_u8(2),
+        RuntimeEventKind::HandlerPanicked => hasher.write_u8(3),
+        RuntimeEventKind::HandlerFinished { effect } => {
+            hasher.write_u8(4);
+            hasher.write_u8(effect_kind_tag(effect));
+        }
+        RuntimeEventKind::EffectObserved { effect } => {
+            hasher.write_u8(5);
+            hasher.write_u8(effect_kind_tag(effect));
+        }
+        RuntimeEventKind::SendDispatchAttempted {
+            target_shard,
+            target_isolate,
+            target_generation,
+        } => {
+            hasher.write_u8(6);
+            hasher.write_u32(target_shard.get());
+            hasher.write_u64(target_isolate.get());
+            hasher.write_u64(target_generation.get());
+        }
+        RuntimeEventKind::SendAccepted {
+            target_shard,
+            target_isolate,
+            target_generation,
+        } => {
+            hasher.write_u8(7);
+            hasher.write_u32(target_shard.get());
+            hasher.write_u64(target_isolate.get());
+            hasher.write_u64(target_generation.get());
+        }
+        RuntimeEventKind::SendRejected {
+            target_shard,
+            target_isolate,
+            target_generation,
+            reason,
+        } => {
+            hasher.write_u8(8);
+            hasher.write_u32(target_shard.get());
+            hasher.write_u64(target_isolate.get());
+            hasher.write_u64(target_generation.get());
+            hasher.write_u8(send_rejected_tag(reason));
+        }
+        RuntimeEventKind::Spawned { child_isolate } => {
+            hasher.write_u8(9);
+            hasher.write_u64(child_isolate.get());
+        }
+        RuntimeEventKind::SupervisorRestartTriggered {
+            policy,
+            failed_child,
+            failed_ordinal,
+        } => {
+            hasher.write_u8(10);
+            hasher.write_u8(restart_policy_tag(policy));
+            hasher.write_u64(failed_child.get());
+            hasher.write_u64(failed_ordinal as u64);
+        }
+        RuntimeEventKind::SupervisorRestartRejected {
+            failed_child,
+            failed_ordinal,
+            reason,
+        } => {
+            hasher.write_u8(11);
+            hasher.write_u64(failed_child.get());
+            hasher.write_u64(failed_ordinal as u64);
+            supervision_rejected_write(reason, hasher);
+        }
+        RuntimeEventKind::RestartChildAttempted {
+            child_ordinal,
+            old_isolate,
+            old_generation,
+        } => {
+            hasher.write_u8(12);
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(old_isolate.get());
+            hasher.write_u64(old_generation.get());
+        }
+        RuntimeEventKind::RestartChildSkipped {
+            child_ordinal,
+            old_isolate,
+            old_generation,
+            reason,
+        } => {
+            hasher.write_u8(13);
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(old_isolate.get());
+            hasher.write_u64(old_generation.get());
+            hasher.write_u8(restart_skipped_tag(reason));
+        }
+        RuntimeEventKind::RestartChildCompleted {
+            child_ordinal,
+            old_isolate,
+            old_generation,
+            new_isolate,
+            new_generation,
+        } => {
+            hasher.write_u8(14);
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(old_isolate.get());
+            hasher.write_u64(old_generation.get());
+            hasher.write_u64(new_isolate.get());
+            hasher.write_u64(new_generation.get());
+        }
+        RuntimeEventKind::IsolateStopped => hasher.write_u8(15),
+        RuntimeEventKind::MessageAbandoned => hasher.write_u8(16),
+        RuntimeEventKind::CallDispatchAttempted { call_id, call_kind } => {
+            hasher.write_u8(17);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_kind_tag(call_kind));
+        }
+        RuntimeEventKind::CallCompleted { call_id, call_kind } => {
+            hasher.write_u8(18);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_kind_tag(call_kind));
+        }
+        RuntimeEventKind::CallFailed {
+            call_id,
+            call_kind,
+            reason,
+        } => {
+            hasher.write_u8(19);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_kind_tag(call_kind));
+            hasher.write_u8(call_error_tag(reason));
+        }
+        RuntimeEventKind::CallCompletionRejected {
+            call_id,
+            call_kind,
+            reason,
+        } => {
+            hasher.write_u8(20);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_kind_tag(call_kind));
+            hasher.write_u8(call_completion_rejected_tag(reason));
+        }
+        RuntimeEventKind::CallReplyRejected { call_id, reason } => {
+            hasher.write_u8(21);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_reply_rejected_tag(reason));
+        }
+        RuntimeEventKind::SnapshotCommitted => hasher.write_u8(22),
+        RuntimeEventKind::SnapshotCommitFailed { reason } => {
+            hasher.write_u8(23);
+            hasher.write_u8(call_error_tag(reason));
+        }
+        RuntimeEventKind::JournalAppended { record_index } => {
+            hasher.write_u8(24);
+            hasher.write_u64(record_index);
+        }
+        RuntimeEventKind::JournalAppendFailed {
+            record_index,
+            reason,
+        } => {
+            hasher.write_u8(25);
+            hasher.write_u64(record_index);
+            hasher.write_u8(call_error_tag(reason));
+        }
+        RuntimeEventKind::RecoveryStarted => hasher.write_u8(26),
+        RuntimeEventKind::RecoveryFinished => hasher.write_u8(27),
+        RuntimeEventKind::RecoveryFailed { reason } => {
+            hasher.write_u8(28);
+            hasher.write_u8(call_error_tag(reason));
+        }
+    }
+}
+
+/// Compute a stable fingerprint of an entire trace as the FNV-1a chain of
+/// each event's [`RuntimeEvent::stable_hash`] in iteration order.
+///
+/// Same stability promise as [`RuntimeEvent::stable_hash`]: stable for the
+/// current Tina version, not a long-term wire format. Trace consumers that
+/// need cross-run comparisons typically already sort by [`EventId`] before
+/// calling this; callers that want order-insensitive comparison must sort
+/// before passing in.
+pub fn stable_trace_hash<'a, I>(events: I) -> u64
+where
+    I: IntoIterator<Item = &'a RuntimeEvent>,
+{
+    let mut hasher = StableHasher::new();
+    for event in events {
+        hasher.write_u64(event.stable_hash());
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod stable_hash_tests {
+    use super::*;
+    use tina::{AddressGeneration, IsolateId, ShardId};
+
+    fn sample_event() -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(7),
+            Some(CauseId::new(EventId::new(3))),
+            ShardId::new(0),
+            IsolateId::new(42),
+            RuntimeEventKind::SendAccepted {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(99),
+                target_generation: AddressGeneration::new(1),
+            },
+        )
+    }
+
+    #[test]
+    fn stable_hash_is_deterministic() {
+        let event = sample_event();
+        assert_eq!(event.stable_hash(), event.stable_hash());
+    }
+
+    #[test]
+    fn stable_hash_changes_with_id() {
+        let mut event = sample_event();
+        let original = event.stable_hash();
+        event = RuntimeEvent::new(
+            EventId::new(8),
+            event.cause(),
+            event.shard(),
+            event.isolate(),
+            event.kind(),
+        );
+        assert_ne!(event.stable_hash(), original);
+    }
+
+    #[test]
+    fn stable_hash_changes_with_kind_payload() {
+        let original = sample_event();
+        let mutated = RuntimeEvent::new(
+            original.id(),
+            original.cause(),
+            original.shard(),
+            original.isolate(),
+            RuntimeEventKind::SendAccepted {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(99),
+                target_generation: AddressGeneration::new(2),
+            },
+        );
+        assert_ne!(original.stable_hash(), mutated.stable_hash());
+    }
+
+    #[test]
+    fn stable_hash_distinguishes_variants_with_same_payload_layout() {
+        let send_accepted = RuntimeEvent::new(
+            EventId::new(1),
+            None,
+            ShardId::new(0),
+            IsolateId::new(1),
+            RuntimeEventKind::SendAccepted {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(2),
+                target_generation: AddressGeneration::new(0),
+            },
+        );
+        let send_dispatch = RuntimeEvent::new(
+            EventId::new(1),
+            None,
+            ShardId::new(0),
+            IsolateId::new(1),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(2),
+                target_generation: AddressGeneration::new(0),
+            },
+        );
+        assert_ne!(send_accepted.stable_hash(), send_dispatch.stable_hash());
+    }
+
+    #[test]
+    fn stable_trace_hash_is_order_sensitive() {
+        let a = sample_event();
+        let b = RuntimeEvent::new(
+            EventId::new(8),
+            a.cause(),
+            a.shard(),
+            a.isolate(),
+            RuntimeEventKind::IsolateStopped,
+        );
+        let forward = stable_trace_hash([&a, &b]);
+        let reversed = stable_trace_hash([&b, &a]);
+        assert_ne!(forward, reversed);
+    }
 }
