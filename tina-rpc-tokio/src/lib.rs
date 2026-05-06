@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 use tina::{Address, Context, Effect, Isolate, Outbound};
 use tina_rpc::{
@@ -144,17 +144,23 @@ fn map_client_result(result: ClientResult) -> Result<Vec<u8>, BridgeError> {
 // Shim isolate: receives ClientResultMsg and forwards via oneshot
 // ---------------------------------------------------------------------------
 
-type PendingMap = HashMap<u64, oneshot::Sender<ClientResult>>;
+/// Pending entries hold `Some(tx)` while a future is awaiting. When
+/// the future is cancelled the [`CancelGuard`] flips it to `None` so
+/// the shim still sees the correlator was admitted (and releases the
+/// admission slot) without trying a dead `oneshot::Sender`.
+type PendingMap = HashMap<u64, Option<oneshot::Sender<ClientResult>>>;
 
 /// Shim isolate registered with the runtime once per [`BridgeClient`].
 /// Its only job is to receive [`ClientResultMsg`] from the
-/// `tina_rpc::Client` and route the per-correlator
-/// `oneshot::Sender` back to the awaiting Tokio task.
+/// `tina_rpc::Client`, route the per-correlator `oneshot::Sender`
+/// back to the awaiting Tokio task, and release one admission slot
+/// for the call that just completed.
 struct ReplyShim<S>
 where
     S: tina::Shard,
 {
     pending: Arc<Mutex<PendingMap>>,
+    slots: Arc<Semaphore>,
     _shard: std::marker::PhantomData<S>,
 }
 
@@ -170,22 +176,31 @@ where
     type Shard = S;
 
     fn handle(&mut self, msg: ClientResultMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
-        let sender = {
+        let entry = {
             let mut pending = self
                 .pending
                 .lock()
                 .expect("BridgeClient pending map mutex poisoned");
             pending.remove(&msg.correlator)
         };
-        if let Some(tx) = sender {
-            // The receiver may have been dropped (caller cancelled the
-            // future); a send error is a noop.
-            let _ = tx.send(msg.result);
+        match entry {
+            Some(Some(tx)) => {
+                // Live awaiter. The receiver may already be dropped;
+                // a send error is a noop.
+                let _ = tx.send(msg.result);
+                self.slots.add_permits(1);
+            }
+            Some(None) => {
+                // Awaiter was cancelled before the reply landed.
+                // Release the admission slot so a queued caller can
+                // proceed.
+                self.slots.add_permits(1);
+            }
+            None => {
+                // Stray: not an admitted correlator. Drop without
+                // releasing — no slot was reserved on its behalf.
+            }
         }
-        // Stray message (no correlator match) is silently dropped —
-        // the underlying Client already enforces "one reply per
-        // correlator" so this only happens on logic bugs in the
-        // caller.
         Effect::Noop
     }
 }
@@ -245,6 +260,11 @@ where
     client_addr: Address<ClientMsg>,
     shim_addr: Address<ClientResultMsg>,
     pending: Arc<Mutex<PendingMap>>,
+    /// Bounded admission counter. One permit = one guaranteed reply
+    /// slot in the shim's mailbox. Acquired synchronously in `call`;
+    /// released by the shim when the reply lands or by the observer
+    /// when ingress fails.
+    slots: Arc<Semaphore>,
     next_correlator: AtomicU64,
     send_and_observe: SendAndObserve,
     _shard: std::marker::PhantomData<S>,
@@ -259,10 +279,14 @@ where
     /// [`ClientResultMsg`] notifications and demux them back to
     /// per-call awaiters.
     ///
-    /// `shim_capacity` is the shim's mailbox capacity; a healthy
-    /// caller sets this at least equal to the underlying
-    /// `Client::max_in_flight` so reply backpressure cannot cause
-    /// `ClientResultMsg` send failures at the runtime boundary.
+    /// `max_in_flight` is the bridge's hard cap on simultaneously
+    /// in-flight calls. Past it, [`BridgeClient::call`] returns
+    /// [`BridgeError::Full`] **synchronously**, before any
+    /// `ClientMsg::Request` hits the runtime. The shim isolate's
+    /// mailbox is sized to match — a successful admission therefore
+    /// guarantees a reply slot, so the shim never silently drops a
+    /// `ClientResultMsg` and an awaiter never hangs on lost replies.
+    /// Must be `> 0`.
     ///
     /// `runtime` is taken as `Arc<ThreadedRuntime<...>>` because
     /// the bridge's reply demux closure must outlive any single
@@ -272,18 +296,24 @@ where
     pub fn new<F>(
         runtime: Arc<ThreadedRuntime<S, F>>,
         client_addr: Address<ClientMsg>,
-        shim_capacity: usize,
+        max_in_flight: usize,
     ) -> Result<Self, BridgeError>
     where
         F: MailboxFactory + Send + Clone + 'static,
     {
+        assert!(
+            max_in_flight > 0,
+            "BridgeClient::new requires max_in_flight > 0",
+        );
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let slots = Arc::new(Semaphore::new(max_in_flight));
         let shim = ReplyShim::<S> {
             pending: Arc::clone(&pending),
+            slots: Arc::clone(&slots),
             _shard: std::marker::PhantomData,
         };
         let shim_addr = runtime
-            .register_with_capacity::<ReplyShim<S>, Infallible>(shim, shim_capacity)
+            .register_with_capacity::<ReplyShim<S>, Infallible>(shim, max_in_flight)
             .map_err(|_| BridgeError::ClientUnavailable)?;
         // We keep the runtime in a closure rather than carrying
         // `<S, F>` through `BridgeClient`'s public type. The
@@ -298,6 +328,7 @@ where
                 client_addr,
                 shim_addr,
                 pending,
+                slots,
                 next_correlator: AtomicU64::new(1),
                 send_and_observe,
                 _shard: std::marker::PhantomData,
@@ -330,6 +361,21 @@ where
         R: FnOnce(u64, Address<ClientResultMsg>) -> Result<ClientRequest, EncodingError>,
         D: FnOnce(&[u8]) -> Result<T, EncodingError>,
     {
+        // Bounded admission. Synchronous refusal at saturation is the
+        // single guarantee that prevents "shim mailbox full → reply
+        // dropped → awaiter hangs forever." Past `max_in_flight`,
+        // `BridgeError::Full` returns immediately, never sends.
+        let permit = match Arc::clone(&self.inner.slots).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Err(BridgeError::Full),
+        };
+        // We "forget" the permit — the slot is held until a shim
+        // notification (or observer / abort path) explicitly returns
+        // it via `add_permits(1)`. This guarantees the live
+        // permit-count tracks "calls whose reply slot is still
+        // reserved," not "futures still polling."
+        permit.forget();
+
         let correlator = self.inner.next_correlator.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel::<ClientResult>();
 
@@ -341,13 +387,13 @@ where
                 .pending
                 .lock()
                 .expect("BridgeClient pending map mutex poisoned");
-            pending.insert(correlator, tx);
+            pending.insert(correlator, Some(tx));
         }
 
         let request = match request_fn(correlator, self.inner.shim_addr) {
             Ok(req) => req,
             Err(err) => {
-                self.cancel_pending(correlator);
+                self.abort_admitted(correlator);
                 return Err(BridgeError::Encoding(err));
             }
         };
@@ -373,8 +419,12 @@ where
 
         // Submit through `try_send_and_observe_with` so a target-side
         // `Full`/`Closed` is surfaced back to the awaiter rather than
-        // silently dropped on the worker thread.
+        // silently dropped on the worker thread. When the observer
+        // fires `Err`, the message never reached the `Client`, so the
+        // shim will never see this correlator — the observer must
+        // therefore release the admission slot itself.
         let pending_for_observer = Arc::clone(&self.inner.pending);
+        let slots_for_observer = Arc::clone(&self.inner.slots);
         let observer: Box<dyn FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static> =
             Box::new(move |observed| {
                 if let Err(err) = observed {
@@ -386,11 +436,14 @@ where
                             ClientResult::IoError(tina_runtime::CallError::Io)
                         }
                     };
-                    if let Ok(mut pending) = pending_for_observer.lock() {
-                        if let Some(tx) = pending.remove(&correlator) {
-                            let _ = tx.send(mapped);
-                        }
+                    let entry = pending_for_observer
+                        .lock()
+                        .ok()
+                        .and_then(|mut p| p.remove(&correlator));
+                    if let Some(Some(tx)) = entry {
+                        let _ = tx.send(mapped);
                     }
+                    slots_for_observer.add_permits(1);
                 }
             });
 
@@ -400,29 +453,51 @@ where
             observer,
         );
         if let Err(err) = send_outcome {
-            self.cancel_pending(correlator);
+            self.abort_admitted(correlator);
             #[cfg(feature = "tracing")]
             warn!(error = ?err, "rpc bridge ingress failed");
             let _ = err;
             return Err(BridgeError::ClientUnavailable);
         }
 
-        let await_fut = async {
-            match rx.await {
-                Ok(result) => Ok(result),
-                Err(_) => {
-                    self.cancel_pending(correlator);
-                    Err(BridgeError::ShimGone)
-                }
-            }
+        // Drop guard for cancellation: if the awaiting future is
+        // dropped, leave a `None` marker in the pending map so the
+        // shim still releases the admission slot when the eventual
+        // reply lands. We do *not* release the slot from the guard —
+        // the reply is still in flight and releasing now would let a
+        // subsequent admit over-subscribe the shim mailbox.
+        let guard = CancelGuard {
+            pending: Arc::clone(&self.inner.pending),
+            correlator,
+        };
+
+        let await_fut = async move {
+            let result = rx.await;
+            // Disarm — on success the entry was already taken by the
+            // shim or observer; the explicit `Err` arm below handles
+            // its own cleanup.
+            std::mem::forget(guard);
+            result
         };
         // `Instrument` keeps the span attached across yield points;
         // a bare `let _enter = span.enter()` would leak the span
         // into other tasks when the await yields.
         #[cfg(feature = "tracing")]
-        let outcome = await_fut.instrument(span.clone()).await?;
+        let recv = await_fut.instrument(span.clone()).await;
         #[cfg(not(feature = "tracing"))]
-        let outcome = await_fut.await?;
+        let recv = await_fut.await;
+
+        let outcome = match recv {
+            Ok(r) => r,
+            Err(_) => {
+                // `oneshot::Sender` was dropped without sending.
+                // Means the shim isolate stopped before the reply
+                // could be delivered; clean up and surface a typed
+                // terminal error rather than hang.
+                self.abort_admitted(correlator);
+                return Err(BridgeError::ShimGone);
+            }
+        };
 
         #[cfg(feature = "tracing")]
         span.record("result_kind", tracing_kind(&outcome));
@@ -441,13 +516,41 @@ where
         self.inner.shim_addr
     }
 
-    fn cancel_pending(&self, correlator: u64) {
-        let mut pending = self
-            .inner
-            .pending
-            .lock()
-            .expect("BridgeClient pending map mutex poisoned");
-        pending.remove(&correlator);
+    /// Removes the pending entry **and** releases the admission slot.
+    /// Used from bridge-side error paths (encoding failure, ingress
+    /// failure, shim death) where no shim notification will ever
+    /// arrive to release the slot for us.
+    fn abort_admitted(&self, correlator: u64) {
+        {
+            let mut pending = self
+                .inner
+                .pending
+                .lock()
+                .expect("BridgeClient pending map mutex poisoned");
+            pending.remove(&correlator);
+        }
+        self.inner.slots.add_permits(1);
+    }
+}
+
+/// Marks the pending entry as cancelled (`Some(None)`) when the
+/// awaiting future is dropped. The shim sees `Some(None)` when the
+/// eventual reply lands and releases the admission slot without
+/// trying a dead `oneshot::Sender`. The slot is **not** released
+/// here — the reply is still in flight, and releasing now would let
+/// a subsequent admit over-subscribe the shim mailbox.
+struct CancelGuard {
+    pending: Arc<Mutex<PendingMap>>,
+    correlator: u64,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(slot) = pending.get_mut(&self.correlator) {
+                *slot = None;
+            }
+        }
     }
 }
 

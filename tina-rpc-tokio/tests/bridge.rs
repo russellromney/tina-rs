@@ -104,6 +104,11 @@ enum StubBehavior {
     /// Reply with `ClientResult::Full` to every request — used to
     /// exercise the retry path.
     AlwaysFull,
+    /// Hold every request without replying. Used to pin the bridge's
+    /// admission limit: in-flight slots stay reserved until the
+    /// awaiter is cancelled, so subsequent calls must surface
+    /// `BridgeError::Full` synchronously instead of hanging.
+    NeverReply,
 }
 
 impl Isolate for ClientStub {
@@ -120,6 +125,7 @@ impl Isolate for ClientStub {
                 let result = match self.behavior {
                     StubBehavior::Echo => ClientResult::Ok(req.payload.clone()),
                     StubBehavior::AlwaysFull => ClientResult::Full,
+                    StubBehavior::NeverReply => return Effect::Noop,
                 };
                 Effect::Send(Outbound::new(
                     req.reply_to,
@@ -239,6 +245,124 @@ async fn retry_policy_eventually_surfaces_persistent_full() {
 
     // Three attempts, all `Full`, surfaces the last error.
     assert_eq!(outcome, Err(BridgeError::Full));
+}
+
+#[tokio::test]
+async fn admission_full_returns_synchronously_no_hang() {
+    // The bridge must surface `BridgeError::Full` synchronously when
+    // the admission cap is reached, not hang on `rx.await` waiting
+    // for a reply slot that will never free.
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::NeverReply);
+    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 2).unwrap();
+
+    // Hold both admission slots with calls that will never complete.
+    let bridge_a = bridge.clone();
+    let h1 = tokio::spawn(async move {
+        bridge_a
+            .call(
+                |corr, rt| {
+                    EchoClient::say_request("a".into(), Duration::from_secs(60), corr, rt, 1024)
+                },
+                |bytes| EchoClient::say_decode_reply(bytes, 1024),
+            )
+            .await
+    });
+    let bridge_b = bridge.clone();
+    let h2 = tokio::spawn(async move {
+        bridge_b
+            .call(
+                |corr, rt| {
+                    EchoClient::say_request("b".into(), Duration::from_secs(60), corr, rt, 1024)
+                },
+                |bytes| EchoClient::say_decode_reply(bytes, 1024),
+            )
+            .await
+    });
+
+    // Yield until both spawned tasks have synchronously claimed
+    // their slots and parked on `rx.await`.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    // Third call must surface `Full` immediately. Wrap in a timeout
+    // so a regression hangs the test loudly instead of forever.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.call(
+            |corr, rt| EchoClient::say_request("c".into(), Duration::from_secs(1), corr, rt, 1024),
+            |bytes| EchoClient::say_decode_reply(bytes, 1024),
+        ),
+    )
+    .await
+    .expect("call past admission cap must return synchronously, not hang");
+
+    assert_eq!(outcome, Err(BridgeError::Full));
+
+    // Cancel the held tasks so the test exits cleanly. The slot
+    // markers stay in `Some(None)` because the stub never sends a
+    // reply, but that is the documented design — the slots stay
+    // reserved until the underlying request completes (one way or
+    // another).
+    h1.abort();
+    h2.abort();
+    let _ = h1.await;
+    let _ = h2.await;
+}
+
+#[tokio::test]
+async fn cancelled_call_releases_slot_when_reply_lands() {
+    // Cancelling an awaiting future must mark the pending entry so
+    // that when the eventual reply lands the shim still releases the
+    // admission slot — otherwise a slow stream of cancellations
+    // would leak slots and starve future calls.
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::Echo);
+    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
+
+    // Cancel a call mid-flight by aborting its task. The Echo stub
+    // still emits its reply; the shim sees `Some(None)` and releases
+    // the slot regardless of whether the awaiter is alive.
+    let bridge_clone = bridge.clone();
+    let abandoned = tokio::spawn(async move {
+        bridge_clone
+            .call(
+                |corr, rt| {
+                    EchoClient::say_request("x".into(), Duration::from_secs(60), corr, rt, 1024)
+                },
+                |bytes| EchoClient::say_decode_reply(bytes, 1024),
+            )
+            .await
+    });
+    abandoned.abort();
+    let _ = abandoned.await;
+
+    // Give the runtime a moment to deliver the abandoned reply and
+    // release the slot.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Slot should be free. The next call must succeed (in the sense
+    // of completing — Echo replies with the request payload, which
+    // is JSON tuple bytes; the macro decoder rejects them, so the
+    // outcome is `Encoding`, not `Full`).
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.call(
+            |corr, rt| EchoClient::say_request("y".into(), Duration::from_secs(1), corr, rt, 1024),
+            |bytes| EchoClient::say_decode_reply(bytes, 1024),
+        ),
+    )
+    .await
+    .expect("post-cancellation call must not hang");
+
+    assert!(
+        !matches!(outcome, Err(BridgeError::Full)),
+        "expected slot to have been released after cancelled call's reply landed; got {outcome:?}",
+    );
 }
 
 #[tokio::test]
