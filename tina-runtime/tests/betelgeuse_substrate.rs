@@ -96,6 +96,60 @@ fn threaded_runtime_rejects_zero_remote_inbound_drain_budget() {
     );
 }
 
+#[test]
+fn threaded_runtime_rejects_zero_driver_lane_capacities() {
+    macro_rules! assert_zero_capacity_panics {
+        ($field:ident, $expected:literal) => {{
+            let panic = std::panic::catch_unwind(|| {
+                let _runtime = ThreadedRuntime::with_config_and_io_loop_factory(
+                    TestShard,
+                    TestMailboxFactory,
+                    ThreadedRuntimeConfig {
+                        $field: 0,
+                        ..ThreadedRuntimeConfig::default()
+                    },
+                    || panic!("I/O loop factory should not run after invalid config"),
+                );
+            })
+            .expect_err("zero capacity should panic before worker start");
+            assert_panic_contains(panic, $expected);
+        }};
+    }
+
+    assert_zero_capacity_panics!(
+        dns_lane_capacity,
+        "ThreadedRuntime requires DNS lane capacity > 0"
+    );
+    assert_zero_capacity_panics!(
+        tls_lane_capacity,
+        "ThreadedRuntime requires TLS lane capacity > 0"
+    );
+    assert_zero_capacity_panics!(
+        process_lane_capacity,
+        "ThreadedRuntime requires process lane capacity > 0"
+    );
+    assert_zero_capacity_panics!(
+        signal_capacity,
+        "ThreadedRuntime requires signal capacity > 0"
+    );
+}
+
+fn assert_panic_contains(panic: Box<dyn std::any::Any + Send>, expected: &str) {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        assert!(
+            message.contains(expected),
+            "panic message {message:?} did not contain {expected:?}"
+        );
+    } else if let Some(message) = panic.downcast_ref::<&str>() {
+        assert!(
+            message.contains(expected),
+            "panic message {message:?} did not contain {expected:?}"
+        );
+    } else {
+        panic!("panic payload was not a string");
+    }
+}
+
 fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F)
 where
     F: FnMut() -> bool,
@@ -1140,6 +1194,43 @@ fn threaded_multishard_rejects_zero_storage_lane_capacity() {
             storage_lane_capacity: 0,
             ..Default::default()
         },
+    );
+}
+
+#[test]
+fn threaded_multishard_rejects_zero_driver_lane_capacities() {
+    macro_rules! assert_zero_capacity_panics {
+        ($field:ident, $expected:literal) => {{
+            let panic = std::panic::catch_unwind(|| {
+                let _runtime = ThreadedMultiShardRuntime::with_config(
+                    [WorkShard(1), WorkShard(2)],
+                    TestMailboxFactory,
+                    ThreadedRuntimeConfig {
+                        $field: 0,
+                        ..ThreadedRuntimeConfig::default()
+                    },
+                );
+            })
+            .expect_err("zero capacity should panic before worker start");
+            assert_panic_contains(panic, $expected);
+        }};
+    }
+
+    assert_zero_capacity_panics!(
+        dns_lane_capacity,
+        "ThreadedMultiShardRuntime requires DNS lane capacity > 0"
+    );
+    assert_zero_capacity_panics!(
+        tls_lane_capacity,
+        "ThreadedMultiShardRuntime requires TLS lane capacity > 0"
+    );
+    assert_zero_capacity_panics!(
+        process_lane_capacity,
+        "ThreadedMultiShardRuntime requires process lane capacity > 0"
+    );
+    assert_zero_capacity_panics!(
+        signal_capacity,
+        "ThreadedMultiShardRuntime requires signal capacity > 0"
     );
 }
 

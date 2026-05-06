@@ -4937,6 +4937,18 @@ where
         if config.storage_lane_capacity == 0 {
             panic!("ThreadedRuntime requires storage lane capacity > 0");
         }
+        if config.dns_lane_capacity == 0 {
+            panic!("ThreadedRuntime requires DNS lane capacity > 0");
+        }
+        if config.tls_lane_capacity == 0 {
+            panic!("ThreadedRuntime requires TLS lane capacity > 0");
+        }
+        if config.process_lane_capacity == 0 {
+            panic!("ThreadedRuntime requires process lane capacity > 0");
+        }
+        if config.signal_capacity == 0 {
+            panic!("ThreadedRuntime requires signal capacity > 0");
+        }
         if config.remote_inbound_drain_budget == 0 {
             panic!("ThreadedRuntime requires remote inbound drain budget > 0");
         }
@@ -5416,6 +5428,18 @@ where
         }
         if config.storage_lane_capacity == 0 {
             panic!("ThreadedMultiShardRuntime requires storage lane capacity > 0");
+        }
+        if config.dns_lane_capacity == 0 {
+            panic!("ThreadedMultiShardRuntime requires DNS lane capacity > 0");
+        }
+        if config.tls_lane_capacity == 0 {
+            panic!("ThreadedMultiShardRuntime requires TLS lane capacity > 0");
+        }
+        if config.process_lane_capacity == 0 {
+            panic!("ThreadedMultiShardRuntime requires process lane capacity > 0");
+        }
+        if config.signal_capacity == 0 {
+            panic!("ThreadedMultiShardRuntime requires signal capacity > 0");
         }
         if config.shard_pair_capacity == 0 {
             panic!("ThreadedMultiShardRuntime requires shard-pair capacity > 0");

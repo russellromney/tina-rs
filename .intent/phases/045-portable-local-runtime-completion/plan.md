@@ -52,7 +52,7 @@ Weak or missing:
   service shape.
 - DST exists, but service-level DST is not yet the default proof wall.
 - no portable cost report command.
-- no `make verify-portable-runtime` CI gate.
+- no portable-runtime coverage inside the single `make verify` CI gate.
 - truth docs are stale in places; `SYSTEM.md` still underclaims live
   cross-shard isolate-call transport.
 
@@ -259,9 +259,8 @@ Weak or missing:
 
 10. **CI Gate For Actual Service Harness**
 
-    Add `make verify-portable-runtime` and wire CI to run it on Linux and macOS.
-
-    It is additive, not a second `make verify`. It must run:
+    Fold the portable runtime harness into the one project gate: `make verify`.
+    It must run:
 
     - capability/budget manifest tests;
     - portable service harness happy path;
@@ -283,7 +282,7 @@ Weak or missing:
 ## Required Proof
 
 - `make verify` passes.
-- `make verify-portable-runtime` exists and passes.
+- `make verify` includes the portable runtime harness and passes.
 - The portable service harness proves composed happy path and focused scary
   paths.
 - User-shaped tests cover positive, negative, overload, timeout/cancel, late
@@ -324,8 +323,8 @@ Implemented:
   shrinking.
 - `make portable-runtime-cost` prints labeled cost-smoke rows only. It is not a
   benchmark.
-- `make verify-portable-runtime` and CI run the portable service harness,
-  budget manifest, service DST, bridge cancellation model, and cost smoke.
+- `make verify` and CI run the portable service harness, budget manifest,
+  service DST, bridge cancellation model, and cost smoke.
 
 Remaining non-claims:
 

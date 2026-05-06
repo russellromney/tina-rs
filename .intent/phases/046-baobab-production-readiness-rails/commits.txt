@@ -1,0 +1,12 @@
+This commit: Close Baobab readiness rails
+
+Proof:
+- `cargo test -p tina-runtime --test readiness_matrix`
+- `cargo test -p tina-runtime --test portable_service`
+- `cargo test -p tina-runtime --test betelgeuse_substrate`
+- `cargo test -p tina-runtime local_system_config_manifest_rejects_zero_capacities_before_start`
+- `cargo test -p tina-sim --test portable_service_dst`
+- `cargo test -p tina-sim --test persistence_simulation`
+- `cargo test -p tina-tokio-bridge --test bridge_model_dst`
+- `cargo run -p tina-runtime --example portable_runtime_cost`
+- `make verify`

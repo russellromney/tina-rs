@@ -197,6 +197,12 @@ and reviews live under `.intent/phases/`.
   through I/O/persistence, executable budget manifest, visible placement and
   backpressure policy proofs, service-level DST with saved seed and shrink,
   portable cost-smoke command, and focused CI gate.
+- Baobab: executable local-service readiness matrix, Baobab user-service
+  gauntlet over TCP/timer/DNS/process/file/persistence/cross-shard call/
+  shutdown, live multi-shard sibling-survives-failed-shard proof, selected
+  LocalSystem rail/backpressure e2e gate, saved-seed service/persistence/bridge
+  DST histories, real Tina local timing smoke rows, all folded into
+  `make verify`.
 
 ## Near-term roadmap
 
@@ -205,7 +211,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Baobab production-readiness rails** | Build the first serious "can a real Tokio/Glommio-shaped service be moved to Tina?" gate, using the portable service harness, cost smoke, and CI gate as its baseline. Seastar is the architectural north star: executable capability matrix, user-perspective service gauntlet, DST gauntlet, live thread-per-core pressure, bridge/runtime cancellation rails, Tina/Tokio/Glommio behavior comparisons, benchmark skeleton, CI/release rails, and sharp non-claims. This is not a docs/demo phase; it is the production-readiness test wall for the thing we just built. |
 | **North Sea io_uring substrate** | Build the first Tina-owned Linux `io_uring` backend for runtime-owned TCP and storage rails. On supported Linux systems it should become the preferred/default live backend; unsupported platforms keep the existing portable backend with explicit capability truth. No raw `io_uring` handle leaks into isolate code, no async-handler model, no hidden fallback queues, and no performance claim until Baobab or a later benchmark phase measures it. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |

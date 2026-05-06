@@ -27,7 +27,8 @@ Verdict: complete for the portable-local-runtime slice.
   observed-send continuation, observed-send full before persistence, closed-worker
   outcomes, journal append, and deletion shrinking.
 - Bridge cancellation model remains in the focused gate.
-- `make verify-portable-runtime` is small and specific.
+- The focused portable-runtime work now runs inside the single `make verify`
+  gate.
 
 ## Hostile Review
 
@@ -58,7 +59,8 @@ Verdict: complete for the portable-local-runtime slice.
 - Existing isolate-call, call-dispatch, local-system cross-shard, consumer API,
   and portable service tests pass.
 - Added `ThreadedRuntimeError::UnknownShard`; workspace check passes.
-- CI now runs an extra focused gate after `make verify`.
+- CI now runs the portable runtime coverage inside the single `make verify`
+  gate.
 
 ## Verification
 
@@ -71,7 +73,6 @@ Verdict: complete for the portable-local-runtime slice.
 - `cargo test -p tina-sim --test portable_service_dst`
 - `cargo test -p tina-tokio-bridge --test bridge_model_dst`
 - `cargo test -p tina-tokio-bridge --test axum_bridge bridge_host_skips_cancelled_queued_request_before_user_state_mutates`
-- `make verify-portable-runtime`
 - `make verify`
 
 Full closeout verification passes.

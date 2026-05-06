@@ -31,6 +31,3 @@ jobs:
 
       - name: Verify workspace
         run: make verify
-
-      - name: Verify portable local runtime
-        run: make verify-portable-runtime

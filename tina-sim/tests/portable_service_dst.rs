@@ -35,6 +35,7 @@ enum WorkerMsg {
     Audited(SendOutcome, Request),
     Durable(Result<(), CallError>, Request, u64),
     Stop,
+    Panic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,7 @@ impl Worker {
             }
             WorkerMsg::Durable(Err(error), _, _) => reply(WorkerReply::DurableFailure(error)),
             WorkerMsg::Stop => stop(),
+            WorkerMsg::Panic => panic!("baobab dst worker panic"),
         }
     }
 }
@@ -112,6 +114,7 @@ impl AuditSink {
 enum RouterMsg {
     Submit(Request),
     Returned(Request, CallOutcome<WorkerReply>),
+    Stop,
 }
 
 #[derive(Debug)]
@@ -158,6 +161,7 @@ impl Router {
                 }
                 noop()
             }
+            RouterMsg::Stop => stop(),
         }
     }
 }
@@ -166,8 +170,10 @@ impl Router {
 enum ServiceOp {
     SubmitEven(u64),
     SubmitOdd(u64),
+    SubmitEvenThenStopRouter(u64),
     StopEven,
     StopOdd,
+    PanicEven,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +185,7 @@ struct ServiceProjection {
     journal_appended: usize,
     audit_stored: Vec<u64>,
     reply_rejected: usize,
+    panicked: usize,
 }
 
 fn portable_service_history() -> History<ServiceOp> {
@@ -269,6 +276,15 @@ fn run_service_history_with_audit_capacity(
     for op in history.operations() {
         match *op {
             ServiceOp::SubmitEven(key) | ServiceOp::SubmitOdd(key) => {
+                let _ = sim.try_send(
+                    router,
+                    RouterMsg::Submit(Request {
+                        key,
+                        body: format!("body-{key}"),
+                    }),
+                );
+            }
+            ServiceOp::SubmitEvenThenStopRouter(key) => {
                 sim.try_send(
                     router,
                     RouterMsg::Submit(Request {
@@ -276,13 +292,18 @@ fn run_service_history_with_audit_capacity(
                         body: format!("body-{key}"),
                     }),
                 )
-                .expect("submit service op");
+                .expect("submit service op before requester stop");
+                let _ = sim.step();
+                let _ = sim.try_send(router, RouterMsg::Stop);
             }
             ServiceOp::StopEven => {
                 let _ = sim.try_send(even, WorkerMsg::Stop);
             }
             ServiceOp::StopOdd => {
                 let _ = sim.try_send(odd, WorkerMsg::Stop);
+            }
+            ServiceOp::PanicEven => {
+                let _ = sim.try_send(even, WorkerMsg::Panic);
             }
         }
         sim.run_until_quiescent();
@@ -323,6 +344,10 @@ fn run_service_history_with_audit_capacity(
             .iter()
             .filter(|event| matches!(event.kind(), RuntimeEventKind::CallReplyRejected { .. }))
             .count(),
+        panicked: trace
+            .iter()
+            .filter(|event| matches!(event.kind(), RuntimeEventKind::HandlerPanicked))
+            .count(),
     };
     let artifact = sim.replay_artifact();
     DstRun::new(projection, artifact)
@@ -343,6 +368,7 @@ fn portable_service_dst_replays_whole_service_history() {
     assert_eq!(run.output().journal_appended, 3);
     assert_eq!(run.output().audit_stored, vec![2, 3, 5]);
     assert_eq!(run.output().reply_rejected, 0);
+    assert_eq!(run.output().panicked, 0);
 }
 
 #[test]
@@ -375,4 +401,68 @@ fn portable_service_dst_replays_observed_send_full_before_persistence() {
     assert_eq!(run.output().journal_appended, 0);
     assert_eq!(run.output().full, 1);
     assert_eq!(run.output().reply_rejected, 0);
+    assert_eq!(run.output().panicked, 0);
+}
+
+#[test]
+fn baobab_dst_replays_observed_send_persistence_and_requester_stop() {
+    let history = History::new(
+        "baobab observed-send persistence requester stop dst",
+        PORTABLE_SERVICE_SEED + 2,
+        vec![ServiceOp::SubmitEvenThenStopRouter(8)],
+    );
+    let run = assert_replays(&history, run_service_history);
+
+    assert!(run.output().accepted.is_empty());
+    assert_eq!(run.output().audit_stored, vec![8]);
+    assert_eq!(run.output().journal_appended, 1);
+    assert_eq!(run.output().reply_rejected, 0);
+    assert_eq!(run.output().panicked, 0);
+}
+
+#[test]
+fn baobab_dst_replays_pressure_shard_failure_and_topology_truth() {
+    let history = History::new(
+        "baobab pressure shard failure topology dst",
+        PORTABLE_SERVICE_SEED + 3,
+        vec![
+            ServiceOp::PanicEven,
+            ServiceOp::SubmitEven(10),
+            ServiceOp::SubmitOdd(11),
+        ],
+    );
+    let run = assert_replays(&history, run_service_history);
+
+    assert_eq!(run.output().panicked, 1);
+    assert_eq!(run.output().closed, 1);
+    assert_eq!(run.output().accepted, vec![11]);
+    assert_eq!(run.output().journal_appended, 1);
+    assert_eq!(run.output().reply_rejected, 0);
+}
+
+#[test]
+fn baobab_dst_shrinks_requester_stop_history() {
+    let history = History::new(
+        "baobab requester stop shrink dst",
+        PORTABLE_SERVICE_SEED + 4,
+        vec![
+            ServiceOp::SubmitOdd(21),
+            ServiceOp::SubmitEvenThenStopRouter(22),
+            ServiceOp::SubmitOdd(23),
+        ],
+    );
+    let shrunk = delete_shrink(
+        &history,
+        ShrinkConfig { max_attempts: 64 },
+        "history still runs accepted worker side effects after requester stop without accepting a reply",
+        |candidate| {
+            let output = run_service_history(candidate).output().clone();
+            output.accepted.is_empty() && output.journal_appended > 0
+        },
+    );
+
+    assert!(shrunk.shrunk().len() < shrunk.original().len());
+    let shrunk_output = run_service_history(shrunk.shrunk()).output().clone();
+    assert!(shrunk_output.accepted.is_empty());
+    assert!(shrunk_output.journal_appended > 0);
 }

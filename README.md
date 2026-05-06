@@ -273,9 +273,8 @@ and small implementation crates.
 ## Development
 
 ```bash
-make verify   # fmt + check + test + loom + doc + clippy
-make verify-portable-runtime  # focused local-service + DST + bridge gate
-make portable-runtime-cost    # labeled local smoke rows, not a benchmark
+make verify   # full project gate, including service/DST/bridge/cost smoke
+make portable-runtime-cost    # optional local smoke rows, not a benchmark
 make miri     # focused unsafe-memory checks for tina-mailbox-spsc
 ```
 

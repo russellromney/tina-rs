@@ -1,15 +1,20 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, CallKind, CallOutcome, LocalSystem, LocalSystemState, MailboxFactory,
-    RuntimeEventKind, SendOutcome, ThreadedRuntimeError, TraceRetention, call, journal_append,
-    send_observed, sleep_then,
+    CallError, CallKind, CallOutcome, FileId, ListenerId, LiveShardState, LocalSystem,
+    LocalSystemState, MailboxFactory, ProcessRunResult, RuntimeEventKind, SendOutcome, StreamId,
+    ThreadedRuntimeError, TraceRetention, call, dns_lookup, file_create, file_read, file_write,
+    journal_append, process_run, send_observed, sleep_then, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,6 +73,20 @@ struct ServiceMailboxFactory;
 
 impl MailboxFactory for ServiceMailboxFactory {
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(ServiceMailbox::new(capacity))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CapacityPanicMailboxFactory {
+    panic_capacity: usize,
+}
+
+impl MailboxFactory for CapacityPanicMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        if capacity == self.panic_capacity {
+            panic!("Baobab test mailbox factory panic for capacity {capacity}");
+        }
         Box::new(ServiceMailbox::new(capacity))
     }
 }
@@ -278,6 +297,260 @@ enum ServiceObservation {
 }
 
 #[derive(Debug, Clone)]
+enum ReadinessMsg {
+    Start,
+    TcpBound(Result<(ListenerId, SocketAddr), CallError>),
+    TcpAccepted(Result<(StreamId, SocketAddr), CallError>),
+    TcpRead(Result<Vec<u8>, CallError>, StreamId),
+    TcpWrote(Result<usize, CallError>, StreamId),
+    TcpStreamClosed(Result<(), CallError>),
+    TcpListenerClosed(Result<(), CallError>),
+    TcpAbortStreamClosed(Result<(), CallError>),
+    TcpAbortListenerClosed(Result<(), CallError>),
+    TimerReady,
+    Dns(Result<Vec<std::net::SocketAddr>, CallError>),
+    Process(Result<ProcessRunResult, CallError>),
+    FileOpened(Result<FileId, CallError>),
+    FileWritten(FileId, Result<usize, CallError>),
+    FileRead(Result<Vec<u8>, CallError>),
+    Journaled(Result<(), CallError>),
+    Worker(CallOutcome<WorkerReply>),
+}
+
+#[derive(Debug)]
+struct ReadinessService {
+    file_path: PathBuf,
+    journal_path: PathBuf,
+    worker: Address<WorkerMsg, WorkerReply>,
+    published: Arc<Mutex<Option<SocketAddr>>>,
+    observed: Arc<Mutex<Vec<ServiceObservation>>>,
+    listener: Option<ListenerId>,
+    tcp_buffer: Vec<u8>,
+}
+
+const READINESS_MAX_FRAME: usize = 64;
+
+#[tina_runtime::isolate(
+    message = ReadinessMsg,
+    call = tina_runtime::RuntimeCall<ReadinessMsg>,
+    shard = ServiceShard
+)]
+impl ReadinessService {
+    fn handle(&mut self, msg: ReadinessMsg, _ctx: &mut Context<'_, ServiceShard>) -> Effect<Self> {
+        match msg {
+            ReadinessMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("readiness bind addr"))
+                .reply(ReadinessMsg::TcpBound),
+            ReadinessMsg::TcpBound(Ok((listener, addr))) => {
+                self.listener = Some(listener);
+                *self.published.lock().expect("readiness published lock") = Some(addr);
+                tcp_accept(listener).reply(ReadinessMsg::TcpAccepted)
+            }
+            ReadinessMsg::TcpBound(Err(error)) => {
+                self.record_rejection(50, format!("tcp-bind:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::TcpAccepted(Ok((stream, _peer))) => {
+                self.tcp_buffer.clear();
+                tcp_read(stream, 4).reply(move |result| ReadinessMsg::TcpRead(result, stream))
+            }
+            ReadinessMsg::TcpAccepted(Err(error)) => {
+                self.record_rejection(50, format!("tcp-accept:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::TcpRead(Ok(bytes), stream) if bytes.is_empty() => {
+                self.record_rejection(50, "tcp-eof-before-frame");
+                tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+            }
+            ReadinessMsg::TcpRead(Ok(bytes), stream) => {
+                self.tcp_buffer.extend_from_slice(&bytes);
+                match self.tcp_buffer.iter().position(|byte| *byte == b'\n') {
+                    Some(newline)
+                        if newline <= READINESS_MAX_FRAME
+                            && &self.tcp_buffer[..newline] == b"baobab-ready" =>
+                    {
+                        tcp_write(stream, b"readiness-ok\n".to_vec())
+                            .reply(move |result| ReadinessMsg::TcpWrote(result, stream))
+                    }
+                    Some(_) => {
+                        self.record_rejection(50, "tcp-frame");
+                        tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+                    }
+                    None if self.tcp_buffer.len() > READINESS_MAX_FRAME => {
+                        self.record_rejection(50, "tcp-frame-too-large");
+                        tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+                    }
+                    None => tcp_read(stream, 4)
+                        .reply(move |result| ReadinessMsg::TcpRead(result, stream)),
+                }
+            }
+            ReadinessMsg::TcpRead(Err(error), stream) => {
+                self.record_rejection(50, format!("tcp-read:{error:?}"));
+                tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+            }
+            ReadinessMsg::TcpWrote(Ok(_), stream) => {
+                tcp_close_stream(stream).reply(ReadinessMsg::TcpStreamClosed)
+            }
+            ReadinessMsg::TcpWrote(Err(error), stream) => {
+                self.record_rejection(50, format!("tcp-write:{error:?}"));
+                tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+            }
+            ReadinessMsg::TcpStreamClosed(Ok(())) => match self.listener.take() {
+                Some(listener) => {
+                    tcp_close_listener(listener).reply(ReadinessMsg::TcpListenerClosed)
+                }
+                None => {
+                    self.record_rejection(50, "tcp-listener-missing");
+                    noop()
+                }
+            },
+            ReadinessMsg::TcpStreamClosed(Err(error)) => {
+                self.record_rejection(50, format!("tcp-close-stream:{error:?}"));
+                match self.listener.take() {
+                    Some(listener) => {
+                        tcp_close_listener(listener).reply(ReadinessMsg::TcpAbortListenerClosed)
+                    }
+                    None => noop(),
+                }
+            }
+            ReadinessMsg::TcpListenerClosed(Ok(())) => {
+                sleep_then(Duration::from_millis(1), ReadinessMsg::TimerReady)
+            }
+            ReadinessMsg::TcpListenerClosed(Err(error)) => {
+                self.record_rejection(50, format!("tcp-close-listener:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::TcpAbortStreamClosed(result) => {
+                if let Err(error) = result {
+                    self.record_rejection(50, format!("tcp-abort-close-stream:{error:?}"));
+                }
+                match self.listener.take() {
+                    Some(listener) => {
+                        tcp_close_listener(listener).reply(ReadinessMsg::TcpAbortListenerClosed)
+                    }
+                    None => noop(),
+                }
+            }
+            ReadinessMsg::TcpAbortListenerClosed(result) => {
+                if let Err(error) = result {
+                    self.record_rejection(50, format!("tcp-abort-close-listener:{error:?}"));
+                }
+                noop()
+            }
+            ReadinessMsg::TimerReady => {
+                dns_lookup("localhost", 80, Duration::from_secs(1)).reply(ReadinessMsg::Dns)
+            }
+            ReadinessMsg::Dns(Ok(addresses)) if !addresses.is_empty() => process_run(
+                "/bin/echo",
+                vec!["baobab-ready".to_string()],
+                Duration::from_secs(1),
+                128,
+                128,
+            )
+            .reply(ReadinessMsg::Process),
+            ReadinessMsg::Dns(Ok(_)) => {
+                self.record_rejection(50, "dns-empty");
+                noop()
+            }
+            ReadinessMsg::Dns(Err(error)) => {
+                self.record_rejection(50, format!("dns:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::Process(Ok(result))
+                if result.status.code == Some(0) && result.stdout.starts_with(b"baobab-ready") =>
+            {
+                file_create(self.file_path.clone()).reply(ReadinessMsg::FileOpened)
+            }
+            ReadinessMsg::Process(Ok(_)) => {
+                self.record_rejection(50, "process-output");
+                noop()
+            }
+            ReadinessMsg::Process(Err(error)) => {
+                self.record_rejection(50, format!("process:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::FileOpened(Ok(file)) => file_write(file, b"baobab".to_vec())
+                .reply(move |result| ReadinessMsg::FileWritten(file, result)),
+            ReadinessMsg::FileOpened(Err(error)) => {
+                self.record_rejection(50, format!("file-open:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::FileWritten(file, Ok(6)) => {
+                file_read(file, 6).reply(ReadinessMsg::FileRead)
+            }
+            ReadinessMsg::FileWritten(_, Ok(_)) => {
+                self.record_rejection(50, "short-write");
+                noop()
+            }
+            ReadinessMsg::FileWritten(_, Err(error)) => {
+                self.record_rejection(50, format!("file-write:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::FileRead(Ok(bytes)) if bytes == b"baobab" => {
+                journal_append(self.journal_path.clone(), 1, bytes).reply(ReadinessMsg::Journaled)
+            }
+            ReadinessMsg::FileRead(Ok(_)) => {
+                self.record_rejection(50, "file-read");
+                noop()
+            }
+            ReadinessMsg::FileRead(Err(error)) => {
+                self.record_rejection(50, format!("file-read:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::Journaled(Ok(())) => call(
+                self.worker,
+                WorkerMsg::Work(ServiceRequest {
+                    key: 51,
+                    body: "cross-shard-gauntlet".to_string(),
+                }),
+                Duration::from_secs(1),
+            )
+            .reply(ReadinessMsg::Worker),
+            ReadinessMsg::Journaled(Err(error)) => {
+                self.record_rejection(50, format!("journal:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::Worker(CallOutcome::Replied(WorkerReply::Stored { .. })) => {
+                self.observed.lock().expect("readiness observed lock").push(
+                    ServiceObservation::Accepted {
+                        key: 50,
+                        body: "tcp-timer-dns-process-file-journal-cross-shard-call".to_string(),
+                    },
+                );
+                noop()
+            }
+            ReadinessMsg::Worker(CallOutcome::Replied(WorkerReply::DurableFailure(error))) => {
+                self.record_rejection(50, format!("worker-durable:{error:?}"));
+                noop()
+            }
+            ReadinessMsg::Worker(CallOutcome::Full) => {
+                self.record_rejection(50, "worker-full");
+                noop()
+            }
+            ReadinessMsg::Worker(CallOutcome::Closed) => {
+                self.record_rejection(50, "worker-closed");
+                noop()
+            }
+            ReadinessMsg::Worker(CallOutcome::Timeout) => {
+                self.record_rejection(50, "worker-timeout");
+                noop()
+            }
+        }
+    }
+}
+
+impl ReadinessService {
+    fn record_rejection(&self, key: u64, reason: impl Into<String>) {
+        self.observed
+            .lock()
+            .expect("readiness observed lock")
+            .push(ServiceObservation::Rejected {
+                key,
+                reason: reason.into(),
+            });
+    }
+}
+
+#[derive(Debug, Clone)]
 enum AuditMsg {
     Record(u64),
 }
@@ -427,6 +700,17 @@ where
         if Instant::now() > deadline {
             panic!("wait_until({label}) timed out");
         }
+        std::thread::yield_now();
+    }
+}
+
+fn wait_for_socket_addr(published: &Arc<Mutex<Option<SocketAddr>>>) -> SocketAddr {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(addr) = *published.lock().expect("published addr lock") {
+            return addr;
+        }
+        assert!(Instant::now() <= deadline, "socket addr was not published");
         std::thread::yield_now();
     }
 }
@@ -581,6 +865,283 @@ fn portable_service_harness_routes_persists_and_reports_terminal_truth() {
         .expect("odd journal replays");
     assert_eq!(odd_replay.records.len(), 1);
     assert_eq!(odd_replay.records[0].bytes, b"3:hay-stack");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn baobab_service_gauntlet_composes_tcp_timer_dns_process_file_persistence_cross_shard_and_shutdown()
+ {
+    let dir = temp_dir("baobab-service-gauntlet");
+    fs::create_dir_all(&dir).expect("create baobab service dir");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let published = Arc::new(Mutex::new(None));
+
+    let app =
+        LocalSystem::<ServiceShard, ServiceMailboxFactory>::multi_shard(ServiceMailboxFactory)
+            .shard(ServiceShard(13))
+            .shard(ServiceShard(17))
+            .ingress_capacity(8)
+            .shard_pair_capacity(8)
+            .dns_lane_capacity(2)
+            .process_lane_capacity(2)
+            .storage_lane_capacity(4)
+            .trace_retention(TraceRetention::Bounded(1024))
+            .build();
+    let worker = app
+        .register_root_on::<DurableWorker, Infallible>(
+            ShardId::new(17),
+            new_worker(&dir, "readiness-worker", &observed),
+            8,
+        )
+        .expect("register readiness worker");
+    let service = app
+        .register_root_on::<ReadinessService, Infallible>(
+            ShardId::new(13),
+            ReadinessService {
+                file_path: dir.join("config.txt"),
+                journal_path: dir.join("checkpoint.journal"),
+                worker,
+                published: Arc::clone(&published),
+                observed: Arc::clone(&observed),
+                listener: None,
+                tcp_buffer: Vec::new(),
+            },
+            8,
+        )
+        .expect("register readiness service");
+
+    app.try_send(service, ReadinessMsg::Start)
+        .expect("start readiness service");
+    let addr = wait_for_socket_addr(&published);
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).expect("connect readiness tcp service");
+        stream
+            .write_all(b"baobab-")
+            .expect("write readiness request prefix");
+        stream
+            .write_all(b"ready\n")
+            .expect("write readiness request suffix");
+        stream.shutdown(Shutdown::Write).expect("finish request");
+        let mut reply = String::new();
+        stream
+            .read_to_string(&mut reply)
+            .expect("read readiness reply");
+        reply
+    });
+    wait_until("baobab service gauntlet completes", || {
+        observed
+            .lock()
+            .expect("observed lock")
+            .contains(&ServiceObservation::Accepted {
+                key: 50,
+                body: "tcp-timer-dns-process-file-journal-cross-shard-call".to_string(),
+            })
+    });
+    assert_eq!(
+        client.join().expect("readiness TCP client joins"),
+        "readiness-ok\n"
+    );
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("baobab service shutdown");
+    assert!(terminal.shutdown_report().clean());
+    for expected in [
+        CallKind::TcpBind,
+        CallKind::TcpAccept,
+        CallKind::TcpRead,
+        CallKind::TcpWrite,
+        CallKind::TcpStreamClose,
+        CallKind::TcpListenerClose,
+        CallKind::Sleep,
+        CallKind::DnsLookup,
+        CallKind::ProcessRun,
+        CallKind::FileOpen,
+        CallKind::FileWriteAt,
+        CallKind::FileReadAt,
+        CallKind::JournalAppend,
+        CallKind::IsolateCall,
+    ] {
+        assert!(
+            terminal.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == expected
+                )
+            }),
+            "expected {expected:?} completion in Baobab service trace"
+        );
+    }
+    let tcp_reads = terminal
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpRead,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        tcp_reads >= 4,
+        "Baobab service should prove framed TCP across multiple reads, saw {tcp_reads}"
+    );
+    assert_eq!(terminal.summary().call_failed, 0);
+    assert_eq!(terminal.summary().journal_appended, 2);
+    assert_eq!(
+        fs::read(dir.join("config.txt")).expect("config file survives"),
+        b"baobab"
+    );
+    let replay = tina_runtime::persistence::replay_journal(&dir.join("checkpoint.journal"))
+        .expect("checkpoint journal replays");
+    assert_eq!(replay.records.len(), 1);
+    assert_eq!(replay.records[0].bytes, b"baobab");
+    let worker_replay =
+        tina_runtime::persistence::replay_journal(&dir.join("readiness-worker.journal"))
+            .expect("readiness worker journal replays");
+    assert_eq!(worker_replay.records.len(), 1);
+    assert_eq!(worker_replay.records[0].bytes, b"51:cross-shard-gauntlet");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn baobab_live_multishard_service_survives_peer_shard_failure() {
+    let dir = temp_dir("baobab-live-multishard-failure");
+    fs::create_dir_all(&dir).expect("create Baobab live multishard dir");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    let app = LocalSystem::<ServiceShard, CapacityPanicMailboxFactory>::multi_shard(
+        CapacityPanicMailboxFactory { panic_capacity: 13 },
+    )
+    .shard(ServiceShard(14))
+    .shard(ServiceShard(15))
+    .shard(ServiceShard(16))
+    .ingress_capacity(16)
+    .shard_pair_capacity(2)
+    .storage_lane_capacity(2)
+    .trace_retention(TraceRetention::Bounded(1024))
+    .build();
+    let even = app
+        .register_root_on::<DurableWorker, Infallible>(
+            ShardId::new(15),
+            new_worker(&dir, "even", &observed),
+            8,
+        )
+        .expect("register even worker");
+    let odd = app
+        .register_root_on::<DurableWorker, Infallible>(
+            ShardId::new(16),
+            new_worker(&dir, "odd", &observed),
+            8,
+        )
+        .expect("register odd worker");
+    let router = app
+        .register_root_on::<Router, Infallible>(
+            ShardId::new(14),
+            Router {
+                even_worker: even,
+                odd_worker: odd,
+                max_retries: 0,
+                observed: Arc::clone(&observed),
+            },
+            8,
+        )
+        .expect("register Baobab router");
+
+    assert!(matches!(
+        app.register_root_on::<DurableWorker, Infallible>(
+            ShardId::new(15),
+            new_worker(&dir, "poison", &observed),
+            13,
+        ),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
+    assert_eq!(
+        app.try_send(
+            even,
+            WorkerMsg::Work(ServiceRequest {
+                key: 100,
+                body: "probe-failed-shard".to_string(),
+            }),
+        ),
+        Err(tina_runtime::ThreadedTrySendError::WorkerStopped)
+    );
+
+    app.try_send(
+        router,
+        RouterMsg::Submit(ServiceRequest {
+            key: 3,
+            body: "healthy-shard-work".to_string(),
+        }),
+    )
+    .expect("healthy shard request accepted after peer failure");
+    app.try_send(
+        router,
+        RouterMsg::Submit(ServiceRequest {
+            key: 2,
+            body: "failed-shard-work".to_string(),
+        }),
+    )
+    .expect("failed shard request reaches router");
+
+    wait_until("healthy sibling and failed target outcomes settle", || {
+        let observed = observed.lock().expect("observed lock");
+        observed.contains(&ServiceObservation::Accepted {
+            key: 3,
+            body: "healthy-shard-work".to_string(),
+        }) && observed.contains(&ServiceObservation::Rejected {
+            key: 2,
+            reason: "closed".to_string(),
+        })
+    });
+
+    let terminal = app.shutdown().drain().join_report();
+    assert_eq!(terminal.state(), LocalSystemState::Failed);
+    assert_eq!(terminal.error(), Some(ThreadedRuntimeError::WorkerStopped));
+    assert!(
+        terminal
+            .shutdown_report()
+            .unclean_reasons()
+            .iter()
+            .any(|reason| matches!(reason, tina_runtime::ShutdownUncleanReason::RuntimeError(_)))
+    );
+    assert_eq!(terminal.summary().journal_appended, 1);
+    let topology = terminal.topology().expect("terminal topology");
+    assert_eq!(
+        topology
+            .shard(ShardId::new(15))
+            .expect("failed shard topology")
+            .state(),
+        LiveShardState::Failed
+    );
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(16)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::JournalAppended { record_index: 1 }
+            )
+    }));
+    assert!(terminal.trace().iter().any(|event| {
+        event.shard() == ShardId::new(14)
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetClosed,
+                    ..
+                }
+            )
+    }));
+
+    let odd_replay = tina_runtime::persistence::replay_journal(&dir.join("odd.journal"))
+        .expect("healthy sibling journal replays");
+    assert_eq!(odd_replay.records.len(), 1);
+    assert_eq!(odd_replay.records[0].bytes, b"3:healthy-shard-work");
     let _ = fs::remove_dir_all(dir);
 }
 

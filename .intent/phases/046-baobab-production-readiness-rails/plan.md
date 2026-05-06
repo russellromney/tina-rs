@@ -2,135 +2,222 @@
 
 ## Goal
 
-Build the first hard gate for "a real Tokio- or Glommio-shaped local service
-can be moved to Tina and the important behavior stays visible, bounded, and
-testable."
+Judge the portable local runtime from 045 hard.
 
-This is not a porting guide, demo, release story, or marketing phase. It is the
-test wall and runtime rails that make later porting attempts honest.
+Baobab answers:
 
-Baobab runs after Phase 045 proves the portable non-`io_uring` local runtime is
-boring enough to judge. If Phase 045 changes capability truth, Baobab must
-compare that landed truth instead of stale assumptions.
+> Can a small Tokio/Glommio-shaped local service move to Tina and become more
+> bounded, visible, and testable without awful ergonomics?
 
-Seastar is the architectural north star: shared-nothing, per-core ownership,
-explicit cross-core communication, and systems-library seriousness. Tokio and
-Glommio are the runnable Rust comparisons for behavior and cost.
+This is not a demo, porting guide, release story, `io_uring` phase, or
+marketing phase. It is the readiness wall over the thing that now exists.
 
-At closeout:
+## Baseline
 
-> Tina has an executable readiness gate for local service ports: capability
-> truth, user-perspective e2e, DST pressure, CI rails, and baseline cost numbers.
+Already built:
+
+- `LocalSystem` / `LocalMultiShardSystem`;
+- runtime-owned TCP, UDP, DNS, TLS, file/path, process, signal, timers,
+  persistence, shutdown notification;
+- bounded Tokio/Tower/Axum edge bridge;
+- `tina-runtime/tests/portable_service.rs`;
+- `tina-sim/tests/portable_service_dst.rs`;
+- `make verify`;
+- `make portable-runtime-cost` smoke rows.
+
+Baobab extends these. It does not rebuild them.
 
 ## Non-Goals
 
-- No remoting, clustering, membership, or placement.
-- No durable mailbox or exactly-once claim.
-- No broad "faster than Tokio/Glommio" claim.
+- No remoting, clustering, distributed placement, durable mailbox, or
+  exactly-once claim.
+- No broad "faster than Tokio/Glommio" or production-ready claim.
 - No Tower/Axum middleware living inside Tina.
-- No `flow!` syntax unless a tiny helper is required to keep tests readable.
+- No `io_uring`.
 - No hidden fallback queues.
+- No broad macro/flow-syntax work.
 
 ## Rules
 
-- If something can overload, a test must observe `Full` or pressure.
-- If something can fail, a test must observe typed failure and trace.
-- If something can race, DST or a deterministic e2e must replay it.
-- If Tina cannot support a common Tokio/Glommio-shaped capability, the
-  capability matrix must say so explicitly.
-- Benchmarks produce numbers, not claims.
-- Comparisons must test behavior first: overload, cancellation, shutdown,
-  replay, and resource ownership matter more than raw throughput.
+- Overload must be visible as `Full` or pressure.
+- Failure must be typed and traced.
+- Races must replay through DST or deterministic e2e.
+- Capability gaps must be explicit.
+- Cost commands print numbers and environment; they do not make speed claims.
+- Glommio is optional/platform-gated and must not break macOS/default verify.
 
 ## Rocks
 
-1. **Capability Matrix**
-   Add an executable matrix for common local-service needs: TCP, DNS, TLS,
-   UDP, files, process, signals, timers, calls, cross-shard sends, persistence,
-   bridge ingress, cancellation, shutdown, and backpressure. Assert it matches
-   `RuntimeCapabilities` and public non-claims. Include explicit columns for
-   Tina, Tokio, and Glommio when a behavior is meaningfully comparable.
+1. **Executable Capability Matrix**
 
-2. **Porting Gap Tests**
-   Add compile/run tests for the patterns a small Tokio service usually needs:
-   listener loop, outbound client call, timeout, retry, bounded queue, config
-   file read, process helper, signal shutdown, and durable checkpoint.
+   Add a Rust-owned matrix, likely `tina-runtime/tests/readiness_matrix.rs`.
+   Docs only summarize it.
 
-3. **Service Gauntlet**
-   Build one user-shaped local Tina service that uses several rails together:
-   TCP/TLS ingress or loopback, DNS, file/path I/O, timer, process, persistence,
-   cross-shard call, and graceful shutdown. Prove positive path and negative
-   paths.
+   Rows: TCP, UDP, DNS, TLS, file/path, process, signal, timers, isolate calls,
+   cross-shard sends, persistence, shutdown, bridge ingress, cancellation,
+   backpressure, replay/DST, affinity, cost reporting.
 
-4. **Bridge Gauntlet**
-   Exercise the Tokio bridge as an app boundary: bounded ingress, timeout,
-   caller cancellation, retry policy naming, shutdown retry, and bridge metrics.
-   No claim that arbitrary Tower/Axum middleware lives inside Tina.
+   Status: `Supported`, `Partial`, `Unsupported`, `NotClaimed`,
+   `PlatformGated`.
+
+   It must compare Tina against public `RuntimeCapabilities`; add Tokio/Glommio
+   notes only where meaningful.
+
+2. **User-Service Gauntlet**
+
+   Extend `portable_service.rs`.
+
+   Keep one composed happy service using multiple rails: TCP or TLS, DNS,
+   file/path, timer, process, persistence, cross-shard call, graceful shutdown.
+
+   Add focused scary-edge tests for:
+
+   - listener/session loop;
+   - outbound client call;
+   - timeout and retry;
+   - config read;
+   - process helper;
+   - signal/shutdown;
+   - durable checkpoint;
+   - clean shutdown;
+   - driver shutdown failure after useful trace;
+   - failed shard with sibling trace retained;
+   - pending owned work reported;
+   - incomplete trace marked incomplete.
+
+3. **Backpressure Wall**
+
+   Add no-sleep-as-proof overload tests for:
+
+   - mailbox full;
+   - live ingress full;
+   - shard-pair full;
+   - bridge ingress full;
+   - storage, DNS, TLS, process, and signal lane full;
+   - persistence append rejection;
+   - requester completion mailbox full.
+
+4. **Bridge Readiness**
+
+   Exercise the bridge as an app edge:
+
+   - bounded ingress;
+   - caller timeout;
+   - cancellation before admission;
+   - cancellation after admission;
+   - retry policy naming;
+   - total deadline;
+   - retryable shutdown after shared handles drop;
+   - metrics and health.
+
+   Pin the contract: caller timeout is not rollback unless cancellation wins
+   before Tina admission.
 
 5. **DST Gauntlet**
-   Add randomized histories that combine at least three rails per history:
-   cancellation + timeout + late completion, pressure + shard failure +
-   topology, persistence + restart + corrupt/truncated data, bridge ingress +
-   service shutdown + retry.
 
-6. **Live Thread-Per-Core Pressure**
-   Run live multi-shard services on real worker threads with cross-shard sends
-   and isolate calls under bounded queue pressure. Use Blue Whale's reported
-   worker/thread/core ownership and advisory affinity truth; do not claim hard
-   OS pinning unless a later backend proves it. Prove healthy shards keep
-   running when one shard fails.
+   Add service-shaped histories with saved seeds, replay assertions, and clear
+   invariants:
 
-7. **Lifecycle Contract Tests**
-   For every public terminal API, prove clean shutdown, driver shutdown
-   failure after useful trace exists, and one-shard-failed with sibling trace
-   retained.
+   - cancellation + timeout + late completion;
+   - pressure + shard failure + topology truth;
+   - persistence + restart + corrupt/truncated data;
+   - bridge ingress + service shutdown + retry;
+   - observed send + persistence + requester stop.
 
-8. **Backpressure Wall**
-   Add explicit overload tests for mailbox, ingress, shard-pair, bridge,
-   resource-lane, and persistence-lane pressure. No sleeps-as-proof.
+   At least one new family must exercise deletion shrinking. The others need
+   saved seeds and replay.
 
-9. **Comparison and Cost Numbers**
-   Add a stable local benchmark/report command for selected paths: local send,
-   cross-shard send, isolate call, TCP loopback, TLS loopback, file read/write,
-   journal append, bridge call. Include narrow Tokio and Glommio baselines
-   where they are local, fair, and easy to run; skip with a visible unsupported
-   row when the platform/substrate makes the comparison dishonest. Record
-   allocations where current probes allow. Add runnable comparisons for
-   constrained-memory and overload behavior: bounded channel pressure, many
-   concurrent connections, slow peer, cancelled request, shutdown while work is
-   in flight, and local disk/persistence pressure. Expected output must say
-   where Tina preserves behavior, where Tina rejects earlier/more loudly, and
-   where Tokio or Glommio have a feature Tina still does not claim.
+6. **Live Multi-Shard Pressure**
 
-10. **CI Rails**
-    Add or tighten CI so the public gate runs: fmt, check, clippy, docs,
-    workspace tests, selected DST seeds, platform capability tests, and the
-    readiness gauntlet. Keep slow/host-specific tests named.
+   Run live services on real worker threads with bounded cross-shard sends and
+   isolate calls under pressure.
 
-11. **API Readiness Sweep**
-    Audit public names and helper shapes used by the gauntlet. Fix footguns
-    that make Tina easy to misuse without adding duplicate ways to do the same
-    thing.
+   Prove healthy shards keep running when one shard fails, terminal report keeps
+   failed-shard truth and sibling trace, advisory core/thread ownership is
+   visible, and hard OS pinning is not claimed.
 
-12. **Readiness Report**
-    Update `review.md`, `CHANGELOG.md`, and `ROADMAP.md` with landed truth:
-    what Tina can now run, what the tests prove, what remains a non-claim, and
-    what blocks prime-time porting.
+7. **Cost And Comparison Rows**
+
+   Upgrade `make portable-runtime-cost`.
+
+   It must print environment, backend, build profile, row status, and timing
+   and/or allocation numbers where available.
+
+   Rows: local send, live ingress, cross-shard send, isolate call, timer, TCP
+   loopback, TLS loopback, file read/write, journal append, bridge call.
+
+   Add runnable behavior comparisons for bounded channel pressure, many
+   connections, slow peer, cancelled request, shutdown with work in flight, and
+   local disk/persistence pressure. Include hardened Tokio where small. Glommio
+   rows are platform-gated and may skip visibly.
+
+8. **CI And Readiness Report**
+
+   Extend current CI, do not replace it.
+
+   Default gate: `make verify`. It must include the readiness matrix, selected
+   Baobab DST seeds, and cost command smoke. Do not make users remember a
+   second verification command.
+
+   Host-specific or slow comparison jobs must be optional and named.
+
+   Update `review.md`, `CHANGELOG.md`, `ROADMAP.md`, and `SYSTEM.md` with
+   landed truth only: what Tina can run, what the gate proves, what remains a
+   non-claim, and what blocks prime-time porting.
 
 ## Required Proof
 
 - `make verify` passes.
-- The service gauntlet has positive, negative, overload, shutdown, and failure
+- Readiness matrix tests pass.
+- Service gauntlet has positive, negative, overload, shutdown, and failure
   tests.
-- DST histories replay from saved seeds and shrink at least one failing-style
-  history.
-- CI config exists and names platform-specific exclusions honestly.
-- Cost command produces numbers locally without turning them into marketing.
+- New DST families replay from saved seeds.
+- At least one new DST family exercises deletion shrinking.
+- Bridge timeout/cancel semantics are directly tested.
+- Cost command prints local numbers and makes no speed claim.
+- CI names platform-specific exclusions honestly.
 
 ## Done Means
 
-- A future small-porting session has a real gate to run before claiming Tina is
-  ready for that port.
-- The matrix tells a user what works, what rejects, and what is still not Tina.
-- No review note can say "this was only tested as happy path" for the rocks
-  above.
+- A future porting session has a real gate to run before claiming Tina is ready
+  for that port.
+- The matrix tells users what works, what rejects, what is platform-gated, and
+  what Tina does not claim.
+- No closeout note can honestly say "this was only happy-path tested" for the
+  rocks above.
+- Tina can claim a serious local-service readiness gate, not production
+  readiness and not general Tokio replacement.
+
+## Closeout Notes
+
+Implemented:
+
+- `tina-runtime/tests/readiness_matrix.rs` is the executable capability matrix.
+  It now includes explicit cancellation, backpressure, and cost-reporting rows.
+- `portable_service.rs` now includes a Baobab user-service gauntlet over a TCP
+  listener/session, Tina-owned timer, DNS, bounded process execution,
+  runtime-owned file I/O, journal append, cross-shard isolate call, and terminal
+  shutdown truth.
+- `portable_service.rs` also includes a live multi-shard failure gauntlet: one
+  worker shard fails, sibling persisted service work still completes, and
+  calls into the failed shard return typed closed/failure truth.
+- `portable_service_dst.rs` now includes saved-seed Baobab histories for
+  requester stop after admitted work, pressure plus shard failure, and deletion
+  shrinking.
+- `persistence_simulation.rs` now includes saved-seed Baobab persistence
+  histories for clean restart, truncated-tail recovery, and corrupt recovery.
+- `bridge_model_dst.rs` now includes a saved-seed Baobab timeout, retry, and
+  shutdown contract history.
+- `make portable-runtime-cost` now runs local smoke rows for local send, live
+  ingress, cross-shard send, isolate call, and TCP loopback; it still prints
+  explicit `not-measured` rows where not yet measured.
+- `make verify` and CI run the readiness matrix, portable service, LocalSystem
+  rail/backpressure e2e, simulator lane-full DST for DNS, process, TLS, and
+  signal, service DST, bridge model/e2e, and cost smoke.
+
+Remaining non-claims:
+
+- The cost command is still smoke/report evidence, not a benchmark.
+- TLS/bridge cost rows are not measured yet.
+- Glommio remains platform-gated and optional.
+- Tina is not production-ready and not a general Tokio replacement.

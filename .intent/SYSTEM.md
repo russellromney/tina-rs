@@ -210,12 +210,12 @@ may count completed, failed, rejected, abandoned, journaled, and recovered work
 that Tina can see in the final trace. It must not grow hidden metrics channels
 that disagree with trace truth.
 
-`make verify-portable-runtime` is the focused CI gate for the canonical local
-service shape. It runs the portable service harness, executable budget manifest
-checks, service-level DST with saved seeds and deletion shrinking, bridge
-cancellation model checks, and a cost-smoke command. The cost-smoke output is
-explicitly "local machine / not benchmark"; it is command-shape evidence, not a
-performance claim.
+`make verify` is the single project gate. It runs format, check, workspace
+tests, loom, docs, clippy, the executable capability matrix, the canonical
+portable service harness, service-level DST, bridge cancellation checks, and the
+local cost-smoke command. Cost rows include small live Tina paths for ingress,
+local send, cross-shard send, isolate call, and local TCP loopback, but remain
+smoke evidence unless a later benchmark phase adds policy and thresholds.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may directly cause many later events. Trace

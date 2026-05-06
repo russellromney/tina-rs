@@ -4,6 +4,34 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Baobab Production-Readiness Rails
+
+- Added an executable readiness matrix in `tina-runtime/tests/readiness_matrix.rs`
+  covering runtime-owned rails, bridge ingress, replay/DST, affinity, cost
+  reporting, cancellation, backpressure, `io_uring` non-claim, and
+  platform-gated Glommio comparison rows.
+- Extended the canonical portable service harness with a Baobab user-service
+  gauntlet that composes a TCP listener/session, Tina-owned timer, DNS, bounded
+  process execution, runtime-owned file I/O, journal append, cross-shard
+  isolate call, and terminal shutdown/report checks through `LocalSystem`.
+- Added a live multi-shard Baobab service proof: one worker shard fails, sibling
+  persisted work still completes, and calls into the failed shard surface typed
+  closed/failure truth.
+- Expanded portable service DST with saved-seed histories for observed-send +
+  persistence + requester stop, pressure + shard failure + topology truth, and
+  deletion shrinking over a requester-stop history.
+- Added Baobab DST histories for persistence restart/corrupt/truncated recovery
+  and bridge timeout/retry/shutdown behavior.
+- Upgraded `make portable-runtime-cost` from shape-only rows to local timing
+  rows over real Tina smoke paths for local send, live ingress, cross-shard
+  send, isolate call, plus local TCP loopback, while keeping unmeasured
+  TLS/bridge rows explicit and labeled "not benchmark".
+- Hardened the Baobab TCP service proof and cost smoke so both use framed or
+  accumulated TCP reads instead of assuming one read is one request.
+- Folded the Baobab readiness gate into the single `make verify` command:
+  readiness matrix, portable service, LocalSystem rail/backpressure e2e tests,
+  service DST, bridge cancellation model/e2e, and cost smoke.
+
 ### Phase Portable Local Runtime Completion
 
 - Added a canonical public-path portable service harness using
@@ -30,10 +58,9 @@ This file records completed work.
   stop/closed outcomes, observed-send full before persistence, replay equality,
   invariant checks, and deletion shrinking.
 - Added `make portable-runtime-cost` as an explicit cost-smoke command and
-  `make verify-portable-runtime` as a focused CI gate over the service harness,
-  budget manifest, service DST, bridge cancellation model, and cost smoke.
-  The cost command is labeled "local machine / not benchmark" and makes no
-  speed claim.
+  folded the service harness, budget manifest, service DST, bridge cancellation
+  model, and cost smoke into the project verification path. The cost command is
+  labeled "local machine / not benchmark" and makes no speed claim.
 
 ### Phase Blue Whale
 

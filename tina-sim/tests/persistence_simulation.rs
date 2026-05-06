@@ -472,11 +472,20 @@ fn persistence_ops(seed: u64, len: usize) -> Vec<PersistenceOp> {
 }
 
 fn run_persistence_ops(seed: u64, ops: &[PersistenceOp]) -> DstRun<Vec<String>> {
+    run_persistence_ops_with_storage(seed, ops, ScriptedStorageFaultConfig::default())
+}
+
+fn run_persistence_ops_with_storage(
+    seed: u64,
+    ops: &[PersistenceOp],
+    storage: ScriptedStorageFaultConfig,
+) -> DstRun<Vec<String>> {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(
         SimShard,
         SimulatorConfig {
             seed,
+            storage,
             ..Default::default()
         },
     );
@@ -659,6 +668,74 @@ fn persistence_history_replays_and_recovers_after_fault_injection() {
                     }
                 )
             })),
+        }
+    }
+}
+
+#[test]
+fn baobab_dst_persistence_restart_truncate_and_corrupt_saved_histories() {
+    let cases = [
+        (
+            "baobab persistence restart clean",
+            46_100,
+            ScriptedStorageFaultConfig::default(),
+            "finished",
+        ),
+        (
+            "baobab persistence restart truncated",
+            46_101,
+            ScriptedStorageFaultConfig {
+                truncate_journal_tail_at: Some(0),
+                ..Default::default()
+            },
+            "finished",
+        ),
+        (
+            "baobab persistence restart corrupt",
+            46_102,
+            ScriptedStorageFaultConfig {
+                corrupt_journal_record_at: Some(0),
+                ..Default::default()
+            },
+            "corrupt",
+        ),
+    ];
+
+    for (name, seed, storage, expected) in cases {
+        let history = History::new(
+            name,
+            seed,
+            vec![
+                PersistenceOp::Mutate("hay".to_owned()),
+                PersistenceOp::RunUntilIdle,
+                PersistenceOp::Recover,
+                PersistenceOp::RunUntilIdle,
+            ],
+        );
+        let run = assert_replays(&history, |candidate| {
+            run_persistence_ops_with_storage(candidate.seed(), candidate.operations(), storage)
+        });
+        InvariantSuite::standard().assert(run.artifact().event_record());
+        match expected {
+            "finished" => assert!(
+                run.artifact()
+                    .event_record()
+                    .iter()
+                    .any(|event| { matches!(event.kind(), RuntimeEventKind::RecoveryFinished) }),
+                "{name} should finish recovery visibly"
+            ),
+            "corrupt" => assert!(
+                run.artifact().event_record().iter().any(|event| {
+                    matches!(
+                        event.kind(),
+                        RuntimeEventKind::RecoveryFailed {
+                            reason: CallError::CorruptRecord
+                        }
+                    )
+                }),
+                "{name} should fail corrupt recovery visibly"
+            ),
+            _ => unreachable!("unknown expected persistence result"),
         }
     }
 }

@@ -6,6 +6,7 @@ use tina_sim::dst::{DstRun, History, ShrinkConfig, assert_replays, delete_shrink
 enum ModelOp {
     Submit(u64),
     TimeoutOldest,
+    Retry(u64),
     WorkerStep,
     Close,
 }
@@ -15,6 +16,7 @@ enum ModelEvent {
     Accepted(u64),
     Full(u64),
     TimedOut(u64),
+    Retried(u64),
     SkippedCancelled(u64),
     Mutated(u64),
     Closed(u64),
@@ -65,6 +67,11 @@ impl BridgeModel {
         }
     }
 
+    fn retry(&mut self, id: u64) {
+        self.events.push(ModelEvent::Retried(id));
+        self.submit(id);
+    }
+
     fn worker_step(&mut self) {
         let Some(request) = self.queue.pop_front() else {
             return;
@@ -109,6 +116,7 @@ fn run_model(history: &History<ModelOp>) -> DstRun<Vec<ModelEvent>, Vec<ModelEve
         match *op {
             ModelOp::Submit(id) => model.submit(id),
             ModelOp::TimeoutOldest => model.timeout_oldest(),
+            ModelOp::Retry(id) => model.retry(id),
             ModelOp::WorkerStep => model.worker_step(),
             ModelOp::Close => model.close(),
         }
@@ -144,6 +152,31 @@ fn bridge_ingress_model_dst_keeps_timeout_from_mutating_service_state() {
             );
         }
     }
+}
+
+#[test]
+fn baobab_bridge_model_replays_timeout_retry_and_shutdown_contract() {
+    let history = History::new(
+        "baobab bridge timeout retry shutdown",
+        46_200,
+        vec![
+            ModelOp::Submit(1),
+            ModelOp::TimeoutOldest,
+            ModelOp::Retry(10),
+            ModelOp::WorkerStep,
+            ModelOp::WorkerStep,
+            ModelOp::Close,
+            ModelOp::Submit(99),
+        ],
+    );
+    let run = assert_replays(&history, run_model);
+
+    assert!(run.output().contains(&ModelEvent::TimedOut(1)));
+    assert!(run.output().contains(&ModelEvent::SkippedCancelled(1)));
+    assert!(run.output().contains(&ModelEvent::Retried(10)));
+    assert!(run.output().contains(&ModelEvent::Mutated(10)));
+    assert!(run.output().contains(&ModelEvent::Closed(99)));
+    assert!(!run.output().contains(&ModelEvent::Mutated(1)));
 }
 
 #[test]

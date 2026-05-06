@@ -1,2 +1,22 @@
+# Cargo build output.
 /target/
+target/
+**/target/
+
+# Local Cargo lockfile for this library workspace.
 Cargo.lock
+
+# Rust compiler backup files.
+**/*.rs.bk
+
+# Native debug symbols and profiling byproducts.
+*.dSYM/
+*.pdb
+*.profraw
+*.profdata
+flamegraph.svg
+
+# Local editor/OS noise.
+.DS_Store
+.idea/
+.vscode/
