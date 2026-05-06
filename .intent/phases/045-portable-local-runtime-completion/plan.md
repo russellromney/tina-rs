@@ -33,6 +33,8 @@ At closeout:
 - No sleeps-as-proof.
 - Public API changes are allowed only when user-visible behavior needs them.
   Prefer crate-private helpers and tests for lifecycle cleanup.
+- The service harness must use ordinary Tina effects only: no async handlers,
+  no raw backend handles, no Tokio tasks inside isolates.
 
 ## Build Rocks
 
@@ -59,6 +61,12 @@ At closeout:
    It must assert against `RuntimeCapabilities`, bridge capabilities where
    relevant, and named non-claims. It covers execution shape, bounded capacity,
    cancellation, shutdown, replay, and blocking-lane truth.
+
+   It must also prove the user-facing resource budget manifest is complete:
+   ingress, mailbox, shard-pair, remote-drain, DNS/TLS/process/storage lanes,
+   signal capacity, trace retention, preallocation, and shutdown drain timeout
+   are reachable from `LocalSystem` builders/config without requiring users to
+   drop into low-level `ThreadedRuntimeConfig`.
 
 3. **Unified Driver Lifecycle Surface**
    Build common lifecycle helpers/events where they reduce special cases:
@@ -94,6 +102,10 @@ At closeout:
    pressure; driver completion under hot mailbox pressure; lane completion
    under unrelated mailbox pressure; shutdown signal under in-flight lane work.
 
+   Add two standard backpressure patterns to the service harness: immediate
+   reject/busy reply, and explicit retry/backoff through Tina-owned timers. Do
+   not add a broad policy framework.
+
    Do not claim preemption. A currently running synchronous handler or
    already-started blocking OS operation may still run until it returns; Tina
    must bound admission, report pressure, tombstone cancellation, and surface
@@ -123,19 +135,46 @@ At closeout:
    responded-late, and shutdown-retry truth where the bridge can observe them.
    Do not claim deterministic replay under Tokio.
 
-8. **Portable Service Harness**
+8. **Canonical Local Service Runner**
+   Build the blessed local-service shape that porting tests will target:
+   create `LocalSystem`, configure the resource budget manifest, register
+   roots, start listener/service isolates, wait for runtime shutdown signal,
+   drain, join, and inspect terminal report.
+
+   This may be a reusable test helper or a tiny public helper only if public
+   API is clearly needed. It must prove the ordinary Tina path, not a hidden
+   runtime shortcut.
+
+9. **Portable Service Harness**
    Build one reusable local service harness in
    `tina-runtime/tests/portable_service.rs` over the portable backend. It must
    use many real rails together: TCP or TLS ingress/loopback, DNS, file/path
    I/O, timer, process, persistence, cross-shard call, bounded queues, and
    graceful shutdown.
 
+   The harness must model the normal listener/session lifecycle: listener
+   isolate accepts, creates or notifies a per-connection/session isolate, hands
+   over stream ownership, reads/writes with timeout, closes, and abandons
+   cleanly on shutdown.
+
    Add one composed happy-path e2e. Add focused scary-edge e2e tests for:
    mailbox full, live ingress full, shard-pair full, resource lane full,
    timeout, cancellation, stale address, failed shard, corrupt persistence,
    slow peer, and shutdown while work is in flight.
 
-9. **DST Families For Weird Rocks**
+   Prove supervision plus I/O composition: supervised listener/session/worker
+   failure while runtime-owned I/O is pending; restart does not inherit stale
+   resources; stale addresses reject visibly; shutdown still drains/reports.
+
+   Prove a port-shaped request/reply boundary: local call, cross-shard call,
+   timeout, requester closed, requester mailbox full, bridge timeout/cancel,
+   and responded-late behavior in one user-shaped request path.
+
+   Prove failure domains under service load: one shard/session fails, sibling
+   shard/session keeps serving, topology names the failed domain, and partial
+   trace survives.
+
+10. **DST Families For Weird Rocks**
    Add new DST families with saved seeds and deterministic replay:
 
    - `tina-sim`: timeout + late completion; persistence corruption + restart;
@@ -146,7 +185,7 @@ At closeout:
 
    At least one new family must exercise deletion shrinking.
 
-10. **Portable Runtime Cost Report**
+11. **Portable Runtime Cost Report**
    Add one stable report command, preferably `make portable-runtime-cost`, for
    the portable backend. It prints backend, platform, profile, operation row,
    allocation count where probes exist, and rough timing where easy.
@@ -157,14 +196,17 @@ At closeout:
    No thresholds. No external Tokio/Glommio baselines. No performance claims.
    Baobab owns comparison.
 
-11. **Portable Runtime CI Gate**
+12. **Portable Runtime CI Gate**
     Add a named additive gate, preferably `make verify-portable-runtime`, and
     wire CI to run it on Linux and macOS. It should include the capability
     table, portable service harness, selected DST seeds, and cost report smoke
     run. It should not duplicate the full workspace `make verify`. Long DST
     stays behind a named env var such as `TINA_DST_LONG`.
 
-12. **Baobab Handoff**
+    The gate must run the canonical service runner and portable service harness
+    scary-edge tests. Tables and DST alone are not enough.
+
+13. **Baobab Handoff**
     Update `CHANGELOG.md`, `ROADMAP.md`, and Phase 046 Baobab plan/review with
     only landed truth. If 045 discovers a remaining non-claim, Baobab must
     compare that truth, not old hope.
@@ -178,8 +220,13 @@ At closeout:
 - Every `deferred-nonclaim` cell is reflected in capability truth and Baobab.
 - Every rail has positive, negative, overload/capacity, timeout/cancel or
   `not-applicable(reason)`, shutdown/resource, and trace proof.
+- Canonical local service runner shape exists and is tested.
 - The portable service harness has composed happy path plus focused scary-edge
   tests.
+- Listener/session lifecycle, supervision plus I/O, request/reply boundary, and
+  sibling progress under failure are directly proved.
+- The target workload uses ordinary Tina effects only, with no async/raw backend
+  leakage inside isolates.
 - New DST families replay saved seeds; at least one new family shrinks.
 - `make portable-runtime-cost` or equivalent runs and prints numbers without
   claims.
@@ -189,7 +236,7 @@ At closeout:
 
 - Baobab gets to judge a built portable runtime, not a TODO list.
 - A future local-service porting experiment can target the current portable
-  backend without immediately falling into known missing lifecycle/report/fairness
-  holes.
+  backend without immediately falling into known
+  lifecycle/report/fairness holes.
 - Tina remains honest: bounded work, visible overload, traceable failure,
   replayable races, no hidden queues, no fake speed story.
