@@ -73,9 +73,14 @@
 //! assert_eq!(decoded_reply.error, Some(FrameError::Full));
 //! ```
 
+mod connection;
 mod encoding;
 mod frame;
 
+pub use connection::{
+    BadPeerReason, CloseReason, Connection, ConnectionConfig, ConnectionInit, ConnectionMsg,
+    RouterReply, RouterRequest,
+};
 pub use encoding::{Encoding, EncodingError, EncodingErrorKind, Json};
 pub use frame::{
     DecodeError, EncodeError, Frame, FrameError, FrameKind, FrameLimits, FRAME_VERSION_V1,

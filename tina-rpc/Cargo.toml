@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tina = { path = "../tina" }
+tina-runtime = { path = "../tina-runtime" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
