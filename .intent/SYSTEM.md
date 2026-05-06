@@ -83,7 +83,7 @@ each restart for restartable children.
 `tina-runtime` is the explicit-step runtime. It handles same-shard sends,
 same-shard child spawn, supervision, restart, sends into the runtime from
 outside, bounded mailboxes, stale generation rejection, panic capture, abandon
-tracing, time calls, ThreadedRuntime TCP calls over Betelgeuse, runtime-owned local file
+tracing, time calls, runtime-owned TCP/UDP/DNS/TLS/file/path/process/signal
 calls, and local snapshot/journal persistence calls. Its `step()` is
 synchronous from the outside: the runtime collects finished owned work,
 translates completions into messages, and then handles ready mailbox work.
@@ -92,12 +92,17 @@ translates completions into messages, and then handles ready mailbox work.
 one shard and `ThreadedMultiShardRuntime` for a fixed shard set. Each
 shard runtime is constructed and owned by one OS worker thread; handles
 communicate through bounded command queues. Live cross-shard sends move
-`Send + 'static` payloads through those bounded worker queues. This is an
-execution path, not a second semantic model: the explicit-step runtime and
-simulator remain the oracle.
-Peer quarantine, cross-shard child ownership, and live cross-shard isolate-call
-reply transport are not claimed. Live cross-shard isolate calls reject with the
-same-shard-only call outcome until a later phase designs reply transport.
+`Send + 'static` payloads through bounded worker queues, and live cross-shard
+isolate calls route typed reply/full/closed/timeout outcomes back to the
+requester shard. This is an execution path, not a second semantic model: the
+explicit-step runtime and simulator remain the oracle. Peer quarantine,
+cross-shard child ownership, shard restart propagation, hard OS thread
+pinning, and network remoting are not claimed.
+
+`LocalSystem` and `LocalMultiShardSystem` are the preferred local live app
+owners. They wrap the live substrate with a public bounded-shape config,
+topology/capability reports, partial/complete trace APIs, and terminal
+shutdown reports. They are not a separate runtime.
 
 The vendored Betelgeuse backend has a completion-driven native I/O shape that
 fits Tina, plus a narrow deterministic simulated TCP backend used for
@@ -108,9 +113,20 @@ liveness faults are not claimed.
 
 The shipped runtime call types are `RuntimeCall<Message>` over
 `CallInput`, `CallOutput`, and `CallError`. Today it covers runtime-owned sleep,
-TCP listener/stream/client-connect operations, local file operations, and local
-snapshot/journal persistence. Sockets and files are runtime-owned opaque ids;
-raw sockets and file handles do not live in isolate state.
+TCP listener/stream/client-connect operations, UDP sockets, DNS lookup, native
+TLS client/server operations, local file/path operations, bounded process runs,
+runtime shutdown notification, Unix signal capture, and local snapshot/journal
+persistence. Runtime-owned sockets, TLS streams, files, and related resources
+are opaque ids; raw OS handles do not live in isolate state.
+
+If a handler was invoked by an isolate call, later messages produced by
+runtime-owned calls or observed-send completions preserve that original call
+context. This lets a service receive a request, perform runtime-owned I/O or
+persistence, and reply afterward without the reply becoming trace-only noise.
+Timeout, full, closed, requester-closed, and mailbox-full paths remain visible.
+The portable service harness and simulator DST directly prove both continuation
+families: backend/persistence completions and observed-send completions,
+including observed-send `Full`.
 
 Persistence is deliberately local and domain-level. `snapshot_commit`,
 `snapshot_load`, `journal_append`, and `journal_replay` persist user-provided
@@ -173,8 +189,10 @@ scripted I/O, not cryptography.
 
 Runtime shutdown notification is a Tina-owned signal rail: shutdown can deliver
 a bounded `"shutdown"` notification into waiting isolates before the worker
-stops. Raw OS signal capture is not claimed unless a later phase explicitly
-adds and tests a process-global signal policy.
+stops. On Unix, raw `SIGINT`/`SIGTERM` capture is installed through
+`signal-hook` and delivered through the same bounded signal rail. It is not a
+Tokio signal task, async handler, custom unsafe handler, or broad
+process-supervision policy.
 
 Richer local filesystem/path operations are runtime-owned calls with typed
 outcomes: metadata, rename-replace, remove-file, read-dir, and parent sync.
@@ -191,6 +209,13 @@ or a process-tree semantics claim.
 may count completed, failed, rejected, abandoned, journaled, and recovered work
 that Tina can see in the final trace. It must not grow hidden metrics channels
 that disagree with trace truth.
+
+`make verify-portable-runtime` is the focused CI gate for the canonical local
+service shape. It runs the portable service harness, executable budget manifest
+checks, service-level DST with saved seeds and deletion shrinking, bridge
+cancellation model checks, and a cost-smoke command. The cost-smoke output is
+explicitly "local machine / not benchmark"; it is command-shape evidence, not a
+performance claim.
 
 The runtime trace is a deterministically ordered causal tree. Each event has at
 most one cause, but one event may directly cause many later events. Trace

@@ -4,6 +4,37 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Portable Local Runtime Completion
+
+- Added a canonical public-path portable service harness using
+  `LocalMultiShardSystem`: configure budgets, register router/workers, route
+  by key to shard-owned workers, perform journal append before reply, shut down,
+  assert terminal topology/report truth, and replay durable journals.
+- Fixed isolate-call continuation semantics in both the live runtime and
+  simulator: runtime-owned call completions and observed-send completions now
+  preserve the original isolate-call context, so a service can receive a call,
+  do runtime-owned I/O/persistence, and reply afterward.
+- Added direct live and DST proofs for observed-send continuation: accepted
+  audit send outcomes can drive the original call reply, accepted audit sends
+  eventually run the target side effect, and full audit sends return a typed
+  failure without mutating the audit target or losing the caller reply.
+- Added visible placement/backpressure proofs: wrong key-to-shard routing
+  rejects before work runs, unknown shard registration returns
+  `ThreadedRuntimeError::UnknownShard`, and busy retry uses a Tina-owned timer
+  before returning a typed rejection.
+- Completed the user-facing budget manifest path with builder knobs for DNS,
+  TLS, process, signal, and shutdown drain timeout, plus terminal topology
+  assertions that the configured shape survives shutdown reporting.
+- Added service-level DST in `tina-sim`: saved-seed whole-service histories
+  over cross-shard call, observed-send continuation, journal append, worker
+  stop/closed outcomes, observed-send full before persistence, replay equality,
+  invariant checks, and deletion shrinking.
+- Added `make portable-runtime-cost` as an explicit cost-smoke command and
+  `make verify-portable-runtime` as a focused CI gate over the service harness,
+  budget manifest, service DST, bridge cancellation model, and cost smoke.
+  The cost command is labeled "local machine / not benchmark" and makes no
+  speed claim.
+
 ### Phase Blue Whale
 
 - Added `AffinityStatus` and shard/core ownership reporting to live topology:

@@ -1322,6 +1322,24 @@ struct InFlightCall {
     requester: RegisteredAddress,
     cause: tina_runtime::CauseId,
     persistence: Option<PersistenceTraceInfo>,
+    continuation_context: Option<MessageCallContext>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallDispatchContext {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    cause: tina_runtime::CauseId,
+    continuation_context: Option<MessageCallContext>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IsolateCallDeliveryContext {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    cause: tina_runtime::CauseId,
+    continuation_context: Option<MessageCallContext>,
+    visible_at_step: u64,
 }
 
 type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
@@ -1388,6 +1406,7 @@ struct PendingIsolateCall {
     cause: tina_runtime::CauseId,
     deadline: Duration,
     insertion_order: u64,
+    continuation_context: Option<MessageCallContext>,
     translator: Option<ErasedIsolateCallTranslator>,
 }
 
@@ -2570,7 +2589,7 @@ where
                     isolate: isolate_id,
                     generation: self.entries[index].generation,
                 };
-                self.dispatch_call(call, requester, cause, route_remote);
+                self.dispatch_call(call, requester, cause, call_context, route_remote);
                 false
             }
             ErasedEffect::Noop => {
@@ -3023,6 +3042,7 @@ where
         call: ErasedCall,
         requester: RegisteredAddress,
         cause: tina_runtime::CauseId,
+        continuation_context: Option<MessageCallContext>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let call_id = self.ids.next_call_id();
@@ -3036,35 +3056,27 @@ where
             Some(cause),
             RuntimeEventKind::CallDispatchAttempted { call_id, call_kind },
         );
+        let dispatch_context = CallDispatchContext {
+            call_id,
+            requester,
+            cause: attempted.into(),
+            continuation_context,
+        };
 
         match call.kind {
             ErasedCallKind::Backend {
                 request,
                 translator,
-            } => self.dispatch_backend_call(
-                call_id,
-                call_kind,
-                requester,
-                attempted.into(),
-                request,
-                translator,
-            ),
-            ErasedCallKind::ObservedSend { send, translator } => self.dispatch_observed_send(
-                call_id,
-                requester,
-                attempted.into(),
-                send,
-                translator,
-                route_remote,
-            ),
+            } => self.dispatch_backend_call(dispatch_context, call_kind, request, translator),
+            ErasedCallKind::ObservedSend { send, translator } => {
+                self.dispatch_observed_send(dispatch_context, send, translator, route_remote)
+            }
             ErasedCallKind::IsolateCall {
                 send,
                 timeout,
                 translator,
             } => self.dispatch_isolate_call(
-                call_id,
-                requester,
-                attempted.into(),
+                dispatch_context,
                 send,
                 timeout,
                 translator,
@@ -3075,33 +3087,33 @@ where
 
     fn dispatch_backend_call(
         &mut self,
-        call_id: CallId,
+        context: CallDispatchContext,
         call_kind: CallKind,
-        requester: RegisteredAddress,
-        cause: tina_runtime::CauseId,
         request: CallInput,
         translator: ErasedTranslator,
     ) {
         let persistence = request.persistence_trace_info();
         if persistence == Some(PersistenceTraceInfo::Recovery) {
             self.push_event(
-                requester.isolate,
-                Some(cause),
+                context.requester.isolate,
+                Some(context.cause),
                 RuntimeEventKind::RecoveryStarted,
             );
         }
         self.in_flight_calls.push(InFlightCall {
-            call_id,
+            call_id: context.call_id,
             call_kind,
-            requester,
-            cause,
+            requester: context.requester,
+            cause: context.cause,
             persistence,
+            continuation_context: context.continuation_context,
         });
         self.translators.push(StoredTranslator {
-            call_id,
+            call_id: context.call_id,
             translator: Some(translator),
         });
 
+        let call_id = context.call_id;
         match request {
             CallInput::Sleep { after } => {
                 let insertion_order = self.next_timer_ordinal;
@@ -3115,9 +3127,9 @@ where
                     insertion_order,
                 });
             }
-            CallInput::TcpBind { addr } => self.handle_tcp_bind(call_id, addr),
-            CallInput::TcpAccept { listener } => self.handle_tcp_accept(call_id, listener),
-            CallInput::TcpConnect { addr } => self.handle_tcp_connect(call_id, addr),
+            CallInput::TcpBind { addr } => self.handle_tcp_bind(context.call_id, addr),
+            CallInput::TcpAccept { listener } => self.handle_tcp_accept(context.call_id, listener),
+            CallInput::TcpConnect { addr } => self.handle_tcp_connect(context.call_id, addr),
             CallInput::TcpRead { stream, max_len } => {
                 self.handle_tcp_read(call_id, stream, max_len)
             }
@@ -3214,9 +3226,7 @@ where
 
     fn dispatch_observed_send(
         &mut self,
-        call_id: CallId,
-        requester: RegisteredAddress,
-        cause: tina_runtime::CauseId,
+        context: CallDispatchContext,
         send: ErasedSend,
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
@@ -3225,8 +3235,8 @@ where
         let target_isolate = send.target_isolate;
         let target_generation = send.target_generation;
         let send_attempted = self.push_event(
-            requester.isolate,
-            Some(cause),
+            context.requester.isolate,
+            Some(context.cause),
             RuntimeEventKind::SendDispatchAttempted {
                 target_shard,
                 target_isolate,
@@ -3250,7 +3260,7 @@ where
         let outcome = match delivery {
             Ok(()) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendAccepted {
                         target_shard,
@@ -3262,7 +3272,7 @@ where
             }
             Err(reason) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendRejected {
                         target_shard,
@@ -3278,15 +3288,19 @@ where
             }
         };
 
-        self.deliver_observed_send_outcome(call_id, requester, cause, outcome, translator);
+        self.deliver_observed_send_outcome(
+            context.call_id,
+            context.requester,
+            context.cause,
+            outcome,
+            translator,
+            context.continuation_context,
+        );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_isolate_call(
         &mut self,
-        call_id: CallId,
-        requester: RegisteredAddress,
-        cause: tina_runtime::CauseId,
+        context: CallDispatchContext,
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
@@ -3296,8 +3310,8 @@ where
         let target_isolate = send.target_isolate;
         let target_generation = send.target_generation;
         let send_attempted = self.push_event(
-            requester.isolate,
-            Some(cause),
+            context.requester.isolate,
+            Some(context.cause),
             RuntimeEventKind::SendDispatchAttempted {
                 target_shard,
                 target_isolate,
@@ -3307,9 +3321,9 @@ where
 
         if target_shard != self.shard.id() {
             let call_context = MessageCallContext::Remote {
-                call_id,
-                requester,
-                cause,
+                call_id: context.call_id,
+                requester: context.requester,
+                cause: context.cause,
             };
             match route_remote(
                 self.shard.id(),
@@ -3321,7 +3335,7 @@ where
             ) {
                 Ok(()) => {
                     self.push_event(
-                        requester.isolate,
+                        context.requester.isolate,
                         Some(send_attempted.into()),
                         RuntimeEventKind::SendAccepted {
                             target_shard,
@@ -3332,17 +3346,18 @@ where
                     let insertion_order = self.next_isolate_call_ordinal;
                     self.next_isolate_call_ordinal += 1;
                     self.pending_isolate_calls.push(PendingIsolateCall {
-                        call_id,
-                        requester,
-                        cause,
+                        call_id: context.call_id,
+                        requester: context.requester,
+                        cause: context.cause,
                         deadline: self.virtual_now + timeout,
                         insertion_order,
+                        continuation_context: context.continuation_context,
                         translator: Some(translator),
                     });
                 }
                 Err(reason) => {
                     self.push_event(
-                        requester.isolate,
+                        context.requester.isolate,
                         Some(send_attempted.into()),
                         RuntimeEventKind::SendRejected {
                             target_shard,
@@ -3356,25 +3371,32 @@ where
                         SendRejectedReason::Closed => CallOutcome::Closed,
                     };
                     self.deliver_isolate_call_outcome(
-                        call_id,
-                        requester,
-                        cause,
+                        IsolateCallDeliveryContext {
+                            call_id: context.call_id,
+                            requester: context.requester,
+                            cause: context.cause,
+                            continuation_context: context.continuation_context,
+                            visible_at_step: self.step_ordinal,
+                        },
                         outcome,
                         translator,
-                        self.step_ordinal,
                     );
                 }
             }
             return;
         }
 
-        let delivery = self
-            .dispatch_local_send_with_context(send, Some(MessageCallContext::Local { call_id }));
+        let delivery = self.dispatch_local_send_with_context(
+            send,
+            Some(MessageCallContext::Local {
+                call_id: context.call_id,
+            }),
+        );
 
         match delivery {
             Ok(()) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendAccepted {
                         target_shard,
@@ -3385,17 +3407,18 @@ where
                 let insertion_order = self.next_isolate_call_ordinal;
                 self.next_isolate_call_ordinal += 1;
                 self.pending_isolate_calls.push(PendingIsolateCall {
-                    call_id,
-                    requester,
-                    cause,
+                    call_id: context.call_id,
+                    requester: context.requester,
+                    cause: context.cause,
                     deadline: self.virtual_now + timeout,
                     insertion_order,
+                    continuation_context: context.continuation_context,
                     translator: Some(translator),
                 });
             }
             Err(reason) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendRejected {
                         target_shard,
@@ -3409,12 +3432,15 @@ where
                     SendRejectedReason::Closed => CallOutcome::Closed,
                 };
                 self.deliver_isolate_call_outcome(
-                    call_id,
-                    requester,
-                    cause,
+                    IsolateCallDeliveryContext {
+                        call_id: context.call_id,
+                        requester: context.requester,
+                        cause: context.cause,
+                        continuation_context: context.continuation_context,
+                        visible_at_step: self.step_ordinal,
+                    },
                     outcome,
                     translator,
-                    self.step_ordinal,
                 );
             }
         }
@@ -5457,12 +5483,15 @@ where
                 panic!("translator for call {:?} already consumed", entry.call_id)
             });
             self.deliver_isolate_call_outcome(
-                entry.call_id,
-                entry.requester,
-                entry.cause,
+                IsolateCallDeliveryContext {
+                    call_id: entry.call_id,
+                    requester: entry.requester,
+                    cause: entry.cause,
+                    continuation_context: entry.continuation_context,
+                    visible_at_step: self.step_ordinal,
+                },
                 CallOutcome::Timeout,
                 translator,
-                self.step_ordinal,
             );
         }
     }
@@ -5478,6 +5507,7 @@ where
         cause: tina_runtime::CauseId,
         outcome: SendOutcome,
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+        continuation_context: Option<MessageCallContext>,
     ) {
         let call_kind = CallKind::ObservedSend;
         let message = translator(outcome);
@@ -5513,7 +5543,7 @@ where
 
         match self.entries[entry_index]
             .inbox
-            .push(message, self.step_ordinal, None)
+            .push(message, self.step_ordinal, continuation_context)
         {
             Ok(()) => {
                 self.push_event(
@@ -5566,24 +5596,24 @@ where
             .take()
             .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
         self.deliver_isolate_call_outcome(
-            call_id,
-            pending.requester,
-            cause,
+            IsolateCallDeliveryContext {
+                call_id,
+                requester: pending.requester,
+                cause,
+                continuation_context: pending.continuation_context,
+                visible_at_step: self.step_ordinal,
+            },
             outcome,
             translator,
-            self.step_ordinal,
         );
         true
     }
 
     fn deliver_isolate_call_outcome(
         &mut self,
-        call_id: CallId,
-        requester: RegisteredAddress,
-        cause: tina_runtime::CauseId,
+        context: IsolateCallDeliveryContext,
         outcome: CallOutcome<Box<dyn Any>>,
         translator: ErasedIsolateCallTranslator,
-        visible_at_step: u64,
     ) {
         let failure_reason = match &outcome {
             CallOutcome::Replied(_) => None,
@@ -5594,10 +5624,10 @@ where
 
         if let Some(reason) = failure_reason {
             self.push_event(
-                requester.isolate,
-                Some(cause),
+                context.requester.isolate,
+                Some(context.cause),
                 RuntimeEventKind::CallFailed {
-                    call_id,
+                    call_id: context.call_id,
                     call_kind: CallKind::IsolateCall,
                     reason,
                 },
@@ -5606,13 +5636,14 @@ where
 
         let message = translator(outcome);
         let Some(entry_index) = self.entries.iter().position(|entry| {
-            entry.id == requester.isolate && entry.generation == requester.generation
+            entry.id == context.requester.isolate
+                && entry.generation == context.requester.generation
         }) else {
             self.push_event(
-                requester.isolate,
-                Some(cause),
+                context.requester.isolate,
+                Some(context.cause),
                 RuntimeEventKind::CallCompletionRejected {
-                    call_id,
+                    call_id: context.call_id,
                     call_kind: CallKind::IsolateCall,
                     reason: CallCompletionRejectedReason::RequesterClosed,
                 },
@@ -5622,10 +5653,10 @@ where
 
         if self.entries[entry_index].stopped.get() {
             self.push_event(
-                requester.isolate,
-                Some(cause),
+                context.requester.isolate,
+                Some(context.cause),
                 RuntimeEventKind::CallCompletionRejected {
-                    call_id,
+                    call_id: context.call_id,
                     call_kind: CallKind::IsolateCall,
                     reason: CallCompletionRejectedReason::RequesterClosed,
                 },
@@ -5633,17 +5664,18 @@ where
             return;
         }
 
-        match self.entries[entry_index]
-            .inbox
-            .push(message, visible_at_step, None)
-        {
+        match self.entries[entry_index].inbox.push(
+            message,
+            context.visible_at_step,
+            context.continuation_context,
+        ) {
             Ok(()) => {
                 if failure_reason.is_none() {
                     self.push_event(
-                        requester.isolate,
-                        Some(cause),
+                        context.requester.isolate,
+                        Some(context.cause),
                         RuntimeEventKind::CallCompleted {
-                            call_id,
+                            call_id: context.call_id,
                             call_kind: CallKind::IsolateCall,
                         },
                     );
@@ -5651,10 +5683,10 @@ where
             }
             Err(TrySendError::Full(_)) => {
                 self.push_event(
-                    requester.isolate,
-                    Some(cause),
+                    context.requester.isolate,
+                    Some(context.cause),
                     RuntimeEventKind::CallCompletionRejected {
-                        call_id,
+                        call_id: context.call_id,
                         call_kind: CallKind::IsolateCall,
                         reason: CallCompletionRejectedReason::MailboxFull,
                     },
@@ -5662,10 +5694,10 @@ where
             }
             Err(TrySendError::Closed(_)) => {
                 self.push_event(
-                    requester.isolate,
-                    Some(cause),
+                    context.requester.isolate,
+                    Some(context.cause),
                     RuntimeEventKind::CallCompletionRejected {
-                        call_id,
+                        call_id: context.call_id,
                         call_kind: CallKind::IsolateCall,
                         reason: CallCompletionRejectedReason::RequesterClosed,
                     },
@@ -5744,10 +5776,11 @@ where
             return;
         }
 
-        match self.entries[entry_index]
-            .inbox
-            .push(message, visible_at_step, None)
-        {
+        match self.entries[entry_index].inbox.push(
+            message,
+            visible_at_step,
+            in_flight.continuation_context,
+        ) {
             Ok(()) => {
                 if failure_reason.is_none() {
                     self.push_event(

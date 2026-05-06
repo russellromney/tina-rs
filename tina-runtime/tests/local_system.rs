@@ -1481,6 +1481,83 @@ fn local_system_topology_report_exposes_all_lane_capacities_and_new_counts() {
 }
 
 #[test]
+fn local_system_builder_exposes_complete_budget_manifest_without_low_level_config() {
+    let app = LocalSystem::single_shard(AppShard(92), AppMailboxFactory)
+        .ingress_capacity(3)
+        .storage_lane_capacity(4)
+        .dns_lane_capacity(5)
+        .tls_lane_capacity(6)
+        .process_lane_capacity(7)
+        .signal_capacity(8)
+        .remote_inbound_drain_budget(9)
+        .shutdown_lane_drain_timeout(Duration::from_millis(17))
+        .trace_retention(TraceRetention::Bounded(33))
+        .build();
+
+    let topology = app.topology();
+    let shard = topology
+        .shard(ShardId::new(92))
+        .expect("single shard report exists");
+    assert_eq!(shard.ingress().capacity(), 3);
+    assert_eq!(shard.storage_lane().capacity(), 4);
+    assert_eq!(shard.dns_lane().capacity(), 5);
+    assert_eq!(shard.tls_lane().capacity(), 6);
+    assert_eq!(shard.process_lane().capacity(), 7);
+    assert_eq!(shard.signal_lane().capacity(), 8);
+    assert_eq!(shard.remote_inbound_drain_budget(), 9);
+    assert_eq!(
+        shard.shutdown_lane_drain_timeout(),
+        Duration::from_millis(17)
+    );
+    assert_eq!(shard.trace_retention(), TraceRetention::Bounded(33));
+
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
+#[test]
+fn local_multi_shard_builder_exposes_complete_budget_manifest_without_low_level_config() {
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(93))
+        .shard(AppShard(94))
+        .ingress_capacity(3)
+        .shard_pair_capacity(4)
+        .storage_lane_capacity(5)
+        .dns_lane_capacity(6)
+        .tls_lane_capacity(7)
+        .process_lane_capacity(8)
+        .signal_capacity(9)
+        .remote_inbound_drain_budget(10)
+        .shutdown_lane_drain_timeout(Duration::from_millis(19))
+        .trace_retention(TraceRetention::Bounded(35))
+        .build();
+
+    let topology = app.topology();
+    for shard_id in [ShardId::new(93), ShardId::new(94)] {
+        let shard = topology.shard(shard_id).expect("shard report exists");
+        assert_eq!(shard.ingress().capacity(), 3);
+        assert_eq!(shard.storage_lane().capacity(), 5);
+        assert_eq!(shard.dns_lane().capacity(), 6);
+        assert_eq!(shard.tls_lane().capacity(), 7);
+        assert_eq!(shard.process_lane().capacity(), 8);
+        assert_eq!(shard.signal_lane().capacity(), 9);
+        assert_eq!(shard.remote_inbound_drain_budget(), 10);
+        assert_eq!(
+            shard.shutdown_lane_drain_timeout(),
+            Duration::from_millis(19)
+        );
+        assert_eq!(shard.trace_retention(), TraceRetention::Bounded(35));
+    }
+    assert!(
+        topology
+            .remote_queues()
+            .iter()
+            .all(|queue| queue.queue().capacity() == 4)
+    );
+
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
+#[test]
 fn local_system_topology_report_before_and_after_shutdown() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let app = LocalSystem::single_shard(AppShard(35), AppMailboxFactory)

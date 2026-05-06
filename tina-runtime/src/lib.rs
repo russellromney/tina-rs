@@ -552,6 +552,15 @@ struct InFlightCall {
     requester: RegisteredAddress,
     cause: CauseId,
     persistence: Option<call::PersistenceTraceInfo>,
+    continuation_context: Option<MessageCallContext>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallDispatchContext {
+    call_id: CallId,
+    requester: RegisteredAddress,
+    cause: CauseId,
+    continuation_context: Option<MessageCallContext>,
 }
 
 type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
@@ -642,6 +651,7 @@ struct PendingIsolateCall {
     cause: CauseId,
     deadline: Instant,
     insertion_order: u64,
+    continuation_context: Option<MessageCallContext>,
     translator: Option<ErasedIsolateCallTranslator>,
 }
 
@@ -1272,7 +1282,7 @@ where
                     isolate: isolate_id,
                     generation: self.entries[index].generation,
                 };
-                self.dispatch_call(call, requester, cause, route_remote);
+                self.dispatch_call(call, requester, cause, call_context, route_remote);
                 false
             }
             ErasedEffect::Noop => {
@@ -1369,6 +1379,7 @@ where
         call: ErasedCall,
         requester: RegisteredAddress,
         cause: CauseId,
+        continuation_context: Option<MessageCallContext>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let call_id = self.ids.next_call_id();
@@ -1383,30 +1394,22 @@ where
             Some(cause),
             RuntimeEventKind::CallDispatchAttempted { call_id, call_kind },
         );
+        let dispatch_context = CallDispatchContext {
+            call_id,
+            requester,
+            cause: attempted.into(),
+            continuation_context,
+        };
 
         match call.kind {
             call::ErasedCallKind::Backend {
                 request,
                 translator,
             } => {
-                self.dispatch_driver_call(
-                    call_id,
-                    call_kind,
-                    requester,
-                    attempted.into(),
-                    request,
-                    translator,
-                );
+                self.dispatch_driver_call(dispatch_context, call_kind, request, translator);
             }
             call::ErasedCallKind::ObservedSend { send, translator } => {
-                self.dispatch_observed_send(
-                    call_id,
-                    requester,
-                    attempted.into(),
-                    send,
-                    translator,
-                    route_remote,
-                );
+                self.dispatch_observed_send(dispatch_context, send, translator, route_remote);
             }
             call::ErasedCallKind::IsolateCall {
                 send,
@@ -1414,9 +1417,7 @@ where
                 translator,
             } => {
                 self.dispatch_isolate_call(
-                    call_id,
-                    requester,
-                    attempted.into(),
+                    dispatch_context,
                     send,
                     timeout,
                     translator,
@@ -1428,18 +1429,16 @@ where
 
     fn dispatch_driver_call(
         &mut self,
-        call_id: CallId,
+        context: CallDispatchContext,
         call_kind: CallKind,
-        requester: RegisteredAddress,
-        cause: CauseId,
         request: CallInput,
         translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
     ) {
         let persistence = request.persistence_trace_info();
         if persistence == Some(call::PersistenceTraceInfo::Recovery) {
             self.push_event(
-                requester.isolate,
-                Some(cause),
+                context.requester.isolate,
+                Some(context.cause),
                 RuntimeEventKind::RecoveryStarted,
             );
         }
@@ -1447,27 +1446,29 @@ where
         // so a synchronous completion (bind / close on Betelgeuse) can be
         // delivered through the same path as async completions.
         self.in_flight_calls.push(InFlightCall {
-            call_id,
+            call_id: context.call_id,
             call_kind,
-            requester,
-            cause,
+            requester: context.requester,
+            cause: context.cause,
             persistence,
+            continuation_context: context.continuation_context,
         });
         self.translators.push(StoredTranslator {
-            call_id,
+            call_id: context.call_id,
             translator: Some(translator),
         });
 
-        if let Some(immediate) = self.driver.submit(call_id, request, self.clock.now()) {
+        if let Some(immediate) = self
+            .driver
+            .submit(context.call_id, request, self.clock.now())
+        {
             self.deliver_completion(immediate.call_id, immediate.result);
         }
     }
 
     fn dispatch_observed_send(
         &mut self,
-        call_id: CallId,
-        requester: RegisteredAddress,
-        cause: CauseId,
+        context: CallDispatchContext,
         send: ErasedSend,
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
@@ -1476,8 +1477,8 @@ where
         let target_isolate = send.target_isolate;
         let target_generation = send.target_generation;
         let send_attempted = self.push_event(
-            requester.isolate,
-            Some(cause),
+            context.requester.isolate,
+            Some(context.cause),
             RuntimeEventKind::SendDispatchAttempted {
                 target_shard,
                 target_isolate,
@@ -1501,7 +1502,7 @@ where
         let outcome = match delivery {
             Ok(()) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendAccepted {
                         target_shard,
@@ -1513,7 +1514,7 @@ where
             }
             Err(reason) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendRejected {
                         target_shard,
@@ -1526,7 +1527,14 @@ where
             }
         };
 
-        self.deliver_observed_send_outcome(call_id, requester, cause, outcome, translator);
+        self.deliver_observed_send_outcome(
+            context.call_id,
+            context.requester,
+            context.cause,
+            outcome,
+            translator,
+            context.continuation_context,
+        );
     }
 
     fn deliver_observed_send_outcome(
@@ -1536,6 +1544,7 @@ where
         cause: CauseId,
         outcome: SendOutcome,
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
+        continuation_context: Option<MessageCallContext>,
     ) {
         let call_kind = CallKind::ObservedSend;
         let message = translator(outcome);
@@ -1569,7 +1578,7 @@ where
             return;
         }
 
-        match self.enqueue_entry_message(entry_index, message, None) {
+        match self.enqueue_entry_message(entry_index, message, continuation_context) {
             Ok(()) => {
                 self.push_event(
                     requester.isolate,
@@ -1602,12 +1611,9 @@ where
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_isolate_call(
         &mut self,
-        call_id: CallId,
-        requester: RegisteredAddress,
-        cause: CauseId,
+        context: CallDispatchContext,
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
@@ -1617,8 +1623,8 @@ where
         let target_isolate = send.target_isolate;
         let target_generation = send.target_generation;
         let send_attempted = self.push_event(
-            requester.isolate,
-            Some(cause),
+            context.requester.isolate,
+            Some(context.cause),
             RuntimeEventKind::SendDispatchAttempted {
                 target_shard,
                 target_isolate,
@@ -1627,12 +1633,14 @@ where
         );
 
         let call_context = if target_shard == self.shard.id() {
-            MessageCallContext::Local { call_id }
+            MessageCallContext::Local {
+                call_id: context.call_id,
+            }
         } else {
             MessageCallContext::Remote {
-                call_id,
-                requester,
-                cause,
+                call_id: context.call_id,
+                requester: context.requester,
+                cause: context.cause,
             }
         };
 
@@ -1652,7 +1660,7 @@ where
         match delivery {
             Ok(()) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendAccepted {
                         target_shard,
@@ -1663,17 +1671,18 @@ where
                 let insertion_order = self.next_isolate_call_ordinal;
                 self.next_isolate_call_ordinal += 1;
                 self.pending_isolate_calls.push(PendingIsolateCall {
-                    call_id,
-                    requester,
-                    cause,
+                    call_id: context.call_id,
+                    requester: context.requester,
+                    cause: context.cause,
                     deadline: self.clock.now() + timeout,
                     insertion_order,
+                    continuation_context: context.continuation_context,
                     translator: Some(translator),
                 });
             }
             Err(reason) => {
                 self.push_event(
-                    requester.isolate,
+                    context.requester.isolate,
                     Some(send_attempted.into()),
                     RuntimeEventKind::SendRejected {
                         target_shard,
@@ -1686,7 +1695,14 @@ where
                     SendRejectedReason::Full => CallOutcome::Full,
                     SendRejectedReason::Closed => CallOutcome::Closed,
                 };
-                self.deliver_isolate_call_outcome(call_id, requester, cause, outcome, translator);
+                self.deliver_isolate_call_outcome(
+                    context.call_id,
+                    context.requester,
+                    context.cause,
+                    outcome,
+                    translator,
+                    context.continuation_context,
+                );
             }
         }
     }
@@ -1714,6 +1730,7 @@ where
                 entry.cause,
                 CallOutcome::Timeout,
                 translator,
+                entry.continuation_context,
             );
         }
     }
@@ -1736,7 +1753,14 @@ where
             .translator
             .take()
             .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
-        self.deliver_isolate_call_outcome(call_id, pending.requester, cause, outcome, translator);
+        self.deliver_isolate_call_outcome(
+            call_id,
+            pending.requester,
+            cause,
+            outcome,
+            translator,
+            pending.continuation_context,
+        );
         true
     }
 
@@ -1747,6 +1771,7 @@ where
         cause: CauseId,
         outcome: CallOutcome<Box<dyn Any>>,
         translator: ErasedIsolateCallTranslator,
+        continuation_context: Option<MessageCallContext>,
     ) {
         let failure_reason = match &outcome {
             CallOutcome::Replied(_) => None,
@@ -1796,7 +1821,7 @@ where
             return;
         }
 
-        match self.enqueue_entry_message(entry_index, message, None) {
+        match self.enqueue_entry_message(entry_index, message, continuation_context) {
             Ok(()) => {
                 if failure_reason.is_none() {
                     self.push_event(
@@ -1921,7 +1946,7 @@ where
             return;
         }
 
-        match self.enqueue_entry_message(entry_index, message, None) {
+        match self.enqueue_entry_message(entry_index, message, in_flight.continuation_context) {
             Ok(()) => {
                 if failure_reason.is_none() {
                     self.push_event(
@@ -3309,6 +3334,9 @@ pub enum LocalSystemConfigError {
 pub enum ThreadedRuntimeError {
     /// The worker thread stopped before it could accept or answer the command.
     WorkerStopped,
+    /// A multi-shard owner operation targeted a shard this local system does
+    /// not own.
+    UnknownShard(ShardId),
     /// The worker could not prove backend completion-slot ownership was
     /// released during shutdown.
     DriverShutdownFailed,
@@ -3550,6 +3578,7 @@ impl LiveShardMetrics {
             affinity_status: self.affinity_status.clone(),
             preallocation: self.preallocation,
             remote_inbound_drain_budget: self.config.remote_inbound_drain_budget,
+            shutdown_lane_drain_timeout: self.config.shutdown_lane_drain_timeout,
             state: self.state(),
             ingress: self.ingress.report(),
             storage_lane: LiveQueueReport::unmeasured(self.storage_lane.capacity),
@@ -3593,6 +3622,7 @@ pub struct LiveShardReport {
     affinity_status: AffinityStatus,
     preallocation: PreallocationConfig,
     remote_inbound_drain_budget: usize,
+    shutdown_lane_drain_timeout: Duration,
     state: LiveShardState,
     ingress: LiveQueueReport,
     storage_lane: LiveQueueReport,
@@ -3648,6 +3678,11 @@ impl LiveShardReport {
     /// a turn.
     pub const fn remote_inbound_drain_budget(&self) -> usize {
         self.remote_inbound_drain_budget
+    }
+
+    /// Per-shard budget for draining lane work during shutdown.
+    pub const fn shutdown_lane_drain_timeout(&self) -> Duration {
+        self.shutdown_lane_drain_timeout
     }
 
     /// Observable lifecycle state.
@@ -4442,6 +4477,30 @@ where
         self
     }
 
+    /// Sets bounded DNS-lane capacity.
+    pub const fn dns_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.dns_lane_capacity = capacity;
+        self
+    }
+
+    /// Sets bounded TLS-lane capacity.
+    pub const fn tls_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.tls_lane_capacity = capacity;
+        self
+    }
+
+    /// Sets bounded process-lane capacity.
+    pub const fn process_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.process_lane_capacity = capacity;
+        self
+    }
+
+    /// Sets bounded signal-wait capacity.
+    pub const fn signal_capacity(mut self, capacity: usize) -> Self {
+        self.config.signal_capacity = capacity;
+        self
+    }
+
     /// Sets the remote-inbound drain budget for fairness under cross-shard
     /// pressure.
     pub const fn remote_inbound_drain_budget(mut self, budget: usize) -> Self {
@@ -4473,6 +4532,12 @@ where
     /// Sets idle wait duration for the live worker.
     pub const fn idle_wait(mut self, idle_wait: Duration) -> Self {
         self.config.idle_wait = idle_wait;
+        self
+    }
+
+    /// Sets the per-shard shutdown lane drain timeout.
+    pub const fn shutdown_lane_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.config.shutdown_lane_drain_timeout = timeout;
         self
     }
 
@@ -4595,6 +4660,30 @@ where
         self
     }
 
+    /// Sets bounded DNS-lane capacity.
+    pub const fn dns_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.dns_lane_capacity = capacity;
+        self
+    }
+
+    /// Sets bounded TLS-lane capacity.
+    pub const fn tls_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.tls_lane_capacity = capacity;
+        self
+    }
+
+    /// Sets bounded process-lane capacity.
+    pub const fn process_lane_capacity(mut self, capacity: usize) -> Self {
+        self.config.process_lane_capacity = capacity;
+        self
+    }
+
+    /// Sets bounded signal-wait capacity.
+    pub const fn signal_capacity(mut self, capacity: usize) -> Self {
+        self.config.signal_capacity = capacity;
+        self
+    }
+
     /// Sets the per-worker remote-inbound drain budget for fairness under
     /// cross-shard pressure.
     pub const fn remote_inbound_drain_budget(mut self, budget: usize) -> Self {
@@ -4618,6 +4707,18 @@ where
     /// Sets the whole bounded-shape config.
     pub const fn config(mut self, config: LocalSystemConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Sets idle wait duration for each live worker.
+    pub const fn idle_wait(mut self, idle_wait: Duration) -> Self {
+        self.config.idle_wait = idle_wait;
+        self
+    }
+
+    /// Sets the per-shard shutdown lane drain timeout.
+    pub const fn shutdown_lane_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.config.shutdown_lane_drain_timeout = timeout;
         self
     }
 
@@ -5629,10 +5730,7 @@ where
         C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
     {
         let Some(sender) = self.commands.get(&shard) else {
-            panic!(
-                "ThreadedMultiShardRuntime targeted unknown shard {}",
-                shard.get()
-            );
+            return Err(ThreadedRuntimeError::UnknownShard(shard));
         };
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         sender
