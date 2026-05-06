@@ -219,8 +219,31 @@ framework before public release-story work.
 | **051 ecosystem bridge adapters** | Make Tokio ecosystem packages fit around Tina without lying. Build better Tower/Axum/Hyper bridge shapes, reqwest outbound worker, SQLx/tokio-postgres bridge sketch, WebSocket bridge pattern, tracing context propagation, and clear `Full`/`Closed`/`Timeout` mappings. Tokio may own the integration edge; Tina owns bounded service state behind it. |
 | **052 Tina RPC first form** | Build a small Tina-native RPC seed: length-prefixed TCP frames, service/method names, request ids, serde payload adapter, bounded in-flight calls, typed full/closed/timeout/error replies, client stub, service registry, simulation, and Eiffel comparison. Not gRPC, not remoting/clustering, not exactly-once. |
 | **053 sharded service primitives** | Add small Seastar-shaped app primitives: key-to-shard placement, sharded counter, sharded map pattern, bounded scatter/gather, partial aggregate result, hot-key pressure policy, examples, and DST. Use ordinary Rust maps/counters inside shard-owned isolates; Tina owns placement, fanout, timeouts, and partial failure truth. |
+| **055 native database first form** | Build the first Tina-owned database client paths so Tina services do not need a Tokio runtime to talk to a database. Adopt sync codec crates (`postgres-protocol` for PG wire, `rusqlite` for SQLite) and drive I/O via Tina runtime calls and connection isolates. Cover: Postgres startup/auth/simple-query/extended-query state machine over `tcp_connect`/`tcp_read`/`tcp_write`; SQLite via per-shard connection isolate with bounded query mailbox; bounded connection pool primitive (probably shared with 048's HTTP client); query timeouts, full/closed/timeout outcomes wire-visible; transaction story first-form or explicit non-goal; DST scenarios for connection death, query timeout, server error reply; Eiffel comparison against `sqlx`/`tokio-postgres`. **No** ORM, no migration tool, no schema discovery, no listen/notify in first form. |
+| **056 native HTTP/2 service stack** | Second-form HTTP after 048 HTTP/1 lands and demand justifies. Adopt sync codec crates where they exist (`hpack` / `hpack_codec` for HPACK, `prost` and `bytes` for protobuf and buffer ownership). For the HTTP/2 frame codec (length-prefixed binary frames with type/flags/stream-id), either vendor the framing modules from `h2` (mostly pure, the async parts live elsewhere) or write the ~few-hundred-line frame state machine directly. Cover: connection isolate, stream isolates, flow control (per-stream and per-connection), HEADERS/DATA/SETTINGS/PING/RST_STREAM/GOAWAY frames, server push explicit non-goal, multiplexing through the connection isolate's request id map, DST proofs for stream multiplexing and reorder. Not a tonic clone; not a complete RFC 7540 implementation; first-form means the HTTP/1 routing/handler shape extends with `:authority`/pseudo-headers and stream-aware bodies. |
+| **057 native gRPC service stack** | Third-form RPC after 056 HTTP/2 lands. Small layer on top: `prost` for protobuf payloads (sync, adopt directly), tonic-style `tonic-build` proc-macro codegen *can* be reused as-is (it is compile-time and runtime-agnostic) with a Tina-shaped service trait template, status codes as a typed enum, unary and server-streaming first form, client and server, DST scenarios for status-code propagation and cancellation. Not a tonic feature-parity claim; bidirectional streaming and full interceptor stack are explicit non-goals for first form. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
+
+Adopt-don't-rebuild discipline for 048/055/056/057: Tina owns sockets,
+buffers, state machines, backpressure, shutdown, and trace. Tina borrows
+*codecs*, never *runtimes*. The public sync ecosystem already covers most
+of the bytes-shaped work:
+
+- HTTP/1 wire — `httparse` (zero-copy parser, sync)
+- HTTP types — the `http` crate (`Request`, `Response`, `Method`, etc.)
+- HPACK / HTTP/2 headers — `hpack` or `hpack_codec` (sync)
+- HTTP/2 framing — vendor or write; pure bytes, no async required
+- Protobuf — `prost` (sync codec, runtime-agnostic)
+- Postgres wire — `postgres-protocol` (sync, just bytes-in/bytes-out)
+- SQLite — `rusqlite` (sync, blocking C wrapper; fits per-shard isolate)
+- TLS — `rustls` (sync state machine; not `tokio-rustls`)
+- WebSocket framing — `tungstenite` core (sync, not `tokio-tungstenite`)
+
+The pattern is always the same: codec is sync, Tina drives the I/O via
+runtime calls, the handler is a state machine that calls the codec on
+each `tcp_read` reply. No vendored async runtimes; no hidden Tokio under
+Tina services.
 
 047 plan, near-grug:
 
