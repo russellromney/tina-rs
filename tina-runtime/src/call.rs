@@ -967,11 +967,11 @@ pub enum CallError {
     Unsupported,
 
     /// The referenced runtime resource lane already has an in-flight
-    /// operation.
-    ///
-    /// TCP accepts, reads, and writes occupy separate lanes. A stream may have
-    /// one read and one write pending at the same time, but duplicate work on
-    /// the same lane and explicit close while any lane is pending fail here.
+    /// operation. TCP accept, read, and write are separate lanes; a
+    /// stream may have one read and one write pending at once, but
+    /// duplicate work on the same lane fails here. Close does not
+    /// surface as `ResourceBusy`: it cancels the pending op and
+    /// closes the resource.
     ResourceBusy,
 
     /// A complete journal record had a checksum mismatch.

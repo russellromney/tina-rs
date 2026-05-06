@@ -209,6 +209,11 @@ pub enum CallCompletionRejectedReason {
     /// The requesting isolate had stopped (or its incarnation was
     /// replaced) by the time the completion arrived.
     RequesterClosed,
+
+    /// User code closed the resource (TCP listener/stream, UDP socket)
+    /// while this call was pending. The call is silently cancelled;
+    /// the caller's continuation never fires.
+    ResourceClosed,
 }
 
 /// Why a reply from a callee could not complete its original isolate call.
@@ -769,6 +774,7 @@ fn call_completion_rejected_tag(reason: CallCompletionRejectedReason) -> u8 {
     match reason {
         CallCompletionRejectedReason::MailboxFull => 1,
         CallCompletionRejectedReason::RequesterClosed => 2,
+        CallCompletionRejectedReason::ResourceClosed => 3,
     }
 }
 

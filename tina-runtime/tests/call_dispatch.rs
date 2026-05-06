@@ -1305,7 +1305,7 @@ fn cancelling_pending_read_does_not_close_stream_for_later_write() {
 }
 
 #[test]
-fn stream_close_while_read_pending_fails_resource_busy() {
+fn stream_close_while_read_pending_cancels_read_and_closes() {
     let listener_slot = Arc::new(Mutex::new(None));
     let addr_slot = Arc::new(Mutex::new(None));
     let stream_slot = Rc::new(Cell::new(None));
@@ -1389,19 +1389,40 @@ fn stream_close_while_read_pending_fails_resource_busy() {
     runtime.step();
     runtime.step();
 
-    assert_eq!(*closer_log.borrow(), vec![CloserMsg::FailedObserved]);
+    // Close wins. The pending read continuation does not fire.
+    assert_eq!(
+        *closer_log.borrow(),
+        vec![CloserMsg::ClosedObserved],
+        "close must succeed when a read was pending on the same stream"
+    );
     assert!(
         reader_log.borrow().is_empty(),
-        "resource-busy close must not complete the active read"
+        "the pending read continuation must not fire after the stream was closed"
     );
-    assert!(
-        runtime.has_in_flight_calls(),
-        "active read stays pending after busy close rejection"
-    );
-
     let kinds = call_event_kinds(runtime.trace());
     assert!(
         kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpRead,
+                reason: CallCompletionRejectedReason::ResourceClosed,
+                ..
+            }
+        )),
+        "trace must record TcpRead ResourceClosed after close-cancel: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpStreamClose,
+                ..
+            }
+        )),
+        "trace must record TcpStreamClose CallCompleted: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
             k,
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpStreamClose,
@@ -1409,17 +1430,7 @@ fn stream_close_while_read_pending_fails_resource_busy() {
                 ..
             }
         )),
-        "trace must record TcpStreamClose ResourceBusy failure: {kinds:?}"
-    );
-    assert!(
-        !kinds.iter().any(|k| matches!(
-            k,
-            RuntimeEventKind::CallCompleted {
-                call_kind: CallKind::TcpStreamClose,
-                ..
-            }
-        )),
-        "busy stream close must not complete successfully"
+        "trace must NOT record TcpStreamClose ResourceBusy under the new contract"
     );
 }
 

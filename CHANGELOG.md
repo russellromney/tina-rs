@@ -4,6 +4,28 @@ This file records completed work.
 
 ## Unreleased
 
+### Runtime: TCP/UDP close cancels pending lanes instead of failing with `ResourceBusy`
+
+- `tcp_close_stream`, `tcp_close_listener`, and `udp_close_socket` no
+  longer fail with `CallError::ResourceBusy` when a read/write/accept/
+  recv is pending. Close cancels the pending op and closes the
+  resource. The pending caller's continuation never fires (silent
+  cancel — same shape as isolate-stop with pending calls).
+- New `CallCompletionRejectedReason::ResourceClosed` trace variant
+  keeps each silent cancellation observable.
+- Live driver pushes cancelled call ids onto `cancelled_by_close`;
+  the runtime layer drains them via the new
+  `RuntimeDriver::take_cancelled_by_close` hook and drops matching
+  `in_flight_calls` plus translators. Without this the worker would
+  spin on ghost calls.
+- Simulator gets a matching `cancel_backend_calls_for_resource`
+  helper that drains its pending queues, in-flight calls, and
+  translators. `run_until_quiescent` no longer hangs after
+  close-while-pending.
+- Tests previously pinning `ResourceBusy` for close-while-pending now
+  assert the clean-cancel-and-close behavior. `examples/FINDINGS.md`
+  is updated to mark the issue fixed.
+
 ### README Rewrite and Forward Roadmap Phases (Native DB / HTTP/2 / gRPC)
 
 - Rewrote the project `README.md` to match the conventions of mature

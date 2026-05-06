@@ -531,25 +531,20 @@ the impl block it is attached to. Until then, the workaround pattern
 needs documenting in the user guide.
 
 ### `tcp_close_stream` rejects while a `tcp_read` is pending on the same lane
-*Surfaced by:* `tina-http` (phase 048a).
+*Surfaced by:* `tina-http` (phase 048a). **Fixed** in the
+`runtime-tcp-close-cancels-pending` slice.
 
-`CallError::ResourceBusy` is the runtime's signal for "this lane has
-work in flight, the close cannot run." That is a defensible choice for
-a clean `tcp_echo`-shaped flow where reads complete before close is
-issued. It is not workable for HTTP error paths that need to *abandon*
-a read — a slow-loris client that drip-feeds bytes triggers the
-slow-loris guard, the connection isolate has an outstanding `tcp_read`
-that will not return, and `tcp_close_stream` is rejected. 048a's
-slow-loris path stops the isolate without explicit close as a
-workaround; the kernel socket is then dropped only when the runtime
-itself shuts down (or, presumably, when the isolate's owned resources
-are reclaimed — exact timing varies). A malicious client can keep many
-sockets open past their deadlines.
+Originally close failed with `CallError::ResourceBusy` if any lane
+had pending work, which left HTTP error paths (slow-loris, parse-fail
+mid-read) unable to close cleanly.
 
-**Improvement:** either expose `tcp_cancel_read(stream)` so user code
-can abandon a pending read before closing, or have `tcp_close_stream`
-implicitly cancel any pending lanes for that stream. Either choice
-should preserve Tina's "every cancellation is a typed event" property.
+Fix: `tcp_close_stream`, `tcp_close_listener`, and `udp_close_socket`
+now cancel any pending op on the resource and close. The pending
+caller's continuation never fires; the cancellation is recorded as
+`CallCompletionRejectedReason::ResourceClosed`. Simulator and live
+driver behave the same. `run_until_quiescent` no longer hangs after a
+close-while-pending. The slow-loris path in `tina-http` can now write
+`408 Request Timeout` then close cleanly.
 
 ### Wire-level `CallOutcome::Full` is not deterministically constructible on a single shard
 *Surfaced by:* `tina-http` (phase 048a).

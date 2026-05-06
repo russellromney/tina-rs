@@ -1423,6 +1423,22 @@ fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
         .count()
 }
 
+fn count_resource_closed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_kind,
+                    reason: CallCompletionRejectedReason::ResourceClosed,
+                    ..
+                } if call_kind == kind
+            )
+        })
+        .count()
+}
+
 fn count_spawned(trace: &[RuntimeEvent]) -> usize {
     trace
         .iter()
@@ -2891,29 +2907,31 @@ fn scripted_udp_negative_paths_are_visible_and_cancelable() {
             .any(|entry| entry == "recv-err:ResourceBusy")
     );
 
+    // Close wins. Pending recv does not notify the probe.
     sim.try_send(probe, UdpProbeMsg::Close(socket)).unwrap();
     sim.step();
     sim.step();
     assert!(
-        observed
+        observed.borrow().iter().any(|entry| entry == "closed"),
+        "close while recv pending must succeed under the new contract; observed = {:?}",
+        observed.borrow()
+    );
+    assert!(
+        !observed
             .borrow()
             .iter()
-            .any(|entry| entry == "close-err:ResourceBusy")
+            .any(|entry| entry == "close-err:ResourceBusy"),
+        "close must not fail with ResourceBusy under the new contract"
     );
-
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::UdpRecvFrom),
+        1,
+        "UDP close must trace pending recv as ResourceClosed"
+    );
+    // Stop the probe to keep the test shape tidy.
     sim.try_send(probe, UdpProbeMsg::Stop).unwrap();
     sim.step();
     assert!(!sim.has_in_flight_calls());
-    assert!(sim.trace().iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::CallCompletionRejected {
-                call_kind: CallKind::UdpRecvFrom,
-                reason: CallCompletionRejectedReason::RequesterClosed,
-                ..
-            }
-        )
-    }));
 }
 
 #[test]
@@ -3697,7 +3715,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
 }
 
 #[test]
-fn listener_close_while_accept_pending_fails_resource_busy() {
+fn listener_close_while_accept_pending_cancels_accept_and_closes() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
@@ -3746,22 +3764,33 @@ fn listener_close_while_accept_pending_fails_resource_busy() {
     sim.try_send(waiter, WaiterMsg::StartAccept).unwrap();
     sim.step();
     sim.try_send(closer, CloserMsg::CloseListener).unwrap();
-    sim.run_until_quiescent();
+    for _ in 0..4 {
+        sim.step();
+    }
 
-    assert_eq!(*log.borrow(), vec![WaiterMsg::Accepted]);
-    assert!(sim.trace().iter().any(|event| {
-        matches!(
+    assert!(
+        log.borrow().is_empty(),
+        "the pending accept continuation must not fire after listener close"
+    );
+    assert!(
+        !sim.trace().iter().any(|event| matches!(
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpListenerClose,
                 reason: CallError::ResourceBusy,
                 ..
             }
-        )
-    }));
+        )),
+        "listener close must not fail ResourceBusy under the new contract"
+    );
     assert_eq!(
         count_call_completed(sim.trace(), CallKind::TcpListenerClose),
-        0
+        1
+    );
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::TcpAccept),
+        1,
+        "listener close must trace pending accept as ResourceClosed"
     );
 }
 
@@ -3903,7 +3932,7 @@ fn read_and_write_on_same_stream_use_separate_lanes() {
 }
 
 #[test]
-fn stream_close_fails_pending_read() {
+fn stream_close_while_read_pending_cancels_read_and_closes() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
@@ -3947,30 +3976,39 @@ fn stream_close_fails_pending_read() {
 
     let closer = sim.register(StreamCloser { stream });
     sim.try_send(closer, CloserMsg::CloseStream).unwrap();
-    sim.run_until_quiescent();
+    for _ in 0..4 {
+        sim.step();
+    }
 
     assert_eq!(
         *read_log.borrow(),
-        vec![ReadProbeMsg::ReadCompleted(b"soon".to_vec())]
+        Vec::<ReadProbeMsg>::new(),
+        "the pending read continuation must not fire after stream close"
     );
-    assert!(sim.trace().iter().any(|event| {
-        matches!(
+    assert!(
+        !sim.trace().iter().any(|event| matches!(
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpStreamClose,
                 reason: CallError::ResourceBusy,
                 ..
             }
-        )
-    }));
+        )),
+        "stream close must not fail ResourceBusy when a read is pending"
+    );
     assert_eq!(
         count_call_completed(sim.trace(), CallKind::TcpStreamClose),
-        0
+        1
+    );
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::TcpRead),
+        1,
+        "stream close must trace pending read as ResourceClosed"
     );
 }
 
 #[test]
-fn stream_close_fails_pending_write() {
+fn stream_close_while_write_pending_cancels_write_and_closes() {
     let mut sim = Simulator::new(
         TestShard,
         SimulatorConfig {
@@ -4014,22 +4052,33 @@ fn stream_close_fails_pending_write() {
 
     let closer = sim.register(StreamCloser { stream });
     sim.try_send(closer, CloserMsg::CloseStream).unwrap();
-    sim.run_until_quiescent();
+    for _ in 0..4 {
+        sim.step();
+    }
 
-    assert_eq!(*write_log.borrow(), vec![WriteProbeMsg::Wrote(7)]);
-    assert!(sim.trace().iter().any(|event| {
-        matches!(
+    assert!(
+        write_log.borrow().is_empty(),
+        "the pending write continuation must not fire after stream close"
+    );
+    assert!(
+        !sim.trace().iter().any(|event| matches!(
             event.kind(),
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TcpStreamClose,
                 reason: CallError::ResourceBusy,
                 ..
             }
-        )
-    }));
+        )),
+        "stream close must not fail ResourceBusy when a write is pending"
+    );
     assert_eq!(
         count_call_completed(sim.trace(), CallKind::TcpStreamClose),
-        0
+        1
+    );
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::TcpWrite),
+        1,
+        "stream close must trace pending write as ResourceClosed"
     );
 }
 

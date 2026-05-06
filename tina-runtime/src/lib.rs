@@ -1698,6 +1698,45 @@ where
         {
             self.deliver_completion(immediate.call_id, immediate.result);
         }
+
+        // Driver cancelled some pending calls because their resource
+        // closed. Drop matching runtime state, or `has_in_flight_calls`
+        // stays true forever.
+        for cancelled in self.driver.take_cancelled_by_close() {
+            self.cancel_in_flight_call_for_resource_close(cancelled);
+        }
+    }
+
+    /// Drops runtime state for a call cancelled by resource close.
+    /// Translator is not run; caller's continuation does not fire.
+    /// Trace records `ResourceClosed`.
+    fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
+        let Some(in_flight_index) = self
+            .in_flight_calls
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        else {
+            return;
+        };
+        let in_flight = self.in_flight_calls.remove(in_flight_index);
+
+        if let Some(translator_index) = self
+            .translators
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        {
+            self.translators.remove(translator_index);
+        }
+
+        self.push_event(
+            in_flight.requester.isolate,
+            Some(in_flight.cause),
+            RuntimeEventKind::CallCompletionRejected {
+                call_id,
+                call_kind: in_flight.call_kind,
+                reason: CallCompletionRejectedReason::ResourceClosed,
+            },
+        );
     }
 
     fn dispatch_observed_send(
