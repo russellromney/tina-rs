@@ -87,6 +87,7 @@
 
 mod client;
 mod connection;
+mod dispatch;
 mod encoding;
 mod frame;
 mod registry;
@@ -100,6 +101,7 @@ pub use connection::{
     BadPeerReason, CloseReason, Connection, ConnectionConfig, ConnectionInit, ConnectionMsg,
     RouterReply, RouterRequest,
 };
+pub use dispatch::{Dispatch, Method, MethodTable, PayloadLimits};
 pub use encoding::{Encoding, EncodingError, EncodingErrorKind, Json};
 pub use frame::{
     DecodeError, EncodeError, FRAME_VERSION_V1, Frame, FrameError, FrameKind, FrameLimits,
