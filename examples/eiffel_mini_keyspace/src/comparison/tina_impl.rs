@@ -1,17 +1,14 @@
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
-    CallError, CallOutcome, ListenerId, MailboxFactory, RuntimeEventKind, StreamId,
-    ThreadedRuntime, ThreadedRuntimeConfig, call, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_read, tcp_write,
+    CallError, CallOutcome, DefaultThreadedMailboxFactory, ListenerId, RuntimeEventKind, StreamId,
+    ThreadedRuntime, ThreadedRuntimeConfig, call, stable_trace_hash, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
 use super::{Command, report_from_response, scripted_client};
@@ -24,59 +21,6 @@ impl Shard for KeyspaceShard {
         ShardId::new(72)
     }
 }
-
-struct KeyspaceMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> KeyspaceMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for KeyspaceMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct KeyspaceMailboxFactory;
-
-impl MailboxFactory for KeyspaceMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(KeyspaceMailbox::new(capacity))
-    }
-}
-
-type BoundAddr = Arc<Mutex<Option<SocketAddr>>>;
 
 #[derive(Debug, Clone)]
 enum StoreMsg {
@@ -235,7 +179,6 @@ enum ListenerMsg {
 #[derive(Debug)]
 struct Listener {
     bind_addr: SocketAddr,
-    bound_addr: BoundAddr,
     store: Address<StoreMsg, StoreReply>,
     listener: Option<ListenerId>,
 }
@@ -249,9 +192,8 @@ impl Listener {
     fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, KeyspaceShard>) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
-            ListenerMsg::Bound(Ok((listener, local_addr))) => {
+            ListenerMsg::Bound(Ok((listener, _local_addr))) => {
                 self.listener = Some(listener);
-                *self.bound_addr.lock().expect("bound addr mutex") = Some(local_addr);
                 tcp_accept(listener).reply(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
@@ -282,10 +224,9 @@ impl Listener {
 
 pub(crate) fn run() -> super::SideReport {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
-    let bound_addr: BoundAddr = Arc::new(Mutex::new(None));
     let runtime = ThreadedRuntime::with_config(
         KeyspaceShard,
-        KeyspaceMailboxFactory,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
@@ -300,25 +241,22 @@ pub(crate) fn run() -> super::SideReport {
         .register_with_capacity::<Listener, Infallible>(
             Listener {
                 bind_addr,
-                bound_addr: Arc::clone(&bound_addr),
                 store,
                 listener: None,
             },
             8,
         )
         .expect("register listener");
+
+    // Phase 047 Rock 4 (slice 1): the runtime's typed bound-address waiter
+    // replaces the previous `Arc<Mutex<Option<SocketAddr>>>` side channel.
+    let bound = runtime.observe_next_bound();
     runtime
         .try_send(listener, ListenerMsg::Start)
         .expect("start listener");
-
-    wait_until(Duration::from_secs(3), "listener bind", || {
-        bound_addr.lock().expect("bound addr mutex").is_some()
-    });
-
-    let addr = bound_addr
-        .lock()
-        .expect("bound addr mutex")
-        .expect("listener published address");
+    let addr = bound
+        .wait(Duration::from_secs(3))
+        .expect("listener bound address");
     let client = thread::spawn(move || scripted_client(addr));
 
     wait_until(Duration::from_secs(3), "tcp close", || {
@@ -330,7 +268,13 @@ pub(crate) fn run() -> super::SideReport {
     });
 
     let response = client.join().expect("client thread");
-    let _trace = runtime.shutdown().expect("runtime shutdown");
+    let trace = runtime.shutdown().expect("runtime shutdown");
+
+    // Phase 047 Rock 3: trace fingerprint via stable_hash, not Debug
+    // formatting. Same workload, same Tina version → same fingerprint.
+    let fingerprint = stable_trace_hash(trace.iter());
+    debug_assert!(fingerprint != 0, "trace fingerprint should be populated");
+
     report_from_response(response)
 }
 

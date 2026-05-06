@@ -71,18 +71,19 @@ What was awkward or surprising:
   enough room for the inbound `StoreReturned` callbacks plus the trailing
   `Wrote`/`Closed` messages; we picked 16 and moved on, but a smaller number
   silently breaks the run. There is no obvious "right" default for this.
-- A custom `Mailbox` + `MailboxFactory` pair is required just to instantiate
-  `ThreadedRuntime`. The `tina-mailbox-spsc` crate exists for tests, but
-  examples still copy ~40 lines of `Rc<RefCell<VecDeque<_>>>` boilerplate. A
-  default in-process mailbox would remove the friction.
-- The bound listener address has to be smuggled out through an
-  `Arc<Mutex<Option<SocketAddr>>>` because nothing in the runtime exposes
-  "tell the outside world what port you got". For real TCP examples this is a
-  recurring papercut — every comparison so far has reinvented `BoundAddr`.
+- ~~A custom `Mailbox` + `MailboxFactory` pair is required just to instantiate
+  `ThreadedRuntime`.~~ **Resolved in phase 047:** the comparison now uses
+  `tina_runtime::DefaultThreadedMailboxFactory`. The 40-line `KeyspaceMailbox` /
+  `KeyspaceMailboxFactory` boilerplate is gone.
+- ~~The bound listener address has to be smuggled out through an
+  `Arc<Mutex<Option<SocketAddr>>>`.~~ **Resolved in phase 047:** the host now
+  calls `runtime.observe_next_bound()` and `waiter.wait(timeout)` instead. The
+  `BoundAddr` type alias, the `Arc<Mutex<Option<SocketAddr>>>` allocation, and
+  the `bound_addr` field on the `Listener` isolate are all gone.
 - Shutdown still relies on `complete_trace()` polling for a specific
   `CallKind::TcpStreamClose` event. Useful for tests, but not a story we want
-  to ship. The runtime needs a "this isolate finished cleanly" signal that
-  external code can await without scanning the trace.
+  to ship. Phase 047's later observation-handle slice (operation-done waiter)
+  will close this gap.
 - The `#[isolate(... shard = KeyspaceShard)]` attribute requires every
   isolate to declare a shard even when there is only one. Single-shard
   examples should be allowed to omit it.

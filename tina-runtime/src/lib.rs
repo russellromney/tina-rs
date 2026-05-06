@@ -51,6 +51,7 @@ use betelgeuse::{IOLoopHandle, io_loop};
 
 mod call;
 mod driver;
+mod observation;
 pub mod persistence;
 mod trace;
 
@@ -71,6 +72,7 @@ pub use call::{
     udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
+pub use observation::{BoundAddressWaiter, WaitError};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
@@ -79,7 +81,7 @@ pub use tina_macros::runtime_isolate as isolate;
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId, EffectKind, EventId,
     RestartSkippedReason, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-    SupervisionRejectedReason,
+    SupervisionRejectedReason, stable_trace_hash,
 };
 
 pub use driver::os_signal_capture_supported;
@@ -98,6 +100,147 @@ pub trait MailboxFactory {
     /// User-provided mailboxes passed to [`Runtime::register`] remain typed
     /// by the isolate message type.
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>>;
+}
+
+/// Blessed in-process bounded mailbox factory for single-threaded runtimes.
+///
+/// Backed by `Rc<RefCell<VecDeque<T>>>` with explicit capacity, FIFO order,
+/// and idempotent close. It is the obvious thing examples and small services
+/// reach for when they do not need a custom mailbox implementation. Custom
+/// factories still work; this is a default, not a requirement.
+///
+/// `DefaultMailboxFactory` is `!Send`. Use [`DefaultThreadedMailboxFactory`]
+/// when constructing a [`ThreadedRuntime`] or any runtime that requires a
+/// `Send + 'static` factory.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultMailboxFactory;
+
+impl MailboxFactory for DefaultMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(DefaultMailbox::new(capacity))
+    }
+}
+
+struct DefaultMailbox<T> {
+    capacity: usize,
+    queue: Rc<RefCell<VecDeque<T>>>,
+    closed: Rc<Cell<bool>>,
+}
+
+impl<T> DefaultMailbox<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            queue: Rc::new(RefCell::new(VecDeque::with_capacity(capacity))),
+            closed: Rc::new(Cell::new(false)),
+        }
+    }
+}
+
+impl<T> Mailbox<T> for DefaultMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        if self.closed.get() {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        queue.push_back(message);
+        Ok(())
+    }
+
+    fn recv(&self) -> Option<T> {
+        self.queue.borrow_mut().pop_front()
+    }
+
+    fn close(&self) {
+        self.closed.set(true);
+    }
+}
+
+/// Blessed in-process bounded mailbox factory for `Send + 'static` runtimes.
+///
+/// Backed by `Arc<Mutex<VecDeque<T>>>` so the factory and its mailboxes can
+/// cross thread boundaries — required by [`ThreadedRuntime`] and other live
+/// substrates that move work onto a worker thread. Capacity is explicit, FIFO
+/// is preserved, and close is idempotent. Custom factories still work; this
+/// is a default for examples and small services.
+///
+/// The mailbox uses `Mutex` rather than a lock-free queue on purpose: the
+/// default keeps observable semantics obvious (one writer wins, one reader
+/// wins) and keeps Tina's bounded-and-visible model intact. Workloads that
+/// outgrow the mutex should reach for a custom factory.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultThreadedMailboxFactory;
+
+impl MailboxFactory for DefaultThreadedMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(DefaultThreadedMailbox::new(capacity))
+    }
+}
+
+struct DefaultThreadedMailbox<T> {
+    capacity: usize,
+    state: Arc<std::sync::Mutex<DefaultThreadedMailboxState<T>>>,
+}
+
+struct DefaultThreadedMailboxState<T> {
+    queue: VecDeque<T>,
+    closed: bool,
+}
+
+impl<T> DefaultThreadedMailbox<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Arc::new(std::sync::Mutex::new(DefaultThreadedMailboxState {
+                queue: VecDeque::with_capacity(capacity),
+                closed: false,
+            })),
+        }
+    }
+}
+
+impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        if state.closed {
+            return Err(TrySendError::Closed(message));
+        }
+        if state.queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        state.queue.push_back(message);
+        Ok(())
+    }
+
+    fn recv(&self) -> Option<T> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        state.queue.pop_front()
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        state.closed = true;
+    }
 }
 
 /// Requirement level for Tina's driver-runtime contract.
@@ -543,6 +686,7 @@ where
     round_messages: Vec<Option<DeliveredMessage>>,
     driver_completions: Vec<DriverCompletion>,
     next_isolate_call_ordinal: u64,
+    observation: observation::ObservationRegistry,
 }
 
 #[derive(Debug)]
@@ -705,6 +849,7 @@ where
             round_messages: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
             driver_completions: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             next_isolate_call_ordinal: 0,
+            observation: observation::ObservationRegistry::new(),
         }
     }
 
@@ -744,6 +889,21 @@ where
     /// Returns the number of trace events dropped by the retention policy.
     pub const fn trace_dropped(&self) -> u64 {
         self.trace_dropped
+    }
+
+    /// Registers a typed waiter for the next `tcp_bind` completion.
+    ///
+    /// Returns a [`BoundAddressWaiter`] that the host can `wait` on to
+    /// receive the bound `SocketAddr` (or a typed error). Each call returns
+    /// a fresh waiter; multiple registrations are served in registration
+    /// order as `tcp_bind` calls complete. The waiter is bounded one-slot:
+    /// no hidden queue is created.
+    ///
+    /// The trace remains the source of audit truth: this method does not
+    /// add a new event class, it only surfaces the bound address that
+    /// [`CallOutput::TcpBound`] already carries inside the runtime.
+    pub fn observe_next_bound(&mut self) -> BoundAddressWaiter {
+        self.observation.register_bound()
     }
 
     /// Sets the trace retention policy for future events.
@@ -1836,6 +1996,20 @@ where
             );
         }
         self.push_persistence_completion_events(&in_flight, &result, failure_reason);
+
+        if matches!(in_flight.call_kind, CallKind::TcpBind) {
+            match (&result, failure_reason) {
+                (CallOutput::TcpBound { local_addr, .. }, _) => {
+                    self.observation
+                        .notify_bound(observation::BoundAddressOutcome::Bound(*local_addr));
+                }
+                (_, Some(reason)) => {
+                    self.observation
+                        .notify_bound(observation::BoundAddressOutcome::Failed(reason));
+                }
+                _ => {}
+            }
+        }
 
         let message = translator(result);
 
@@ -4680,6 +4854,30 @@ where
         config: SupervisorConfig,
     ) -> Result<(), ThreadedRuntimeError> {
         self.call(move |runtime| runtime.supervise(parent, config))
+    }
+
+    /// Registers a typed waiter for the next `tcp_bind` completion on the
+    /// worker shard.
+    ///
+    /// Returns a [`BoundAddressWaiter`] the host can call `.wait(timeout)`
+    /// on. Each call returns a fresh waiter.
+    ///
+    /// **Order matters.** Register the waiter *before* you trigger the bind
+    /// (typically before the `try_send` that kicks the listener isolate). The
+    /// command channel is FIFO, so a registration enqueued before the bind
+    /// trigger always lands in the registry before the worker processes the
+    /// trigger; a registration enqueued after the bind has already completed
+    /// will wait for the *next* bind, not the one that just happened.
+    ///
+    /// If the worker is already stopped, the returned waiter resolves
+    /// immediately to [`WaitError::RuntimeStopped`] when `wait` is called —
+    /// the waiter itself is the single source of truth for "did this bind
+    /// happen", so no extra registration error is surfaced here.
+    pub fn observe_next_bound(&self) -> BoundAddressWaiter {
+        match self.call(|runtime| runtime.observe_next_bound()) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_bound_waiter(),
+        }
     }
 
     /// Attempts one typed ingress handoff through the bounded worker queue.
