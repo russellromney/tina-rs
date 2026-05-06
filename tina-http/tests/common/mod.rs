@@ -4,26 +4,22 @@
 //! `tests/server_bad_input.rs`, etc.) writes its own `mod common;` and
 //! uses [`TestHarness::start()`] to spin up a real `ThreadedRuntime` with
 //! one shard, a `Counter` service isolate, and an `HttpListener` bound
-//! to loopback. The harness publishes the bound socket address so test
-//! clients can dial it.
+//! to loopback. The harness observes the runtime's bound-address fact so
+//! test clients can dial it.
 
 #![allow(dead_code)]
 
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use http::{Method, StatusCode};
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::prelude::*;
 use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
 use tina_runtime::{
-    MailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
+    DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
+    ThreadedRuntimeConfig,
 };
 
 /// Single source of truth for the integration-test shard id. Each
@@ -38,57 +34,6 @@ pub struct TestShard;
 impl Shard for TestShard {
     fn id(&self) -> ShardId {
         ShardId::new(TEST_SHARD_ID)
-    }
-}
-
-pub struct TestMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> TestMailbox<T> {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for TestMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut q = self.queue.borrow_mut();
-        if q.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        q.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TestMailboxFactory;
-
-impl MailboxFactory for TestMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(TestMailbox::new(capacity))
     }
 }
 
@@ -148,7 +93,7 @@ impl Default for HarnessConfig {
 /// [`TestHarness::shutdown`] to stop the runtime cleanly.
 pub struct TestHarness {
     pub addr: SocketAddr,
-    runtime: Option<ThreadedRuntime<TestShard, TestMailboxFactory>>,
+    runtime: Option<ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>>,
     listener: Address<HttpListenerMsg>,
 }
 
@@ -160,7 +105,7 @@ impl TestHarness {
     pub fn start_with_config(config: HarnessConfig) -> Self {
         let runtime = ThreadedRuntime::with_config(
             TestShard,
-            TestMailboxFactory,
+            DefaultThreadedMailboxFactory,
             ThreadedRuntimeConfig {
                 command_capacity: 64,
                 idle_wait: Duration::from_millis(1),
@@ -176,11 +121,9 @@ impl TestHarness {
             .expect("register counter");
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
-        let bound_addr_slot = Arc::new(Mutex::new(None));
 
         let listener_isolate = HttpListener::<TestShard>::new(
             bind_addr,
-            Arc::clone(&bound_addr_slot),
             counter,
             config.limits,
             config.service_call_timeout,
@@ -190,11 +133,14 @@ impl TestHarness {
             .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
             .expect("register listener");
 
+        let bound = runtime.observe_next_bound();
         runtime
             .try_send(listener, HttpListenerMsg::Start)
             .expect("send Start");
 
-        let addr = wait_for_bound_addr(&bound_addr_slot, Duration::from_secs(2));
+        let addr = bound
+            .wait(Duration::from_secs(2))
+            .expect("listener publishes bound address");
 
         Self {
             addr,
@@ -245,19 +191,6 @@ impl Drop for TestHarness {
             let _ = runtime.try_send(self.listener, HttpListenerMsg::Stop);
             let _ = runtime.shutdown();
         }
-    }
-}
-
-pub fn wait_for_bound_addr(slot: &Arc<Mutex<Option<SocketAddr>>>, timeout: Duration) -> SocketAddr {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(addr) = *slot.lock().expect("bound addr lock") {
-            return addr;
-        }
-        if Instant::now() > deadline {
-            panic!("listener bind timed out");
-        }
-        thread::yield_now();
     }
 }
 

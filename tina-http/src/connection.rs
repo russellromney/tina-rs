@@ -50,7 +50,7 @@ pub enum HttpConnectionMsg {
     /// Slow-loris guard: fires once after
     /// [`HttpLimits::header_read_timeout`] from connection start. If
     /// the connection still has not finished reading the request head,
-    /// the connection writes `408 Request Timeout` and closes.
+    /// the connection stops and lets runtime cleanup close the stream.
     HeaderDeadline(Result<(), CallError>),
     /// Service `call` reply.
     ServiceReturned(CallOutcome<HttpResponse>),
@@ -90,9 +90,9 @@ pub struct HttpConnection<S: Shard> {
 
     // Slow-loris guard. While `head_deadline_armed` is true, an
     // outstanding `sleep` runtime call is racing the head-read; if it
-    // fires before parsing completes, the connection writes 408 and
-    // closes. After parsing completes the flag flips, and the deadline
-    // message becomes a no-op when it arrives.
+    // fires before parsing completes, the connection stops and lets runtime
+    // cleanup close the stream. After parsing completes the flag flips,
+    // and the deadline message becomes a no-op when it arrives.
     head_deadline_armed: bool,
 
     _shard: std::marker::PhantomData<S>,
@@ -202,9 +202,9 @@ impl<S: Shard + 'static> HttpConnection<S> {
 
     /// Slow-loris guard: this fires after
     /// [`HttpLimits::header_read_timeout`]. If the connection has not
-    /// yet parsed a request head, it writes `408 Request Timeout` and
-    /// closes. If parsing already completed, the deadline fires
-    /// harmlessly.
+    /// yet parsed a request head, it stops the isolate and lets runtime
+    /// cleanup close the stream. If parsing already completed, the deadline
+    /// fires harmlessly.
     fn handle_header_deadline(&mut self) -> Effect<Self> {
         if !self.head_deadline_armed {
             return noop();
@@ -253,7 +253,11 @@ impl<S: Shard + 'static> HttpConnection<S> {
         // First form: drop any bytes after content_length. We do not
         // support pipelining, and we close this connection after the
         // response anyway.
-        self.will_close = self.will_close || head.connection_close;
+        // First form is one request per connection, so every response is
+        // terminal for the socket. Force close so HTTP/1.1 clients see an
+        // honest `Connection: close` header before the runtime closes the
+        // stream.
+        self.will_close = true;
 
         let request = head.into_request(body);
         call(self.service, request, self.service_call_timeout)
@@ -298,6 +302,9 @@ impl<S: Shard + 'static> HttpConnection<S> {
     }
 
     fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
+        if count == 0 {
+            return self.begin_close();
+        }
         if count >= self.pending_response.len() {
             self.pending_response.clear();
             self.begin_close()
@@ -378,8 +385,8 @@ fn response_for_call_error(error: &CallError) -> HttpResponse {
 ///
 /// Returns `None` when the outcome carries a real reply; the caller is
 /// expected to use that reply directly. Returns `Some(response)` for
-/// `Full`, `Closed`, and `Timeout`, with the status mapping mirrored from
-/// [`response_for_call_error`].
+/// `Full`, `Closed`, and `Timeout`, with the same status mapping used by
+/// the connection isolate's runtime-call error path.
 ///
 /// Exposed publicly so service-side code can build the same mapping
 /// when wrapping a downstream call into its own response shape.

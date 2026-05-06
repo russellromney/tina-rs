@@ -5,15 +5,8 @@
 //! handles one request, calls the user's service isolate, writes the
 //! response, and closes.
 //!
-//! The bound socket address is published via a shared
-//! `Arc<Mutex<Option<SocketAddr>>>` slot. This is the same `BoundAddr`
-//! pattern used by the keyspace and chat Eiffel comparisons; phase 047's
-//! "host observation handles" rock will replace it with a typed handle
-//! when it lands.
-
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -23,11 +16,6 @@ use tina_runtime::{
 
 use crate::connection::{HttpConnection, HttpConnectionMsg};
 use crate::types::{HttpLimits, HttpRequest, HttpResponse};
-
-/// Shared slot the listener writes its bound socket address into. The
-/// host (or tests) reads this once after registering the isolate to
-/// learn the actual port the kernel chose.
-pub type BoundAddrSlot = Arc<Mutex<Option<SocketAddr>>>;
 
 /// Inbound message variants for [`HttpListener`].
 #[derive(Debug, Clone)]
@@ -56,7 +44,6 @@ pub enum HttpListenerMsg {
 /// any shard placement chosen by the surrounding service.
 pub struct HttpListener<S: Shard + 'static> {
     bind_addr: SocketAddr,
-    bound_addr: BoundAddrSlot,
     service: Address<HttpRequest, HttpResponse>,
     limits: HttpLimits,
     service_call_timeout: Duration,
@@ -81,7 +68,6 @@ impl<S: Shard + 'static> HttpListener<S> {
     /// upstream-side analogue of an HTTP request deadline.
     pub fn new(
         bind_addr: SocketAddr,
-        bound_addr: BoundAddrSlot,
         service: Address<HttpRequest, HttpResponse>,
         limits: HttpLimits,
         service_call_timeout: Duration,
@@ -89,7 +75,6 @@ impl<S: Shard + 'static> HttpListener<S> {
     ) -> Self {
         Self {
             bind_addr,
-            bound_addr,
             service,
             limits,
             service_call_timeout,
@@ -119,9 +104,7 @@ impl<S: Shard + 'static> Isolate for HttpListener<S> {
 
             HttpListenerMsg::Bound(Ok((listener, local_addr))) => {
                 self.listener = Some(listener);
-                if let Ok(mut slot) = self.bound_addr.lock() {
-                    *slot = Some(local_addr);
-                }
+                let _ = local_addr;
                 tcp_accept(listener).reply(HttpListenerMsg::Accepted)
             }
             HttpListenerMsg::Bound(Err(_)) => stop(),

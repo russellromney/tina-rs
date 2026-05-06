@@ -16,7 +16,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use tina_http::{HttpLimits, ParseProgress, RequestParseError, parse_request_head};
+use tina_http::{HttpLimits, RequestParseError, parse_request_head};
 
 #[test]
 fn parser_is_pure_for_well_formed_request() {

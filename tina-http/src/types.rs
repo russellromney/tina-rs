@@ -117,7 +117,9 @@ pub enum RequestParseError {
     UnsupportedHttpVersion,
     /// The client did not send a complete request head before
     /// [`HttpLimits::header_read_timeout`] elapsed. The slow-loris case.
-    /// Maps to `408 Request Timeout`.
+    /// Maps to `408 Request Timeout` when a response can be sent; the
+    /// current connection isolate closes without writing the response while
+    /// a read is pending.
     HeaderReadTimeout,
 }
 
@@ -155,12 +157,10 @@ pub struct HttpLimits {
     /// Number of headers `httparse` may parse. Headers beyond this limit
     /// fail as a parse error.
     pub max_headers: usize,
-    /// Maximum wall-clock time the connection isolate will wait for the
-    /// client to finish sending the request head (status line + headers
-    /// + terminating CRLF CRLF). Slow-loris-style clients that drip-feed
-    /// bytes hit this and are rejected with
-    /// [`RequestParseError::HeaderReadTimeout`] (`408 Request Timeout`),
-    /// then the connection closes.
+    /// Maximum wall-clock time the connection isolate will wait for the client
+    /// to finish sending the request head (status line + headers + terminating
+    /// CRLF CRLF). Slow-loris-style clients that drip-feed bytes hit this and
+    /// the connection closes without reaching the service.
     pub header_read_timeout: std::time::Duration,
 }
 

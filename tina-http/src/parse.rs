@@ -164,8 +164,11 @@ fn build_head(
         if name == http::header::CONTENT_LENGTH {
             let value_str = std::str::from_utf8(header.value)
                 .map_err(|_| RequestParseError::InvalidContentLength)?;
-            let parsed_len: usize = value_str
-                .trim()
+            let trimmed = value_str.trim();
+            if trimmed.is_empty() || !trimmed.as_bytes().iter().all(u8::is_ascii_digit) {
+                return Err(RequestParseError::InvalidContentLength);
+            }
+            let parsed_len: usize = trimmed
                 .parse()
                 .map_err(|_| RequestParseError::InvalidContentLength)?;
             if parsed_len > limits.max_body_bytes {
@@ -232,8 +235,8 @@ fn is_origin_form(target: &str) -> bool {
 /// Serialises a response onto a wire buffer using HTTP/1.1 framing.
 ///
 /// First form: always emits `Content-Length`. Never emits chunked
-/// transfer encoding. Adds `Connection: close` if the request asked for
-/// it; otherwise relies on the version default.
+/// transfer encoding. Adds `Connection: close` when the caller says this
+/// response is the last response on the socket.
 pub fn encode_response(response: &crate::types::HttpResponse, connection_close: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + response.body.len());
 
@@ -455,6 +458,17 @@ mod tests {
                 assert_eq!(error.status(), http::StatusCode::BAD_REQUEST);
             }
             other => panic!("expected InvalidContentLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_length_must_be_digits_only() {
+        for bad in ["+5", "-1", "5.0", ""] {
+            let buf = format!("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: {bad}\r\n\r\n");
+            match parse_request_head(buf.as_bytes(), &limits()) {
+                ParseProgress::Failed(RequestParseError::InvalidContentLength) => {}
+                other => panic!("expected InvalidContentLength for {bad:?}, got {other:?}"),
+            }
         }
     }
 

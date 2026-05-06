@@ -26,7 +26,7 @@ use tina_runtime::{
 #[derive(Debug, Clone)]
 enum CallerMsg {
     Begin,
-    SleepDone(Result<(), tina_runtime::CallError>),
+    SleepDone,
 }
 
 #[derive(Debug)]
@@ -41,11 +41,11 @@ impl Caller {
             CallerMsg::Begin => {
                 let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.fanout as usize);
                 for _ in 0..self.fanout {
-                    effects.push(sleep(Duration::ZERO).reply(CallerMsg::SleepDone));
+                    effects.push(sleep(Duration::ZERO).reply(|_| CallerMsg::SleepDone));
                 }
                 batch(effects)
             }
-            CallerMsg::SleepDone(_) => noop(),
+            CallerMsg::SleepDone => noop(),
         }
     }
 }
@@ -125,7 +125,7 @@ fn _consume_call_outcome(_outcome: CallOutcome<u32>) {}
 #[derive(Debug, Clone)]
 enum ObsMsg {
     Begin,
-    Outcome(tina_runtime::SendOutcome),
+    Outcome,
 }
 
 #[derive(Debug)]
@@ -141,12 +141,13 @@ impl ObsCaller {
             ObsMsg::Begin => {
                 let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.burst as usize);
                 for n in 0..self.burst {
-                    effects
-                        .push(send_observed(self.fanout, NoiseMsg::Tick(n)).reply(ObsMsg::Outcome));
+                    effects.push(
+                        send_observed(self.fanout, NoiseMsg::Tick(n)).reply(|_| ObsMsg::Outcome),
+                    );
                 }
                 batch(effects)
             }
-            ObsMsg::Outcome(_) => noop(),
+            ObsMsg::Outcome => noop(),
         }
     }
 }

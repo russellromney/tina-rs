@@ -6,10 +6,10 @@
 //!   than one TCP read travels end-to-end through the server's
 //!   accumulating read buffer up to `Content-Length`. Asserted via a
 //!   trace count of `tcp_read` completions.
-//! - rock 5 (load and overload): a service with mailbox capacity 1
-//!   under concurrent load surfaces typed `503 Service Unavailable`
-//!   responses on the wire. The slow-loris guard rejects partial
-//!   request heads with `408 Request Timeout` after
+//! - rock 5 (load and overload): service call failure maps are pinned at
+//!   the unit layer; this file adds deterministic wire-level coverage for
+//!   timeout (`504 Gateway Timeout`). Wire-level `Full` remains 048b work.
+//!   The slow-loris guard closes partial request heads after
 //!   `HttpLimits::header_read_timeout`.
 //! - rock 6 (graceful shutdown): sending `HttpListenerMsg::Stop` stops
 //!   accept and lets the runtime shut down cleanly. A `Stop` race —
@@ -129,7 +129,7 @@ fn slowloris_partial_header_closes_within_header_read_timeout() {
     // 408 first; the close happens via runtime cleanup. A future
     // runtime affordance (`tcp_cancel_read` or implicit cancel-on-close)
     // would let us send 408 first; tracked as 047/runtime ergonomics.
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpStream;
     use tina_http::HttpLimits;
 
@@ -256,60 +256,17 @@ fn service_call_timeout_returns_504_on_the_wire() {
     use std::convert::Infallible;
 
     use http::StatusCode;
-    use tina::{Mailbox, TrySendError, prelude::*};
+    use tina::prelude::*;
     use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
-    use tina_runtime::{MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
+    use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
-    use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
     use std::net::SocketAddr;
-    use std::rc::Rc;
-    use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]
     struct TimeoutShard;
     impl Shard for TimeoutShard {
         fn id(&self) -> ShardId {
             ShardId::new(common::TEST_SHARD_ID)
-        }
-    }
-
-    struct Bx<T> {
-        cap: usize,
-        q: Rc<RefCell<VecDeque<T>>>,
-        closed: Rc<Cell<bool>>,
-    }
-    impl<T> Mailbox<T> for Bx<T> {
-        fn capacity(&self) -> usize {
-            self.cap
-        }
-        fn try_send(&self, m: T) -> Result<(), TrySendError<T>> {
-            if self.closed.get() {
-                return Err(TrySendError::Closed(m));
-            }
-            let mut q = self.q.borrow_mut();
-            if q.len() >= self.cap {
-                return Err(TrySendError::Full(m));
-            }
-            q.push_back(m);
-            Ok(())
-        }
-        fn recv(&self) -> Option<T> {
-            self.q.borrow_mut().pop_front()
-        }
-        fn close(&self) {
-            self.closed.set(true);
-        }
-    }
-    #[derive(Clone, Copy)]
-    struct F;
-    impl MailboxFactory for F {
-        fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-            Box::new(Bx::<T> {
-                cap: capacity,
-                q: Rc::new(RefCell::new(VecDeque::new())),
-                closed: Rc::new(Cell::new(false)),
-            })
         }
     }
 
@@ -338,7 +295,7 @@ fn service_call_timeout_returns_504_on_the_wire() {
 
     let runtime = ThreadedRuntime::with_config(
         TimeoutShard,
-        F,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 32,
             idle_wait: Duration::from_millis(1),
@@ -350,12 +307,10 @@ fn service_call_timeout_returns_504_on_the_wire() {
         .expect("register service");
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
-    let bound = Arc::new(Mutex::new(None));
     let listener = runtime
         .register_with_capacity::<HttpListener<TimeoutShard>, _>(
             HttpListener::<TimeoutShard>::new(
                 bind_addr,
-                Arc::clone(&bound),
                 svc,
                 HttpLimits::default(),
                 Duration::from_millis(150), // short call timeout
@@ -364,16 +319,14 @@ fn service_call_timeout_returns_504_on_the_wire() {
             8,
         )
         .expect("register listener");
+    let bound = runtime.observe_next_bound();
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");
 
-    let server_addr = loop {
-        if let Some(addr) = *bound.lock().expect("bound lock") {
-            break addr;
-        }
-        std::thread::yield_now();
-    };
+    let server_addr = bound
+        .wait(Duration::from_secs(2))
+        .expect("listener publishes bound address");
 
     // Single client request — deterministic. The service never replies,
     // so the call times out at 150 ms and we receive a 504 on the wire.

@@ -60,7 +60,7 @@ cargo run --manifest-path examples/eiffel_native_http/Cargo.toml -- tina
 
 What worked well:
 
-- `HttpListener::<AppShard>::new(bind_addr, slot, service, limits,
+- `HttpListener::<SingleShard>::new(bind_addr, service, limits,
   timeout, capacity)` plus `runtime.try_send(listener,
   HttpListenerMsg::Start)` is the entire bind + accept setup. The
   listener spawns one `HttpConnection` isolate per accepted socket;
@@ -82,15 +82,11 @@ What worked well:
 
 What was awkward or surprising:
 
-- Same `Mailbox` + `MailboxFactory` boilerplate that every Eiffel
-  comparison has. The `tina-http` crate doesn't help here — the
-  surrounding service still needs the standard ~40 lines. 047's
-  default mailbox factory removes this when it lands.
-- The bound socket address is still smuggled through
-  `Arc<Mutex<Option<SocketAddr>>>`. The `BoundAddr` slot pattern
-  shows up in every TCP server example. 047's host observation
-  handles will replace it.
-- The `HttpListener::<AppShard>` turbofish is required because
+- Phase 047 upgrades make the Tina side much less noisy than the first
+  draft: `DefaultThreadedMailboxFactory` replaces local mailbox
+  boilerplate, `SingleShard` replaces a one-off shard type, and
+  `runtime.observe_next_bound()` replaces the old bound-address slot.
+- The `HttpListener::<SingleShard>` turbofish is required because
   `tina-http`'s listener and connection isolates are generic over
   `S: Shard`. This is the cost of making the crate work with any
   user-chosen shard.
