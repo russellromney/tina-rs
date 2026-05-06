@@ -1,4 +1,4 @@
-# Phase 045: Baobab Production-Readiness Rails
+# Phase 046: Baobab Production-Readiness Rails
 
 ## Goal
 
@@ -8,6 +8,10 @@ testable."
 
 This is not a porting guide, demo, release story, or marketing phase. It is the
 test wall and runtime rails that make later porting attempts honest.
+
+Baobab runs after Phase 045 proves the portable non-`io_uring` local runtime is
+boring enough to judge. If Phase 045 changes capability truth, Baobab must
+compare that landed truth instead of stale assumptions.
 
 Seastar is the architectural north star: shared-nothing, per-core ownership,
 explicit cross-core communication, and systems-library seriousness. Tokio and

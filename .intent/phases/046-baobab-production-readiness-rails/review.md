@@ -20,11 +20,11 @@ What is strong:
 
 Load-bearing fixes before implementation:
 
-1. **North Sea dependency is unclear.**
-   Roadmap order says North Sea `io_uring` comes before Baobab, but this plan
-   can run on the current portable backend. Pin the rule: Baobab must not wait
-   for `io_uring`; it records backend rows honestly. If North Sea lands first,
-   Baobab includes it. If not, Baobab says portable backend only.
+1. **Portable-completion dependency must stay explicit.**
+   Baobab should run after the portable local runtime is completed, not after
+   `io_uring`. Pin the rule: Baobab judges landed backend truth. If `io_uring`
+   has not landed, Baobab records portable-backend rows only. If it has landed,
+   Baobab includes it without changing Tina user semantics.
 
 2. **Glommio comparison must be platform-gated.**
    Glommio is not a portable baseline for every CI/dev box. Add a required
