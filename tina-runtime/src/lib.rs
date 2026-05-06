@@ -1179,7 +1179,33 @@ where
     /// addresses are programmer errors and panic. Reconfiguring the same parent
     /// replaces the config and resets the runtime-lifetime budget tracker.
     pub fn supervise<M: 'static, R>(&mut self, parent: Address<M, R>, config: SupervisorConfig) {
-        let parent = self.checked_registered_address(parent, "supervise");
+        // Phase 047 Rock 8: keep the panicking surface for callers who want
+        // a setup-time assertion, but route the actual work through the
+        // fallible `try_supervise` so the panic message stays in one place.
+        if self.try_supervise(parent, config).is_err() {
+            panic!(
+                "supervise expected an address registered with this runtime, got an unknown or stale address",
+            );
+        }
+    }
+
+    /// Configures one registered isolate as supervisor without panicking on
+    /// unknown parents.
+    ///
+    /// Phase 047 Rock 8 (runtime surface alignment): the panicking
+    /// [`supervise`](Self::supervise) variant remains available for setup
+    /// code that wants the unknown-parent case to be a hard programmer
+    /// error. `try_supervise` is the fallible variant that
+    /// [`ThreadedRuntime`] uses internally so an unknown-parent registration
+    /// does not crash the worker thread.
+    pub fn try_supervise<M: 'static, R>(
+        &mut self,
+        parent: Address<M, R>,
+        config: SupervisorConfig,
+    ) -> Result<(), SuperviseError> {
+        let Some(parent) = self.try_registered_address(parent) else {
+            return Err(SuperviseError::UnknownParent);
+        };
         let budget_state = config.budget().tracker();
 
         if let Some(record) = self
@@ -1189,7 +1215,7 @@ where
         {
             record.config = config;
             record.budget_state = budget_state;
-            return;
+            return Ok(());
         }
 
         self.supervisors.push(SupervisorRecord {
@@ -1197,6 +1223,7 @@ where
             config,
             budget_state,
         });
+        Ok(())
     }
 
     /// Runs one deterministic round over all registered isolates.
@@ -2741,45 +2768,28 @@ where
             .position(|record| record.parent.isolate == parent)
     }
 
-    fn checked_registered_address<M: 'static, R>(
+    fn try_registered_address<M: 'static, R>(
         &self,
         address: Address<M, R>,
-        operation: &str,
-    ) -> RegisteredAddress {
+    ) -> Option<RegisteredAddress> {
         if address.shard() != self.shard.id() {
-            panic!(
-                "{operation} targeted a parent on another shard: target shard {} != runtime shard {}",
-                address.shard().get(),
-                self.shard.id().get(),
-            );
+            return None;
         }
 
-        let Some(entry) = self
+        let entry = self
             .entries
             .iter()
-            .find(|entry| entry.id == address.isolate())
-        else {
-            panic!(
-                "{operation} targeted unknown parent isolate {} on shard {}",
-                address.isolate().get(),
-                address.shard().get(),
-            );
-        };
+            .find(|entry| entry.id == address.isolate())?;
 
         if entry.generation != address.generation() {
-            panic!(
-                "{operation} targeted stale parent isolate {} generation {} on shard {}",
-                address.isolate().get(),
-                address.generation().get(),
-                address.shard().get(),
-            );
+            return None;
         }
 
-        RegisteredAddress {
+        Some(RegisteredAddress {
             shard: address.shard(),
             isolate: address.isolate(),
             generation: address.generation(),
-        }
+        })
     }
 
     fn register_entry<I, Outbound>(
@@ -3470,6 +3480,19 @@ pub enum ThreadedRuntimeError {
     /// The worker could not prove backend completion-slot ownership was
     /// released during shutdown.
     DriverShutdownFailed,
+}
+
+/// Error returned by [`Runtime::try_supervise`] and the threaded equivalents.
+///
+/// Phase 047 Rock 8: replaces a panic on unknown / stale parent registration
+/// in `Runtime::supervise` so the explicit-step and threaded surfaces both
+/// have a fallible variant. The panicking [`Runtime::supervise`] is kept
+/// for setup-time assertions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperviseError {
+    /// The address did not name a parent registered with this runtime
+    /// (unknown isolate id, stale generation, or wrong shard).
+    UnknownParent,
 }
 
 /// Error returned by [`ThreadedRuntime::try_send`].
@@ -4922,12 +4945,33 @@ where
     }
 
     /// Configures a registered isolate as supervisor on the worker shard.
+    ///
+    /// Phase 047 Rock 8: this method panics on unknown parent (consistent
+    /// with the explicit-step `Runtime::supervise`). Use
+    /// [`try_supervise`](Self::try_supervise) for a non-panicking variant
+    /// that surfaces unknown / stale parents as a typed
+    /// [`SuperviseError::UnknownParent`] without crashing the worker.
     pub fn supervise<M: 'static, R: 'static>(
         &self,
         parent: Address<M, R>,
         config: SupervisorConfig,
     ) -> Result<(), ThreadedRuntimeError> {
         self.call(move |runtime| runtime.supervise(parent, config))
+    }
+
+    /// Configures a registered isolate as supervisor on the worker shard
+    /// without panicking on unknown / stale parents.
+    ///
+    /// `Ok(Ok(()))` — registration succeeded. `Ok(Err(SuperviseError::UnknownParent))`
+    /// — the address is not currently registered or its generation is
+    /// stale. `Err(ThreadedRuntimeError)` — the worker thread had already
+    /// stopped or the shutdown handshake could not be observed.
+    pub fn try_supervise<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+        config: SupervisorConfig,
+    ) -> Result<Result<(), SuperviseError>, ThreadedRuntimeError> {
+        self.call(move |runtime| runtime.try_supervise(parent, config))
     }
 
     /// Registers a typed waiter for the next `tcp_bind` completion on the
@@ -5005,6 +5049,20 @@ where
     /// does not mean the target mailbox has accepted the message yet. Mailbox
     /// `Full` / `Closed` outcomes are observed on the worker side through trace
     /// or through [`send_and_observe`](Self::send_and_observe).
+    ///
+    /// Phase 047 Rock 8 — porting note: this is the fast, fire-and-forget
+    /// surface. Unlike [`Runtime::try_send`] (the explicit-step equivalent),
+    /// `ThreadedRuntime::try_send`:
+    ///
+    /// - returns `ThreadedTrySendError`, not `TrySendError<M>`. The
+    ///   message is consumed even on `IngressFull`; callers that need to
+    ///   recover the message (or distinguish `MailboxFull` from
+    ///   `MailboxClosed`) should use [`send_and_observe`](Self::send_and_observe),
+    ///   which is the strict, message-recoverable equivalent.
+    /// - silently drops messages addressed to a stale or unknown isolate
+    ///   on the worker side once the command is accepted. Use
+    ///   [`send_and_observe`] when the host must learn that the target was
+    ///   already closed.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,
