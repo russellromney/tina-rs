@@ -277,3 +277,128 @@ Remaining issues to pin before or during implementation:
    and allocation counts.
 
 No blocker beyond these pins. With them, 045 is a real pre-Baobab build phase.
+
+# Plan Review 3: IDD Hostile Review
+
+Verdict: close, but not ready. The plan points at the right thing: build the
+portable local runtime surface a real app will use. The remaining problems are
+IDD problems: changed behavior is not always tied to direct public-path proof,
+old behavior is not always re-proved, and one rock can still turn into a table
+instead of code.
+
+I read `/Users/russellromney/Documents/Github/idd`: `review.md` is append-only,
+plans must say what changes, what must not change, how new behavior is proved,
+and how blast radius is proved. Direct proof beats surrogate proof. User-shaped
+e2e is preferred for changed behavior.
+
+## Strong Proof
+
+- Public runner is now required. That closes the "test-only app shape" smell.
+- The plan requires ordinary Tina effects only: no async handlers, raw backend
+  handles, or Tokio tasks inside isolates.
+- The service harness is user-shaped: listener, session, I/O, bounded queues,
+  shutdown, report.
+- Scary-edge tests are named, not hand-waved.
+- DST is included as weird-combo pressure, not a replacement for normal tests.
+- `make verify-portable-runtime` must run the actual service harness, not just
+  tables.
+
+## Weak Or Missing Proof
+
+1. **Rock 1 still risks becoming the phase.**
+   "Coverage Map, Then Fix" is useful, but IDD says build and prove. Rename it
+   to an implementation ledger and state it cannot be the main deliverable.
+   The ledger records discovered gaps and proof status while building.
+
+2. **Public runner API is not pinned enough.**
+   The plan allows "explicit builder/run path first" and an attribute macro
+   later. Pin the 045 target: explicit public `LocalSystem` runner/builder now,
+   no attribute macro in this phase. Direct proof: outside integration test
+   uses the public runner and receives a terminal report.
+
+3. **Blast radius for existing low-level runtime APIs is vague.**
+   Adding a public runner must not break direct `LocalSystem`,
+   `LocalMultiShardSystem`, or `ThreadedRuntime` construction. Required proof
+   should include existing low-level tests plus one new test that bypasses the
+   runner and still works.
+
+4. **Resource-budget manifest must name mailbox split.**
+   Runtime budgets can live in runner/config, but isolate mailbox capacities
+   are per registration/spawn/child. Pin that as intentional. Direct proof:
+   one public-runner test configures runtime budgets and separately configures
+   small mailbox capacity, then observes `Full`.
+
+5. **One mega-harness can hide missing direct proof.**
+   Rock 10 asks a lot from one harness. IDD wants changed paths hit directly.
+   Keep one canonical service harness, but require focused direct tests for
+   each changed rail: runner, budget, lifecycle, lane full, cancel/tombstone,
+   shutdown report, trace partial, supervision plus I/O.
+
+6. **Blocking cancellation needs proof vocabulary.**
+   Queued blocking work can cancel. Started blocking work may only tombstone
+   and report. Direct tests must prove both separately. Do not let one
+   "cancel" test close both claims.
+
+7. **Trace/report survival needs public negative tests.**
+   Add direct outside tests: after shard failure, `trace()` returns partial
+   with missing shard names, `complete_trace()` fails cleanly, and terminal
+   report still carries topology/resource/error truth.
+
+8. **Bridge capability must not pollute runtime capability.**
+   Bridge matters for porting, but it is adapter truth. Keep runtime capability
+   table and bridge capability table distinct. Direct proof: one bridge test
+   exercises timeout/cancel/late response without changing runtime capability
+   claims.
+
+9. **Live DST must not depend on OS timing.**
+   For live runtime, DST/projection should compare stable semantic facts only:
+   accepted/full/closed/timeout/cancel/report shape. Simulator/model DST owns
+   randomness and shrinking. Say this in the plan.
+
+10. **Non-toy example needs CI-safe side effects.**
+    Require ephemeral ports, temp directories, no external network, and cleanup.
+    Otherwise the example will pass locally and rot in CI.
+
+11. **Cost report needs stable mode.**
+    Pin profile and modes: small smoke mode for CI, larger manual mode for
+    humans. Include configured capacities/preallocation in every row.
+
+12. **Tiny-helper rule needs a hard stop.**
+    045 may add helpers only when repeated public runner/service ceremony proves
+    the need. No second semantic path, no hidden retry, no hidden capacity, no
+    `flow!`.
+
+## Old Behavior At Risk
+
+- Existing explicit runtime construction could regress behind the new runner.
+- Existing capability reports could become bridge-contaminated.
+- Existing cancel/shutdown semantics could be overclaimed as preemption.
+- Existing trace APIs could become prettier but less honest under failure.
+- Existing platform-gated rails could become silent skips in CI.
+
+## Human Decisions Needed
+
+None. The obvious choices are:
+
+- explicit public runner now;
+- no attribute macro in 045;
+- runtime capability and bridge capability remain separate;
+- one canonical harness plus focused direct tests;
+- started blocking work is tombstoned/reported unless truly cancellable.
+
+## Required Plan Edits
+
+- Rename Rock 1 to **Implementation Ledger And Gap Closure**.
+- Pin explicit public `LocalSystem` runner/builder as 045 target.
+- Add blast-radius proof for low-level runtime construction.
+- Pin mailbox-capacity split in resource manifest.
+- Split mega-harness proof into canonical harness plus focused direct tests.
+- Add queued-cancel versus started-tombstone proof language.
+- Add public negative trace/complete-trace tests.
+- Separate runtime and bridge capability truth.
+- Pin live DST as semantic/scripted, not wall-clock random.
+- Require ephemeral ports/temp dirs/no external network for the example.
+- Pin cost report smoke/manual modes and capacity context.
+- Add tiny-helper stop rule.
+
+After those edits, 045 is ready to execute.
