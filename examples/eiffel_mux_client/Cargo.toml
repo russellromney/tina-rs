@@ -1,0 +1,14 @@
+[package]
+name = "eiffel-mux-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+tina = { path = "../../tina" }
+tina-runtime = { path = "../../tina-runtime" }
+tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "sync", "time"] }
+
+[workspace]

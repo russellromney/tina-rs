@@ -8,6 +8,20 @@ members = [
     "tina-supervisor",
     "tina-tokio-bridge",
 ]
+exclude = [
+    "examples/eiffel_real_io_chat",
+    "examples/eiffel_mini_keyspace",
+    "examples/eiffel_axum_counter",
+    "examples/eiffel_ws_room",
+    "examples/eiffel_mux_client",
+    "examples/eiffel_cpu_run",
+    "examples/eiffel_mem_run",
+    "examples/eiffel_supervised_worker",
+    "examples/eiffel_persistent_counter",
+    "examples/eiffel_replay_dst",
+    "examples/eiffel_outbound_fetch",
+    "examples/eiffel_graceful_shutdown",
+]
 resolver = "2"
 
 [workspace.package]
