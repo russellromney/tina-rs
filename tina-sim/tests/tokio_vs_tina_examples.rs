@@ -439,6 +439,77 @@ impl CrossDriver {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatClientMsg {
+    Deliver(&'static str),
+}
+
+#[derive(Debug)]
+struct ChatClient {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[tina_runtime::isolate(message = ChatClientMsg, shard = ComparisonShard)]
+impl ChatClient {
+    fn handle(
+        &mut self,
+        msg: ChatClientMsg,
+        _ctx: &mut Context<'_, ComparisonShard>,
+    ) -> Effect<Self> {
+        match msg {
+            ChatClientMsg::Deliver(message) => {
+                push(&self.events, message);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatRoomMsg {
+    Burst(Address<ChatClientMsg>),
+    Delivered(SendOutcome),
+}
+
+#[derive(Debug)]
+struct ChatRoom {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[tina_runtime::isolate(
+    message = ChatRoomMsg,
+    send = Outbound<ChatClientMsg>,
+    shard = ComparisonShard
+)]
+impl ChatRoom {
+    fn handle(
+        &mut self,
+        msg: ChatRoomMsg,
+        _ctx: &mut Context<'_, ComparisonShard>,
+    ) -> Effect<Self> {
+        match msg {
+            ChatRoomMsg::Burst(client) => batch(vec![
+                send_observed(client, ChatClientMsg::Deliver("delivered"))
+                    .reply(ChatRoomMsg::Delivered),
+                send_observed(client, ChatClientMsg::Deliver("overflow"))
+                    .reply(ChatRoomMsg::Delivered),
+            ]),
+            ChatRoomMsg::Delivered(outcome) => {
+                let event = if outcome.is_accepted() {
+                    "accepted"
+                } else if outcome.is_full() {
+                    "full"
+                } else {
+                    debug_assert!(outcome.is_closed());
+                    "closed"
+                };
+                push(&self.events, event);
+                noop()
+            }
+        }
+    }
+}
+
 fn simulator() -> Simulator<ComparisonShard> {
     Simulator::new(ComparisonShard, SimulatorConfig::default())
 }
@@ -842,6 +913,35 @@ fn tina_cross_shard_transport_full() -> Vec<&'static str> {
     }
 }
 
+fn tina_chat_slow_consumer_burst() -> Vec<&'static str> {
+    let events = events();
+    let mut sim = simulator();
+    let client = sim.register_with_mailbox_capacity(
+        ChatClient {
+            events: Arc::clone(&events),
+        },
+        1,
+    );
+    let room = sim.register_with_mailbox_capacity(
+        ChatRoom {
+            events: Arc::clone(&events),
+        },
+        8,
+    );
+    sim.try_send(room, ChatRoomMsg::Burst(client)).unwrap();
+    sim.run_until_quiescent();
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                reason: SendRejectedReason::Full,
+                ..
+            }
+        )
+    }));
+    snapshot(&events)
+}
+
 async fn tokio_fire_and_forget() -> Vec<&'static str> {
     let (tx, mut rx) = mpsc::channel(1);
     tx.send("hit").await.unwrap();
@@ -1044,6 +1144,21 @@ async fn tokio_constrained_overload_service() -> Vec<&'static str> {
         out.push("hit");
     }
     out.rotate_right(1);
+    out
+}
+
+async fn tokio_unbounded_chat_slow_consumer_burst() -> Vec<&'static str> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<&'static str>();
+    let mut out = Vec::new();
+    if tx.send("delivered").is_ok() {
+        out.push("accepted");
+    }
+    if tx.send("overflow").is_ok() {
+        out.push("accepted");
+    }
+    if let Some(message) = rx.recv().await {
+        out.push(message);
+    }
     out
 }
 
@@ -1263,6 +1378,15 @@ fn compare_constrained_overload_service_shape() -> Comparison {
     )
 }
 
+fn compare_unbounded_chat_slow_consumer_burst() -> Comparison {
+    Comparison::different_but_expected(
+        "unbounded chat slow-consumer burst",
+        block_on(tokio_unbounded_chat_slow_consumer_burst()),
+        tina_chat_slow_consumer_burst(),
+        Ease::C,
+    )
+}
+
 macro_rules! comparison_suite {
     ($($name:ident => $compare:ident: $label:literal),+ $(,)?) => {
         $(
@@ -1275,9 +1399,9 @@ macro_rules! comparison_suite {
         )+
 
         #[test]
-        fn runnable_comparison_suite_has_twenty_three_examples() {
+        fn runnable_comparison_suite_has_twenty_four_examples() {
             let examples = [$($label),+];
-            assert_eq!(examples.len(), 23);
+            assert_eq!(examples.len(), 24);
         }
 
         #[test]
@@ -1337,6 +1461,8 @@ comparison_suite! {
         "shutdown drain versus stop abandonment",
     example_23_constrained_overload_service => compare_constrained_overload_service_shape:
         "constrained overload service",
+    example_24_unbounded_chat_slow_consumer_burst => compare_unbounded_chat_slow_consumer_burst:
+        "unbounded chat slow-consumer burst",
 }
 
 #[test]
@@ -1358,7 +1484,7 @@ fn tina_examples_use_the_current_ergonomic_surface() {
         );
     }
 
-    assert!(source.matches("#[tina_runtime::isolate").count() >= 8);
+    assert!(source.matches("#[tina_runtime::isolate").count() >= 10);
     assert!(source.contains("sleep_then(Duration::from_millis(5), RetryMsg::Later)"));
     assert!(source.contains("outcome.into_result()"));
     assert!(source.contains("outcome.is_accepted()"));

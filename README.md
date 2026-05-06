@@ -270,6 +270,12 @@ None of this is new. Erlang, Akka, Seastar, TigerBeetle, FoundationDB, and
 Tina-Odin all matter here. `tina-rs` is these ideas expressed as Rust traits
 and small implementation crates.
 
+## Docs
+
+- [Tina User Guide](docs/tina-user-guide/README.md): short practical pages for
+  writing isolates, using runtime calls, handling overload, testing in
+  simulation, and porting small Tokio-shaped code.
+
 ## Development
 
 ```bash

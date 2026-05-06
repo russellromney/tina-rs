@@ -211,9 +211,27 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
+| **Eiffel Tokio comparison gauntlet** | Build a root-level suite of paired Tokio-vs-Tina implementation comparisons, not a single benchmark. The goal is discovery: find where Tina is wrong, broken, half-formed, awkward, better than Tokio, worse than Tokio, or pointing at a deeper model change. Start with chat/slow-consumer broadcast, mini-redis-style TCP/keyspace sessions, narrow Axum/Tower stateful services, WebSocket bidirectional pressure, and a small multiplexed-client subset. Each comparison should include separate Tokio and Tina processes, the same protocol and metrics format, a load driver, constrained-memory/CPU/overload pressure where practical, visible failure assertions, simulator replay where possible, and notes on ergonomics/model gaps. |
 | **North Sea io_uring substrate** | Build the first Tina-owned Linux `io_uring` backend for runtime-owned TCP and storage rails. On supported Linux systems it should become the preferred/default live backend; unsupported platforms keep the existing portable backend with explicit capability truth. No raw `io_uring` handle leaks into isolate code, no async-handler model, no hidden fallback queues, and no performance claim until Baobab or a later benchmark phase measures it. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
+
+Eiffel comparison backlog:
+
+| Comparison | Pressure shape | Learning goal |
+|---|---|---|
+| Chat / slow-consumer fanout | Real TCP, burst fanout, slow or non-reading clients | Learn whether Tina's visible `Full` pressure is worth the extra ceremony versus easy Tokio buffering. |
+| Mini-redis-style keyspace | Hot keys, many clients, slow replies, persistence later | Test isolate-per-key/session ergonomics, request/reply repetition, and runtime-owned TCP framing. |
+| Axum/Tower stateful service | Tokio HTTP edge, Tina stateful core, overload at ingress | Test bridge ergonomics and whether visible Tina failures map cleanly to HTTP/Tower behavior. |
+| Supervised worker | Job worker that panics on poison messages, parent observes the failure | Test whether Tina's supervisor + restart budget reads more honestly than hand-rolled Tokio `catch_unwind`/respawn loops. |
+| Persistent counter | Process restart over snapshot + journal | Test runtime-owned local persistence ergonomics against Tokio + a hand-rolled file/sled story. |
+| Replay / DST comparison | Same workload run twice under `tina-sim` with one seed plus a Tokio reference run | Demonstrate deterministic replay as a real Tina capability that the Tokio shape cannot offer. |
+| Outbound fetch / Tina-as-client | DNS + outbound TCP + read/aggregate | Test whether Tina is honest as a client library, not just a server, and surface DNS/connect/read timeout shapes. |
+| Graceful shutdown | Long-lived service with in-flight work receiving SIGINT | Compare `tokio::signal` + manual drain against Tina signal capture, bounded shutdown drain, and terminal `ShutdownReport`. |
+| WebSocket room | Bidirectional read/write, ping/pong, reconnects, slow readers | Test whether explicit connection/session isolates make liveness clearer or too verbose. |
+| Multiplexed client subset | Many in-flight requests on one connection, timeout/cancel/reply matching | Test whether Tina can model client libraries naturally, not only servers. |
+| CPU contention run | Same service load while CPU is quota-limited or contended | See whether Tina keeps shedding visibly under scheduler pressure. |
+| Memory-tier run | 32/64/128 MB process limits, same load profile | See whether Tina plateaus while Tokio-shaped buffering grows or fails less visibly. |
 
 Parallel-safe side work: CI matrix planning, formatting of existing
 performance reports, README wording that adds no new claims, external review
