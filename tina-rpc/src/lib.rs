@@ -29,10 +29,12 @@
 //!   `max_frame_size` before any body buffer is allocated.
 //! - Server-reported error codes only. Client-observed conditions (`timeout`,
 //!   `connection_closed`) never appear as wire frames.
+//! - Pluggable payload encoding via [`Encoding`]. First impl: [`Json`].
+//!   Encode/decode enforces `max_size` before invoking the underlying
+//!   serializer.
 //!
-//! Out of scope: encoding adapter (Rock 5), connection isolate (Rock 2),
-//! service registry (Rock 3), client stub (Rock 4), simulation (Rock 6),
-//! Eiffel comparison (Rock 7).
+//! Out of scope: connection isolate (Rock 2), service registry (Rock 3),
+//! client stub (Rock 4), simulation (Rock 6), Eiffel comparison (Rock 7).
 //!
 //! # Example
 //!
@@ -71,8 +73,10 @@
 //! assert_eq!(decoded_reply.error, Some(FrameError::Full));
 //! ```
 
+mod encoding;
 mod frame;
 
+pub use encoding::{Encoding, EncodingError, EncodingErrorKind, Json};
 pub use frame::{
     DecodeError, EncodeError, Frame, FrameError, FrameKind, FrameLimits, FRAME_VERSION_V1,
     LENGTH_PREFIX_SIZE, MAX_METHOD_LEN, MAX_SERVICE_LEN, decode, decode_body, encode,
