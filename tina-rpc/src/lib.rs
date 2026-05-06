@@ -38,9 +38,11 @@
 //!   paths.
 //! - Service registry ([`Registry`]) that maps service names to uniform
 //!   `Address<ServiceCall, ServiceReply>` and forwards via isolate-call.
+//! - Client stub ([`Client`]) per outbound TCP stream, with bounded
+//!   in-flight multiplexing, per-request deadlines, out-of-order reply
+//!   matching, and visible failure of pending calls on close.
 //!
-//! Out of scope: client stub (Rock 4), simulation (Rock 6), Eiffel
-//! comparison (Rock 7).
+//! Out of scope: simulation (Rock 6), Eiffel comparison (Rock 7).
 //!
 //! # Example
 //!
@@ -79,11 +81,15 @@
 //! assert_eq!(decoded_reply.error, Some(FrameError::Full));
 //! ```
 
+mod client;
 mod connection;
 mod encoding;
 mod frame;
 mod registry;
 
+pub use client::{
+    Client, ClientConfig, ClientInit, ClientMsg, ClientRequest, ClientResult, ClientResultMsg,
+};
 pub use connection::{
     BadPeerReason, CloseReason, Connection, ConnectionConfig, ConnectionInit, ConnectionMsg,
     RouterReply, RouterRequest,
