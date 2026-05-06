@@ -1,17 +1,13 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Duration;
 
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
-    CallError, MailboxFactory, StreamId, ThreadedRuntime, ThreadedRuntimeConfig, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write,
+    CallError, DefaultThreadedMailboxFactory, StreamId, ThreadedRuntime, ThreadedRuntimeConfig,
+    tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 
 use super::{FETCH_COUNT, RESPONSE, SideReport, TestServer};
@@ -25,63 +21,11 @@ impl Shard for FetchShard {
     }
 }
 
-struct FetchMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> FetchMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for FetchMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FetchMailboxFactory;
-
-impl MailboxFactory for FetchMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(FetchMailbox::new(capacity))
-    }
-}
-
 #[derive(Default)]
 struct Outcome {
     successful: AtomicU32,
     failed: AtomicU32,
     bytes: AtomicUsize,
-    done: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +52,6 @@ impl Fetcher {
         match msg {
             FetchMsg::Begin => {
                 if self.remaining == 0 {
-                    self.outcome.done.store(true, Ordering::Release);
                     return stop();
                 }
                 tcp_connect(self.target).reply(FetchMsg::Connected)
@@ -183,7 +126,6 @@ impl Fetcher {
     fn next_iteration(&mut self) -> Effect<Self> {
         self.remaining -= 1;
         if self.remaining == 0 {
-            self.outcome.done.store(true, Ordering::Release);
             stop()
         } else {
             tcp_connect(self.target).reply(FetchMsg::Connected)
@@ -197,7 +139,7 @@ pub(crate) fn run() -> SideReport {
 
     let runtime = ThreadedRuntime::with_config(
         FetchShard,
-        FetchMailboxFactory,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
@@ -220,18 +162,17 @@ pub(crate) fn run() -> SideReport {
         )
         .expect("register fetcher");
 
+    // Phase 047 Rock 4: typed isolate-complete waiter replaces the
+    // `Arc<AtomicBool> done` flag + spin loop. Register before kicking the
+    // fetcher so the host is already observing when the fetcher finishes.
+    let fetcher_done = runtime.observe_isolate_complete(fetcher);
     runtime
         .try_send(fetcher, FetchMsg::Begin)
         .expect("kick fetcher");
 
-    // Wait for the isolate to finish all iterations.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !outcome.done.load(Ordering::Acquire) {
-        if Instant::now() > deadline {
-            panic!("tina fetcher timed out");
-        }
-        thread::yield_now();
-    }
+    fetcher_done
+        .wait(Duration::from_secs(5))
+        .expect("tina fetcher finishes");
 
     let _ = runtime.shutdown().expect("runtime shutdown");
     drop(server);

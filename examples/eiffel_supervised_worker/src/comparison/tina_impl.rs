@@ -1,16 +1,13 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
+use tina::{RestartBudget, RestartPolicy, prelude::*};
 use tina_runtime::{
-    MailboxFactory, RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedTrySendError,
+    DefaultThreadedMailboxFactory, RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
+    ThreadedTrySendError,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -25,66 +22,15 @@ impl Shard for WorkerShard {
     }
 }
 
-struct WorkerMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> WorkerMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for WorkerMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WorkerMailboxFactory;
-
-impl MailboxFactory for WorkerMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(WorkerMailbox::new(capacity))
-    }
-}
-
-// Shared state the live worker fills with its current address each time the
-// supervisor restarts it. The driver thread reads this to send the next job
-// to whatever incarnation is currently running. `generation` increments on
-// every `Boot`, so the driver can wait for "the *next* incarnation" after a
-// known-poison send.
+// Phase 047 Rock 4: the host now learns about each restart via a typed
+// `ChildRestartedWaiter` instead of an `AtomicU64` generation counter. The
+// initial address still comes from the worker self-publishing on its first
+// `Boot` because the runtime does not (yet) expose an
+// `observe_next_child_spawned` waiter; the slot's mutex stays for that
+// one-shot publish only.
 #[derive(Default)]
 struct WorkerSlot {
     inner: Mutex<Option<WorkerAddr>>,
-    generation: AtomicU64,
 }
 
 type WorkerAddr = Address<WorkerMsg>;
@@ -99,18 +45,12 @@ impl WorkerSlot {
     }
 
     fn set(&self, addr: WorkerAddr) {
-        let mut guard: MutexGuard<'_, Option<WorkerAddr>> =
-            self.inner.lock().expect("worker slot mutex");
+        let mut guard = self.inner.lock().expect("worker slot mutex");
         *guard = Some(addr);
-        self.generation.fetch_add(1, Ordering::Release);
-    }
-
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerMsg {
     Boot,
     Process(Job),
@@ -175,7 +115,7 @@ pub(crate) fn run() -> SideReport {
 
     let runtime = ThreadedRuntime::with_config(
         WorkerShard,
-        WorkerMailboxFactory,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
@@ -208,29 +148,42 @@ pub(crate) fn run() -> SideReport {
         .try_send(parent, ParentMsg::Spawn)
         .expect("send spawn");
 
-    // Drive jobs from this thread. Each Poison advances the worker
-    // generation; everything else uses the current incarnation.
-    let mut last_seen_gen: u64 = 0;
+    // Wait for the worker's first Boot to publish its address. The first
+    // address still arrives via the worker self-publishing through `slot`
+    // (a child-spawned waiter is future runtime work; the slot is a
+    // one-shot mutex now, no `AtomicU64` generation counter).
     wait_until(Duration::from_secs(2), "first worker boot", || {
-        slot.generation() > last_seen_gen
+        slot.current().is_some()
     });
-    last_seen_gen = slot.generation();
 
     for job in script {
         let addr = wait_for_addr(&slot, Duration::from_secs(2));
-        send_until_accepted(
-            &runtime,
-            addr,
-            WorkerMsg::Process(job),
-            Duration::from_secs(2),
-        );
         if matches!(job, Job::Poison) {
-            // Wait for the supervisor to restart and the new worker to Boot.
-            let target = last_seen_gen + 1;
-            wait_until(Duration::from_secs(2), "supervisor restart", || {
-                slot.generation() >= target
+            // Phase 047 Rock 4: register the typed restart waiter BEFORE
+            // sending the poison job, so the host is observing when the
+            // panic-induced restart fires. This deletes the
+            // `AtomicU64` generation counter and the spin-loop predicate.
+            let restart_waiter = runtime.observe_child_restarted(parent);
+            send_until_accepted(
+                &runtime,
+                addr,
+                WorkerMsg::Process(job),
+                Duration::from_secs(2),
+            );
+            restart_waiter
+                .wait(Duration::from_secs(2))
+                .expect("supervisor restart resolves");
+            // Wait for the fresh incarnation to publish its address.
+            wait_until(Duration::from_secs(2), "next worker boot", || {
+                slot.current().map(|a| a != addr).unwrap_or(false)
             });
-            last_seen_gen = slot.generation();
+        } else {
+            send_until_accepted(
+                &runtime,
+                addr,
+                WorkerMsg::Process(job),
+                Duration::from_secs(2),
+            );
         }
     }
 
@@ -277,7 +230,7 @@ fn wait_for_addr(slot: &Arc<WorkerSlot>, timeout: Duration) -> WorkerAddr {
 }
 
 fn send_until_accepted(
-    runtime: &ThreadedRuntime<WorkerShard, WorkerMailboxFactory>,
+    runtime: &ThreadedRuntime<WorkerShard, DefaultThreadedMailboxFactory>,
     addr: WorkerAddr,
     msg: WorkerMsg,
     timeout: Duration,

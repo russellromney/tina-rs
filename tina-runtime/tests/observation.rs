@@ -1,17 +1,25 @@
-//! Phase 047 Rock 4 (slice 1): typed bound-address waiter tests.
+//! Phase 047 Rock 4: typed observation handle tests.
+//!
+//! Slice 1 covers the bound-address waiter; slice 2 (this file's later
+//! tests) covers isolate-complete, operation-done, and child-restarted
+//! waiters.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use tina::{Mailbox, TrySendError, prelude::*};
+use tina::{RestartBudget, RestartPolicy};
 use tina_runtime::{
-    CallError, ListenerId, MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, WaitError,
-    tcp_bind, tcp_close_listener,
+    CallError, CallKind, ListenerId, MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+    WaitError, sleep, tcp_bind, tcp_close_listener,
 };
+use tina_supervisor::SupervisorConfig;
 
 #[derive(Debug, Default)]
 struct TestShard;
@@ -246,6 +254,229 @@ fn waiter_serves_observers_in_registration_order() {
     assert!(first_addr.port() != 0);
     assert!(second_addr.port() != 0);
     assert_ne!(first_addr.port(), second_addr.port());
+
+    let _ = runtime.shutdown();
+}
+
+// -- Slice 2: IsolateComplete / OperationDone / ChildRestarted -------------
+
+#[derive(Debug, Clone)]
+enum SleeperMsg {
+    Start,
+    SleepDone(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct Sleeper {
+    nap: Duration,
+}
+
+#[tina_runtime::isolate(message = SleeperMsg, shard = TestShard)]
+impl Sleeper {
+    fn handle(&mut self, msg: SleeperMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+        match msg {
+            SleeperMsg::Start => sleep(self.nap).reply(SleeperMsg::SleepDone),
+            SleeperMsg::SleepDone(_) => stop(),
+        }
+    }
+}
+
+#[test]
+fn isolate_complete_waiter_resolves_when_isolate_stops() {
+    let runtime = make_runtime();
+    let sleeper = runtime
+        .register_with_capacity::<Sleeper, Infallible>(
+            Sleeper {
+                nap: Duration::from_millis(20),
+            },
+            8,
+        )
+        .expect("register sleeper");
+
+    // Register before triggering — same FIFO contract as the bound waiter.
+    let done = runtime.observe_isolate_complete(sleeper);
+    runtime
+        .try_send(sleeper, SleeperMsg::Start)
+        .expect("kick sleeper");
+
+    done.wait(Duration::from_secs(3))
+        .expect("isolate complete resolves");
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn isolate_complete_waiter_times_out_when_isolate_lives() {
+    let runtime = make_runtime();
+    let sleeper = runtime
+        .register_with_capacity::<Sleeper, Infallible>(
+            Sleeper {
+                nap: Duration::from_millis(5),
+            },
+            8,
+        )
+        .expect("register sleeper");
+
+    let done = runtime.observe_isolate_complete(sleeper);
+    // Never send Start; the isolate just sits idle.
+    let outcome = done.wait(Duration::from_millis(50));
+    assert_eq!(outcome, Err(WaitError::Timeout));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn operation_done_waiter_resolves_on_matching_call_kind() {
+    let runtime = make_runtime();
+    let sleeper = runtime
+        .register_with_capacity::<Sleeper, Infallible>(
+            Sleeper {
+                nap: Duration::from_millis(5),
+            },
+            8,
+        )
+        .expect("register sleeper");
+
+    let waiter = runtime.observe_operation_done(sleeper, CallKind::Sleep);
+    runtime
+        .try_send(sleeper, SleeperMsg::Start)
+        .expect("kick sleeper");
+
+    waiter
+        .wait(Duration::from_secs(3))
+        .expect("sleep call completed");
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn operation_done_waiter_does_not_resolve_on_other_isolate() {
+    let runtime = make_runtime();
+    let sleeper_a = runtime
+        .register_with_capacity::<Sleeper, Infallible>(
+            Sleeper {
+                nap: Duration::from_millis(5),
+            },
+            8,
+        )
+        .expect("register sleeper A");
+    let sleeper_b = runtime
+        .register_with_capacity::<Sleeper, Infallible>(
+            Sleeper {
+                nap: Duration::from_millis(5),
+            },
+            8,
+        )
+        .expect("register sleeper B");
+
+    // Register a waiter on B, but kick A.
+    let waiter = runtime.observe_operation_done(sleeper_b, CallKind::Sleep);
+    runtime
+        .try_send(sleeper_a, SleeperMsg::Start)
+        .expect("kick sleeper A");
+
+    let outcome = waiter.wait(Duration::from_millis(80));
+    assert_eq!(outcome, Err(WaitError::Timeout));
+
+    let _ = runtime.shutdown();
+}
+
+// Crashy worker for the child-restarted test.
+
+#[derive(Debug, Clone)]
+enum CrashMsg {
+    Boom,
+    Settle,
+}
+
+#[derive(Debug)]
+struct Crashy {
+    crashed: Arc<AtomicU32>,
+}
+
+#[tina_runtime::isolate(message = CrashMsg, shard = TestShard)]
+impl Crashy {
+    fn handle(&mut self, msg: CrashMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+        match msg {
+            CrashMsg::Boom => {
+                self.crashed.fetch_add(1, Ordering::Relaxed);
+                panic!("boom");
+            }
+            CrashMsg::Settle => noop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ParentMsg {
+    Spawn,
+    Settle,
+}
+
+#[derive(Debug)]
+struct Parent {
+    crashed: Arc<AtomicU32>,
+    child: Option<Address<CrashMsg>>,
+}
+
+#[tina_runtime::isolate(
+    message = ParentMsg,
+    spawn = RestartableChildDefinition<Crashy>,
+    shard = TestShard,
+)]
+impl Parent {
+    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+        match msg {
+            ParentMsg::Spawn => {
+                let crashed = Arc::clone(&self.crashed);
+                spawn(
+                    RestartableChildDefinition::new(
+                        move || Crashy {
+                            crashed: Arc::clone(&crashed),
+                        },
+                        4,
+                    )
+                    .with_initial_message(|| CrashMsg::Boom),
+                )
+            }
+            ParentMsg::Settle => noop(),
+        }
+    }
+}
+
+#[test]
+fn child_restarted_waiter_resolves_after_panic_and_restart() {
+    let runtime = make_runtime();
+    let crashed = Arc::new(AtomicU32::new(0));
+    let parent = runtime
+        .register_with_capacity::<Parent, Infallible>(
+            Parent {
+                crashed: Arc::clone(&crashed),
+                child: None,
+            },
+            8,
+        )
+        .expect("register parent");
+    runtime
+        .supervise(
+            parent,
+            SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(2)),
+        )
+        .expect("supervise");
+
+    let restart_waiter = runtime.observe_child_restarted(parent);
+    runtime
+        .try_send(parent, ParentMsg::Spawn)
+        .expect("ask parent to spawn");
+
+    let restarted = restart_waiter
+        .wait(Duration::from_secs(3))
+        .expect("restart event resolves");
+    assert_eq!(restarted.child_ordinal, 0);
+    // The child has crashed at least once. The replacement carries a
+    // fresh incarnation id (and generation policy is owned by the runtime,
+    // not by this test), so just check that the runtime saw the panic.
+    assert!(crashed.load(Ordering::Relaxed) >= 1);
 
     let _ = runtime.shutdown();
 }

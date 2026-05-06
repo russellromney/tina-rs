@@ -72,7 +72,10 @@ pub use call::{
     udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
-pub use observation::{BoundAddressWaiter, WaitError};
+pub use observation::{
+    BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
+    OperationDoneWaiter, WaitError,
+};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
@@ -904,6 +907,50 @@ where
     /// [`CallOutput::TcpBound`] already carries inside the runtime.
     pub fn observe_next_bound(&mut self) -> BoundAddressWaiter {
         self.observation.register_bound()
+    }
+
+    /// Registers a typed waiter for the targeted isolate's `IsolateStopped`.
+    ///
+    /// The waiter resolves the next time the isolate identified by `address`
+    /// (matched by isolate id and generation) emits
+    /// [`RuntimeEventKind::IsolateStopped`]. Replaces `Arc<AtomicBool>` done
+    /// flags in user code. Bounded one-slot.
+    pub fn observe_isolate_complete<M, R>(
+        &mut self,
+        address: Address<M, R>,
+    ) -> observation::IsolateCompleteWaiter {
+        self.observation
+            .register_isolate_complete(address.isolate(), address.generation())
+    }
+
+    /// Registers a typed waiter for the next runtime call of `call_kind`
+    /// issued by the isolate identified by `address` that completes (success
+    /// or failure).
+    ///
+    /// Replaces `complete_trace()` polling for a specific
+    /// `CallKind::TcpStreamClose` / `CallKind::Sleep` / etc. event in user
+    /// code. Bounded one-slot; the runtime drops the slot once a matching
+    /// completion lands.
+    pub fn observe_operation_done<M, R>(
+        &mut self,
+        address: Address<M, R>,
+        call_kind: CallKind,
+    ) -> observation::OperationDoneWaiter {
+        self.observation
+            .register_operation_done(address.isolate(), call_kind)
+    }
+
+    /// Registers a typed waiter for the next supervised restart of any
+    /// direct child of the parent identified by `parent_address`.
+    ///
+    /// The resolved [`observation::ChildRestarted`] carries the new child
+    /// incarnation's isolate id and generation. Bounded one-slot.
+    pub fn observe_child_restarted<M, R>(
+        &mut self,
+        parent_address: Address<M, R>,
+    ) -> observation::ChildRestartedWaiter {
+        self.observation
+            .register_child_restarted(parent_address.isolate())
     }
 
     /// Sets the trace retention policy for future events.
@@ -2011,6 +2058,20 @@ where
             }
         }
 
+        match failure_reason {
+            None => self.observation.notify_operation_completed(
+                in_flight.requester.isolate,
+                in_flight.call_kind,
+                call_id,
+            ),
+            Some(error) => self.observation.notify_operation_failed(
+                in_flight.requester.isolate,
+                in_flight.call_kind,
+                call_id,
+                error,
+            ),
+        }
+
         let message = translator(result);
 
         let entry_index = self.entries.iter().position(|entry| {
@@ -2198,6 +2259,8 @@ where
         self.entries[index].mailbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
+        self.observation
+            .notify_isolate_stopped(isolate_id, self.entries[index].generation);
         self.cancel_driver_calls_for_requester(RegisteredAddress {
             shard: self.shard.id(),
             isolate: isolate_id,
@@ -2393,6 +2456,17 @@ where
         if let Some(message) = bootstrap_message {
             self.enqueue_bootstrap_message(new_child, message, restarted.into());
         }
+        // Notify *after* the bootstrap message has been enqueued so a host
+        // that wakes from `wait()` cannot race a `try_send` ahead of the
+        // bootstrap delivery.
+        self.observation.notify_child_restarted(
+            parent,
+            observation::ChildRestarted {
+                child_ordinal,
+                new_isolate: new_child.isolate,
+                new_generation: new_child.generation,
+            },
+        );
     }
 
     fn push_event(
@@ -4877,6 +4951,51 @@ where
         match self.call(|runtime| runtime.observe_next_bound()) {
             Ok(waiter) => waiter,
             Err(_) => observation::stopped_bound_waiter(),
+        }
+    }
+
+    /// Registers a typed waiter for the targeted isolate's `IsolateStopped`
+    /// event on the worker shard.
+    ///
+    /// See [`Runtime::observe_isolate_complete`] for semantics. If the worker
+    /// is already stopped the returned waiter resolves immediately to
+    /// [`WaitError::RuntimeStopped`].
+    pub fn observe_isolate_complete<M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> observation::IsolateCompleteWaiter {
+        match self.call(move |runtime| runtime.observe_isolate_complete(address)) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_isolate_complete_waiter(),
+        }
+    }
+
+    /// Registers a typed waiter for the next runtime call of `call_kind`
+    /// issued by `address` that completes on the worker shard.
+    ///
+    /// See [`Runtime::observe_operation_done`] for semantics.
+    pub fn observe_operation_done<M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        call_kind: CallKind,
+    ) -> observation::OperationDoneWaiter {
+        match self.call(move |runtime| runtime.observe_operation_done(address, call_kind)) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_operation_done_waiter(),
+        }
+    }
+
+    /// Registers a typed waiter for the next supervised restart of any
+    /// direct child of `parent_address` on the worker shard.
+    ///
+    /// See [`Runtime::observe_child_restarted`] for semantics.
+    pub fn observe_child_restarted<M: 'static, R: 'static>(
+        &self,
+        parent_address: Address<M, R>,
+    ) -> observation::ChildRestartedWaiter {
+        match self.call(move |runtime| runtime.observe_child_restarted(parent_address)) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_child_restarted_waiter(),
         }
     }
 
