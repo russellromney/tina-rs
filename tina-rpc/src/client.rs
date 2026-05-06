@@ -273,7 +273,12 @@ where
     inbound: Vec<u8>,
     in_flight: HashMap<u64, InFlight>,
     next_request_id: u64,
-    write_queue: VecDeque<Vec<u8>>,
+    /// Queued outbound frames. Each entry pairs the wire `request_id`
+    /// the frame belongs to (if known) with the bytes. `None` means
+    /// "this is the unwritten tail of a partial write" — those bytes
+    /// have already been partially put on the wire and cannot be
+    /// cancelled.
+    write_queue: VecDeque<(Option<u64>, Vec<u8>)>,
     write_in_flight: Option<Vec<u8>>,
     activity_seq: u64,
     closing: Option<ClientResult>,
@@ -410,7 +415,7 @@ where
         // Stream not yet established (Pending init mode, before Connected).
         // Leave the bytes queued; on_connected starts the write.
         let stream = self.established_stream()?;
-        let bytes = self.write_queue.pop_front()?;
+        let (_request_id, bytes) = self.write_queue.pop_front()?;
         self.write_in_flight = Some(bytes.clone());
         Some(Self::write_effect(bytes, stream))
     }
@@ -585,7 +590,7 @@ where
                 reply_to: req.reply_to,
             },
         );
-        self.write_queue.push_back(bytes);
+        self.write_queue.push_back((Some(request_id), bytes));
         let mut effects = Vec::new();
         if let Some(eff) = self.maybe_start_write() {
             effects.push(eff);
@@ -682,7 +687,10 @@ where
         }
         if count < attempted.len() {
             let tail = attempted[count..].to_vec();
-            self.write_queue.push_front(tail);
+            // Tail tags as `None`: those bytes have already been
+            // partially written to the wire and cannot be cancelled by
+            // a subsequent deadline-fire on the same request.
+            self.write_queue.push_front((None, tail));
         }
         match self.maybe_start_write() {
             Some(eff) => eff,
@@ -695,7 +703,20 @@ where
             return noop();
         }
         match self.in_flight.remove(&request_id) {
-            Some(entry) => Self::notify(entry, ClientResult::Timeout),
+            Some(entry) => {
+                // Drop any not-yet-written queued frame for this
+                // request. Bytes in `write_in_flight` and any
+                // partial-write tail (tagged `None`) are already on
+                // their way to the wire and cannot be recalled — the
+                // server completes the request and the late reply is
+                // dropped on arrival, per the no-cancellation-frame
+                // rule. But a request whose bytes never made it past
+                // the write queue can be silently suppressed: no
+                // wasted server work, no wasted bytes on the wire.
+                self.write_queue
+                    .retain(|(rid, _)| *rid != Some(request_id));
+                Self::notify(entry, ClientResult::Timeout)
+            }
             // Already replied to (or already closed); nothing to do.
             None => noop(),
         }
@@ -979,6 +1000,43 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].result, ClientResult::Timeout);
         assert_eq!(client.in_flight.len(), 0, "slot freed on timeout");
+    }
+
+    #[test]
+    fn deadline_drops_unwritten_queued_request() {
+        // A request whose bytes are still queued (not yet on the wire)
+        // gets silently suppressed when its deadline fires. The server
+        // never sees it; the user still receives Timeout exactly once.
+        let mut config = small_config();
+        config.max_in_flight = 4;
+        config.write_queue_cap = 8;
+        let mut client = make_client(config);
+        let _ = dispatch(&mut client, ClientMsg::Begin);
+        // First request: takes the in-flight write slot (write_in_flight set).
+        let _ = dispatch(&mut client, ClientMsg::Request(make_request(1, 1000)));
+        assert!(client.write_in_flight.is_some());
+        let in_flight_bytes_len = client.write_in_flight.as_ref().unwrap().len();
+        // Second request: queued behind the first.
+        let _ = dispatch(&mut client, ClientMsg::Request(make_request(2, 1000)));
+        assert_eq!(client.write_queue.len(), 1, "second request should be queued");
+        // Now fire the deadline for request id 2 (the one still queued).
+        let effect = dispatch(&mut client, ClientMsg::DeadlineFired { request_id: 2 });
+        // User got Timeout for correlator 2.
+        let sends = collect_sends(&effect);
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].correlator, 2);
+        assert_eq!(sends[0].result, ClientResult::Timeout);
+        // The queued frame for request 2 is gone.
+        assert!(
+            client.write_queue.is_empty(),
+            "queued frame for timed-out request must be dropped",
+        );
+        // The first request's in-flight bytes are untouched.
+        assert_eq!(
+            client.write_in_flight.as_ref().unwrap().len(),
+            in_flight_bytes_len,
+            "in-flight bytes for unrelated request must not be affected",
+        );
     }
 
     #[test]

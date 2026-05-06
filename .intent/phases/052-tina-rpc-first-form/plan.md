@@ -111,8 +111,12 @@ Compromise:
    - unknown service gives error reply;
    - unknown method gives error reply;
    - service full maps to full reply (emergent from isolate call full);
-   - service timeout maps to timeout reply (emergent from isolate call
-     timeout).
+   - service timeout maps to `internal` on the wire (a wire `timeout`
+     frame would violate the wire-error invariant; the wire-error code
+     vocabulary is `full`, `unknown_service`, `unknown_method`,
+     `decode`, `protocol`, `internal` — no `timeout`). The
+     client-observed timeout it produces locally still elapses on the
+     client deadline.
 
 4. **Client Stub First Form**
 
@@ -164,7 +168,11 @@ Compromise:
 ## Required Proof
 
 - Client calls server over real TCP and gets reply.
-- Full, closed, timeout, decode error, and unknown method are wire-visible.
+- Full, decode error, unknown service, and unknown method are wire-visible
+  as server-reported error frames. Closed and timeout are
+  client-observed conditions and surface locally (peer disconnect, local
+  deadline elapses); they never appear as wire frames per the wire-error
+  invariant in the Rules section.
 - In-flight limit rejects visibly.
 - Max frame size, max in-flight, and idle timeout are tested.
 - Peer-close / half-open behavior fails pending calls visibly.

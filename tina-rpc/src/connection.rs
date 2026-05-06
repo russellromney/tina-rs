@@ -285,6 +285,10 @@ where
     /// Once true, no further `tcp_read` should be issued (closing or peer
     /// half-closed).
     reads_done: bool,
+    /// Once true, the read loop has been kicked off by `Begin`; a
+    /// duplicate `Begin` is a no-op rather than issuing a second
+    /// `tcp_read` (which the runtime rejects as `ResourceBusy`).
+    began: bool,
     _shard: std::marker::PhantomData<S>,
 }
 
@@ -302,6 +306,7 @@ where
             .field("closing", &self.closing)
             .field("close_dispatched", &self.close_dispatched)
             .field("reads_done", &self.reads_done)
+            .field("began", &self.began)
             .finish()
     }
 }
@@ -325,6 +330,7 @@ where
             closing: None,
             close_dispatched: false,
             reads_done: false,
+            began: false,
             _shard: std::marker::PhantomData,
         }
     }
@@ -688,9 +694,10 @@ where
     }
 
     fn on_begin(&mut self) -> Effect<Self> {
-        if self.closing.is_some() || self.close_dispatched {
+        if self.closing.is_some() || self.close_dispatched || self.began {
             return noop();
         }
+        self.began = true;
         Effect::Batch(vec![self.read_effect(), self.idle_arm_effect()])
     }
 }
@@ -826,6 +833,20 @@ mod tests {
         assert_eq!(shape.call, 2, "begin should emit two runtime calls");
         assert_eq!(conn.in_flight, 0);
         assert!(conn.closing.is_none());
+    }
+
+    #[test]
+    fn begin_is_idempotent() {
+        // A duplicate Begin must not issue a second tcp_read on the
+        // same stream; the runtime would reject it as ResourceBusy and
+        // the connection would close as IoError. Bootstrap/retry
+        // wiring would otherwise hit this path.
+        let mut conn = make_connection(small_config());
+        let _ = dispatch(&mut conn, ConnectionMsg::Begin);
+        assert!(conn.began);
+        let second = dispatch(&mut conn, ConnectionMsg::Begin);
+        assert!(matches!(second, Effect::Noop), "duplicate Begin must be a noop");
+        assert!(conn.closing.is_none(), "duplicate Begin must not close");
     }
 
     #[test]
