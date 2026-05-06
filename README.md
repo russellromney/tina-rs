@@ -194,7 +194,8 @@ This repo is a Cargo workspace with six crates:
 - **`tina-runtime`**: explicit-step runtime, multi-shard runner,
   `ThreadedRuntime` over the Betelgeuse backend, runtime-owned TCP/time, observed
   backpressure, isolate calls with mandatory timeout, local snapshot/journal
-  persistence helpers, and a named `TINA_DRIVER_RUNTIME_CONTRACT`.
+  persistence helpers, preferred `LocalSystem`/`LocalMultiShardSystem` app
+  owners, and a named `TINA_DRIVER_RUNTIME_CONTRACT`.
 - **`tina-sim`**: deterministic simulator with virtual time, seeded faults,
   checkers, scripted TCP, durable images, and replay.
 - **`tina-tokio-bridge`**: narrow bounded ingress from Tokio/Tower/Axum into a
@@ -213,12 +214,21 @@ You can write isolates against the modern surface: `Outbound`,
 Local persistence has an explicit support table:
 `LOCAL_PERSISTENCE_SUPPORT` names temp-write, rename, file fsync,
 parent-directory fsync, truncated-tail warning, and checksum validation
-support for the current build. No quiet durability cosplay.
+support for the current build. No quiet durability claim.
 If snapshot rename succeeds but the final durability step cannot be proven,
 Tina reports `CallError::CommitUncertain`, because disk state may already have
-changed. In this slice, persistence calls use synchronous local filesystem work
-inside the Tina-owned driver path; they are correct-first helpers, not a
-high-throughput storage reactor.
+changed. Live persistence runs through a bounded storage lane; already-started
+local filesystem work still cannot be preempted. These are correct-first
+helpers, not a high-throughput storage reactor.
+
+The canonical local-service proof is
+[`portable_service.rs`](tina-runtime/tests/portable_service.rs). It wires one
+copyable app shape: configure budgets, register router and shard-owned workers,
+route by key, apply visible backpressure, perform runtime-owned persistence
+before reply, shut down, inspect terminal truth, and replay the durable journal.
+The simulator companion
+[`portable_service_dst.rs`](tina-sim/tests/portable_service_dst.rs) runs the
+same service idea through saved-seed DST with replay and shrinking.
 
 The old `SendMessage`, `SpawnSpec`, `CurrentCall`, `CallRequest`,
 `CallResult`, `CallFailureReason`, and `tina-runtime-current` names are not the
@@ -264,6 +274,8 @@ and small implementation crates.
 
 ```bash
 make verify   # fmt + check + test + loom + doc + clippy
+make verify-portable-runtime  # focused local-service + DST + bridge gate
+make portable-runtime-cost    # labeled local smoke rows, not a benchmark
 make miri     # focused unsafe-memory checks for tina-mailbox-spsc
 ```
 
