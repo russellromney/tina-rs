@@ -103,3 +103,79 @@ Recommended implementation shape:
    truth.
 
 After these pins, Blue Whale should be ready to execute.
+
+# Second Hostile Review
+
+Verdict: much closer. The plan is now mostly implementable, but still needs a
+few pins before execution so the phase does not accidentally build fake
+affinity, fake fairness, or unsafe-ish memory wins.
+
+What improved:
+
+- Affinity is no longer a silent claim; reporting is mandatory and hard pinning
+  is optional.
+- Fairness is correctly scoped to handler-turn boundaries, not preemption.
+- Weighted service classes are no longer smuggled into the phase.
+- Preallocation has named targets and clear out-of-scope allocator work.
+- Backend-owned completion-slot pooling is blocked unless ownership proof is
+  reopened.
+- Substrate work is crate-private/test-visible first.
+- The checklist is now checked, not review-only.
+
+Remaining fixes:
+
+1. **Fairness may already exist in the explicit-step runtime.**
+   Current explicit-step delivery has registration-order/round semantics. The
+   plan should let Rock 1 prove existing one-turn-per-isolate behavior is
+   enough for part of the fairness claim instead of forcing a new budget knob.
+   If implementation adds a knob anyway, it must explain the gap it closes.
+
+2. **Fairness default is not pinned.**
+   A new turn budget can silently change old deterministic traces. Pin the
+   default before coding: recommended default is "preserve current semantics";
+   add explicit config only for live/local-system pressure if a test proves the
+   current behavior can starve normal work.
+
+3. **Resource-lane fairness is separate from isolate-turn fairness.**
+   The plan says "hot isolate or resource lane" but the Turn Fairness Budget
+   rock mostly describes isolate turns. Driver completions, lane queues, and
+   blocking lane workers need their own fairness/audit line: prove they cannot
+   starve shard progress, or classify the remaining behavior as lane capacity /
+   worker-held accounting rather than fairness.
+
+4. **Observed core reporting can become fake portability.**
+   `observed_core` may not be available portably. The plan should allow
+   `observed_core: None` with `AdvisoryOnly`/`Unsupported` status rather than
+   pressuring implementation into dubious OS calls. Worker thread id/name and
+   configured shard ownership are the portable minimum.
+
+5. **"Completion storage reserves" needs a safety qualifier.**
+   This must mean runtime-owned metadata reserves, not backend-owned completion
+   slot pooling. The plan should say "completion metadata reserves" to avoid
+   reopening the raw-pointer lifecycle bug by accident.
+
+6. **Checklist location and update rule are unpinned.**
+   Decide whether the checked Blue Whale table lives in a Rust test,
+   generated markdown, or both. Recommended: a Rust test owns the source table;
+   the review/changelog summarizes it. The source table must be the thing that
+   fails when a required item loses evidence.
+
+7. **Baobab dependency is one-way but should be explicit.**
+   Blue Whale closeout should not merely "update Baobab if needed"; it should
+   require a Baobab plan review after Blue Whale lands, because affinity and
+   fairness results directly shape what Baobab can honestly compare.
+
+Suggested small plan edits:
+
+- In Rock 8, add: "First prove whether current runtime round semantics already
+  satisfy cooperative fairness; add config only for an identified gap."
+- In Rock 8, add a line for runtime completion/lane fairness separate from
+  isolate turns.
+- In Rock 2, make `observed_core` optional and portable-minimum reporting
+  explicit.
+- In Rock 4, rename `completion storage reserves` to `completion metadata
+  reserves`.
+- In Rock 9, pin the checklist source to a Rust test/table.
+- In Required Proof, require a Baobab plan review after closeout.
+
+After those edits, I would call the plan ready to implement.

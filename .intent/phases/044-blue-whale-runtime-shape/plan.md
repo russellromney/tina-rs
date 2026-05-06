@@ -61,8 +61,10 @@ Seastar is the architectural north star:
 2. **Shard/Core Ownership Reporting**
    Add explicit shard-to-worker/core ownership reporting. Reporting is
    mandatory. Expected shape: worker name/id, shard id, configured core,
-   observed core when available, and affinity status. Prove shard identity does
-   not drift and resource ownership stays shard-local.
+   optional observed core when available, and affinity status. Portable minimum
+   is worker thread id/name plus configured shard ownership; `observed_core`
+   may be `None` when the platform cannot report it honestly. Prove shard
+   identity does not drift and resource ownership stays shard-local.
 
 3. **Optional Affinity Capability**
    Hard pinning is optional. If implemented, report
@@ -74,7 +76,7 @@ Seastar is the architectural north star:
 4. **Per-Shard Preallocation Knobs**
    Add setup/preallocation knobs for the safe runtime-owned targets:
    trace event capacity, per-step scratch capacity, cross-shard queue capacity,
-   resource table reserves, completion storage reserves, and call-context
+   resource table reserves, completion metadata reserves, and call-context
    reserves where practical. Separate setup, warm-up, steady-state, trace, and
    replay allocation behavior in tests.
 
@@ -110,9 +112,11 @@ Seastar is the architectural north star:
 8. **Turn Fairness Budget**
    Add a minimal Tina-shaped fairness rail so one hot isolate or resource lane
    cannot silently monopolize a shard between turns. Expected implementation is
-   a small per-step/per-shard turn budget or round budget. No service-class
-   weights in this phase unless a test proves the simple budget cannot work and
-   the plan is amended.
+   to first prove whether current registration-order/round semantics already
+   satisfy cooperative fairness. Add a new per-step/per-shard turn budget or
+   round budget only for an identified gap, and preserve current semantics by
+   default. No service-class weights in this phase unless a test proves the
+   simple budget cannot work and the plan is amended.
 
    Required tests: hot self-sender does not starve quiet isolate, cross-shard
    delivery still progresses, runtime completion still delivers under hot
@@ -120,12 +124,19 @@ Seastar is the architectural north star:
    they both claim, and an infinite-loop handler remains a documented
    non-preemptible user bug.
 
+   Resource-lane fairness is audited separately from isolate-turn fairness:
+   prove driver completions/lane queues cannot starve shard progress, or
+   classify the behavior as lane capacity / worker-held accounting rather than
+   fairness.
+
 9. **Blue Whale Checklist**
-   Add a checked checklist, not review theater. It should classify each item as
-   `True`, `Partial`, `Advisory`, `Future`, or `NonGoal` with evidence:
-   per-core ownership, thread pinning, SPSC/cross-shard queues, bounded queues,
-   preallocation, allocator locality, polling model, network/storage backend,
-   NUMA, scheduler groups, DST/replay, and Tina's non-`await` user model.
+   Add a checked checklist, not review theater. The source of truth should be a
+   Rust test/table; review/changelog may summarize it but must not be the thing
+   that enforces it. The table should classify each item as `True`, `Partial`,
+   `Advisory`, `Future`, or `NonGoal` with evidence: per-core ownership,
+   thread pinning, SPSC/cross-shard queues, bounded queues, preallocation,
+   allocator locality, polling model, network/storage backend, NUMA, scheduler
+   groups, DST/replay, and Tina's non-`await` user model.
 
 10. **Combined E2E/DST Proof**
    Add e2e/DST tests that combine these rocks:
@@ -147,6 +158,9 @@ Seastar is the architectural north star:
 - Review notes say what moved Tina closer to Seastar and what remains future.
 - If Blue Whale discovers that a feature is only advisory or future-only,
   update the Baobab plan so the readiness gate does not overclaim it.
+- Blue Whale closeout includes a Baobab plan review, because affinity,
+  preallocation, substrate, and fairness results directly shape what Baobab can
+  honestly compare.
 
 ## Done Means
 
