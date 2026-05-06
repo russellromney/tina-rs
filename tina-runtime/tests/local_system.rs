@@ -1486,6 +1486,7 @@ fn local_system_topology_report_before_and_after_shutdown() {
     let app = LocalSystem::single_shard(AppShard(35), AppMailboxFactory)
         .ingress_capacity(3)
         .storage_lane_capacity(2)
+        .remote_inbound_drain_budget(5)
         .trace_retention(TraceRetention::Bounded(64))
         .build();
     wait_until(|| {
@@ -1505,6 +1506,7 @@ fn local_system_topology_report_before_and_after_shutdown() {
     assert_eq!(shard.storage_lane().capacity(), 2);
     assert_eq!(shard.storage_lane().accepted(), None);
     assert_eq!(shard.storage_lane().rejected_full(), None);
+    assert_eq!(shard.remote_inbound_drain_budget(), 5);
     assert_eq!(shard.trace_retention(), TraceRetention::Bounded(64));
     assert_eq!(shard.worker_name(), Some("tina-shard-35"));
     assert!(shard.worker_thread_id().is_some());
@@ -1637,14 +1639,9 @@ fn blue_whale_combined_e2e_core_preallocation_and_cross_shard_call() {
         .shard(AppShard(45))
         .shard(AppShard(46))
         .configured_core(3)
+        .remote_inbound_drain_budget(1)
         .preallocation(preallocation)
-        .config(LocalSystemConfig {
-            remote_inbound_drain_budget: 1,
-            preallocation,
-            configured_core: Some(3),
-            trace_retention: TraceRetention::Bounded(256),
-            ..LocalSystemConfig::default()
-        })
+        .trace_retention(TraceRetention::Bounded(256))
         .build();
     wait_until(|| {
         app.topology()
@@ -1673,6 +1670,12 @@ fn blue_whale_combined_e2e_core_preallocation_and_cross_shard_call() {
             .shards()
             .iter()
             .all(|shard| shard.preallocation() == preallocation)
+    );
+    assert!(
+        topology
+            .shards()
+            .iter()
+            .all(|shard| shard.remote_inbound_drain_budget() == 1)
     );
 
     let worker = app

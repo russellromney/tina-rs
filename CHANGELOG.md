@@ -23,6 +23,9 @@ This file records completed work.
   bounded number of remote envelopes before giving local runtime work a turn.
   Cooperative isolate fairness remains one delivery chance per isolate per
   runtime step; Tina still does not preempt a synchronous handler.
+- Exposed that fairness budget in `LiveShardReport`, added builder helpers for
+  `LocalSystem`, and made low-level `ThreadedRuntime` reject zero budgets
+  before starting a worker.
 - Tightened fake-driver contract tests with a TCP-ish pending resource path
   that proves pending-call and table-owned resource reporting clear on cancel.
 - Added a checked Blue Whale/Seastar principles table as a Rust test covering

@@ -2899,6 +2899,7 @@ fn make_shard_report(
         observed_core: None,
         affinity_status: AffinityStatus::NotRequested,
         preallocation: PreallocationConfig::default(),
+        remote_inbound_drain_budget: ThreadedRuntimeConfig::default().remote_inbound_drain_budget,
         state,
         ingress: LiveQueueReport::unmeasured(8),
         storage_lane: LiveQueueReport::unmeasured(8),

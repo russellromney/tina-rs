@@ -83,6 +83,19 @@ impl MailboxFactory for TestMailboxFactory {
     }
 }
 
+#[test]
+#[should_panic(expected = "ThreadedRuntime requires remote inbound drain budget > 0")]
+fn threaded_runtime_rejects_zero_remote_inbound_drain_budget() {
+    let _runtime = ThreadedRuntime::with_config(
+        TestShard,
+        TestMailboxFactory,
+        ThreadedRuntimeConfig {
+            remote_inbound_drain_budget: 0,
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+}
+
 fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F)
 where
     F: FnMut() -> bool,

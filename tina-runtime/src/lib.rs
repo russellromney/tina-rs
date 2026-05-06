@@ -3549,6 +3549,7 @@ impl LiveShardMetrics {
             observed_core: None,
             affinity_status: self.affinity_status.clone(),
             preallocation: self.preallocation,
+            remote_inbound_drain_budget: self.config.remote_inbound_drain_budget,
             state: self.state(),
             ingress: self.ingress.report(),
             storage_lane: LiveQueueReport::unmeasured(self.storage_lane.capacity),
@@ -3591,6 +3592,7 @@ pub struct LiveShardReport {
     observed_core: Option<usize>,
     affinity_status: AffinityStatus,
     preallocation: PreallocationConfig,
+    remote_inbound_drain_budget: usize,
     state: LiveShardState,
     ingress: LiveQueueReport,
     storage_lane: LiveQueueReport,
@@ -3640,6 +3642,12 @@ impl LiveShardReport {
     /// Runtime-owned metadata reserves configured for this shard.
     pub const fn preallocation(&self) -> PreallocationConfig {
         self.preallocation
+    }
+
+    /// Maximum remote envelopes this worker harvests before giving local work
+    /// a turn.
+    pub const fn remote_inbound_drain_budget(&self) -> usize {
+        self.remote_inbound_drain_budget
     }
 
     /// Observable lifecycle state.
@@ -4434,6 +4442,13 @@ where
         self
     }
 
+    /// Sets the remote-inbound drain budget for fairness under cross-shard
+    /// pressure.
+    pub const fn remote_inbound_drain_budget(mut self, budget: usize) -> Self {
+        self.config.remote_inbound_drain_budget = budget;
+        self
+    }
+
     /// Records desired worker core ownership as advisory intent.
     ///
     /// The current portable backend does not hard-pin the worker. Topology
@@ -4577,6 +4592,13 @@ where
     /// Sets bounded storage-lane capacity for local persistence work.
     pub const fn storage_lane_capacity(mut self, capacity: usize) -> Self {
         self.config.storage_lane_capacity = capacity;
+        self
+    }
+
+    /// Sets the per-worker remote-inbound drain budget for fairness under
+    /// cross-shard pressure.
+    pub const fn remote_inbound_drain_budget(mut self, budget: usize) -> Self {
+        self.config.remote_inbound_drain_budget = budget;
         self
     }
 
@@ -4813,6 +4835,9 @@ where
         }
         if config.storage_lane_capacity == 0 {
             panic!("ThreadedRuntime requires storage lane capacity > 0");
+        }
+        if config.remote_inbound_drain_budget == 0 {
+            panic!("ThreadedRuntime requires remote inbound drain budget > 0");
         }
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);

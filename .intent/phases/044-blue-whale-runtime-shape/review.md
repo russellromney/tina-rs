@@ -379,3 +379,48 @@ phase may want an explicit shard-to-core map.
 
 - `cargo +nightly test -p tina-runtime blue_whale -- --nocapture`: passed.
 - `make verify`: passed.
+
+# Baobab Prep Pass
+
+Verdict: Blue Whale was basically honest, but one fairness rail was too quiet
+for Baobab.
+
+## Findings
+
+- `remote_inbound_drain_budget` is load-bearing runtime shape. It bounds how
+  much live remote traffic a worker harvests before local work gets a turn.
+  Before this pass, users could configure it, but topology reports did not show
+  it.
+- `LocalSystem` validated zero remote-drain budgets, and multi-shard runtime
+  rejected them, but the lower-level single `ThreadedRuntime` constructor did
+  not. That was inconsistent public config behavior.
+- Builders had helpers for ingress, storage, affinity, and preallocation, but
+  not for the new fairness budget. That made the good path slightly too
+  `config { ... }` heavy.
+
+## Fixes
+
+- `LiveShardReport` now exposes `remote_inbound_drain_budget()`.
+- Single-shard `ThreadedRuntime` now rejects zero
+  `remote_inbound_drain_budget` before starting a worker.
+- Single- and multi-shard `LocalSystem` builders now have
+  `remote_inbound_drain_budget(...)` helpers.
+- Blue Whale e2e/topology tests now prove the budget is reported, and the
+  low-level threaded constructor has a direct zero-budget panic test.
+
+## Remaining Before Baobab
+
+- Hard OS pinning stays future work; Baobab should compare advisory affinity
+  truth, not pretend Tina controls the scheduler.
+- Per-shard allocator locality, NUMA policy, and backend completion-slot/user
+  payload pooling remain future rocks.
+- Resource-lane fairness is still capacity/accounting/shutdown-report shaped,
+  not service-class scheduling.
+
+## Proof Run
+
+- `cargo +nightly fmt --check`: passed.
+- `cargo +nightly test -p tina-runtime remote_inbound_drain_budget -- --nocapture`: passed.
+- `cargo +nightly test -p tina-runtime local_system_topology_report_before_and_after_shutdown --test local_system -- --nocapture`: passed.
+- `cargo +nightly test -p tina-runtime blue_whale_combined_e2e_core_preallocation_and_cross_shard_call --test local_system -- --nocapture`: passed.
+- `cargo +nightly test -p tina-runtime`: passed.
