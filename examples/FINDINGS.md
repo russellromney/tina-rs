@@ -513,6 +513,63 @@ clearly document that on other platforms the runner is a no-op. The
 broader lesson: any runner that depends on kernel-level resource
 limits must declare its platform truth, not pretend otherwise.
 
+### `#[tina_runtime::isolate(shard = S)]` does not accept a generic shard
+*Surfaced by:* `tina-http` (phase 048a).
+
+`tina-http` defines `HttpConnection<S: Shard>` and `HttpListener<S: Shard>`
+so a single implementation works for any user-chosen shard. The
+`#[tina_runtime::isolate(...)]` attribute parses `shard = S` as a
+literal type and emits an `impl Isolate for HttpConnection` whose
+generic header collides with the surrounding `impl<S>` block, producing
+a parse error in the user's source. The workaround is to hand-roll the
+`Isolate` impl using `tina::isolate_types!` — `tina-http` does this
+twice, and any future generic-over-shard isolate will hit the same
+friction.
+
+**Improvement:** the macro should propagate the generic parameters of
+the impl block it is attached to. Until then, the workaround pattern
+needs documenting in the user guide.
+
+### `tcp_close_stream` rejects while a `tcp_read` is pending on the same lane
+*Surfaced by:* `tina-http` (phase 048a).
+
+`CallError::ResourceBusy` is the runtime's signal for "this lane has
+work in flight, the close cannot run." That is a defensible choice for
+a clean `tcp_echo`-shaped flow where reads complete before close is
+issued. It is not workable for HTTP error paths that need to *abandon*
+a read — a slow-loris client that drip-feeds bytes triggers the
+slow-loris guard, the connection isolate has an outstanding `tcp_read`
+that will not return, and `tcp_close_stream` is rejected. 048a's
+slow-loris path stops the isolate without explicit close as a
+workaround; the kernel socket is then dropped only when the runtime
+itself shuts down (or, presumably, when the isolate's owned resources
+are reclaimed — exact timing varies). A malicious client can keep many
+sockets open past their deadlines.
+
+**Improvement:** either expose `tcp_cancel_read(stream)` so user code
+can abandon a pending read before closing, or have `tcp_close_stream`
+implicitly cancel any pending lanes for that stream. Either choice
+should preserve Tina's "every cancellation is a typed event" property.
+
+### Wire-level `CallOutcome::Full` is not deterministically constructible on a single shard
+*Surfaced by:* `tina-http` (phase 048a).
+
+The connection isolate maps `CallOutcome::Full` to `503 Service
+Unavailable` and the unit tests prove the mapping. A wire-level
+integration test of "service mailbox full -> 503 over TCP" was
+attempted and removed: with single-shard execution, even a
+capacity-1 service drains too quickly between effect-processing rounds
+for concurrent calls to find the mailbox occupied. 048a substitutes a
+deterministic 504 (`CallError::Timeout`) test via a service that never
+replies; rock 5b in 048b is expected to ship the wire-level Full test
+naturally once the connection pool primitive lands and admission
+limits introduce real Full conditions.
+
+**Improvement:** noted as 048b scope. Two complementary primitives
+would also unlock it cleanly: a delayed-reply primitive on the service
+side, or multi-shard service placement so the dispatcher and the
+service run on different threads with their own scheduling rates.
+
 ## Suggested follow-ups, ranked by frequency of trip
 
 Counted by how many comparisons surfaced the issue. Several of these

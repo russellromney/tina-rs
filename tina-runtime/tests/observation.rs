@@ -280,7 +280,7 @@ fn waiter_serves_observers_in_registration_order() {
 #[derive(Debug, Clone)]
 enum SleeperMsg {
     Start,
-    SleepDone(Result<(), CallError>),
+    SleepDone,
 }
 
 #[derive(Debug)]
@@ -292,8 +292,8 @@ struct Sleeper {
 impl Sleeper {
     fn handle(&mut self, msg: SleeperMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
         match msg {
-            SleeperMsg::Start => sleep(self.nap).reply(SleeperMsg::SleepDone),
-            SleeperMsg::SleepDone(_) => stop(),
+            SleeperMsg::Start => sleep(self.nap).reply(|_| SleeperMsg::SleepDone),
+            SleeperMsg::SleepDone => stop(),
         }
     }
 }
@@ -403,7 +403,6 @@ fn operation_done_waiter_does_not_resolve_on_other_isolate() {
 #[derive(Debug, Clone)]
 enum CrashMsg {
     Boom,
-    Settle,
 }
 
 #[derive(Debug)]
@@ -419,7 +418,6 @@ impl Crashy {
                 self.crashed.fetch_add(1, Ordering::Relaxed);
                 panic!("boom");
             }
-            CrashMsg::Settle => noop(),
         }
     }
 }
@@ -427,13 +425,11 @@ impl Crashy {
 #[derive(Debug, Clone)]
 enum ParentMsg {
     Spawn,
-    Settle,
 }
 
 #[derive(Debug)]
 struct Parent {
     crashed: Arc<AtomicU32>,
-    child: Option<Address<CrashMsg>>,
 }
 
 #[tina_runtime::isolate(
@@ -456,7 +452,6 @@ impl Parent {
                     .with_initial_message(|| CrashMsg::Boom),
                 )
             }
-            ParentMsg::Settle => noop(),
         }
     }
 }
@@ -469,7 +464,6 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         .register_with_capacity::<Parent, Infallible>(
             Parent {
                 crashed: Arc::clone(&crashed),
-                child: None,
             },
             8,
         )

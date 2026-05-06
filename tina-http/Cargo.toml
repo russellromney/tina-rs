@@ -1,0 +1,17 @@
+[package]
+name = "tina-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native HTTP/1.1 service stack for tina-rs (first form, server side)"
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina = { path = "../tina" }
+tina-runtime = { path = "../tina-runtime" }
+httparse = { version = "1", default-features = false, features = ["std"] }
+http = { version = "1", default-features = false, features = ["std"] }

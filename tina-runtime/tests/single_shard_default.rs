@@ -50,7 +50,7 @@ impl Hello {
 #[derive(Debug, Clone)]
 enum SleeperMsg {
     Start,
-    Done(Result<(), tina_runtime::CallError>),
+    Done,
 }
 
 #[derive(Debug)]
@@ -62,9 +62,9 @@ impl Sleeper {
     fn handle(&mut self, msg: SleeperMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             SleeperMsg::Start => {
-                tina_runtime::sleep(Duration::from_millis(1)).reply(SleeperMsg::Done)
+                tina_runtime::sleep(Duration::from_millis(1)).reply(|_| SleeperMsg::Done)
             }
-            SleeperMsg::Done(_) => stop(),
+            SleeperMsg::Done => stop(),
         }
     }
 }

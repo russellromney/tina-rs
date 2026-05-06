@@ -5392,8 +5392,8 @@ where
     ///   which is the strict, message-recoverable equivalent.
     /// - silently drops messages addressed to a stale or unknown isolate
     ///   on the worker side once the command is accepted. Use
-    ///   [`send_and_observe`] when the host must learn that the target was
-    ///   already closed.
+    ///   [`send_and_observe`](Self::send_and_observe) when the host must
+    ///   learn that the target was already closed.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,
