@@ -1,4 +1,4 @@
-# Phase 044: San Production-Readiness Rails
+# Phase 044: Baobab Production-Readiness Rails
 
 ## Goal
 
@@ -8,6 +8,10 @@ testable."
 
 This is not a porting guide, demo, release story, or marketing phase. It is the
 test wall and runtime rails that make later porting attempts honest.
+
+Seastar is the architectural north star: shared-nothing, per-core ownership,
+explicit cross-core communication, and systems-library seriousness. Tokio and
+Glommio are the runnable Rust comparisons for behavior and cost.
 
 At closeout:
 
