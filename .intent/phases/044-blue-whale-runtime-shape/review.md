@@ -179,3 +179,45 @@ Suggested small plan edits:
 - In Required Proof, require a Baobab plan review after closeout.
 
 After those edits, I would call the plan ready to implement.
+
+# Third Hostile Review
+
+Verdict: ready to implement.
+
+The gruggening did not lose the load-bearing constraints. The plan is shorter,
+but still pins:
+
+- mandatory shard/core reporting;
+- optional/advisory hard affinity;
+- no OS scheduling claim without proof;
+- no preemption of running handlers;
+- current round semantics tested before adding fairness knobs;
+- resource-lane fairness audited separately;
+- safe-only preallocation/pooling;
+- no backend-owned completion-slot pooling without amended ownership proof;
+- crate-private substrate contract first;
+- checked Blue Whale table as Rust test/table;
+- Baobab plan review after closeout.
+
+No new blocker found.
+
+Implementation watchpoints:
+
+1. **Public names can still drift.** The plan intentionally leaves exact type
+   names open. During implementation, keep names boring and obvious:
+   `AffinityStatus`, `ShardExecutionReport`, `PreallocationConfig`,
+   `FairnessConfig`, or similarly plain shapes. Do not invent clever names.
+
+2. **"Boring-owned" is a judgment call.** Treat it conservatively. If storage
+   crosses into a backend, worker thread, raw pointer, user payload, or erased
+   `Any` boundary, do not pool it in this phase unless the plan is amended.
+
+3. **Fairness tests must avoid fake sleeps.** Use deterministic step counts,
+   bounded queues, manual/scripted completions, or explicit synchronization.
+   No "sleep and hope the quiet isolate ran" proof.
+
+4. **Advisory affinity must stay visibly advisory.** A platform that cannot
+   prove core pinning should still pass with honest `Unsupported` /
+   `AdvisoryOnly` evidence, not fake zeroes or guessed CPU ids.
+
+If implementation follows those watchpoints, Blue Whale is a good next rock.
