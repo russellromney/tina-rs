@@ -263,7 +263,10 @@ impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ServiceTooLong { len } => {
-                write!(f, "service name length {len} exceeds {MAX_SERVICE_LEN} bytes")
+                write!(
+                    f,
+                    "service name length {len} exceeds {MAX_SERVICE_LEN} bytes"
+                )
             }
             Self::MethodTooLong { len } => {
                 write!(f, "method name length {len} exceeds {MAX_METHOD_LEN} bytes")

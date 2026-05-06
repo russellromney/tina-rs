@@ -372,7 +372,10 @@ where
     /// - `max_frame_size >= MIN_BODY_SIZE` (enforced separately by the
     ///   frame codec).
     pub fn new(init: ClientInit<S>) -> Self {
-        debug_assert!(init.config.max_in_flight > 0, "max_in_flight must be positive");
+        debug_assert!(
+            init.config.max_in_flight > 0,
+            "max_in_flight must be positive"
+        );
         debug_assert!(
             init.config.write_queue_cap >= init.config.max_in_flight,
             "write_queue_cap ({}) must be >= max_in_flight ({})",
@@ -623,7 +626,20 @@ where
             // and tear the connection down so the user sees IoError on
             // every pending request rather than a per-request `Full` that
             // they would naturally retry into the same congestion.
-            return self.begin_close(ClientResult::IoError(CallError::Io));
+            //
+            // The triggering request itself was never inserted into
+            // `in_flight`, so `begin_close` would not notify it. Notify
+            // it explicitly first; `begin_close` then fans `IoError` out
+            // to every other pending request.
+            let notify = Self::notify_caller(
+                req.reply_to,
+                req.correlator,
+                ClientResult::IoError(CallError::Io),
+            );
+            return Effect::Batch(vec![
+                notify,
+                self.begin_close(ClientResult::IoError(CallError::Io)),
+            ]);
         }
         self.in_flight.insert(
             request_id,
@@ -755,8 +771,7 @@ where
                 // rule. But a request whose bytes never made it past
                 // the write queue can be silently suppressed: no
                 // wasted server work, no wasted bytes on the wire.
-                self.write_queue
-                    .retain(|(rid, _)| *rid != Some(request_id));
+                self.write_queue.retain(|(rid, _)| *rid != Some(request_id));
                 Self::notify(entry, ClientResult::Timeout)
             }
             // Already replied to (or already closed); nothing to do.
@@ -846,7 +861,6 @@ mod tests {
         })
     }
 
-
     fn dispatch(client: &mut Client<TestShard>, msg: ClientMsg) -> Effect<Client<TestShard>> {
         let mut shard = TestShard;
         let mut ctx = Context::new(&mut shard, IsolateId::new(99));
@@ -925,13 +939,22 @@ mod tests {
         });
         // First Begin: dispatches tcp_connect.
         let first = dispatch(&mut client, ClientMsg::Begin);
-        assert!(matches!(first, Effect::Call(_)), "first Begin must dispatch the connect");
+        assert!(
+            matches!(first, Effect::Call(_)),
+            "first Begin must dispatch the connect"
+        );
         assert!(client.connect_dispatched);
         assert!(client.closing.is_none());
         // Second Begin while still pending: noop, MUST NOT close.
         let second = dispatch(&mut client, ClientMsg::Begin);
-        assert!(matches!(second, Effect::Noop), "second Begin must be a noop");
-        assert!(client.closing.is_none(), "second Begin must not close the connection");
+        assert!(
+            matches!(second, Effect::Noop),
+            "second Begin must be a noop"
+        );
+        assert!(
+            client.closing.is_none(),
+            "second Begin must not close the connection"
+        );
     }
 
     #[test]
@@ -1045,6 +1068,51 @@ mod tests {
     }
 
     #[test]
+    fn write_queue_overflow_notifies_triggering_request_before_closing() {
+        // The request that trips write_queue_cap must itself receive a
+        // ClientResultMsg, not just the in-flight requests that
+        // begin_close fans out. Caller would otherwise hang.
+        //
+        // The default invariant (`write_queue_cap >= max_in_flight`,
+        // debug-asserted in `Client::new`) makes natural overflow
+        // unreachable, but the fields are public on `ClientConfig` so a
+        // release-build misconfiguration (or a bug in the runtime that
+        // wedges writes) could still hit this branch. Force it by
+        // mutating `config` directly after construction.
+        let mut client = make_client(small_config());
+        client.config.write_queue_cap = 1;
+        client.config.max_in_flight = 8;
+        let _ = dispatch(&mut client, ClientMsg::Begin);
+        // First request: takes write_in_flight, queue stays at 0.
+        let _ = dispatch(&mut client, ClientMsg::Request(make_request(0, 1000)));
+        // Second request: enqueues, queue length = 1 (== cap).
+        let _ = dispatch(&mut client, ClientMsg::Request(make_request(1, 1000)));
+        assert_eq!(client.write_queue.len(), 1, "queue at cap before trigger");
+        // Third request: queue is at cap → overflow branch.
+        let effect = dispatch(&mut client, ClientMsg::Request(make_request(99, 1000)));
+        let sends = collect_sends(&effect);
+        let triggering: Vec<_> = sends.iter().filter(|m| m.correlator == 99).collect();
+        assert_eq!(
+            triggering.len(),
+            1,
+            "triggering request must receive exactly one notification, got {sends:?}",
+        );
+        assert!(matches!(
+            triggering[0].result,
+            ClientResult::IoError(CallError::Io)
+        ));
+        // The two prior in-flight requests also get fan-out IoError.
+        let total_io_errors = sends
+            .iter()
+            .filter(|m| matches!(m.result, ClientResult::IoError(_)))
+            .count();
+        assert_eq!(
+            total_io_errors, 3,
+            "2 in-flight + 1 triggering must be notified, got {sends:?}",
+        );
+    }
+
+    #[test]
     fn deadline_drops_unwritten_queued_request() {
         // A request whose bytes are still queued (not yet on the wire)
         // gets silently suppressed when its deadline fires. The server
@@ -1060,7 +1128,11 @@ mod tests {
         let in_flight_bytes_len = client.write_in_flight.as_ref().unwrap().len();
         // Second request: queued behind the first.
         let _ = dispatch(&mut client, ClientMsg::Request(make_request(2, 1000)));
-        assert_eq!(client.write_queue.len(), 1, "second request should be queued");
+        assert_eq!(
+            client.write_queue.len(),
+            1,
+            "second request should be queued"
+        );
         // Now fire the deadline for request id 2 (the one still queued).
         let effect = dispatch(&mut client, ClientMsg::DeadlineFired { request_id: 2 });
         // User got Timeout for correlator 2.
@@ -1198,7 +1270,11 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].correlator, 5);
         assert_eq!(sends[0].result, ClientResult::LocalEncodeFailed);
-        assert_eq!(client.in_flight.len(), 0, "encode failure must not consume slot");
+        assert_eq!(
+            client.in_flight.len(),
+            0,
+            "encode failure must not consume slot"
+        );
     }
 
     #[test]
@@ -1208,11 +1284,18 @@ mod tests {
         let frame = build_reply_frame(1, b"fragmented-payload");
         let (head, tail) = frame.split_at(7);
         let _ = dispatch(&mut client, ClientMsg::Read(Ok(head.to_vec())));
-        assert_eq!(client.in_flight.len(), 1, "still pending after partial read");
+        assert_eq!(
+            client.in_flight.len(),
+            1,
+            "still pending after partial read"
+        );
         let effect = dispatch(&mut client, ClientMsg::Read(Ok(tail.to_vec())));
         let sends = collect_sends(&effect);
         assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].result, ClientResult::Ok(b"fragmented-payload".to_vec()));
+        assert_eq!(
+            sends[0].result,
+            ClientResult::Ok(b"fragmented-payload".to_vec())
+        );
     }
 
     #[test]
@@ -1232,10 +1315,7 @@ mod tests {
         let effect = dispatch(&mut client, ClientMsg::Read(Err(CallError::Io)));
         let sends = collect_sends(&effect);
         assert_eq!(sends.len(), 1);
-        assert_eq!(
-            sends[0].result,
-            ClientResult::IoError(CallError::Io)
-        );
+        assert_eq!(sends[0].result, ClientResult::IoError(CallError::Io));
     }
 
     #[test]
@@ -1287,6 +1367,9 @@ mod tests {
         let _ = dispatch(&mut client, ClientMsg::Wrote(Ok(4)));
         // New write started for the tail.
         assert!(client.write_in_flight.is_some());
-        assert_eq!(client.write_in_flight.as_ref().unwrap().len(), attempted_len - 4);
+        assert_eq!(
+            client.write_in_flight.as_ref().unwrap().len(),
+            attempted_len - 4
+        );
     }
 }

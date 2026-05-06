@@ -31,20 +31,13 @@ fn golden_bytes_request_frame() {
     let bytes = encode(&frame, &limits()).unwrap();
     let expected: &[u8] = &[
         // length prefix u32 BE: 13 (header) + 3 (service) + 1 (method) + 2 (payload) = 19
-        0x00, 0x00, 0x00, 0x13,
-        // version = 1
-        0x01,
-        // kind = Request (0)
-        0x00,
-        // error_code = 0 (None)
-        0x00,
-        // request_id u64 BE
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-        // service_len = 3, "svc"
-        0x03, b's', b'v', b'c',
-        // method_len = 1, "m"
-        0x01, b'm',
-        // payload "hi"
+        0x00, 0x00, 0x00, 0x13, // version = 1
+        0x01, // kind = Request (0)
+        0x00, // error_code = 0 (None)
+        0x00, // request_id u64 BE
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, // service_len = 3, "svc"
+        0x03, b's', b'v', b'c', // method_len = 1, "m"
+        0x01, b'm', // payload "hi"
         b'h', b'i',
     ];
     assert_eq!(bytes.as_slice(), expected);

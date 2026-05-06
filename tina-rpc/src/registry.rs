@@ -181,11 +181,7 @@ where
 
     /// Registers `addr` as the service named `name`. Re-registering the same
     /// name overwrites the previous binding.
-    pub fn register(
-        &mut self,
-        name: impl Into<String>,
-        addr: Address<ServiceCall, ServiceReply>,
-    ) {
+    pub fn register(&mut self, name: impl Into<String>, addr: Address<ServiceCall, ServiceReply>) {
         self.services.insert(name.into(), addr);
     }
 
@@ -298,11 +294,8 @@ where
 impl<S> Registry<S>
 where
     S: tina::Shard,
-    Self: tina::Isolate<
-            Message = RegistryMsg,
-            Reply = RouterReply,
-            Call = RuntimeCall<RegistryMsg>,
-        >,
+    Self:
+        tina::Isolate<Message = RegistryMsg, Reply = RouterReply, Call = RuntimeCall<RegistryMsg>>,
 {
     fn route(&mut self, request: RouterRequest) -> Effect<Self> {
         let RouterRequest {
@@ -465,10 +458,7 @@ mod tests {
     #[test]
     fn service_full_maps_to_router_reply_full() {
         let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::ServiceResult(CallOutcome::Full),
-        );
+        let effect = dispatch(&mut registry, RegistryMsg::ServiceResult(CallOutcome::Full));
         assert!(matches!(effect, Effect::Reply(RouterReply::Full)));
     }
 

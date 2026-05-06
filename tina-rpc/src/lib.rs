@@ -96,11 +96,11 @@ pub use connection::{
     RouterReply, RouterRequest,
 };
 pub use encoding::{Encoding, EncodingError, EncodingErrorKind, Json};
-pub use registry::{
-    Registry, RegistryBuilder, RegistryConfig, RegistryMsg, ServiceCall, ServiceReply,
-};
 pub use frame::{
-    DecodeError, EncodeError, Frame, FrameError, FrameKind, FrameLimits, FRAME_VERSION_V1,
+    DecodeError, EncodeError, FRAME_VERSION_V1, Frame, FrameError, FrameKind, FrameLimits,
     LENGTH_PREFIX_SIZE, MAX_METHOD_LEN, MAX_SERVICE_LEN, decode, decode_body, encode,
     parse_length_prefix,
+};
+pub use registry::{
+    Registry, RegistryBuilder, RegistryConfig, RegistryMsg, ServiceCall, ServiceReply,
 };

@@ -58,7 +58,10 @@ Compromise:
 - Every request has a request id.
 - Every request has a timeout.
 - In-flight requests are bounded.
-- Full/closed/timeout/error replies are wire-visible.
+- Server-reported error replies are wire-visible: `full`,
+  `unknown_service`, `unknown_method`, `decode`, `protocol`, `internal`.
+  Client-observed conditions (`timeout`, `connection_closed`) are not
+  wire frames; see the wire-error invariant below.
 - Payload encoding is pluggable, but first form can pick one boring default.
 - Trace links network frame to isolate call where practical.
 - A bad peer cannot force unbounded memory growth.

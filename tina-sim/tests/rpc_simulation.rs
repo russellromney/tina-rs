@@ -21,14 +21,12 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{
-    Address, Context, Effect, Isolate, Outbound, ShardId, prelude::Shard,
-};
-use tina_runtime::{RuntimeCall, RuntimeEvent};
+use tina::{Address, Context, Effect, Isolate, Outbound, ShardId, prelude::Shard};
 use tina_rpc::{
     Client, ClientConfig, ClientInit, ClientMsg, ClientRequest, ClientResult, ClientResultMsg,
     ClientStream, Frame, FrameLimits, encode,
 };
+use tina_runtime::{RuntimeCall, RuntimeEvent};
 use tina_sim::{
     ScriptedListenerConfig, ScriptedPeerConfig, ScriptedTcpConfig, Simulator, SimulatorConfig,
 };
@@ -185,12 +183,7 @@ fn client_reply_before_timeout_via_scripted_peer() {
     h.sim
         .try_send(
             h.client,
-            ClientMsg::Request(make_request(
-                42,
-                b"hi",
-                h.observer,
-                Duration::from_secs(60),
-            )),
+            ClientMsg::Request(make_request(42, b"hi", h.observer, Duration::from_secs(60))),
         )
         .expect("request");
     h.sim.run_until_quiescent();
@@ -205,7 +198,10 @@ fn client_reply_before_timeout_via_scripted_peer() {
         1,
         "request 42 must receive exactly one notification, got {received:?}",
     );
-    assert_eq!(for_correlator[0].result, ClientResult::Ok(b"hello".to_vec()));
+    assert_eq!(
+        for_correlator[0].result,
+        ClientResult::Ok(b"hello".to_vec())
+    );
 }
 
 #[test]
@@ -263,12 +259,7 @@ fn client_decode_error_closes_with_connection_closed() {
     h.sim
         .try_send(
             h.client,
-            ClientMsg::Request(make_request(
-                7,
-                b"req",
-                h.observer,
-                Duration::from_secs(60),
-            )),
+            ClientMsg::Request(make_request(7, b"req", h.observer, Duration::from_secs(60))),
         )
         .expect("request");
     h.sim.run_until_quiescent();
@@ -278,7 +269,11 @@ fn client_decode_error_closes_with_connection_closed() {
         .iter()
         .filter(|m| m.result == ClientResult::ConnectionClosed)
         .collect();
-    assert_eq!(closed.len(), 1, "expected ConnectionClosed, got {received:?}");
+    assert_eq!(
+        closed.len(),
+        1,
+        "expected ConnectionClosed, got {received:?}"
+    );
     assert_eq!(closed[0].correlator, 7);
 }
 
@@ -293,30 +288,23 @@ fn client_peer_closed_notifies_pending_and_writes_no_cancel_frame() {
     h.sim
         .try_send(
             h.client,
-            ClientMsg::Request(make_request(
-                11,
-                b"q1",
-                h.observer,
-                Duration::from_secs(60),
-            )),
+            ClientMsg::Request(make_request(11, b"q1", h.observer, Duration::from_secs(60))),
         )
         .expect("request 1");
     h.sim
         .try_send(
             h.client,
-            ClientMsg::Request(make_request(
-                22,
-                b"q2",
-                h.observer,
-                Duration::from_secs(60),
-            )),
+            ClientMsg::Request(make_request(22, b"q2", h.observer, Duration::from_secs(60))),
         )
         .expect("request 2");
     h.sim.run_until_quiescent();
 
     let received = h.received.borrow();
     for correlator in [11u64, 22u64] {
-        let for_c: Vec<_> = received.iter().filter(|m| m.correlator == correlator).collect();
+        let for_c: Vec<_> = received
+            .iter()
+            .filter(|m| m.correlator == correlator)
+            .collect();
         assert_eq!(
             for_c.len(),
             1,

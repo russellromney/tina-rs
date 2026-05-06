@@ -565,8 +565,8 @@ where
             let body = self.inbound[LENGTH_PREFIX_SIZE..total].to_vec();
             // Slide the rest forward.
             self.inbound.drain(..total);
-            let frame = decode_body(&body)
-                .map_err(|e| DrainError::BadPeer(BadPeerReason::Decode(e)))?;
+            let frame =
+                decode_body(&body).map_err(|e| DrainError::BadPeer(BadPeerReason::Decode(e)))?;
             match frame.kind {
                 FrameKind::Request => {
                     if self.in_flight >= self.config.max_in_flight {
@@ -578,8 +578,7 @@ where
                             Vec::new(),
                         );
                         let bytes = self.encode_frame(&full).ok_or(DrainError::LocalEncode)?;
-                        self.enqueue_write(bytes)
-                            .map_err(DrainError::BadPeer)?;
+                        self.enqueue_write(bytes).map_err(DrainError::BadPeer)?;
                     } else {
                         emitted.push(self.route_request(frame));
                     }
@@ -862,7 +861,10 @@ mod tests {
         }
     }
 
-    fn dispatch(conn: &mut Connection<TestShard>, msg: ConnectionMsg) -> Effect<Connection<TestShard>> {
+    fn dispatch(
+        conn: &mut Connection<TestShard>,
+        msg: ConnectionMsg,
+    ) -> Effect<Connection<TestShard>> {
         let mut shard = TestShard;
         let mut ctx = Context::new(&mut shard, IsolateId::new(99));
         conn.handle(msg, &mut ctx)
@@ -928,7 +930,10 @@ mod tests {
         let _ = dispatch(&mut conn, ConnectionMsg::Begin);
         assert!(conn.began);
         let second = dispatch(&mut conn, ConnectionMsg::Begin);
-        assert!(matches!(second, Effect::Noop), "duplicate Begin must be a noop");
+        assert!(
+            matches!(second, Effect::Noop),
+            "duplicate Begin must be a noop"
+        );
         assert!(conn.closing.is_none(), "duplicate Begin must not close");
     }
 
@@ -983,7 +988,9 @@ mod tests {
         bytes.extend(body);
         let _effect = dispatch(&mut conn, ConnectionMsg::Read(Ok(bytes)));
         match conn.closing.as_ref() {
-            Some(CloseReason::BadPeer(BadPeerReason::Decode(DecodeError::UnsupportedVersion(99)))) => {}
+            Some(CloseReason::BadPeer(BadPeerReason::Decode(DecodeError::UnsupportedVersion(
+                99,
+            )))) => {}
             other => panic!("expected BadPeer(Decode(UnsupportedVersion)), got {other:?}"),
         }
     }
@@ -996,7 +1003,9 @@ mod tests {
         let prefix = (5000u32).to_be_bytes().to_vec();
         let _effect = dispatch(&mut conn, ConnectionMsg::Read(Ok(prefix)));
         match conn.closing.as_ref() {
-            Some(CloseReason::BadPeer(BadPeerReason::Decode(DecodeError::BodyTooLarge { .. }))) => {}
+            Some(CloseReason::BadPeer(BadPeerReason::Decode(DecodeError::BodyTooLarge {
+                ..
+            }))) => {}
             other => panic!("expected BadPeer(Decode(BodyTooLarge)), got {other:?}"),
         }
     }
@@ -1011,7 +1020,9 @@ mod tests {
         let _effect = dispatch(&mut conn, ConnectionMsg::Read(Ok(bytes)));
         assert!(matches!(
             conn.closing.as_ref(),
-            Some(CloseReason::BadPeer(BadPeerReason::UnexpectedKind(FrameKind::Reply)))
+            Some(CloseReason::BadPeer(BadPeerReason::UnexpectedKind(
+                FrameKind::Reply
+            )))
         ));
     }
 
@@ -1232,8 +1243,14 @@ mod tests {
         let mut conn = make_connection(config);
         let _ = dispatch(&mut conn, ConnectionMsg::Begin);
         // Saturate in-flight first.
-        let _ = dispatch(&mut conn, ConnectionMsg::Read(Ok(build_request(1, "s", "m", &[]))));
-        let _ = dispatch(&mut conn, ConnectionMsg::Read(Ok(build_request(2, "s", "m", &[]))));
+        let _ = dispatch(
+            &mut conn,
+            ConnectionMsg::Read(Ok(build_request(1, "s", "m", &[]))),
+        );
+        let _ = dispatch(
+            &mut conn,
+            ConnectionMsg::Read(Ok(build_request(2, "s", "m", &[]))),
+        );
         assert_eq!(conn.in_flight, 2);
         // Now keep sending requests beyond the cap; each one queues a Full
         // error frame. After 2 such errors the write queue is full
@@ -1313,7 +1330,10 @@ mod tests {
             },
         );
         // Should not have closed; should have substituted Internal-error frame.
-        assert!(conn.closing.is_none(), "oversize reply must not tear down connection");
+        assert!(
+            conn.closing.is_none(),
+            "oversize reply must not tear down connection"
+        );
         let pending = conn.write_in_flight.as_ref().expect("write started");
         let frame = crate::frame::decode(pending, &FrameLimits::new(32)).unwrap();
         assert_eq!(frame.kind, FrameKind::Error);
