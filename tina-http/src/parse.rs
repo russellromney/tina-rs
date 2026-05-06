@@ -87,10 +87,6 @@ const MAX_INLINE_HEADERS: usize = 64;
 /// Allocation: the common case (`max_headers <= 64`) uses a stack array
 /// for the header slot. Larger limits fall back to a heap `Vec`.
 pub fn parse_request_head(buffer: &[u8], limits: &HttpLimits) -> ParseProgress {
-    if buffer.len() > limits.max_header_bytes {
-        return ParseProgress::Failed(RequestParseError::HeadersTooLarge);
-    }
-
     let mut inline_headers = [httparse::EMPTY_HEADER; MAX_INLINE_HEADERS];
     let mut heap_headers: Vec<httparse::Header<'_>>;
     let header_slots: &mut [httparse::Header<'_>] = if limits.max_headers <= MAX_INLINE_HEADERS {
@@ -103,13 +99,16 @@ pub fn parse_request_head(buffer: &[u8], limits: &HttpLimits) -> ParseProgress {
 
     match req.parse(buffer) {
         Ok(httparse::Status::Partial) => {
-            if buffer.len() == limits.max_header_bytes {
+            if buffer.len() >= limits.max_header_bytes {
                 ParseProgress::Failed(RequestParseError::HeadersTooLarge)
             } else {
                 ParseProgress::NeedMore
             }
         }
         Ok(httparse::Status::Complete(head_len)) => {
+            if head_len > limits.max_header_bytes {
+                return ParseProgress::Failed(RequestParseError::HeadersTooLarge);
+            }
             let parsed = match build_head(&req, limits) {
                 Ok(head) => head,
                 Err(error) => return ParseProgress::Failed(error),
@@ -254,12 +253,14 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
     out.extend_from_slice(reason.as_bytes());
     out.extend_from_slice(b"\r\n");
 
-    let mut wrote_content_length = false;
     let mut wrote_connection = false;
     for (name, value) in response.headers.iter() {
         if name == http::header::CONTENT_LENGTH {
-            wrote_content_length = true;
+            continue;
         } else if name == http::header::CONNECTION {
+            if connection_close {
+                continue;
+            }
             wrote_connection = true;
         }
         out.extend_from_slice(name.as_str().as_bytes());
@@ -267,11 +268,9 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    if !wrote_content_length {
-        out.extend_from_slice(b"Content-Length: ");
-        out.extend_from_slice(response.body.len().to_string().as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
+    out.extend_from_slice(b"Content-Length: ");
+    out.extend_from_slice(response.body.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
     if connection_close && !wrote_connection {
         out.extend_from_slice(b"Connection: close\r\n");
     }
@@ -360,10 +359,6 @@ pub struct HttpResponseHead {
 /// same byte-budget invariants apply (header section bounded by
 /// `limits.max_header_bytes`, header count bounded by `limits.max_headers`).
 pub fn parse_response_head(buffer: &[u8], limits: &HttpLimits) -> ResponseParseProgress {
-    if buffer.len() > limits.max_header_bytes {
-        return ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge);
-    }
-
     let mut inline_headers = [httparse::EMPTY_HEADER; MAX_INLINE_HEADERS];
     let mut heap_headers: Vec<httparse::Header<'_>>;
     let header_slots: &mut [httparse::Header<'_>] = if limits.max_headers <= MAX_INLINE_HEADERS {
@@ -376,16 +371,21 @@ pub fn parse_response_head(buffer: &[u8], limits: &HttpLimits) -> ResponseParseP
 
     match response.parse(buffer) {
         Ok(httparse::Status::Partial) => {
-            if buffer.len() == limits.max_header_bytes {
+            if buffer.len() >= limits.max_header_bytes {
                 ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge)
             } else {
                 ResponseParseProgress::NeedMore
             }
         }
-        Ok(httparse::Status::Complete(head_len)) => match build_response_head(&response, limits) {
-            Ok(head) => ResponseParseProgress::Complete { head, head_len },
-            Err(error) => ResponseParseProgress::Failed(error),
-        },
+        Ok(httparse::Status::Complete(head_len)) => {
+            if head_len > limits.max_header_bytes {
+                return ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge);
+            }
+            match build_response_head(&response, limits) {
+                Ok(head) => ResponseParseProgress::Complete { head, head_len },
+                Err(error) => ResponseParseProgress::Failed(error),
+            }
+        }
         Err(httparse::Error::TooManyHeaders) => {
             ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge)
         }
@@ -508,6 +508,28 @@ mod tests {
                 assert_eq!(&buf[head_len..], b"hello world");
             }
             other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_header_limit_counts_head_not_already_read_body() {
+        let head = b"POST /x HTTP/1.1\r\nContent-Length: 64\r\n\r\n";
+        let mut buf = head.to_vec();
+        buf.extend(vec![b'a'; 64]);
+        let limits = HttpLimits {
+            max_header_bytes: head.len(),
+            max_body_bytes: 128,
+            ..HttpLimits::default()
+        };
+        match parse_request_head(&buf, &limits) {
+            ParseProgress::Complete {
+                head: parsed,
+                head_len,
+            } => {
+                assert_eq!(head_len, head.len());
+                assert_eq!(parsed.content_length, 64);
+            }
+            other => panic!("expected complete despite body bytes, got {other:?}"),
         }
     }
 
@@ -719,6 +741,27 @@ mod tests {
     }
 
     #[test]
+    fn encode_response_overrides_framing_headers() {
+        let mut response = crate::types::HttpResponse::with_status(StatusCode::OK);
+        response.body = b"hello".to_vec();
+        response.headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("999"),
+        );
+        response.headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive"),
+        );
+
+        let bytes = encode_response(&response, true);
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert!(!text.contains("Content-Length: 999"));
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(!text.contains("keep-alive"));
+    }
+
+    #[test]
     fn encode_request_emits_content_length_and_close() {
         let req = HttpRequest {
             method: Method::GET,
@@ -780,6 +823,28 @@ mod tests {
                 assert_eq!(&buf[head_len..], b"hello");
             }
             other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_header_limit_counts_head_not_already_read_body() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n";
+        let mut buf = head.to_vec();
+        buf.extend(vec![b'a'; 64]);
+        let limits = HttpLimits {
+            max_header_bytes: head.len(),
+            max_body_bytes: 128,
+            ..HttpLimits::default()
+        };
+        match parse_response_head(&buf, &limits) {
+            ResponseParseProgress::Complete {
+                head: parsed,
+                head_len,
+            } => {
+                assert_eq!(head_len, head.len());
+                assert_eq!(parsed.content_length, 64);
+            }
+            other => panic!("expected complete despite body bytes, got {other:?}"),
         }
     }
 
