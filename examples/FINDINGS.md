@@ -534,24 +534,17 @@ needs documenting in the user guide.
 *Surfaced by:* `tina-http` (phase 048a). **Fixed** in the
 `runtime-tcp-close-cancels-pending` slice.
 
-Originally: `CallError::ResourceBusy` was the runtime's signal for
-"this lane has work in flight, the close cannot run." That choice was
-defensible for a clean `tcp_echo`-shaped flow where reads complete
-before close is issued, but it was not workable for HTTP error paths
-that need to *abandon* a read.
+Originally close failed with `CallError::ResourceBusy` if any lane
+had pending work, which left HTTP error paths (slow-loris, parse-fail
+mid-read) unable to close cleanly.
 
 Fix: `tcp_close_stream`, `tcp_close_listener`, and `udp_close_socket`
-now implicitly cancel any pending operations on the resource before
-closing. The pending operations' callers see no completion (silent
-cancel, mirroring the isolate-stop semantic), and the cancellation is
-recorded in the trace as `CallCompletionRejectedReason::ResourceClosed`
-so the operation remains observable. The simulator (`tina-sim`)
-matches the live driver's semantics — `run_until_quiescent` no longer
-hangs after a close-while-pending.
-
-This also improves `tina-http`'s slow-loris path: the connection
-isolate can now write `408 Request Timeout` and then close cleanly
-instead of stopping silently.
+now cancel any pending op on the resource and close. The pending
+caller's continuation never fires; the cancellation is recorded as
+`CallCompletionRejectedReason::ResourceClosed`. Simulator and live
+driver behave the same. `run_until_quiescent` no longer hangs after a
+close-while-pending. The slow-loris path in `tina-http` can now write
+`408 Request Timeout` then close cleanly.
 
 ### Wire-level `CallOutcome::Full` is not deterministically constructible on a single shard
 *Surfaced by:* `tina-http` (phase 048a).

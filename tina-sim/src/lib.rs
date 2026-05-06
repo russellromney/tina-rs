@@ -3658,11 +3658,7 @@ where
             return;
         }
 
-        // Silent-cancel any pending accepts on this listener, mirroring
-        // the live driver's `do_listener_close` behavior. The original
-        // accept caller's continuation never fires; the cancellation
-        // is recorded as `CallCompletionRejected{ResourceClosed}` in
-        // the trace.
+        // Close wins. Pending accepts are cancelled and traced.
         self.cancel_backend_calls_for_resource(TcpResourceKey::ListenerAccept(listener));
 
         self.listeners[listener_index].closed = true;
@@ -3680,11 +3676,7 @@ where
             return;
         }
 
-        // Silent-cancel any pending reads/writes on this stream's lanes
-        // before closing, mirroring the live driver's behavior in
-        // `do_stream_close`. Original callers' continuations never
-        // fire; cancellations are recorded as
-        // `CallCompletionRejected{ResourceClosed}` in the trace.
+        // Close wins. Pending reads/writes are cancelled and traced.
         self.cancel_backend_calls_for_resource(TcpResourceKey::StreamRead(stream));
         self.cancel_backend_calls_for_resource(TcpResourceKey::StreamWrite(stream));
 
@@ -3843,10 +3835,7 @@ where
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         }
-        // Silent-cancel any pending recv on this socket, mirroring the
-        // live driver's `do_udp_close` behavior. Cancellations are
-        // recorded as `CallCompletionRejected{ResourceClosed}` in the
-        // trace.
+        // Close wins. Pending recv is cancelled and traced.
         self.cancel_backend_calls_for_resource(TcpResourceKey::UdpRecv(socket));
         self.udp_sockets[socket_index].closed = true;
         self.deliver_completion(call_id, CallOutput::UdpSocketClosed);
@@ -6110,14 +6099,10 @@ where
         stopped
     }
 
-    /// Cancels every backend call whose pending op lives on the given
-    /// resource, used when that resource is being closed by user code.
-    /// Mirrors the live driver's silent-cancel behavior: original
-    /// callers' continuations never fire, but we drop the in-flight-
-    /// call tracking and translators so the simulator reaches
-    /// quiescence and `has_in_flight_calls` returns false promptly.
-    /// A `CallCompletionRejected` event with `ResourceClosed` is
-    /// emitted so the cancellation remains trace-observable.
+    /// Drops simulator state for calls cancelled by resource close.
+    ///
+    /// The translator is not run; the caller's continuation does not fire.
+    /// Trace records `ResourceClosed`.
     fn cancel_backend_calls_for_resource(&mut self, resource: TcpResourceKey) {
         let cancelled_call_ids: Vec<CallId> = self
             .pending_tcp_completions
@@ -6149,7 +6134,7 @@ where
             .collect();
 
         for call_id in cancelled_call_ids {
-            // Drop the pending op record from whichever queue it lives in.
+            // Drop the backend op from whichever queue owns it.
             self.pending_tcp_completions
                 .retain(|pending| pending.call_id != call_id);
             self.pending_accepts
@@ -6157,9 +6142,7 @@ where
             self.pending_udp_recvs
                 .retain(|pending| pending.call_id != call_id);
 
-            // Drop the runtime-side tracking. Without this,
-            // `has_in_flight_calls` would return true forever and
-            // `run_until_quiescent` would loop.
+            // Drop simulator call state too, or quiescence never arrives.
             let in_flight_index = self
                 .in_flight_calls
                 .iter()

@@ -210,11 +210,9 @@ pub enum CallCompletionRejectedReason {
     /// replaced) by the time the completion arrived.
     RequesterClosed,
 
-    /// User code closed the underlying resource (TCP listener/stream,
-    /// UDP socket, ...) while a call against it was still pending. The
-    /// pending call is silently cancelled — the original caller's
-    /// continuation never fires — but the cancellation remains
-    /// trace-observable via this rejection reason.
+    /// User code closed the resource (TCP listener/stream, UDP socket)
+    /// while this call was pending. The call is silently cancelled;
+    /// the caller's continuation never fires.
     ResourceClosed,
 }
 

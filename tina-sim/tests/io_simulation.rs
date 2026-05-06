@@ -2891,11 +2891,7 @@ fn scripted_udp_negative_paths_are_visible_and_cancelable() {
             .any(|entry| entry == "recv-err:ResourceBusy")
     );
 
-    // New contract: close-while-recv-pending succeeds. The pending
-    // recv is silently cancelled (no completion delivered to the
-    // probe), and the close call returns `closed`. Previously this
-    // returned `ResourceBusy` and forced the user to drain the recv
-    // first.
+    // Close wins. Pending recv does not notify the probe.
     sim.try_send(probe, UdpProbeMsg::Close(socket)).unwrap();
     sim.step();
     sim.step();
@@ -2911,8 +2907,7 @@ fn scripted_udp_negative_paths_are_visible_and_cancelable() {
             .any(|entry| entry == "close-err:ResourceBusy"),
         "close must not fail with ResourceBusy under the new contract"
     );
-    // Stop the probe to mirror the original test's shape; the recv
-    // was already cancelled by the close, so nothing pending remains.
+    // Stop the probe to keep the test shape tidy.
     sim.try_send(probe, UdpProbeMsg::Stop).unwrap();
     sim.step();
     assert!(!sim.has_in_flight_calls());

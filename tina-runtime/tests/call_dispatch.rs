@@ -1389,11 +1389,7 @@ fn stream_close_while_read_pending_cancels_read_and_closes() {
     runtime.step();
     runtime.step();
 
-    // New contract: tcp_close_stream while a read is pending succeeds.
-    // The pending read is silently cancelled — the original reader's
-    // continuation message never fires, mirroring the
-    // isolate-stop-cancels-pending semantic. The trace records the
-    // close as a successful CallCompleted (not CallFailed).
+    // Close wins. The pending read continuation does not fire.
     assert_eq!(
         *closer_log.borrow(),
         vec![CloserMsg::ClosedObserved],
@@ -1403,14 +1399,8 @@ fn stream_close_while_read_pending_cancels_read_and_closes() {
         reader_log.borrow().is_empty(),
         "the pending read continuation must not fire after the stream was closed"
     );
-    // Note: we do not assert `!runtime.has_in_flight_calls()` here
-    // because the cancelled read's runtime-side tracking is reaped
-    // lazily on subsequent steps, and the moment the test runs
-    // `has_in_flight_calls` may still observe transient state from
-    // the runtime's `in_flight_calls` map. The properties under test
-    // are: close succeeded, the pending read's continuation did not
-    // fire, and the trace records a clean close — all asserted above
-    // and below.
+    // Runtime-side cleanup is covered by the ResourceClosed tests; this
+    // one pins the close result and missing read continuation.
 
     let kinds = call_event_kinds(runtime.trace());
     assert!(

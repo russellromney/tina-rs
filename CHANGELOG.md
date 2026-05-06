@@ -6,28 +6,25 @@ This file records completed work.
 
 ### Runtime: TCP/UDP close cancels pending lanes instead of failing with `ResourceBusy`
 
-- Closing a TCP stream, TCP listener, or UDP socket no longer fails
-  with `CallError::ResourceBusy` when a read/write/accept/recv is
-  pending on that resource. Previous behavior forced user code to
-  drain pending lanes before close, which made HTTP error paths
-  (slow-loris, parse-fail mid-read) awkward — the reader could never
-  complete and the closer could never succeed.
-- New behavior in both `tina-runtime` driver and `tina-sim`: close
-  marks any pending operations on the resource as cancelled and
-  closes immediately. The pending callers' continuations never fire
-  (silent cancel, mirroring the existing isolate-stop semantic).
-- New `CallCompletionRejectedReason::ResourceClosed` event variant
-  records each silently-cancelled call in the trace, so the
-  cancellation remains observable.
-- Simulator: a new `cancel_backend_calls_for_resource` helper drains
-  the dedicated pending queues (`pending_accepts`,
-  `pending_udp_recvs`), the scheduled `pending_tcp_completions`
-  queue, and the runtime-side `in_flight_calls` plus translators —
-  `run_until_quiescent` no longer hangs after a close-while-pending.
-- Tests updated: previous tests that asserted close-while-pending →
-  `ResourceBusy` now assert the new clean-close-with-cancel
-  behavior. `examples/FINDINGS.md` is updated to mark the issue
-  fixed.
+- `tcp_close_stream`, `tcp_close_listener`, and `udp_close_socket` no
+  longer fail with `CallError::ResourceBusy` when a read/write/accept/
+  recv is pending. Close cancels the pending op and closes the
+  resource. The pending caller's continuation never fires (silent
+  cancel — same shape as isolate-stop with pending calls).
+- New `CallCompletionRejectedReason::ResourceClosed` trace variant
+  keeps each silent cancellation observable.
+- Live driver pushes cancelled call ids onto `cancelled_by_close`;
+  the runtime layer drains them via the new
+  `RuntimeDriver::take_cancelled_by_close` hook and drops matching
+  `in_flight_calls` plus translators. Without this the worker would
+  spin on ghost calls.
+- Simulator gets a matching `cancel_backend_calls_for_resource`
+  helper that drains its pending queues, in-flight calls, and
+  translators. `run_until_quiescent` no longer hangs after
+  close-while-pending.
+- Tests previously pinning `ResourceBusy` for close-while-pending now
+  assert the clean-cancel-and-close behavior. `examples/FINDINGS.md`
+  is updated to mark the issue fixed.
 
 ### README Rewrite and Forward Roadmap Phases (Native DB / HTTP/2 / gRPC)
 

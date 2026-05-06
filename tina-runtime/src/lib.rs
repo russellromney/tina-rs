@@ -1698,6 +1698,46 @@ where
         {
             self.deliver_completion(immediate.call_id, immediate.result);
         }
+
+        // Close wins at the driver. Drop matching runtime call state too,
+        // or the cancelled call would keep the worker non-idle forever.
+        let cancelled = self.driver.take_cancelled_by_close();
+        for cancelled_call_id in cancelled {
+            self.cancel_in_flight_call_for_resource_close(cancelled_call_id);
+        }
+    }
+
+    /// Drops runtime state for a call cancelled by resource close.
+    ///
+    /// The translator is not run; the caller's continuation does not fire.
+    /// Trace records `ResourceClosed`.
+    fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
+        let Some(in_flight_index) = self
+            .in_flight_calls
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        else {
+            return;
+        };
+        let in_flight = self.in_flight_calls.remove(in_flight_index);
+
+        if let Some(translator_index) = self
+            .translators
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        {
+            self.translators.remove(translator_index);
+        }
+
+        self.push_event(
+            in_flight.requester.isolate,
+            Some(in_flight.cause),
+            RuntimeEventKind::CallCompletionRejected {
+                call_id,
+                call_kind: in_flight.call_kind,
+                reason: CallCompletionRejectedReason::ResourceClosed,
+            },
+        );
     }
 
     fn dispatch_observed_send(
