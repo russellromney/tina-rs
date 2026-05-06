@@ -11,6 +11,7 @@ members = [
 ]
 exclude = [
     "examples/eiffel_real_io_chat",
+    "examples/eiffel_rpc",
     "examples/eiffel_mini_keyspace",
     "examples/eiffel_axum_counter",
     "examples/eiffel_ws_room",
