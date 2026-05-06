@@ -51,9 +51,12 @@ Following the abstraction-vs-implementation rule (capability traits live in thei
 - `tina-supervisor` — supervision tree mechanism
 - `tina-runtime` — current explicit-step, simulated-driver, and
   `ThreadedRuntime` implementation over the Betelgeuse backend
-- `tina-runtime-monoio` — possible future multi-shard runtime on monoio
-  (io_uring), only if it preserves Tina's semantics better than the current
-  driver path
+- `tina-runtime-uring` — future Linux `io_uring` driver/substrate backend.
+  When supported, this should become the default local live backend for TCP and
+  storage rails. Tina user code must stay backend-neutral.
+- `tina-runtime-monoio` / `tina-runtime-glommio` — possible future adapter
+  backends if they preserve Tina's semantics better than a Tina-owned
+  `io_uring` driver
 - `tina-runtime-tokio-bridge` — adapter for adopting tina inside an existing Tokio app
 - `tina-sim` — deterministic simulator
 
@@ -193,6 +196,7 @@ framework before public release-story work.
 | Phase | Purpose |
 |---|---|
 | **Blue Whale runtime shape** | Build the missing local-runtime features before the readiness gate: explicit shard/core ownership and optional affinity, per-shard preallocation posture, pool/slab cleanup where clearly worth it, mature driver/substrate lifecycle contract, swappable substrate boundary, minimal fairness/scheduling rail, and a Seastar-principles checklist. |
+| **North Sea io_uring substrate** | Build the first Tina-owned Linux `io_uring` backend for runtime-owned TCP and storage rails. On supported Linux systems it should become the preferred/default live backend; unsupported platforms keep the existing portable backend with explicit capability truth. No raw `io_uring` handle leaks into isolate code, no async-handler model, no hidden fallback queues, and no performance claim until Baobab measures it. |
 | **Baobab production-readiness rails** | Build the first serious "can a real Tokio/Glommio-shaped service be moved to Tina?" gate, with Seastar as the architectural north star: executable capability matrix, user-perspective service gauntlet, DST gauntlet, live thread-per-core pressure, bridge/runtime cancellation rails, Tina/Tokio/Glommio behavior comparisons, benchmark skeleton, CI/release rails, and sharp non-claims. This is not a docs/demo phase; it is the next production-readiness test wall. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
@@ -226,8 +230,10 @@ These should be resolved before public release or broad adoption claims:
   exploration is not blocked on this, but public positioning and any publish
   decision should not outrun an explicit decision.
 - **Set the MSRV/runtime-substrate policy.** The current implementation uses
-  nightly-facing Betelgeuse pieces; public release needs an explicit stable
-  story or an honest nightly-only claim.
+  nightly-facing Betelgeuse pieces. Public release needs an explicit stable
+  story or an honest nightly-only claim. Linux should prefer the Tina-owned
+  `io_uring` backend once North Sea proves it; other platforms must report
+  their actual backend capability instead of pretending to have `io_uring`.
 - **Strengthen CI before release.** Local `make verify` is not enough for a
   public framework claim. CI should exercise the workspace gate and the
   platform-specific substrate paths we intend to support.
