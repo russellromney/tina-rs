@@ -1,23 +1,18 @@
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::sleep;
+use tina_runtime::{sleep, stable_trace_hash};
 use tina_sim::{FaultConfig, FaultMode, LocalSendFaultMode, Simulator, SimulatorConfig};
 
 use super::TinaReport;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ReplayShard;
-
-impl Shard for ReplayShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(73)
-    }
-}
+// Phase 047 Rock 5: single-shard programs use the built-in `SingleShard`
+// type (re-exported via `tina::prelude`); the per-example `ReplayShard`
+// struct + `Shard` impl are gone. The `#[tina_runtime::isolate(...)]`
+// attribute now defaults to `shard = ::tina::SingleShard` when the
+// argument is omitted.
 
 #[derive(Debug, Clone, Copy)]
 enum ProducerMsg {
@@ -30,13 +25,9 @@ struct Producer {
     remaining: u32,
 }
 
-#[tina_runtime::isolate(
-    message = ProducerMsg,
-    send = Outbound<SinkMsg>,
-    shard = ReplayShard
-)]
+#[tina_runtime::isolate(message = ProducerMsg, send = Outbound<SinkMsg>)]
 impl Producer {
-    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, ReplayShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             ProducerMsg::Tick(count) => {
                 let next = count + 1;
@@ -62,9 +53,9 @@ struct Sink {
     received: Rc<RefCell<Vec<u32>>>,
 }
 
-#[tina_runtime::isolate(message = SinkMsg, shard = ReplayShard)]
+#[tina_runtime::isolate(message = SinkMsg)]
 impl Sink {
-    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, ReplayShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             SinkMsg::Got(value) => {
                 self.received.borrow_mut().push(value);
@@ -93,7 +84,7 @@ fn run_once(seed: u64) -> (usize, u64, usize) {
         },
         ..Default::default()
     };
-    let mut sim = Simulator::new(ReplayShard, config);
+    let mut sim = Simulator::new(SingleShard, config);
 
     let received = Rc::new(RefCell::new(Vec::new()));
     let sink = sim.register_with_mailbox_capacity(
@@ -109,21 +100,13 @@ fn run_once(seed: u64) -> (usize, u64, usize) {
     sim.run_until_quiescent();
 
     let trace = sim.trace();
-    let fingerprint = fingerprint_trace(trace);
+    // Phase 047 Rock 3: stable trace fingerprint via `stable_trace_hash`,
+    // not `format!("{event:?}").hash(...)`. Same seed → same fingerprint
+    // is the simulator's existing replay contract; this just stops
+    // depending on `Debug` to be stable.
+    let fingerprint = stable_trace_hash(trace.iter());
     let received_count = received.borrow().len();
     (trace.len(), fingerprint, received_count)
-}
-
-fn fingerprint_trace(trace: &[tina_runtime::RuntimeEvent]) -> u64 {
-    // Trace events are deterministic across replays under the same config.
-    // We hash the Debug projection because it captures the full event shape
-    // in stable form — enough for a fingerprint without re-implementing a
-    // canonical encoding.
-    let mut hasher = DefaultHasher::new();
-    for event in trace {
-        format!("{event:?}").hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 pub(crate) fn run() -> TinaReport {

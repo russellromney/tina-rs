@@ -600,6 +600,37 @@ pub trait Shard {
     }
 }
 
+/// Built-in single-shard type for programs that have only one shard.
+///
+/// Phase 047 Rock 5: when `#[tina::isolate]` (or `#[tina_runtime::isolate]`)
+/// is invoked without a `shard = ...` argument, the macro defaults to this
+/// type so single-shard examples and small services do not need to define
+/// a one-off shard struct just to satisfy the macro. Programs that run
+/// across more than one shard continue to declare their own shard types
+/// explicitly.
+///
+/// `SingleShard` is a real value the user constructs at runtime startup;
+/// it is **not** a global mutable singleton, and registering an isolate on
+/// it still goes through the runtime's normal registration path.
+///
+/// The shard id is fixed at `ShardId::new(0)`. If a program mixes
+/// `SingleShard` with another shard at id `0`, that is a configuration
+/// error and the runtime will reject the registrations as it does today
+/// for any duplicate shard id.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SingleShard;
+
+impl SingleShard {
+    /// The shard id `SingleShard` always reports.
+    pub const ID: ShardId = ShardId::new(0);
+}
+
+impl Shard for SingleShard {
+    fn id(&self) -> ShardId {
+        Self::ID
+    }
+}
+
 /// Per-handler context provided by the runtime.
 ///
 /// `Context` lets a handler inspect its current shard and build typed
@@ -980,7 +1011,7 @@ impl AddressGeneration {
 pub mod prelude {
     pub use crate::{
         Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
-        RestartableChildDefinition, Shard, ShardId, batch, isolate, isolate_types, noop, reply,
-        restart_children, send, spawn, stop,
+        RestartableChildDefinition, Shard, ShardId, SingleShard, batch, isolate, isolate_types,
+        noop, reply, restart_children, send, spawn, stop,
     };
 }

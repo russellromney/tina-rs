@@ -62,14 +62,14 @@ pub use call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
     IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
     PathKind, PathMetadata, PersistenceTraceInfo, ProcessRunResult, ProcessStatus, RuntimeCall,
-    RuntimeCallParts, SendOutcome, SnapshotImage, StreamId, TlsListenerId, TlsStreamId, TypedCall,
-    UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
-    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
-    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
-    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
-    udp_recv_from, udp_send_to,
+    RuntimeCallParts, RuntimeCallable, SendOutcome, SnapshotImage, StreamId, TlsListenerId,
+    TlsStreamId, TypedCall, UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync,
+    file_open, file_read, file_read_at, file_size, file_write, file_write_at, journal_append,
+    journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace,
+    send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent,
+    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write,
+    udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
 pub use observation::{
