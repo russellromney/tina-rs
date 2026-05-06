@@ -402,3 +402,93 @@ None. The obvious choices are:
 - Add tiny-helper stop rule.
 
 After those edits, 045 is ready to execute.
+
+# Plan Review 4: Final Hostile Pass
+
+Verdict: almost ready. The Plan Review 3 edits landed. The phase is now
+implementation-shaped and mostly IDD-shaped. I would still tighten a few
+things before execution so the implementer cannot satisfy the words while
+leaving a squishy public surface or weak blast-radius proof.
+
+## What Is Strong Now
+
+- Rock 1 is now a ledger, not the main work.
+- The public runner is pinned as real public API.
+- No attribute macro in 045. Good.
+- Runtime capability truth and bridge truth are separated.
+- Mailbox capacity is explicitly separate from runner/runtime budgets.
+- Queued cancel and started-work tombstone are separated.
+- Trace/`complete_trace()` negative public tests are required.
+- Live DST is semantic/scripted, not wall-clock random.
+- The example is CI-safe by design.
+- Cost report has smoke/manual modes and capacity/profile context.
+
+## Remaining Issues
+
+1. **Plan lacks a plain "What Will Not Change" section.**
+   Non-goals are good, but IDD wants old intent named. Add a small section:
+   handlers remain sync/effect-returning, mailbox semantics remain bounded
+   `Full`/`Closed`, existing low-level runtime constructors remain supported,
+   no async/raw backend/Tokio leakage into isolates, no hidden queues, no
+   preemption claim, no bridge semantics in runtime capability truth.
+
+2. **Public runner target still lacks a minimum API shape.**
+   The plan says explicit public `LocalSystem` runner/builder, but not the
+   minimum shape. This can cause bikeshedding or halfwork. Add a pin like:
+   builder/configure/register/run/drain/terminal-report. Names may follow code
+   style, but those operations must be present and public.
+
+3. **Runner must not become a hidden scheduler shortcut.**
+   The runner should compose existing `LocalSystem` behavior. It must not add a
+   second delivery engine, hidden worker pool, hidden queue, or special service
+   path that tests pass but normal Tina semantics do not use.
+
+4. **Blast-radius proof should name exact old paths.**
+   "Direct construction without the public runner still works" is right but
+   broad. Name at least these: single-shard `LocalSystem`, multi-shard
+   `LocalMultiShardSystem`, and low-level `ThreadedRuntime`/current runtime
+   construction. Also keep existing bridge tests green.
+
+5. **No-async-leakage proof could be stronger.**
+   The harness says ordinary Tina effects only. Add proof shape: the non-toy
+   example and public-runner e2e compile and run without `tokio::spawn`,
+   `async fn` handlers, or raw backend handles in isolate code. This can be
+   code review plus targeted `rg`/compile proof, not necessarily a fancy test.
+
+6. **Bridge timeout/cancel remains in scope but not central.**
+   Plan includes bridge metrics and bridge DST. Good. Make clear bridge work is
+   only to keep existing adapter truth from regressing while the runtime
+   surface changes. 045 should not become another bridge phase.
+
+7. **"Every rail" proof can still over-expand.**
+   Required Proof says every rail has many proof modes. Some rails may be
+   `not-applicable(reason)` or already covered. Execution should close by
+   direct proof for changed behavior, blast-radius proof for old behavior, or
+   named non-claim. Do not require reauthoring every old rail test if the rail
+   did not change.
+
+8. **Service harness needs deterministic external process choice.**
+   Process rail in a portable CI harness can be flaky if it shells out to
+   platform-specific commands. Pin a tiny deterministic command or a
+   platform-gated process scenario.
+
+9. **SYSTEM.md update timing should be explicit.**
+   Update `SYSTEM.md` only after direct proof, not during planning or halfway
+   through execution. The plan should say closeout updates SYSTEM/roadmap/
+   changelog only with landed truth.
+
+## Required Plan Edits
+
+- Add **What Will Not Change** section.
+- Add minimum public runner operation shape.
+- State runner composes existing `LocalSystem`; no second delivery engine.
+- Name old-path blast-radius proof exactly.
+- Strengthen no-async-leakage proof for example/harness.
+- Keep bridge work scoped as adapter regression proof, not central runtime
+  work.
+- Clarify "every rail" closure: changed rails direct proof, old rails
+  blast-radius or existing proof, nonclaims explicit.
+- Pin deterministic/platform-gated process command in harness.
+- State `SYSTEM.md` updates only after proof.
+
+After those edits, I would hand 045 to implementation.
