@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 
 use http::{Method, StatusCode};
 use tina::{Mailbox, TrySendError, prelude::*};
-use tina_http::{
-    HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
-};
+use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
 use tina_runtime::{MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
 #[derive(Debug, Default)]
@@ -101,11 +99,7 @@ impl Isolate for Counter {
         shard: TestShard,
     }
 
-    fn handle(
-        &mut self,
-        request: HttpRequest,
-        _ctx: &mut Context<'_, TestShard>,
-    ) -> Effect<Self> {
+    fn handle(&mut self, request: HttpRequest, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
         let response = match (request.method.clone(), request.path.as_str()) {
             (Method::GET, "/counter") => HttpResponse::text(self.value.to_string()),
             (Method::POST, "/counter") => {
@@ -218,10 +212,7 @@ impl Drop for TestHarness {
     }
 }
 
-pub fn wait_for_bound_addr(
-    slot: &Arc<Mutex<Option<SocketAddr>>>,
-    timeout: Duration,
-) -> SocketAddr {
+pub fn wait_for_bound_addr(slot: &Arc<Mutex<Option<SocketAddr>>>, timeout: Duration) -> SocketAddr {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(addr) = *slot.lock().expect("bound addr lock") {
@@ -235,9 +226,10 @@ pub fn wait_for_bound_addr(
 }
 
 pub fn scripted_request(addr: SocketAddr, request: &[u8]) -> Vec<u8> {
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("read timeout");
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
     stream.write_all(request).expect("write request");
     stream.flush().expect("flush");
     let mut response = Vec::new();

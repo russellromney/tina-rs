@@ -17,9 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{
-    CallError, ListenerId, StreamId, tcp_accept, tcp_bind, tcp_close_listener,
-};
+use tina_runtime::{CallError, ListenerId, StreamId, tcp_accept, tcp_bind, tcp_close_listener};
 
 use crate::connection::{HttpConnection, HttpConnectionMsg};
 use crate::types::{HttpLimits, HttpRequest, HttpResponse};
@@ -109,11 +107,7 @@ impl<S: Shard + 'static> Isolate for HttpListener<S> {
         shard: S,
     }
 
-    fn handle(
-        &mut self,
-        msg: HttpListenerMsg,
-        _ctx: &mut Context<'_, S>,
-    ) -> Effect<Self> {
+    fn handle(&mut self, msg: HttpListenerMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
         match msg {
             HttpListenerMsg::Start => tcp_bind(self.bind_addr).reply(HttpListenerMsg::Bound),
 
@@ -172,12 +166,7 @@ impl<S: Shard + 'static> Isolate for HttpListener<S> {
 impl<S: Shard + 'static> HttpListener<S> {
     fn build_connection_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S>> {
         ChildDefinition::new(
-            HttpConnection::<S>::new(
-                stream,
-                self.service,
-                self.limits,
-                self.service_call_timeout,
-            ),
+            HttpConnection::<S>::new(stream, self.service, self.limits, self.service_call_timeout),
             self.connection_mailbox_capacity,
         )
         .with_initial_message(HttpConnectionMsg::Begin)
@@ -192,12 +181,7 @@ impl<S: Shard + 'static> HttpListener<S> {
         // peer hangs up. This is fine because we are stopping the
         // listener.
         ChildDefinition::new(
-            HttpConnection::<S>::new(
-                stream,
-                self.service,
-                self.limits,
-                self.service_call_timeout,
-            ),
+            HttpConnection::<S>::new(stream, self.service, self.limits, self.service_call_timeout),
             self.connection_mailbox_capacity,
         )
         .with_initial_message(HttpConnectionMsg::Begin)

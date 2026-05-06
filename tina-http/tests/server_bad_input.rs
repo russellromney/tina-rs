@@ -50,9 +50,11 @@ fn oversized_header_section_is_rejected_either_with_431_or_connection_reset() {
     let huge_value = "x".repeat(20 * 1024);
     let request = format!("GET / HTTP/1.1\r\nX-Huge: {huge_value}\r\n\r\n");
 
-    let mut stream = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2))
-        .expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("read timeout");
+    let mut stream =
+        TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
     let _ = stream.write_all(request.as_bytes());
     let _ = stream.flush();
     let mut response = Vec::new();
@@ -92,9 +94,7 @@ fn chunked_transfer_encoding_returns_501() {
 fn oversized_content_length_returns_413() {
     let harness = TestHarness::start();
     let huge = 10 * 1024 * 1024; // 10 MiB exceeds default 1 MiB body limit
-    let request = format!(
-        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {huge}\r\n\r\n"
-    );
+    let request = format!("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {huge}\r\n\r\n");
     let response = scripted_request(harness.addr, request.as_bytes());
     common::assert_status_starts_with(&response, "413");
     harness.shutdown();
@@ -121,7 +121,9 @@ fn peer_close_mid_request_does_not_panic_or_hang() {
     // shutdown.
     let mut stream =
         TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_millis(200))).expect("read timeout");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("read timeout");
     stream
         .write_all(b"GET /counter HTTP/1.1\r\nHost: ")
         .expect("write partial");

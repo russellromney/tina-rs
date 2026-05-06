@@ -24,9 +24,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
-use tina_runtime::{
-    CallError, CallOutcome, StreamId, call, tcp_close_stream, tcp_read, tcp_write,
-};
+use tina_runtime::{CallError, CallOutcome, StreamId, call, tcp_close_stream, tcp_read, tcp_write};
 
 use crate::parse::{HttpRequestHead, ParseProgress, encode_response, parse_request_head};
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, RequestParseError};
@@ -121,11 +119,7 @@ impl<S: Shard + 'static> Isolate for HttpConnection<S> {
         shard: S,
     }
 
-    fn handle(
-        &mut self,
-        msg: HttpConnectionMsg,
-        _ctx: &mut Context<'_, S>,
-    ) -> Effect<Self> {
+    fn handle(&mut self, msg: HttpConnectionMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
         match msg {
             HttpConnectionMsg::Begin => self.read_more(),
 
@@ -174,7 +168,10 @@ impl<S: Shard + 'static> HttpConnection<S> {
     }
 
     fn maybe_dispatch_or_read_more(&mut self) -> Effect<Self> {
-        let head = self.parsed_head.as_ref().expect("head parsed before dispatch");
+        let head = self
+            .parsed_head
+            .as_ref()
+            .expect("head parsed before dispatch");
         let needed = self.head_len + head.content_length;
         if self.read_buf.len() < needed {
             self.read_more()
@@ -184,7 +181,10 @@ impl<S: Shard + 'static> HttpConnection<S> {
     }
 
     fn dispatch_to_service(&mut self) -> Effect<Self> {
-        let head = self.parsed_head.take().expect("head parsed before dispatch");
+        let head = self
+            .parsed_head
+            .take()
+            .expect("head parsed before dispatch");
         let body_end = self.head_len + head.content_length;
         let body = self.read_buf[self.head_len..body_end].to_vec();
         // First form: drop any bytes after content_length. We do not
@@ -197,10 +197,7 @@ impl<S: Shard + 'static> HttpConnection<S> {
             .reply(HttpConnectionMsg::ServiceReturned)
     }
 
-    fn handle_service_outcome(
-        &mut self,
-        outcome: CallOutcome<HttpResponse>,
-    ) -> Effect<Self> {
+    fn handle_service_outcome(&mut self, outcome: CallOutcome<HttpResponse>) -> Effect<Self> {
         let response = match outcome.into_result() {
             Ok(response) => response,
             Err(call_error) => {
@@ -276,9 +273,7 @@ pub fn response_for_call_outcome(outcome: &CallOutcome<HttpResponse>) -> Option<
     match outcome {
         CallOutcome::Replied(_) => None,
         CallOutcome::Full => Some(HttpResponse::with_status(StatusCode::SERVICE_UNAVAILABLE)),
-        CallOutcome::Closed => {
-            Some(HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR))
-        }
+        CallOutcome::Closed => Some(HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR)),
         CallOutcome::Timeout => Some(HttpResponse::with_status(StatusCode::GATEWAY_TIMEOUT)),
     }
 }
@@ -335,6 +330,9 @@ mod tests {
     #[test]
     fn replied_outcome_projects_to_none() {
         let response = response_for_call_outcome(&CallOutcome::Replied(HttpResponse::ok()));
-        assert!(response.is_none(), "successful replies do not project to a synthetic response");
+        assert!(
+            response.is_none(),
+            "successful replies do not project to a synthetic response"
+        );
     }
 }

@@ -67,9 +67,10 @@ impl HttpResponse {
     pub fn text(body: impl Into<String>) -> Self {
         let body = body.into().into_bytes();
         let mut response = Self::with_status(StatusCode::OK);
-        response
-            .headers
-            .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/plain"));
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain"),
+        );
         response.body = body;
         response
     }

@@ -116,8 +116,8 @@ fn build_head(
     limits: &HttpLimits,
 ) -> Result<HttpRequestHead, RequestParseError> {
     let method_str = parsed.method.ok_or(RequestParseError::BadRequestLine)?;
-    let method = Method::from_bytes(method_str.as_bytes())
-        .map_err(|_| RequestParseError::BadRequestLine)?;
+    let method =
+        Method::from_bytes(method_str.as_bytes()).map_err(|_| RequestParseError::BadRequestLine)?;
 
     let raw_path = parsed.path.ok_or(RequestParseError::BadRequestLine)?;
     if !is_origin_form(raw_path) {
@@ -143,12 +143,12 @@ fn build_head(
         }
         let name = HeaderName::from_bytes(header.name.as_bytes())
             .map_err(|_| RequestParseError::BadRequestLine)?;
-        let value = HeaderValue::from_bytes(header.value)
-            .map_err(|_| RequestParseError::BadRequestLine)?;
+        let value =
+            HeaderValue::from_bytes(header.value).map_err(|_| RequestParseError::BadRequestLine)?;
 
         if name == http::header::CONTENT_LENGTH {
-            let value_str =
-                std::str::from_utf8(header.value).map_err(|_| RequestParseError::InvalidContentLength)?;
+            let value_str = std::str::from_utf8(header.value)
+                .map_err(|_| RequestParseError::InvalidContentLength)?;
             let parsed_len: usize = value_str
                 .trim()
                 .parse()
@@ -280,7 +280,8 @@ mod tests {
 
     #[test]
     fn parses_post_with_content_length() {
-        let buf = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world";
+        let buf =
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world";
         match parse_request_head(buf, &limits()) {
             ParseProgress::Complete { head, head_len } => {
                 assert_eq!(head.method, Method::POST);
@@ -313,9 +314,8 @@ mod tests {
     #[test]
     fn rejects_oversized_body_via_content_length() {
         let huge = HttpLimits::default().max_body_bytes + 1;
-        let buf_str = format!(
-            "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {huge}\r\n\r\n"
-        );
+        let buf_str =
+            format!("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {huge}\r\n\r\n");
         match parse_request_head(buf_str.as_bytes(), &limits()) {
             ParseProgress::Failed(RequestParseError::BodyTooLarge) => {}
             other => panic!("expected BodyTooLarge, got {other:?}"),

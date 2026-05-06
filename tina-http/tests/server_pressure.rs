@@ -36,14 +36,13 @@ fn body_larger_than_one_tcp_read_round_trips_through_post_echo() {
 
     let body_size = 8 * 1024;
     let body: Vec<u8> = (0..body_size).map(|i| (i % 251) as u8).collect();
-    let mut request = format!(
-        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {body_size}\r\n\r\n"
-    )
-    .into_bytes();
+    let mut request =
+        format!("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {body_size}\r\n\r\n")
+            .into_bytes();
     request.extend_from_slice(&body);
 
-    let mut stream = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2))
-        .expect("connect");
+    let mut stream =
+        TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
@@ -51,10 +50,14 @@ fn body_larger_than_one_tcp_read_round_trips_through_post_echo() {
     // Write the request in two halves with a pause to force an extra
     // server-side read. Even without the pause an 8 KiB body will not
     // arrive in one 4 KiB chunk.
-    stream.write_all(&request[..request.len() / 2]).expect("first half");
+    stream
+        .write_all(&request[..request.len() / 2])
+        .expect("first half");
     stream.flush().expect("flush");
     std::thread::sleep(Duration::from_millis(20));
-    stream.write_all(&request[request.len() / 2..]).expect("second half");
+    stream
+        .write_all(&request[request.len() / 2..])
+        .expect("second half");
     stream.flush().expect("flush");
 
     let mut response = Vec::new();
@@ -78,7 +81,8 @@ fn body_larger_than_one_tcp_read_round_trips_through_post_echo() {
     let body_offset = header_end + separator.len();
     let body_in_response = &response[body_offset..];
     assert_eq!(
-        body_in_response, &body[..],
+        body_in_response,
+        &body[..],
         "echoed body must match request body byte-for-byte"
     );
 
