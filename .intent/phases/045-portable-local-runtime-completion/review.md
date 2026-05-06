@@ -213,3 +213,67 @@ Recommended plan additions:
 
 After these additions, 045 would really be building the core features Baobab
 needs before asking "can Tina port Tokio projects yet?"
+
+# Second Porting-Readiness Hostile Review
+
+Verdict: now on target. The plan is finally about building the portable runtime
+surface that Baobab needs, not just proving rails around it.
+
+What got fixed:
+
+- The target workload must use ordinary Tina effects only. Good. That protects
+  the no-async-handler story.
+- Resource-budget manifest completeness is now explicit. Good. Porting cannot
+  require spelunking into `ThreadedRuntimeConfig`.
+- Backpressure patterns are now part of the harness: reject/busy and
+  retry/backoff. Good. Baobab can compare app behavior instead of inventing it.
+- Canonical local service runner is now a rock. Good. This is the shape a
+  porter needs.
+- Listener/session lifecycle is now mandatory. Good. That is the heart of
+  Tokio-shaped services.
+- Supervision plus I/O, request/reply boundary, sibling progress under failure,
+  and service-harness CI are all now named. Good.
+
+Remaining issues to pin before or during implementation:
+
+1. **Canonical runner must not stay test-only if it reveals missing public API.**
+   The plan says tiny public helper only if needed. During implementation, be
+   strict: if every realistic service test repeats the same shutdown/signal/run
+   ceremony, that is a product smell. Either add a small public helper or
+   deliberately record why the explicit ceremony is the intended Tina surface.
+
+2. **Resource budget manifest must include mailbox capacities.**
+   `LocalSystemConfig` covers runtime/lane/shard capacities, but isolate
+   mailbox capacities are still passed at registration/spawn. That may be
+   correct, but the manifest proof must name it: app-level isolate capacities
+   remain per-registration/per-child, while runtime resource budgets live in
+   `LocalSystemConfig`.
+
+3. **Bridge is not a portable runtime rail.**
+   It is an adapter boundary. The plan correctly includes bridge timeout/cancel
+   because porting from Tokio needs it, but implementation should avoid pulling
+   Tokio bridge concerns into `tina-runtime` capability truth. Runtime table and
+   bridge table can cross-check, but should stay distinct.
+
+4. **Session lifecycle must prove ownership transfer.**
+   The harness should assert not just "session reads/writes" but that after a
+   stream is handed to a session, stale/competing owner behavior is rejected or
+   impossible by construction. This is the kind of bug a port would hit fast.
+
+5. **Supervision plus pending I/O needs exact restart outcome.**
+   If a supervised session panics while a read/write/process/file call is
+   pending, the plan should prove whether restart happens after cancellation,
+   whether late completion is rejected, and whether new generation receives no
+   old completion. Do not settle for "trace contains restart."
+
+6. **Failure-domain proof should distinguish isolate failure from shard failure.**
+   A session panic is not the same as a worker-thread/shard failure. Both matter
+   for porting confidence. If both cannot fit, make one `fixed` and the other
+   `deferred-nonclaim` with capability/Baobab update.
+
+7. **Cost report rows should include configured capacities.**
+   A bounded framework's cost without capacity context is weak. The cost report
+   should print the capacities/preallocation used for each row, not just timing
+   and allocation counts.
+
+No blocker beyond these pins. With them, 045 is a real pre-Baobab build phase.
