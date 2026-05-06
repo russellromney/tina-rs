@@ -49,6 +49,17 @@ Seastar is the architectural north star:
   service-class scheduling.
 - Fairness is between handler turns and runtime completions. Tina does not
   preempt a synchronous handler that is currently running.
+- Public names must stay boring and obvious. Prefer shapes like
+  `AffinityStatus`, `ShardExecutionReport`, `PreallocationConfig`,
+  `FairnessConfig`, and similar plain names.
+- "Boring-owned" pooling is conservative. If storage crosses into a backend,
+  worker thread, raw pointer, user payload, or erased `Any` boundary, do not
+  pool it unless the plan is amended.
+- Fairness tests must use deterministic step counts, bounded queues,
+  manual/scripted completions, or explicit synchronization. No sleeps-as-proof.
+- Advisory affinity must stay visibly advisory. Unsupported or advisory
+  platforms report `Unsupported` / `AdvisoryOnly`, not fake zeroes or guessed
+  CPU ids.
 
 ## Rocks
 
