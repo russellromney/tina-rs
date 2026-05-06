@@ -7,6 +7,11 @@ Build the missing portable-runtime features that Baobab needs to judge.
 This is not a survey phase. The first step maps coverage so we do not repeat
 work. Every later step builds or hardens concrete runtime surface.
 
+This phase must leave seven portability gates in place for Baobab:
+complete local runtime story, clear app/service shape, good enough ergonomics,
+brutal tests, visible capability matrix, non-toy examples, and enough cost
+numbers to discuss performance without hand-waving.
+
 At closeout:
 
 > Tina's current non-`io_uring` local runtime is complete for serious local
@@ -35,6 +40,8 @@ At closeout:
   Prefer crate-private helpers and tests for lifecycle cleanup.
 - The service harness must use ordinary Tina effects only: no async handlers,
   no raw backend handles, no Tokio tasks inside isolates.
+- Ergonomics may remove ceremony, but must not hide overload, failure,
+  timeout, cancellation, queueing, or shutdown.
 
 ## Build Rocks
 
@@ -145,7 +152,20 @@ At closeout:
    API is clearly needed. It must prove the ordinary Tina path, not a hidden
    runtime shortcut.
 
-9. **Portable Service Harness**
+   Add only the tiny helper methods needed to make this path readable. If no
+   helper is added, record why the explicit ceremony is the intended surface.
+
+9. **Non-Toy Portable Service Example**
+   Build a runnable example that uses the same harness shape but reads like an
+   app, not a unit test. It should be small enough to understand and serious
+   enough to resemble a port target: listener/session lifecycle, bounded
+   resource config, timeout/retry, persistence checkpoint, graceful shutdown,
+   and terminal report inspection.
+
+   This is not marketing polish. It is a compile/run artifact that proves the
+   app/service shape is legible outside a test assertion wall.
+
+10. **Portable Service Harness**
    Build one reusable local service harness in
    `tina-runtime/tests/portable_service.rs` over the portable backend. It must
    use many real rails together: TCP or TLS ingress/loopback, DNS, file/path
@@ -174,7 +194,7 @@ At closeout:
    shard/session keeps serving, topology names the failed domain, and partial
    trace survives.
 
-10. **DST Families For Weird Rocks**
+11. **DST Families For Weird Rocks**
    Add new DST families with saved seeds and deterministic replay:
 
    - `tina-sim`: timeout + late completion; persistence corruption + restart;
@@ -185,10 +205,11 @@ At closeout:
 
    At least one new family must exercise deletion shrinking.
 
-11. **Portable Runtime Cost Report**
+12. **Portable Runtime Cost Report**
    Add one stable report command, preferably `make portable-runtime-cost`, for
    the portable backend. It prints backend, platform, profile, operation row,
-   allocation count where probes exist, and rough timing where easy.
+   configured capacities/preallocation, allocation count where probes exist,
+   and rough timing where easy.
 
    Rows: local send, live ingress, cross-shard send, isolate call, timer, TCP
    loopback, TLS loopback, file read/write, journal append, bridge call.
@@ -196,7 +217,7 @@ At closeout:
    No thresholds. No external Tokio/Glommio baselines. No performance claims.
    Baobab owns comparison.
 
-12. **Portable Runtime CI Gate**
+13. **Portable Runtime CI Gate**
     Add a named additive gate, preferably `make verify-portable-runtime`, and
     wire CI to run it on Linux and macOS. It should include the capability
     table, portable service harness, selected DST seeds, and cost report smoke
@@ -206,7 +227,7 @@ At closeout:
     The gate must run the canonical service runner and portable service harness
     scary-edge tests. Tables and DST alone are not enough.
 
-13. **Baobab Handoff**
+14. **Baobab Handoff**
     Update `CHANGELOG.md`, `ROADMAP.md`, and Phase 046 Baobab plan/review with
     only landed truth. If 045 discovers a remaining non-claim, Baobab must
     compare that truth, not old hope.
@@ -221,6 +242,7 @@ At closeout:
 - Every rail has positive, negative, overload/capacity, timeout/cancel or
   `not-applicable(reason)`, shutdown/resource, and trace proof.
 - Canonical local service runner shape exists and is tested.
+- Non-toy runnable portable service example exists and uses the same app shape.
 - The portable service harness has composed happy path plus focused scary-edge
   tests.
 - Listener/session lifecycle, supervision plus I/O, request/reply boundary, and
@@ -229,7 +251,7 @@ At closeout:
   leakage inside isolates.
 - New DST families replay saved seeds; at least one new family shrinks.
 - `make portable-runtime-cost` or equivalent runs and prints numbers without
-  claims.
+  claims, including capacity/preallocation context.
 - CI names platform exclusions honestly.
 
 ## Done Means
