@@ -33,8 +33,14 @@
 //!   Encode/decode enforces `max_size` before invoking the underlying
 //!   serializer.
 //!
-//! Out of scope: connection isolate (Rock 2), service registry (Rock 3),
-//! client stub (Rock 4), simulation (Rock 6), Eiffel comparison (Rock 7).
+//! - Connection isolate ([`Connection`]) per accepted TCP stream, with
+//!   bounded in-flight, write queue, idle timeout, and observable close
+//!   paths.
+//! - Service registry ([`Registry`]) that maps service names to uniform
+//!   `Address<ServiceCall, ServiceReply>` and forwards via isolate-call.
+//!
+//! Out of scope: client stub (Rock 4), simulation (Rock 6), Eiffel
+//! comparison (Rock 7).
 //!
 //! # Example
 //!
@@ -76,12 +82,14 @@
 mod connection;
 mod encoding;
 mod frame;
+mod registry;
 
 pub use connection::{
     BadPeerReason, CloseReason, Connection, ConnectionConfig, ConnectionInit, ConnectionMsg,
     RouterReply, RouterRequest,
 };
 pub use encoding::{Encoding, EncodingError, EncodingErrorKind, Json};
+pub use registry::{Registry, RegistryConfig, RegistryMsg, ServiceCall, ServiceReply};
 pub use frame::{
     DecodeError, EncodeError, Frame, FrameError, FrameKind, FrameLimits, FRAME_VERSION_V1,
     LENGTH_PREFIX_SIZE, MAX_METHOD_LEN, MAX_SERVICE_LEN, decode, decode_body, encode,

@@ -108,7 +108,7 @@ impl Default for ConnectionConfig {
 /// Rock 3 implements a router isolate whose mailbox accepts this type and
 /// replies with [`RouterReply`]. The connection only knows the type, not the
 /// registry implementation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouterRequest {
     /// The wire `request_id` of the originating frame. The router does not
     /// need to interpret it; it is included for tracing/debugging.
@@ -137,6 +137,9 @@ pub enum RouterReply {
     Decode,
     /// The service hit an internal error unrelated to the request payload.
     Internal,
+    /// The named service is at capacity. The router emits this when its
+    /// isolate-call to the service returned `CallOutcome::Full`.
+    Full,
 }
 
 /// Why the connection treated a peer as malformed.
@@ -223,7 +226,7 @@ where
     /// Stream id assigned by the runtime when this connection was accepted.
     pub stream: StreamId,
     /// Address of the router isolate (Rock 3).
-    pub router: Address<RouterRequest, RouterReply>,
+    pub router: Address<crate::registry::RegistryMsg, RouterReply>,
     /// Optional address that receives one [`CloseReason`] when this
     /// connection closes.
     pub watcher: Option<Address<CloseReason>>,
@@ -264,7 +267,7 @@ where
     S: tina::Shard,
 {
     stream: StreamId,
-    router: Address<RouterRequest, RouterReply>,
+    router: Address<crate::registry::RegistryMsg, RouterReply>,
     watcher: Option<Address<CloseReason>>,
     config: ConnectionConfig,
     inbound: Vec<u8>,
@@ -437,13 +440,16 @@ where
             payload: frame.payload,
         };
         self.in_flight += 1;
-        call(self.router, request, self.config.service_call_timeout).reply(move |outcome| {
-            ConnectionMsg::Routed {
-                request_id,
-                service,
-                method,
-                outcome,
-            }
+        call(
+            self.router,
+            crate::registry::RegistryMsg::Route(request),
+            self.config.service_call_timeout,
+        )
+        .reply(move |outcome| ConnectionMsg::Routed {
+            request_id,
+            service,
+            method,
+            outcome,
         })
     }
 
@@ -611,6 +617,13 @@ where
                 FrameError::Internal,
                 Vec::new(),
             )),
+            CallOutcome::Replied(RouterReply::Full) => Some(Frame::error(
+                request_id,
+                service,
+                method,
+                FrameError::Full,
+                Vec::new(),
+            )),
             CallOutcome::Full => Some(Frame::error(
                 request_id,
                 service,
@@ -729,8 +742,9 @@ mod tests {
         }
     }
 
-    fn router_addr() -> Address<RouterRequest, RouterReply> {
-        Address::<RouterRequest>::new(ShardId::new(0), IsolateId::new(1)).with_reply::<RouterReply>()
+    fn router_addr() -> Address<crate::registry::RegistryMsg, RouterReply> {
+        Address::<crate::registry::RegistryMsg>::new(ShardId::new(0), IsolateId::new(1))
+            .with_reply::<RouterReply>()
     }
 
     fn watcher_addr() -> Address<CloseReason> {
@@ -977,6 +991,27 @@ mod tests {
         assert_eq!(frame.kind, FrameKind::Error);
         assert_eq!(frame.error, Some(FrameError::Full));
         assert_eq!(frame.request_id, 5);
+    }
+
+    #[test]
+    fn routed_router_reply_full_writes_full_frame() {
+        let mut conn = make_connection(small_config());
+        let _ = dispatch(&mut conn, ConnectionMsg::Begin);
+        let r = build_request(8, "svc", "m", &[]);
+        let _ = dispatch(&mut conn, ConnectionMsg::Read(Ok(r)));
+        let _ = dispatch(
+            &mut conn,
+            ConnectionMsg::Routed {
+                request_id: 8,
+                service: "svc".into(),
+                method: "m".into(),
+                outcome: CallOutcome::Replied(RouterReply::Full),
+            },
+        );
+        let pending = conn.write_in_flight.as_ref().expect("write started");
+        let frame = crate::frame::decode(pending, &FrameLimits::new(1024)).unwrap();
+        assert_eq!(frame.kind, FrameKind::Error);
+        assert_eq!(frame.error, Some(FrameError::Full));
     }
 
     #[test]
