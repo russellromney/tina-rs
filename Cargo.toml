@@ -4,6 +4,7 @@ members = [
     "tina-http",
     "tina-macros",
     "tina-mailbox-spsc",
+    "tina-rpc",
     "tina-runtime",
     "tina-sim",
     "tina-supervisor",
@@ -11,6 +12,7 @@ members = [
 ]
 exclude = [
     "examples/eiffel_real_io_chat",
+    "examples/eiffel_rpc",
     "examples/eiffel_mini_keyspace",
     "examples/eiffel_axum_counter",
     "examples/eiffel_ws_room",
