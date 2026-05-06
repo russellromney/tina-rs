@@ -4,8 +4,9 @@
 
 Build the missing portable-runtime features that Baobab needs to judge.
 
-This is not a survey phase. The first step maps coverage so we do not repeat
-work. Every later step builds or hardens concrete runtime surface.
+This is not a survey phase. The phase builds concrete runtime surface first.
+The coverage ledger records what was built, what proof exists, and what stays
+a non-claim.
 
 This phase must leave eight portability gates in place for Baobab:
 complete local runtime story, a public app runner, clear app/service shape,
@@ -43,17 +44,25 @@ At closeout:
   no raw backend handles, no Tokio tasks inside isolates.
 - Ergonomics may remove ceremony, but must not hide overload, failure,
   timeout, cancellation, queueing, or shutdown.
+- Tiny helpers are allowed only when repeated public runner/service ceremony
+  proves the need. No helper may create a second semantic path, hidden retry,
+  hidden capacity, hidden timeout, or hidden shutdown behavior.
 
 ## Build Rocks
 
-1. **Coverage Map, Then Fix**
-   Add a compact rail matrix in `review.md`: timers, TCP, TLS, DNS, UDP,
-   file/path, process, signal, persistence, isolate calls, cross-shard sends,
-   bridge ingress. Columns: positive, negative, overload, timeout/cancel,
-   late completion, shutdown/resource report, trace, DST. Mark each cell
-   `covered`, `weak`, `missing`, or `not-applicable(reason)`.
+1. **Implementation Ledger And Gap Closure**
+   Keep a compact rail ledger in `review.md` while building. This ledger is
+   evidence, not the main deliverable. It must not replace code, tests, or
+   public-path proof.
 
-   Then close each needed cell as `covered`, `fixed`, or
+   Rows: timers, TCP, TLS, DNS, UDP, file/path, process, signal, persistence,
+   isolate calls, cross-shard sends, bridge ingress.
+
+   Columns: positive, negative, overload, timeout/cancel, late completion,
+   shutdown/resource report, trace, DST.
+
+   Mark each cell `covered`, `weak`, `missing`, or
+   `not-applicable(reason)`. Close each needed cell as `covered`, `fixed`, or
    `deferred-nonclaim`. `deferred-nonclaim` must update capability truth and
    Phase 046 Baobab.
 
@@ -66,15 +75,18 @@ At closeout:
    field, so `NotApplicable` and `Partial` stay assertable instead of becoming
    prose.
 
-   It must assert against `RuntimeCapabilities`, bridge capabilities where
-   relevant, and named non-claims. It covers execution shape, bounded capacity,
-   cancellation, shutdown, replay, and blocking-lane truth.
+   It must assert against `RuntimeCapabilities` and named runtime non-claims.
+   Bridge capability truth must stay separate, with its own adapter-facing
+   table or assertions. Cross-check bridge truth where relevant, but do not let
+   `tina-runtime` claim Tokio bridge semantics.
 
-   It must also prove the user-facing resource budget manifest is complete:
-   ingress, mailbox, shard-pair, remote-drain, DNS/TLS/process/storage lanes,
-   signal capacity, trace retention, preallocation, and shutdown drain timeout
-   are reachable from `LocalSystem` builders/config without requiring users to
-   drop into low-level `ThreadedRuntimeConfig`.
+   It must also prove the user-facing resource budget manifest is complete.
+   Runtime-owned budgets live in the public runner/config: ingress,
+   shard-pair, remote-drain, DNS/TLS/process/storage lanes, signal capacity,
+   trace retention, preallocation, and shutdown drain timeout. Isolate mailbox
+   capacities remain explicit per root registration, spawn, or child
+   definition. Tests must prove both halves are visible without requiring users
+   to drop into low-level `ThreadedRuntimeConfig`.
 
 3. **Unified Driver Lifecycle Surface**
    Build common lifecycle helpers/events where they reduce special cases:
@@ -114,17 +126,18 @@ At closeout:
    reject/busy reply, and explicit retry/backoff through Tina-owned timers. Do
    not add a broad policy framework.
 
-   Do not claim preemption. A currently running synchronous handler or
-   already-started blocking OS operation may still run until it returns; Tina
-   must bound admission, report pressure, tombstone cancellation, and surface
-   shutdown truth.
+   Do not claim preemption. Queued blocking work can be cancelled when the
+   backend supports removing it before start. Already-started blocking OS work
+   may still run until it returns; Tina must bound admission, report pressure,
+   tombstone cancellation, and surface shutdown truth.
 
 6. **Blocking-Lane Hardening**
    For storage, DNS, TLS, process, and persistence-over-storage lanes,
    build/prove:
    lane full, queued cancellation, started-work tombstoning, late completion
    swallowing, shutdown drain timeout, worker-held accounting, and terminal
-   reporting.
+   reporting. Prove queued cancellation and started-work tombstoning with
+   separate tests.
 
    Capability truth must say `LaneBackedBlocking` where that is the actual
    portable backend shape. Signals and UDP are poll-backed, not blocking-lane
@@ -143,6 +156,10 @@ At closeout:
    responded-late, and shutdown-retry truth where the bridge can observe them.
    Do not claim deterministic replay under Tokio.
 
+   Add direct public negative tests: after shard failure, `trace()` returns a
+   partial snapshot naming missing shards, `complete_trace()` fails cleanly,
+   and the terminal report still carries topology, resource, and error truth.
+
 8. **Public Local Service Runner**
    Build the blessed local-service shape that users and porting tests will
    target. It must be public API, not a test-only helper.
@@ -153,18 +170,23 @@ At closeout:
    drain, join, and return/inspect the terminal report.
 
    This should feel like Tokio's split between `#[tokio::main]` and
-   `runtime::Builder`: Tina may expose an explicit builder/run path first and
-   add an attribute macro later, but normal users must have a real way to run
-   a Tina app without copying test scaffolding.
+   `runtime::Builder`: 045 builds an explicit public `LocalSystem`
+   runner/builder path now. No attribute macro in this phase. Normal users
+   must have a real way to run a Tina app without copying test scaffolding.
 
    The runner must not hide mailbox capacity, ingress capacity, lane capacity,
    timeout policy, shutdown policy, or terminal reports. It may remove
    ceremony; it may not hide overload, failure, cancellation, queueing, or
    shutdown truth.
 
-   Tests must prove the public runner path directly. The service harness and
-   non-toy example must use this public path unless a test is intentionally
-   exercising lower-level runtime internals.
+   Tests must prove the public runner path directly from outside the crate and
+   assert that it returns a terminal report. The service harness and non-toy
+   example must use this public path unless a test is intentionally exercising
+   lower-level runtime internals.
+
+   Blast-radius proof: direct `LocalSystem`, `LocalMultiShardSystem`, and
+   `ThreadedRuntime` construction must still work. Add at least one new test
+   that bypasses the runner and still exercises the old low-level path.
 
 9. **Non-Toy Portable Service Example**
    Build a runnable example that uses the same harness shape but reads like an
@@ -173,25 +195,33 @@ At closeout:
    resource config, timeout/retry, persistence checkpoint, graceful shutdown,
    and terminal report inspection.
 
+   The example must be CI-safe: use ephemeral ports, temp directories,
+   deterministic cleanup, and no external network dependency.
+
    This is not marketing polish. It is a compile/run artifact that proves the
    app/service shape is legible outside a test assertion wall.
 
 10. **Portable Service Harness**
    Build one reusable local service harness in
-   `tina-runtime/tests/portable_service.rs` over the portable backend. It must
-   use many real rails together: TCP or TLS ingress/loopback, DNS, file/path
-   I/O, timer, process, persistence, cross-shard call, bounded queues, and
-   graceful shutdown.
+   `tina-runtime/tests/portable_service.rs` over the portable backend. It
+   should use several real rails together without forcing every rail into one
+   unreadable scenario: TCP or TLS ingress/loopback, DNS, file/path I/O,
+   timer, process, persistence, cross-shard call, bounded queues, and graceful
+   shutdown.
 
    The harness must model the normal listener/session lifecycle: listener
    isolate accepts, creates or notifies a per-connection/session isolate, hands
    over stream ownership, reads/writes with timeout, closes, and abandons
    cleanly on shutdown.
 
-   Add one composed happy-path e2e. Add focused scary-edge e2e tests for:
+   Add one composed happy-path e2e. Add focused direct scary-edge e2e tests
+   for:
    mailbox full, live ingress full, shard-pair full, resource lane full,
    timeout, cancellation, stale address, failed shard, corrupt persistence,
    slow peer, and shutdown while work is in flight.
+
+   Focused tests must directly hit changed paths rather than relying on the
+   composed happy path as surrogate proof.
 
    Prove supervision plus I/O composition: supervised listener/session/worker
    failure while runtime-owned I/O is pending; restart does not inherit stale
@@ -211,7 +241,10 @@ At closeout:
    - `tina-sim`: timeout + late completion; persistence corruption + restart;
      trace retention + failure.
    - `tina-runtime`: deterministic scripted live-vs-sim projection for remote
-     full + shard failure; requester stop + driver completion.
+     full + shard failure; requester stop + driver completion. Compare stable
+     semantic facts only: accepted/full/closed/timeout/cancel/report shape.
+     Do not compare wall-clock order, OS scheduling order, or raw trace byte
+     equality with live backend noise.
    - `tina-tokio-bridge`: bridge ingress + service shutdown + retry/cancel.
 
    At least one new family must exercise deletion shrinking.
@@ -225,8 +258,9 @@ At closeout:
    Rows: local send, live ingress, cross-shard send, isolate call, timer, TCP
    loopback, TLS loopback, file read/write, journal append, bridge call.
 
-   No thresholds. No external Tokio/Glommio baselines. No performance claims.
-   Baobab owns comparison.
+   Use a tiny smoke mode for CI and a larger manual mode for humans. Pin the
+   profile in the output. No thresholds. No external Tokio/Glommio baselines.
+   No performance claims. Baobab owns comparison.
 
 13. **Portable Runtime CI Gate**
     Add a named additive gate, preferably `make verify-portable-runtime`, and
@@ -237,6 +271,9 @@ At closeout:
 
     The gate must run the public service runner and portable service harness
     scary-edge tests. Tables and DST alone are not enough.
+
+    Platform differences must be asserted through capability truth and
+    platform-gated expectations, not silent skips.
 
 14. **Baobab Handoff**
     Update `CHANGELOG.md`, `ROADMAP.md`, and Phase 046 Baobab plan/review with
@@ -253,6 +290,7 @@ At closeout:
 - Every rail has positive, negative, overload/capacity, timeout/cancel or
   `not-applicable(reason)`, shutdown/resource, and trace proof.
 - Public local service runner shape exists and is tested from the outside.
+- Direct construction without the public runner still works.
 - Non-toy runnable portable service example exists and uses the same app shape.
 - The portable service harness has composed happy path plus focused scary-edge
   tests.
@@ -261,8 +299,10 @@ At closeout:
 - The target workload uses ordinary Tina effects only, with no async/raw backend
   leakage inside isolates.
 - New DST families replay saved seeds; at least one new family shrinks.
+- Live DST/projection compares semantic facts only, not wall-clock ordering.
 - `make portable-runtime-cost` or equivalent runs and prints numbers without
-  claims, including capacity/preallocation context.
+  claims, including capacity/preallocation context, profile, CI smoke mode,
+  and manual mode.
 - CI names platform exclusions honestly.
 
 ## Done Means
