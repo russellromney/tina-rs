@@ -244,22 +244,34 @@ impl<S: Shard + 'static> HttpConnection<S> {
 }
 
 /// Maps a runtime `CallError` from the service call into a synthetic HTTP
-/// response. Used when the service mailbox was full, the address was
-/// closed, or the call timed out before the service replied.
+/// response. Mirrors the variants of [`CallOutcome`]:
+///
+/// | `CallError`    | Status                       |
+/// |----------------|------------------------------|
+/// | `TargetFull`   | `503 Service Unavailable`    |
+/// | `TargetClosed` | `500 Internal Server Error`  |
+/// | `Timeout`      | `504 Gateway Timeout`        |
+/// | other          | `500 Internal Server Error`  |
 fn response_for_call_error(error: &CallError) -> HttpResponse {
     match error {
+        CallError::TargetFull => HttpResponse::with_status(StatusCode::SERVICE_UNAVAILABLE),
         CallError::Timeout => HttpResponse::with_status(StatusCode::GATEWAY_TIMEOUT),
-        // Closed/Cancelled/Aborted addresses are an internal error from
-        // the client's perspective: the service is supposed to be there
-        // and isn't.
+        // TargetClosed and any other variant land here: the service is
+        // supposed to be there and isn't, which is a server-side fault.
         _ => HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
-/// Service-overload handler used by callers that want to project a
-/// non-`Replied` outcome into a typed HTTP response. The connection
-/// isolate uses this internally; it is exposed here so service-side code
-/// can build the same mapping (e.g. when wrapping a downstream call).
+/// Projects a [`CallOutcome`] into an HTTP response when it is *not* a
+/// successful reply.
+///
+/// Returns `None` when the outcome carries a real reply; the caller is
+/// expected to use that reply directly. Returns `Some(response)` for
+/// `Full`, `Closed`, and `Timeout`, with the status mapping mirrored from
+/// [`response_for_call_error`].
+///
+/// Exposed publicly so service-side code can build the same mapping
+/// when wrapping a downstream call into its own response shape.
 pub fn response_for_call_outcome(outcome: &CallOutcome<HttpResponse>) -> Option<HttpResponse> {
     match outcome {
         CallOutcome::Replied(_) => None,
@@ -268,5 +280,61 @@ pub fn response_for_call_outcome(outcome: &CallOutcome<HttpResponse>) -> Option<
             Some(HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR))
         }
         CallOutcome::Timeout => Some(HttpResponse::with_status(StatusCode::GATEWAY_TIMEOUT)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_call_error_maps_to_503() {
+        assert_eq!(
+            response_for_call_error(&CallError::TargetFull).status,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+
+    #[test]
+    fn closed_call_error_maps_to_500() {
+        assert_eq!(
+            response_for_call_error(&CallError::TargetClosed).status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+
+    #[test]
+    fn timeout_call_error_maps_to_504() {
+        assert_eq!(
+            response_for_call_error(&CallError::Timeout).status,
+            StatusCode::GATEWAY_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn full_outcome_projects_to_503() {
+        let response = response_for_call_outcome(&CallOutcome::<HttpResponse>::Full)
+            .expect("Full projects to a response");
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn closed_outcome_projects_to_500() {
+        let response = response_for_call_outcome(&CallOutcome::<HttpResponse>::Closed)
+            .expect("Closed projects to a response");
+        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn timeout_outcome_projects_to_504() {
+        let response = response_for_call_outcome(&CallOutcome::<HttpResponse>::Timeout)
+            .expect("Timeout projects to a response");
+        assert_eq!(response.status, StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn replied_outcome_projects_to_none() {
+        let response = response_for_call_outcome(&CallOutcome::Replied(HttpResponse::ok()));
+        assert!(response.is_none(), "successful replies do not project to a synthetic response");
     }
 }
