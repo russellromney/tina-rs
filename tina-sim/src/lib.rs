@@ -6100,8 +6100,7 @@ where
     }
 
     /// Drops simulator state for calls cancelled by resource close.
-    ///
-    /// The translator is not run; the caller's continuation does not fire.
+    /// Translator is not run; caller's continuation does not fire.
     /// Trace records `ResourceClosed`.
     fn cancel_backend_calls_for_resource(&mut self, resource: TcpResourceKey) {
         let cancelled_call_ids: Vec<CallId> = self

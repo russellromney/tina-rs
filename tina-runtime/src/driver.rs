@@ -118,13 +118,12 @@ impl TlsRuntimeStream {
 /// [`crate::Runtime`], advances them when the runtime asks, and returns typed
 /// completions for the runtime to deliver on later turns.
 ///
-/// TCP drivers must treat listener accept, stream read, and stream write as
-/// separate pending lanes. Duplicate work on one lane fails with
-/// [`CallError::ResourceBusy`]. Closing a listener, stream, or UDP socket
-/// silently cancels pending work on that resource before closing it; the
-/// cancelled callers do not receive completions. Per-call cancel must stop
-/// requester completion and quiescence pressure without silently invalidating
-/// unrelated active lanes.
+/// TCP drivers treat listener accept, stream read, and stream write as
+/// separate lanes. Duplicate work on one lane fails with
+/// [`CallError::ResourceBusy`]. Close cancels pending work on the
+/// resource and closes; the cancelled caller's continuation does not
+/// fire. Per-call cancel stops the runtime from waiting on this id;
+/// it does not invalidate other lanes.
 pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// Submits one runtime-owned call.
     fn submit(
@@ -161,10 +160,8 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// effect, such as a TCP write handed to the OS, can be undone.
     fn cancel(&mut self, call_id: CallId) -> bool;
 
-    /// Drains call ids cancelled because their resource was closed.
-    ///
-    /// Close wins. The driver drops the backend work; the runtime drops
-    /// its call state and records `ResourceClosed`.
+    /// Drains call ids the close path silently cancelled. Runtime
+    /// drops their tracking and records `ResourceClosed`.
     fn take_cancelled_by_close(&mut self) -> Vec<CallId> {
         Vec::new()
     }
@@ -3622,8 +3619,7 @@ impl BetelgeuseTcp {
     }
 
     fn do_listener_close(&mut self, listener: ListenerId) -> CallOutput {
-        // Close wins. Pending accepts are cancelled; their continuations
-        // do not fire. Runtime drains `cancelled_by_close` and records it.
+        // Close wins: cancel any pending accept on this listener.
         for op in self.pending.iter_mut() {
             if matches!(op.lane, PendingLane::ListenerAccept(l) if l == listener)
                 && !op.user_cancelled
@@ -3644,8 +3640,7 @@ impl BetelgeuseTcp {
     }
 
     fn do_stream_close(&mut self, stream: StreamId) -> CallOutput {
-        // Close wins. Pending reads/writes are cancelled; their
-        // continuations do not fire.
+        // Close wins: cancel any pending read or write on this stream.
         for op in self.pending.iter_mut() {
             let on_this_stream = match op.lane {
                 PendingLane::StreamRead(s) | PendingLane::StreamWrite(s) => s == stream,
@@ -3708,8 +3703,7 @@ impl BetelgeuseTcp {
     }
 
     fn do_udp_close(&mut self, socket: UdpSocketId) -> CallOutput {
-        // Close wins. Pending recv is cancelled; its continuation does
-        // not fire.
+        // Close wins: cancel any pending recv on this socket.
         for op in self.pending.iter_mut() {
             if matches!(op.lane, PendingLane::UdpRecv(s) if s == socket) && !op.user_cancelled {
                 op.user_cancelled = true;

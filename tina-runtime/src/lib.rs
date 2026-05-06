@@ -1699,17 +1699,16 @@ where
             self.deliver_completion(immediate.call_id, immediate.result);
         }
 
-        // Close wins at the driver. Drop matching runtime call state too,
-        // or the cancelled call would keep the worker non-idle forever.
-        let cancelled = self.driver.take_cancelled_by_close();
-        for cancelled_call_id in cancelled {
-            self.cancel_in_flight_call_for_resource_close(cancelled_call_id);
+        // Driver cancelled some pending calls because their resource
+        // closed. Drop matching runtime state, or `has_in_flight_calls`
+        // stays true forever.
+        for cancelled in self.driver.take_cancelled_by_close() {
+            self.cancel_in_flight_call_for_resource_close(cancelled);
         }
     }
 
     /// Drops runtime state for a call cancelled by resource close.
-    ///
-    /// The translator is not run; the caller's continuation does not fire.
+    /// Translator is not run; caller's continuation does not fire.
     /// Trace records `ResourceClosed`.
     fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
         let Some(in_flight_index) = self
