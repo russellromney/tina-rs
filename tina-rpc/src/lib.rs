@@ -89,6 +89,7 @@ mod registry;
 
 pub use client::{
     Client, ClientConfig, ClientInit, ClientMsg, ClientRequest, ClientResult, ClientResultMsg,
+    ClientStream,
 };
 pub use connection::{
     BadPeerReason, CloseReason, Connection, ConnectionConfig, ConnectionInit, ConnectionMsg,

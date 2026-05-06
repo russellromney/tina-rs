@@ -53,11 +53,13 @@
 //! discarded by the client (slot already gone).
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, RuntimeCall, StreamId, sleep_then, tcp_close_stream, tcp_read, tcp_write,
+    CallError, RuntimeCall, StreamId, sleep_then, tcp_close_stream, tcp_connect, tcp_read,
+    tcp_write,
 };
 
 use crate::frame::{
@@ -157,6 +159,14 @@ pub struct ClientRequest {
     pub payload: Vec<u8>,
     /// Local deadline. The client emits a [`ClientResult::Timeout`]
     /// notification when this elapses with no matching reply.
+    ///
+    /// The deadline is armed when [`ClientMsg::Request`] is delivered to
+    /// the client, **including** any time the request waits for a
+    /// pending `tcp_connect` to complete. A request submitted before
+    /// `Connected` therefore loses some of its deadline budget to the
+    /// connect handshake. Wait for `Connected` (e.g. by sending `Begin`
+    /// first and only then submitting requests) if you need the deadline
+    /// to cover only the wire round-trip.
     pub deadline: Duration,
     /// User-supplied tag; echoed in the reply for the user's correlation.
     pub correlator: u64,
@@ -171,11 +181,14 @@ pub struct ClientRequest {
 /// are public so tests can simulate the runtime.
 #[derive(Debug, Clone)]
 pub enum ClientMsg {
-    /// Initial kick-off after the caller has completed `tcp_connect`. The
-    /// client starts its read loop and arms the idle timer in response.
-    /// Without `Begin`, a quiescent client (no requests yet) would never
-    /// read replies and never observe an idle close.
+    /// Initial kick-off. If [`ClientStream`] was constructed with
+    /// [`ClientStream::Established`], this arms the read loop and idle
+    /// timer immediately. If [`ClientStream::Pending`], `Begin` issues
+    /// the `tcp_connect` and the read/idle arm runs after `Connected`.
     Begin,
+    /// Result of the `tcp_connect` issued in response to `Begin` for a
+    /// [`ClientStream::Pending`] client.
+    Connected(Result<StreamId, CallError>),
     /// User-issued RPC.
     Request(ClientRequest),
     /// Result of an outstanding `tcp_read`.
@@ -199,13 +212,23 @@ pub enum ClientMsg {
     Shutdown,
 }
 
+/// How the client should obtain its TCP stream.
+#[derive(Debug, Clone, Copy)]
+pub enum ClientStream {
+    /// The caller already performed `tcp_connect`; reuse this stream id.
+    Established(StreamId),
+    /// Issue `tcp_connect` to this address on `Begin`. The read loop
+    /// arms after the connect completes.
+    Pending(SocketAddr),
+}
+
 /// Initialization data for [`Client::new`].
 pub struct ClientInit<S>
 where
     S: tina::Shard,
 {
-    /// Stream id assigned by the runtime when this client connected.
-    pub stream: StreamId,
+    /// Source of the client's TCP stream.
+    pub stream: ClientStream,
     /// Connection-local configuration.
     pub config: ClientConfig,
     /// Marker so the type carries the shard parameter.
@@ -235,7 +258,17 @@ pub struct Client<S>
 where
     S: tina::Shard,
 {
-    stream: StreamId,
+    /// Stream once established. `None` means a `tcp_connect` is pending
+    /// (Pending init mode, before `Connected` arrives).
+    stream: Option<StreamId>,
+    /// Address to dial on `Begin`, recorded only when init mode was
+    /// `Pending`. Stays populated until `Connected` so a duplicate
+    /// `Begin` can no-op rather than tearing the connection down.
+    pending_connect: Option<SocketAddr>,
+    /// Set once `Begin` issued the `tcp_connect`; prevents a second
+    /// `Begin` from re-dispatching or from tripping the
+    /// no-stream-and-no-pending-connect close branch.
+    connect_dispatched: bool,
     config: ClientConfig,
     inbound: Vec<u8>,
     in_flight: HashMap<u64, InFlight>,
@@ -257,6 +290,8 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("stream", &self.stream)
+            .field("pending_connect", &self.pending_connect)
+            .field("connect_dispatched", &self.connect_dispatched)
             .field("in_flight", &self.in_flight.len())
             .field("next_request_id", &self.next_request_id)
             .field("write_queue", &self.write_queue.len())
@@ -275,8 +310,9 @@ where
     S: tina::Shard,
 {
     /// Builds a new client isolate from initialization data. The TCP
-    /// stream must already be established (the caller does the
-    /// `tcp_connect`).
+    /// stream may either be already established (caller did the
+    /// `tcp_connect` themselves) or [`ClientStream::Pending`], in which
+    /// case `Begin` will dispatch the connect.
     ///
     /// # Required configuration invariants (debug-asserted)
     ///
@@ -296,8 +332,14 @@ where
             init.config.write_queue_cap,
             init.config.max_in_flight,
         );
+        let (stream, pending_connect) = match init.stream {
+            ClientStream::Established(id) => (Some(id), None),
+            ClientStream::Pending(addr) => (None, Some(addr)),
+        };
         Self {
-            stream: init.stream,
+            stream,
+            pending_connect,
+            connect_dispatched: false,
             config: init.config,
             inbound: Vec::new(),
             in_flight: HashMap::new(),
@@ -327,8 +369,17 @@ where
         FrameLimits::new(self.config.max_frame_size)
     }
 
+    /// Returns the established stream id, or `None` if `tcp_connect` has
+    /// not completed yet.
+    fn established_stream(&self) -> Option<StreamId> {
+        self.stream
+    }
+
     fn read_effect(&self) -> Effect<Self> {
-        tcp_read(self.stream, self.config.read_chunk).reply(ClientMsg::Read)
+        let stream = self
+            .established_stream()
+            .expect("read_effect called before stream established");
+        tcp_read(stream, self.config.read_chunk).reply(ClientMsg::Read)
     }
 
     fn write_effect(bytes: Vec<u8>, stream: StreamId) -> Effect<Self> {
@@ -356,9 +407,12 @@ where
         if self.write_in_flight.is_some() {
             return None;
         }
+        // Stream not yet established (Pending init mode, before Connected).
+        // Leave the bytes queued; on_connected starts the write.
+        let stream = self.established_stream()?;
         let bytes = self.write_queue.pop_front()?;
         self.write_in_flight = Some(bytes.clone());
-        Some(Self::write_effect(bytes, self.stream))
+        Some(Self::write_effect(bytes, stream))
     }
 
     /// Notifies an in-flight entry with `result`.
@@ -418,8 +472,18 @@ where
         self.reads_done = true;
         self.write_queue.clear();
         self.write_in_flight = None;
-        effects.push(tcp_close_stream(self.stream).reply(ClientMsg::StreamClosed));
-        Effect::Batch(effects)
+        // If the stream was never established (connect failed), there is
+        // no resource to close at the runtime; finalize synchronously.
+        match self.established_stream() {
+            Some(stream) => {
+                effects.push(tcp_close_stream(stream).reply(ClientMsg::StreamClosed));
+                Effect::Batch(effects)
+            }
+            None => {
+                effects.push(stop());
+                Effect::Batch(effects)
+            }
+        }
     }
 
     fn finalize_close(&mut self) -> Effect<Self> {
@@ -430,11 +494,43 @@ where
     }
 
     fn on_begin(&mut self) -> Effect<Self> {
-        if self.is_closing() || self.read_started {
+        if self.is_closing() || self.read_started || self.connect_dispatched {
             return noop();
         }
-        self.read_started = true;
-        Effect::Batch(vec![self.read_effect(), self.idle_arm_effect()])
+        if self.established_stream().is_some() {
+            self.read_started = true;
+            return Effect::Batch(vec![self.read_effect(), self.idle_arm_effect()]);
+        }
+        let Some(addr) = self.pending_connect else {
+            // No stream and no pending connect — misconfiguration.
+            return self.begin_close(ClientResult::IoError(CallError::InvalidResource));
+        };
+        self.connect_dispatched = true;
+        tcp_connect(addr).reply(|res| match res {
+            Ok((stream, _local, _peer)) => ClientMsg::Connected(Ok(stream)),
+            Err(err) => ClientMsg::Connected(Err(err)),
+        })
+    }
+
+    fn on_connected(&mut self, result: Result<StreamId, CallError>) -> Effect<Self> {
+        if self.is_closing() {
+            return noop();
+        }
+        match result {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.read_started = true;
+                let mut effects = vec![self.read_effect(), self.idle_arm_effect()];
+                // If requests came in before Connected, their bytes are
+                // already queued; kick the write loop now that the stream
+                // exists.
+                if let Some(eff) = self.maybe_start_write() {
+                    effects.push(eff);
+                }
+                Effect::Batch(effects)
+            }
+            Err(err) => self.begin_close(ClientResult::IoError(err)),
+        }
     }
 
     fn on_request(&mut self, req: ClientRequest) -> Effect<Self> {
@@ -638,6 +734,7 @@ where
     fn handle(&mut self, msg: ClientMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
         match msg {
             ClientMsg::Begin => self.on_begin(),
+            ClientMsg::Connected(result) => self.on_connected(result),
             ClientMsg::Request(req) => self.on_request(req),
             ClientMsg::Read(result) => self.on_read(result),
             ClientMsg::Wrote(result) => self.on_wrote(result),
@@ -680,7 +777,7 @@ mod tests {
 
     fn make_client(config: ClientConfig) -> Client<TestShard> {
         Client::new(ClientInit {
-            stream: StreamId::new(0),
+            stream: ClientStream::Established(StreamId::new(0)),
             config,
             _shard: std::marker::PhantomData,
         })
@@ -750,6 +847,53 @@ mod tests {
         let _ = dispatch(&mut client, ClientMsg::Begin);
         let effect = dispatch(&mut client, ClientMsg::Begin);
         assert!(matches!(effect, Effect::Noop));
+    }
+
+    #[test]
+    fn begin_in_pending_mode_is_idempotent_before_connected() {
+        // Regression: a second `Begin` while `tcp_connect` is in flight
+        // must NOT trip the "no stream and no pending connect" branch
+        // and tear the connection down.
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let mut client = Client::<TestShard>::new(ClientInit {
+            stream: ClientStream::Pending(addr),
+            config: small_config(),
+            _shard: std::marker::PhantomData,
+        });
+        // First Begin: dispatches tcp_connect.
+        let first = dispatch(&mut client, ClientMsg::Begin);
+        assert!(matches!(first, Effect::Call(_)), "first Begin must dispatch the connect");
+        assert!(client.connect_dispatched);
+        assert!(client.closing.is_none());
+        // Second Begin while still pending: noop, MUST NOT close.
+        let second = dispatch(&mut client, ClientMsg::Begin);
+        assert!(matches!(second, Effect::Noop), "second Begin must be a noop");
+        assert!(client.closing.is_none(), "second Begin must not close the connection");
+    }
+
+    #[test]
+    fn deadline_fire_emits_only_send_no_wire_write() {
+        // Wire-error invariant: a local timeout produces a user
+        // notification (Effect::Send) but never a wire frame
+        // (Effect::Call(tcp_write...)).
+        let mut client = make_client(small_config());
+        let _ = dispatch(&mut client, ClientMsg::Begin);
+        let _ = dispatch(&mut client, ClientMsg::Request(make_request(99, 50)));
+        let effect = dispatch(&mut client, ClientMsg::DeadlineFired { request_id: 1 });
+        // Walk the effect tree; expect a single Send and zero Call leaves.
+        let mut sends = 0usize;
+        let mut calls = 0usize;
+        fn count<I: tina::Isolate>(eff: &Effect<I>, sends: &mut usize, calls: &mut usize) {
+            match eff {
+                Effect::Send(_) => *sends += 1,
+                Effect::Call(_) => *calls += 1,
+                Effect::Batch(items) => items.iter().for_each(|e| count(e, sends, calls)),
+                _ => {}
+            }
+        }
+        count(&effect, &mut sends, &mut calls);
+        assert_eq!(sends, 1, "deadline must produce one Send notification");
+        assert_eq!(calls, 0, "deadline must NOT produce any wire-write Call");
     }
 
     #[test]

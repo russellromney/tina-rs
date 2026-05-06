@@ -11,4 +11,5 @@ tina-runtime = { path = "../tina-runtime" }
 tina-supervisor = { path = "../tina-supervisor" }
 
 [dev-dependencies]
+tina-rpc = { path = "../tina-rpc" }
 tokio = { version = "1.48.0", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time", "test-util"] }
