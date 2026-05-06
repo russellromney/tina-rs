@@ -2,8 +2,8 @@
 //! and service isolates.
 //!
 //! Wraps the `http` crate's `Method`, `StatusCode`, `HeaderMap`, and
-//! `Version` types. Body is a bounded `Vec<u8>`; streaming bodies live in
-//! 048c.
+//! `Version` types. Body is a bounded `Vec<u8>`; streaming bodies are out
+//! of scope here.
 
 use http::{HeaderMap, Method, StatusCode, Version};
 
@@ -82,6 +82,84 @@ impl HttpResponse {
         response.body = body;
         response
     }
+
+    /// Builds a `text/plain` response with the given status and body.
+    pub fn with_text(status: StatusCode, body: impl Into<String>) -> Self {
+        let mut response = Self::text(body);
+        response.status = status;
+        response
+    }
+
+    /// Convenience: `400 Bad Request`.
+    pub fn bad_request() -> Self {
+        Self::with_status(StatusCode::BAD_REQUEST)
+    }
+
+    /// Convenience: `404 Not Found`.
+    pub fn not_found() -> Self {
+        Self::with_status(StatusCode::NOT_FOUND)
+    }
+
+    /// Convenience: `500 Internal Server Error`.
+    pub fn internal_error() -> Self {
+        Self::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
+    /// Convenience: `503 Service Unavailable`. Same shape the connection
+    /// isolate emits on a `CallOutcome::Full` when the policy chooses to
+    /// reply rather than close.
+    pub fn service_unavailable() -> Self {
+        Self::with_status(StatusCode::SERVICE_UNAVAILABLE)
+    }
+
+    /// Convenience: `502 Bad Gateway`. Useful for proxy services that
+    /// receive a structured error from an upstream.
+    pub fn bad_gateway() -> Self {
+        Self::with_status(StatusCode::BAD_GATEWAY)
+    }
+
+    /// Convenience: `504 Gateway Timeout`. Mirrors the connection
+    /// isolate's mapping for a service-call timeout.
+    pub fn gateway_timeout() -> Self {
+        Self::with_status(StatusCode::GATEWAY_TIMEOUT)
+    }
+}
+
+impl HttpRequest {
+    /// Borrows the body as a `&str`. Returns the underlying UTF-8 error if
+    /// the bytes are not valid UTF-8.
+    pub fn body_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.body)
+    }
+
+    /// Returns `true` if the request carries any body bytes.
+    pub fn has_body(&self) -> bool {
+        !self.body.is_empty()
+    }
+}
+
+/// Reasons response parsing rejected an inbound response.
+///
+/// Mirror of the request-side errors. Each maps to an
+/// [`crate::HttpClientError::Parse`] variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseParseError {
+    /// Malformed status line.
+    BadStatusLine,
+    /// Header section exceeded the configured byte limit.
+    HeadersTooLarge,
+    /// `Transfer-Encoding` other than `identity`. Only `Content-Length`
+    /// framing is supported.
+    UnsupportedTransferEncoding,
+    /// `Content-Length` failed to parse or had conflicting values.
+    InvalidContentLength,
+    /// `Content-Length` missing on a response that needs framing.
+    MissingContentLength,
+    /// Declared body length exceeded the configured byte limit.
+    BodyTooLarge,
+    /// The HTTP version on the wire was neither `HTTP/1.0` nor
+    /// `HTTP/1.1`.
+    UnsupportedHttpVersion,
 }
 
 /// Reasons request parsing rejected an inbound request before it reached
@@ -173,4 +251,160 @@ impl Default for HttpLimits {
             header_read_timeout: std::time::Duration::from_secs(10),
         }
     }
+}
+
+/// Server-side knobs: limits, timeout, and mailbox capacities.
+///
+/// `Copy` so callers can read it once to build the listener and again
+/// to pass `listener_mailbox_capacity` into `register_with_capacity`.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpServerConfig {
+    /// Per-request byte and slow-loris limits.
+    pub limits: HttpLimits,
+    /// Per-call timeout into the service isolate. Exceeding it maps to
+    /// `504 Gateway Timeout`.
+    pub service_call_timeout: std::time::Duration,
+    /// Mailbox size for each [`crate::HttpConnection`] child.
+    pub connection_mailbox_capacity: usize,
+    /// Mailbox size for the listener isolate itself.
+    pub listener_mailbox_capacity: usize,
+}
+
+impl HttpServerConfig {
+    /// Roomy preset: generous limits, 10s service timeout.
+    pub fn dev() -> Self {
+        Self {
+            limits: HttpLimits::default(),
+            service_call_timeout: std::time::Duration::from_secs(10),
+            connection_mailbox_capacity: 16,
+            listener_mailbox_capacity: 8,
+        }
+    }
+
+    /// Tight preset for pressure tests: small limits, 1s service
+    /// timeout.
+    pub fn pressure() -> Self {
+        Self {
+            limits: HttpLimits {
+                max_header_bytes: 4 * 1024,
+                max_body_bytes: 64 * 1024,
+                max_headers: 32,
+                header_read_timeout: std::time::Duration::from_millis(500),
+            },
+            service_call_timeout: std::time::Duration::from_secs(1),
+            connection_mailbox_capacity: 8,
+            listener_mailbox_capacity: 4,
+        }
+    }
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self::dev()
+    }
+}
+
+/// Client-side knobs: limits and request deadline.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpClientConfig {
+    /// Byte/time limits for parsing the response head.
+    pub limits: HttpLimits,
+    /// Wall-clock deadline for the whole request — connect, write,
+    /// response head, response body, close. Exceeding it surfaces as
+    /// [`HttpClientError::Timeout`].
+    pub request_timeout: std::time::Duration,
+}
+
+impl HttpClientConfig {
+    /// Roomy preset for development and example code: generous limits,
+    /// 10s request deadline, mailbox capacity 16.
+    pub fn dev() -> Self {
+        Self {
+            limits: HttpLimits::default(),
+            request_timeout: std::time::Duration::from_secs(10),
+        }
+    }
+
+    /// Tight preset for pressure tests: 1s request deadline.
+    pub fn pressure() -> Self {
+        Self {
+            limits: HttpLimits {
+                max_header_bytes: 4 * 1024,
+                max_body_bytes: 64 * 1024,
+                max_headers: 32,
+                header_read_timeout: std::time::Duration::from_millis(500),
+            },
+            request_timeout: std::time::Duration::from_secs(1),
+        }
+    }
+}
+
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self::dev()
+    }
+}
+
+/// Pool-side knobs.
+///
+/// `capacity` must be 1. Multi-slot pools are a separate slice.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    /// Maximum number of in-flight HTTP calls. Must be `1`.
+    pub capacity: usize,
+    /// Per-call timeout the pool passes to the underlying
+    /// [`crate::HttpClient`].
+    pub client_call_timeout: std::time::Duration,
+    /// Mailbox size for the pool isolate.
+    pub mailbox_capacity: usize,
+}
+
+impl PoolConfig {
+    /// Roomy preset: 10s client call timeout.
+    pub fn dev() -> Self {
+        Self {
+            capacity: 1,
+            client_call_timeout: std::time::Duration::from_secs(10),
+            mailbox_capacity: 16,
+        }
+    }
+
+    /// Tight preset for pressure tests: 1s client call timeout.
+    pub fn pressure() -> Self {
+        Self {
+            capacity: 1,
+            client_call_timeout: std::time::Duration::from_secs(1),
+            mailbox_capacity: 8,
+        }
+    }
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self::dev()
+    }
+}
+
+/// Reasons an outbound HTTP call failed before producing a parsed
+/// [`HttpResponse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpClientError {
+    /// `tcp_connect` failed before the request could be written.
+    Connect,
+    /// `tcp_write` failed mid-request.
+    Write,
+    /// `tcp_read` failed mid-response.
+    Read,
+    /// The response parser rejected the bytes from the server.
+    Parse(ResponseParseError),
+    /// Peer closed before the response head/body completed.
+    Closed,
+    /// `request_timeout` elapsed before delivery.
+    Timeout,
+    /// The client isolate already had a call in flight when this one
+    /// arrived. Use a pool for explicit admission.
+    Busy,
+    /// The pool's slot was busy when this Submit arrived. Direct (non-
+    /// pooled) calls never produce this variant.
+    PoolFull,
 }

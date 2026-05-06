@@ -15,7 +15,7 @@ use tina_runtime::{
 };
 
 use crate::connection::{HttpConnection, HttpConnectionMsg};
-use crate::types::{HttpLimits, HttpRequest, HttpResponse};
+use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
 
 /// Inbound message variants for [`HttpListener`].
 #[derive(Debug, Clone)]
@@ -40,11 +40,13 @@ pub enum HttpListenerMsg {
 
 /// Listener isolate.
 ///
-/// Generic over the user's `Shard` so a single implementation works for
-/// any shard placement chosen by the surrounding service.
-pub struct HttpListener<S: Shard + 'static> {
+/// Generic over the user's `Shard` and the service's message type
+/// `M`. `M` defaults to `HttpRequest` for sync-reply services;
+/// multi-turn services declare an enum that wraps `HttpRequest` and
+/// supply `From<HttpRequest>`.
+pub struct HttpListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'static = HttpRequest> {
     bind_addr: SocketAddr,
-    service: Address<HttpRequest, HttpResponse>,
+    service: Address<M, HttpResponse>,
     limits: HttpLimits,
     service_call_timeout: Duration,
     connection_mailbox_capacity: usize,
@@ -53,22 +55,20 @@ pub struct HttpListener<S: Shard + 'static> {
     _shard: PhantomData<S>,
 }
 
-impl<S: Shard + 'static> HttpListener<S> {
+impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, M> {
     /// Builds a listener that will bind to `bind_addr`, dispatch every
     /// parsed request to `service`, and spawn one connection isolate
     /// per accept.
     ///
     /// `connection_mailbox_capacity` is the bounded mailbox size for
-    /// each [`HttpConnection`] child. A small number (16-32) is enough
-    /// for first form: one Begin, one Read, one ServiceReturned, one
-    /// Wrote, one Closed, plus headroom.
+    /// each [`HttpConnection`] child. A small number (16-32) is plenty.
     ///
     /// `service_call_timeout` is the timeout passed to every
     /// [`tina_runtime::call`] into the service isolate. It is the
     /// upstream-side analogue of an HTTP request deadline.
     pub fn new(
         bind_addr: SocketAddr,
-        service: Address<HttpRequest, HttpResponse>,
+        service: Address<M, HttpResponse>,
         limits: HttpLimits,
         service_call_timeout: Duration,
         connection_mailbox_capacity: usize,
@@ -84,16 +84,35 @@ impl<S: Shard + 'static> HttpListener<S> {
             _shard: PhantomData,
         }
     }
+
+    /// Convenience constructor that absorbs an [`HttpServerConfig`].
+    ///
+    /// `HttpServerConfig` is `Copy`, so the caller can read
+    /// `listener_mailbox_capacity` from the same value when calling
+    /// `register_with_capacity`.
+    pub fn with_config(
+        bind_addr: SocketAddr,
+        service: Address<M, HttpResponse>,
+        config: HttpServerConfig,
+    ) -> Self {
+        Self::new(
+            bind_addr,
+            service,
+            config.limits,
+            config.service_call_timeout,
+            config.connection_mailbox_capacity,
+        )
+    }
 }
 
 // Hand-rolled `Isolate` impl: the macro requires a concrete shard type;
 // we want this generic so callers can pick their own shard.
-impl<S: Shard + 'static> Isolate for HttpListener<S> {
+impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for HttpListener<S, M> {
     tina::isolate_types! {
         message: HttpListenerMsg,
         reply: (),
         send: tina::Outbound<std::convert::Infallible>,
-        spawn: ChildDefinition<HttpConnection<S>>,
+        spawn: ChildDefinition<HttpConnection<S, M>>,
         call: tina_runtime::RuntimeCall<HttpListenerMsg>,
         shard: S,
     }
@@ -166,10 +185,15 @@ impl<S: Shard + 'static> Isolate for HttpListener<S> {
     }
 }
 
-impl<S: Shard + 'static> HttpListener<S> {
-    fn build_connection_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S>> {
+impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, M> {
+    fn build_connection_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S, M>> {
         ChildDefinition::new(
-            HttpConnection::<S>::new(stream, self.service, self.limits, self.service_call_timeout),
+            HttpConnection::<S, M>::new(
+                stream,
+                self.service,
+                self.limits,
+                self.service_call_timeout,
+            ),
             self.connection_mailbox_capacity,
         )
         .with_initial_message(HttpConnectionMsg::Begin)

@@ -23,7 +23,7 @@ fn assert_connection_close(response: &[u8]) {
 fn native_http_server_serves_get_and_post() {
     let harness = TestHarness::start();
 
-    // Three requests in sequence (single-request-per-connection in 048a).
+    // Three requests in sequence (one request per connection).
     let response_a = scripted_request(harness.addr, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     let response_b = scripted_request(
         harness.addr,

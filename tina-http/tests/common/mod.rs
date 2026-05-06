@@ -167,6 +167,15 @@ impl TestHarness {
             .map(|rt| rt.complete_trace().unwrap_or_default())
             .unwrap_or_default()
     }
+
+    /// Borrows the underlying runtime so tests can register their own
+    /// auxiliary isolates (e.g. an outbound `HttpClient` driver) on the
+    /// same runtime that's hosting the server.
+    pub fn runtime_handle(&self) -> &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> {
+        self.runtime
+            .as_ref()
+            .expect("runtime present until shutdown")
+    }
 }
 
 /// Counts runtime events whose kind is `CallCompleted` for a TCP-read

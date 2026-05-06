@@ -1,20 +1,17 @@
 //! Pressure-side integration tests for the native HTTP/1.1 server.
 //!
-//! Covers phase 048 rocks:
-//!
-//! - rock 4 (streaming bodies, partial coverage in 048a): a body larger
-//!   than one TCP read travels end-to-end through the server's
-//!   accumulating read buffer up to `Content-Length`. Asserted via a
-//!   trace count of `tcp_read` completions.
-//! - rock 5 (load and overload): service call failure maps are pinned at
-//!   the unit layer; this file adds deterministic wire-level coverage for
-//!   timeout (`504 Gateway Timeout`). Wire-level `Full` remains 048b work.
-//!   The slow-loris guard closes partial request heads after
-//!   `HttpLimits::header_read_timeout`.
-//! - rock 6 (graceful shutdown): sending `HttpListenerMsg::Stop` stops
-//!   accept and lets the runtime shut down cleanly. A `Stop` race —
-//!   an `Accepted(Ok)` queued by the kernel before our close took
-//!   effect — must not panic the listener isolate.
+//! - Streaming-ish: a body larger than one TCP read travels end-to-end
+//!   through the server's accumulating read buffer up to
+//!   `Content-Length`. Asserted via a trace count of `tcp_read`
+//!   completions.
+//! - Overload: service call failure maps are pinned at the unit layer;
+//!   this file adds deterministic wire-level coverage for timeout
+//!   (`504 Gateway Timeout`). The slow-loris guard closes partial
+//!   request heads after `HttpLimits::header_read_timeout`.
+//! - Graceful shutdown: sending `HttpListenerMsg::Stop` stops accept
+//!   and lets the runtime shut down cleanly. A `Stop` race — an
+//!   `Accepted(Ok)` queued by the kernel before our close took effect
+//!   — must not panic the listener isolate.
 
 mod common;
 
@@ -124,11 +121,11 @@ fn slowloris_partial_header_closes_within_header_read_timeout() {
     // (the client sees FIN or RST).
     //
     // Note: the current runtime rejects `tcp_close_stream` while a
-    // `tcp_read` is pending (`CallError::ResourceBusy`). The 048a
-    // slow-loris path therefore stops the isolate without writing a
-    // 408 first; the close happens via runtime cleanup. A future
-    // runtime affordance (`tcp_cancel_read` or implicit cancel-on-close)
-    // would let us send 408 first; tracked as 047/runtime ergonomics.
+    // `tcp_read` is pending (`CallError::ResourceBusy`). The slow-loris
+    // path therefore stops the isolate without writing a 408 first; the
+    // close happens via runtime cleanup. A future runtime affordance
+    // (`tcp_cancel_read` or implicit cancel-on-close) would let us send
+    // 408 first.
     use std::io::Write;
     use std::net::TcpStream;
     use tina_http::HttpLimits;
@@ -245,14 +242,11 @@ fn service_call_timeout_returns_504_on_the_wire() {
     // the connection writes `504 Gateway Timeout` to the wire before
     // closing.
     //
-    // This is a deterministic alternative to the harder-to-construct
-    // "service mailbox full -> 503" path. The Full path requires
-    // concurrent timing the single-shard runtime does not naturally
-    // produce, and is tested at the unit-test level in
-    // `connection::tests::full_call_error_maps_to_503`. Future work
-    // (delayed-reply primitive, multi-shard service placement, or the
-    // 048b connection pool) will let us add a deterministic wire-level
-    // 503 test.
+    // Deterministic alternative to the harder-to-construct "service
+    // mailbox full -> 503" path. The Full path requires concurrent
+    // timing the single-shard runtime does not naturally produce, and
+    // is tested at the unit-test level in
+    // `connection::tests::full_call_error_maps_to_503`.
     use std::convert::Infallible;
 
     use http::StatusCode;

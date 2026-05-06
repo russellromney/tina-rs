@@ -1,17 +1,14 @@
-//! Phase 048 rock 8: deterministic-replay coverage for the HTTP state
-//! machine.
+//! Deterministic-replay coverage for the HTTP parser.
 //!
-//! 048a's first form ships parser-level DST: the same wire bytes
-//! produce a byte-identical [`ParseProgress`] outcome regardless of
-//! how many times the parser is invoked, and a fingerprint hash over
-//! a generated request corpus is stable across runs.
+//! Same wire bytes produce a byte-identical [`ParseProgress`] outcome
+//! regardless of how many times the parser is invoked, and a
+//! fingerprint hash over a generated request corpus is stable across
+//! runs.
 //!
 //! Listener- and connection-isolate level DST under
-//! `tina_sim::Simulator` with `ScriptedTcpConfig` is recorded as
-//! 048a-followup work — the scripted-TCP setup is substantial enough
-//! that it deserves its own slice. The parser is the foundation that
-//! later DST work composes onto, so this test is the minimum
-//! correctness claim that downstream DST builds on.
+//! `tina_sim::Simulator` with `ScriptedTcpConfig` is its own slice —
+//! the scripted-TCP setup is substantial enough that it deserves
+//! one. The parser is the foundation downstream DST composes onto.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

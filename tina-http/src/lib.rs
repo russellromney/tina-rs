@@ -1,47 +1,49 @@
-//! Native HTTP/1.1 service stack for tina-rs (first form, server side).
+//! Native HTTP/1.1 service stack for tina-rs.
 //!
-//! Phase 048a: Tina speaks HTTP without a Tokio edge.
+//! Tina speaks HTTP without a Tokio edge. HTTP/1.1 only. `Content-Length`
+//! request bodies only — no chunked request bodies, no pipelining, no
+//! `Expect: 100-continue`.
 //!
-//! See `.intent/phases/048-native-http-service-stack/plan.md` for scope.
+//! User registers an [`HttpListener`] with a service-isolate address.
+//! The listener spawns one [`HttpConnection`] per accepted socket.
+//! Services receive [`HttpRequest`] and reply [`HttpResponse`].
 //!
-//! # First form contract
+//! Backpressure surfaces as typed `CallOutcome::{Replied, Full, Closed,
+//! Timeout}`, mapped to HTTP status codes by an explicit policy.
 //!
-//! - HTTP/1.1 only. No HTTP/2, no gRPC, no Tower middleware, no web framework.
-//! - `Content-Length` request bodies only. Chunked request bodies, pipelining,
-//!   and `Expect: 100-continue` are explicit non-goals in the first form.
-//! - User registers an [`HttpListener`] isolate that knows the bind address
-//!   and a service-isolate address. The listener spawns one
-//!   [`HttpConnection`] isolate per accepted socket. Service isolates handle
-//!   typed [`HttpRequest`] messages and reply with [`HttpResponse`].
-//! - Backpressure surfaces as runtime-call typed outcomes:
-//!   `CallOutcome::{Replied, Full, Closed, Timeout}` map to HTTP status codes
-//!   by an explicit policy.
-//! - Tina owns the listener, every connection isolate, every read buffer,
-//!   the parser invocation, every write, and the close path. No library
-//!   that owns the socket, blocks on `Read`/`Write`, spawns threads, owns
-//!   a pool, or hides buffers.
+//! Tina owns the listener, every connection isolate, every read buffer,
+//! the parser invocation, every write, and the close path. No library
+//! owns the socket, blocks on `Read`/`Write`, spawns threads, or hides
+//! buffers.
 //!
-//! # First form non-goals
-//!
-//! - No TLS termination at this layer.
-//! - No connection pool primitive in 048a (lives in 048b alongside the
-//!   client).
-//! - No streaming bodies in 048a (lives in 048c).
-//! - No routing helper in 048a (the service isolate handles its own
-//!   `match (method, path)`).
-//! - No production performance claim.
+//! Out of scope here: TLS, streaming bodies, a routing helper, and any
+//! production-performance claim.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod client;
 pub mod connection;
 pub mod listener;
 pub mod parse;
+pub mod pool;
+pub mod request_builder;
+pub mod router;
 pub mod types;
 
+pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use listener::{HttpListener, HttpListenerMsg};
-pub use parse::{ParseProgress, encode_response, parse_request_head};
-pub use types::{HttpLimits, HttpRequest, HttpResponse, RequestParseError};
+pub use parse::{
+    HttpResponseHead, ParseProgress, ResponseParseProgress, encode_request, encode_response,
+    parse_request_head, parse_response_head,
+};
+pub use pool::{HttpConnectionPool, HttpPoolMsg};
+pub use request_builder::RequestBuilder;
+pub use router::{RouteHandler, Router};
+pub use types::{
+    HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpResponse, HttpServerConfig,
+    PoolConfig, RequestParseError, ResponseParseError,
+};
 
 // Re-exports from the `http` crate for convenient `tina_http::Method`,
 // `tina_http::StatusCode`, etc., without forcing users to add `http` as a

@@ -565,6 +565,20 @@ would also unlock it cleanly: a delayed-reply primitive on the service
 side, or multi-shard service placement so the dispatcher and the
 service run on different threads with their own scheduling rates.
 
+### Outbound HTTP: visible call boundary vs. hidden await
+*Surfaced by:* `eiffel_outbound_http`.
+
+The Tokio side's outbound is `client.get(url).send().await?.text().await?`.
+One line. Cancellation, backpressure, the state machine, and the
+connection lifecycle all live behind `await`.
+
+The Tina side is `call(client, HttpClientMsg::call(target, request),
+timeout).reply(DriverMsg::Returned)` plus the matching arm. The reply
+arrives as a typed `CallOutcome::{Replied, Full, Closed, Timeout}`,
+so connection-busy and timeout are not silent — they are arms in the
+caller's `match`. Verbose vs. async/await, and that is the trade. The
+shape is the same one Tina services already use everywhere else.
+
 ## Suggested follow-ups, ranked by frequency of trip
 
 Counted by how many comparisons surfaced the issue. Several of these

@@ -62,12 +62,13 @@ pub enum HttpConnectionMsg {
 
 /// Per-connection isolate.
 ///
-/// Generic over the user's `Shard` type so a single `HttpConnection`
-/// implementation works for any shard placement chosen by the
-/// surrounding service.
-pub struct HttpConnection<S: Shard> {
+/// Generic over the user's `Shard` type and the service's message
+/// type `M`. `M` defaults to `HttpRequest` for sync-reply services;
+/// multi-turn services declare an enum that wraps `HttpRequest` and
+/// supply `From<HttpRequest>`.
+pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = HttpRequest> {
     stream: StreamId,
-    service: Address<HttpRequest, HttpResponse>,
+    service: Address<M, HttpResponse>,
     limits: HttpLimits,
     service_call_timeout: Duration,
 
@@ -98,11 +99,11 @@ pub struct HttpConnection<S: Shard> {
     _shard: std::marker::PhantomData<S>,
 }
 
-impl<S: Shard> HttpConnection<S> {
+impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
     /// Builds a new connection isolate state for one accepted TCP stream.
     pub fn new(
         stream: StreamId,
-        service: Address<HttpRequest, HttpResponse>,
+        service: Address<M, HttpResponse>,
         limits: HttpLimits,
         service_call_timeout: Duration,
     ) -> Self {
@@ -125,7 +126,7 @@ impl<S: Shard> HttpConnection<S> {
 // The `#[tina_runtime::isolate]` macro requires a concrete shard type; we
 // write the `Isolate` impl by hand so a single `HttpConnection`
 // implementation works for any user-chosen shard.
-impl<S: Shard + 'static> Isolate for HttpConnection<S> {
+impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for HttpConnection<S, M> {
     tina::isolate_types! {
         message: HttpConnectionMsg,
         reply: (),
@@ -154,7 +155,7 @@ impl<S: Shard + 'static> Isolate for HttpConnection<S> {
     }
 }
 
-impl<S: Shard + 'static> HttpConnection<S> {
+impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
     /// First-effect hook. Issues both the initial `tcp_read` and the
     /// slow-loris deadline `sleep` in one batch so they race the
     /// client's bytes against the configured timeout.
@@ -260,7 +261,7 @@ impl<S: Shard + 'static> HttpConnection<S> {
         self.will_close = true;
 
         let request = head.into_request(body);
-        call(self.service, request, self.service_call_timeout)
+        call(self.service, M::from(request), self.service_call_timeout)
             .reply(HttpConnectionMsg::ServiceReturned)
     }
 
