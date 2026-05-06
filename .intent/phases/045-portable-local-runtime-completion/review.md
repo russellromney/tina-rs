@@ -1,108 +1,114 @@
 # Plan Review: Portable Local Runtime Completion
 
-Verdict: correct phase, not yet execution-tight.
-
-This is the right rock before Baobab. Baobab should not judge a runtime that we
-already know is missing portable-runtime basics. Phase 045 correctly says:
-build the non-`io_uring` local runtime into a boring thing first, then let
-Baobab compare and gate it.
+Verdict: much better. This is now a build phase, not a review phase. Still
+needs a few pins before implementation so it does not sprawl or quietly become
+Baobab.
 
 What is strong:
 
-- The phase is feature/core work, not comparison theater.
-- It keeps `io_uring`, remoting, clustering, durable mailbox, and `flow!` out.
-- It focuses on Tina's real rules: visible overload, traceable failure,
-  replayable races, bounded rails, no hidden queues.
-- The 10 rocks are the right families: lifecycle, resource truth, fairness,
-  capability truth, blocking-lane honesty, report survival, service e2e, DST,
-  cost report, CI.
-- It clearly prepares Baobab instead of pretending to be Baobab.
+- The plan now says "build missing runtime surface" directly.
+- Coverage map is only Rock 1, not the whole phase.
+- Baobab is correctly downstream: 045 builds the portable runtime, 046 judges
+  it.
+- `io_uring`, remoting, clustering, durable mailbox, `flow!`, and performance
+  claims stay out.
+- The concrete build rocks are right: capability table, lifecycle surface,
+  resource inventory, fairness/progress, blocking lanes, report survival,
+  service harness, DST, cost report, CI, Baobab handoff.
 
-Load-bearing fixes before implementation:
+Load-bearing issues:
 
-1. **Rock 1 can become an endless audit.**
-   It names every rail and every lifecycle verb. Good. But implementation needs
-   a bounded output: an executable lifecycle table plus focused fixes for rows
-   that are false. Do not refactor every rail just because names differ.
+1. **"Complete portable runtime" can overclaim.**
+   The goal should mean complete for *local service experiments*, not complete
+   as a universal runtime. Keep that wording everywhere. Anything not needed
+   for local services can remain a named non-claim.
 
-2. **Existing coverage must be counted before adding new tests.**
-   Many rocks already have proof from Victor, Sadie's Ward, Blue Whale,
-   resource-rail DST, `local_system.rs`, `application_surface.rs`, and
-   `betelgeuse_substrate.rs`. Add a first audit step in `review.md`: for each
-   rail, mark `covered | weak | missing` for positive, negative, overload,
-   cancellation/timeout, shutdown, trace, and DST. Then fill only weak/missing
-   cells.
+2. **Rock 1 still lacks a pass/fail rule.**
+   It says fix every missing and load-bearing weak cell "needed for the
+   portable local runtime claim." Good, but implementation needs an explicit
+   rule: a cell can close as `covered`, `fixed`, or `deferred-nonclaim`.
+   `deferred-nonclaim` must update capability truth and Baobab.
 
-3. **Capability table shape is underspecified.**
-   Pin statuses and authority. Recommended statuses:
-   `Supported`, `Partial`, `Unsupported`, `NotClaimed`, `PlatformGated`.
-   The Rust table should assert against `RuntimeCapabilities`, bridge
-   capabilities where relevant, and named non-claims. Markdown is only summary.
+3. **Capability statuses need ownership.**
+   `NotApplicable(reason)` is listed with normal statuses, but it carries a
+   string and may not fit a simple enum. Pin the expected shape before coding:
+   either enum + reason field, or enum variant with `&'static str`. The table
+   should stay easy to assert, not become prose in disguise.
 
-4. **"Every public rail has every proof" may be too literal.**
-   Some rails do not have every lifecycle verb. Example: timers do not have
-   `close`; signals may not have meaningful `late completion`; persistence has
-   commit uncertainty instead of ordinary close. The table must allow
-   `NotApplicable(reason)` so absence is explicit rather than fake.
+4. **Unified Driver Lifecycle could still trigger broad refactors.**
+   "Build common lifecycle helpers/events" is right, but public API changes
+   should be gated. First preference: crate-private helpers and tests. Public
+   events/types only when user-visible behavior needs them.
 
-5. **Fairness Completion needs exact starvation targets.**
-   "Blocking lanes all get turns" can overclaim: a started blocking worker may
-   occupy a lane until it returns. The phase should prove bounded admission,
-   tombstoning, shutdown drain, and shard progress around lanes. It should not
-   imply Tina can preempt OS blocking work.
+5. **Resource inventory needs queued-lane definition.**
+   Current reports already expose table-owned, worker-held, pending driver
+   calls, lane capacities, and remote queues. "Queued lane work" may need new
+   counters. Pin whether 045 must add exact queued-depth counters or whether
+   accepted/rejected/capacity plus pending/worker-held is enough. If exact
+   depth cannot be reported honestly for `sync_channel`, say so.
 
-6. **Resource ownership inventory needs count vocabulary.**
-   Require separate rows for table-owned, worker-held, pending-driver-call,
-   queued-lane, and remote-queue pressure. Otherwise one "resource count"
-   number can hide the exact class of stuck work.
+6. **Fairness/progress needs concrete scenarios.**
+   Add required tests:
+   - local ingress under hot self-sender;
+   - remote inbound under local ingress pressure;
+   - driver completion under hot mailbox pressure;
+   - lane completion under unrelated mailbox pressure;
+   - shutdown signal under in-flight lane work.
+   Without named scenarios, "fairness" is too easy to declare done.
 
-7. **Trace/report survival should define preferred APIs.**
-   The plan names `trace()` and `complete_trace()`, but not the user rule.
-   Pin it: `trace()` returns partial trace with completeness truth; 
-   `complete_trace()` is strict and may fail; terminal report must retain
-   trace/topology/error/resource truth even on failed shutdown.
+7. **Blocking lanes should list all target lanes exactly.**
+   Rock 6 names storage, DNS, TLS, process, persistence. Persistence rides the
+   storage lane today; say whether it is separate in the table or a storage-lane
+   use case. Signals are poll-backed, not blocking. UDP is poll-backed. Good,
+   but the plan should say that explicitly to avoid fake lane work.
 
-8. **Full Local Service E2E is too broad unless split.**
-   One composed happy service should use many rails. Negative paths should be
-   focused per edge. Do not build one giant test where DNS, TLS, process,
-   persistence, shard failure, slow peer, and shutdown all race together.
+8. **Trace/report API hardening needs bridge boundary truth.**
+   Bridge metrics are not the same as `TraceSnapshot`. Pin what bridge must
+   expose: accepted/full/closed/timeout/cancelled/responded-late counts and
+   shutdown retry state. Do not force bridge to pretend it has deterministic
+   replay under Tokio.
 
-9. **DST families need owners.**
-   Name which crate owns each family:
-   `tina-sim` for simulator resource histories and shrinker proofs;
-   `tina-runtime` for live-vs-sim projection or deterministic live e2e;
-   `tina-tokio-bridge` for bridge model DST. This avoids dumping all DST into
-   one crate.
+9. **Portable Service Harness must live somewhere reusable.**
+   Decide location. Recommended: `tina-runtime/tests/portable_service.rs` owns
+   the harness for runtime e2e; `tina-sim` owns DST models; bridge tests use a
+   smaller adapter-facing harness. If the harness is copied across crates,
+   future changes will rot.
 
-10. **Cost report may accidentally become a benchmark policy.**
-   Pin it as a report command/test that prints numbers and exits. No thresholds
-   except "runs." No CI comparison against prior numbers. No Tokio/Glommio
-   rows in this phase unless they are trivial and optional; Baobab owns
-   comparison.
+10. **DST live-vs-sim projection can be expensive and flaky.**
+   Pin live DST as deterministic bounded e2e with saved scripted histories, not
+   random OS timing. True random histories belong to simulator/model DST. Live
+   tests should project stable semantic facts, not wall-clock order.
 
-11. **CI rails should be named exactly.**
-   Existing `.github/workflows/verify.yml` already runs `make verify` on Ubuntu
-   and macOS. Phase 045 should add one portable readiness command, for example
-   `make verify-portable-runtime`, and have CI call it. Keep long DST behind a
-   named env var such as `TINA_DST_LONG`.
+11. **Cost report should not print from normal tests.**
+   Rust tests that print timing numbers are noisy and unstable. Better shape:
+   a small example/bin or `make portable-runtime-cost` command. `make
+   verify-portable-runtime` can smoke-run it with tiny iteration count.
 
-12. **Baobab update should be mandatory at closeout.**
-   If 045 lands new capability truth or non-claims, 046 must be edited in the
-   same closeout commit. Otherwise Baobab will compare stale rocks again.
+12. **CI gate may duplicate `make verify`.**
+   Pin `verify-portable-runtime` as additive: capability table, portable
+   service e2e, selected DST seeds, cost smoke. It should not rerun the whole
+   workspace if CI already runs `make verify`, or CI time will balloon.
 
-Recommended plan edits:
+13. **Baobab handoff must include review cleanup.**
+   At closeout, 045 should update 046's plan and review if the earlier review
+   became stale. Otherwise Baobab will inherit old objections about North Sea
+   or missing portable truth.
 
-- Add Rock 0 or prepend Rock 1 with "coverage matrix first."
-- Add explicit table statuses, including `NotApplicable(reason)`.
-- Add the count vocabulary for resource inventory.
-- Add the `trace()` vs `complete_trace()` user rule.
-- Split e2e into composed happy service plus focused scary-edge tests.
-- Assign DST families to owning crates.
-- Rename Cost/Allocation output to "portable runtime cost report"; no external
-  baselines here.
-- Name the CI command and long-DST gate.
-- Require Baobab plan update in closeout.
+Recommended edits:
 
-After those edits, the plan is ready to execute. Without them, the phase is
-directionally right but too easy to turn into either a giant audit or a
-half-Baobab comparison phase.
+- In Goal/Done Means, use "complete for local service experiments."
+- Add closure statuses for Rock 1: `covered`, `fixed`, `deferred-nonclaim`.
+- Pin capability table shape with reason-bearing status rows.
+- Add public API change pause gate for lifecycle surface.
+- Define queued-lane truth and whether exact depth is required.
+- Add the five named fairness/progress tests.
+- Clarify persistence/storage lane and poll-backed signal/UDP.
+- Pin bridge metrics expected fields.
+- Name `tina-runtime/tests/portable_service.rs` as the main harness home.
+- Keep live DST deterministic/scripted; simulator/model DST owns randomness.
+- Split cost command from normal tests.
+- Keep `verify-portable-runtime` additive, not a full duplicate of
+  `make verify`.
+- Require 046 plan/review refresh at closeout.
+
+After these edits, I would call 045 ready to implement.
