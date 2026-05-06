@@ -382,6 +382,11 @@ where
             init.config.write_queue_cap,
             init.config.max_in_flight,
         );
+        debug_assert!(
+            init.config.read_chunk > 0,
+            "ClientConfig::read_chunk must be > 0 (a zero read returns empty bytes \
+             which the client treats as peer EOF)",
+        );
         let (stream, pending_connect) = match init.stream {
             ClientStream::Established(id) => (Some(id), None),
             ClientStream::Pending(addr) => (None, Some(addr)),
@@ -429,7 +434,10 @@ where
         let stream = self
             .established_stream()
             .expect("read_effect called before stream established");
-        tcp_read(stream, self.config.read_chunk).reply(ClientMsg::Read)
+        // Clamp to >= 1; see Connection::read_effect for rationale (a
+        // zero-length read is interpreted as peer EOF).
+        let max_len = self.config.read_chunk.max(1);
+        tcp_read(stream, max_len).reply(ClientMsg::Read)
     }
 
     fn write_effect(bytes: Vec<u8>, stream: StreamId) -> Effect<Self> {

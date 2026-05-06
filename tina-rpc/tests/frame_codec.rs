@@ -374,6 +374,36 @@ fn body_truncated_rejected() {
 }
 
 #[test]
+fn decode_rejects_trailing_bytes_after_frame() {
+    // A buffer holding two concatenated frames must not be silently
+    // truncated to the first one. Streaming decoders use
+    // parse_length_prefix + decode_body; the convenience `decode` is
+    // strict.
+    let frame = Frame::request(1, "svc", "m", b"hi".to_vec());
+    let mut bytes = encode(&frame, &limits()).unwrap();
+    // Append a second frame's bytes.
+    bytes.extend(encode(&frame, &limits()).unwrap());
+    let err = decode(&bytes, &limits()).unwrap_err();
+    match err {
+        DecodeError::TrailingBytes { extra } => {
+            assert!(extra > 0, "extra byte count must be non-zero");
+        }
+        other => panic!("expected TrailingBytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_rejects_one_extra_byte() {
+    let frame = Frame::reply(7, "svc", "m", b"out".to_vec());
+    let mut bytes = encode(&frame, &limits()).unwrap();
+    bytes.push(0u8);
+    assert!(matches!(
+        decode(&bytes, &limits()),
+        Err(DecodeError::TrailingBytes { extra: 1 })
+    ));
+}
+
+#[test]
 fn body_truncated_with_zero_body_bytes() {
     // Prefix says 20 bytes but we provide only the prefix.
     let prefix = 20u32.to_be_bytes();

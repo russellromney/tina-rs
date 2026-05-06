@@ -345,6 +345,15 @@ pub enum DecodeError {
     UnexpectedErrorCode,
     /// Error frame had error code 0.
     MissingErrorCode,
+    /// `decode` was given a buffer longer than the declared frame.
+    /// Streaming decoders should drive [`parse_length_prefix`] and
+    /// [`decode_body`] directly; the convenience [`decode`] entry
+    /// point rejects trailing bytes so a concatenated second frame
+    /// or accidental garbage cannot be silently dropped.
+    TrailingBytes {
+        /// Number of unread bytes after the declared frame.
+        extra: usize,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -376,6 +385,11 @@ impl fmt::Display for DecodeError {
             Self::MethodLengthOverrun => write!(f, "method name length overruns body"),
             Self::ServiceNotUtf8 => write!(f, "service name is not valid UTF-8"),
             Self::MethodNotUtf8 => write!(f, "method name is not valid UTF-8"),
+            Self::TrailingBytes { extra } => write!(
+                f,
+                "decode received {extra} bytes after the declared frame; \
+                 use parse_length_prefix + decode_body for streaming input"
+            ),
             Self::UnexpectedErrorCode => {
                 write!(f, "request or reply frame had a non-zero error code")
             }
@@ -517,11 +531,13 @@ pub fn decode_body(body: &[u8]) -> Result<Frame, DecodeError> {
     })
 }
 
-/// Decodes a complete frame (length prefix plus body) from `bytes`.
+/// Decodes one complete frame (length prefix plus body) from `bytes`.
 ///
-/// Convenience for callers that already hold the full frame in memory. The
-/// length prefix is validated against `limits` before any body parsing
-/// happens.
+/// Convenience for callers that already hold exactly one frame in memory.
+/// The input must contain exactly the declared frame and no trailing
+/// bytes; concatenated frames or trailing garbage return
+/// [`DecodeError::TrailingBytes`]. Streaming decoders should drive
+/// [`parse_length_prefix`] and [`decode_body`] directly.
 pub fn decode(bytes: &[u8], limits: &FrameLimits) -> Result<Frame, DecodeError> {
     if bytes.len() < LENGTH_PREFIX_SIZE {
         return Err(DecodeError::LengthPrefixTruncated);
@@ -544,6 +560,12 @@ pub fn decode(bytes: &[u8], limits: &FrameLimits) -> Result<Frame, DecodeError> 
         return Err(DecodeError::BodyTruncated {
             expected: body_len,
             got: bytes.len() - LENGTH_PREFIX_SIZE,
+        });
+    }
+
+    if bytes.len() > body_end {
+        return Err(DecodeError::TrailingBytes {
+            extra: bytes.len() - body_end,
         });
     }
 

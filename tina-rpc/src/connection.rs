@@ -399,7 +399,19 @@ where
     S: tina::Shard,
 {
     /// Builds a new connection isolate from initialization data.
+    ///
+    /// Panics in debug builds if `config.read_chunk == 0`; a zero
+    /// `read_chunk` would cause every `tcp_read` to return `Ok(empty)`
+    /// (the runtime's "no bytes requested" path), which the connection
+    /// interprets as peer half-close — a healthy stream would tear
+    /// itself down. In release builds the read path also clamps to
+    /// `read_chunk.max(1)` to keep this from being a silent EOF.
     pub fn new(init: ConnectionInit<S>) -> Self {
+        debug_assert!(
+            init.config.read_chunk > 0,
+            "ConnectionConfig::read_chunk must be > 0 (a zero read returns empty bytes \
+             which the connection treats as peer EOF)",
+        );
         Self {
             stream: init.stream,
             router: init.router,
@@ -433,7 +445,12 @@ where
     }
 
     fn read_effect(&self) -> Effect<Self> {
-        tcp_read(self.stream, self.config.read_chunk).reply(ConnectionMsg::Read)
+        // Clamp to >= 1: a zero-length read returns Ok(empty) which the
+        // connection's EOF path interprets as peer half-close. The
+        // debug_assert in `Client::new`/`Connection::new` catches this
+        // in dev; the clamp is the release-build guard.
+        let max_len = self.config.read_chunk.max(1);
+        tcp_read(self.stream, max_len).reply(ConnectionMsg::Read)
     }
 
     fn write_effect(bytes: Vec<u8>, stream: StreamId) -> Effect<Self> {

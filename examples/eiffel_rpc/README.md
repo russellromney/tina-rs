@@ -18,11 +18,19 @@ observably different behavior.
 
 ## Run
 
+This example is workspace-excluded (matching the other `eiffel_*`
+examples), so run it via `--manifest-path` from the repo root or `cd`
+in first:
+
 ```sh
-cargo run -p eiffel-rpc                    # both sides
-cargo run -p eiffel-rpc -- tina            # tina only
-cargo run -p eiffel-rpc -- tokio           # tokio only
-cargo run -p eiffel-rpc -- compare 8       # 8-burst on both sides
+# From the repo root:
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml                       # both sides
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- tina               # tina only
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- tokio              # tokio only
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- compare 8          # 8-burst
+
+# Or from inside the example dir:
+cd examples/eiffel_rpc && cargo run -- compare 8
 ```
 
 Each side prints one line of the same shape:

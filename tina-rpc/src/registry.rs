@@ -114,15 +114,24 @@ pub enum RegistryMsg {
 #[derive(Debug, Clone)]
 pub struct RegistryConfig {
     /// Timeout the registry uses on every `IsolateCall` to a service.
-    /// Should be configured shorter than the connection's
-    /// `service_call_timeout` so connection-side timeouts dominate the
-    /// observable wire behavior.
+    ///
+    /// **Set this shorter than the connection's `service_call_timeout`**
+    /// so the registry-side timeout fires first and the client sees a
+    /// well-formed wire response (`Error(Internal)`) rather than the
+    /// connection's own timeout firing and producing no wire frame at
+    /// all (per the wire-error invariant). Inverting the relationship —
+    /// connection timeout shorter than registry timeout — leaves the
+    /// client to surface a local `Timeout` while the server still has
+    /// the work in flight, which is correct but harder to debug.
+    ///
+    /// "Registry-dominant" is the recommended posture; the default 4 s
+    /// pairs with the connection's default 5 s service-call timeout.
     pub service_call_timeout: Duration,
 }
 
 impl Default for RegistryConfig {
     /// 4 s default — slightly under the connection isolate's 5 s default
-    /// `service_call_timeout`.
+    /// `service_call_timeout` so the registry-side timeout dominates.
     fn default() -> Self {
         Self {
             service_call_timeout: Duration::from_secs(4),
