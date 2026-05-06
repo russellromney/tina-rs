@@ -7,10 +7,10 @@ Build the missing portable-runtime features that Baobab needs to judge.
 This is not a survey phase. The first step maps coverage so we do not repeat
 work. Every later step builds or hardens concrete runtime surface.
 
-This phase must leave seven portability gates in place for Baobab:
-complete local runtime story, clear app/service shape, good enough ergonomics,
-brutal tests, visible capability matrix, non-toy examples, and enough cost
-numbers to discuss performance without hand-waving.
+This phase must leave eight portability gates in place for Baobab:
+complete local runtime story, a public app runner, clear app/service shape,
+good enough ergonomics, brutal tests, visible capability matrix, non-toy
+examples, and enough cost numbers to discuss performance without hand-waving.
 
 At closeout:
 
@@ -36,8 +36,9 @@ At closeout:
 - Blocking work is allowed only through bounded, reported lanes.
 - Observation must survive failure: trace, topology, resources, unclean reason.
 - No sleeps-as-proof.
-- Public API changes are allowed only when user-visible behavior needs them.
-  Prefer crate-private helpers and tests for lifecycle cleanup.
+- Public API changes are allowed when they are the user path. The canonical
+  app runner is the user path, not a test-only helper.
+  Prefer crate-private helpers only for lifecycle internals.
 - The service harness must use ordinary Tina effects only: no async handlers,
   no raw backend handles, no Tokio tasks inside isolates.
 - Ergonomics may remove ceremony, but must not hide overload, failure,
@@ -142,18 +143,28 @@ At closeout:
    responded-late, and shutdown-retry truth where the bridge can observe them.
    Do not claim deterministic replay under Tokio.
 
-8. **Canonical Local Service Runner**
-   Build the blessed local-service shape that porting tests will target:
+8. **Public Local Service Runner**
+   Build the blessed local-service shape that users and porting tests will
+   target. It must be public API, not a test-only helper.
+
+   Shape:
    create `LocalSystem`, configure the resource budget manifest, register
    roots, start listener/service isolates, wait for runtime shutdown signal,
-   drain, join, and inspect terminal report.
+   drain, join, and return/inspect the terminal report.
 
-   This may be a reusable test helper or a tiny public helper only if public
-   API is clearly needed. It must prove the ordinary Tina path, not a hidden
-   runtime shortcut.
+   This should feel like Tokio's split between `#[tokio::main]` and
+   `runtime::Builder`: Tina may expose an explicit builder/run path first and
+   add an attribute macro later, but normal users must have a real way to run
+   a Tina app without copying test scaffolding.
 
-   Add only the tiny helper methods needed to make this path readable. If no
-   helper is added, record why the explicit ceremony is the intended surface.
+   The runner must not hide mailbox capacity, ingress capacity, lane capacity,
+   timeout policy, shutdown policy, or terminal reports. It may remove
+   ceremony; it may not hide overload, failure, cancellation, queueing, or
+   shutdown truth.
+
+   Tests must prove the public runner path directly. The service harness and
+   non-toy example must use this public path unless a test is intentionally
+   exercising lower-level runtime internals.
 
 9. **Non-Toy Portable Service Example**
    Build a runnable example that uses the same harness shape but reads like an
@@ -224,7 +235,7 @@ At closeout:
     run. It should not duplicate the full workspace `make verify`. Long DST
     stays behind a named env var such as `TINA_DST_LONG`.
 
-    The gate must run the canonical service runner and portable service harness
+    The gate must run the public service runner and portable service harness
     scary-edge tests. Tables and DST alone are not enough.
 
 14. **Baobab Handoff**
@@ -241,7 +252,7 @@ At closeout:
 - Every `deferred-nonclaim` cell is reflected in capability truth and Baobab.
 - Every rail has positive, negative, overload/capacity, timeout/cancel or
   `not-applicable(reason)`, shutdown/resource, and trace proof.
-- Canonical local service runner shape exists and is tested.
+- Public local service runner shape exists and is tested from the outside.
 - Non-toy runnable portable service example exists and uses the same app shape.
 - The portable service harness has composed happy path plus focused scary-edge
   tests.
