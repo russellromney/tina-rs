@@ -222,6 +222,7 @@ framework before public release-story work.
 | **055 native database first form** | Build the first Tina-owned database client paths so Tina services do not need a Tokio runtime to talk to a database. Adopt sync codec crates (`postgres-protocol` for PG wire, `rusqlite` for SQLite) and drive I/O via Tina runtime calls and connection isolates. Cover: Postgres startup/auth/simple-query/extended-query state machine over `tcp_connect`/`tcp_read`/`tcp_write`; SQLite via per-shard connection isolate with bounded query mailbox; bounded connection pool primitive (probably shared with 048's HTTP client); query timeouts, full/closed/timeout outcomes wire-visible; transaction story first-form or explicit non-goal; DST scenarios for connection death, query timeout, server error reply; Eiffel comparison against `sqlx`/`tokio-postgres`. **No** ORM, no migration tool, no schema discovery, no listen/notify in first form. |
 | **056 native HTTP/2 service stack** | Second-form HTTP after 048 HTTP/1 lands and demand justifies. Adopt sync codec crates where they exist (`hpack` / `hpack_codec` for HPACK, `prost` and `bytes` for protobuf and buffer ownership). For the HTTP/2 frame codec (length-prefixed binary frames with type/flags/stream-id), either vendor the framing modules from `h2` (mostly pure, the async parts live elsewhere) or write the ~few-hundred-line frame state machine directly. Cover: connection isolate, stream isolates, flow control (per-stream and per-connection), HEADERS/DATA/SETTINGS/PING/RST_STREAM/GOAWAY frames, server push explicit non-goal, multiplexing through the connection isolate's request id map, DST proofs for stream multiplexing and reorder. Not a tonic clone; not a complete RFC 7540 implementation; first-form means the HTTP/1 routing/handler shape extends with `:authority`/pseudo-headers and stream-aware bodies. |
 | **057 native gRPC service stack** | Third-form RPC after 056 HTTP/2 lands. Small layer on top: `prost` for protobuf payloads (sync, adopt directly), tonic-style `tonic-build` proc-macro codegen *can* be reused as-is (it is compile-time and runtime-agnostic) with a Tina-shaped service trait template, status codes as a typed enum, unary and server-streaming first form, client and server, DST scenarios for status-code propagation and cancellation. Not a tonic feature-parity claim; bidirectional streaming and full interceptor stack are explicit non-goals for first form. |
+| **058 small files, same behavior** | Split the giant runtime/simulator files into boring modules so review stops burning tokens. Mostly move-only: no new semantics, no feature work, no clever abstractions. Success means TCP close, HTTP, RPC, and DST changes touch named files instead of spelunking through 6k-line blobs. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
@@ -244,6 +245,31 @@ The pattern is always the same: codec is sync, Tina drives the I/O via
 runtime calls, the handler is a state machine that calls the codec on
 each `tcp_read` reply. No vendored async runtimes; no hidden Tokio under
 Tina services.
+
+### 058 small files, same behavior sketch
+
+Goal: lower the token and review cost of Tina work. Big files made sense while
+the shape was molten. Now they hide bugs.
+
+Rules:
+
+- Move code first. Behavior changes wait.
+- Keep public exports stable.
+- Keep tests passing after each small move.
+- Prefer dumb module names over clever architecture.
+- Delete phase-history comments while touching moved code; keep invariants.
+
+First cuts:
+
+- `tina-runtime/src/lib.rs` into runtime core, threaded runtime, shutdown
+  reporting, config, and live topology.
+- `tina-runtime/src/driver.rs` into driver trait/shared types plus TCP/UDP,
+  storage/file, DNS, TLS, process, signal, and tests.
+- `tina-sim/src/lib.rs` into simulator core, scripted I/O, fault config,
+  replay/checker helpers, topology, and multishard simulation.
+
+Done when a TCP close change mostly reads `driver/tcp.rs`,
+`runtime/call_lifecycle.rs`, and `sim/scripted_io.rs`, not three huge files.
 
 047 plan, near-grug:
 

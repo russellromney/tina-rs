@@ -58,9 +58,9 @@ use tina::{
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
     CallReplyRejectedReason, EffectKind, ListenerId, PathKind, PathMetadata, PersistenceTraceInfo,
-    ProcessStatus, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
-    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason, TlsListenerId,
-    TlsStreamId, UdpSocketId,
+    ProcessStatus, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeCallable,
+    RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason,
+    TlsListenerId, TlsStreamId, UdpSocketId,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -2137,6 +2137,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,
@@ -2147,6 +2148,15 @@ where
     }
 
     /// Registers one isolate with an explicit simulator mailbox capacity.
+    ///
+    /// Phase 047 Rock 5: the redundant `I::Call: RuntimeCallable` bound
+    /// surfaces a targeted compile diagnostic when an isolate authored
+    /// with `#[tina::isolate(...)]` (which defaults `Call = Infallible`)
+    /// is registered with the simulator: instead of an opaque
+    /// `Call = RuntimeCall<...>` mismatch, Rust also reports that
+    /// `Infallible: RuntimeCallable` is not satisfied, and the trait's
+    /// `#[diagnostic::on_unimplemented]` note points at the
+    /// `#[tina_runtime::isolate(...)]` fix.
     #[allow(private_bounds)]
     pub fn register_with_mailbox_capacity<I, Msg, Outbound>(
         &mut self,
@@ -2160,6 +2170,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,
@@ -3647,14 +3658,10 @@ where
             return;
         }
 
-        let resource = TcpResourceKey::ListenerAccept(listener);
-        if self.resource_has_active_pending(resource) {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
-            return;
-        }
+        // Close wins. Pending accepts are cancelled and traced.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::ListenerAccept(listener));
 
         self.listeners[listener_index].closed = true;
-        self.fail_pending_accepts(listener);
         self.deliver_completion(call_id, CallOutput::TcpListenerClosed);
     }
 
@@ -3669,10 +3676,9 @@ where
             return;
         }
 
-        if self.stream_has_active_pending(stream) {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
-            return;
-        }
+        // Close wins. Pending reads/writes are cancelled and traced.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::StreamRead(stream));
+        self.cancel_backend_calls_for_resource(TcpResourceKey::StreamWrite(stream));
 
         self.streams[stream_index].closed = true;
         self.deliver_completion(call_id, CallOutput::TcpStreamClosed);
@@ -3829,13 +3835,9 @@ where
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         }
-        if self.resource_has_active_pending(TcpResourceKey::UdpRecv(socket)) {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
-            return;
-        }
+        // Close wins. Pending recv is cancelled and traced.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::UdpRecv(socket));
         self.udp_sockets[socket_index].closed = true;
-        self.pending_udp_recvs
-            .retain(|pending| pending.socket != socket);
         self.deliver_completion(call_id, CallOutput::UdpSocketClosed);
     }
 
@@ -4758,11 +4760,6 @@ where
                 .any(|pending| pending.resource == resource)
     }
 
-    fn stream_has_active_pending(&self, stream: tina_runtime::StreamId) -> bool {
-        self.resource_has_active_pending(TcpResourceKey::StreamRead(stream))
-            || self.resource_has_active_pending(TcpResourceKey::StreamWrite(stream))
-    }
-
     fn udp_socket_index(&self, socket: UdpSocketId) -> Option<usize> {
         self.udp_sockets.iter().position(|state| state.id == socket)
     }
@@ -5202,21 +5199,6 @@ where
             bytes,
             truncated,
         })
-    }
-
-    fn fail_pending_accepts(&mut self, listener: ListenerId) {
-        let mut survivors = Vec::new();
-        for pending in std::mem::take(&mut self.pending_accepts) {
-            if pending.listener == listener {
-                self.deliver_completion(
-                    pending.call_id,
-                    CallOutput::Failed(CallError::InvalidResource),
-                );
-            } else {
-                survivors.push(pending);
-            }
-        }
-        self.pending_accepts = survivors;
     }
 
     fn harvest_tcp(&mut self) {
@@ -6117,6 +6099,69 @@ where
         stopped
     }
 
+    /// Drops simulator state for calls cancelled by resource close.
+    /// Translator is not run; caller's continuation does not fire.
+    /// Trace records `ResourceClosed`.
+    fn cancel_backend_calls_for_resource(&mut self, resource: TcpResourceKey) {
+        let cancelled_call_ids: Vec<CallId> = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|pending| pending.resource == resource)
+            .map(|pending| pending.call_id)
+            .chain(
+                self.pending_accepts
+                    .iter()
+                    .filter(|pending| {
+                        matches!(
+                            resource,
+                            TcpResourceKey::ListenerAccept(l) if l == pending.listener
+                        )
+                    })
+                    .map(|pending| pending.call_id),
+            )
+            .chain(
+                self.pending_udp_recvs
+                    .iter()
+                    .filter(|pending| {
+                        matches!(
+                            resource,
+                            TcpResourceKey::UdpRecv(s) if s == pending.socket
+                        )
+                    })
+                    .map(|pending| pending.call_id),
+            )
+            .collect();
+
+        for call_id in cancelled_call_ids {
+            // Drop the backend op from whichever queue owns it.
+            self.pending_tcp_completions
+                .retain(|pending| pending.call_id != call_id);
+            self.pending_accepts
+                .retain(|pending| pending.call_id != call_id);
+            self.pending_udp_recvs
+                .retain(|pending| pending.call_id != call_id);
+
+            // Drop simulator call state too, or quiescence never arrives.
+            let in_flight_index = self
+                .in_flight_calls
+                .iter()
+                .position(|entry| entry.call_id == call_id);
+            if let Some(index) = in_flight_index {
+                let call = self.in_flight_calls.remove(index);
+                self.translators.retain(|stored| stored.call_id != call_id);
+                self.push_event(
+                    call.requester.isolate,
+                    Some(call.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id: call.call_id,
+                        call_kind: call.call_kind,
+                        reason: CallCompletionRejectedReason::ResourceClosed,
+                    },
+                );
+            }
+        }
+    }
+
     fn cancel_backend_calls_for_requester(&mut self, requester: RegisteredAddress) {
         let mut index = 0;
         while index < self.in_flight_calls.len() {
@@ -6541,6 +6586,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,
@@ -6566,6 +6612,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,

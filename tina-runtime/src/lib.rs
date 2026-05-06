@@ -51,6 +51,7 @@ use betelgeuse::{IOLoopHandle, io_loop};
 
 mod call;
 mod driver;
+mod observation;
 pub mod persistence;
 mod trace;
 
@@ -61,16 +62,20 @@ pub use call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
     IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
     PathKind, PathMetadata, PersistenceTraceInfo, ProcessRunResult, ProcessStatus, RuntimeCall,
-    RuntimeCallParts, SendOutcome, SnapshotImage, StreamId, TlsListenerId, TlsStreamId, TypedCall,
-    UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
-    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
-    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
-    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
-    udp_recv_from, udp_send_to,
+    RuntimeCallParts, RuntimeCallable, SendOutcome, SnapshotImage, StreamId, TlsListenerId,
+    TlsStreamId, TypedCall, UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync,
+    file_open, file_read, file_read_at, file_size, file_write, file_write_at, journal_append,
+    journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace,
+    send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent,
+    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write,
+    udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
+pub use observation::{
+    BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
+    OperationDoneWaiter, WaitError,
+};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
@@ -79,7 +84,7 @@ pub use tina_macros::runtime_isolate as isolate;
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId, EffectKind, EventId,
     RestartSkippedReason, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-    SupervisionRejectedReason,
+    SupervisionRejectedReason, stable_trace_hash,
 };
 
 pub use driver::os_signal_capture_supported;
@@ -98,6 +103,147 @@ pub trait MailboxFactory {
     /// User-provided mailboxes passed to [`Runtime::register`] remain typed
     /// by the isolate message type.
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>>;
+}
+
+/// Blessed in-process bounded mailbox factory for single-threaded runtimes.
+///
+/// Backed by `Rc<RefCell<VecDeque<T>>>` with explicit capacity, FIFO order,
+/// and idempotent close. It is the obvious thing examples and small services
+/// reach for when they do not need a custom mailbox implementation. Custom
+/// factories still work; this is a default, not a requirement.
+///
+/// `DefaultMailboxFactory` is `!Send`. Use [`DefaultThreadedMailboxFactory`]
+/// when constructing a [`ThreadedRuntime`] or any runtime that requires a
+/// `Send + 'static` factory.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultMailboxFactory;
+
+impl MailboxFactory for DefaultMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(DefaultMailbox::new(capacity))
+    }
+}
+
+struct DefaultMailbox<T> {
+    capacity: usize,
+    queue: Rc<RefCell<VecDeque<T>>>,
+    closed: Rc<Cell<bool>>,
+}
+
+impl<T> DefaultMailbox<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            queue: Rc::new(RefCell::new(VecDeque::with_capacity(capacity))),
+            closed: Rc::new(Cell::new(false)),
+        }
+    }
+}
+
+impl<T> Mailbox<T> for DefaultMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        if self.closed.get() {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        queue.push_back(message);
+        Ok(())
+    }
+
+    fn recv(&self) -> Option<T> {
+        self.queue.borrow_mut().pop_front()
+    }
+
+    fn close(&self) {
+        self.closed.set(true);
+    }
+}
+
+/// Blessed in-process bounded mailbox factory for `Send + 'static` runtimes.
+///
+/// Backed by `Arc<Mutex<VecDeque<T>>>` so the factory and its mailboxes can
+/// cross thread boundaries — required by [`ThreadedRuntime`] and other live
+/// substrates that move work onto a worker thread. Capacity is explicit, FIFO
+/// is preserved, and close is idempotent. Custom factories still work; this
+/// is a default for examples and small services.
+///
+/// The mailbox uses `Mutex` rather than a lock-free queue on purpose: the
+/// default keeps observable semantics obvious (one writer wins, one reader
+/// wins) and keeps Tina's bounded-and-visible model intact. Workloads that
+/// outgrow the mutex should reach for a custom factory.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultThreadedMailboxFactory;
+
+impl MailboxFactory for DefaultThreadedMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(DefaultThreadedMailbox::new(capacity))
+    }
+}
+
+struct DefaultThreadedMailbox<T> {
+    capacity: usize,
+    state: Arc<std::sync::Mutex<DefaultThreadedMailboxState<T>>>,
+}
+
+struct DefaultThreadedMailboxState<T> {
+    queue: VecDeque<T>,
+    closed: bool,
+}
+
+impl<T> DefaultThreadedMailbox<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Arc::new(std::sync::Mutex::new(DefaultThreadedMailboxState {
+                queue: VecDeque::with_capacity(capacity),
+                closed: false,
+            })),
+        }
+    }
+}
+
+impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        if state.closed {
+            return Err(TrySendError::Closed(message));
+        }
+        if state.queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        state.queue.push_back(message);
+        Ok(())
+    }
+
+    fn recv(&self) -> Option<T> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        state.queue.pop_front()
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        state.closed = true;
+    }
 }
 
 /// Requirement level for Tina's driver-runtime contract.
@@ -543,6 +689,7 @@ where
     round_messages: Vec<Option<DeliveredMessage>>,
     driver_completions: Vec<DriverCompletion>,
     next_isolate_call_ordinal: u64,
+    observation: observation::ObservationRegistry,
 }
 
 #[derive(Debug)]
@@ -767,6 +914,7 @@ where
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,
+            observation: observation::ObservationRegistry::new(),
         }
     }
 
@@ -806,6 +954,65 @@ where
     /// Returns the number of trace events dropped by the retention policy.
     pub const fn trace_dropped(&self) -> u64 {
         self.trace_dropped
+    }
+
+    /// Registers a typed waiter for the next `tcp_bind` completion.
+    ///
+    /// Returns a [`BoundAddressWaiter`] that the host can `wait` on to
+    /// receive the bound `SocketAddr` (or a typed error). Each call returns
+    /// a fresh waiter; multiple registrations are served in registration
+    /// order as `tcp_bind` calls complete. The waiter is bounded one-slot:
+    /// no hidden queue is created.
+    ///
+    /// The trace remains the source of audit truth: this method does not
+    /// add a new event class, it only surfaces the bound address that
+    /// [`CallOutput::TcpBound`] already carries inside the runtime.
+    pub fn observe_next_bound(&mut self) -> BoundAddressWaiter {
+        self.observation.register_bound()
+    }
+
+    /// Registers a typed waiter for the targeted isolate's `IsolateStopped`.
+    ///
+    /// The waiter resolves the next time the isolate identified by `address`
+    /// (matched by isolate id and generation) emits
+    /// [`RuntimeEventKind::IsolateStopped`]. Replaces `Arc<AtomicBool>` done
+    /// flags in user code. Bounded one-slot.
+    pub fn observe_isolate_complete<M, R>(
+        &mut self,
+        address: Address<M, R>,
+    ) -> observation::IsolateCompleteWaiter {
+        self.observation
+            .register_isolate_complete(address.isolate(), address.generation())
+    }
+
+    /// Registers a typed waiter for the next runtime call of `call_kind`
+    /// issued by the isolate identified by `address` that completes (success
+    /// or failure).
+    ///
+    /// Replaces `complete_trace()` polling for a specific
+    /// `CallKind::TcpStreamClose` / `CallKind::Sleep` / etc. event in user
+    /// code. Bounded one-slot; the runtime drops the slot once a matching
+    /// completion lands.
+    pub fn observe_operation_done<M, R>(
+        &mut self,
+        address: Address<M, R>,
+        call_kind: CallKind,
+    ) -> observation::OperationDoneWaiter {
+        self.observation
+            .register_operation_done(address.isolate(), call_kind)
+    }
+
+    /// Registers a typed waiter for the next supervised restart of any
+    /// direct child of the parent identified by `parent_address`.
+    ///
+    /// The resolved [`observation::ChildRestarted`] carries the new child
+    /// incarnation's isolate id and generation. Bounded one-slot.
+    pub fn observe_child_restarted<M, R>(
+        &mut self,
+        parent_address: Address<M, R>,
+    ) -> observation::ChildRestartedWaiter {
+        self.observation
+            .register_child_restarted(parent_address.isolate())
     }
 
     /// Sets the trace retention policy for future events.
@@ -1034,7 +1241,33 @@ where
     /// addresses are programmer errors and panic. Reconfiguring the same parent
     /// replaces the config and resets the runtime-lifetime budget tracker.
     pub fn supervise<M: 'static, R>(&mut self, parent: Address<M, R>, config: SupervisorConfig) {
-        let parent = self.checked_registered_address(parent, "supervise");
+        // Phase 047 Rock 8: keep the panicking surface for callers who want
+        // a setup-time assertion, but route the actual work through the
+        // fallible `try_supervise` so the panic message stays in one place.
+        if self.try_supervise(parent, config).is_err() {
+            panic!(
+                "supervise expected an address registered with this runtime, got an unknown or stale address",
+            );
+        }
+    }
+
+    /// Configures one registered isolate as supervisor without panicking on
+    /// unknown parents.
+    ///
+    /// Phase 047 Rock 8 (runtime surface alignment): the panicking
+    /// [`supervise`](Self::supervise) variant remains available for setup
+    /// code that wants the unknown-parent case to be a hard programmer
+    /// error. `try_supervise` is the fallible variant that
+    /// [`ThreadedRuntime`] uses internally so an unknown-parent registration
+    /// does not crash the worker thread.
+    pub fn try_supervise<M: 'static, R>(
+        &mut self,
+        parent: Address<M, R>,
+        config: SupervisorConfig,
+    ) -> Result<(), SuperviseError> {
+        let Some(parent) = self.try_registered_address(parent) else {
+            return Err(SuperviseError::UnknownParent);
+        };
         let budget_state = config.budget().tracker();
 
         if let Some(record) = self
@@ -1044,7 +1277,7 @@ where
         {
             record.config = config;
             record.budget_state = budget_state;
-            return;
+            return Ok(());
         }
 
         self.supervisors.push(SupervisorRecord {
@@ -1052,6 +1285,7 @@ where
             config,
             budget_state,
         });
+        Ok(())
     }
 
     /// Runs one deterministic round over all registered isolates.
@@ -1464,6 +1698,45 @@ where
         {
             self.deliver_completion(immediate.call_id, immediate.result);
         }
+
+        // Driver cancelled some pending calls because their resource
+        // closed. Drop matching runtime state, or `has_in_flight_calls`
+        // stays true forever.
+        for cancelled in self.driver.take_cancelled_by_close() {
+            self.cancel_in_flight_call_for_resource_close(cancelled);
+        }
+    }
+
+    /// Drops runtime state for a call cancelled by resource close.
+    /// Translator is not run; caller's continuation does not fire.
+    /// Trace records `ResourceClosed`.
+    fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
+        let Some(in_flight_index) = self
+            .in_flight_calls
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        else {
+            return;
+        };
+        let in_flight = self.in_flight_calls.remove(in_flight_index);
+
+        if let Some(translator_index) = self
+            .translators
+            .iter()
+            .position(|entry| entry.call_id == call_id)
+        {
+            self.translators.remove(translator_index);
+        }
+
+        self.push_event(
+            in_flight.requester.isolate,
+            Some(in_flight.cause),
+            RuntimeEventKind::CallCompletionRejected {
+                call_id,
+                call_kind: in_flight.call_kind,
+                reason: CallCompletionRejectedReason::ResourceClosed,
+            },
+        );
     }
 
     fn dispatch_observed_send(
@@ -1914,6 +2187,34 @@ where
         }
         self.push_persistence_completion_events(&in_flight, &result, failure_reason);
 
+        if matches!(in_flight.call_kind, CallKind::TcpBind) {
+            match (&result, failure_reason) {
+                (CallOutput::TcpBound { local_addr, .. }, _) => {
+                    self.observation
+                        .notify_bound(observation::BoundAddressOutcome::Bound(*local_addr));
+                }
+                (_, Some(reason)) => {
+                    self.observation
+                        .notify_bound(observation::BoundAddressOutcome::Failed(reason));
+                }
+                _ => {}
+            }
+        }
+
+        match failure_reason {
+            None => self.observation.notify_operation_completed(
+                in_flight.requester.isolate,
+                in_flight.call_kind,
+                call_id,
+            ),
+            Some(error) => self.observation.notify_operation_failed(
+                in_flight.requester.isolate,
+                in_flight.call_kind,
+                call_id,
+                error,
+            ),
+        }
+
         let message = translator(result);
 
         let entry_index = self.entries.iter().position(|entry| {
@@ -2101,6 +2402,8 @@ where
         self.entries[index].mailbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
+        self.observation
+            .notify_isolate_stopped(isolate_id, self.entries[index].generation);
         self.cancel_driver_calls_for_requester(RegisteredAddress {
             shard: self.shard.id(),
             isolate: isolate_id,
@@ -2296,6 +2599,17 @@ where
         if let Some(message) = bootstrap_message {
             self.enqueue_bootstrap_message(new_child, message, restarted.into());
         }
+        // Notify *after* the bootstrap message has been enqueued so a host
+        // that wakes from `wait()` cannot race a `try_send` ahead of the
+        // bootstrap delivery.
+        self.observation.notify_child_restarted(
+            parent,
+            observation::ChildRestarted {
+                child_ordinal,
+                new_isolate: new_child.isolate,
+                new_generation: new_child.generation,
+            },
+        );
     }
 
     fn push_event(
@@ -2570,45 +2884,28 @@ where
             .position(|record| record.parent.isolate == parent)
     }
 
-    fn checked_registered_address<M: 'static, R>(
+    fn try_registered_address<M: 'static, R>(
         &self,
         address: Address<M, R>,
-        operation: &str,
-    ) -> RegisteredAddress {
+    ) -> Option<RegisteredAddress> {
         if address.shard() != self.shard.id() {
-            panic!(
-                "{operation} targeted a parent on another shard: target shard {} != runtime shard {}",
-                address.shard().get(),
-                self.shard.id().get(),
-            );
+            return None;
         }
 
-        let Some(entry) = self
+        let entry = self
             .entries
             .iter()
-            .find(|entry| entry.id == address.isolate())
-        else {
-            panic!(
-                "{operation} targeted unknown parent isolate {} on shard {}",
-                address.isolate().get(),
-                address.shard().get(),
-            );
-        };
+            .find(|entry| entry.id == address.isolate())?;
 
         if entry.generation != address.generation() {
-            panic!(
-                "{operation} targeted stale parent isolate {} generation {} on shard {}",
-                address.isolate().get(),
-                address.generation().get(),
-                address.shard().get(),
-            );
+            return None;
         }
 
-        RegisteredAddress {
+        Some(RegisteredAddress {
             shard: address.shard(),
             isolate: address.isolate(),
             generation: address.generation(),
-        }
+        })
     }
 
     fn register_entry<I, Outbound>(
@@ -3340,6 +3637,19 @@ pub enum ThreadedRuntimeError {
     /// The worker could not prove backend completion-slot ownership was
     /// released during shutdown.
     DriverShutdownFailed,
+}
+
+/// Error returned by [`Runtime::try_supervise`] and the threaded equivalents.
+///
+/// Phase 047 Rock 8: replaces a panic on unknown / stale parent registration
+/// in `Runtime::supervise` so the explicit-step and threaded surfaces both
+/// have a fallible variant. The panicking [`Runtime::supervise`] is kept
+/// for setup-time assertions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperviseError {
+    /// The address did not name a parent registered with this runtime
+    /// (unknown isolate id, stale generation, or wrong shard).
+    UnknownParent,
 }
 
 /// Error returned by [`ThreadedRuntime::try_send`].
@@ -5005,6 +5315,12 @@ where
     }
 
     /// Configures a registered isolate as supervisor on the worker shard.
+    ///
+    /// Phase 047 Rock 8: this method panics on unknown parent (consistent
+    /// with the explicit-step `Runtime::supervise`). Use
+    /// [`try_supervise`](Self::try_supervise) for a non-panicking variant
+    /// that surfaces unknown / stale parents as a typed
+    /// [`SuperviseError::UnknownParent`] without crashing the worker.
     pub fn supervise<M: 'static, R: 'static>(
         &self,
         parent: Address<M, R>,
@@ -5013,12 +5329,110 @@ where
         self.call(move |runtime| runtime.supervise(parent, config))
     }
 
+    /// Configures a registered isolate as supervisor on the worker shard
+    /// without panicking on unknown / stale parents.
+    ///
+    /// `Ok(Ok(()))` — registration succeeded. `Ok(Err(SuperviseError::UnknownParent))`
+    /// — the address is not currently registered or its generation is
+    /// stale. `Err(ThreadedRuntimeError)` — the worker thread had already
+    /// stopped or the shutdown handshake could not be observed.
+    pub fn try_supervise<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+        config: SupervisorConfig,
+    ) -> Result<Result<(), SuperviseError>, ThreadedRuntimeError> {
+        self.call(move |runtime| runtime.try_supervise(parent, config))
+    }
+
+    /// Registers a typed waiter for the next `tcp_bind` completion on the
+    /// worker shard.
+    ///
+    /// Returns a [`BoundAddressWaiter`] the host can call `.wait(timeout)`
+    /// on. Each call returns a fresh waiter.
+    ///
+    /// **Order matters.** Register the waiter *before* you trigger the bind
+    /// (typically before the `try_send` that kicks the listener isolate). The
+    /// command channel is FIFO, so a registration enqueued before the bind
+    /// trigger always lands in the registry before the worker processes the
+    /// trigger; a registration enqueued after the bind has already completed
+    /// will wait for the *next* bind, not the one that just happened.
+    ///
+    /// If the worker is already stopped, the returned waiter resolves
+    /// immediately to [`WaitError::RuntimeStopped`] when `wait` is called —
+    /// the waiter itself is the single source of truth for "did this bind
+    /// happen", so no extra registration error is surfaced here.
+    pub fn observe_next_bound(&self) -> BoundAddressWaiter {
+        match self.call(|runtime| runtime.observe_next_bound()) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_bound_waiter(),
+        }
+    }
+
+    /// Registers a typed waiter for the targeted isolate's `IsolateStopped`
+    /// event on the worker shard.
+    ///
+    /// See [`Runtime::observe_isolate_complete`] for semantics. If the worker
+    /// is already stopped the returned waiter resolves immediately to
+    /// [`WaitError::RuntimeStopped`].
+    pub fn observe_isolate_complete<M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> observation::IsolateCompleteWaiter {
+        match self.call(move |runtime| runtime.observe_isolate_complete(address)) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_isolate_complete_waiter(),
+        }
+    }
+
+    /// Registers a typed waiter for the next runtime call of `call_kind`
+    /// issued by `address` that completes on the worker shard.
+    ///
+    /// See [`Runtime::observe_operation_done`] for semantics.
+    pub fn observe_operation_done<M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        call_kind: CallKind,
+    ) -> observation::OperationDoneWaiter {
+        match self.call(move |runtime| runtime.observe_operation_done(address, call_kind)) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_operation_done_waiter(),
+        }
+    }
+
+    /// Registers a typed waiter for the next supervised restart of any
+    /// direct child of `parent_address` on the worker shard.
+    ///
+    /// See [`Runtime::observe_child_restarted`] for semantics.
+    pub fn observe_child_restarted<M: 'static, R: 'static>(
+        &self,
+        parent_address: Address<M, R>,
+    ) -> observation::ChildRestartedWaiter {
+        match self.call(move |runtime| runtime.observe_child_restarted(parent_address)) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_child_restarted_waiter(),
+        }
+    }
+
     /// Attempts one typed ingress handoff through the bounded worker queue.
     ///
     /// Success means the worker accepted ownership of the message command. It
     /// does not mean the target mailbox has accepted the message yet. Mailbox
     /// `Full` / `Closed` outcomes are observed on the worker side through trace
     /// or through [`send_and_observe`](Self::send_and_observe).
+    ///
+    /// Phase 047 Rock 8 — porting note: this is the fast, fire-and-forget
+    /// surface. Unlike [`Runtime::try_send`] (the explicit-step equivalent),
+    /// `ThreadedRuntime::try_send`:
+    ///
+    /// - returns `ThreadedTrySendError`, not `TrySendError<M>`. The
+    ///   message is consumed even on `IngressFull`; callers that need to
+    ///   recover the message (or distinguish `MailboxFull` from
+    ///   `MailboxClosed`) should use [`send_and_observe`](Self::send_and_observe),
+    ///   which is the strict, message-recoverable equivalent.
+    /// - silently drops messages addressed to a stale or unknown isolate
+    ///   on the worker side once the command is accepted. Use
+    ///   [`send_and_observe`](Self::send_and_observe) when the host must
+    ///   learn that the target was already closed.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,

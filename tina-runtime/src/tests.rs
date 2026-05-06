@@ -3084,3 +3084,93 @@ fn shutdown_report_sums_counts_across_shards() {
         Some(ShutdownUncleanReason::WorkerHeldResourcesRemaining),
     );
 }
+
+// Phase 047 Rock 1: blessed default mailbox factories. The single-thread
+// default (`DefaultMailboxFactory`) and the threaded variant
+// (`DefaultThreadedMailboxFactory`) each have to honor the explicit
+// capacity, FIFO order, idempotent close, and Full/Closed differentiation
+// that user mailboxes rely on.
+
+#[test]
+fn default_mailbox_factory_is_fifo_within_capacity() {
+    let factory = DefaultMailboxFactory;
+    let mailbox: Box<dyn Mailbox<u32>> = factory.create(3);
+
+    assert_eq!(mailbox.capacity(), 3);
+    assert!(mailbox.try_send(10).is_ok());
+    assert!(mailbox.try_send(20).is_ok());
+    assert!(mailbox.try_send(30).is_ok());
+    assert_eq!(mailbox.recv(), Some(10));
+    assert_eq!(mailbox.recv(), Some(20));
+    assert_eq!(mailbox.recv(), Some(30));
+    assert_eq!(mailbox.recv(), None);
+}
+
+#[test]
+fn default_mailbox_factory_returns_full_with_message() {
+    let factory = DefaultMailboxFactory;
+    let mailbox: Box<dyn Mailbox<&'static str>> = factory.create(1);
+    assert!(mailbox.try_send("alpha").is_ok());
+    match mailbox.try_send("beta") {
+        Err(TrySendError::Full(value)) => assert_eq!(value, "beta"),
+        other => panic!("expected Full, got {other:?}"),
+    }
+}
+
+#[test]
+fn default_mailbox_factory_returns_closed_with_message() {
+    let factory = DefaultMailboxFactory;
+    let mailbox: Box<dyn Mailbox<&'static str>> = factory.create(2);
+    mailbox.close();
+    match mailbox.try_send("late") {
+        Err(TrySendError::Closed(value)) => assert_eq!(value, "late"),
+        other => panic!("expected Closed, got {other:?}"),
+    }
+}
+
+#[test]
+fn default_mailbox_factory_close_is_idempotent_and_drains_buffered() {
+    let factory = DefaultMailboxFactory;
+    let mailbox: Box<dyn Mailbox<u32>> = factory.create(2);
+    assert!(mailbox.try_send(1).is_ok());
+    assert!(mailbox.try_send(2).is_ok());
+    mailbox.close();
+    mailbox.close();
+    // Already-buffered messages remain visible after close.
+    assert_eq!(mailbox.recv(), Some(1));
+    assert_eq!(mailbox.recv(), Some(2));
+    assert_eq!(mailbox.recv(), None);
+    // Send-after-close still rejects with Closed.
+    match mailbox.try_send(3) {
+        Err(TrySendError::Closed(value)) => assert_eq!(value, 3),
+        other => panic!("expected Closed, got {other:?}"),
+    }
+}
+
+#[test]
+fn default_threaded_mailbox_factory_is_fifo_within_capacity() {
+    let factory = DefaultThreadedMailboxFactory;
+    let mailbox: Box<dyn Mailbox<u32>> = factory.create(2);
+    assert_eq!(mailbox.capacity(), 2);
+    assert!(mailbox.try_send(7).is_ok());
+    assert!(mailbox.try_send(8).is_ok());
+    match mailbox.try_send(9) {
+        Err(TrySendError::Full(value)) => assert_eq!(value, 9),
+        other => panic!("expected Full, got {other:?}"),
+    }
+    assert_eq!(mailbox.recv(), Some(7));
+    assert_eq!(mailbox.recv(), Some(8));
+    assert_eq!(mailbox.recv(), None);
+}
+
+#[test]
+fn default_threaded_mailbox_factory_close_is_idempotent() {
+    let factory = DefaultThreadedMailboxFactory;
+    let mailbox: Box<dyn Mailbox<u8>> = factory.create(1);
+    mailbox.close();
+    mailbox.close();
+    match mailbox.try_send(0) {
+        Err(TrySendError::Closed(value)) => assert_eq!(value, 0),
+        other => panic!("expected Closed, got {other:?}"),
+    }
+}

@@ -118,12 +118,12 @@ impl TlsRuntimeStream {
 /// [`crate::Runtime`], advances them when the runtime asks, and returns typed
 /// completions for the runtime to deliver on later turns.
 ///
-/// TCP drivers must treat listener accept, stream read, and stream write as
-/// separate pending lanes. Duplicate work on one lane fails with
-/// [`CallError::ResourceBusy`]; closing a listener or stream while any relevant
-/// lane is pending also fails with [`CallError::ResourceBusy`]. Per-call cancel
-/// must stop requester completion and quiescence pressure without silently
-/// invalidating unrelated active lanes.
+/// TCP drivers treat listener accept, stream read, and stream write as
+/// separate lanes. Duplicate work on one lane fails with
+/// [`CallError::ResourceBusy`]. Close cancels pending work on the
+/// resource and closes; the cancelled caller's continuation does not
+/// fire. Per-call cancel stops the runtime from waiting on this id;
+/// it does not invalidate other lanes.
 pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// Submits one runtime-owned call.
     fn submit(
@@ -159,6 +159,12 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// driver. It is not a promise that an already-submitted substrate side
     /// effect, such as a TCP write handed to the OS, can be undone.
     fn cancel(&mut self, call_id: CallId) -> bool;
+
+    /// Drains call ids the close path silently cancelled. Runtime
+    /// drops their tracking and records `ResourceClosed`.
+    fn take_cancelled_by_close(&mut self) -> Vec<CallId> {
+        Vec::new()
+    }
 
     /// Injects one runtime-owned signal event and appends ready completions.
     fn notify_signal(&mut self, _name: &str, _completed: &mut Vec<DriverCompletion>) {}
@@ -389,6 +395,8 @@ struct BetelgeuseTcp {
     udp_sockets: Vec<UdpSocketEntry>,
     files: Vec<FileEntry>,
     pending: Vec<PendingOperation>,
+    /// Calls cancelled by resource close. Runtime drains and traces them.
+    cancelled_by_close: Vec<CallId>,
 }
 
 struct ListenerEntry {
@@ -891,6 +899,10 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.poll_os_signals(completed);
         self.harvest_signals(now, completed);
         self.harvest_timers(now, completed);
+    }
+
+    fn take_cancelled_by_close(&mut self) -> Vec<CallId> {
+        self.tcp.take_cancelled_by_close()
     }
 
     fn has_pending(&self) -> bool {
@@ -2947,7 +2959,13 @@ impl BetelgeuseTcp {
             udp_sockets: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             files: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             pending: Vec::with_capacity(INITIAL_DRIVER_PENDING_CAPACITY),
+            cancelled_by_close: Vec::new(),
         }
+    }
+
+    /// Drains calls cancelled by resource close.
+    fn take_cancelled_by_close(&mut self) -> Vec<CallId> {
+        std::mem::take(&mut self.cancelled_by_close)
     }
 
     /// Submits one runtime-owned call. Synchronous Betelgeuse ops (bind,
@@ -3259,11 +3277,6 @@ impl BetelgeuseTcp {
         self.pending.iter().any(|op| op.lane == lane)
     }
 
-    fn stream_has_active_pending(&self, stream: StreamId) -> bool {
-        self.lane_has_active_pending(PendingLane::StreamRead(stream))
-            || self.lane_has_active_pending(PendingLane::StreamWrite(stream))
-    }
-
     fn file_has_active_pending(&self, file: FileId) -> bool {
         self.lane_has_active_pending(PendingLane::FileRead(file))
             || self.lane_has_active_pending(PendingLane::FileWrite(file))
@@ -3368,11 +3381,8 @@ impl BetelgeuseTcp {
             streams: self.streams.len(),
             udp_sockets: self.udp_sockets.len(),
             files: self.files.len(),
-            // Count entries the runtime is still waiting on. User-cancelled
-            // work no longer counts (the runtime stopped waiting); stuck
-            // shutdown-marked work does count so the terminal report can
-            // name it. See Phase 043 Rock 2/3 plus the hostile review fix
-            // for the previous "transient flicker" concern.
+            // Count work the runtime still waits on. User-cancelled work
+            // does not count; shutdown-stuck work does.
             pending_calls: self.pending.iter().filter(|op| !op.user_cancelled).count(),
             ..DriverResourceReport::default()
         }
@@ -3609,8 +3619,14 @@ impl BetelgeuseTcp {
     }
 
     fn do_listener_close(&mut self, listener: ListenerId) -> CallOutput {
-        if self.lane_has_active_pending(PendingLane::ListenerAccept(listener)) {
-            return CallOutput::Failed(CallError::ResourceBusy);
+        // Close wins: cancel any pending accept on this listener.
+        for op in self.pending.iter_mut() {
+            if matches!(op.lane, PendingLane::ListenerAccept(l) if l == listener)
+                && !op.user_cancelled
+            {
+                op.user_cancelled = true;
+                self.cancelled_by_close.push(op.call_id);
+            }
         }
 
         match self.listeners.iter().position(|entry| entry.id == listener) {
@@ -3624,8 +3640,16 @@ impl BetelgeuseTcp {
     }
 
     fn do_stream_close(&mut self, stream: StreamId) -> CallOutput {
-        if self.stream_has_active_pending(stream) {
-            return CallOutput::Failed(CallError::ResourceBusy);
+        // Close wins: cancel any pending read or write on this stream.
+        for op in self.pending.iter_mut() {
+            let on_this_stream = match op.lane {
+                PendingLane::StreamRead(s) | PendingLane::StreamWrite(s) => s == stream,
+                _ => false,
+            };
+            if on_this_stream && !op.user_cancelled {
+                op.user_cancelled = true;
+                self.cancelled_by_close.push(op.call_id);
+            }
         }
 
         match self.streams.iter().position(|entry| entry.id == stream) {
@@ -3679,8 +3703,12 @@ impl BetelgeuseTcp {
     }
 
     fn do_udp_close(&mut self, socket: UdpSocketId) -> CallOutput {
-        if self.lane_has_active_pending(PendingLane::UdpRecv(socket)) {
-            return CallOutput::Failed(CallError::ResourceBusy);
+        // Close wins: cancel any pending recv on this socket.
+        for op in self.pending.iter_mut() {
+            if matches!(op.lane, PendingLane::UdpRecv(s) if s == socket) && !op.user_cancelled {
+                op.user_cancelled = true;
+                self.cancelled_by_close.push(op.call_id);
+            }
         }
         match self.udp_sockets.iter().position(|entry| entry.id == socket) {
             Some(index) => {
@@ -4385,7 +4413,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_recv_lane_rejects_duplicate_and_close_until_cancelled() {
+    fn udp_recv_lane_rejects_duplicate_and_close_cancels_pending_recv() {
         let io_loop =
             io_loop(Global).expect("failed to initialise Betelgeuse IO loop for driver test");
         let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
@@ -4425,28 +4453,19 @@ mod tests {
             CallOutput::Failed(CallError::ResourceBusy)
         ));
 
-        let close_busy = driver
+        // Close wins. Pending recv is cancelled.
+        let closed = driver
             .submit(
                 CallId::new(4),
                 CallInput::UdpSocketClose { socket },
                 Instant::now(),
             )
-            .expect("busy udp close rejected inline");
-        assert!(matches!(
-            close_busy.result,
-            CallOutput::Failed(CallError::ResourceBusy)
-        ));
-
-        assert!(driver.cancel(CallId::new(2)));
-        assert!(!driver.has_pending());
-        let closed = driver
-            .submit(
-                CallId::new(5),
-                CallInput::UdpSocketClose { socket },
-                Instant::now(),
-            )
-            .expect("udp close succeeds after cancel");
+            .expect("udp close completes inline even with a pending recv");
         assert!(matches!(closed.result, CallOutput::UdpSocketClosed));
+        assert!(
+            !driver.has_pending(),
+            "the pending recv was cancelled by the close and is no longer counted as in-flight"
+        );
     }
 
     // -------------------------------------------------------------------

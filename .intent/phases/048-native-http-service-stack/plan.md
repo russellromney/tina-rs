@@ -19,6 +19,82 @@ Near-grug:
 > Parse request. Run isolate. Write response. Shed load when full. Shutdown
 > clean. No Tokio edge.
 
+## Slices
+
+The phase has 12 rocks. They do not all need to land together. Implementing
+them as one undifferentiated chunk risks scope sprawl and a "first form"
+framing that loses teeth. The phase ships in three ordered slices, each
+testable on its own:
+
+| Slice | Rocks | Closes |
+|---|---|---|
+| **048a — server first form** | 1, 2, 3, **5a**, 6, 7, 8, 12 | The headline question: native HTTP server without a Tokio edge. Listener, connection, parser, service dispatch, *typed-mapping overload* (5a), shutdown, example, DST, observability. |
+| **048b — HTTP client + pool + 5b** | 9, 10, **5b** | Outbound shape, plus rock 5b: max connection count, per-connection metrics, deterministic wire-level 503. The pool is a general primitive 055 native DB also needs and naturally produces overload scenarios. |
+| **048c — streaming and routing** | 4, 11 | Sharp-edges polish. Defer until 048a's first endpoint is proven. The plan already says rock 4 must not swallow the phase. |
+
+Rock 5 is **split** into 5a (typed-mapping overload visibility, shipped
+in 048a) and 5b (admission limits + metrics + deterministic wire-level
+503/Full coverage, shipped in 048b alongside the connection pool). The
+split is honest about the limitation that constructing
+`CallOutcome::Full` reliably on a single shard requires either a
+delayed-reply primitive Tina does not yet expose, or the 048b
+connection pool's natural overload scenarios. 048a does ship
+deterministic wire-level coverage of the *Timeout* (504) path via a
+service that never replies — that is the integration-test arm of 5a.
+
+048a closes the phase's headline. 048b lets the slice eat its own dogfood
+(client fetches from server). 048c is incremental.
+
+## User-Facing Shape (First Form)
+
+Two reasonable surfaces:
+
+- **A: builder/router.** `HttpServer::builder().bind(addr).route(GET, "/x", addr).build()`.
+  Familiar to axum users, fewer lines per service.
+- **B: assemble-it-yourself.** User registers a `HttpListener` isolate that
+  knows the bind address and the dispatcher address; the listener spawns
+  one connection isolate per accepted socket; user writes their service
+  isolate as ordinary Tina code that handles `HttpRequest` messages and
+  replies with `HttpResponse`.
+
+First form ships as **B**. It preserves the property that Tina services are
+ordinary Tina isolates with no framework magic, matches how `tcp_echo.rs`
+already reads, and exposes the same `call(service, req, timeout).reply(...)`
+ceremony users already know from the keyspace example.
+
+A future 048-sugar slice can add a builder/router on top. The first slice
+must not foreclose that path, but also must not block on it.
+
+## Crate Placement
+
+Native HTTP lives in a new workspace crate **`tina-http`** alongside
+`tina-supervisor` and `tina-mailbox-spsc`, depending on `tina` and
+`tina-runtime`. This keeps `tina-runtime` focused on the substrate and
+makes the HTTP work an opt-in dependency for consumers who do not need
+it.
+
+## Coordination With 047
+
+048a runs in parallel with 047 (Eiffel ergonomics harvest). The overlap
+surface is small but real:
+
+- 047's `tcp_write_all` / `tcp_read_to_eof` helpers are load-bearing for
+  HTTP server response writes. Until 047 ships them, 048a hand-rolls a
+  small write-all loop *inside the connection isolate* — same shape as
+  `tcp_echo.rs` already does. **Do not publish a `tina-http::tcp_write_all`
+  helper.** When 047's public helper lands, the swap is delete-the-local
+  + call-the-public.
+- 047's default mailbox factory simplifies the example boilerplate. Until
+  it lands, the example carries the standard 40-line `Mailbox` + factory
+  copy. When 047 ships it, the example shrinks. No API freeze either way.
+- 047's stable trace fingerprint helps DST in rock 8. Until it lands, the
+  DST work hashes the `Debug` projection — same shape as
+  `eiffel_replay_dst`. When 047 ships it, swap.
+
+Concrete file-conflict surface between 048a and 047: only the workspace
+`Cargo.toml` `members = [...]` line where 048a registers `tina-http`.
+Trivial merge.
+
 ## Baseline
 
 Already exists:

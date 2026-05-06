@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "tina",
+    "tina-http",
     "tina-macros",
     "tina-mailbox-spsc",
     "tina-rpc",
@@ -23,6 +24,7 @@ exclude = [
     "examples/eiffel_replay_dst",
     "examples/eiffel_outbound_fetch",
     "examples/eiffel_graceful_shutdown",
+    "examples/eiffel_native_http",
 ]
 resolver = "2"
 

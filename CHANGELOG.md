@@ -4,6 +4,116 @@ This file records completed work.
 
 ## Unreleased
 
+### Runtime: TCP/UDP close cancels pending lanes instead of failing with `ResourceBusy`
+
+- `tcp_close_stream`, `tcp_close_listener`, and `udp_close_socket` no
+  longer fail with `CallError::ResourceBusy` when a read/write/accept/
+  recv is pending. Close cancels the pending op and closes the
+  resource. The pending caller's continuation never fires (silent
+  cancel — same shape as isolate-stop with pending calls).
+- New `CallCompletionRejectedReason::ResourceClosed` trace variant
+  keeps each silent cancellation observable.
+- Live driver pushes cancelled call ids onto `cancelled_by_close`;
+  the runtime layer drains them via the new
+  `RuntimeDriver::take_cancelled_by_close` hook and drops matching
+  `in_flight_calls` plus translators. Without this the worker would
+  spin on ghost calls.
+- Simulator gets a matching `cancel_backend_calls_for_resource`
+  helper that drains its pending queues, in-flight calls, and
+  translators. `run_until_quiescent` no longer hangs after
+  close-while-pending.
+- Tests previously pinning `ResourceBusy` for close-while-pending now
+  assert the clean-cancel-and-close behavior. `examples/FINDINGS.md`
+  is updated to mark the issue fixed.
+
+### README Rewrite and Forward Roadmap Phases (Native DB / HTTP/2 / gRPC)
+
+- Rewrote the project `README.md` to match the conventions of mature
+  framework READMEs (Tokio, Mbanugo's Tina/Odin, Seastar): descriptive
+  lead, property bullets, one canonical TCP-echo example, an
+  architecture section with ASCII diagram and crate table, a
+  deterministic-simulation section as one section among several, a
+  quickstart, a documentation table, an honest status/limits paragraph,
+  and a prior-art table that names the Rust neighbors (madsim, turmoil,
+  ambitious, joerl, lunatic, glommio, monoio, loom, shuttle).
+- Added forward-roadmap phases 055 (native database, Postgres via
+  `postgres-protocol` plus SQLite via `rusqlite`), 056 (native HTTP/2),
+  and 057 (native gRPC), with an "adopt-don't-rebuild" discipline note
+  naming the sync codec crates Tina borrows (`httparse`,
+  `postgres-protocol`, `rusqlite`, `hpack`, `prost`, `rustls`,
+  `tungstenite`).
+
+### Phase 048a Native HTTP Service Stack — Server First Form
+
+- Added a new workspace crate `tina-http` containing the HTTP/1.1
+  server first form: `parse` module wrapping `httparse` with typed
+  `RequestParseError` variants (`BadRequestLine`, `HeadersTooLarge`,
+  `UnsupportedTransferEncoding`, `InvalidContentLength`, `BodyTooLarge`,
+  `UnsupportedRequestTarget`, `UnsupportedHttpVersion`,
+  `HeaderReadTimeout`); `connection` module hosting an
+  `HttpConnection<S: Shard>` isolate that reads, parses, accumulates a
+  `Content-Length` body, calls a service isolate via `tina_runtime::call`,
+  writes the response, and closes; `listener` module hosting an
+  `HttpListener<S: Shard>` isolate that binds, accepts, and spawns one
+  connection per accept; `types` module with `HttpRequest`,
+  `HttpResponse`, and `HttpLimits` (including `header_read_timeout`).
+- Pinned the connection isolate's `CallOutcome` -> HTTP status mapping
+  with an exhaustive match on every `CallError` variant: `TargetFull`
+  -> 503, `Timeout` -> 504, `TargetClosed` -> 500, every other variant
+  -> 500. Adding a new `CallError` in `tina-runtime` is now a compile
+  error in `tina-http`.
+- Added a slow-loris guard: an in-flight `sleep(header_read_timeout)`
+  fires concurrently with the head-read; if parsing has not completed
+  by the deadline, the connection isolate stops and the runtime drops
+  the stream. Documented the runtime's `tcp_close_stream`-while-read-
+  pending limitation in `examples/FINDINGS.md`.
+- Fixed the listener `Stop` race: a queued `Accepted(Ok)` arriving
+  after `Stop` took the listener now closes the orphan stream instead
+  of panicking on `self.listener.expect(...)`. Removed the dead
+  `build_close_child` helper.
+- Fixed RFC 7230 §6.1 parsing: `Connection: close, keep-alive` (in any
+  order) now correctly reports `connection_close = true`. Fixed RFC
+  7230 §3.3.2 parsing: conflicting `Content-Length` values now map to
+  `400 Bad Request` (was incorrectly `411 Length Required`).
+- Switched the parser's per-call header buffer to a stack-allocated
+  array for the common case (`max_headers <= 64`), with a heap fallback
+  for larger configurations.
+- Switched the connection isolate's partial-write loop to a
+  `drain(..count)` + `clone()` pattern (matching `tcp_echo.rs`) instead
+  of slicing-with-offset, bounding total response-write copies to
+  O(N) for an N-byte response.
+- Added an `eiffel_native_http` paired Tokio-vs-Tina comparison: axum
+  on the Tokio side, `tina-http` on the Tina side, identical scripted
+  client, asserts byte-equivalent outcomes. The Tina HTTP server runs
+  with no Tokio runtime in the process — first Eiffel comparison where
+  Tina speaks the wire protocol itself.
+- Added the 048 plan's "Slices", "User-Facing Shape (First Form)",
+  "Crate Placement", and "Coordination With 047" sections, plus an
+  honest split of rock 5 into 5a (typed-mapping overload visibility,
+  shipped in 048a) and 5b (admission limits + metrics + wire-level
+  Full coverage, deferred to 048b alongside the connection pool).
+- Filed three new entries in `examples/FINDINGS.md` capturing real
+  pain surfaced by 048a: the `#[tina_runtime::isolate(shard = S)]`
+  macro does not accept a generic shard parameter (forces hand-rolled
+  `Isolate` impls); `tcp_close_stream` rejects with `ResourceBusy`
+  while a `tcp_read` is pending on the same lane (no
+  `tcp_cancel_read` primitive exists, blocking the slow-loris path's
+  ability to write 408 before close); wire-level `CallOutcome::Full`
+  is not deterministically constructible on a single shard with the
+  current API.
+- 41 tests in `tina-http`: 25 unit (parser determinism, parser
+  edge-cases, response encoder, exhaustive `CallError` mapping); 4 DST
+  parser-replay (parser purity, corpus fingerprint stability,
+  fingerprint sensitivity to limit changes, error->status mapping
+  fingerprint); 6 bad-input integration (malformed line, oversized
+  headers, chunked transfer encoding, oversized Content-Length,
+  absolute-form target, peer close mid-request — all with follow-up
+  request assertion to prove listener uncorrupted); 5 pressure
+  integration (multi-read body with trace assertion, graceful
+  shutdown, slow-loris timeout via deadline trace event, stop-race
+  regression, wire-level 504 via a service that never replies); 1
+  happy-path smoke. Plus the paired `eiffel_native_http` comparison.
+
 ### Phase Baobab Production-Readiness Rails
 
 - Added an executable readiness matrix in `tina-runtime/tests/readiness_matrix.rs`

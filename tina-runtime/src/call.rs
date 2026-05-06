@@ -967,11 +967,11 @@ pub enum CallError {
     Unsupported,
 
     /// The referenced runtime resource lane already has an in-flight
-    /// operation.
-    ///
-    /// TCP accepts, reads, and writes occupy separate lanes. A stream may have
-    /// one read and one write pending at the same time, but duplicate work on
-    /// the same lane and explicit close while any lane is pending fail here.
+    /// operation. TCP accept, read, and write are separate lanes; a
+    /// stream may have one read and one write pending at once, but
+    /// duplicate work on the same lane fails here. Close does not
+    /// surface as `ResourceBusy`: it cancels the pending op and
+    /// closes the resource.
     ResourceBusy,
 
     /// A complete journal record had a checksum mismatch.
@@ -1101,6 +1101,44 @@ impl SendOutcome {
 pub struct RuntimeCall<M> {
     kind: RuntimeCallKind<M>,
 }
+
+mod runtime_callable_sealed {
+    pub trait Sealed {}
+}
+
+/// Marker trait identifying `Isolate::Call` types accepted by simulator-
+/// driven and runtime-call-aware contexts.
+///
+/// Phase 047 Rock 5: this trait is implemented only for [`RuntimeCall`].
+/// Surfaces in simulator and runtime-call bounds get a clearer compile
+/// error than the previous `Call = RuntimeCall<...>` equality mismatch
+/// when an isolate is authored with `#[tina::isolate]` (which defaults
+/// `Call = Infallible`).
+///
+/// `RuntimeCall` satisfies the bound:
+///
+/// ```
+/// use tina_runtime::{RuntimeCall, RuntimeCallable};
+/// fn assert_callable<C: RuntimeCallable>() {}
+/// assert_callable::<RuntimeCall<u32>>();
+/// ```
+///
+/// `Infallible` (the default `Call` from `#[tina::isolate]`) does not:
+///
+/// ```compile_fail
+/// use tina_runtime::RuntimeCallable;
+/// fn assert_callable<C: RuntimeCallable>() {}
+/// assert_callable::<std::convert::Infallible>();
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a Tina runtime call channel",
+    label = "this isolate's `Call` is not `RuntimeCall<...>`",
+    note = "`#[tina::isolate(...)]` defaults `Call = std::convert::Infallible`, which simulator-driven and runtime-call-aware paths cannot drive. Switch the attribute to `#[tina_runtime::isolate(...)]`, or supply `call = ::tina_runtime::RuntimeCall<YourMessage>` explicitly."
+)]
+pub trait RuntimeCallable: runtime_callable_sealed::Sealed {}
+
+impl<M> runtime_callable_sealed::Sealed for RuntimeCall<M> {}
+impl<M> RuntimeCallable for RuntimeCall<M> {}
 
 enum RuntimeCallKind<M> {
     Backend {
