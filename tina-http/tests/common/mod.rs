@@ -59,7 +59,13 @@ impl Isolate for Counter {
                 self.value += 1;
                 HttpResponse::text(self.value.to_string())
             }
-            (Method::POST, "/echo") => HttpResponse::with_body(StatusCode::OK, request.body),
+            (Method::POST, "/echo") => {
+                let body_bytes = match request.body {
+                    tina_http::HttpRequestBody::Buffered(b) => b,
+                    tina_http::HttpRequestBody::Stream(_) => Vec::new(),
+                };
+                HttpResponse::with_body(StatusCode::OK, body_bytes)
+            }
             _ => HttpResponse::with_status(StatusCode::NOT_FOUND),
         };
         reply(response)

@@ -16,8 +16,7 @@
 //! owns the socket, blocks on `Read`/`Write`, spawns threads, or hides
 //! buffers.
 //!
-//! Out of scope here: TLS, streaming bodies, a routing helper, and any
-//! production-performance claim.
+//! Out of scope here: TLS and any production-performance claim.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -28,6 +27,7 @@ pub mod parse;
 pub mod pool;
 pub mod request_builder;
 pub mod router;
+pub mod streaming;
 pub mod types;
 
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
@@ -40,9 +40,13 @@ pub use parse::{
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
 pub use router::{RouteHandler, Router};
+pub use streaming::{
+    RequestChunkMsg, RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply,
+    ResponseStream,
+};
 pub use types::{
-    HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpResponse, HttpServerConfig,
-    PoolConfig, RequestParseError, ResponseParseError,
+    HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody, HttpResponse,
+    HttpResponseBody, HttpServerConfig, PoolConfig, RequestParseError, ResponseParseError,
 };
 
 // Re-exports from the `http` crate for convenient `tina_http::Method`,

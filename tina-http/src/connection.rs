@@ -28,8 +28,11 @@ use tina_runtime::{
     CallError, CallOutcome, StreamId, call, sleep, tcp_close_stream, tcp_read, tcp_write,
 };
 
-use crate::parse::{HttpRequestHead, ParseProgress, encode_response, parse_request_head};
-use crate::types::{HttpLimits, HttpRequest, HttpResponse, RequestParseError};
+use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_request_head};
+use crate::streaming::{
+    RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
+};
+use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError};
 
 /// Bytes the connection isolate asks for per `tcp_read`. Bounded so a
 /// single read does not pull more than this into the runtime, regardless
@@ -58,6 +61,19 @@ pub enum HttpConnectionMsg {
     Wrote(Result<usize, CallError>),
     /// `tcp_close_stream` reply.
     Closed(Result<(), CallError>),
+    /// Streaming response: chunk source's reply to a pulled `Next`.
+    StreamChunk(CallOutcome<ResponseChunkReply>),
+    /// Streaming request: service asks the connection for the next
+    /// chunk of the inbound body. Replies with [`RequestChunkReply`].
+    RequestBodyNext,
+}
+
+impl HttpConnectionMsg {
+    /// Convenience: build a `RequestBodyNext` for use at a service
+    /// call site without spelling out the variant.
+    pub fn body_next() -> Self {
+        Self::RequestBodyNext
+    }
 }
 
 /// Per-connection isolate.
@@ -82,6 +98,27 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     // `handle_wrote` drains the accepted prefix and we re-issue the
     // remainder.
     pending_response: Vec<u8>,
+
+    // Streaming-response state. `Some` once we have written the head of
+    // a streamed response and need to keep pulling chunks until `Eof`.
+    // `bytes_remaining` is decremented as chunks are written; when it
+    // hits zero (or we receive `Eof`), we close.
+    stream_source: Option<Address<ResponseChunkMsg, ResponseChunkReply>>,
+    stream_bytes_remaining: usize,
+    stream_call_timeout: Duration,
+
+    // Streaming-request state: holds the buffered request body and the
+    // cursor of how much has been served to the service via
+    // `RequestBodyNext` calls. Set when the dispatch path chose the
+    // streaming variant; empty otherwise.
+    inbound_body: Vec<u8>,
+    inbound_cursor: usize,
+    inbound_chunk_size: usize,
+
+    // Captured at the first handler turn (`start()`), used to construct
+    // the typed self-address for streaming-body dispatch.
+    self_shard_id: Option<tina::ShardId>,
+    self_isolate_id: Option<tina::IsolateId>,
 
     // Whether the connection should close after the current response. Set
     // to true on parse error, on service overload that triggers a 503
@@ -116,6 +153,14 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             parsed_head: None,
             head_len: 0,
             pending_response: Vec::new(),
+            stream_source: None,
+            stream_bytes_remaining: 0,
+            stream_call_timeout: service_call_timeout,
+            inbound_body: Vec::new(),
+            inbound_cursor: 0,
+            inbound_chunk_size: 0,
+            self_shard_id: None,
+            self_isolate_id: None,
             will_close: false,
             head_deadline_armed: true,
             _shard: std::marker::PhantomData,
@@ -129,14 +174,20 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for HttpConnection<S, M> {
     tina::isolate_types! {
         message: HttpConnectionMsg,
-        reply: (),
+        reply: RequestChunkReply,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
         call: tina_runtime::RuntimeCall<HttpConnectionMsg>,
         shard: S,
     }
 
-    fn handle(&mut self, msg: HttpConnectionMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(&mut self, msg: HttpConnectionMsg, ctx: &mut Context<'_, S>) -> Effect<Self> {
+        // Capture self-identity once. Used by the streaming-request
+        // dispatch path to hand the service a typed self-address.
+        if self.self_isolate_id.is_none() {
+            self.self_shard_id = Some(ctx.shard_id());
+            self.self_isolate_id = Some(ctx.isolate_id());
+        }
         match msg {
             HttpConnectionMsg::Begin => self.start(),
 
@@ -149,6 +200,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
             HttpConnectionMsg::Wrote(Ok(count)) => self.handle_wrote(count),
             HttpConnectionMsg::Wrote(Err(_)) => self.begin_close(),
+
+            HttpConnectionMsg::StreamChunk(outcome) => self.handle_stream_chunk(outcome),
+
+            HttpConnectionMsg::RequestBodyNext => self.handle_request_body_next(),
 
             HttpConnectionMsg::Closed(_) => stop(),
         }
@@ -251,18 +306,67 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .expect("head parsed before dispatch");
         let body_end = self.head_len + head.content_length;
         let body = self.read_buf[self.head_len..body_end].to_vec();
-        // First form: drop any bytes after content_length. We do not
-        // support pipelining, and we close this connection after the
-        // response anyway.
-        // First form is one request per connection, so every response is
-        // terminal for the socket. Force close so HTTP/1.1 clients see an
-        // honest `Connection: close` header before the runtime closes the
-        // stream.
         self.will_close = true;
 
-        let request = head.into_request(body);
+        // Decide buffered vs streaming dispatch based on the limits.
+        let request = match self.limits.inbound_stream_chunk_size {
+            Some(chunk_size) if !body.is_empty() => {
+                // Stream: stash the body in the connection state, hand
+                // the service an address pointing at us with the
+                // streaming reply type. The service pulls chunks via
+                // `call(addr, RequestBodyNext, t).reply(...)`.
+                let content_length = body.len();
+                self.inbound_body = body;
+                self.inbound_cursor = 0;
+                self.inbound_chunk_size = chunk_size.max(1);
+                // Build the typed chunk-source address. Generation 0
+                // matches the first incarnation of this isolate; supervised
+                // restarts would invalidate this. First-form connections
+                // are not supervised, so this is safe.
+                let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
+                    tina::Address::new_with_generation(
+                        self.shard_id_for_self(),
+                        self.isolate_id_for_self(),
+                        tina::AddressGeneration::new(0),
+                    );
+                let stream = RequestStream {
+                    content_length,
+                    source: me_chunk,
+                };
+                head.into_streaming_request(stream)
+            }
+            _ => head.into_request(body),
+        };
         call(self.service, M::from(request), self.service_call_timeout)
             .reply(HttpConnectionMsg::ServiceReturned)
+    }
+
+    /// Returns the shard id for self. The dispatch path needs this to
+    /// build a typed self-address; we cannot use `ctx.me()` here
+    /// because handler entrypoints take `&mut self` and `ctx` is at a
+    /// higher scope. The values are recorded by the runtime when the
+    /// isolate is registered and unchanging across handler turns —
+    /// stash them in `start()` instead.
+    fn shard_id_for_self(&self) -> tina::ShardId {
+        self.self_shard_id.expect("shard id captured at start()")
+    }
+
+    fn isolate_id_for_self(&self) -> tina::IsolateId {
+        self.self_isolate_id
+            .expect("isolate id captured at start()")
+    }
+
+    fn handle_request_body_next(&mut self) -> Effect<Self> {
+        let remaining = self.inbound_body.len().saturating_sub(self.inbound_cursor);
+        if remaining == 0 {
+            return reply(RequestChunkReply::Eof);
+        }
+        let take = self.inbound_chunk_size.min(remaining);
+        let start = self.inbound_cursor;
+        let end = start + take;
+        let chunk = self.inbound_body[start..end].to_vec();
+        self.inbound_cursor = end;
+        reply(RequestChunkReply::Chunk(chunk))
     }
 
     fn handle_service_outcome(&mut self, outcome: CallOutcome<HttpResponse>) -> Effect<Self> {
@@ -283,22 +387,39 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn start_writing(&mut self, response: HttpResponse) -> Effect<Self> {
-        let bytes = encode_response(&response, self.will_close);
-        self.pending_response = bytes;
-        self.write_pending()
+        // Encode the head with the declared body length. The body bytes
+        // (or chunks for a streamed body) are written separately so
+        // streaming can pace per-chunk.
+        let head_bytes = encode_response_head(&response, self.will_close);
+        match response.body {
+            HttpResponseBody::Buffered(body_bytes) => {
+                // Append the buffered body to the head and write it all
+                // through the existing partial-write loop.
+                let mut bytes = head_bytes;
+                bytes.extend_from_slice(&body_bytes);
+                self.pending_response = bytes;
+                self.write_pending()
+            }
+            HttpResponseBody::Stream(ResponseStream {
+                content_length,
+                source,
+            }) => {
+                // Write the head; once the head has fully drained,
+                // `handle_wrote` will pull the first chunk from the
+                // source and write it.
+                self.pending_response = head_bytes;
+                self.stream_source = Some(source);
+                self.stream_bytes_remaining = content_length;
+                self.write_pending()
+            }
+        }
     }
 
     /// Issues a `tcp_write` for whatever still remains in
     /// `self.pending_response`. The drain happens in `handle_wrote` once
     /// we know how many bytes the runtime accepted; we do not pre-copy
-    /// the buffer with an offset, mirroring the partial-write pattern in
-    /// `tina-runtime/examples/tcp_echo.rs`.
+    /// the buffer with an offset.
     fn write_pending(&mut self) -> Effect<Self> {
-        // Cloning here is unavoidable in first form: `tcp_write` takes
-        // `Vec<u8>` by value because the runtime owns the bytes during
-        // the call. The clone is bounded to remaining-bytes via the
-        // drain in `handle_wrote`, so the worst case is O(N) total
-        // copies for an N-byte response, not O(N^2).
         tcp_write(self.stream, self.pending_response.clone()).reply(HttpConnectionMsg::Wrote)
     }
 
@@ -308,10 +429,65 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
         if count >= self.pending_response.len() {
             self.pending_response.clear();
-            self.begin_close()
+            // Buffer drained. If we are streaming, pull the next chunk;
+            // otherwise close.
+            if self.stream_source.is_some() && self.stream_bytes_remaining > 0 {
+                self.pull_next_chunk()
+            } else {
+                self.stream_source = None;
+                self.begin_close()
+            }
         } else {
             self.pending_response.drain(..count);
             self.write_pending()
+        }
+    }
+
+    /// Issues a `call(source, Next, t).reply(StreamChunk)` to pull the
+    /// next chunk of a streamed response.
+    fn pull_next_chunk(&mut self) -> Effect<Self> {
+        let source = self.stream_source.expect("stream source set");
+        call(source, ResponseChunkMsg::Next, self.stream_call_timeout)
+            .reply(HttpConnectionMsg::StreamChunk)
+    }
+
+    fn handle_stream_chunk(&mut self, outcome: CallOutcome<ResponseChunkReply>) -> Effect<Self> {
+        match outcome {
+            CallOutcome::Replied(ResponseChunkReply::Chunk(bytes)) => {
+                if bytes.is_empty() {
+                    // Treat empty chunk like Eof — defensive against
+                    // sources that signal end-of-stream this way.
+                    self.stream_source = None;
+                    return self.begin_close();
+                }
+                if bytes.len() > self.stream_bytes_remaining {
+                    // Source over-produced relative to declared length.
+                    // Truncate to keep the wire framing honest.
+                    let mut truncated = bytes;
+                    truncated.truncate(self.stream_bytes_remaining);
+                    self.stream_bytes_remaining = 0;
+                    self.pending_response = truncated;
+                } else {
+                    self.stream_bytes_remaining -= bytes.len();
+                    self.pending_response = bytes;
+                }
+                self.write_pending()
+            }
+            CallOutcome::Replied(ResponseChunkReply::Eof) => {
+                // Source finished. Close — note the wire `Content-Length`
+                // we already emitted is canonical; the source under-
+                // producing is a contract violation but we close cleanly.
+                self.stream_source = None;
+                self.begin_close()
+            }
+            CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => {
+                // Source died mid-stream. Close the wire — the client
+                // sees a truncated body relative to `Content-Length`.
+                // First-form policy: close, do not try to inject an
+                // error response on top of an already-emitted head.
+                self.stream_source = None;
+                self.begin_close()
+            }
         }
     }
 

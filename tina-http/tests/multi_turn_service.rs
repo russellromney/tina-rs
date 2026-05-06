@@ -70,9 +70,10 @@ impl Isolate for Proxy {
                 // Build a fresh outbound request — the inbound's
                 // `Connection` and `Host` headers are stripped by the
                 // outbound encoder.
+                let body_bytes = req.body.as_buffered().unwrap_or(&[]).to_vec();
                 let outbound = HttpRequest::builder(req.method, req.path)
                     .header("Host", "upstream")
-                    .body(req.body)
+                    .body(body_bytes)
                     .build();
                 call(
                     self.client,

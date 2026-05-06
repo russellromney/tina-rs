@@ -239,7 +239,7 @@ impl<S: Shard + 'static> HttpClient<S> {
             status: head.status,
             version: head.version,
             headers: head.headers,
-            body,
+            body: crate::HttpResponseBody::Buffered(body),
         };
         self.finish(Ok(response), state.stream)
     }

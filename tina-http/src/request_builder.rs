@@ -108,7 +108,7 @@ impl RequestBuilder {
             path: self.path,
             version: self.version,
             headers: self.headers,
-            body: self.body,
+            body: crate::types::HttpRequestBody::Buffered(self.body),
         }
     }
 }
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(req.method, Method::GET);
         assert_eq!(req.path, "/counter");
         assert_eq!(req.version, Version::HTTP_11);
-        assert!(req.body.is_empty());
+        assert_eq!(req.body.declared_length(), 0);
         assert_eq!(
             req.headers.get("host").map(|v| v.as_bytes()),
             Some(b"x" as &[u8])
