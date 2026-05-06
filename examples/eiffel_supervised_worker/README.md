@@ -87,13 +87,11 @@ What worked well:
 
 What was awkward or surprising:
 
-- The bound listener address pattern strikes again. The driver thread
-  still needs the *current* worker's address, so we built another
-  `Arc<Mutex<Option<Address<...>>>>` slot, plus an `AtomicU64` generation
-  counter so the driver can wait for "the *next* incarnation" after a
-  Poison send. This is the third comparison in a row to hand-roll a
-  variant of the `BoundAddr` pattern from `eiffel_real_io_chat` and
-  `eiffel_mini_keyspace`.
+- The driver thread still needs the *current* worker's address, so there
+  is still a small `Arc<Mutex<Option<Address<...>>>>` slot for the child
+  to publish its boot address. **Partly resolved in phase 047:** the
+  old `AtomicU64` generation counter is gone; the driver now registers
+  `runtime.observe_child_restarted(parent)` before sending a poison job.
 - `ThreadedTrySendError` only carries `IngressFull` and `WorkerStopped`
   — no `Closed`. Sending to an address whose isolate has already died
   returns `Ok(())` from the ingress, and the runtime drops the message
@@ -105,13 +103,13 @@ What was awkward or surprising:
 - `try_send` consumes the message even on `IngressFull`. To retry on
   full, the message must be `Copy` or hand-rebuilt. For a `Job` that's
   fine; for anything heavier, it is friction.
-- The four-line copy of `WorkerMailbox` + `WorkerMailboxFactory`
-  boilerplate is here too. Same as keyspace, axum_counter, and chat.
-- Driving the comparison still requires `complete_trace()` polling to
-  count restart events. The runtime knows the restart happened — it
-  emits the event — but the only public path to "tell me if a restart
-  has happened yet" is to scrape the trace. Same scraping shape as the
-  keyspace `tcp_close` poll.
+- ~~The four-line copy of `WorkerMailbox` + `WorkerMailboxFactory`
+  boilerplate is here too.~~ **Resolved in phase 047:** the comparison
+  uses `DefaultThreadedMailboxFactory`.
+- ~~Driving the comparison requires `complete_trace()` polling to notice
+  the next restart event.~~ **Resolved for this use in phase 047:**
+  `observe_child_restarted(parent)` gives the driver a typed waiter for
+  each restart. The trace is still used as audit truth for the final count.
 - `runtime.supervise(...)` returns `Result<(), ThreadedRuntimeError>`
   while the inner explicit-step `Runtime::supervise(...)` returns `()`.
   The `.expect("supervise parent")` at every call site is small but

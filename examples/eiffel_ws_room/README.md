@@ -45,11 +45,12 @@ cargo run --manifest-path examples/eiffel_ws_room/Cargo.toml -- tina
 
 ### What was awkward
 
-- Bridge mailbox + factory boilerplate again. Fourth copy.
-- The "Send" generic on `tina::isolate(...)` defaults to `Outbound<()>`
-  even though this isolate sends nothing to other isolates; the macro
-  would not let me omit `shard = RoomShard` even for a one-isolate
-  service.
+- ~~Bridge mailbox + factory boilerplate again. Fourth copy.~~
+  **Resolved in phase 047:** the room uses `DefaultThreadedMailboxFactory`.
+- ~~The macro would not let me omit `shard = RoomShard` even for a
+  one-isolate service.~~ **Resolved in phase 047:** omitted `shard = ...`
+  defaults to `SingleShard`, so this comparison no longer declares a
+  throwaway shard.
 - Connection plumbing still happens in tokio code (axum WS upgrade), and
   the Tina runtime only owns the room-state isolate. That is the honest
   shape of using the bridge — but it means liveness/ping-pong concerns

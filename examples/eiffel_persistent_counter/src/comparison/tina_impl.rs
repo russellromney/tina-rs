@@ -1,80 +1,17 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
-    CallError, JournalReplay, MailboxFactory, SnapshotImage, ThreadedRuntime,
+    CallError, DefaultThreadedMailboxFactory, JournalReplay, SnapshotImage, ThreadedRuntime,
     ThreadedRuntimeConfig, journal_append, journal_replay, snapshot_commit, snapshot_load,
 };
 
 use super::{PHASE_A_INCREMENTS, PHASE_B_INCREMENTS, SideReport};
-
-#[derive(Debug, Default)]
-struct CounterShard;
-
-impl Shard for CounterShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(56)
-    }
-}
-
-struct CounterMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> CounterMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for CounterMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CounterMailboxFactory;
-
-impl MailboxFactory for CounterMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(CounterMailbox::new(capacity))
-    }
-}
 
 // Shared observation slot — the driver thread reads each completed op id
 // here so it can tell when an Increment / Snapshot / Recover has actually
@@ -127,9 +64,9 @@ struct Counter {
     last_journal_index: u64,
 }
 
-#[tina_runtime::isolate(message = CounterMsg, shard = CounterShard)]
+#[tina_runtime::isolate(message = CounterMsg)]
 impl Counter {
-    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, CounterShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             CounterMsg::Recover { op } => snapshot_load(self.snapshot_path.clone())
                 .reply(move |result| CounterMsg::SnapshotLoaded { op, result }),
@@ -294,8 +231,8 @@ fn run_phase(
     take_snapshot: bool,
 ) -> PhaseReport {
     let runtime = ThreadedRuntime::with_config(
-        CounterShard,
-        CounterMailboxFactory,
+        SingleShard,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
             idle_wait: Duration::from_millis(1),
@@ -318,7 +255,7 @@ fn run_phase(
         .expect("register counter");
 
     let mut next_op = 1u64;
-    let wait_op = |runtime: &ThreadedRuntime<CounterShard, CounterMailboxFactory>,
+    let wait_op = |runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
                    msg: CounterMsg,
                    op: u64| {
         runtime.try_send(counter, msg).expect("send op");

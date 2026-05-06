@@ -88,9 +88,10 @@ What worked well:
   is the seam where deterministic perturbation lives. Set the same
   seed → identical trace. Change the seed → different trace.
   Property and counter-property assertable in one report.
-- `sim.trace()` returns `&[RuntimeEvent]` directly. The fingerprint is
-  a `DefaultHasher` over the `Debug` projection of every event. Five
-  lines of code; the rest of the runtime did the work.
+- `sim.trace()` returns `&[RuntimeEvent]` directly. Phase 047 added
+  `stable_trace_hash(...)`, so the fingerprint no longer depends on
+  `Debug` formatting or `DefaultHasher`. Five lines of code; the rest
+  of the runtime did the work.
 - `tina_runtime::sleep(Duration).reply(...)` is *also* what runs in
   live `ThreadedRuntime` — same handler code, same effect type. The
   comparison's punchline is that the shape under tina-sim is the same
@@ -115,11 +116,10 @@ What was awkward or surprising:
   back by 1 delivery round, deterministically chosen by seed") has
   to be looked up. Naming is fine; documentation that lists "what
   changes when I bump `one_in`" would shorten the on-ramp.
-- Building the trace fingerprint via `format!("{event:?}").hash(...)`
-  works but is slightly cheesy. A first-class
-  `RuntimeEvent::stable_hash()` (or even `serialize`) would let
-  examples claim "byte-identical trace" with less of an "I trust
-  Debug to be stable" caveat.
+- ~~Building the trace fingerprint via `format!("{event:?}").hash(...)`
+  works but is slightly cheesy.~~ **Resolved in phase 047:**
+  `RuntimeEvent::stable_hash()` and `stable_trace_hash(...)` give this
+  comparison a first-class trace fingerprint.
 - The simulator does not expose a "current virtual time" accessor at
   the public API surface (or if it does, it isn't named in the
   examples). The only way to reason about *when* an event happened

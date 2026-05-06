@@ -1,8 +1,4 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -12,73 +8,12 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use tina::prelude::*;
-use tina::{Mailbox, TrySendError};
-use tina_runtime::{MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
-use tina_tokio_bridge::{BridgeHandle, BridgeRequest};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
+use tina_tokio_bridge::{BridgeHandle, BridgeHost, BridgeRequest};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::mpsc;
 
 use super::{SideReport, run_room_clients};
-
-#[derive(Debug, Clone, Copy)]
-struct RoomShard;
-
-impl Shard for RoomShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(74)
-    }
-}
-
-struct RoomMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> RoomMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for RoomMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RoomMailboxFactory;
-
-impl MailboxFactory for RoomMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(RoomMailbox::new(capacity))
-    }
-}
 
 #[derive(Debug)]
 enum RoomRequest {
@@ -94,15 +29,12 @@ struct Room {
     subscribers: Vec<mpsc::UnboundedSender<String>>,
 }
 
-#[tina::isolate(
-    message = BridgeRequest<RoomRequest, RoomReply>,
-    shard = RoomShard
-)]
+#[tina::isolate(message = BridgeRequest<RoomRequest, RoomReply>)]
 impl Room {
     fn handle(
         &mut self,
         msg: BridgeRequest<RoomRequest, RoomReply>,
-        _ctx: &mut Context<'_, RoomShard>,
+        _ctx: &mut Context<'_, SingleShard>,
     ) -> Effect<Self> {
         let (request, responder) = msg.into_parts();
         match request {
@@ -118,7 +50,7 @@ impl Room {
     }
 }
 
-type RoomBridge = BridgeHandle<RoomRequest, RoomReply, RoomShard, RoomMailboxFactory, ()>;
+type RoomBridge = BridgeHandle<RoomRequest, RoomReply, SingleShard, DefaultThreadedMailboxFactory, ()>;
 
 async fn ws_upgrade(
     State(bridge): State<RoomBridge>,
@@ -158,19 +90,22 @@ async fn handle_socket(socket: WebSocket, bridge: RoomBridge) {
 }
 
 pub(crate) fn run() -> SideReport {
-    let runtime = Arc::new(ThreadedRuntime::with_config(
-        RoomShard,
-        RoomMailboxFactory,
+    let mut host = BridgeHost::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 32,
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },
-    ));
-    let address = runtime
-        .register_with_capacity::<Room, Infallible>(Room::default(), 32)
-        .expect("register room isolate");
-    let bridge = BridgeHandle::new(Arc::clone(&runtime), address, Duration::from_secs(2));
+    );
+    let bridge: RoomBridge = host
+        .register_bridge::<Room, RoomRequest, RoomReply, Infallible>(
+            Room::default(),
+            32,
+            Duration::from_secs(2),
+        )
+        .expect("register room bridge");
 
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -200,12 +135,9 @@ pub(crate) fn run() -> SideReport {
 
     drop(tokio_runtime);
 
-    match Arc::try_unwrap(runtime) {
-        Ok(runtime) => {
-            let _ = runtime.shutdown();
-        }
-        Err(still_shared) => drop(still_shared),
-    }
+    let _ = host
+        .drain_and_shutdown(Duration::from_secs(2))
+        .expect("bridge host drains and shuts down cleanly");
 
     report
 }

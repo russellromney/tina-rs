@@ -71,9 +71,8 @@ cargo run --manifest-path examples/eiffel_mux_client/Cargo.toml -- tina
   `Arc<Mutex<Vec<u32>>>` because there is no clean Tina affordance for
   "harvest results from this isolate when it finishes." Same shape as
   the bound-addr smuggling we saw in earlier comparisons.
-- **Mailbox boilerplate, fifth copy.** The `MuxMailbox` /
-  `MuxMailboxFactory` block is identical to the previous four
-  comparisons modulo type names.
+- ~~Mailbox boilerplate, fifth copy.~~ **Resolved in phase 047:** the
+  client uses `DefaultThreadedMailboxFactory`.
 - **`#[allow(dead_code)]` on the message enum.** The message variants
   carry `Result<_, CallError>` payloads we don't read, but rustc warns
   on the unread `Ok` payload — the warning cannot be suppressed at the

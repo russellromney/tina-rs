@@ -58,9 +58,9 @@ use tina::{
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
     CallReplyRejectedReason, EffectKind, ListenerId, PathKind, PathMetadata, PersistenceTraceInfo,
-    ProcessStatus, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeEvent,
-    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason, TlsListenerId,
-    TlsStreamId, UdpSocketId,
+    ProcessStatus, RestartSkippedReason, RuntimeCall, RuntimeCallParts, RuntimeCallable,
+    RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason,
+    TlsListenerId, TlsStreamId, UdpSocketId,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -2137,6 +2137,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,
@@ -2147,6 +2148,15 @@ where
     }
 
     /// Registers one isolate with an explicit simulator mailbox capacity.
+    ///
+    /// Phase 047 Rock 5: the redundant `I::Call: RuntimeCallable` bound
+    /// surfaces a targeted compile diagnostic when an isolate authored
+    /// with `#[tina::isolate(...)]` (which defaults `Call = Infallible`)
+    /// is registered with the simulator: instead of an opaque
+    /// `Call = RuntimeCall<...>` mismatch, Rust also reports that
+    /// `Infallible: RuntimeCallable` is not satisfied, and the trait's
+    /// `#[diagnostic::on_unimplemented]` note points at the
+    /// `#[tina_runtime::isolate(...)]` fix.
     #[allow(private_bounds)]
     pub fn register_with_mailbox_capacity<I, Msg, Outbound>(
         &mut self,
@@ -2160,6 +2170,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,
@@ -6541,6 +6552,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,
@@ -6566,6 +6578,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Call = RuntimeCall<Msg>,
             > + 'static,
+        I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::Reply: 'static,
         Msg: 'static,
