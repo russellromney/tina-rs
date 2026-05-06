@@ -2900,7 +2900,9 @@ fn failed_shard_rejects_later_ingress_to_existing_isolate() {
     );
     assert_eq!(
         terminal.shutdown_report().unclean_reason(),
-        Some(ShutdownUncleanReason::RuntimeError),
+        Some(ShutdownUncleanReason::RuntimeError(
+            ThreadedRuntimeError::WorkerStopped
+        )),
     );
 }
 

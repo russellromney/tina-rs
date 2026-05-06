@@ -495,3 +495,62 @@ After all of this, the phase still satisfies the plan's "Done Means":
 `make verify` is green, the new tests cover positive, negative, weird,
 and shutdown paths for the named lanes, and `ROADMAP.md` /
 `CHANGELOG.md` were updated only with what shipped.
+
+# Hostile-Review Fixes
+
+Each numbered finding above has now been addressed, except #5 which
+remains a flagged "next layer".
+
+1. **Shared signal flag → per-driver registration.** Each
+   `BetelgeuseDriver` calls `OsSignalDispatcher::install()` and gets its
+   own `Arc<AtomicBool>` registered with `signal-hook` via
+   `flag::register`, returning a `SigId` that the dispatcher's `Drop`
+   passes to `signal_hook::low_level::unregister`. `signal-hook` chains
+   handlers, so a single SIGINT now sets every driver's flag and every
+   parked `signal_wait` fires.
+
+2. **Transient pending-call flicker → split flags.**
+   `PendingOperation` now carries `user_cancelled` (set by
+   `cancel(call_id)`) and `shutdown_marked` (set by the shutdown drain)
+   independently. `resource_report` filters on `!user_cancelled` so
+   user-cancelled ops drop out immediately, while shutdown-stuck work
+   stays counted.
+
+3. **Single-valued `unclean_reason` → priority-ordered list.**
+   `LocalSystemShutdownReport` now stores
+   `unclean_reasons: Vec<ShutdownUncleanReason>` and exposes both
+   `unclean_reason()` (highest priority, convenience) and
+   `unclean_reasons()` (full list). A shutdown that fails for several
+   reasons surfaces every cause.
+
+4. **Race priority documentation.** A load-bearing doc block on
+   `Runtime::cancel_in_flight_calls_for_shutdown` now pins the
+   priority order (requester stopped/full → shard failed → timeout →
+   full transport/mailbox) and explains how the "exactly one terminal
+   outcome" property is enforced structurally via `in_flight_calls`
+   removal.
+
+5. **Combinatorial DST histories.** Still deferred. The existing
+   simulator and DST suites cover much of the lane-by-lane surface;
+   the specific named combinations from the plan (shutdown + late
+   completion + topology, shard failure + remote full + timeout) are
+   left as the next layer of coverage.
+
+6. **Drop zero-budget shutdown.** Confirmed as the intentional
+   bounded-shutdown design rather than a bug. Lanes' `Drop` impl signals
+   stop without blocking; workers exit when their command channel
+   closes. The doc on `cancel_pending` already names this contract.
+
+7. **`RuntimeError` payload.** `ShutdownUncleanReason::RuntimeError`
+   now wraps `ThreadedRuntimeError`, so callers can read the underlying
+   cause directly from the unclean reason without hopping to
+   `terminal.error()`.
+
+8. **Signal handler chain.** Documented on `OsSignalDispatcher`: the
+   runtime owns SIGINT/SIGTERM capture by registering its own flag
+   handlers, but `signal-hook`'s chained registration design means any
+   pre-existing handler keeps running. Not displaced; not hidden.
+
+After these fixes, `make verify` is clean, all workspace tests pass,
+and the only remaining flagged limitation is the deferred combinatorial
+DST coverage in #5.

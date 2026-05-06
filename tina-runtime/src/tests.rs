@@ -2805,7 +2805,9 @@ fn shutdown_report_runtime_error_outranks_other_unclean_reasons() {
     assert!(!report.clean());
     assert_eq!(
         report.unclean_reason(),
-        Some(ShutdownUncleanReason::RuntimeError),
+        Some(ShutdownUncleanReason::RuntimeError(
+            ThreadedRuntimeError::DriverShutdownFailed
+        )),
     );
 }
 

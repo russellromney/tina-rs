@@ -243,50 +243,61 @@ pub(crate) struct BetelgeuseDriver {
     os_signals: OsSignalDispatcher,
 }
 
-/// Captures process-wide OS signals as flag bits so the runtime step
-/// loop can convert them into runtime-owned signal completions.
+/// Captures process-wide OS signals as per-driver flag bits so the
+/// runtime step loop can convert them into runtime-owned signal
+/// completions.
 ///
 /// Phase 043 Rock 4 contract:
 /// * Unix: register `signal-hook` flag handlers for `SIGINT` and
-///   `SIGTERM`. No async task, no Tokio dependency, no custom unsafe
-///   handler — the flag handlers live entirely inside `signal-hook`.
+///   `SIGTERM` *per driver*, so every `BetelgeuseDriver` running in a
+///   process sees every signal. Registrations are released when the
+///   driver is dropped. No async task, no Tokio dependency, no custom
+///   unsafe handler — the flag handlers live entirely inside
+///   `signal-hook`.
 /// * Non-Unix: the dispatcher is a no-op. `signal_wait` calls for
 ///   "sigint" / "sigterm" still park; they simply never fire from the
 ///   OS and complete via timeout or cancel only.
 ///
-/// The flag state is per-process and lazily initialised, so multiple
-/// `LocalSystem` instances in one process share the same handlers.
+/// Each `BetelgeuseDriver` owns its own dispatcher so a single SIGINT
+/// fans out to every driver's parked `signal_wait` rather than being
+/// consumed by whichever driver polls first.
+///
+/// `signal-hook` chains handlers, so a process that already installed
+/// a `SIGINT` handler before constructing a `BetelgeuseDriver` keeps
+/// running its handler in addition to ours. The runtime assumes it
+/// owns `SIGINT`/`SIGTERM` capture but does not attempt to displace
+/// pre-existing handlers.
 #[cfg(unix)]
-#[derive(Clone)]
 struct OsSignalDispatcher {
     sigint: Arc<AtomicBool>,
     sigterm: Arc<AtomicBool>,
+    sigint_token: Option<signal_hook::SigId>,
+    sigterm_token: Option<signal_hook::SigId>,
 }
 
 #[cfg(not(unix))]
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct OsSignalDispatcher;
 
 #[cfg(unix)]
 impl OsSignalDispatcher {
-    fn shared() -> Self {
-        use std::sync::OnceLock;
-        static STATE: OnceLock<OsSignalDispatcher> = OnceLock::new();
-        STATE
-            .get_or_init(|| {
-                let sigint = Arc::new(AtomicBool::new(false));
-                let sigterm = Arc::new(AtomicBool::new(false));
-                // Best-effort registration. If the process already
-                // installed an incompatible handler the registration
-                // fails; the runtime keeps running with no live signal
-                // capture rather than panic at startup.
-                let _ =
-                    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint));
-                let _ =
-                    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm));
-                Self { sigint, sigterm }
-            })
-            .clone()
+    fn install() -> Self {
+        let sigint = Arc::new(AtomicBool::new(false));
+        let sigterm = Arc::new(AtomicBool::new(false));
+        // Best-effort registration. If the process already installed an
+        // incompatible handler the registration fails; the runtime keeps
+        // running with no live signal capture rather than panic at
+        // startup.
+        let sigint_token =
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint)).ok();
+        let sigterm_token =
+            signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm)).ok();
+        Self {
+            sigint,
+            sigterm,
+            sigint_token,
+            sigterm_token,
+        }
     }
 
     fn consume_sigint(&self) -> bool {
@@ -298,21 +309,35 @@ impl OsSignalDispatcher {
     }
 
     /// Test-only constructor that returns a dispatcher whose flags are
-    /// not registered with the process-wide signal-hook handlers, so a
-    /// test can simulate signal delivery without competing with other
-    /// drivers that share the global state.
+    /// not registered with `signal-hook`, so a test can simulate signal
+    /// delivery without coupling to process-wide state or interfering
+    /// with parallel tests.
     #[cfg(test)]
     fn private_for_test() -> Self {
         Self {
             sigint: Arc::new(AtomicBool::new(false)),
             sigterm: Arc::new(AtomicBool::new(false)),
+            sigint_token: None,
+            sigterm_token: None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OsSignalDispatcher {
+    fn drop(&mut self) {
+        if let Some(token) = self.sigint_token.take() {
+            signal_hook::low_level::unregister(token);
+        }
+        if let Some(token) = self.sigterm_token.take() {
+            signal_hook::low_level::unregister(token);
         }
     }
 }
 
 #[cfg(not(unix))]
 impl OsSignalDispatcher {
-    fn shared() -> Self {
+    fn install() -> Self {
         Self
     }
 
@@ -388,7 +413,14 @@ struct PendingOperation {
     call_id: CallId,
     kind: PendingKind,
     lane: PendingLane,
-    cancelled: bool,
+    /// User explicitly cancelled this op via `cancel(call_id)`. Once
+    /// set, the op no longer counts as a pending driver call: the
+    /// runtime stopped waiting for its result.
+    user_cancelled: bool,
+    /// Shutdown drain blanket-marked this op for backend pointer
+    /// release. Stays counted as a pending driver call so the terminal
+    /// report can name work the lane could not finish in budget.
+    shutdown_marked: bool,
 }
 
 /// One async operation in flight against Betelgeuse.
@@ -693,7 +725,7 @@ impl BetelgeuseDriver {
             signal_capacity: DEFAULT_SIGNAL_CAPACITY,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
-            os_signals: OsSignalDispatcher::shared(),
+            os_signals: OsSignalDispatcher::install(),
         }
     }
 
@@ -715,7 +747,7 @@ impl BetelgeuseDriver {
             signal_capacity,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
             next_timer_ordinal: 0,
-            os_signals: OsSignalDispatcher::shared(),
+            os_signals: OsSignalDispatcher::install(),
         }
     }
 }
@@ -3001,7 +3033,8 @@ impl BetelgeuseTcp {
                         buffer: vec![0; max_len.saturating_add(1)],
                     },
                     lane,
-                    cancelled: false,
+                    user_cancelled: false,
+                    shutdown_marked: false,
                 });
                 None
             }
@@ -3021,7 +3054,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3042,7 +3076,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3067,7 +3102,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3088,7 +3124,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3109,7 +3146,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3130,7 +3168,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3145,7 +3184,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3166,7 +3206,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3187,7 +3228,8 @@ impl BetelgeuseTcp {
                             call_id,
                             kind: pending,
                             lane,
-                            cancelled: false,
+                            user_cancelled: false,
+                            shutdown_marked: false,
                         });
                         None
                     }
@@ -3208,7 +3250,7 @@ impl BetelgeuseTcp {
     fn lane_has_active_pending(&self, lane: PendingLane) -> bool {
         self.pending
             .iter()
-            .any(|op| op.lane == lane && !op.cancelled)
+            .any(|op| op.lane == lane && !op.user_cancelled && !op.shutdown_marked)
     }
 
     fn lane_has_pending(&self, lane: PendingLane) -> bool {
@@ -3240,7 +3282,7 @@ impl BetelgeuseTcp {
         let mut index = 0;
         while index < self.pending.len() {
             let mut op = self.pending.remove(index);
-            if op.cancelled {
+            if op.user_cancelled || op.shutdown_marked {
                 if op.kind.has_result() || op.kind.drops_on_cancel() {
                     continue;
                 }
@@ -3269,17 +3311,22 @@ impl BetelgeuseTcp {
     /// this to decide whether stepping further can produce more
     /// completions.
     fn has_pending(&self) -> bool {
-        self.pending.iter().any(|op| !op.cancelled)
+        self.pending
+            .iter()
+            .any(|op| !op.user_cancelled && !op.shutdown_marked)
     }
 
     /// Cancels pending TCP operations during runtime shutdown.
     ///
     /// Tina emits requester-facing shutdown/cancel trace events from
     /// `Runtime`; TCP state only owns the substrate completion slots and
-    /// resource handles.
+    /// resource handles. Sets `shutdown_marked` rather than the
+    /// user-cancellation flag so stuck work surfaces in the terminal
+    /// report's `pending_driver_call_count` while user-cancelled work
+    /// stays correctly excluded.
     fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError> {
         for op in &mut self.pending {
-            op.cancelled = true;
+            op.shutdown_marked = true;
         }
         self.io_loop
             .cancel_pending_completions()
@@ -3296,11 +3343,11 @@ impl BetelgeuseTcp {
         let Some(index) = self
             .pending
             .iter()
-            .position(|op| op.call_id == call_id && !op.cancelled)
+            .position(|op| op.call_id == call_id && !op.user_cancelled)
         else {
             return false;
         };
-        self.pending[index].cancelled = true;
+        self.pending[index].user_cancelled = true;
         true
     }
 
@@ -3315,10 +3362,12 @@ impl BetelgeuseTcp {
             streams: self.streams.len(),
             udp_sockets: self.udp_sockets.len(),
             files: self.files.len(),
-            // Count physical entries so cancelled-but-undrained pending
-            // ops, including any work the backend still owns after a
-            // bounded shutdown, stay visible. See Phase 043 Rock 2/3.
-            pending_calls: self.pending.len(),
+            // Count entries the runtime is still waiting on. User-cancelled
+            // work no longer counts (the runtime stopped waiting); stuck
+            // shutdown-marked work does count so the terminal report can
+            // name it. See Phase 043 Rock 2/3 plus the hostile review fix
+            // for the previous "transient flicker" concern.
+            pending_calls: self.pending.iter().filter(|op| !op.user_cancelled).count(),
             ..DriverResourceReport::default()
         }
     }

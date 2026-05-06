@@ -755,6 +755,27 @@ where
         self.enforce_trace_retention();
     }
 
+    /// Cancels every in-flight runtime-owned call ahead of shutdown.
+    ///
+    /// The terminal-outcome priority for any call that could resolve
+    /// multiple ways is fixed:
+    /// 1. **requester stopped/full**: a stopped or full requester wins
+    ///    its local completion path (the in-flight-call entry was
+    ///    already removed when the requester stopped, so any later
+    ///    completion routes through `RequesterClosed` tombstoning).
+    /// 2. **shard failed**: a failed source/destination shard wins over
+    ///    a later success because [`LiveShardState::Failed`] gates
+    ///    ingress and the worker thread has stopped delivering.
+    /// 3. **timeout**: a deadline that fired before the failure was
+    ///    observed wins the call's result via `CallError::Timeout`.
+    /// 4. **full transport/mailbox**: full reasons only stick when no
+    ///    higher-priority terminal state already exists.
+    ///
+    /// The "exactly one terminal outcome" property is enforced
+    /// structurally by the `in_flight_calls` map: the first terminal
+    /// event removes the entry; subsequent attempts hit a missing
+    /// call_id and tombstone (or get dropped at the lane's
+    /// `finish_completion` when the user-cancelled flag is set).
     fn cancel_in_flight_calls_for_shutdown(
         &mut self,
         deadline: Instant,
@@ -3638,10 +3659,15 @@ pub struct LocalSystemTerminalReport {
 
 /// Why a shutdown is unclean.
 ///
-/// Highest-priority reason wins, matching the order in
-/// [`LocalSystemShutdownReport::unclean_reason`]:
+/// Multiple reasons may apply to one shutdown — for example, a runtime
+/// error plus remaining worker-held resources. The terminal report
+/// surfaces the full set in priority order via
+/// [`LocalSystemShutdownReport::unclean_reasons`]:
 /// runtime error > failed shard > final state not Closed >
 /// remaining worker-held > remaining pending call > remaining table-owned.
+/// [`unclean_reason`](LocalSystemShutdownReport::unclean_reason) keeps
+/// the convenience single-reason accessor for callers that only need the
+/// most significant cause.
 ///
 /// Not exhaustive: future variants may be added; pattern matches should
 /// handle the catchall.
@@ -3649,8 +3675,8 @@ pub struct LocalSystemTerminalReport {
 #[non_exhaustive]
 pub enum ShutdownUncleanReason {
     /// A worker thread or driver returned a terminal error before clean
-    /// shutdown completed.
-    RuntimeError,
+    /// shutdown completed. The wrapped value names the underlying error.
+    RuntimeError(ThreadedRuntimeError),
     /// At least one shard ended in [`LiveShardState::Failed`].
     FailedShards,
     /// The system did not reach [`LocalSystemState::Closed`] before the
@@ -3679,7 +3705,7 @@ pub struct LocalSystemShutdownReport {
     remaining_owned_resource_count: usize,
     remaining_worker_held_resource_count: usize,
     remaining_pending_driver_call_count: usize,
-    unclean_reason: Option<ShutdownUncleanReason>,
+    unclean_reasons: Vec<ShutdownUncleanReason>,
 }
 
 impl LocalSystemShutdownReport {
@@ -3727,24 +3753,30 @@ impl LocalSystemShutdownReport {
                     .sum()
             })
             .unwrap_or_default();
-        let unclean_reason = if error.is_some() {
-            Some(ShutdownUncleanReason::RuntimeError)
-        } else if !failed_shards.is_empty() {
-            Some(ShutdownUncleanReason::FailedShards)
-        } else if state != LocalSystemState::Closed {
-            Some(ShutdownUncleanReason::NotClosed)
-        } else if remaining_worker_held_resource_count > 0 {
-            Some(ShutdownUncleanReason::WorkerHeldResourcesRemaining)
-        } else if remaining_pending_driver_call_count > 0 {
-            Some(ShutdownUncleanReason::PendingDriverCallsRemaining)
-        } else if remaining_owned_resource_count > 0 {
-            Some(ShutdownUncleanReason::OwnedResourcesRemaining)
-        } else {
-            None
-        };
+        // Collect every applicable unclean reason in priority order so
+        // callers can see the full picture, not just the first cause.
+        let mut unclean_reasons = Vec::new();
+        if let Some(error) = error {
+            unclean_reasons.push(ShutdownUncleanReason::RuntimeError(error));
+        }
+        if !failed_shards.is_empty() {
+            unclean_reasons.push(ShutdownUncleanReason::FailedShards);
+        }
+        if state != LocalSystemState::Closed {
+            unclean_reasons.push(ShutdownUncleanReason::NotClosed);
+        }
+        if remaining_worker_held_resource_count > 0 {
+            unclean_reasons.push(ShutdownUncleanReason::WorkerHeldResourcesRemaining);
+        }
+        if remaining_pending_driver_call_count > 0 {
+            unclean_reasons.push(ShutdownUncleanReason::PendingDriverCallsRemaining);
+        }
+        if remaining_owned_resource_count > 0 {
+            unclean_reasons.push(ShutdownUncleanReason::OwnedResourcesRemaining);
+        }
         Self {
             final_state: state,
-            clean: unclean_reason.is_none(),
+            clean: unclean_reasons.is_empty(),
             canceled_count: summary.call_completion_rejected,
             tombstoned_count: summary.call_reply_rejected,
             rejected_after_drain_count: summary.send_rejected,
@@ -3752,7 +3784,7 @@ impl LocalSystemShutdownReport {
             remaining_owned_resource_count,
             remaining_worker_held_resource_count,
             remaining_pending_driver_call_count,
-            unclean_reason,
+            unclean_reasons,
         }
     }
 
@@ -3802,13 +3834,22 @@ impl LocalSystemShutdownReport {
         self.remaining_pending_driver_call_count
     }
 
-    /// Typed reason this shutdown is unclean, if any.
+    /// Highest-priority typed reason this shutdown is unclean.
     ///
-    /// `None` iff [`clean`](Self::clean) is `true`. The reason is the
-    /// highest-priority condition observed at shutdown; see
-    /// [`ShutdownUncleanReason`] for the priority order.
-    pub const fn unclean_reason(&self) -> Option<ShutdownUncleanReason> {
-        self.unclean_reason
+    /// `None` iff [`clean`](Self::clean) is `true`. Use
+    /// [`unclean_reasons`](Self::unclean_reasons) for the full list.
+    /// See [`ShutdownUncleanReason`] for priority ordering.
+    pub fn unclean_reason(&self) -> Option<ShutdownUncleanReason> {
+        self.unclean_reasons.first().copied()
+    }
+
+    /// Every applicable unclean-shutdown reason in priority order.
+    ///
+    /// Empty iff [`clean`](Self::clean) is `true`. A shutdown can be
+    /// unclean for several reasons at once (for example, a runtime error
+    /// plus stuck worker-held resources); this list shows every one.
+    pub fn unclean_reasons(&self) -> &[ShutdownUncleanReason] {
+        &self.unclean_reasons
     }
 }
 
