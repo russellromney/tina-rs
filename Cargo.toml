@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "tina",
+    "tina-http",
     "tina-macros",
     "tina-mailbox-spsc",
     "tina-runtime",
