@@ -2048,11 +2048,33 @@ fn local_system_shutdown_reports_in_flight_tls_handshake_resource() {
         .expect("parse bound addr");
     let raw = TcpStream::connect(addr).expect("connect raw tcp to tls listener");
 
+    wait_until(|| {
+        let topology = app.topology();
+        let shard = topology
+            .shard(ShardId::new(46))
+            .expect("tls in-flight shard");
+        shard.worker_held_resource_count() > 0 && shard.pending_driver_call_count() > 0
+    });
+
     let terminal = app.shutdown().drain().join_report();
     assert!(!terminal.shutdown_report().clean());
     assert!(
         terminal.shutdown_report().remaining_owned_resource_count() >= 1,
         "shutdown must not claim zero while TLS worker still owns accept/handshake resource"
+    );
+    assert!(
+        terminal
+            .shutdown_report()
+            .remaining_worker_held_resource_count()
+            >= 1,
+        "shutdown must report TLS worker-held resource clones while handshake is stuck"
+    );
+    assert!(
+        terminal
+            .shutdown_report()
+            .remaining_pending_driver_call_count()
+            >= 1,
+        "shutdown must report the stuck TLS accept/handshake call"
     );
     drop(raw);
 }
@@ -2146,7 +2168,9 @@ fn local_system_shutdown_signal_rail_delivers_message_before_stop() {
     app.try_send(address, SignalUnsupportedMsg::Start)
         .expect("start signal service");
     wait_until(|| {
-        app.trace().expect("trace snapshot").iter().any(|event| {
+        let trace = app.trace();
+        assert!(trace.is_complete());
+        trace.events().iter().any(|event| {
             matches!(
                 event.kind(),
                 RuntimeEventKind::CallDispatchAttempted {
@@ -2717,7 +2741,9 @@ fn live_cross_shard_isolate_call_destination_closed_returns_typed_closed() {
     app.try_send(worker, CrossShardCallWorkerMsg::Stop)
         .expect("stop cross shard worker");
     wait_until(|| {
-        app.trace().expect("trace snapshot").iter().any(|event| {
+        let trace = app.trace();
+        assert!(trace.is_complete());
+        trace.events().iter().any(|event| {
             event.shard() == ShardId::new(52)
                 && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
         })
@@ -2907,6 +2933,121 @@ fn failed_shard_rejects_later_ingress_to_existing_isolate() {
 }
 
 #[test]
+fn failed_shard_cross_shard_call_returns_one_closed_outcome() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::<AppShard, CapacityPanicMailboxFactory>::multi_shard(
+        CapacityPanicMailboxFactory { panic_capacity: 13 },
+    )
+    .shard(AppShard(83))
+    .shard(AppShard(84))
+    .ingress_capacity(8)
+    .trace_retention(TraceRetention::Bounded(256))
+    .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(84),
+            CrossShardCallWorker,
+            8,
+        )
+        .expect("register worker before shard failure");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(83),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register healthy client");
+
+    assert_eq!(
+        app.register_root_on::<LlamaService, Infallible>(
+            ShardId::new(84),
+            LlamaService {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            },
+            13,
+        ),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    app.try_send(client, CrossShardCallClientMsg::Start(worker))
+        .expect("healthy client accepts call command");
+
+    wait_until(|| !outcomes.lock().expect("failed call outcomes").is_empty());
+    let outcomes = outcomes.lock().expect("failed call outcomes").clone();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "call to failed shard must produce exactly one terminal outcome"
+    );
+    assert!(matches!(outcomes[0], CallOutcome::Closed));
+    let terminal = app.shutdown().drain().join_report();
+    assert_eq!(terminal.state(), LocalSystemState::Failed);
+}
+
+#[test]
+fn timeout_before_later_shard_failure_keeps_timeout_outcome() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::<AppShard, CapacityPanicMailboxFactory>::multi_shard(
+        CapacityPanicMailboxFactory { panic_capacity: 13 },
+    )
+    .shard(AppShard(85))
+    .shard(AppShard(86))
+    .ingress_capacity(8)
+    .trace_retention(TraceRetention::Bounded(256))
+    .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(86),
+            CrossShardCallWorker,
+            8,
+        )
+        .expect("register no-reply worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(85),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register timeout client");
+
+    app.try_send(client, CrossShardCallClientMsg::StartTimeout(worker))
+        .expect("start timeout call");
+    wait_until(|| {
+        outcomes
+            .lock()
+            .expect("timeout outcomes")
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Timeout))
+    });
+
+    assert_eq!(
+        app.register_root_on::<LlamaService, Infallible>(
+            ShardId::new(86),
+            LlamaService {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            },
+            13,
+        ),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+
+    let outcomes = outcomes.lock().expect("timeout outcomes").clone();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "later shard failure must not add a second terminal outcome"
+    );
+    assert!(matches!(outcomes[0], CallOutcome::Timeout));
+    let terminal = app.shutdown().drain().join_report();
+    assert_eq!(terminal.state(), LocalSystemState::Failed);
+}
+
+#[test]
 fn failed_worker_marks_one_shard_failed_and_rejects_later_work() {
     let right_seen = Arc::new(Mutex::new(Vec::new()));
     let app = LocalSystem::<AppShard, CapacityPanicMailboxFactory>::multi_shard(
@@ -2957,10 +3098,31 @@ fn failed_worker_marks_one_shard_failed_and_rejects_later_work() {
     app.try_send(right, LlamaMsg::Feed(99))
         .expect("healthy shard still accepts ingress");
     wait_until(|| right_seen.lock().expect("right seen lock").as_slice() == [99]);
+    assert_eq!(
+        app.complete_trace(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    let trace = app.trace();
+    assert!(trace.is_partial());
+    assert!(
+        trace
+            .events()
+            .iter()
+            .any(|event| event.shard() == ShardId::new(46)),
+        "best-effort live trace should preserve events from healthy shards after one shard fails"
+    );
+    assert_eq!(trace.missing_shards(), &[ShardId::new(45)]);
 
     let terminal = app.shutdown().drain().join_report();
     assert_eq!(terminal.state(), LocalSystemState::Failed);
     assert_eq!(terminal.error(), Some(ThreadedRuntimeError::WorkerStopped));
+    assert!(
+        terminal
+            .trace()
+            .iter()
+            .any(|event| event.shard() == ShardId::new(46)),
+        "failed terminal report should retain partial trace from shards that shut down cleanly"
+    );
     let terminal_topology = terminal.topology().expect("terminal topology");
     assert_eq!(
         terminal_topology

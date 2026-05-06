@@ -872,9 +872,9 @@ fn local_system_ingress_handoff_allocation_count_is_pinned_on_caller_thread() {
         .register_root::<AllocationSink, Infallible>(AllocationSink, 8)
         .expect("sink register accepts");
 
-    let warmup_trace_len = app.trace().expect("trace snapshot").len();
+    let warmup_trace_len = app.complete_trace().expect("trace snapshot").len();
     app.try_send(sink, AllocationEvent::Arrived).unwrap();
-    wait_until(|| app.trace().expect("trace snapshot").len() > warmup_trace_len);
+    wait_until(|| app.complete_trace().expect("trace snapshot").len() > warmup_trace_len);
 
     let handoff = measure_allocations(|| {
         app.try_send(sink, AllocationEvent::Arrived).unwrap();

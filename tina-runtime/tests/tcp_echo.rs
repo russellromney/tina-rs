@@ -735,7 +735,7 @@ fn run_betelgeuse_echo_scenario(
     });
 
     wait_until(timeout, "Betelgeuse listener stop", || {
-        let trace = runtime.trace().expect("Betelgeuse trace");
+        let trace = runtime.complete_trace().expect("Betelgeuse trace");
         trace.iter().any(|event| {
             event.isolate() == listener_addr.isolate()
                 && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
@@ -877,7 +877,7 @@ fn run_threaded_simulated_betelgeuse_echo_scenario(
         Duration::from_secs(2),
         "threaded simulated echo close",
         || {
-            let trace = runtime.trace().expect("trace query succeeds");
+            let trace = runtime.complete_trace().expect("trace query succeeds");
             trace.iter().any(|event| {
                 event.isolate() == listener_addr.isolate()
                     && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
@@ -1210,7 +1210,7 @@ fn threaded_runtime_surfaces_closed_mailbox_after_stop() {
         .expect("stop message accepts");
 
     wait_until(Duration::from_secs(2), "Betelgeuse stop", || {
-        let trace = runtime.trace().expect("Betelgeuse trace");
+        let trace = runtime.complete_trace().expect("Betelgeuse trace");
         trace.iter().any(|event| {
             event.isolate() == listener_addr.isolate()
                 && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
@@ -1245,7 +1245,7 @@ fn threaded_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
         .expect("listener start handoff accepted");
 
     wait_until(Duration::from_secs(2), "Betelgeuse accept pending", || {
-        let trace = runtime.trace().expect("Betelgeuse trace");
+        let trace = runtime.complete_trace().expect("Betelgeuse trace");
         trace.iter().any(|event| {
             event.isolate() == listener_addr.isolate()
                 && matches!(
@@ -1348,7 +1348,7 @@ fn threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() 
 
     wake_tx.send(()).expect("release parked handler");
     wait_until(Duration::from_secs(2), "Betelgeuse ingress drain", || {
-        let trace = runtime.trace().expect("Betelgeuse trace");
+        let trace = runtime.complete_trace().expect("Betelgeuse trace");
         trace
             .iter()
             .filter(|event| event.isolate() == blocking_addr.isolate())

@@ -416,7 +416,7 @@ fn run_send_stop_betelgeuse() -> (Vec<u8>, Vec<RuntimeEvent>) {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while observed.lock().expect("observed mutex").as_slice() != [1, 2]
-        || closed_rejections(&runtime.trace().unwrap_or_default()) < 2
+        || closed_rejections(runtime.trace().events()) < 2
     {
         if Instant::now() > deadline {
             panic!(

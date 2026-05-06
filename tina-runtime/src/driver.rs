@@ -284,19 +284,21 @@ impl OsSignalDispatcher {
     fn install() -> Self {
         let sigint = Arc::new(AtomicBool::new(false));
         let sigterm = Arc::new(AtomicBool::new(false));
-        // Best-effort registration. If the process already installed an
-        // incompatible handler the registration fails; the runtime keeps
-        // running with no live signal capture rather than panic at
-        // startup.
+        // Signal capture is a Tina capability, not a hidden maybe. If
+        // installation fails on a supported platform, fail loudly instead
+        // of letting `os_signal_capture_supported()` claim support while
+        // no signal can ever arrive.
         let sigint_token =
-            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint)).ok();
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))
+                .expect("failed to install Tina SIGINT handler");
         let sigterm_token =
-            signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm)).ok();
+            signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))
+                .expect("failed to install Tina SIGTERM handler");
         Self {
             sigint,
             sigterm,
-            sigint_token,
-            sigterm_token,
+            sigint_token: Some(sigint_token),
+            sigterm_token: Some(sigterm_token),
         }
     }
 
@@ -3328,12 +3330,16 @@ impl BetelgeuseTcp {
         for op in &mut self.pending {
             op.shutdown_marked = true;
         }
-        self.io_loop
+        let cancel_result = self
+            .io_loop
             .cancel_pending_completions()
-            .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions)?;
+            .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions);
         self.close_all_resources();
         self.drain_cancelled_pending_for_shutdown(deadline);
-        if !self.pending.is_empty() || self.io_loop.pending_completion_count() != 0 {
+        if cancel_result.is_err()
+            || !self.pending.is_empty()
+            || self.io_loop.pending_completion_count() != 0
+        {
             return Err(DriverShutdownError::BackendStillOwnsCompletions);
         }
         Ok(())

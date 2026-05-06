@@ -318,18 +318,21 @@ fn run_live_topology_history(history: &History<TopologyOp>) -> TopologyProjectio
                 app.try_send(target, TargetMsg::Stop)
                     .expect("live stop handoff");
                 wait_until("live target stopped", || {
-                    app.trace().expect("live trace").iter().any(|event| {
-                        event.shard() == ShardId::new(2)
-                            && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
-                    })
+                    app.complete_trace()
+                        .expect("live trace")
+                        .iter()
+                        .any(|event| {
+                            event.shard() == ShardId::new(2)
+                                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                        })
                 });
             }
             TopologyOp::CrossShard(value) => {
-                let before = send_rejected_closed(&app.trace().expect("live trace"));
+                let before = send_rejected_closed(&app.complete_trace().expect("live trace"));
                 app.try_send(source, SourceMsg::Send(value))
                     .expect("live source handoff");
                 wait_until("live closed rejection", || {
-                    send_rejected_closed(&app.trace().expect("live trace")) > before
+                    send_rejected_closed(&app.complete_trace().expect("live trace")) > before
                 });
                 if !saw_rejection {
                     saw_rejection = true;

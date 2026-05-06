@@ -498,8 +498,7 @@ and shutdown paths for the named lanes, and `ROADMAP.md` /
 
 # Hostile-Review Fixes
 
-Each numbered finding above has now been addressed, except #5 which
-remains a flagged "next layer".
+Each numbered finding above has now been addressed.
 
 1. **Shared signal flag → per-driver registration.** Each
    `BetelgeuseDriver` calls `OsSignalDispatcher::install()` and gets its
@@ -530,11 +529,11 @@ remains a flagged "next layer".
    outcome" property is enforced structurally via `in_flight_calls`
    removal.
 
-5. **Combinatorial DST histories.** Still deferred. The existing
-   simulator and DST suites cover much of the lane-by-lane surface;
-   the specific named combinations from the plan (shutdown + late
-   completion + topology, shard failure + remote full + timeout) are
-   left as the next layer of coverage.
+5. **Combinatorial DST histories.** Added a named cross-shard call DST
+   history that combines timeout, bounded remote Full, and closed-target
+   outcomes in one replayed history. Existing TCP cancellation DST covers
+   late completions after cancellation under delayed completion faults,
+   and Timmerhus topology DST covers topology/closed-target projection.
 
 6. **Drop zero-budget shutdown.** Confirmed as the intentional
    bounded-shutdown design rather than a bug. Lanes' `Drop` impl signals
@@ -551,6 +550,68 @@ remains a flagged "next layer".
    handlers, but `signal-hook`'s chained registration design means any
    pre-existing handler keeps running. Not displaced; not hidden.
 
-After these fixes, `make verify` is clean, all workspace tests pass,
-and the only remaining flagged limitation is the deferred combinatorial
-DST coverage in #5.
+After these fixes, `make verify` is clean and all workspace tests pass.
+
+# Codex Hostile Review Follow-up
+
+Second hostile review found six issues in the first fix pass:
+
+1. TCP shutdown returned immediately when backend cancellation failed, before
+   closing resources or draining/tombstoning pending completion slots.
+2. Failed shutdown published stale resource counts because worker metrics were
+   updated only on successful driver shutdown.
+3. Required DST proof was being deferred while the phase claimed Done.
+4. Failed-shard priority was mostly documented, not directly exercised.
+5. Unix signal registration silently ignored install failure while claiming OS
+   signal support.
+6. TLS shutdown e2e asserted table-owned count but not worker-held or
+   pending-call accounting.
+
+Fixes landed:
+
+- `BetelgeuseTcp::cancel_pending` now records cancellation failure but still
+  closes resources and runs the bounded drain before returning the typed error.
+- Runtime worker loops now publish final resource counts even when driver
+  shutdown fails.
+- Shutdown cancellation clears/tombstones runtime in-flight calls even when the
+  driver reports a shutdown error.
+- Unix signal registration is loud: supported platforms either install
+  handlers or fail startup instead of silently losing the signal rail.
+- TLS live shutdown test now proves live and terminal worker-held /
+  pending-driver-call counts.
+- Live failed-shard tests now prove call-to-failed-shard returns exactly one
+  Closed outcome, and timeout-before-later-failure stays Timeout.
+- DST gained a named cross-shard call history covering timeout + remote Full +
+  closed target in one replayed matrix.
+- Follow-up traceability fix: live `trace()` now returns a `TraceSnapshot`
+  instead of failing the observability path. The snapshot carries retained
+  events plus `is_complete()`, `is_partial()`, and `missing_shards()`. Strict
+  `complete_trace()` remains available when a caller needs proof that every
+  shard reported. Failed terminal shutdown reports retain partial trace instead
+  of returning an empty trace. A regression test proves the healthy shard's
+  trace survives a sibling worker failure.
+- Behavior-review fix: worker joins now return trace plus optional error rather
+  than `Result<trace, error>`. This prevents both single-shard and multi-shard
+  shutdown failures from discarding already-retained trace at the exact moment
+  the terminal report needs it most.
+- Low-level behavior fix: `ThreadedRuntime` and `ThreadedMultiShardRuntime`
+  now expose `shutdown_report()` too. The older `shutdown()` remains the simple
+  `Result<trace, error>` path, but users who need terminal truth can get trace,
+  topology, resource counts, and error together without moving up to
+  `LocalSystem`.
+- Added lower-level multi-shard e2e pressure: one worker fails after a sibling
+  has emitted useful trace. The test now proves `complete_trace()` errors,
+  default `trace()` still returns healthy-shard events with missing-shard
+  metadata, and low-level `shutdown_report()` returns error + retained trace +
+  failed/stopped topology.
+
+Test lesson for future lifecycle work:
+
+- Every terminal API should have three proofs: clean exit, driver-shutdown
+  failure after useful trace exists, and one-shard-failed while sibling work
+  still has useful trace.
+- DST histories should combine fault + topology + late/terminal observation,
+  not only ordinary message outcomes. Timmerhus-style projection tests are the
+  right shape for live/sim comparison; Betelgeuse substrate e2e is the right
+  shape for OS-thread failure and driver failure that the simulator cannot
+  create directly.

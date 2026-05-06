@@ -830,6 +830,48 @@ fn seeded_random_cross_shard_call_histories_replay_and_cover_reply_paths() {
 }
 
 #[test]
+fn dst_cross_shard_call_history_combines_timeout_remote_full_and_closed() {
+    let history = History::new(
+        "cross-shard call timeout full closed matrix",
+        43043,
+        vec![
+            CrossCallOp::NoReply(0),
+            CrossCallOp::Step,
+            CrossCallOp::Burst(10),
+            CrossCallOp::Step,
+            CrossCallOp::StopWorker,
+            CrossCallOp::RunUntilIdle,
+            CrossCallOp::Ask(99),
+            CrossCallOp::RunUntilIdle,
+        ],
+    );
+    let run = assert_replays(&history, |history| {
+        run_random_cross_shard_call_history(history.seed(), history.operations())
+    });
+    let trace = run.artifact().event_record();
+    InvariantSuite::standard().assert(trace);
+
+    assert!(
+        run.output()
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Timeout)),
+        "history must include requester timeout"
+    );
+    assert!(
+        run.output()
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Full)),
+        "history must include bounded remote Full"
+    );
+    assert!(
+        run.output()
+            .iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Closed)),
+        "history must include closed failed-target outcome"
+    );
+}
+
+#[test]
 fn cross_shard_call_transport_full_shrinks_to_small_reproducer() {
     let noisy = History::new(
         "cross-shard call full shrink",

@@ -729,7 +729,7 @@ fn assert_listener_stopped_and_idle(
     label: &str,
 ) {
     wait_until(Duration::from_secs(2), label, || {
-        let trace = runtime.trace().expect("trace query succeeds");
+        let trace = runtime.complete_trace().expect("trace query succeeds");
         trace.iter().any(|event| {
             event.isolate() == listener.isolate()
                 && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
@@ -1412,7 +1412,7 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
         .try_send(long_work, LongWorkMsg::Start { worker })
         .expect("long work start handoff accepts");
     wait_until(Duration::from_secs(2), "server-shaped pending work", || {
-        let trace = runtime.trace().expect("trace query succeeds");
+        let trace = runtime.complete_trace().expect("trace query succeeds");
         runtime
             .has_in_flight_calls()
             .expect("in-flight query succeeds")
@@ -1521,7 +1521,7 @@ fn local_server_shutdown_cancels_pending_write_work() {
         .expect("write-shutdown peer connects");
 
     wait_until(Duration::from_secs(2), "pending write dispatched", || {
-        let trace = runtime.trace().expect("trace query succeeds");
+        let trace = runtime.complete_trace().expect("trace query succeeds");
         runtime
             .has_in_flight_calls()
             .expect("in-flight query succeeds")

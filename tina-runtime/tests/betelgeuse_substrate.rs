@@ -287,7 +287,9 @@ fn threaded_runtime_honors_bounded_trace_retention() {
             .contains(&RetryObservation::Succeeded(2))
     });
 
-    let trace = runtime.trace().expect("trace snapshot");
+    let trace = runtime.trace();
+    assert!(trace.is_complete());
+    let trace = trace.events();
     assert_eq!(trace.len(), 5);
     assert!(trace.first().expect("retained first event").id().get() > 1);
     assert!(trace.windows(2).all(|pair| pair[0].id() < pair[1].id()));
@@ -508,6 +510,8 @@ struct StuckReleaseIo {
 struct StuckReleaseState {
     local_addr: Option<SocketAddr>,
     pending_completion_count: usize,
+    close_count: usize,
+    cancel_error: bool,
 }
 
 impl StuckReleaseIo {
@@ -568,7 +572,9 @@ impl IOSocket for StuckReleaseSocket {
         Ok(())
     }
 
-    fn close(&self) {}
+    fn close(&self) {
+        self.state.lock().expect("stuck io mutex").close_count += 1;
+    }
 }
 
 impl IO for StuckReleaseIo {
@@ -609,6 +615,9 @@ impl IOLoop for StuckReleaseIo {
     }
 
     fn cancel_pending_completions(&self) -> io::Result<()> {
+        if self.state.lock().expect("stuck io mutex").cancel_error {
+            return Err(io::Error::other("test backend refused cancellation"));
+        }
         Ok(())
     }
 }
@@ -662,12 +671,138 @@ fn threaded_runtime_shutdown_reports_driver_release_failure() {
     );
 }
 
+#[test]
+fn threaded_runtime_shutdown_report_keeps_trace_on_driver_release_failure() {
+    let stuck_io = StuckReleaseIo::default();
+    let io_for_worker = stuck_io.clone();
+    let runtime = ThreadedRuntime::with_config_and_io_loop_factory(
+        TestShard,
+        TestMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+        move || io_for_worker.loop_handle(),
+    );
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let worker = runtime
+        .register_with_capacity::<TcpAcceptWorker, _>(
+            TcpAcceptWorker {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+                published: Arc::clone(&published),
+                listener: None,
+                observed,
+            },
+            8,
+        )
+        .expect("Betelgeuse register accepts");
+
+    runtime
+        .try_send(worker, TcpAcceptMsg::Bind)
+        .expect("bind handoff accepted");
+    wait_until(Duration::from_secs(2), "stuck bind published", || {
+        published.lock().expect("published addr mutex").is_some()
+    });
+    runtime
+        .try_send(worker, TcpAcceptMsg::StartAccept)
+        .expect("accept handoff accepted");
+    wait_until(Duration::from_secs(2), "stuck accept pending", || {
+        runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+
+    let report = runtime.shutdown_report();
+    assert_eq!(
+        report.error(),
+        Some(ThreadedRuntimeError::DriverShutdownFailed)
+    );
+    assert!(
+        !report.trace().is_empty(),
+        "failed low-level shutdown report must retain trace collected before driver failure"
+    );
+    assert!(
+        report.shutdown_report().unclean_reason().is_some(),
+        "failed low-level shutdown report must keep unclean accounting"
+    );
+}
+
+#[test]
+fn threaded_runtime_shutdown_still_closes_resources_when_backend_cancel_fails() {
+    let stuck_io = StuckReleaseIo::default();
+    stuck_io.state.lock().expect("stuck io mutex").cancel_error = true;
+    let io_for_worker = stuck_io.clone();
+    let runtime = ThreadedRuntime::with_config_and_io_loop_factory(
+        TestShard,
+        TestMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+        move || io_for_worker.loop_handle(),
+    );
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let worker = runtime
+        .register_with_capacity::<TcpAcceptWorker, _>(
+            TcpAcceptWorker {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback parse"),
+                published: Arc::clone(&published),
+                listener: None,
+                observed,
+            },
+            8,
+        )
+        .expect("Betelgeuse register accepts");
+
+    runtime
+        .try_send(worker, TcpAcceptMsg::Bind)
+        .expect("bind handoff accepted");
+    wait_until(Duration::from_secs(2), "stuck bind published", || {
+        published.lock().expect("published addr mutex").is_some()
+    });
+    runtime
+        .try_send(worker, TcpAcceptMsg::StartAccept)
+        .expect("accept handoff accepted");
+    wait_until(Duration::from_secs(2), "stuck accept pending", || {
+        runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+
+    assert_eq!(
+        runtime.shutdown(),
+        Err(ThreadedRuntimeError::DriverShutdownFailed)
+    );
+    assert!(
+        stuck_io.state.lock().expect("stuck io mutex").close_count > 0,
+        "resource close must run even when backend cancel reports failure"
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PanickingMailboxFactory;
 
 impl MailboxFactory for PanickingMailboxFactory {
     fn create<T: 'static>(&self, _capacity: usize) -> Box<dyn Mailbox<T>> {
         panic!("test mailbox factory panic")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CapacityPanicMailboxFactory {
+    panic_capacity: usize,
+}
+
+impl MailboxFactory for CapacityPanicMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        if capacity == self.panic_capacity {
+            panic!("test mailbox factory panic for capacity {capacity}");
+        }
+        Box::new(TestMailbox::new(capacity))
     }
 }
 
@@ -679,7 +814,13 @@ fn threaded_runtime_worker_panic_returns_typed_handle_error() {
         runtime.register_with_capacity::<LongTimer, _>(LongTimer, 8),
         Err(ThreadedRuntimeError::WorkerStopped)
     );
-    assert_eq!(runtime.trace(), Err(ThreadedRuntimeError::WorkerStopped));
+    assert_eq!(
+        runtime.complete_trace(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    let trace = runtime.trace();
+    assert!(trace.is_partial());
+    assert_eq!(trace.missing_shards(), &[ShardId::new(61)]);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -749,8 +890,9 @@ fn threaded_runtime_local_mailbox_full_is_visible_in_trace() {
         .expect("driver handoff accepted");
 
     wait_until(Duration::from_secs(2), "Betelgeuse local full", || {
-        let trace = runtime.trace().expect("Betelgeuse trace");
-        trace.iter().any(|event| {
+        let trace = runtime.trace();
+        assert!(trace.is_complete());
+        trace.events().iter().any(|event| {
             matches!(
                 event.kind(),
                 RuntimeEventKind::SendRejected {
@@ -1036,6 +1178,83 @@ fn threaded_multishard_bad_remote_does_not_poison_good_remote_work() {
             )
     }));
     assert!(has_send_accepted_between(&trace, 2, 1));
+}
+
+#[test]
+fn threaded_multishard_shutdown_report_keeps_trace_after_one_worker_fails() {
+    let runtime = ThreadedMultiShardRuntime::with_config(
+        [WorkShard(1), WorkShard(2)],
+        CapacityPanicMailboxFactory { panic_capacity: 13 },
+        ThreadedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let sink = runtime
+        .register_with_capacity_on::<WorkSink, _>(ShardId::new(2), WorkSink, 8)
+        .expect("healthy shard register accepts");
+    runtime
+        .try_send(sink, SinkMsg::Hit)
+        .expect("healthy shard handoff accepted");
+    wait_until(
+        Duration::from_secs(2),
+        "healthy shard records trace before sibling failure",
+        || {
+            runtime
+                .trace_on(ShardId::new(2))
+                .expect("healthy shard trace")
+                .iter()
+                .any(|event| {
+                    event.shard() == ShardId::new(2)
+                        && matches!(event.kind(), RuntimeEventKind::HandlerFinished { .. })
+                })
+        },
+    );
+
+    assert!(matches!(
+        runtime.register_with_capacity_on::<WorkSink, _>(ShardId::new(1), WorkSink, 13),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
+    assert_eq!(
+        runtime.complete_trace(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    let trace = runtime.trace();
+    assert!(trace.is_partial());
+    assert!(
+        trace
+            .events()
+            .iter()
+            .any(|event| event.shard() == ShardId::new(2)),
+        "best-effort trace should retain healthy shard events after sibling failure"
+    );
+    assert_eq!(trace.missing_shards(), &[ShardId::new(1)]);
+
+    let report = runtime.shutdown_report();
+    assert_eq!(report.error(), Some(ThreadedRuntimeError::WorkerStopped));
+    assert!(
+        report
+            .trace()
+            .iter()
+            .any(|event| event.shard() == ShardId::new(2)),
+        "failed low-level multishard report must retain healthy shard trace"
+    );
+    let topology = report.topology().expect("terminal topology");
+    assert_eq!(
+        topology
+            .shard(ShardId::new(1))
+            .expect("failed shard")
+            .state(),
+        tina_runtime::LiveShardState::Failed
+    );
+    assert_eq!(
+        topology
+            .shard(ShardId::new(2))
+            .expect("healthy shard")
+            .state(),
+        tina_runtime::LiveShardState::Stopped
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

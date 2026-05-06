@@ -31,12 +31,22 @@ This file records completed work.
 - Hardened threaded `try_send` (single-shard and multi-shard) so a
   `Failed` shard rejects ingress immediately with `WorkerStopped` instead
   of relying on the bounded sync channel to observe `Disconnected`.
+- Changed live `trace()` to return a `TraceSnapshot`: default observation now
+  keeps retained events even after a shard failure, while `complete_trace()`
+  remains the strict all-shards-or-error path. Terminal reports retain partial
+  trace instead of going blind when shutdown/failure is exactly what the user
+  needs to inspect.
+- Added `shutdown_report()` on the low-level threaded runtime owners so users
+  can get terminal error, topology, resource counts, and retained trace
+  together instead of losing report shape on driver shutdown failure.
 - Added per-lane unit tests for the count rules, a unit test that the
   storage and Betelgeuse TCP shutdowns return inside their budget when a
   worker is stuck, a real `raise(SIGINT)` test that reaches a parked
   `signal_wait`, a live `LocalSystem` test that a failed shard rejects
-  ingress while a healthy shard keeps running, and a live `LocalSystem`
-  topology test that exposes every new field through the public API.
+  ingress while a healthy shard keeps running, low-level tests that retained
+  trace survives sibling worker failure, DST combining timeout/remote-full/
+  closed-target outcomes, and a live `LocalSystem` topology test that exposes
+  every new field through the public API.
 
 ### Phase Jan de Quay
 

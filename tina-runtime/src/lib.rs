@@ -780,7 +780,7 @@ where
         &mut self,
         deadline: Instant,
     ) -> Result<(), DriverShutdownError> {
-        self.driver.cancel_pending(deadline)?;
+        let driver_result = self.driver.cancel_pending(deadline);
         self.translators.clear();
 
         let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
@@ -808,7 +808,7 @@ where
                 },
             );
         }
-        Ok(())
+        driver_result
     }
 
     fn notify_signal(&mut self, name: &str) {
@@ -3628,7 +3628,25 @@ impl LiveTopologyReport {
 
 type ThreadedCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
 type ThreadedIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
-type ThreadedWorkerJoin = JoinHandle<Result<Vec<RuntimeEvent>, ThreadedRuntimeError>>;
+type ThreadedWorkerJoin = JoinHandle<ThreadedWorkerExit>;
+
+struct ThreadedWorkerExit {
+    trace: Vec<RuntimeEvent>,
+    error: Option<ThreadedRuntimeError>,
+}
+
+impl ThreadedWorkerExit {
+    fn clean(trace: Vec<RuntimeEvent>) -> Self {
+        Self { trace, error: None }
+    }
+
+    fn failed(error: ThreadedRuntimeError, trace: Vec<RuntimeEvent>) -> Self {
+        Self {
+            trace,
+            error: Some(error),
+        }
+    }
+}
 
 /// Lifecycle state for the canonical local Tina app owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3882,6 +3900,68 @@ pub struct LocalSystemTerminalSummary {
     pub recovery_failed: usize,
 }
 
+/// Trace events plus whether every live shard could report them.
+///
+/// This is the default live trace shape because observability should keep
+/// working after the thing being observed breaks. Use
+/// [`complete_events`](Self::complete_events) when code needs proof that no
+/// shard was missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceSnapshot {
+    events: Vec<RuntimeEvent>,
+    missing_shards: Vec<ShardId>,
+}
+
+impl TraceSnapshot {
+    fn complete(events: Vec<RuntimeEvent>) -> Self {
+        Self {
+            events,
+            missing_shards: Vec::new(),
+        }
+    }
+
+    fn partial(events: Vec<RuntimeEvent>, missing_shards: Vec<ShardId>) -> Self {
+        Self {
+            events,
+            missing_shards,
+        }
+    }
+
+    /// Retained trace events that could still be collected.
+    pub fn events(&self) -> &[RuntimeEvent] {
+        &self.events
+    }
+
+    /// Whether every shard reported trace successfully.
+    pub fn is_complete(&self) -> bool {
+        self.missing_shards.is_empty()
+    }
+
+    /// Whether at least one shard could not report trace.
+    pub fn is_partial(&self) -> bool {
+        !self.is_complete()
+    }
+
+    /// Shards that could not report trace.
+    pub fn missing_shards(&self) -> &[ShardId] {
+        &self.missing_shards
+    }
+
+    /// Returns complete trace events, or a typed error if any shard was missing.
+    pub fn complete_events(self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+        if self.is_complete() {
+            Ok(self.events)
+        } else {
+            Err(ThreadedRuntimeError::WorkerStopped)
+        }
+    }
+
+    /// Consumes the snapshot and returns whatever events could be collected.
+    pub fn into_events(self) -> Vec<RuntimeEvent> {
+        self.events
+    }
+}
+
 impl LocalSystemTerminalReport {
     /// Creates a terminal report from final state and trace.
     pub fn new(state: LocalSystemState, trace: Vec<RuntimeEvent>) -> Self {
@@ -3926,15 +4006,25 @@ impl LocalSystemTerminalReport {
 
     /// Creates a failed terminal report with the final live topology snapshot.
     pub fn failed_with_topology(error: ThreadedRuntimeError, topology: LiveTopologyReport) -> Self {
+        Self::failed_with_topology_and_trace(error, topology, Vec::new())
+    }
+
+    /// Creates a failed terminal report with topology and trace collected from
+    /// workers that could still report.
+    pub fn failed_with_topology_and_trace(
+        error: ThreadedRuntimeError,
+        topology: LiveTopologyReport,
+        trace: Vec<RuntimeEvent>,
+    ) -> Self {
         let shutdown = LocalSystemShutdownReport::from_parts(
             LocalSystemState::Failed,
-            &[],
+            &trace,
             Some(error),
             Some(&topology),
         );
         Self {
             state: LocalSystemState::Failed,
-            trace: Vec::new(),
+            trace,
             error: Some(error),
             topology: Some(topology),
             shutdown,
@@ -4110,9 +4200,14 @@ where
         self.runtime().send_and_observe(address, message)
     }
 
-    /// Returns a trace snapshot.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+    /// Returns retained trace without failing the observability path.
+    pub fn trace(&self) -> TraceSnapshot {
         self.runtime().trace()
+    }
+
+    /// Returns complete trace, failing if the worker can no longer report.
+    pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+        self.runtime().complete_trace()
     }
 
     /// Begins graceful shutdown.
@@ -4238,15 +4333,18 @@ where
         let Some(mut runtime) = self.runtime.take() else {
             return LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new());
         };
-        match runtime.shutdown_inner() {
-            Ok(trace) => LocalSystemTerminalReport::new_with_topology(
+        let (shutdown_result, trace) = runtime.shutdown_inner_with_available_trace();
+        match shutdown_result {
+            Ok(()) => LocalSystemTerminalReport::new_with_topology(
                 LocalSystemState::Closed,
                 trace,
                 runtime.topology(),
             ),
-            Err(error) => {
-                LocalSystemTerminalReport::failed_with_topology(error, runtime.topology())
-            }
+            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
+                error,
+                runtime.topology(),
+                trace,
+            ),
         }
     }
 }
@@ -4375,9 +4473,14 @@ where
         self.runtime().try_send(address, message)
     }
 
-    /// Returns a globally sorted trace snapshot.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+    /// Returns retained trace without failing the observability path.
+    pub fn trace(&self) -> TraceSnapshot {
         self.runtime().trace()
+    }
+
+    /// Returns complete trace, failing if any shard can no longer report.
+    pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+        self.runtime().complete_trace()
     }
 
     /// Returns a live topology snapshot for this app.
@@ -4438,15 +4541,18 @@ where
         let Some(mut runtime) = self.runtime.take() else {
             return LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new());
         };
-        match runtime.shutdown_inner() {
-            Ok(trace) => LocalSystemTerminalReport::new_with_topology(
+        let (shutdown_result, trace) = runtime.shutdown_inner_with_available_trace();
+        match shutdown_result {
+            Ok(()) => LocalSystemTerminalReport::new_with_topology(
                 LocalSystemState::Closed,
                 trace,
                 runtime.topology(),
             ),
-            Err(error) => {
-                LocalSystemTerminalReport::failed_with_topology(error, runtime.topology())
-            }
+            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
+                error,
+                runtime.topology(),
+                trace,
+            ),
         }
     }
 }
@@ -4474,7 +4580,7 @@ where
     F: MailboxFactory + Send + 'static,
 {
     commands: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>,
-    handle: Option<JoinHandle<Result<Vec<RuntimeEvent>, ThreadedRuntimeError>>>,
+    handle: Option<ThreadedWorkerJoin>,
     metrics: Arc<LiveShardMetrics>,
 }
 
@@ -4730,8 +4836,31 @@ where
         }
     }
 
-    /// Returns a snapshot of the worker trace.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+    /// Returns retained trace without failing the observability path.
+    pub fn trace(&self) -> TraceSnapshot {
+        match self.complete_trace() {
+            Ok(events) => TraceSnapshot::complete(events),
+            Err(ThreadedRuntimeError::WorkerStopped) => TraceSnapshot::partial(
+                Vec::new(),
+                self.topology()
+                    .shards()
+                    .iter()
+                    .map(|shard| shard.shard())
+                    .collect(),
+            ),
+            Err(_) => TraceSnapshot::partial(
+                Vec::new(),
+                self.topology()
+                    .shards()
+                    .iter()
+                    .map(|shard| shard.shard())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Returns complete trace, failing if the worker can no longer report.
+    pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.call(|runtime| runtime.trace().to_vec())
     }
 
@@ -4757,8 +4886,30 @@ where
     }
 
     /// Requests shutdown and joins the worker, returning its final trace.
-    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
-        self.shutdown_inner()
+    pub fn shutdown(self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+        let report = self.shutdown_report();
+        if let Some(error) = report.error() {
+            Err(error)
+        } else {
+            Ok(report.into_trace())
+        }
+    }
+
+    /// Requests shutdown and joins the worker, always returning terminal truth.
+    pub fn shutdown_report(mut self) -> LocalSystemTerminalReport {
+        let (shutdown_result, trace) = self.shutdown_inner_with_available_trace();
+        match shutdown_result {
+            Ok(()) => LocalSystemTerminalReport::new_with_topology(
+                LocalSystemState::Closed,
+                trace,
+                self.topology(),
+            ),
+            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
+                error,
+                self.topology(),
+                trace,
+            ),
+        }
     }
 
     fn call<R, C>(&self, command: C) -> Result<R, ThreadedRuntimeError>
@@ -4782,22 +4933,30 @@ where
     }
 
     fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+        let (result, trace) = self.shutdown_inner_with_available_trace();
+        result.map(|()| trace)
+    }
+
+    fn shutdown_inner_with_available_trace(
+        &mut self,
+    ) -> (Result<(), ThreadedRuntimeError>, Vec<RuntimeEvent>) {
         let Some(handle) = self.handle.take() else {
-            return Ok(Vec::new());
+            return (Ok(()), Vec::new());
         };
         let _ = self.commands.send(ThreadedCommand::Shutdown);
         match handle.join() {
-            Ok(Ok(trace)) => {
-                self.metrics.set_state(LiveShardState::Stopped);
-                Ok(trace)
-            }
-            Ok(Err(error)) => {
-                self.metrics.set_state(LiveShardState::Failed);
-                Err(error)
+            Ok(exit) => {
+                if let Some(error) = exit.error {
+                    self.metrics.set_state(LiveShardState::Failed);
+                    (Err(error), exit.trace)
+                } else {
+                    self.metrics.set_state(LiveShardState::Stopped);
+                    (Ok(()), exit.trace)
+                }
             }
             Err(_) => {
                 self.metrics.set_state(LiveShardState::Failed);
-                Err(ThreadedRuntimeError::WorkerStopped)
+                (Err(ThreadedRuntimeError::WorkerStopped), Vec::new())
             }
         }
     }
@@ -4820,7 +4979,7 @@ fn threaded_worker_loop<S, F>(
     config: ThreadedRuntimeConfig,
     io_loop_factory: ThreadedIoLoopFactory,
     metrics: Arc<LiveShardMetrics>,
-) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError>
+) -> ThreadedWorkerExit
 where
     S: Shard,
     F: MailboxFactory,
@@ -4873,11 +5032,13 @@ where
     }
 
     let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;
-    runtime
-        .cancel_in_flight_calls_for_shutdown(shutdown_deadline)
-        .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
+    let shutdown_result = runtime.cancel_in_flight_calls_for_shutdown(shutdown_deadline);
     metrics.set_resource_counts(runtime.resource_report());
-    Ok(runtime.trace().to_vec())
+    let trace = runtime.trace().to_vec();
+    if shutdown_result.is_err() {
+        return ThreadedWorkerExit::failed(ThreadedRuntimeError::DriverShutdownFailed, trace);
+    }
+    ThreadedWorkerExit::clean(trace)
 }
 
 fn deliver_shutdown_signal_and_drain<S, F>(runtime: &mut Runtime<S, F>)
@@ -5136,8 +5297,22 @@ where
         }
     }
 
-    /// Returns a globally sorted trace snapshot across all worker shards.
-    pub fn trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+    /// Returns retained trace from shards still able to report.
+    pub fn trace(&self) -> TraceSnapshot {
+        let mut events = Vec::new();
+        let mut missing_shards = Vec::new();
+        for shard in self.commands.keys() {
+            match self.call_on(*shard, |runtime| runtime.trace().to_vec()) {
+                Ok(trace) => events.extend(trace),
+                Err(_) => missing_shards.push(*shard),
+            }
+        }
+        events.sort_by_key(|event| event.id());
+        TraceSnapshot::partial(events, missing_shards)
+    }
+
+    /// Returns complete trace, failing if any shard can no longer report.
+    pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         let mut events = Vec::new();
         for shard in self.commands.keys() {
             events.extend(self.call_on(*shard, |runtime| runtime.trace().to_vec())?);
@@ -5188,8 +5363,30 @@ where
     }
 
     /// Requests shutdown and joins every worker.
-    pub fn shutdown(mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
-        self.shutdown_inner()
+    pub fn shutdown(self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+        let report = self.shutdown_report();
+        if let Some(error) = report.error() {
+            Err(error)
+        } else {
+            Ok(report.into_trace())
+        }
+    }
+
+    /// Requests shutdown and joins every worker, always returning terminal truth.
+    pub fn shutdown_report(mut self) -> LocalSystemTerminalReport {
+        let (shutdown_result, trace) = self.shutdown_inner_with_available_trace();
+        match shutdown_result {
+            Ok(()) => LocalSystemTerminalReport::new_with_topology(
+                LocalSystemState::Closed,
+                trace,
+                self.topology(),
+            ),
+            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
+                error,
+                self.topology(),
+                trace,
+            ),
+        }
     }
 
     fn call_on<R, C>(&self, shard: ShardId, command: C) -> Result<R, ThreadedRuntimeError>
@@ -5223,6 +5420,13 @@ where
     }
 
     fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
+        let (result, events) = self.shutdown_inner_with_available_trace();
+        result.map(|()| events)
+    }
+
+    fn shutdown_inner_with_available_trace(
+        &mut self,
+    ) -> (Result<(), ThreadedRuntimeError>, Vec<RuntimeEvent>) {
         for sender in self.commands.values() {
             let _ = sender.send(ThreadedCommand::Shutdown);
         }
@@ -5231,17 +5435,16 @@ where
         let mut failure = None;
         for (shard, handle) in std::mem::take(&mut self.handles) {
             match handle.join() {
-                Ok(Ok(trace)) => {
-                    if let Some(metrics) = self.shard_metrics.get(&shard) {
+                Ok(exit) => {
+                    if let Some(error) = exit.error {
+                        if let Some(metrics) = self.shard_metrics.get(&shard) {
+                            metrics.set_state(LiveShardState::Failed);
+                        }
+                        failure = Some(error);
+                    } else if let Some(metrics) = self.shard_metrics.get(&shard) {
                         metrics.set_state(LiveShardState::Stopped);
                     }
-                    events.extend(trace);
-                }
-                Ok(Err(error)) => {
-                    if let Some(metrics) = self.shard_metrics.get(&shard) {
-                        metrics.set_state(LiveShardState::Failed);
-                    }
-                    failure = Some(error);
+                    events.extend(exit.trace);
                 }
                 Err(_) => {
                     if let Some(metrics) = self.shard_metrics.get(&shard) {
@@ -5251,11 +5454,11 @@ where
                 }
             }
         }
-        if let Some(error) = failure {
-            return Err(error);
-        }
         events.sort_by_key(|event| event.id());
-        Ok(events)
+        if let Some(error) = failure {
+            return (Err(error), events);
+        }
+        (Ok(()), events)
     }
 }
 
@@ -5283,7 +5486,7 @@ fn threaded_worker_loop_with_remote<S, F>(
     )>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
     shard_metrics: Arc<LiveShardMetrics>,
-) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError>
+) -> ThreadedWorkerExit
 where
     S: Shard,
     F: MailboxFactory,
@@ -5356,11 +5559,13 @@ where
     }
 
     let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;
-    runtime
-        .cancel_in_flight_calls_for_shutdown(shutdown_deadline)
-        .map_err(|_| ThreadedRuntimeError::DriverShutdownFailed)?;
+    let shutdown_result = runtime.cancel_in_flight_calls_for_shutdown(shutdown_deadline);
     shard_metrics.set_resource_counts(runtime.resource_report());
-    Ok(runtime.trace().to_vec())
+    let trace = runtime.trace().to_vec();
+    if shutdown_result.is_err() {
+        return ThreadedWorkerExit::failed(ThreadedRuntimeError::DriverShutdownFailed, trace);
+    }
+    ThreadedWorkerExit::clean(trace)
 }
 
 fn drain_remote_inbound<S, F>(
