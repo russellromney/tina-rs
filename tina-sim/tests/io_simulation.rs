@@ -1423,6 +1423,22 @@ fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
         .count()
 }
 
+fn count_resource_closed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_kind,
+                    reason: CallCompletionRejectedReason::ResourceClosed,
+                    ..
+                } if call_kind == kind
+            )
+        })
+        .count()
+}
+
 fn count_spawned(trace: &[RuntimeEvent]) -> usize {
     trace
         .iter()
@@ -2907,6 +2923,11 @@ fn scripted_udp_negative_paths_are_visible_and_cancelable() {
             .any(|entry| entry == "close-err:ResourceBusy"),
         "close must not fail with ResourceBusy under the new contract"
     );
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::UdpRecvFrom),
+        1,
+        "UDP close must trace pending recv as ResourceClosed"
+    );
     // Stop the probe to keep the test shape tidy.
     sim.try_send(probe, UdpProbeMsg::Stop).unwrap();
     sim.step();
@@ -3766,6 +3787,11 @@ fn listener_close_while_accept_pending_cancels_accept_and_closes() {
         count_call_completed(sim.trace(), CallKind::TcpListenerClose),
         1
     );
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::TcpAccept),
+        1,
+        "listener close must trace pending accept as ResourceClosed"
+    );
 }
 
 #[test]
@@ -3974,6 +4000,11 @@ fn stream_close_while_read_pending_cancels_read_and_closes() {
         count_call_completed(sim.trace(), CallKind::TcpStreamClose),
         1
     );
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::TcpRead),
+        1,
+        "stream close must trace pending read as ResourceClosed"
+    );
 }
 
 #[test]
@@ -4043,6 +4074,11 @@ fn stream_close_while_write_pending_cancels_write_and_closes() {
     assert_eq!(
         count_call_completed(sim.trace(), CallKind::TcpStreamClose),
         1
+    );
+    assert_eq!(
+        count_resource_closed(sim.trace(), CallKind::TcpWrite),
+        1,
+        "stream close must trace pending write as ResourceClosed"
     );
 }
 

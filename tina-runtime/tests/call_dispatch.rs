@@ -1399,10 +1399,18 @@ fn stream_close_while_read_pending_cancels_read_and_closes() {
         reader_log.borrow().is_empty(),
         "the pending read continuation must not fire after the stream was closed"
     );
-    // Runtime-side cleanup is covered by the ResourceClosed tests; this
-    // one pins the close result and missing read continuation.
-
     let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpRead,
+                reason: CallCompletionRejectedReason::ResourceClosed,
+                ..
+            }
+        )),
+        "trace must record TcpRead ResourceClosed after close-cancel: {kinds:?}"
+    );
     assert!(
         kinds.iter().any(|k| matches!(
             k,
