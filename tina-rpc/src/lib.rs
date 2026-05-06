@@ -112,3 +112,4 @@ pub use registry::{
     Registry, RegistryBuilder, RegistryConfig, RegistryMsg, ServiceCall, ServiceReply,
 };
 pub use service::{PooledService, ServiceConfig, ServiceHandler, ShardedService, SingleService};
+pub use tina_rpc_macros::service;
