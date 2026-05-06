@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -563,6 +563,40 @@ const INITIAL_SUPERVISOR_CAPACITY: usize = 4;
 const INITIAL_TRACE_CAPACITY: usize = 256;
 const INITIAL_CALL_CAPACITY: usize = 8;
 
+/// Setup-time reserves for runtime-owned metadata.
+///
+/// These knobs reserve only Tina-owned vectors and scratch buffers. They do
+/// not pool user messages, erased replies, durable storage buffers, or
+/// backend-owned completion slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreallocationConfig {
+    /// Registered isolate table reserve.
+    pub entry_capacity: usize,
+    /// Child-record table reserve.
+    pub child_record_capacity: usize,
+    /// Supervisor table reserve.
+    pub supervisor_capacity: usize,
+    /// Runtime trace event reserve.
+    pub trace_capacity: usize,
+    /// In-flight call, translator, isolate-call, and driver-completion reserve.
+    pub call_capacity: usize,
+    /// Per-step round scratch reserve.
+    pub round_scratch_capacity: usize,
+}
+
+impl Default for PreallocationConfig {
+    fn default() -> Self {
+        Self {
+            entry_capacity: INITIAL_ENTRY_CAPACITY,
+            child_record_capacity: INITIAL_CHILD_RECORD_CAPACITY,
+            supervisor_capacity: INITIAL_SUPERVISOR_CAPACITY,
+            trace_capacity: INITIAL_TRACE_CAPACITY,
+            call_capacity: INITIAL_CALL_CAPACITY,
+            round_scratch_capacity: INITIAL_ENTRY_CAPACITY,
+        }
+    }
+}
+
 /// Runtime trace retention policy.
 ///
 /// Tests usually want [`Full`](Self::Full) so replay artifacts keep every
@@ -686,24 +720,42 @@ where
         ids: IdSource,
         driver: Box<dyn RuntimeDriver>,
     ) -> Self {
+        Self::with_clock_and_ids_and_driver_and_preallocation(
+            shard,
+            mailbox_factory,
+            clock,
+            ids,
+            driver,
+            PreallocationConfig::default(),
+        )
+    }
+
+    fn with_clock_and_ids_and_driver_and_preallocation(
+        shard: S,
+        mailbox_factory: F,
+        clock: Box<dyn Clock>,
+        ids: IdSource,
+        driver: Box<dyn RuntimeDriver>,
+        preallocation: PreallocationConfig,
+    ) -> Self {
         Self {
             shard,
             mailbox_factory,
-            entries: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
-            child_records: Vec::with_capacity(INITIAL_CHILD_RECORD_CAPACITY),
-            supervisors: Vec::with_capacity(INITIAL_SUPERVISOR_CAPACITY),
+            entries: Vec::with_capacity(preallocation.entry_capacity),
+            child_records: Vec::with_capacity(preallocation.child_record_capacity),
+            supervisors: Vec::with_capacity(preallocation.supervisor_capacity),
             next_isolate_id: 1,
             ids,
-            trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
+            trace: Vec::with_capacity(preallocation.trace_capacity),
             trace_retention: TraceRetention::Full,
             trace_dropped: 0,
             driver,
-            in_flight_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
-            translators: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            in_flight_calls: Vec::with_capacity(preallocation.call_capacity),
+            translators: Vec::with_capacity(preallocation.call_capacity),
             clock,
-            pending_isolate_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
-            round_messages: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
-            driver_completions: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_isolate_calls: Vec::with_capacity(preallocation.call_capacity),
+            round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
+            driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,
         }
     }
@@ -3053,6 +3105,10 @@ pub struct ThreadedRuntimeConfig {
     /// Capacity of each live source-shard -> destination-shard transport.
     pub shard_pair_capacity: usize,
 
+    /// Maximum remote envelopes one live shard worker harvests before giving
+    /// its local runtime a turn.
+    pub remote_inbound_drain_budget: usize,
+
     /// Capacity of the bounded storage lane used for local persistence work.
     pub storage_lane_capacity: usize,
 
@@ -3067,6 +3123,16 @@ pub struct ThreadedRuntimeConfig {
 
     /// Capacity of runtime-owned signal waits.
     pub signal_capacity: usize,
+
+    /// Desired OS core for this shard worker.
+    ///
+    /// The current portable backend reports this as advisory intent only. It
+    /// does not hard-pin the worker without a platform-specific affinity
+    /// implementation.
+    pub configured_core: Option<usize>,
+
+    /// Setup-time reserves for runtime-owned metadata.
+    pub preallocation: PreallocationConfig,
 
     /// Trace retention for the worker-owned runtime.
     pub trace_retention: TraceRetention,
@@ -3086,11 +3152,14 @@ impl Default for ThreadedRuntimeConfig {
         Self {
             command_capacity: 64,
             shard_pair_capacity: 64,
+            remote_inbound_drain_budget: 64,
             storage_lane_capacity: driver::DEFAULT_STORAGE_LANE_CAPACITY,
             dns_lane_capacity: driver::DEFAULT_DNS_LANE_CAPACITY,
             tls_lane_capacity: driver::DEFAULT_TLS_LANE_CAPACITY,
             process_lane_capacity: driver::DEFAULT_PROCESS_LANE_CAPACITY,
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
+            configured_core: None,
+            preallocation: PreallocationConfig::default(),
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
             shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
@@ -3112,6 +3181,9 @@ pub struct LocalSystemConfig {
     pub ingress_capacity: usize,
     /// Capacity of each local source-shard -> destination-shard transport.
     pub shard_pair_capacity: usize,
+    /// Maximum remote envelopes one worker harvests before giving local work a
+    /// turn.
+    pub remote_inbound_drain_budget: usize,
     /// Capacity of the bounded storage lane used for local filesystem and
     /// persistence work.
     pub storage_lane_capacity: usize,
@@ -3123,6 +3195,12 @@ pub struct LocalSystemConfig {
     pub process_lane_capacity: usize,
     /// Capacity of runtime-owned signal waits.
     pub signal_capacity: usize,
+    /// Desired OS core for shard workers. This is advisory until a backend can
+    /// prove hard affinity. Multi-shard local systems treat this as the first
+    /// core in stable shard order and assign later shards to contiguous cores.
+    pub configured_core: Option<usize>,
+    /// Setup-time reserves for runtime-owned metadata.
+    pub preallocation: PreallocationConfig,
     /// Trace retention for worker-owned runtimes.
     pub trace_retention: TraceRetention,
     /// How long an idle worker may park before checking runtime-owned work.
@@ -3140,11 +3218,15 @@ impl Default for LocalSystemConfig {
         Self {
             ingress_capacity: ThreadedRuntimeConfig::default().command_capacity,
             shard_pair_capacity: ThreadedRuntimeConfig::default().command_capacity,
+            remote_inbound_drain_budget: ThreadedRuntimeConfig::default()
+                .remote_inbound_drain_budget,
             storage_lane_capacity: driver::DEFAULT_STORAGE_LANE_CAPACITY,
             dns_lane_capacity: driver::DEFAULT_DNS_LANE_CAPACITY,
             tls_lane_capacity: driver::DEFAULT_TLS_LANE_CAPACITY,
             process_lane_capacity: driver::DEFAULT_PROCESS_LANE_CAPACITY,
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
+            configured_core: None,
+            preallocation: PreallocationConfig::default(),
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
             shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
@@ -3160,6 +3242,9 @@ impl LocalSystemConfig {
         }
         if self.shard_pair_capacity == 0 {
             return Err(LocalSystemConfigError::ZeroShardPairCapacity);
+        }
+        if self.remote_inbound_drain_budget == 0 {
+            return Err(LocalSystemConfigError::ZeroRemoteInboundDrainBudget);
         }
         if self.storage_lane_capacity == 0 {
             return Err(LocalSystemConfigError::ZeroStorageLaneCapacity);
@@ -3183,11 +3268,14 @@ impl LocalSystemConfig {
         ThreadedRuntimeConfig {
             command_capacity: self.ingress_capacity,
             shard_pair_capacity: self.shard_pair_capacity,
+            remote_inbound_drain_budget: self.remote_inbound_drain_budget,
             storage_lane_capacity: self.storage_lane_capacity,
             dns_lane_capacity: self.dns_lane_capacity,
             tls_lane_capacity: self.tls_lane_capacity,
             process_lane_capacity: self.process_lane_capacity,
             signal_capacity: self.signal_capacity,
+            configured_core: self.configured_core,
+            preallocation: self.preallocation,
             trace_retention: self.trace_retention,
             idle_wait: self.idle_wait,
             shutdown_lane_drain_timeout: self.shutdown_lane_drain_timeout,
@@ -3202,6 +3290,8 @@ pub enum LocalSystemConfigError {
     ZeroIngressCapacity,
     /// Shard-pair capacity must be greater than zero.
     ZeroShardPairCapacity,
+    /// Remote inbound drain budget must be greater than zero.
+    ZeroRemoteInboundDrainBudget,
     /// Storage-lane capacity must be greater than zero.
     ZeroStorageLaneCapacity,
     /// DNS-lane capacity must be greater than zero.
@@ -3379,6 +3469,10 @@ impl LiveQueueMetrics {
 struct LiveShardMetrics {
     shard: ShardId,
     worker_name: Option<String>,
+    worker_thread_id: Mutex<Option<String>>,
+    configured_core: Option<usize>,
+    affinity_status: AffinityStatus,
+    preallocation: PreallocationConfig,
     config: ThreadedRuntimeConfig,
     state: AtomicU8,
     ingress: LiveQueueMetrics,
@@ -3394,6 +3488,14 @@ impl LiveShardMetrics {
         Self {
             shard,
             worker_name,
+            worker_thread_id: Mutex::new(None),
+            configured_core: config.configured_core,
+            affinity_status: if config.configured_core.is_some() {
+                AffinityStatus::AdvisoryOnly
+            } else {
+                AffinityStatus::NotRequested
+            },
+            preallocation: config.preallocation,
             config,
             state: AtomicU8::new(LiveShardState::RUNNING),
             ingress: LiveQueueMetrics::new(config.command_capacity),
@@ -3427,10 +3529,26 @@ impl LiveShardMetrics {
             .store(report.pending_driver_call_count(), Ordering::Release);
     }
 
+    fn set_worker_thread_id(&self, id: String) {
+        *self
+            .worker_thread_id
+            .lock()
+            .expect("worker thread id lock poisoned") = Some(id);
+    }
+
     fn report(&self) -> LiveShardReport {
         LiveShardReport {
             shard: self.shard,
             worker_name: self.worker_name.clone(),
+            worker_thread_id: self
+                .worker_thread_id
+                .lock()
+                .expect("worker thread id lock poisoned")
+                .clone(),
+            configured_core: self.configured_core,
+            observed_core: None,
+            affinity_status: self.affinity_status.clone(),
+            preallocation: self.preallocation,
             state: self.state(),
             ingress: self.ingress.report(),
             storage_lane: LiveQueueReport::unmeasured(self.storage_lane.capacity),
@@ -3447,11 +3565,32 @@ impl LiveShardMetrics {
     }
 }
 
+/// Shard-worker affinity state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AffinityStatus {
+    /// No core affinity was requested.
+    NotRequested,
+    /// The backend proved hard affinity was applied.
+    Applied,
+    /// The platform/backend cannot support hard affinity.
+    Unsupported,
+    /// Affinity was requested but failed with a visible reason.
+    Failed(String),
+    /// Affinity is recorded as ownership intent only; no OS scheduling control
+    /// is claimed.
+    AdvisoryOnly,
+}
+
 /// Snapshot of one live shard worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveShardReport {
     shard: ShardId,
     worker_name: Option<String>,
+    worker_thread_id: Option<String>,
+    configured_core: Option<usize>,
+    observed_core: Option<usize>,
+    affinity_status: AffinityStatus,
+    preallocation: PreallocationConfig,
     state: LiveShardState,
     ingress: LiveQueueReport,
     storage_lane: LiveQueueReport,
@@ -3475,6 +3614,32 @@ impl LiveShardReport {
     /// Worker thread name when the live substrate can name it.
     pub fn worker_name(&self) -> Option<&str> {
         self.worker_name.as_deref()
+    }
+
+    /// Worker thread id formatted by the live backend, when the worker has
+    /// started and reported it.
+    pub fn worker_thread_id(&self) -> Option<&str> {
+        self.worker_thread_id.as_deref()
+    }
+
+    /// Desired core configured for this shard worker.
+    pub const fn configured_core(&self) -> Option<usize> {
+        self.configured_core
+    }
+
+    /// Observed core when the backend can report it honestly.
+    pub const fn observed_core(&self) -> Option<usize> {
+        self.observed_core
+    }
+
+    /// Affinity status for this worker.
+    pub const fn affinity_status(&self) -> &AffinityStatus {
+        &self.affinity_status
+    }
+
+    /// Runtime-owned metadata reserves configured for this shard.
+    pub const fn preallocation(&self) -> PreallocationConfig {
+        self.preallocation
     }
 
     /// Observable lifecycle state.
@@ -4269,6 +4434,21 @@ where
         self
     }
 
+    /// Records desired worker core ownership as advisory intent.
+    ///
+    /// The current portable backend does not hard-pin the worker. Topology
+    /// reports show [`AffinityStatus::AdvisoryOnly`] when this is set.
+    pub const fn configured_core(mut self, core: usize) -> Self {
+        self.config.configured_core = Some(core);
+        self
+    }
+
+    /// Sets runtime-owned metadata reserves.
+    pub const fn preallocation(mut self, preallocation: PreallocationConfig) -> Self {
+        self.config.preallocation = preallocation;
+        self
+    }
+
     /// Sets the whole bounded-shape config.
     pub const fn config(mut self, config: LocalSystemConfig) -> Self {
         self.config = config;
@@ -4397,6 +4577,19 @@ where
     /// Sets bounded storage-lane capacity for local persistence work.
     pub const fn storage_lane_capacity(mut self, capacity: usize) -> Self {
         self.config.storage_lane_capacity = capacity;
+        self
+    }
+
+    /// Records desired worker core ownership as advisory intent for every
+    /// shard in this local system.
+    pub const fn configured_core(mut self, core: usize) -> Self {
+        self.config.configured_core = Some(core);
+        self
+    }
+
+    /// Sets runtime-owned metadata reserves for every shard.
+    pub const fn preallocation(mut self, preallocation: PreallocationConfig) -> Self {
+        self.config.preallocation = preallocation;
         self
     }
 
@@ -4984,7 +5177,8 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+    metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
+    let mut runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
         shard,
         mailbox_factory,
         Box::new(MonotonicClock),
@@ -4997,6 +5191,7 @@ where
             config.process_lane_capacity,
             config.signal_capacity,
         )),
+        config.preallocation,
     );
     runtime.set_trace_retention(config.trace_retention);
 
@@ -5099,6 +5294,9 @@ where
         if config.shard_pair_capacity == 0 {
             panic!("ThreadedMultiShardRuntime requires shard-pair capacity > 0");
         }
+        if config.remote_inbound_drain_budget == 0 {
+            panic!("ThreadedMultiShardRuntime requires remote inbound drain budget > 0");
+        }
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
@@ -5117,7 +5315,11 @@ where
         let mut commands = BTreeMap::new();
         let mut shard_metrics = BTreeMap::new();
         let mut receivers = Vec::with_capacity(shards.len());
-        for shard in &shards {
+        for (ordinal, shard) in shards.iter().enumerate() {
+            let worker_config = ThreadedRuntimeConfig {
+                configured_core: config.configured_core.map(|core| core + ordinal),
+                ..config
+            };
             let (sender, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
             commands.insert(shard.id(), sender);
             shard_metrics.insert(
@@ -5125,7 +5327,7 @@ where
                 Arc::new(LiveShardMetrics::new(
                     shard.id(),
                     Some(format!("tina-shard-{}", shard.id().get())),
-                    config,
+                    worker_config,
                 )),
             );
             receivers.push((shard.id(), receiver));
@@ -5159,7 +5361,13 @@ where
 
         let ids = IdSource::new();
         let mut handles = Vec::with_capacity(shards.len());
-        for (shard, (_shard_id, receiver)) in shards.into_iter().zip(receivers) {
+        for (ordinal, (shard, (_shard_id, receiver))) in
+            shards.into_iter().zip(receivers).enumerate()
+        {
+            let worker_config = ThreadedRuntimeConfig {
+                configured_core: config.configured_core.map(|core| core + ordinal),
+                ..config
+            };
             let factory = mailbox_factory.clone();
             let ids = ids.clone();
             let remote_senders = remote_senders.clone();
@@ -5179,26 +5387,27 @@ where
                         let io_loop = io_loop(Global).expect(
                             "failed to initialise Betelgeuse IO loop for tina-runtime shard",
                         );
-                        let runtime = Runtime::with_clock_and_ids_and_driver(
+                        let runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
                             shard,
                             factory,
                             Box::new(MonotonicClock),
                             ids,
                             Box::new(BetelgeuseDriver::with_io_loop_and_capacities(
                                 io_loop,
-                                config.storage_lane_capacity,
-                                config.dns_lane_capacity,
-                                config.tls_lane_capacity,
-                                config.process_lane_capacity,
-                                config.signal_capacity,
+                                worker_config.storage_lane_capacity,
+                                worker_config.dns_lane_capacity,
+                                worker_config.tls_lane_capacity,
+                                worker_config.process_lane_capacity,
+                                worker_config.signal_capacity,
                             )),
+                            worker_config.preallocation,
                         );
                         let mut runtime = runtime;
-                        runtime.set_trace_retention(config.trace_retention);
+                        runtime.set_trace_retention(worker_config.trace_retention);
                         threaded_worker_loop_with_remote(
                             runtime,
                             receiver,
-                            config,
+                            worker_config,
                             remote_senders,
                             remote_receivers,
                             remote_metrics_for_worker,
@@ -5491,6 +5700,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    shard_metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
     let source_shard = runtime.shard().id();
     loop {
         shard_metrics.set_resource_counts(runtime.resource_report());
@@ -5525,20 +5735,25 @@ where
                 }
             }
         };
-        if drain_remote_inbound(&mut runtime, &remote_receivers, &route_remote) > 0 {
-            continue;
-        }
-        match receiver.try_recv() {
-            Ok(ThreadedCommand::Run(command)) => {
-                command(&mut runtime);
-                continue;
+        let remote_delivered = drain_remote_inbound(
+            &mut runtime,
+            &remote_receivers,
+            &route_remote,
+            config.remote_inbound_drain_budget,
+        );
+        if remote_delivered == 0 {
+            match receiver.try_recv() {
+                Ok(ThreadedCommand::Run(command)) => {
+                    command(&mut runtime);
+                    continue;
+                }
+                Ok(ThreadedCommand::Shutdown) => {
+                    deliver_shutdown_signal_and_drain(&mut runtime);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            Ok(ThreadedCommand::Shutdown) => {
-                deliver_shutdown_signal_and_drain(&mut runtime);
-                break;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
@@ -5575,6 +5790,7 @@ fn drain_remote_inbound<S, F>(
         std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
     )],
     route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    budget: usize,
 ) -> usize
 where
     S: Shard,
@@ -5583,6 +5799,9 @@ where
     let mut delivered = 0;
     for (_, receiver) in remote_receivers {
         loop {
+            if delivered >= budget {
+                return delivered;
+            }
             match receiver.try_recv() {
                 Ok(envelope) => {
                     delivered += 1;

@@ -43,6 +43,36 @@ fn round_message_scratch_reserve_covers_more_than_initial_capacity() {
     );
 }
 
+#[test]
+fn runtime_preallocation_config_reserves_runtime_owned_metadata() {
+    let preallocation = PreallocationConfig {
+        entry_capacity: 21,
+        child_record_capacity: 13,
+        supervisor_capacity: 5,
+        trace_capacity: 377,
+        call_capacity: 34,
+        round_scratch_capacity: 55,
+    };
+    let runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+        preallocation,
+    );
+
+    assert!(runtime.entries.capacity() >= preallocation.entry_capacity);
+    assert!(runtime.child_records.capacity() >= preallocation.child_record_capacity);
+    assert!(runtime.supervisors.capacity() >= preallocation.supervisor_capacity);
+    assert!(runtime.trace.capacity() >= preallocation.trace_capacity);
+    assert!(runtime.in_flight_calls.capacity() >= preallocation.call_capacity);
+    assert!(runtime.translators.capacity() >= preallocation.call_capacity);
+    assert!(runtime.pending_isolate_calls.capacity() >= preallocation.call_capacity);
+    assert!(runtime.driver_completions.capacity() >= preallocation.call_capacity);
+    assert!(runtime.round_messages.capacity() >= preallocation.round_scratch_capacity);
+}
+
 #[derive(Debug, Default)]
 struct TestShard;
 
@@ -1083,6 +1113,37 @@ enum TimerMsg {
     StopNow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FairMsg {
+    Tick,
+}
+
+#[derive(Debug)]
+struct CooperativeFairness {
+    label: &'static str,
+    remaining_self_ticks: usize,
+    seen: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl Isolate for CooperativeFairness {
+    type Message = FairMsg;
+    type Reply = ();
+    type Send = Outbound<FairMsg>;
+    type Spawn = Infallible;
+    type Call = Infallible;
+    type Shard = TestShard;
+
+    fn handle(&mut self, _msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        self.seen.borrow_mut().push(self.label);
+        if self.remaining_self_ticks == 0 {
+            noop()
+        } else {
+            self.remaining_self_ticks -= 1;
+            ctx.send_self(FairMsg::Tick)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Sleeper {
     delay: Duration,
@@ -1159,11 +1220,17 @@ impl RuntimeDriver for FakeDriver {
         request: CallInput,
         _now: Instant,
     ) -> Option<DriverCompletion> {
+        let result = match &request {
+            CallInput::Sleep { .. } => CallOutput::TimerFired,
+            CallInput::TcpBind { addr } => CallOutput::TcpBound {
+                listener: ListenerId::new(call_id.get()),
+                local_addr: *addr,
+            },
+            CallInput::TcpListenerClose { .. } => CallOutput::TcpListenerClosed,
+            _ => CallOutput::TimerFired,
+        };
         self.submitted.borrow_mut().push(request);
-        self.pending.push_back(DriverCompletion {
-            call_id,
-            result: CallOutput::TimerFired,
-        });
+        self.pending.push_back(DriverCompletion { call_id, result });
         None
     }
 
@@ -1189,6 +1256,18 @@ impl RuntimeDriver for FakeDriver {
         self.pending
             .retain(|completion| completion.call_id != call_id);
         before != self.pending.len()
+    }
+
+    fn resource_report(&self) -> DriverResourceReport {
+        DriverResourceReport {
+            listeners: self
+                .pending
+                .iter()
+                .filter(|completion| matches!(completion.result, CallOutput::TcpBound { .. }))
+                .count(),
+            pending_calls: self.pending.len(),
+            ..DriverResourceReport::default()
+        }
     }
 }
 
@@ -2296,6 +2375,67 @@ fn runtime_shutdown_surfaces_driver_completion_release_failure() {
 }
 
 #[test]
+fn fake_driver_contract_reports_tcpish_pending_and_cancel() {
+    let submitted = Rc::new(RefCell::new(Vec::new()));
+    let mut driver = FakeDriver::new(Rc::clone(&submitted));
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+
+    assert!(
+        driver
+            .submit(CallId::new(7), CallInput::TcpBind { addr }, Instant::now())
+            .is_none()
+    );
+    assert!(matches!(
+        submitted.borrow().as_slice(),
+        [CallInput::TcpBind { addr: submitted_addr }] if *submitted_addr == addr
+    ));
+    let report = driver.resource_report();
+    assert_eq!(report.pending_driver_call_count(), 1);
+    assert_eq!(report.owned_resource_count(), 1);
+
+    assert!(driver.cancel(CallId::new(7)));
+    let report = driver.resource_report();
+    assert_eq!(report.pending_driver_call_count(), 0);
+    assert_eq!(report.owned_resource_count(), 0);
+}
+
+#[test]
+fn cooperative_hot_isolate_does_not_starve_quiet_isolate_in_one_round() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let hot = runtime.register(
+        CooperativeFairness {
+            label: "hot",
+            remaining_self_ticks: 4,
+            seen: Rc::clone(&seen),
+        },
+        TestMailbox::new(8),
+    );
+    let quiet = runtime.register(
+        CooperativeFairness {
+            label: "quiet",
+            remaining_self_ticks: 0,
+            seen: Rc::clone(&seen),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime.try_send(hot, FairMsg::Tick).unwrap();
+    runtime.try_send(quiet, FairMsg::Tick).unwrap();
+
+    assert_eq!(runtime.step(), 2);
+    assert_eq!(seen.borrow().as_slice(), ["hot", "quiet"]);
+
+    for _ in 0..4 {
+        assert_eq!(runtime.step(), 1);
+    }
+    assert_eq!(
+        seen.borrow().as_slice(),
+        ["hot", "quiet", "hot", "hot", "hot", "hot"]
+    );
+}
+
+#[test]
 fn timer_fires_exactly_once() {
     let (mut runtime, clock) = new_manual_runtime();
     let sleeper = runtime.register(
@@ -2754,6 +2894,11 @@ fn make_shard_report(
     LiveShardReport {
         shard,
         worker_name: None,
+        worker_thread_id: None,
+        configured_core: None,
+        observed_core: None,
+        affinity_status: AffinityStatus::NotRequested,
+        preallocation: PreallocationConfig::default(),
         state,
         ingress: LiveQueueReport::unmeasured(8),
         storage_lane: LiveQueueReport::unmeasured(8),

@@ -71,7 +71,9 @@ At closeout:
 
 6. **Live Thread-Per-Core Pressure**
    Run live multi-shard services on real worker threads with cross-shard sends
-   and isolate calls under bounded queue pressure. Prove healthy shards keep
+   and isolate calls under bounded queue pressure. Use Blue Whale's reported
+   worker/thread/core ownership and advisory affinity truth; do not claim hard
+   OS pinning unless a later backend proves it. Prove healthy shards keep
    running when one shard fails.
 
 7. **Lifecycle Contract Tests**

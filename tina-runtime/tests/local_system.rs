@@ -10,17 +10,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, CallKind, CallOutcome, CancellationSupport, FileId, ListenerId, LiveShardState,
-    LocalSystem, LocalSystemConfig, LocalSystemConfigError, LocalSystemState, MailboxFactory,
-    PathKind, PathMetadata, PersistenceSupportLevel, ResourceExecutionShape, ResourceSupport,
-    RuntimeEventKind, ShutdownSupport, ShutdownUncleanReason, SnapshotImage, StreamId,
-    ThreadedRuntimeError, ThreadedTrySendError, TlsListenerId, TlsStreamId, TraceRetention,
-    UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_read, file_size,
-    file_write, journal_append, journal_replay, path_metadata, process_run, read_dir, remove_file,
-    rename_replace, signal_wait, sleep, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write, tls_accept, tls_bind, tls_close,
-    tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
-    udp_recv_from, udp_send_to,
+    AffinityStatus, CallError, CallKind, CallOutcome, CancellationSupport, FileId, ListenerId,
+    LiveShardState, LocalSystem, LocalSystemConfig, LocalSystemConfigError, LocalSystemState,
+    MailboxFactory, PathKind, PathMetadata, PersistenceSupportLevel, PreallocationConfig,
+    ResourceExecutionShape, ResourceSupport, RuntimeEventKind, ShutdownSupport,
+    ShutdownUncleanReason, SnapshotImage, StreamId, ThreadedRuntimeError, ThreadedTrySendError,
+    TlsListenerId, TlsStreamId, TraceRetention, UdpSocketId, call, dns_lookup, file_close,
+    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
+    path_metadata, process_run, read_dir, remove_file, rename_replace, signal_wait, sleep,
+    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+    tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect,
+    tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1488,6 +1488,12 @@ fn local_system_topology_report_before_and_after_shutdown() {
         .storage_lane_capacity(2)
         .trace_retention(TraceRetention::Bounded(64))
         .build();
+    wait_until(|| {
+        app.topology()
+            .shard(ShardId::new(35))
+            .and_then(|shard| shard.worker_thread_id())
+            .is_some()
+    });
 
     let running = app.topology();
     let shard = running
@@ -1501,6 +1507,10 @@ fn local_system_topology_report_before_and_after_shutdown() {
     assert_eq!(shard.storage_lane().rejected_full(), None);
     assert_eq!(shard.trace_retention(), TraceRetention::Bounded(64));
     assert_eq!(shard.worker_name(), Some("tina-shard-35"));
+    assert!(shard.worker_thread_id().is_some());
+    assert_eq!(shard.configured_core(), None);
+    assert_eq!(shard.observed_core(), None);
+    assert_eq!(shard.affinity_status(), &AffinityStatus::NotRequested);
 
     let address = app
         .register_root::<LlamaService, Infallible>(
@@ -1534,6 +1544,167 @@ fn local_system_topology_report_before_and_after_shutdown() {
             .state(),
         LiveShardState::Stopped
     );
+}
+
+#[test]
+fn local_system_topology_reports_advisory_configured_core() {
+    let app = LocalSystem::single_shard(AppShard(36), AppMailboxFactory)
+        .configured_core(2)
+        .build();
+    wait_until(|| {
+        app.topology()
+            .shard(ShardId::new(36))
+            .and_then(|shard| shard.worker_thread_id())
+            .is_some()
+    });
+
+    let topology = app.topology();
+    let shard = topology
+        .shard(ShardId::new(36))
+        .expect("single shard report exists");
+    assert_eq!(shard.worker_name(), Some("tina-shard-36"));
+    assert!(shard.worker_thread_id().is_some());
+    assert_eq!(shard.configured_core(), Some(2));
+    assert_eq!(shard.observed_core(), None);
+    assert_eq!(shard.affinity_status(), &AffinityStatus::AdvisoryOnly);
+
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
+#[test]
+fn local_multi_shard_topology_reports_contiguous_advisory_cores() {
+    let app = LocalSystem::multi_shard(AppMailboxFactory)
+        .shard(AppShard(42))
+        .shard(AppShard(40))
+        .configured_core(8)
+        .build();
+    wait_until(|| {
+        let topology = app.topology();
+        topology
+            .shards()
+            .iter()
+            .all(|shard| shard.worker_thread_id().is_some())
+    });
+
+    let topology = app.topology();
+    let first = topology.shard(ShardId::new(40)).expect("first shard");
+    let second = topology.shard(ShardId::new(42)).expect("second shard");
+    assert_eq!(first.configured_core(), Some(8));
+    assert_eq!(second.configured_core(), Some(9));
+    assert_eq!(first.observed_core(), None);
+    assert_eq!(second.observed_core(), None);
+    assert_eq!(first.affinity_status(), &AffinityStatus::AdvisoryOnly);
+    assert_eq!(second.affinity_status(), &AffinityStatus::AdvisoryOnly);
+
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
+#[test]
+fn local_system_topology_reports_runtime_metadata_preallocation() {
+    let preallocation = PreallocationConfig {
+        entry_capacity: 17,
+        child_record_capacity: 11,
+        supervisor_capacity: 7,
+        trace_capacity: 333,
+        call_capacity: 19,
+        round_scratch_capacity: 23,
+    };
+    let app = LocalSystem::single_shard(AppShard(38), AppMailboxFactory)
+        .preallocation(preallocation)
+        .build();
+
+    let topology = app.topology();
+    let shard = topology
+        .shard(ShardId::new(38))
+        .expect("single shard report exists");
+    assert_eq!(shard.preallocation(), preallocation);
+
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
+#[test]
+fn blue_whale_combined_e2e_core_preallocation_and_cross_shard_call() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let preallocation = PreallocationConfig {
+        entry_capacity: 12,
+        child_record_capacity: 4,
+        supervisor_capacity: 2,
+        trace_capacity: 256,
+        call_capacity: 16,
+        round_scratch_capacity: 12,
+    };
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(45))
+        .shard(AppShard(46))
+        .configured_core(3)
+        .preallocation(preallocation)
+        .config(LocalSystemConfig {
+            remote_inbound_drain_budget: 1,
+            preallocation,
+            configured_core: Some(3),
+            trace_retention: TraceRetention::Bounded(256),
+            ..LocalSystemConfig::default()
+        })
+        .build();
+    wait_until(|| {
+        app.topology()
+            .shards()
+            .iter()
+            .all(|shard| shard.worker_thread_id().is_some())
+    });
+
+    let topology = app.topology();
+    assert_eq!(
+        topology
+            .shard(ShardId::new(45))
+            .expect("client shard")
+            .configured_core(),
+        Some(3)
+    );
+    assert_eq!(
+        topology
+            .shard(ShardId::new(46))
+            .expect("worker shard")
+            .configured_core(),
+        Some(4)
+    );
+    assert!(
+        topology
+            .shards()
+            .iter()
+            .all(|shard| shard.preallocation() == preallocation)
+    );
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(46),
+            CrossShardCallWorker,
+            8,
+        )
+        .expect("register worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(45),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register client");
+
+    app.try_send(client, CrossShardCallClientMsg::Start(worker))
+        .expect("start handoff");
+    wait_until(|| {
+        outcomes.lock().expect("outcomes").iter().any(|outcome| {
+            matches!(
+                outcome,
+                CallOutcome::Replied(CrossShardCallReply(bytes)) if bytes == b"llama"
+            )
+        })
+    });
+
+    let terminal = app.shutdown().drain().join().expect("clean shutdown");
+    assert!(terminal.shutdown_report().clean());
 }
 
 #[test]
@@ -2490,6 +2661,13 @@ fn local_system_config_manifest_rejects_zero_capacities_before_start() {
                 ..LocalSystemConfig::default()
             },
             LocalSystemConfigError::ZeroShardPairCapacity,
+        ),
+        (
+            LocalSystemConfig {
+                remote_inbound_drain_budget: 0,
+                ..LocalSystemConfig::default()
+            },
+            LocalSystemConfigError::ZeroRemoteInboundDrainBudget,
         ),
         (
             LocalSystemConfig {

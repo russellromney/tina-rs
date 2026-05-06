@@ -4,6 +4,35 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase Blue Whale
+
+- Added `AffinityStatus` and shard/core ownership reporting to live topology:
+  `LiveShardReport` now exposes worker name, worker thread id, configured
+  core, optional observed core, and affinity status. The current portable
+  backend reports configured cores as `AdvisoryOnly`; it does not claim hard
+  OS pinning.
+- Added `configured_core` to `LocalSystemConfig` and
+  `ThreadedRuntimeConfig`. Multi-shard local systems treat it as the first
+  core in stable shard order and report contiguous advisory core ownership.
+- Added `PreallocationConfig` for setup-time runtime-owned metadata reserves:
+  isolate entries, child records, supervisors, trace events, in-flight calls,
+  translators, isolate-call metadata, driver-completion scratch, and per-step
+  round scratch. User payloads, erased reply/message boxes, durable buffers,
+  and backend-owned completion slots remain explicit non-claims.
+- Added `remote_inbound_drain_budget` so a live destination shard harvests a
+  bounded number of remote envelopes before giving local runtime work a turn.
+  Cooperative isolate fairness remains one delivery chance per isolate per
+  runtime step; Tina still does not preempt a synchronous handler.
+- Tightened fake-driver contract tests with a TCP-ish pending resource path
+  that proves pending-call and table-owned resource reporting clear on cancel.
+- Added a checked Blue Whale/Seastar principles table as a Rust test covering
+  per-core ownership, thread pinning, bounded queues, preallocation, allocator
+  locality, backend shape, NUMA, scheduling groups, DST/replay, and Tina's
+  non-`await` user model.
+- Added combined e2e coverage for advisory core ownership, preallocation
+  posture, bounded remote drain budget, and live cross-shard isolate-call
+  behavior. `make verify` passes.
+
 ### Phase Sadie's Ward
 
 - Added typed worker-held and pending-driver-call accounting alongside the

@@ -221,3 +221,161 @@ Implementation watchpoints:
    `AdvisoryOnly` evidence, not fake zeroes or guessed CPU ids.
 
 If implementation follows those watchpoints, Blue Whale is a good next rock.
+
+# Rock 1 Audit
+
+Verdict: starting surface is real. Blue Whale is not green-field runtime work.
+It is completion work around already-visible seams.
+
+## Runtime Surface
+
+- `ThreadedRuntimeConfig` already names bounded ingress, shard-pair, storage,
+  DNS, TLS, process, signal, trace-retention, idle-wait, and shutdown-drain
+  knobs.
+- `LocalSystemConfig` mirrors the user-facing bounded resource manifest and
+  validates zero capacities.
+- `LiveShardReport` already exposes shard id, worker name, lifecycle state,
+  ingress pressure, lane capacities, trace retention, resource counts,
+  worker-held resource counts, and pending driver-call counts.
+- `LiveTopologyReport` already snapshots shards and source-target remote queue
+  reports without probing failed workers.
+- Missing for Blue Whale: configured core, optional observed core, affinity
+  status, thread/core ownership vocabulary, and preallocation posture.
+
+## Fairness Surface
+
+- The explicit-step runtime already advances driver completions, harvests
+  isolate-call timeouts, then gives each registered isolate at most one
+  delivery chance in registration order per step.
+- The explicit multi-shard runtime steps shards in stable shard order and
+  moves next-step remote queues deterministically.
+- Live shard workers run the same `Runtime::step()` loop, so isolate-turn
+  fairness mostly exists for cooperative handlers.
+- Suspicious gap: live `drain_remote_inbound` drains every queued remote
+  envelope for each inbound source before local ingress and before `step()`.
+  Under heavy cross-shard pressure, remote harvesting can monopolize a worker
+  turn. Blue Whale should cap or prove this path.
+- Non-gap: a synchronous handler that loops forever cannot be preempted. That
+  stays a documented user bug, not a runtime promise.
+
+## Allocation / Preallocation Surface
+
+- `Runtime` preallocates entries, child records, supervisors, trace,
+  in-flight calls, translators, pending isolate calls, round scratch, and
+  driver-completion scratch with fixed initial capacities.
+- Runtime round scratch has a regression test proving reserve covers more than
+  the initial capacity.
+- Multi-shard explicit-step runners prebuild queue/index storage and
+  per-pair `VecDeque`s with shard-pair capacity.
+- `BetelgeuseDriver` preallocates timers, resources, pending vectors, signal
+  waits, and lane pending storage with fixed constants/capacity caps.
+- Missing for Blue Whale: user-configurable safe reserves for runtime-owned
+  metadata, and tests that separate setup/warm-up/steady-state/trace/replay
+  allocation behavior.
+- Named costs to keep honest: boxed erased messages/replies, user payloads,
+  translator boxes, backend-owned completion slots, and trace/replay growth.
+
+## Driver / Fake-Driver Surface
+
+- `RuntimeDriver` is crate-private and already has `submit`, `advance`,
+  `has_pending`, `cancel_pending`, `cancel`, `notify_signal`, and
+  `resource_report`.
+- `BetelgeuseDriver` already treats TCP, storage, DNS, TLS, process, signals,
+  timers, and resource accounting as runtime-owned substrate work.
+- Unit fake-driver coverage exists for timer-ish submission/completion,
+  shutdown cancellation, per-call cancel, and driver shutdown failure.
+- Driver tests cover many lane-level resource reports and late-completion /
+  cancellation paths, especially after 043.
+- Missing for Blue Whale: one compact fake-substrate proof that treats the
+  driver contract itself as the thing under test, including cancel, late
+  completion, drain, shutdown report, capability truth, and a TCP-ish
+  resource-like path.
+
+## E2E / DST Surface
+
+- Local-system tests already cover topology, trace retention, live resource
+  reports, terminal shutdown reports, live cross-shard calls, TLS/DNS/file/
+  signal/process rails, and composed service workloads.
+- `tina-sim` has reusable DST/randomized tests over storage, TCP cancellation,
+  bridge ingress, resource rails, topology/failure, and live-vs-sim
+  projections.
+- Missing for Blue Whale: combined tests for hot isolate + normal isolate,
+  hot remote pressure + local progress, affinity/core reporting, configured
+  preallocation posture, and checked Blue Whale/Seastar status evidence.
+
+## Implementation Direction From Audit
+
+1. Add reporting/config fields first; do not change scheduling yet.
+2. Add advisory affinity status without a new dependency unless hard pinning is
+   obviously boring.
+3. Add preallocation config only for runtime-owned metadata reserves.
+4. Add a remote-inbound drain budget if tests prove the live gap.
+5. Add fake-substrate contract tests around existing `RuntimeDriver` before
+   extracting any public substrate API.
+6. Add a checked Blue Whale table as a Rust test.
+
+# Implementation Review
+
+Verdict: Blue Whale closes on its own terms.
+
+## Positive Review
+
+- Shard/core ownership is now visible in topology. Each live shard reports
+  worker name, worker thread id, configured core, optional observed core, and
+  `AffinityStatus`.
+- Affinity stays honest. The portable backend reports `NotRequested` or
+  `AdvisoryOnly`; it does not claim hard OS pinning.
+- Multi-shard configured core ownership is deterministic: `configured_core:
+  Some(n)` assigns sorted shards to `n`, `n + 1`, ...
+- `PreallocationConfig` reserves only runtime-owned metadata. It does not pool
+  user payloads, erased boxes, durable buffers, or backend-owned completion
+  slots.
+- Live remote inbound harvest is now bounded by
+  `remote_inbound_drain_budget`, so remote harvesting cannot keep looping
+  forever before the shard gets a local runtime turn.
+- The fake driver now has a TCP-ish pending resource proof, and its resource
+  counts clear on cancel.
+- Cooperative fairness is directly pinned: a self-sending hot isolate gets one
+  delivery chance in a round and does not starve a quiet isolate.
+- Blue Whale's Seastar-shaped claims live in
+  `tina-runtime/tests/blue_whale_checklist.rs`, not only in prose.
+- A combined e2e proves advisory core reporting, preallocation posture, bounded
+  remote drain config, and live cross-shard isolate-call behavior together.
+
+## Hostile Review
+
+No P1/P2 code bugs found after implementation fixes.
+
+Important non-claims remain visible:
+
+- Hard OS pinning is not implemented.
+- `observed_core` is `None` on the portable backend.
+- No allocator-locality or NUMA claim exists.
+- No user payload / erased `Any` / backend completion-slot pooling was added.
+- Fairness is cooperative between handler turns. A synchronous infinite loop in
+  a handler is still a user bug Tina cannot preempt.
+- Resource-lane fairness remains bounded by lane capacity, worker-held
+  accounting, and shutdown reporting rather than service-class scheduling.
+
+One design wart to watch later: `configured_core: Some(n)` means "first core"
+for multi-shard systems. That is simple and tested, but a later hard-pinning
+phase may want an explicit shard-to-core map.
+
+## Blast Radius
+
+- Public config surface changed: `ThreadedRuntimeConfig` and
+  `LocalSystemConfig` gained `configured_core`, `preallocation`, and
+  `remote_inbound_drain_budget`.
+- Public topology surface changed: `LiveShardReport` gained worker thread id,
+  configured/observed core, affinity status, and preallocation reporting.
+- `LocalSystemConfig::validate()` now rejects zero remote inbound drain budget.
+- Live multi-shard worker scheduling changed only at the remote-harvest edge:
+  a worker harvests at most the configured remote inbound budget before
+  running a local step. Existing tests and `make verify` pass.
+- Baobab was updated to consume Blue Whale's advisory affinity truth and avoid
+  overclaiming hard OS pinning.
+
+## Proof Run
+
+- `cargo +nightly test -p tina-runtime blue_whale -- --nocapture`: passed.
+- `make verify`: passed.
