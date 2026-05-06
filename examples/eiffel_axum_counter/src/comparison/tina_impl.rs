@@ -28,8 +28,6 @@ struct Counter {
     value: u64,
 }
 
-// Phase 047 Rock 5: macro defaults `shard = ::tina::SingleShard`, so we
-// can drop the per-example shard struct entirely.
 #[tina::isolate(message = BridgeRequest<CounterRequest, CounterReply>)]
 impl Counter {
     fn handle(
@@ -65,10 +63,7 @@ async fn increment_counter(State(bridge): State<CounterBridge>) -> (StatusCode, 
 }
 
 pub(crate) fn run() -> SideReport {
-    // Phase 047 Rock 7: BridgeHost owns the runtime and gives back a
-    // typed handle. Phase 047 Rock 1: DefaultThreadedMailboxFactory
-    // replaces the 50-line per-example mailbox factory.
-    let host = BridgeHost::new(
+    let mut host = BridgeHost::new(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -116,8 +111,6 @@ pub(crate) fn run() -> SideReport {
 
     drop(tokio_runtime);
 
-    // Phase 047 Rock 7: one-call drain + shutdown. The previous
-    // `Arc::try_unwrap` dance is gone.
     let _ = host
         .drain_and_shutdown(Duration::from_secs(2))
         .expect("bridge host drains and shuts down cleanly");

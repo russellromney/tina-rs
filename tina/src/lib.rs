@@ -105,8 +105,9 @@ use std::marker::PhantomData;
 /// Declares a Tina isolate from an inherent `impl` block.
 ///
 /// This is the preferred authoring path for ordinary Tina code. Only `message`
-/// and `shard` are required; `reply`, `send`, `spawn`, and `call` default to
-/// the no-reply/no-send/no-spawn/no-runtime-call shape.
+/// is required for single-shard isolates: omitted `shard = ...` defaults to
+/// [`SingleShard`]. `reply`, `send`, `spawn`, and `call` default to the
+/// no-reply/no-send/no-spawn/no-runtime-call shape.
 ///
 /// ```compile_fail
 /// struct DemoShard;

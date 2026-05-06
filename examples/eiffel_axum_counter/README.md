@@ -53,18 +53,18 @@ cargo run --manifest-path examples/eiffel_axum_counter/Cargo.toml -- tina
 
 ### What was awkward
 
-- Forty more lines of `BridgeMailbox` + `BridgeMailboxFactory` boilerplate
-  before any service code can run. Same as the keyspace example. This is
-  now the second comparison in a row that opens with copy-pasted mailbox
-  scaffolding.
-- The runtime + bridge wiring is verbose: build `ThreadedRuntime` →
+- ~~Forty more lines of `BridgeMailbox` + `BridgeMailboxFactory`
+  boilerplate before any service code can run.~~ **Resolved in phase 047:**
+  the example uses `DefaultThreadedMailboxFactory`.
+- ~~The runtime + bridge wiring is verbose: build `ThreadedRuntime` →
   `register_with_capacity::<Counter, Infallible>` → `BridgeHandle::new` →
-  pass `Arc` clones around. For a one-isolate service this is more setup
-  than the entire Tokio side.
-- Shutdown of the Tina runtime requires unwrapping the `Arc` and calling
-  `shutdown()` only when no clones remain. There's no obvious "drain and
-  stop" affordance from a bridge-hosted service, so example code falls
-  back to `Arc::try_unwrap` plus a discarded clone path.
+  pass `Arc` clones around.~~ **Mostly resolved in phase 047:** `BridgeHost`
+  owns the runtime and registers the bridge handle in one place. There is
+  still setup, but it now reads like one bridge-hosted service shape.
+- ~~Shutdown of the Tina runtime requires unwrapping the `Arc` and calling
+  `shutdown()` only when no clones remain.~~ **Resolved in phase 047:**
+  `BridgeHost::drain_and_shutdown(...)` waits for handle clones to drain,
+  returns a structured report, and leaves the host retryable on timeout.
 - Both sides need a `tokio::runtime` to host axum, so the Tina side ends
   up with **two** runtimes (Tina's own thread + a Tokio current-thread
   runtime). That is the bridge's nature, but it's a real comprehension

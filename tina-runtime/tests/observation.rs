@@ -151,6 +151,23 @@ fn waiter_times_out_when_no_bind_submitted() {
 }
 
 #[test]
+fn observation_registration_is_bounded() {
+    let runtime = make_runtime();
+
+    for _ in 0..1024 {
+        let _waiter = runtime.observe_next_bound();
+    }
+
+    let saturated = runtime.observe_next_bound();
+    assert_eq!(
+        saturated.wait(Duration::from_secs(1)),
+        Err(WaitError::ObservationFull)
+    );
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
 fn waiter_runtime_stopped_when_runtime_dropped() {
     let runtime = make_runtime();
     let waiter = runtime.observe_next_bound();

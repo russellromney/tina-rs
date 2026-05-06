@@ -1,80 +1,16 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
-use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    CallError, MailboxFactory, StreamId, ThreadedRuntime, ThreadedRuntimeConfig, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write,
+    CallError, DefaultThreadedMailboxFactory, StreamId, ThreadedRuntime, ThreadedRuntimeConfig,
+    tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 
 use super::{REQUEST_IDS, SideReport, spawn_responder};
-
-#[derive(Debug, Clone, Copy)]
-struct MuxShard;
-
-impl Shard for MuxShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(75)
-    }
-}
-
-struct MuxMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> MuxMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for MuxMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MuxMailboxFactory;
-
-impl MailboxFactory for MuxMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(MuxMailbox::new(capacity))
-    }
-}
 
 type ArrivalLog = Arc<Mutex<Vec<u32>>>;
 
@@ -97,9 +33,9 @@ struct MuxClient {
     read_buf: Vec<u8>,
 }
 
-#[tina_runtime::isolate(message = MuxMsg, shard = MuxShard)]
+#[tina_runtime::isolate(message = MuxMsg)]
 impl MuxClient {
-    fn handle(&mut self, msg: MuxMsg, _ctx: &mut Context<'_, MuxShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: MuxMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             MuxMsg::Begin => tcp_connect(self.target).reply(MuxMsg::Connected),
             MuxMsg::Connected(Ok((stream, _local, _peer))) => {
@@ -166,8 +102,8 @@ pub(crate) fn run() -> SideReport {
 
     let arrivals: ArrivalLog = Arc::default();
     let runtime = ThreadedRuntime::with_config(
-        MuxShard,
-        MuxMailboxFactory,
+        SingleShard,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 32,
             idle_wait: Duration::from_millis(1),
@@ -186,13 +122,14 @@ pub(crate) fn run() -> SideReport {
             16,
         )
         .expect("register mux client");
+    let client_done = runtime.observe_isolate_complete(address);
     runtime
         .try_send(address, MuxMsg::Begin)
         .expect("kick mux client");
 
-    wait_until(Duration::from_secs(3), "all responses arrived", || {
-        arrivals.lock().expect("arrivals lock").len() == REQUEST_IDS.len()
-    });
+    client_done
+        .wait(Duration::from_secs(3))
+        .expect("mux client finishes");
 
     let _ = runtime.shutdown();
     let _ = server_done_tx.send(());
@@ -202,18 +139,5 @@ pub(crate) fn run() -> SideReport {
     SideReport {
         arrival_order,
         request_ids: REQUEST_IDS.to_vec(),
-    }
-}
-
-fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F)
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    while !predicate() {
-        if Instant::now() > deadline {
-            panic!("wait_until({label}) timed out");
-        }
-        thread::yield_now();
     }
 }

@@ -106,14 +106,11 @@ What was awkward or surprising:
   comparisons, applied to a domain where the Tokio shape is genuinely
   near-optimal.
 - "Wait for the runtime to be drained" still requires polling shared
-  atomics from the driver thread. The pattern is now showing up in
-  every comparison: chat (slow consumer counts), keyspace (trace
-  poll for `TcpStreamClose`), supervised worker (slot generation),
-  persistent counter (op id), outbound fetch (`done` AtomicBool),
-  and now this comparison's "produced == processed && producer
-  stopped" three-fact check. There should be a public Tina API
-  surface for "this isolate finished" or "the runtime has nothing
-  left to do".
+  atomics from the driver thread. Phase 047 removed several earlier
+  side channels (bound addresses, isolate completion, restart waits),
+  but this comparison still wants a higher-level "runtime is drained"
+  or "these application facts are all true" surface. Today the app
+  owns that telemetry.
 - `TimerFired(u32, Result<(), CallError>)` continuations carry a
   `Result<(), CallError>` we generally do not care about (the timer
   effectively never fails on healthy systems). Every Tina handler

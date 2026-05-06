@@ -14,8 +14,9 @@
 //!   spawned by a chosen parent.
 //!
 //! Each handle is one bounded slot. Handles do not create secret unbounded
-//! queues. The trace remains the source of audit truth: handles only
-//! surface facts the runtime already records into the trace.
+//! queues: the runtime also caps the number of pending observation slots.
+//! The trace remains the source of audit truth: handles only surface facts
+//! the runtime already records into the trace.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -36,6 +37,10 @@ pub enum WaitError {
     RuntimeStopped,
     /// The awaited runtime call failed; the trace recorded the failure.
     CallFailed(CallError),
+    /// The runtime already has its configured number of pending host
+    /// observations. The fact may still happen and still be traced, but this
+    /// waiter was not registered.
+    ObservationFull,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,16 +90,34 @@ pub struct ChildRestarted {
 #[derive(Debug)]
 pub struct BoundAddressWaiter {
     rx: mpsc::Receiver<BoundAddressOutcome>,
+    pre_error: Option<WaitError>,
 }
 
 impl BoundAddressWaiter {
     pub(crate) fn from_pair() -> (Self, SyncSender<BoundAddressOutcome>) {
         let (tx, rx) = mpsc::sync_channel(1);
-        (Self { rx }, tx)
+        (
+            Self {
+                rx,
+                pre_error: None,
+            },
+            tx,
+        )
+    }
+
+    fn with_error(error: WaitError) -> Self {
+        let (_tx, rx) = mpsc::sync_channel(1);
+        Self {
+            rx,
+            pre_error: Some(error),
+        }
     }
 
     /// Waits up to `timeout` for the next `tcp_bind` to complete.
     pub fn wait(self, timeout: Duration) -> Result<SocketAddr, WaitError> {
+        if let Some(error) = self.pre_error {
+            return Err(error);
+        }
         match self.rx.recv_timeout(timeout) {
             Ok(BoundAddressOutcome::Bound(addr)) => Ok(addr),
             Ok(BoundAddressOutcome::Failed(error)) => Err(WaitError::CallFailed(error)),
@@ -110,16 +133,34 @@ impl BoundAddressWaiter {
 #[derive(Debug)]
 pub struct IsolateCompleteWaiter {
     rx: mpsc::Receiver<()>,
+    pre_error: Option<WaitError>,
 }
 
 impl IsolateCompleteWaiter {
     pub(crate) fn from_pair() -> (Self, SyncSender<()>) {
         let (tx, rx) = mpsc::sync_channel(1);
-        (Self { rx }, tx)
+        (
+            Self {
+                rx,
+                pre_error: None,
+            },
+            tx,
+        )
+    }
+
+    fn with_error(error: WaitError) -> Self {
+        let (_tx, rx) = mpsc::sync_channel(1);
+        Self {
+            rx,
+            pre_error: Some(error),
+        }
     }
 
     /// Waits up to `timeout` for the targeted isolate to stop.
     pub fn wait(self, timeout: Duration) -> Result<(), WaitError> {
+        if let Some(error) = self.pre_error {
+            return Err(error);
+        }
         match self.rx.recv_timeout(timeout) {
             Ok(()) => Ok(()),
             Err(RecvTimeoutError::Timeout) => Err(WaitError::Timeout),
@@ -133,12 +174,27 @@ impl IsolateCompleteWaiter {
 #[derive(Debug)]
 pub struct OperationDoneWaiter {
     rx: mpsc::Receiver<OperationDoneOutcome>,
+    pre_error: Option<WaitError>,
 }
 
 impl OperationDoneWaiter {
     pub(crate) fn from_pair() -> (Self, SyncSender<OperationDoneOutcome>) {
         let (tx, rx) = mpsc::sync_channel(1);
-        (Self { rx }, tx)
+        (
+            Self {
+                rx,
+                pre_error: None,
+            },
+            tx,
+        )
+    }
+
+    fn with_error(error: WaitError) -> Self {
+        let (_tx, rx) = mpsc::sync_channel(1);
+        Self {
+            rx,
+            pre_error: Some(error),
+        }
     }
 
     /// Waits up to `timeout` for the matching call to complete.
@@ -147,6 +203,9 @@ impl OperationDoneWaiter {
     /// match this completion against any context it kept. On failure the
     /// `CallError` is surfaced via [`WaitError::CallFailed`].
     pub fn wait(self, timeout: Duration) -> Result<CallId, WaitError> {
+        if let Some(error) = self.pre_error {
+            return Err(error);
+        }
         match self.rx.recv_timeout(timeout) {
             Ok(OperationDoneOutcome::Completed(call_id)) => Ok(call_id),
             Ok(OperationDoneOutcome::Failed { error, .. }) => Err(WaitError::CallFailed(error)),
@@ -164,16 +223,34 @@ impl OperationDoneWaiter {
 #[derive(Debug)]
 pub struct ChildRestartedWaiter {
     rx: mpsc::Receiver<ChildRestarted>,
+    pre_error: Option<WaitError>,
 }
 
 impl ChildRestartedWaiter {
     pub(crate) fn from_pair() -> (Self, SyncSender<ChildRestarted>) {
         let (tx, rx) = mpsc::sync_channel(1);
-        (Self { rx }, tx)
+        (
+            Self {
+                rx,
+                pre_error: None,
+            },
+            tx,
+        )
+    }
+
+    fn with_error(error: WaitError) -> Self {
+        let (_tx, rx) = mpsc::sync_channel(1);
+        Self {
+            rx,
+            pre_error: Some(error),
+        }
     }
 
     /// Waits up to `timeout` for the parent's next direct-child restart.
     pub fn wait(self, timeout: Duration) -> Result<ChildRestarted, WaitError> {
+        if let Some(error) = self.pre_error {
+            return Err(error);
+        }
         match self.rx.recv_timeout(timeout) {
             Ok(restarted) => Ok(restarted),
             Err(RecvTimeoutError::Timeout) => Err(WaitError::Timeout),
@@ -212,6 +289,7 @@ pub(crate) struct ObservationRegistry {
     pending_isolate_complete: Vec<IsolateCompleteSlot>,
     pending_operation_done: Vec<OperationDoneSlot>,
     pending_child_restarted: Vec<ChildRestartedSlot>,
+    max_pending: usize,
 }
 
 impl std::fmt::Debug for ObservationRegistry {
@@ -228,6 +306,7 @@ impl std::fmt::Debug for ObservationRegistry {
                 "pending_child_restarted",
                 &self.pending_child_restarted.len(),
             )
+            .field("max_pending", &self.max_pending)
             .finish()
     }
 }
@@ -235,40 +314,42 @@ impl std::fmt::Debug for ObservationRegistry {
 /// Constructs a waiter whose receiver is already disconnected, so the next
 /// `wait` resolves immediately to [`WaitError::RuntimeStopped`].
 pub(crate) fn stopped_bound_waiter() -> BoundAddressWaiter {
-    let (tx, rx) = mpsc::sync_channel(1);
-    drop(tx);
-    BoundAddressWaiter { rx }
+    BoundAddressWaiter::with_error(WaitError::RuntimeStopped)
 }
 
 pub(crate) fn stopped_isolate_complete_waiter() -> IsolateCompleteWaiter {
-    let (tx, rx) = mpsc::sync_channel(1);
-    drop(tx);
-    IsolateCompleteWaiter { rx }
+    IsolateCompleteWaiter::with_error(WaitError::RuntimeStopped)
 }
 
 pub(crate) fn stopped_operation_done_waiter() -> OperationDoneWaiter {
-    let (tx, rx) = mpsc::sync_channel(1);
-    drop(tx);
-    OperationDoneWaiter { rx }
+    OperationDoneWaiter::with_error(WaitError::RuntimeStopped)
 }
 
 pub(crate) fn stopped_child_restarted_waiter() -> ChildRestartedWaiter {
-    let (tx, rx) = mpsc::sync_channel(1);
-    drop(tx);
-    ChildRestartedWaiter { rx }
+    ChildRestartedWaiter::with_error(WaitError::RuntimeStopped)
 }
 
 impl ObservationRegistry {
+    pub(crate) const DEFAULT_MAX_PENDING: usize = 1024;
+
     pub(crate) const fn new() -> Self {
+        Self::with_max_pending(Self::DEFAULT_MAX_PENDING)
+    }
+
+    pub(crate) const fn with_max_pending(max_pending: usize) -> Self {
         Self {
             pending_bound: VecDeque::new(),
             pending_isolate_complete: Vec::new(),
             pending_operation_done: Vec::new(),
             pending_child_restarted: Vec::new(),
+            max_pending,
         }
     }
 
     pub(crate) fn register_bound(&mut self) -> BoundAddressWaiter {
+        if self.is_full() {
+            return BoundAddressWaiter::with_error(WaitError::ObservationFull);
+        }
         let (waiter, sender) = BoundAddressWaiter::from_pair();
         self.pending_bound.push_back(sender);
         waiter
@@ -279,6 +360,9 @@ impl ObservationRegistry {
         isolate: IsolateId,
         generation: AddressGeneration,
     ) -> IsolateCompleteWaiter {
+        if self.is_full() {
+            return IsolateCompleteWaiter::with_error(WaitError::ObservationFull);
+        }
         let (waiter, sender) = IsolateCompleteWaiter::from_pair();
         self.pending_isolate_complete.push(IsolateCompleteSlot {
             isolate,
@@ -293,6 +377,9 @@ impl ObservationRegistry {
         isolate: IsolateId,
         call_kind: CallKind,
     ) -> OperationDoneWaiter {
+        if self.is_full() {
+            return OperationDoneWaiter::with_error(WaitError::ObservationFull);
+        }
         let (waiter, sender) = OperationDoneWaiter::from_pair();
         self.pending_operation_done.push(OperationDoneSlot {
             isolate,
@@ -303,10 +390,24 @@ impl ObservationRegistry {
     }
 
     pub(crate) fn register_child_restarted(&mut self, parent: IsolateId) -> ChildRestartedWaiter {
+        if self.is_full() {
+            return ChildRestartedWaiter::with_error(WaitError::ObservationFull);
+        }
         let (waiter, sender) = ChildRestartedWaiter::from_pair();
         self.pending_child_restarted
             .push(ChildRestartedSlot { parent, sender });
         waiter
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_bound.len()
+            + self.pending_isolate_complete.len()
+            + self.pending_operation_done.len()
+            + self.pending_child_restarted.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.pending_count() >= self.max_pending
     }
 
     pub(crate) fn notify_bound(&mut self, outcome: BoundAddressOutcome) {

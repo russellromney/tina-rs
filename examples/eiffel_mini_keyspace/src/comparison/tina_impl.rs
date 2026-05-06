@@ -6,21 +6,12 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, CallOutcome, DefaultThreadedMailboxFactory, ListenerId, RuntimeEventKind, StreamId,
-    ThreadedRuntime, ThreadedRuntimeConfig, call, stable_trace_hash, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    CallError, CallOutcome, DefaultThreadedMailboxFactory, ListenerId, StreamId, ThreadedRuntime,
+    ThreadedRuntimeConfig, call, stable_trace_hash, tcp_accept, tcp_bind, tcp_close_listener,
+    tcp_close_stream, tcp_read, tcp_write,
 };
 
 use super::{Command, report_from_response, scripted_client};
-
-#[derive(Debug, Default)]
-struct KeyspaceShard;
-
-impl Shard for KeyspaceShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(72)
-    }
-}
 
 #[derive(Debug, Clone)]
 enum StoreMsg {
@@ -45,10 +36,9 @@ struct Store {
 #[tina_runtime::isolate(
     message = StoreMsg,
     reply = StoreReply,
-    shard = KeyspaceShard
 )]
 impl Store {
-    fn handle(&mut self, msg: StoreMsg, _ctx: &mut Context<'_, KeyspaceShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: StoreMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             StoreMsg::Set { key, value } => {
                 self.values.insert(key, value);
@@ -87,12 +77,12 @@ struct Connection {
     response: Vec<u8>,
 }
 
-#[tina_runtime::isolate(message = ConnectionMsg, shard = KeyspaceShard)]
+#[tina_runtime::isolate(message = ConnectionMsg)]
 impl Connection {
     fn handle(
         &mut self,
         msg: ConnectionMsg,
-        _ctx: &mut Context<'_, KeyspaceShard>,
+        _ctx: &mut Context<'_, SingleShard>,
     ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 4096).reply(|result| match result {
@@ -186,10 +176,9 @@ struct Listener {
 #[tina_runtime::isolate(
     message = ListenerMsg,
     spawn = ChildDefinition<Connection>,
-    shard = KeyspaceShard
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, KeyspaceShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {
@@ -225,7 +214,7 @@ impl Listener {
 pub(crate) fn run() -> super::SideReport {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
     let runtime = ThreadedRuntime::with_config(
-        KeyspaceShard,
+        SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
@@ -248,8 +237,6 @@ pub(crate) fn run() -> super::SideReport {
         )
         .expect("register listener");
 
-    // Phase 047 Rock 4 (slice 1): the runtime's typed bound-address waiter
-    // replaces the previous `Arc<Mutex<Option<SocketAddr>>>` side channel.
     let bound = runtime.observe_next_bound();
     runtime
         .try_send(listener, ListenerMsg::Start)
@@ -259,42 +246,15 @@ pub(crate) fn run() -> super::SideReport {
         .expect("listener bound address");
     let client = thread::spawn(move || scripted_client(addr));
 
-    wait_until(Duration::from_secs(3), "tcp close", || {
-        runtime
-            .complete_trace()
-            .expect("trace available")
-            .iter()
-            .any(tcp_stream_close_completed)
-    });
-
+    // The client thread reads until EOF, which only happens after the
+    // server's spawned Connection isolate closes the stream. Joining the
+    // client is sufficient — no separate trace polling for `TcpStreamClose`
+    // is needed.
     let response = client.join().expect("client thread");
     let trace = runtime.shutdown().expect("runtime shutdown");
 
-    // Phase 047 Rock 3: trace fingerprint via stable_hash, not Debug
-    // formatting. Same workload, same Tina version → same fingerprint.
     let fingerprint = stable_trace_hash(trace.iter());
     debug_assert!(fingerprint != 0, "trace fingerprint should be populated");
 
     report_from_response(response)
-}
-
-fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F)
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    while !predicate() {
-        if Instant::now() > deadline {
-            panic!("wait_until({label}) timed out");
-        }
-        thread::yield_now();
-    }
-}
-
-fn tcp_stream_close_completed(event: &tina_runtime::RuntimeEvent) -> bool {
-    matches!(
-        event.kind(),
-        RuntimeEventKind::CallCompleted { call_kind, .. }
-            if matches!(call_kind, tina_runtime::CallKind::TcpStreamClose)
-    )
 }

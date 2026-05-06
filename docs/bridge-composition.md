@@ -71,7 +71,7 @@ unwrap silently fails.
 **Fix:** use `BridgeHost::drain_and_shutdown(drain_timeout)`:
 
 ```rust,ignore
-let host = BridgeHost::new(SingleShard, DefaultThreadedMailboxFactory, config);
+let mut host = BridgeHost::new(SingleShard, DefaultThreadedMailboxFactory, config);
 let bridge = host.register_bridge::<MyIsolate, Req, Resp, Infallible>(
     isolate, mailbox_capacity, per_call_timeout,
 )?;
@@ -81,9 +81,11 @@ assert!(report.drained_within_timeout);
 ```
 
 The drain loop polls until every `BridgeHandle` clone has been dropped
-or the timeout elapses. `BridgeShutdownReport.outstanding_handles_at_shutdown`
-names how many clones survived the drain (zero on success). `pending_handles()`
-is also available between calls if the host wants to log progress.
+or the timeout elapses. If clones remain, the runtime is left alive and
+the host can retry after more handles are dropped.
+`BridgeShutdownReport.outstanding_handles_at_shutdown` names how many
+clones survived the drain (zero on success). `pending_handles()` is also
+available between calls if the host wants to log progress.
 
 ## Footgun #3: Tokio + Tina signal handlers in the same process
 

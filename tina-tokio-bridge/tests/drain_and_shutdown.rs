@@ -56,7 +56,7 @@ fn make_host() -> BridgeHost<SingleShard, DefaultThreadedMailboxFactory> {
 
 #[test]
 fn drain_and_shutdown_succeeds_when_no_handles_outstanding() {
-    let host = make_host();
+    let mut host = make_host();
     let report = host
         .drain_and_shutdown(Duration::from_millis(100))
         .expect("shutdown completes");
@@ -66,7 +66,7 @@ fn drain_and_shutdown_succeeds_when_no_handles_outstanding() {
 
 #[test]
 fn drain_and_shutdown_waits_for_outstanding_handles_to_drop() {
-    let host = make_host();
+    let mut host = make_host();
     let handle = host
         .register_bridge::<EchoIsolate, u32, u32, Infallible>(
             EchoIsolate,
@@ -93,7 +93,7 @@ fn drain_and_shutdown_waits_for_outstanding_handles_to_drop() {
 
 #[test]
 fn drain_and_shutdown_reports_partial_drain_on_timeout() {
-    let host = make_host();
+    let mut host = make_host();
     let leak = host
         .register_bridge::<EchoIsolate, u32, u32, Infallible>(
             EchoIsolate,
@@ -108,7 +108,13 @@ fn drain_and_shutdown_reports_partial_drain_on_timeout() {
         .expect("drain returns even if handles remain");
     assert!(!report.drained_within_timeout);
     assert!(report.outstanding_handles_at_shutdown >= 1);
+    assert!(report.trace.is_empty());
     drop(leak);
+    let retry = host
+        .drain_and_shutdown(Duration::from_secs(2))
+        .expect("retry drain after leaked handle is dropped");
+    assert!(retry.drained_within_timeout);
+    assert_eq!(retry.outstanding_handles_at_shutdown, 0);
 }
 
 #[test]

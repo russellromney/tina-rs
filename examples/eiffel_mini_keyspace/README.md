@@ -82,19 +82,15 @@ What was awkward or surprising:
   the `bound_addr` field on the `Listener` isolate are all gone.
 - Shutdown still relies on `complete_trace()` polling for a specific
   `CallKind::TcpStreamClose` event. Useful for tests, but not a story we want
-  to ship. Phase 047's later observation-handle slice (operation-done waiter)
-  will close this gap.
-- The `#[isolate(... shard = KeyspaceShard)]` attribute requires every
-  isolate to declare a shard even when there is only one. Single-shard
-  examples should be allowed to omit it.
+  to ship. Phase 047 added operation-done waiters for narrower host waits;
+  a richer terminal/shutdown waiter is still future work.
+- ~~The `#[isolate(... shard = KeyspaceShard)]` attribute requires every
+  isolate to declare a shard even when there is only one.~~ **Resolved in
+  phase 047:** the example now omits `shard = ...` and uses `SingleShard`.
 
 ### Suggested follow-ups for Tina (recorded for the roadmap)
 
-- Provide a default `MailboxFactory` for in-process examples.
-- Provide a "wait for isolate to stop" handle so tests/examples don't
-  scrape the trace.
+- Keep improving host observation shapes for shutdown/terminal facts.
 - Consider sugar for "issue a sequence of calls then write a buffer" — the
   `next_effect()` shape will recur in nearly every connection-handling
   isolate.
-- Consider returning the bound `SocketAddr` as part of `tcp_bind`'s reply
-  in a way the spawning code can read without a side-channel mutex.

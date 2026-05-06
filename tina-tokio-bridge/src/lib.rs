@@ -582,11 +582,9 @@ where
     /// `Arc::try_unwrap` dance Eiffel examples used to write.
     ///
     /// Polls until every `BridgeHandle` clone has been dropped or
-    /// `drain_timeout` elapses, then attempts to consume the
-    /// `Arc<ThreadedRuntime>` and shut down. Returns a structured
-    /// [`BridgeShutdownReport`] that names the trace plus how many
-    /// outstanding handles existed at shutdown time, so callers can
-    /// observe whether the drain completed.
+    /// `drain_timeout` elapses. If the drain completes, consumes the
+    /// `Arc<ThreadedRuntime>` and shuts down. If handles remain, the host is
+    /// left intact so callers can drop more handles and retry.
     ///
     /// `drain_timeout` is a real wall-clock timeout. The poll cadence is
     /// short (1ms) so tests do not need to cooperate with anything other
@@ -594,7 +592,7 @@ where
     /// holds an extra clone of the runtime Arc, the drain is bounded by
     /// when callers drop their handles.
     pub fn drain_and_shutdown(
-        mut self,
+        &mut self,
         drain_timeout: Duration,
     ) -> Result<BridgeShutdownReport, BridgeShutdownError> {
         let deadline = std::time::Instant::now() + drain_timeout;
@@ -604,9 +602,8 @@ where
             }
             if std::time::Instant::now() >= deadline {
                 let pending = self.pending_handles();
-                // We deliberately do not call try_shutdown here; the host
-                // can be reused (drop more handles, retry) if the caller
-                // wants. Report partial drain explicitly.
+                // We deliberately do not call try_shutdown here; the host is
+                // still live so callers can drop more handles and retry.
                 return Ok(BridgeShutdownReport {
                     trace: Vec::new(),
                     outstanding_handles_at_shutdown: pending,
@@ -628,9 +625,13 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeShutdownReport {
     /// Trace recorded by the hosted Tina runtime up to shutdown.
+    ///
+    /// Empty when [`drained_within_timeout`](Self::drained_within_timeout) is
+    /// `false`, because the runtime is deliberately left running so the host
+    /// can retry after callers drop outstanding handles.
     pub trace: Vec<RuntimeEvent>,
-    /// Number of `BridgeHandle` clones still alive when shutdown attempted.
-    /// When `drained_within_timeout` is `true` this is `0`.
+    /// Number of `BridgeHandle` clones still alive when drain finished. When
+    /// `drained_within_timeout` is `true` this is `0` and shutdown completed.
     pub outstanding_handles_at_shutdown: usize,
     /// Whether every bridge handle had been dropped before
     /// `drain_timeout` elapsed.

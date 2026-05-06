@@ -8,12 +8,6 @@ use tina_sim::{FaultConfig, FaultMode, LocalSendFaultMode, Simulator, SimulatorC
 
 use super::TinaReport;
 
-// Phase 047 Rock 5: single-shard programs use the built-in `SingleShard`
-// type (re-exported via `tina::prelude`); the per-example `ReplayShard`
-// struct + `Shard` impl are gone. The `#[tina_runtime::isolate(...)]`
-// attribute now defaults to `shard = ::tina::SingleShard` when the
-// argument is omitted.
-
 #[derive(Debug, Clone, Copy)]
 enum ProducerMsg {
     Tick(u32),
@@ -100,10 +94,6 @@ fn run_once(seed: u64) -> (usize, u64, usize) {
     sim.run_until_quiescent();
 
     let trace = sim.trace();
-    // Phase 047 Rock 3: stable trace fingerprint via `stable_trace_hash`,
-    // not `format!("{event:?}").hash(...)`. Same seed → same fingerprint
-    // is the simulator's existing replay contract; this just stops
-    // depending on `Debug` to be stable.
     let fingerprint = stable_trace_hash(trace.iter());
     let received_count = received.borrow().len();
     (trace.len(), fingerprint, received_count)

@@ -12,15 +12,6 @@ use tina_runtime::{
 
 use super::{FETCH_COUNT, RESPONSE, SideReport, TestServer};
 
-#[derive(Debug, Default)]
-struct FetchShard;
-
-impl Shard for FetchShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(81)
-    }
-}
-
 #[derive(Default)]
 struct Outcome {
     successful: AtomicU32,
@@ -46,9 +37,9 @@ struct Fetcher {
     response_buf: Vec<u8>,
 }
 
-#[tina_runtime::isolate(message = FetchMsg, shard = FetchShard)]
+#[tina_runtime::isolate(message = FetchMsg)]
 impl Fetcher {
-    fn handle(&mut self, msg: FetchMsg, _ctx: &mut Context<'_, FetchShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: FetchMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             FetchMsg::Begin => {
                 if self.remaining == 0 {
@@ -138,7 +129,7 @@ pub(crate) fn run() -> SideReport {
     let addr = server.addr;
 
     let runtime = ThreadedRuntime::with_config(
-        FetchShard,
+        SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
@@ -162,9 +153,6 @@ pub(crate) fn run() -> SideReport {
         )
         .expect("register fetcher");
 
-    // Phase 047 Rock 4: typed isolate-complete waiter replaces the
-    // `Arc<AtomicBool> done` flag + spin loop. Register before kicking the
-    // fetcher so the host is already observing when the fetcher finishes.
     let fetcher_done = runtime.observe_isolate_complete(fetcher);
     runtime
         .try_send(fetcher, FetchMsg::Begin)

@@ -13,21 +13,6 @@ use tina_supervisor::SupervisorConfig;
 
 use super::{Job, SideReport, job_script};
 
-#[derive(Debug, Default)]
-struct WorkerShard;
-
-impl Shard for WorkerShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(91)
-    }
-}
-
-// Phase 047 Rock 4: the host now learns about each restart via a typed
-// `ChildRestartedWaiter` instead of an `AtomicU64` generation counter. The
-// initial address still comes from the worker self-publishing on its first
-// `Boot` because the runtime does not (yet) expose an
-// `observe_next_child_spawned` waiter; the slot's mutex stays for that
-// one-shot publish only.
 #[derive(Default)]
 struct WorkerSlot {
     inner: Mutex<Option<WorkerAddr>>,
@@ -60,9 +45,9 @@ struct Worker {
     slot: Arc<WorkerSlot>,
 }
 
-#[tina_runtime::isolate(message = WorkerMsg, shard = WorkerShard)]
+#[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, WorkerShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             WorkerMsg::Boot => {
                 self.slot.set(ctx.me());
@@ -87,10 +72,9 @@ struct Parent {
 #[tina_runtime::isolate(
     message = ParentMsg,
     spawn = RestartableChildDefinition<Worker>,
-    shard = WorkerShard
 )]
 impl Parent {
-    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, WorkerShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             ParentMsg::Spawn => {
                 let slot = Arc::clone(&self.slot);
@@ -114,7 +98,7 @@ pub(crate) fn run() -> SideReport {
     let poison_count = script.iter().filter(|j| matches!(j, Job::Poison)).count() as u32;
 
     let runtime = ThreadedRuntime::with_config(
-        WorkerShard,
+        SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 16,
@@ -159,10 +143,6 @@ pub(crate) fn run() -> SideReport {
     for job in script {
         let addr = wait_for_addr(&slot, Duration::from_secs(2));
         if matches!(job, Job::Poison) {
-            // Phase 047 Rock 4: register the typed restart waiter BEFORE
-            // sending the poison job, so the host is observing when the
-            // panic-induced restart fires. This deletes the
-            // `AtomicU64` generation counter and the spin-loop predicate.
             let restart_waiter = runtime.observe_child_restarted(parent);
             send_until_accepted(
                 &runtime,
@@ -230,7 +210,7 @@ fn wait_for_addr(slot: &Arc<WorkerSlot>, timeout: Duration) -> WorkerAddr {
 }
 
 fn send_until_accepted(
-    runtime: &ThreadedRuntime<WorkerShard, DefaultThreadedMailboxFactory>,
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     addr: WorkerAddr,
     msg: WorkerMsg,
     timeout: Duration,
