@@ -1,4 +1,4 @@
-# Phase 044: Seastar-Core Runtime Shape
+# Phase 044: Blue Whale Runtime Shape
 
 ## Goal
 
