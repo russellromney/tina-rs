@@ -167,3 +167,82 @@ fn call_site_reads_like_any_other_tina_call() {
     assert_eq!(result.status, StatusCode::NO_CONTENT);
     assert!(result.body.is_empty());
 }
+
+#[test]
+fn second_call_while_busy_returns_busy() {
+    // Black-hole upstream: accepts but never writes. The client's
+    // first Call ties up its in-flight slot until request_timeout.
+    // While in flight, a second Call must reply Err(Busy).
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind black-hole");
+    let target = listener.local_addr().expect("local addr");
+    let _silent = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        }
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    // Mailbox >= 2 so the second Call can land while the first is
+    // still in flight.
+    let client = runtime
+        .register_with_capacity::<HttpClient<SingleShard>, Infallible>(
+            HttpClient::<SingleShard>::new(HttpClientConfig::dev()),
+            8,
+        )
+        .expect("register client");
+
+    let (tx_a, _rx_a) = mpsc::channel();
+    let driver_a = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_a }, 8)
+        .expect("register driver A");
+    runtime
+        .try_send(
+            driver_a,
+            DriverMsg::Begin {
+                client,
+                target,
+                request: HttpRequest::get("/").header("Host", "x").build(),
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .expect("send Begin A");
+
+    // Brief pause so Call_A reaches the client and sets state.
+    thread::sleep(Duration::from_millis(50));
+
+    let (tx_b, rx_b) = mpsc::channel();
+    let driver_b = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_b }, 8)
+        .expect("register driver B");
+    runtime
+        .try_send(
+            driver_b,
+            DriverMsg::Begin {
+                client,
+                target,
+                request: HttpRequest::get("/").header("Host", "x").build(),
+                timeout: Duration::from_secs(2),
+            },
+        )
+        .expect("send Begin B");
+
+    let result_b = rx_b
+        .recv_timeout(Duration::from_secs(3))
+        .expect("driver B replies");
+    assert!(
+        matches!(result_b, Err(HttpClientError::Busy)),
+        "expected Busy while client is in flight, got {result_b:?}"
+    );
+
+    let _ = runtime.shutdown();
+}

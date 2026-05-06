@@ -299,27 +299,23 @@ pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
     out.extend_from_slice(version_str.as_bytes());
     out.extend_from_slice(b"\r\n");
 
-    let mut wrote_content_length = false;
-    let mut wrote_connection = false;
+    // Always force `Connection: close` and our own `Content-Length`.
+    // The client reads to EOF, so a user-supplied `keep-alive` would
+    // hang the read until `request_timeout`. Drop both from user input
+    // and re-emit ours.
     for (name, value) in request.headers.iter() {
-        if name == http::header::CONTENT_LENGTH {
-            wrote_content_length = true;
-        } else if name == http::header::CONNECTION {
-            wrote_connection = true;
+        if name == http::header::CONTENT_LENGTH || name == http::header::CONNECTION {
+            continue;
         }
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    if !wrote_content_length {
-        out.extend_from_slice(b"Content-Length: ");
-        out.extend_from_slice(request.body.len().to_string().as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    if !wrote_connection {
-        out.extend_from_slice(b"Connection: close\r\n");
-    }
+    out.extend_from_slice(b"Content-Length: ");
+    out.extend_from_slice(request.body.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&request.body);
     out
@@ -736,6 +732,24 @@ mod tests {
         assert!(text.starts_with("GET /x HTTP/1.1\r\n"));
         assert!(text.contains("Content-Length: 0\r\n"));
         assert!(text.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn encode_request_overrides_user_keep_alive() {
+        // First-form client reads to EOF. A `keep-alive` user header
+        // would hang the read; encoder must drop it and emit `close`.
+        let req = HttpRequest::get("/x")
+            .header("Connection", "keep-alive")
+            .header("Content-Length", "999")
+            .build();
+        let bytes = encode_request(&req);
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(!text.contains("keep-alive"));
+        // Content-Length must reflect the actual body length, not the
+        // user-supplied value.
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(!text.contains("Content-Length: 999"));
     }
 
     #[test]

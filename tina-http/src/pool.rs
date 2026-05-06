@@ -17,6 +17,13 @@
 //! Capacity is fixed at 1; constructing a pool with any other value
 //! panics. Multi-slot pools need multiple `HttpClient` instances and
 //! a placement policy — that is a separate slice.
+//!
+//! Topology: register one `HttpClient` per pool. If two pools share
+//! one client, pool B's call into the client can return
+//! `CallOutcome::Full` (because pool A is using it), which the pool
+//! maps to `HttpClientError::Busy`. Submit-callers then see `Busy`
+//! coming out of a "PoolFull"-shaped situation and cannot
+//! distinguish.
 
 use std::marker::PhantomData;
 

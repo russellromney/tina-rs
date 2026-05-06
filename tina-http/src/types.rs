@@ -292,7 +292,7 @@ impl Default for HttpServerConfig {
     }
 }
 
-/// Client-side knobs: limits, request deadline, mailbox capacity.
+/// Client-side knobs: limits and request deadline.
 #[derive(Debug, Clone, Copy)]
 pub struct HttpClientConfig {
     /// Byte/time limits for parsing the response head.
@@ -301,8 +301,6 @@ pub struct HttpClientConfig {
     /// response head, response body, close. Exceeding it surfaces as
     /// [`HttpClientError::Timeout`].
     pub request_timeout: std::time::Duration,
-    /// Mailbox size for the [`crate::HttpClient`] isolate.
-    pub mailbox_capacity: usize,
 }
 
 impl HttpClientConfig {
@@ -312,12 +310,10 @@ impl HttpClientConfig {
         Self {
             limits: HttpLimits::default(),
             request_timeout: std::time::Duration::from_secs(10),
-            mailbox_capacity: 16,
         }
     }
 
-    /// Tight preset for pressure tests: 1s request deadline, mailbox
-    /// capacity 8.
+    /// Tight preset for pressure tests: 1s request deadline.
     pub fn pressure() -> Self {
         Self {
             limits: HttpLimits {
@@ -327,7 +323,6 @@ impl HttpClientConfig {
                 header_read_timeout: std::time::Duration::from_millis(500),
             },
             request_timeout: std::time::Duration::from_secs(1),
-            mailbox_capacity: 8,
         }
     }
 }
