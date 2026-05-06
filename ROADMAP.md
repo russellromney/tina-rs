@@ -194,6 +194,7 @@ framework before public release-story work.
 |---|---|
 | **Blue Whale runtime shape** | Build the missing local-runtime features before the readiness gate: explicit shard/core ownership and optional affinity, per-shard preallocation posture, pool/slab cleanup where clearly worth it, mature driver/substrate lifecycle contract, swappable substrate boundary, minimal fairness/scheduling rail, and a Seastar-principles checklist. |
 | **Baobab production-readiness rails** | Build the first serious "can a real Tokio/Glommio-shaped service be moved to Tina?" gate, with Seastar as the architectural north star: executable capability matrix, user-perspective service gauntlet, DST gauntlet, live thread-per-core pressure, bridge/runtime cancellation rails, Tina/Tokio/Glommio behavior comparisons, benchmark skeleton, CI/release rails, and sharp non-claims. This is not a docs/demo phase; it is the next production-readiness test wall. |
+| **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 Parallel-safe side work: CI matrix planning, formatting of existing
@@ -218,12 +219,12 @@ blockers for the first local-runtime story.
 These should be resolved before public release or broad adoption claims:
 
 - **Decide the Peter Mbanugo / Tina-Odin public-positioning question early.**
-  Preferred path: reach out before public publish and coordinate if practical.
-  If that does not happen, docs must be explicit that `tina-rs` is an
-  independently maintained Rust project inspired by Tina-Odin, not an official
-  project or implied endorsement. Local design exploration is not blocked on
-  this, but public positioning and any publish decision should not outrun an
-  explicit decision.
+  Preferred path: rename public project identity to Alpaca before launch, then
+  reach out before public publish and coordinate if practical. Docs must be
+  explicit that Alpaca is an independently maintained Rust project inspired by
+  Tina-Odin, not an official port or implied endorsement. Local design
+  exploration is not blocked on this, but public positioning and any publish
+  decision should not outrun an explicit decision.
 - **Set the MSRV/runtime-substrate policy.** The current implementation uses
   nightly-facing Betelgeuse pieces; public release needs an explicit stable
   story or an honest nightly-only claim.
