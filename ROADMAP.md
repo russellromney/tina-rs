@@ -212,9 +212,32 @@ framework before public release-story work.
 | Phase | Purpose |
 |---|---|
 | **Eiffel Tokio comparison gauntlet** | Build a root-level suite of paired Tokio-vs-Tina implementation comparisons, not a single benchmark. The goal is discovery: find where Tina is wrong, broken, half-formed, awkward, better than Tokio, worse than Tokio, or pointing at a deeper model change. Start with chat/slow-consumer broadcast, mini-redis-style TCP/keyspace sessions, narrow Axum/Tower stateful services, WebSocket bidirectional pressure, and a small multiplexed-client subset. Each comparison should include separate Tokio and Tina processes, the same protocol and metrics format, a load driver, constrained-memory/CPU/overload pressure where practical, visible failure assertions, simulator replay where possible, and notes on ergonomics/model gaps. |
-| **North Sea io_uring substrate** | Build the first Tina-owned Linux `io_uring` backend for runtime-owned TCP and storage rails. On supported Linux systems it should become the preferred/default live backend; unsupported platforms keep the existing portable backend with explicit capability truth. No raw `io_uring` handle leaks into isolate code, no async-handler model, no hidden fallback queues, and no performance claim until Baobab or a later benchmark phase measures it. |
+| **047 Eiffel ergonomics harvest** | Take the repeated pain from `examples/FINDINGS.md` and turn it into small Tina primitives. This is not "write more examples"; it is "make the examples less stupid to write." Ship the boring helpers first: default in-process mailbox factory, explicit mailbox/reply-slot sizing guidance, stable trace fingerprints, host-visible runtime observation handles, single-shard defaults, sequenced-call/TCP helpers, bridge lifecycle cleanup, and aligned threaded-vs-explicit runtime surfaces. Success means Eiffel examples delete side channels and boilerplate while Tina keeps the same bounded/no-hidden-work contract. |
+| **048 native HTTP service stack** | Build the first Tina-owned HTTP/1.1 server path so Tina services do not require Tokio to own the edge. Start small and first-form: parser/framing, `Content-Length`, connection isolate, service handler shape, bounded chunk bodies, visible overload, graceful shutdown, real TCP example, and DST where feasible. This is not HTTP/1.1 completeness, Axum, Tower, HTTP/2, gRPC, or a web framework. It is the first proof that Tina can speak service HTTP itself. |
+| **049 North Sea and tracing** | Build the Linux substrate and ops truth lane: `io_uring` design/spike/integration plan, capability truth, buffer ownership roadmap, platform-gated cost smoke, and `RuntimeEvent` to `tracing` integration. The explicit-step runtime remains the oracle; unsupported platforms stay honest; no DPDK, userspace TCP, zero-copy, or performance claim lands without proof. |
+| **050 Eiffel round 2: harder pressure** | Second discovery pass *after* 047 lands. Round 1 (the original Eiffel gauntlet) probed the model with small scripted comparisons. Round 2 stresses model claims and missing features the first 11 didn't reach: multi-shard routing, dynamic worker pools, external cancellation, outbound connection pooling, system-of-systems backpressure, streaming/large-payload memory pressure, periodic batching, stateful HTTP sessions, real load drivers, TLS rails, plus adversarial probes that try to break the positive claims. The point is not coverage breadth. The point is two questions: **(a)** did the 047 ergonomics harvest actually fix the surface — do the hand-rolled `Arc<Mutex<Option<_>>>` smuggles, mailbox boilerplate, and trace-polling actually go away in practice — and **(b)** what *else* breaks when the model is pushed harder? Same paired-Tokio-vs-Tina shape (with a small number of intentionally Tina-only adversarial probes), same `examples/FINDINGS.md` discipline. Round-2 backlog is below the Round-1 backlog. |
+| **051 ecosystem bridge adapters** | Make Tokio ecosystem packages fit around Tina without lying. Build better Tower/Axum/Hyper bridge shapes, reqwest outbound worker, SQLx/tokio-postgres bridge sketch, WebSocket bridge pattern, tracing context propagation, and clear `Full`/`Closed`/`Timeout` mappings. Tokio may own the integration edge; Tina owns bounded service state behind it. |
+| **052 Tina RPC first form** | Build a small Tina-native RPC seed: length-prefixed TCP frames, service/method names, request ids, serde payload adapter, bounded in-flight calls, typed full/closed/timeout/error replies, client stub, service registry, simulation, and Eiffel comparison. Not gRPC, not remoting/clustering, not exactly-once. |
+| **053 sharded service primitives** | Add small Seastar-shaped app primitives: key-to-shard placement, sharded counter, sharded map pattern, bounded scatter/gather, partial aggregate result, hot-key pressure policy, examples, and DST. Use ordinary Rust maps/counters inside shard-owned isolates; Tina owns placement, fanout, timeouts, and partial failure truth. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
+
+047 plan, near-grug:
+
+| Step | Work | Done when |
+|---|---|---|
+| 1 | Default mailbox factory | Examples and docs can use one blessed bounded in-process mailbox factory instead of copying `Rc<RefCell<VecDeque<_>>>` glue. Custom factories still work. Capacity stays explicit. |
+| 2 | Mailbox capacity truth | User guide names the rule: runtime replies, isolate call replies, and observed-send replies land in the requester's mailbox. Add sizing examples for listener, connection, store, worker. Add trace/diagnostic coverage for reply rejected because requester mailbox is full. |
+| 3 | Stable trace fingerprint | `RuntimeEvent` or trace snapshots get stable hash/serialization so replay tests stop hashing `Debug` strings. Eiffel replay uses the stable path. |
+| 4 | Host observation handles | Host code can wait for "ready", "stopped", "child restarted", or "operation done" without `Arc<Mutex<_>>` side channels or polling `complete_trace()`. Handles are typed and bounded. No secret queues. |
+| 5 | Single-shard easy path | Small programs can omit the ceremonial shard type or use a built-in single shard. Simulator errors say plainly when user picked `#[tina::isolate]` but needed runtime calls. |
+| 6 | Sequence and TCP helpers | Document `batch(...)` same-resource semantics. Add small helpers for ordered runtime calls and common TCP loops: write-all and read-to-eof. Outbound fetch and mux client get shorter. |
+| 7 | Bridge lifecycle | Bridge host/handle gets one-call close/drain/shutdown. Axum/WebSocket examples stop doing `Arc::try_unwrap` dances. Docs name the two-runtime shape and the sync-blocking-in-Tokio footgun. |
+| 8 | Runtime surface alignment | Threaded and explicit-step runtimes say the same thing about `try_send`, full, closed/stale addresses, message ownership on failure, and `supervise` return shape. Differences are either removed or loudly documented. |
+
+047 success rule: rerun Eiffel. Move resolved items out of
+`examples/FINDINGS.md` "what feels bad" into resolved notes, or delete the
+workaround from examples. Diff the pain, not the vibes.
 
 Eiffel comparison backlog:
 
@@ -233,6 +256,47 @@ Eiffel comparison backlog:
 | CPU contention run | Same service load while CPU is quota-limited or contended | See whether Tina keeps shedding visibly under scheduler pressure. |
 | Memory-tier run | 32/64/128 MB process limits, same load profile | See whether Tina plateaus while Tokio-shaped buffering grows or fails less visibly. |
 
+Eiffel round 2 backlog (phase 050, runs after 047 ergonomics harvest):
+
+The first six probe Tina's stated *model* claims under shapes the round-1
+suite never tested. The next four stress production-shaped workloads. The
+next three are intentionally Tina-only adversarial probes — they try to
+break the positive claims in `examples/FINDINGS.md` rather than measure a
+ratio against Tokio. The final five are coverage amplifiers: the rails
+that exist in the runtime but no comparison currently exercises, plus the
+real load driver promised but never built in round 1.
+
+| Comparison | Pressure shape | Learning goal |
+|---|---|---|
+| Multi-shard request routing | N shards, hash-routed requests, some cross-shard calls | Validate the Seastar-style sharding claim. Cross-shard `call` ergonomics, address-shard identity, mailbox composition across shards. The single biggest model claim untested in round 1. |
+| Dynamic worker pool | Coordinator spawns 10 workers, joins all results, partial-failure aggregation | Test dynamic spawning at scale and the post-047 host observation handle for "join all of these" ergonomics. Expose whether `batch(...)` is the right combinator for fan-out-and-join or whether a `JoinSet`-equivalent is missing. |
+| Cancellation chain | One request fans into 5 downstream calls; caller cancels mid-flight | Force the question of *external* cancellation. Tina's current public surface offers `stop()` from inside a handler and not much else; this comparison should expose the gap or prove me wrong. Likely surfaces a missing-feature finding. |
+| Outbound connection pool | Fetch M URLs with at most N concurrent connections, K per host, retries with backoff, per-request deadline | Test whether Tina has (or needs) a pool primitive, and which pressure choice it makes: queue-when-full vs shed-when-full. The Cloudflare/Stripe edge-service shape, completely untested. |
+| Backpressure chain | A → B → C with slow C and a 100ms shared deadline | End-to-end test of the "visible shedding" pitch. Does timeout-as-load-control compose up the chain? Does deadline propagation exist as a concept? Half of Tina's pitch and zero round-1 comparisons test it. |
+| Hot-key fairness | Mini-keyspace under skewed traffic where one key gets 90% of writes | Does the hot-key isolate's mailbox saturate while cold keys starve? Does the runtime maintain fairness or leave it to the user? |
+| Streaming response | TCP service streams a 100 MB response to a slow reader | Partial-write loops at scale (every round-1 comparison has tiny payloads). Slow-reader backpressure on the *server* side. Memory boundedness of writes-in-flight. First comparison where the server can be memory-pressured. |
+| Periodic batcher | Producer pushes items, batcher accumulates until 100 ms timer or 1000 items, flushes durably | Common production pattern (Kafka producer, log shipper, metrics aggregator). Tests timer + state + bounded buffer + persistence in one isolate. Also validates the "cancellation as message arm beats `select!`" claim under real timer load. |
+| Stateful HTTP session | `POST /login` issues cookie, `GET /me` reads per-session state | Per-session-isolate ergonomics through the bridge with a real web shape: cookie/header round-tripping, session lifecycle, GC. Tests the "isolate per session" pitch with a non-contrived scenario. |
+| Heterogeneous workload | TCP listener + timer-driven flusher + bridge ingress + persistence in one runtime | Tests interactions between subsystems that single-protocol probes can't see. Closer to what real services actually look like. |
+| Owned-state leak attempt (adversarial) | Try in good faith to construct a shared-mutable-state leak through every channel — `Rc<RefCell<T>>` in a message, `Address` captured into an escaping closure, `&mut self.value` into a runtime-call reply closure | Hardens or breaks the "owned state through isolates" property listed in `FINDINGS.md`. *Failure to leak is the positive result*; any successful leak is a critical finding. |
+| Durability-misorder attempt (adversarial) | Try to update `self.value` before journal commit completes | Tests whether "append-before-apply enforced by message shape" is a real type-system property or just a discipline. |
+| Non-determinism-in-isolate (adversarial) | Inject `SystemTime::now()`, `HashMap` iteration, `thread_rng()` inside a handler under tina-sim | Tests whether the replay claim has teeth. If the simulator can't detect the non-determinism, "deterministic replay" is weaker than asserted. |
+| Seeded-fault crash recovery | `eiffel_persistent_counter` shape under tina-sim FaultConfig with mid-write process death (mid-len, mid-payload, mid-checksum) | Turns the deterministic-replay property into a deterministic-crash-recovery property. The hard test of persistence — torn-tail handling, journal-replay correctness, snapshot atomicity. The thing operators actually want. |
+| Live trace ↔ sim trace identity | Record a trace under `ThreadedRuntime`, replay against `Simulator` with the same seed and inputs | The direct end-to-end DST claim: that *production* and *simulation* produce byte-identical traces, not just sim-to-sim. Currently only sim-to-sim is asserted. |
+| Session fanout (1000 sessions) | 1000 concurrent session isolates, each with mailbox, lifecycle, periodic flush | Stress-tests the "isolate-per-session" pitch. Reveals per-isolate memory cost, mailbox-creation throughput, address-allocation cost, what happens when many isolates compete for one shard's processing slot. |
+| TLS variant | Existing TCP comparison, swap `tcp_bind`/`tcp_accept` for `tls_bind`/`tls_accept` | TLS rails exist in the runtime imports and have *zero* exercise in any comparison. Real production = TLS. Surface gaps in cert handling, handshake error reporting, mid-stream renegotiation. |
+| Real load driver on chat | The driver promised in `eiffel_real_io_chat`'s README, never delivered: 1000 clients × 50 000 messages | Finally measures "visible Full" under sustained burst rather than a single hardcoded scripted output. Required to make `eiffel_cpu_run` and `eiffel_mem_run` reports useful — they currently only answer "did it pass," not "did Tina shed visibly while Tokio buffered silently." |
+
+Round-2 success rule, mirroring 047's: rerun the round-1 examples and
+confirm the documented round-1 papercuts are gone in practice. Then
+collect new findings from round 2 into `examples/FINDINGS.md` the same
+way (`Surfaced by:` tags, no detail dropped). The expected outcome is
+that round 2 finds *fewer* surface ergonomic papercuts and *more*
+missing-feature / model-claim findings — the gap between "it's
+verbose" and "it's incomplete." If round 2 surfaces the same shape
+of papercuts as round 1, 047 didn't actually fix what it claimed to
+fix.
+
 Parallel-safe side work: CI matrix planning, formatting of existing
 performance reports, README wording that adds no new claims, external review
 prompts, and research notes for future remoting/clustering. Do not parallelize
@@ -246,6 +310,7 @@ blockers for the first local-runtime story.
 
 | Phase | Purpose |
 |---|---|
+| **054 userspace TCP research door** | Name the future kernel-bypass/userspace TCP contract and the measurements that would justify it. This is deliberately not an implementation phase: no DPDK, no packet parser, no NIC driver, no launch promise. Kernel TCP plus North Sea `io_uring` stays the real path until evidence says otherwise. |
 | **Jan Peter Balkenende remoting** | Tina runtime to Tina runtime over a network with typed, bounded, traceable remote outcomes. |
 | **Mark Rutte clustering** | Membership and placement after remoting is boring, without weakening local boundedness or stale-address semantics. |
 | **Gemini release story** | Prime-time readiness only after Tina is reasonably complete: guides, invariant docs, semver/publication decision, CI/proof gate, public positioning, and adoption story. |
