@@ -5,7 +5,7 @@
 //! [`RequestParseError`] documented in `tina_http::types`, then closes
 //! the connection cleanly.
 //!
-//! Coverage maps to phase 048's rock 12 (bad input suite):
+//! Cases:
 //!
 //! - malformed request line -> `400 Bad Request`
 //! - oversized header section -> `431 Request Header Fields Too Large`
@@ -42,10 +42,9 @@ fn oversized_header_section_is_rejected_either_with_431_or_connection_reset() {
     // rejected the oversized headers; only "200 OK" or a hang would be
     // a bug.
     //
-    // Future work (drain-before-close, tracked against 048b): the
-    // connection isolate should consume any remaining inbound body
-    // bytes before closing so error responses always reach the client
-    // cleanly.
+    // Future work (drain-before-close): the connection isolate should
+    // consume any remaining inbound body bytes before closing so error
+    // responses always reach the client cleanly.
     let harness = TestHarness::start();
     let huge_value = "x".repeat(20 * 1024);
     let request = format!("GET / HTTP/1.1\r\nX-Huge: {huge_value}\r\n\r\n");
@@ -71,8 +70,8 @@ fn oversized_header_section_is_rejected_either_with_431_or_connection_reset() {
         {
             // Server closed the connection forcibly (RST) before the
             // response could be fully drained by the client. Acceptable
-            // in 048a — the server still rejected the input cleanly on
-            // its side. Drain-before-close is 048b future work.
+            // — the server still rejected the input cleanly on its
+            // side. Drain-before-close is future work.
         }
         Err(other) => panic!("unexpected client read error: {other:?}"),
     }

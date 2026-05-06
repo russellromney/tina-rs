@@ -15,7 +15,7 @@ use tina_runtime::{
 };
 
 use crate::connection::{HttpConnection, HttpConnectionMsg};
-use crate::types::{HttpLimits, HttpRequest, HttpResponse};
+use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
 
 /// Inbound message variants for [`HttpListener`].
 #[derive(Debug, Clone)]
@@ -83,6 +83,25 @@ impl<S: Shard + 'static> HttpListener<S> {
             stopping: false,
             _shard: PhantomData,
         }
+    }
+
+    /// Convenience constructor that absorbs an [`HttpServerConfig`].
+    ///
+    /// `HttpServerConfig` is `Copy`, so the caller can read
+    /// `listener_mailbox_capacity` from the same value when calling
+    /// `register_with_capacity`.
+    pub fn with_config(
+        bind_addr: SocketAddr,
+        service: Address<HttpRequest, HttpResponse>,
+        config: HttpServerConfig,
+    ) -> Self {
+        Self::new(
+            bind_addr,
+            service,
+            config.limits,
+            config.service_call_timeout,
+            config.connection_mailbox_capacity,
+        )
     }
 }
 

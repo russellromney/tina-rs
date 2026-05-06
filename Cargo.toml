@@ -21,6 +21,7 @@ exclude = [
     "examples/eiffel_persistent_counter",
     "examples/eiffel_replay_dst",
     "examples/eiffel_outbound_fetch",
+    "examples/eiffel_outbound_http",
     "examples/eiffel_graceful_shutdown",
     "examples/eiffel_native_http",
 ]

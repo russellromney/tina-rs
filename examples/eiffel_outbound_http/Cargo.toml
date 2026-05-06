@@ -1,0 +1,18 @@
+[package]
+name = "eiffel-outbound-http"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+tina = { path = "../../tina" }
+tina-http = { path = "../../tina-http" }
+tina-runtime = { path = "../../tina-runtime" }
+http = { version = "1", default-features = false, features = ["std"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+
+[workspace]

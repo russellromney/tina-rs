@@ -15,9 +15,9 @@
 //! reports the declared length) and constructing the full
 //! [`HttpRequest`].
 
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Version};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 
-use crate::types::{HttpLimits, HttpRequest, RequestParseError};
+use crate::types::{HttpLimits, HttpRequest, RequestParseError, ResponseParseError};
 
 /// Result of attempting to parse a request head out of a buffer.
 #[derive(Debug)]
@@ -280,6 +280,201 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
     out
 }
 
+/// Serialises a client-side request onto wire bytes.
+///
+/// Always emits `Content-Length` (zero when no body) and `Connection:
+/// close` — one request per connection, no keep-alive on the client.
+pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128 + request.body.len());
+
+    let version_str = match request.version {
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        _ => "HTTP/1.1",
+    };
+    out.extend_from_slice(request.method.as_str().as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(request.path.as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(version_str.as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    let mut wrote_content_length = false;
+    let mut wrote_connection = false;
+    for (name, value) in request.headers.iter() {
+        if name == http::header::CONTENT_LENGTH {
+            wrote_content_length = true;
+        } else if name == http::header::CONNECTION {
+            wrote_connection = true;
+        }
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if !wrote_content_length {
+        out.extend_from_slice(b"Content-Length: ");
+        out.extend_from_slice(request.body.len().to_string().as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if !wrote_connection {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&request.body);
+    out
+}
+
+/// Result of attempting to parse a response head out of a buffer.
+#[derive(Debug)]
+pub enum ResponseParseProgress {
+    /// Buffer does not yet contain a complete response head.
+    NeedMore,
+    /// Buffer contains a complete response head.
+    Complete {
+        /// Parsed status line, version, headers, and declared body length.
+        head: HttpResponseHead,
+        /// Byte index where the body begins inside the input buffer.
+        head_len: usize,
+    },
+    /// Parsing rejected the response before completion.
+    Failed(ResponseParseError),
+}
+
+/// Parsed HTTP response head with no body.
+#[derive(Debug)]
+pub struct HttpResponseHead {
+    /// HTTP wire version (1.0 or 1.1).
+    pub version: Version,
+    /// Status code.
+    pub status: StatusCode,
+    /// Reason phrase (may be empty).
+    pub reason: String,
+    /// Parsed headers.
+    pub headers: HeaderMap,
+    /// Declared body length from `Content-Length`. The first-form client
+    /// requires this for any response that frames a body.
+    pub content_length: usize,
+}
+
+/// Attempts to parse an HTTP/1.x response head out of `buffer`.
+///
+/// Pure: does not consume `buffer`. Pairs with `parse_request_head` on the
+/// server side. Re-uses the same `httparse`-backed parser path so the
+/// same byte-budget invariants apply (header section bounded by
+/// `limits.max_header_bytes`, header count bounded by `limits.max_headers`).
+pub fn parse_response_head(buffer: &[u8], limits: &HttpLimits) -> ResponseParseProgress {
+    if buffer.len() > limits.max_header_bytes {
+        return ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge);
+    }
+
+    let mut inline_headers = [httparse::EMPTY_HEADER; MAX_INLINE_HEADERS];
+    let mut heap_headers: Vec<httparse::Header<'_>>;
+    let header_slots: &mut [httparse::Header<'_>] = if limits.max_headers <= MAX_INLINE_HEADERS {
+        &mut inline_headers[..limits.max_headers]
+    } else {
+        heap_headers = vec![httparse::EMPTY_HEADER; limits.max_headers];
+        &mut heap_headers
+    };
+    let mut response = httparse::Response::new(header_slots);
+
+    match response.parse(buffer) {
+        Ok(httparse::Status::Partial) => {
+            if buffer.len() == limits.max_header_bytes {
+                ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge)
+            } else {
+                ResponseParseProgress::NeedMore
+            }
+        }
+        Ok(httparse::Status::Complete(head_len)) => match build_response_head(&response, limits) {
+            Ok(head) => ResponseParseProgress::Complete { head, head_len },
+            Err(error) => ResponseParseProgress::Failed(error),
+        },
+        Err(httparse::Error::TooManyHeaders) => {
+            ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge)
+        }
+        Err(_) => ResponseParseProgress::Failed(ResponseParseError::BadStatusLine),
+    }
+}
+
+fn build_response_head(
+    parsed: &httparse::Response<'_, '_>,
+    limits: &HttpLimits,
+) -> Result<HttpResponseHead, ResponseParseError> {
+    let version = match parsed.version {
+        Some(0) => Version::HTTP_10,
+        Some(1) => Version::HTTP_11,
+        Some(_) => return Err(ResponseParseError::UnsupportedHttpVersion),
+        None => return Err(ResponseParseError::BadStatusLine),
+    };
+    let code = parsed.code.ok_or(ResponseParseError::BadStatusLine)?;
+    let status = StatusCode::from_u16(code).map_err(|_| ResponseParseError::BadStatusLine)?;
+    let reason = parsed.reason.unwrap_or("").to_owned();
+
+    let mut headers = HeaderMap::with_capacity(parsed.headers.len());
+    let mut content_length: Option<usize> = None;
+    let mut transfer_encoding_invalid = false;
+
+    for header in parsed.headers.iter() {
+        if header.name.is_empty() {
+            continue;
+        }
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| ResponseParseError::BadStatusLine)?;
+        let value =
+            HeaderValue::from_bytes(header.value).map_err(|_| ResponseParseError::BadStatusLine)?;
+
+        if name == http::header::CONTENT_LENGTH {
+            let value_str = std::str::from_utf8(header.value)
+                .map_err(|_| ResponseParseError::InvalidContentLength)?;
+            let trimmed = value_str.trim();
+            if trimmed.is_empty() || !trimmed.as_bytes().iter().all(u8::is_ascii_digit) {
+                return Err(ResponseParseError::InvalidContentLength);
+            }
+            let parsed_len: usize = trimmed
+                .parse()
+                .map_err(|_| ResponseParseError::InvalidContentLength)?;
+            if parsed_len > limits.max_body_bytes {
+                return Err(ResponseParseError::BodyTooLarge);
+            }
+            if let Some(prev) = content_length {
+                if prev != parsed_len {
+                    return Err(ResponseParseError::InvalidContentLength);
+                }
+            }
+            content_length = Some(parsed_len);
+        } else if name == http::header::TRANSFER_ENCODING {
+            let value_str = std::str::from_utf8(header.value).unwrap_or("");
+            if !value_str.eq_ignore_ascii_case("identity") {
+                transfer_encoding_invalid = true;
+            }
+        }
+
+        headers.append(name, value);
+    }
+
+    if transfer_encoding_invalid {
+        return Err(ResponseParseError::UnsupportedTransferEncoding);
+    }
+
+    // First-form client: a body-bearing response must declare its length.
+    // Status codes that never carry a body (1xx, 204, 304) are exempt.
+    let body_forbidden = matches!(status.as_u16(), 100..=199 | 204 | 304);
+    let content_length = match content_length {
+        Some(n) => n,
+        None if body_forbidden => 0,
+        None => return Err(ResponseParseError::MissingContentLength),
+    };
+
+    Ok(HttpResponseHead {
+        version,
+        status,
+        reason,
+        headers,
+        content_length,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +720,129 @@ mod tests {
         let bytes = encode_response(&response, true);
         let text = std::str::from_utf8(&bytes).expect("utf8");
         assert!(text.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn encode_request_emits_content_length_and_close() {
+        let req = HttpRequest {
+            method: Method::GET,
+            path: "/x".to_owned(),
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+        let bytes = encode_request(&req);
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.starts_with("GET /x HTTP/1.1\r\n"));
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(text.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn encode_request_keeps_caller_supplied_headers() {
+        let req = HttpRequest::post("/echo")
+            .header("Host", "example")
+            .body(b"hello".to_vec())
+            .build();
+        let bytes = encode_request(&req);
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        // `http` crate canonicalises header names to lowercase via
+        // `HeaderName::as_str()`, mirroring `encode_response`. Wire format
+        // is case-insensitive per RFC 7230 §3.2.
+        assert!(text.contains("host: example\r\n"));
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert!(text.ends_with("\r\nhello"));
+    }
+
+    #[test]
+    fn parses_simple_response() {
+        let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Complete { head, head_len } => {
+                assert_eq!(head.status, StatusCode::OK);
+                assert_eq!(head.version, Version::HTTP_11);
+                assert_eq!(head.reason, "OK");
+                assert_eq!(head.content_length, 5);
+                assert_eq!(&buf[head_len..], b"hello");
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_partial_yields_need_more() {
+        let buf = b"HTTP/1.1 200 OK\r\nContent-Len";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::NeedMore => {}
+            other => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_chunked_transfer_encoding_rejected() {
+        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_missing_content_length_rejected_for_200() {
+        let buf = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::MissingContentLength) => {}
+            other => panic!("expected MissingContentLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_204_no_content_length_required() {
+        let buf = b"HTTP/1.1 204 No Content\r\nServer: x\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Complete { head, .. } => {
+                assert_eq!(head.status, StatusCode::NO_CONTENT);
+                assert_eq!(head.content_length, 0);
+            }
+            other => panic!("expected complete (204 needs no Content-Length), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_invalid_content_length_returns_typed_error() {
+        let buf = b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::InvalidContentLength) => {}
+            other => panic!("expected InvalidContentLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_oversized_body_via_content_length_rejected() {
+        let huge = HttpLimits::default().max_body_bytes + 1;
+        let buf = format!("HTTP/1.1 200 OK\r\nContent-Length: {huge}\r\n\r\n");
+        match parse_response_head(buf.as_bytes(), &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::BodyTooLarge) => {}
+            other => panic!("expected BodyTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_oversized_header_section_rejected() {
+        let huge_value = "x".repeat(HttpLimits::default().max_header_bytes);
+        let buf = format!("HTTP/1.1 200 OK\r\nX-Huge: {huge_value}\r\n\r\n");
+        match parse_response_head(buf.as_bytes(), &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::HeadersTooLarge) => {}
+            other => panic!("expected HeadersTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_bad_status_line_rejected() {
+        let buf = b"NOT-HTTP/garbage\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::BadStatusLine) => {}
+            other => panic!("expected BadStatusLine, got {other:?}"),
+        }
     }
 }

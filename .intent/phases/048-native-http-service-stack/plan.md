@@ -383,3 +383,114 @@ server body.
   pool, streaming, and North Sea work.
 - Tina is closer to "as easy as Tokio for normal services," but still does not
   claim full Tokio ecosystem replacement.
+
+## 048b Slice Design Notes
+
+048b lands rocks 9 (HTTP client first form), 10 (bounded connection pool),
+and 5b (wire-level admission overload — naturally constructible once the
+pool exists).
+
+### Shape decisions
+
+**Client is service-shaped via `call(...).reply(...)`.** Earlier analysis
+claimed `Effect::Reply` was usable only during the handler turn for the
+current message. That was wrong: `continuation_context` propagates
+through runtime-call `.reply(continuation)` chains
+([tina-runtime/src/lib.rs:1952](tina-runtime/src/lib.rs#L1952),
+[tina-runtime/src/lib.rs:2097](tina-runtime/src/lib.rs#L2097)),
+demonstrated by `tina-runtime/tests/portable_service.rs` where a
+durable-store worker defers its reply across a journal append. So
+`HttpClient` can be a long-lived isolate that takes an `HttpClientMsg`
+via `call`, kicks off `tcp_connect/read/write` continuations across many
+turns, and finally `Effect::Reply`s the original caller. The user-side
+call site is one expression:
+
+```rust
+call(http_client, HttpClientMsg::call(target, request), timeout)
+    .reply(MyMsg::HttpReturned)
+```
+
+No fn-pointer mapper, no spawn-and-route-back, no generic over user
+message type. The same pattern Tina uses everywhere else.
+
+**Direct vs pooled stays visible.** Calling `http_client` directly does
+one TCP connect per call. Calling `pool.Submit` adds bounded admission
+control — when the pool's slot is busy, `Submit` returns
+`Err(HttpClientError::PoolFull)` immediately rather than waiting. Both
+paths are tested separately because their failure modes differ: direct
+surfaces `Connect`/`Read`/`Write`/`Timeout`; pooled adds `PoolFull`.
+
+**Bootstrap helpers stay runtime-neutral.** No
+`spawn_http_listener(runtime, ...)` helper that takes a runtime by
+reference — that couples to a specific runtime flavor (threaded vs local
+vs simulator). Instead:
+
+- `HttpServerConfig::dev() / ::pressure()` — Copy struct of limits +
+  timeouts + mailbox capacities.
+- `HttpListener::with_config(addr, service, config)` — 3-arg constructor
+  that absorbs the config struct.
+- User still calls `runtime.register_with_capacity(...)` +
+  `try_send(Start)` themselves. Three lines instead of five; runtime
+  coupling stays out of `tina-http`.
+
+**Symmetric presets across server/client/pool.** `HttpServerConfig`,
+`HttpClientConfig`, `PoolConfig` each ship `::dev()` and `::pressure()`
+presets. Examples should never need to hand-roll a timeout/limit triple.
+
+### Deferred to 048c (or later)
+
+- JSON helpers (`Response::ok_json`, `req.json::<T>()`) — defer the serde
+  dependency decision; ship `body_str()` / `with_text()` first and choose
+  between feature-gated serde and a `tina-http-json` extension once the
+  example demand is clear.
+- Fluent server builder (`HttpServer::bind().route().spawn()`) — couples
+  to rock 11 (routing), comes in 048c.
+- Internal close/drain rename inside `connection.rs` — pure rename diff,
+  defer until the names actually annoy us in code review.
+- Per-connection client keep-alive — first form is one connection per
+  request; pool reuse covers the keep-alive *use case* without the
+  state-machine complexity. Add only if the example demands it.
+
+### First-form pool scope
+
+- **Capacity = 1.** Multi-slot pools require multiple `HttpClient`
+  instances and a placement policy; that's an honest 048c slice once
+  the call-shaped primitive proves out. Constructing a pool with
+  `capacity != 1` panics.
+- **No idle reuse.** Each `Submit` call results in a fresh
+  `tcp_connect`. Idle reuse needs the client to hand the `StreamId`
+  back to the pool on completion — natural in the call chain when we
+  generalise the reply type, but a separate slice.
+- **No waiter queue.** Submits arriving while the slot is busy return
+  `Err(PoolFull)` immediately. Acquire-timeout and waiter queue come
+  with multi-slot.
+
+### Required proof for 048b specifically
+
+- `HttpClient` fetches from the native server
+  (`client_against_native.rs`) and from a stdlib `TcpListener` reference
+  (`client_smoke.rs`).
+- Bad-input client suite covers malformed response head, oversized
+  headers, unsupported transfer encoding, missing `Content-Length`.
+- Pool tests cover slot acquisition, immediate `PoolFull` when busy,
+  and pass-through correctness against the native server.
+- Wire-level 503 (`pressure_503.rs`) — service mailbox of capacity 1
+  hammered by concurrent inbound TCP requests in threaded mode produces
+  `CallOutcome::Full` at the connection isolate's call into the
+  service, mapped to `503 Service Unavailable` over the wire.
+- Paired comparison `examples/eiffel_outbound_http` — axum + reqwest
+  on Tokio side, native `HttpListener` + service-shaped `HttpClient`
+  on Tina side, same scripted endpoint sequence.
+
+### Connection-isolate service-shape note
+
+`HttpListener`'s service address remains `Address<HttpRequest,
+HttpResponse>` — sync-reply, single-variant message. Multi-turn user
+services (services that need to call upstream HTTP via the new
+`HttpClient`) can't fit that signature directly because their handler
+for `HttpRequest` would need to issue `.reply(continuation)` with a
+continuation type matching the service's own message type, which is
+fixed to `HttpRequest`. For 048b we leave the connection isolate's
+service shape unchanged and document the limitation. A flexible
+service shape — generic over user message/reply types with conversions
+to/from HTTP types — is a 048c candidate.
