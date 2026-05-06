@@ -7,6 +7,13 @@ state machines. Each isolate owns its state, processes one message at a time,
 and returns an `Effect`. The runtime owns scheduling, time, I/O, supervision,
 and replay.
 
+Tina is not an async I/O runtime like Tokio or monoio. It is the concurrency
+model above the runtime substrate. Today `tina-runtime` runs on an explicit-step
+oracle and a threaded runtime backed by
+[Pekka Enberg's Betelgeuse](https://github.com/penberg/betelgeuse); future
+backends (`io_uring`, monoio, glommio) can ride underneath if they preserve
+the contract.
+
 It is an independent Rust implementation inspired by
 [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina) and by thread-per-core
 systems like [Seastar](https://seastar.io/). The motivation comes from
@@ -81,6 +88,25 @@ Tina exits the handler after each message, runs the I/O on its own driver
 rail, and re-enters with the result. The handler stays synchronous; the
 runtime owns suspension, cancellation, and shutdown.
 
+For comparison, the same echo loop in Tokio keeps control flow inside an
+async task:
+
+```rust
+tokio::spawn(async move {
+    let mut buf = [0; 4096];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 { break; }
+        stream.write_all(&buf[..n]).await?;
+    }
+});
+```
+
+Tokio suspends the function across each `.await`. Tina returns to the
+runtime between effects. Both are correct; the difference is whether
+suspension points are syntactic (`.await`) or structural (one match arm
+per resumption).
+
 The full echo server, including the listener that spawns one connection
 isolate per accepted socket, lives in
 [`tina-runtime/examples/tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs).
@@ -130,6 +156,14 @@ The repository is a Cargo workspace:
 
 End consumers depend on `tina` plus one runtime or simulator crate.
 
+## The rule
+
+If something can overload, Tina makes it visible.
+
+If something can fail, Tina makes it traceable.
+
+If something can race, Tina makes it replayable.
+
 ## Deterministic simulation testing
 
 `tina-sim` runs the same isolate code as `tina-runtime` under a deterministic
@@ -152,6 +186,8 @@ different seed exercises different timer-wake ordering, send delivery
 order, and TCP completion order under bounded fault models. Live and
 simulated runs share the same handler code; the difference is the driver
 underneath.
+
+Same seed. Same config. Same failure.
 
 See [`tina-sim/tests/`](tina-sim/tests/) and
 [`docs/tina-user-guide/08-simulation-and-dst.md`](docs/tina-user-guide/08-simulation-and-dst.md)
