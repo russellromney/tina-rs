@@ -286,6 +286,16 @@ where
     /// the batch, later effects in the same batch are not executed.
     ///
     /// An empty batch is equivalent to [`Noop`](Self::Noop).
+    ///
+    /// **Same-stream caveat (Phase 047 Rock 6):** `Batch` does *not* serialize
+    /// runtime calls that target the same I/O resource. Issuing several
+    /// `tcp_write` calls against the same `StreamId` inside a single batch is
+    /// unsupported — the second runtime call against the same stream lane
+    /// returns `CallError::ResourceBusy` because the first is still pending.
+    /// For "do these writes one after another" semantics, fold the loop
+    /// through the isolate's own continuation messages (one
+    /// `tcp_write(...).reply(...)`, then another from the next handler turn).
+    /// See `docs/tcp-loops.md` for canonical patterns.
     Batch(Vec<Effect<I>>),
 }
 
@@ -340,6 +350,28 @@ where
 
 /// Returns an effect that executes several existing effects in source order.
 pub fn batch<I, T>(effects: T) -> Effect<I>
+where
+    I: Isolate,
+    T: IntoIterator<Item = Effect<I>>,
+{
+    Effect::Batch(effects.into_iter().collect())
+}
+
+/// Phase 047 Rock 6: documented sugar for ordered runtime-call sequences.
+///
+/// `sequence(...)` is equivalent to [`batch`]: the runtime executes the
+/// contained effects in source order, a [`Stop`](Effect::Stop) short-
+/// circuits the rest, and an empty input is [`Noop`](Effect::Noop). The
+/// difference is *intent*: use `sequence` when the items are runtime calls
+/// or sends that should happen left-to-right, and use [`batch`] when the
+/// items happen to be a small list of unrelated effects.
+///
+/// The same caveat applies as for [`batch`]: items targeting the same I/O
+/// resource (e.g. multiple `tcp_write` calls on the same stream) still
+/// return `CallError::ResourceBusy` for the second-and-later calls. For
+/// "write, then read, then write again" patterns on a single stream,
+/// continue using continuation messages from the isolate's handler.
+pub fn sequence<I, T>(effects: T) -> Effect<I>
 where
     I: Isolate,
     T: IntoIterator<Item = Effect<I>>,
@@ -1012,6 +1044,6 @@ pub mod prelude {
     pub use crate::{
         Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
         RestartableChildDefinition, Shard, ShardId, SingleShard, batch, isolate, isolate_types,
-        noop, reply, restart_children, send, spawn, stop,
+        noop, reply, restart_children, send, sequence, spawn, stop,
     };
 }
