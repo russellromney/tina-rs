@@ -1,0 +1,20 @@
+[package]
+name = "tina-rpc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tina framed request/reply first form (phase 052). Not gRPC. Not a general RPC framework."
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina = { path = "../tina" }
+tina-runtime = { path = "../tina-runtime" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+proptest = { version = "1.6.0", default-features = false, features = ["std"] }
