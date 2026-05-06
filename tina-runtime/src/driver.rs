@@ -120,10 +120,11 @@ impl TlsRuntimeStream {
 ///
 /// TCP drivers must treat listener accept, stream read, and stream write as
 /// separate pending lanes. Duplicate work on one lane fails with
-/// [`CallError::ResourceBusy`]; closing a listener or stream while any relevant
-/// lane is pending also fails with [`CallError::ResourceBusy`]. Per-call cancel
-/// must stop requester completion and quiescence pressure without silently
-/// invalidating unrelated active lanes.
+/// [`CallError::ResourceBusy`]. Closing a listener, stream, or UDP socket
+/// silently cancels pending work on that resource before closing it; the
+/// cancelled callers do not receive completions. Per-call cancel must stop
+/// requester completion and quiescence pressure without silently invalidating
+/// unrelated active lanes.
 pub(crate) trait RuntimeDriver: std::fmt::Debug {
     /// Submits one runtime-owned call.
     fn submit(
@@ -3259,11 +3260,6 @@ impl BetelgeuseTcp {
         self.pending.iter().any(|op| op.lane == lane)
     }
 
-    fn stream_has_active_pending(&self, stream: StreamId) -> bool {
-        self.lane_has_active_pending(PendingLane::StreamRead(stream))
-            || self.lane_has_active_pending(PendingLane::StreamWrite(stream))
-    }
-
     fn file_has_active_pending(&self, file: FileId) -> bool {
         self.lane_has_active_pending(PendingLane::FileRead(file))
             || self.lane_has_active_pending(PendingLane::FileWrite(file))
@@ -3609,8 +3605,17 @@ impl BetelgeuseTcp {
     }
 
     fn do_listener_close(&mut self, listener: ListenerId) -> CallOutput {
-        if self.lane_has_active_pending(PendingLane::ListenerAccept(listener)) {
-            return CallOutput::Failed(CallError::ResourceBusy);
+        // Same silent-cancellation semantic as `do_stream_close`: any
+        // pending `tcp_accept` for this listener is marked
+        // user-cancelled and dropped before the listener socket is
+        // closed. Previously this returned `ResourceBusy` and forced
+        // user code to drain accepts before close, which is awkward
+        // for any real shutdown path that wants the socket closed
+        // immediately.
+        for op in self.pending.iter_mut() {
+            if matches!(op.lane, PendingLane::ListenerAccept(l) if l == listener) {
+                op.user_cancelled = true;
+            }
         }
 
         match self.listeners.iter().position(|entry| entry.id == listener) {
@@ -3624,8 +3629,29 @@ impl BetelgeuseTcp {
     }
 
     fn do_stream_close(&mut self, stream: StreamId) -> CallOutput {
-        if self.stream_has_active_pending(stream) {
-            return CallOutput::Failed(CallError::ResourceBusy);
+        // Cancel any pending read or write on this stream's lanes before
+        // closing. Each cancelled op is marked `user_cancelled = true`;
+        // the harvest loop in `try_complete` drops cancelled ops that
+        // have a result (i.e. it never delivers their completion to
+        // the original caller). This is the same silent-cancellation
+        // semantic used when an isolate stops with pending calls.
+        //
+        // Behavior change from earlier revisions: a stream close no
+        // longer fails with `ResourceBusy` while reads or writes are
+        // pending. User code that called `tcp_close_stream` wants the
+        // stream closed; previously they had to first cancel-then-
+        // close, which made HTTP error paths (slow-loris, parse-fail
+        // mid-read) awkward — the reader could never complete and the
+        // closer could never succeed. The simulator side preserves the
+        // matching shape via `ScriptedTcpConfig` peer scripts.
+        for op in self.pending.iter_mut() {
+            let on_this_stream = match op.lane {
+                PendingLane::StreamRead(s) | PendingLane::StreamWrite(s) => s == stream,
+                _ => false,
+            };
+            if on_this_stream {
+                op.user_cancelled = true;
+            }
         }
 
         match self.streams.iter().position(|entry| entry.id == stream) {
@@ -3679,8 +3705,13 @@ impl BetelgeuseTcp {
     }
 
     fn do_udp_close(&mut self, socket: UdpSocketId) -> CallOutput {
-        if self.lane_has_active_pending(PendingLane::UdpRecv(socket)) {
-            return CallOutput::Failed(CallError::ResourceBusy);
+        // Same silent-cancellation semantic as `do_stream_close`: a
+        // pending `udp_recv` for this socket is marked user-cancelled
+        // and dropped before the socket is closed.
+        for op in self.pending.iter_mut() {
+            if matches!(op.lane, PendingLane::UdpRecv(s) if s == socket) {
+                op.user_cancelled = true;
+            }
         }
         match self.udp_sockets.iter().position(|entry| entry.id == socket) {
             Some(index) => {
@@ -4385,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_recv_lane_rejects_duplicate_and_close_until_cancelled() {
+    fn udp_recv_lane_rejects_duplicate_and_close_cancels_pending_recv() {
         let io_loop =
             io_loop(Global).expect("failed to initialise Betelgeuse IO loop for driver test");
         let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
@@ -4425,28 +4456,20 @@ mod tests {
             CallOutput::Failed(CallError::ResourceBusy)
         ));
 
-        let close_busy = driver
+        // New contract: close-while-recv-pending succeeds inline; the
+        // pending recv is silently cancelled (mirrors `do_stream_close`).
+        let closed = driver
             .submit(
                 CallId::new(4),
                 CallInput::UdpSocketClose { socket },
                 Instant::now(),
             )
-            .expect("busy udp close rejected inline");
-        assert!(matches!(
-            close_busy.result,
-            CallOutput::Failed(CallError::ResourceBusy)
-        ));
-
-        assert!(driver.cancel(CallId::new(2)));
-        assert!(!driver.has_pending());
-        let closed = driver
-            .submit(
-                CallId::new(5),
-                CallInput::UdpSocketClose { socket },
-                Instant::now(),
-            )
-            .expect("udp close succeeds after cancel");
+            .expect("udp close completes inline even with a pending recv");
         assert!(matches!(closed.result, CallOutput::UdpSocketClosed));
+        assert!(
+            !driver.has_pending(),
+            "the pending recv was cancelled by the close and is no longer counted as in-flight"
+        );
     }
 
     // -------------------------------------------------------------------

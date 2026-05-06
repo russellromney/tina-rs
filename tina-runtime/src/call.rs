@@ -971,7 +971,10 @@ pub enum CallError {
     ///
     /// TCP accepts, reads, and writes occupy separate lanes. A stream may have
     /// one read and one write pending at the same time, but duplicate work on
-    /// the same lane and explicit close while any lane is pending fail here.
+    /// the same lane fails here. Note that explicit close
+    /// (`tcp_close_listener` / `tcp_close_stream` / `udp_close_socket`)
+    /// no longer fails with `ResourceBusy` when a lane is pending: it
+    /// silently cancels the pending operation and closes the resource.
     ResourceBusy,
 
     /// A complete journal record had a checksum mismatch.

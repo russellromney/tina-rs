@@ -3658,14 +3658,14 @@ where
             return;
         }
 
-        let resource = TcpResourceKey::ListenerAccept(listener);
-        if self.resource_has_active_pending(resource) {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
-            return;
-        }
+        // Silent-cancel any pending accepts on this listener, mirroring
+        // the live driver's `do_listener_close` behavior. The original
+        // accept caller's continuation never fires; the cancellation
+        // is recorded as `CallCompletionRejected{ResourceClosed}` in
+        // the trace.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::ListenerAccept(listener));
 
         self.listeners[listener_index].closed = true;
-        self.fail_pending_accepts(listener);
         self.deliver_completion(call_id, CallOutput::TcpListenerClosed);
     }
 
@@ -3680,10 +3680,13 @@ where
             return;
         }
 
-        if self.stream_has_active_pending(stream) {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
-            return;
-        }
+        // Silent-cancel any pending reads/writes on this stream's lanes
+        // before closing, mirroring the live driver's behavior in
+        // `do_stream_close`. Original callers' continuations never
+        // fire; cancellations are recorded as
+        // `CallCompletionRejected{ResourceClosed}` in the trace.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::StreamRead(stream));
+        self.cancel_backend_calls_for_resource(TcpResourceKey::StreamWrite(stream));
 
         self.streams[stream_index].closed = true;
         self.deliver_completion(call_id, CallOutput::TcpStreamClosed);
@@ -3840,13 +3843,12 @@ where
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         }
-        if self.resource_has_active_pending(TcpResourceKey::UdpRecv(socket)) {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
-            return;
-        }
+        // Silent-cancel any pending recv on this socket, mirroring the
+        // live driver's `do_udp_close` behavior. Cancellations are
+        // recorded as `CallCompletionRejected{ResourceClosed}` in the
+        // trace.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::UdpRecv(socket));
         self.udp_sockets[socket_index].closed = true;
-        self.pending_udp_recvs
-            .retain(|pending| pending.socket != socket);
         self.deliver_completion(call_id, CallOutput::UdpSocketClosed);
     }
 
@@ -4769,11 +4771,6 @@ where
                 .any(|pending| pending.resource == resource)
     }
 
-    fn stream_has_active_pending(&self, stream: tina_runtime::StreamId) -> bool {
-        self.resource_has_active_pending(TcpResourceKey::StreamRead(stream))
-            || self.resource_has_active_pending(TcpResourceKey::StreamWrite(stream))
-    }
-
     fn udp_socket_index(&self, socket: UdpSocketId) -> Option<usize> {
         self.udp_sockets.iter().position(|state| state.id == socket)
     }
@@ -5213,21 +5210,6 @@ where
             bytes,
             truncated,
         })
-    }
-
-    fn fail_pending_accepts(&mut self, listener: ListenerId) {
-        let mut survivors = Vec::new();
-        for pending in std::mem::take(&mut self.pending_accepts) {
-            if pending.listener == listener {
-                self.deliver_completion(
-                    pending.call_id,
-                    CallOutput::Failed(CallError::InvalidResource),
-                );
-            } else {
-                survivors.push(pending);
-            }
-        }
-        self.pending_accepts = survivors;
     }
 
     fn harvest_tcp(&mut self) {
@@ -6126,6 +6108,76 @@ where
             );
         }
         stopped
+    }
+
+    /// Cancels every backend call whose pending op lives on the given
+    /// resource, used when that resource is being closed by user code.
+    /// Mirrors the live driver's silent-cancel behavior: original
+    /// callers' continuations never fire, but we drop the in-flight-
+    /// call tracking and translators so the simulator reaches
+    /// quiescence and `has_in_flight_calls` returns false promptly.
+    /// A `CallCompletionRejected` event with `ResourceClosed` is
+    /// emitted so the cancellation remains trace-observable.
+    fn cancel_backend_calls_for_resource(&mut self, resource: TcpResourceKey) {
+        let cancelled_call_ids: Vec<CallId> = self
+            .pending_tcp_completions
+            .iter()
+            .filter(|pending| pending.resource == resource)
+            .map(|pending| pending.call_id)
+            .chain(
+                self.pending_accepts
+                    .iter()
+                    .filter(|pending| {
+                        matches!(
+                            resource,
+                            TcpResourceKey::ListenerAccept(l) if l == pending.listener
+                        )
+                    })
+                    .map(|pending| pending.call_id),
+            )
+            .chain(
+                self.pending_udp_recvs
+                    .iter()
+                    .filter(|pending| {
+                        matches!(
+                            resource,
+                            TcpResourceKey::UdpRecv(s) if s == pending.socket
+                        )
+                    })
+                    .map(|pending| pending.call_id),
+            )
+            .collect();
+
+        for call_id in cancelled_call_ids {
+            // Drop the pending op record from whichever queue it lives in.
+            self.pending_tcp_completions
+                .retain(|pending| pending.call_id != call_id);
+            self.pending_accepts
+                .retain(|pending| pending.call_id != call_id);
+            self.pending_udp_recvs
+                .retain(|pending| pending.call_id != call_id);
+
+            // Drop the runtime-side tracking. Without this,
+            // `has_in_flight_calls` would return true forever and
+            // `run_until_quiescent` would loop.
+            let in_flight_index = self
+                .in_flight_calls
+                .iter()
+                .position(|entry| entry.call_id == call_id);
+            if let Some(index) = in_flight_index {
+                let call = self.in_flight_calls.remove(index);
+                self.translators.retain(|stored| stored.call_id != call_id);
+                self.push_event(
+                    call.requester.isolate,
+                    Some(call.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id: call.call_id,
+                        call_kind: call.call_kind,
+                        reason: CallCompletionRejectedReason::ResourceClosed,
+                    },
+                );
+            }
+        }
     }
 
     fn cancel_backend_calls_for_requester(&mut self, requester: RegisteredAddress) {
