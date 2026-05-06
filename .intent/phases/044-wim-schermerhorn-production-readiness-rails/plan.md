@@ -2,8 +2,9 @@
 
 ## Goal
 
-Build the first hard gate for "a real Tokio-shaped local service can be moved
-to Tina and the important behavior stays visible, bounded, and testable."
+Build the first hard gate for "a real Tokio- or Glommio-shaped local service
+can be moved to Tina and the important behavior stays visible, bounded, and
+testable."
 
 This is not a porting guide, demo, release story, or marketing phase. It is the
 test wall and runtime rails that make later porting attempts honest.
@@ -17,7 +18,7 @@ At closeout:
 
 - No remoting, clustering, membership, or placement.
 - No durable mailbox or exactly-once claim.
-- No broad "faster than Tokio" claim.
+- No broad "faster than Tokio/Glommio" claim.
 - No Tower/Axum middleware living inside Tina.
 - No `flow!` syntax unless a tiny helper is required to keep tests readable.
 - No hidden fallback queues.
@@ -27,9 +28,11 @@ At closeout:
 - If something can overload, a test must observe `Full` or pressure.
 - If something can fail, a test must observe typed failure and trace.
 - If something can race, DST or a deterministic e2e must replay it.
-- If Tina cannot support a common Tokio-shaped capability, the capability
-  matrix must say so explicitly.
+- If Tina cannot support a common Tokio/Glommio-shaped capability, the
+  capability matrix must say so explicitly.
 - Benchmarks produce numbers, not claims.
+- Comparisons must test behavior first: overload, cancellation, shutdown,
+  replay, and resource ownership matter more than raw throughput.
 
 ## Rocks
 
@@ -37,7 +40,8 @@ At closeout:
    Add an executable matrix for common local-service needs: TCP, DNS, TLS,
    UDP, files, process, signals, timers, calls, cross-shard sends, persistence,
    bridge ingress, cancellation, shutdown, and backpressure. Assert it matches
-   `RuntimeCapabilities` and public non-claims.
+   `RuntimeCapabilities` and public non-claims. Include explicit columns for
+   Tina, Tokio, and Glommio when a behavior is meaningfully comparable.
 
 2. **Porting Gap Tests**
    Add compile/run tests for the patterns a small Tokio service usually needs:
@@ -75,10 +79,18 @@ At closeout:
    Add explicit overload tests for mailbox, ingress, shard-pair, bridge,
    resource-lane, and persistence-lane pressure. No sleeps-as-proof.
 
-9. **Cost Numbers**
+9. **Comparison and Cost Numbers**
    Add a stable local benchmark/report command for selected paths: local send,
    cross-shard send, isolate call, TCP loopback, TLS loopback, file read/write,
-   journal append, bridge call. Record allocations where current probes allow.
+   journal append, bridge call. Include narrow Tokio and Glommio baselines
+   where they are local, fair, and easy to run; skip with a visible unsupported
+   row when the platform/substrate makes the comparison dishonest. Record
+   allocations where current probes allow. Add runnable comparisons for
+   constrained-memory and overload behavior: bounded channel pressure, many
+   concurrent connections, slow peer, cancelled request, shutdown while work is
+   in flight, and local disk/persistence pressure. Expected output must say
+   where Tina preserves behavior, where Tina rejects earlier/more loudly, and
+   where Tokio or Glommio have a feature Tina still does not claim.
 
 10. **CI Rails**
     Add or tighten CI so the public gate runs: fmt, check, clippy, docs,

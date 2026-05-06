@@ -192,7 +192,7 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Wim Schermerhorn production-readiness rails** | Build the first serious "can a real Tokio-shaped service be moved to Tina?" gate: executable capability matrix, user-perspective service gauntlet, DST gauntlet, live thread-per-core pressure, bridge/runtime cancellation rails, benchmark skeleton, CI/release rails, and sharp non-claims. This is not a docs/demo phase; it is the next production-readiness test wall. |
+| **Wim Schermerhorn production-readiness rails** | Build the first serious "can a real Tokio/Glommio-shaped service be moved to Tina?" gate: executable capability matrix, user-perspective service gauntlet, DST gauntlet, live thread-per-core pressure, bridge/runtime cancellation rails, Tina/Tokio/Glommio behavior comparisons, benchmark skeleton, CI/release rails, and sharp non-claims. This is not a docs/demo phase; it is the next production-readiness test wall. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |
 
 Parallel-safe side work: CI matrix planning, formatting of existing
