@@ -27,6 +27,7 @@ pub mod listener;
 pub mod parse;
 pub mod pool;
 pub mod request_builder;
+pub mod router;
 pub mod types;
 
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
@@ -38,6 +39,7 @@ pub use parse::{
 };
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
+pub use router::{RouteHandler, Router};
 pub use types::{
     HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpResponse, HttpServerConfig,
     PoolConfig, RequestParseError, ResponseParseError,

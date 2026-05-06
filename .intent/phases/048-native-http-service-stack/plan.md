@@ -494,3 +494,45 @@ fixed to `HttpRequest`. For 048b we leave the connection isolate's
 service shape unchanged and document the limitation. A flexible
 service shape — generic over user message/reply types with conversions
 to/from HTTP types — is a 048c candidate.
+
+## 048c Slice Design Notes
+
+048c lands rock 11 (tiny routing) as a sync helper. Rock 4 (streaming
+bodies) is deferred to the same shape-change slice as the multi-turn
+service support.
+
+### Rock 4 (streaming bodies) — deferred
+
+True streaming — the service produces chunks lazily without buffering
+the whole body — needs the connection-isolate service-shape change so
+the connection can call back into the service for each chunk. Without
+that, "streaming" reduces to chunked egress over a fully-buffered
+body, which does not lower memory and is just ceremony.
+
+048a's multi-read accumulation already covers "request body larger
+than one TCP read" up to `max_body_bytes`. That is the honest
+first-form bounded-body story. Real streaming ships with the
+shape-change slice.
+
+### Rock 11 (tiny routing) — sync helper
+
+Ship a small `Router` type that maps `(Method, path)` to a fn handler
+and is invoked from inside a service's `handle`:
+
+```rust
+let router = Router::new()
+    .route(Method::GET, "/counter", get_counter)
+    .route(Method::POST, "/counter", post_counter);
+// inside the service handler:
+let response = router.dispatch(&request);
+reply(response)
+```
+
+Stateless handlers only. For stateful routes the user writes a manual
+`match` in their service handler. Forwarding to other isolates is
+gated on the shape change — a route that needs to call upstream HTTP
+or a database can't fit through a `fn(&HttpRequest) -> HttpResponse`
+handler.
+
+No middleware. No path params (defer until an example needs them).
+404 fallback baked in.
