@@ -223,6 +223,18 @@ pub enum ClientStream {
 }
 
 /// Initialization data for [`Client::new`].
+///
+/// Use the [`ClientInit::connect`] / [`ClientInit::with_stream`]
+/// builders rather than constructing the struct directly:
+///
+/// ```ignore
+/// // Dial on Begin:
+/// ClientInit::<MyShard>::connect("127.0.0.1:9000".parse().unwrap())
+///     .with_config(ClientConfig::default())
+///
+/// // Or reuse an already-established stream:
+/// ClientInit::<MyShard>::with_stream(stream_id)
+/// ```
 pub struct ClientInit<S>
 where
     S: tina::Shard,
@@ -232,7 +244,37 @@ where
     /// Connection-local configuration.
     pub config: ClientConfig,
     /// Marker so the type carries the shard parameter.
+    #[doc(hidden)]
     pub _shard: std::marker::PhantomData<S>,
+}
+
+impl<S> ClientInit<S>
+where
+    S: tina::Shard,
+{
+    /// Builds an initializer that dials `addr` on `Begin`.
+    pub fn connect(addr: SocketAddr) -> Self {
+        Self {
+            stream: ClientStream::Pending(addr),
+            config: ClientConfig::default(),
+            _shard: std::marker::PhantomData,
+        }
+    }
+
+    /// Builds an initializer reusing an already-established stream.
+    pub fn with_stream(stream: StreamId) -> Self {
+        Self {
+            stream: ClientStream::Established(stream),
+            config: ClientConfig::default(),
+            _shard: std::marker::PhantomData,
+        }
+    }
+
+    /// Replaces the configuration.
+    pub fn with_config(mut self, config: ClientConfig) -> Self {
+        self.config = config;
+        self
+    }
 }
 
 impl<S> std::fmt::Debug for ClientInit<S>

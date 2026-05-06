@@ -103,6 +103,42 @@ impl Default for ConnectionConfig {
     }
 }
 
+impl ConnectionConfig {
+    /// Default configuration tuned for development and examples — same
+    /// as [`ConnectionConfig::default`].
+    pub fn dev() -> Self {
+        Self::default()
+    }
+
+    /// Default configuration with `max_in_flight` clamped to `cap` and
+    /// `write_queue_cap` set to `cap.max(16)` so the
+    /// "queue holds at least one frame per in-flight slot" invariant
+    /// stays satisfied. Useful for building deliberate-overload demos.
+    pub fn bounded(cap: usize) -> Self {
+        Self {
+            max_in_flight: cap,
+            write_queue_cap: cap.max(16),
+            ..Self::default()
+        }
+    }
+
+    /// Configuration designed to produce wire-visible overload at very
+    /// small bursts: in-flight cap of 1, idle timeout of 5 s, service
+    /// timeout of 8 s (longer than the registry default so registry
+    /// timeouts dominate). Use for demos that want to show the `Full`
+    /// path without needing a slow service.
+    pub fn tiny_pressure() -> Self {
+        Self {
+            max_frame_size: 64 * 1024,
+            max_in_flight: 1,
+            idle_timeout: Duration::from_secs(5),
+            read_chunk: 4096,
+            write_queue_cap: 64,
+            service_call_timeout: Duration::from_secs(8),
+        }
+    }
+}
+
 /// Request payload the connection forwards to the router.
 ///
 /// Rock 3 implements a router isolate whose mailbox accepts this type and
@@ -219,6 +255,18 @@ pub enum ConnectionMsg {
 }
 
 /// Initialization data for [`Connection::new`].
+///
+/// Use the [`ConnectionInit::new`] builder rather than constructing the
+/// struct directly:
+///
+/// ```ignore
+/// ConnectionInit::<MyShard>::new(stream, registry)
+///     .with_config(ConnectionConfig::bounded(1))
+///     .with_watcher(watcher_addr)
+/// ```
+///
+/// Direct field access is retained for back-compat but the
+/// `_shard: PhantomData` field is private — use the builder.
 pub struct ConnectionInit<S>
 where
     S: tina::Shard,
@@ -233,7 +281,42 @@ where
     /// Connection-local configuration.
     pub config: ConnectionConfig,
     /// Marker so the type carries the shard parameter.
+    #[doc(hidden)]
     pub _shard: std::marker::PhantomData<S>,
+}
+
+impl<S> ConnectionInit<S>
+where
+    S: tina::Shard,
+{
+    /// Builds the minimum-viable initializer: an accepted stream id and
+    /// the registry to forward requests to. Defaults `watcher` to
+    /// `None` and `config` to [`ConnectionConfig::default`].
+    pub fn new(
+        stream: StreamId,
+        router: Address<crate::registry::RegistryMsg, RouterReply>,
+    ) -> Self {
+        Self {
+            stream,
+            router,
+            watcher: None,
+            config: ConnectionConfig::default(),
+            _shard: std::marker::PhantomData,
+        }
+    }
+
+    /// Replaces the configuration.
+    pub fn with_config(mut self, config: ConnectionConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Attaches a watcher address that receives one [`CloseReason`]
+    /// when the connection closes.
+    pub fn with_watcher(mut self, watcher: Address<CloseReason>) -> Self {
+        self.watcher = Some(watcher);
+        self
+    }
 }
 
 impl<S> std::fmt::Debug for ConnectionInit<S>

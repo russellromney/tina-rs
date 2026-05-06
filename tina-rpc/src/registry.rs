@@ -203,6 +203,96 @@ where
     pub fn is_empty(&self) -> bool {
         self.services.is_empty()
     }
+
+    /// Returns a builder that constructs a registry incrementally.
+    ///
+    /// ```ignore
+    /// let registry = Registry::<MyShard>::builder()
+    ///     .timeout(Duration::from_secs(2))
+    ///     .service("echo", echo_addr)
+    ///     .service("billing", billing_addr)
+    ///     .build();
+    /// ```
+    pub fn builder() -> RegistryBuilder<S> {
+        RegistryBuilder::default()
+    }
+}
+
+/// Incremental builder for [`Registry`].
+pub struct RegistryBuilder<S>
+where
+    S: tina::Shard,
+{
+    services: HashMap<String, Address<ServiceCall, ServiceReply>>,
+    config: RegistryConfig,
+    _shard: std::marker::PhantomData<S>,
+}
+
+impl<S> std::fmt::Debug for RegistryBuilder<S>
+where
+    S: tina::Shard,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryBuilder")
+            .field("services", &self.services.keys().collect::<Vec<_>>())
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+impl<S> Default for RegistryBuilder<S>
+where
+    S: tina::Shard,
+{
+    fn default() -> Self {
+        Self {
+            services: HashMap::new(),
+            config: RegistryConfig::default(),
+            _shard: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<S> RegistryBuilder<S>
+where
+    S: tina::Shard,
+{
+    /// Registers `addr` as the service named `name`. Re-registering the
+    /// same name overwrites the previous binding.
+    pub fn service(
+        mut self,
+        name: impl Into<String>,
+        addr: Address<ServiceCall, ServiceReply>,
+    ) -> Self {
+        self.services.insert(name.into(), addr);
+        self
+    }
+
+    /// Sets the per-service-call timeout the registry will use on every
+    /// `IsolateCall` to a registered service.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.config.service_call_timeout = timeout;
+        self
+    }
+
+    /// Replaces the entire configuration.
+    pub fn config(mut self, config: RegistryConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Finalizes the builder.
+    pub fn build(self) -> Registry<S> {
+        debug_assert!(
+            !self.config.service_call_timeout.is_zero(),
+            "RegistryConfig::service_call_timeout must be non-zero",
+        );
+        Registry {
+            services: self.services,
+            config: self.config,
+            _shard: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<S> Registry<S>

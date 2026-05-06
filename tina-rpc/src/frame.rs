@@ -81,12 +81,23 @@ pub enum FrameKind {
 
 /// Server-reported error code. Sent inside an [`FrameKind::Error`] frame.
 ///
-/// **Wire-error invariant.** These variants must remain server-reported only.
-/// Client-observed conditions (`timeout`, `connection_closed`) are surfaced
-/// locally by the client stub (Rock 4) and never appear as wire frames. Do
-/// not add `Timeout` or `ConnectionClosed` variants here. The
-/// [`frame_error_variants_are_server_reported`](crate#guard-tests) guard test
-/// fails if the variant set drifts.
+/// **Wire-error invariant.** These variants are *server-reported only*.
+/// They name conditions the **server** observed about a request that the
+/// **client** could not have observed from its side: the service name was
+/// unknown to the registry, the method was unknown to the service, the
+/// payload failed to decode at the service, the service mailbox was at
+/// capacity, the frame violated wire format, or an internal failure. The
+/// matching client-observable conditions — local-deadline `Timeout`,
+/// `ConnectionClosed` — live on [`crate::ClientResult`] and are produced
+/// purely by the client stub. The two enums are intentionally disjoint;
+/// **do not** add `Timeout` or `ConnectionClosed` variants here. The
+/// [`frame_error_variants_are_server_reported`](crate#guard-tests) guard
+/// test fails if the variant set drifts.
+///
+/// Note: a server-side service-call timeout (the registry's `IsolateCall`
+/// to a registered service elapses) maps to [`FrameError::Internal`], not
+/// to a fictional `Timeout` variant. The client's local deadline is what
+/// surfaces as `ClientResult::Timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameError {
     /// The target service is at capacity.

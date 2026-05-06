@@ -17,8 +17,8 @@ use tina_runtime::{
     tcp_bind, tcp_close_listener,
 };
 use tina_rpc::{
-    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Registry, RegistryConfig,
-    RegistryMsg, RouterReply, ServiceCall, ServiceReply,
+    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Registry, RegistryMsg,
+    RouterReply, ServiceCall, ServiceReply,
 };
 
 use super::{ComparisonConfig, SideReport, drive_client};
@@ -143,26 +143,13 @@ impl Listener {
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
                 let listener = self.listener_id.expect("listener set after bind");
-                let connection = Connection::<EiffelShard>::new(ConnectionInit {
-                    stream,
-                    router: self.router,
-                    watcher: None,
-                    config: ConnectionConfig {
-                        max_frame_size: 64 * 1024,
-                        // The whole point of the demo: cap in flight msgs at 1.
-                        max_in_flight: 1,
-                        idle_timeout: Duration::from_secs(5),
-                        read_chunk: 4096,
-                        write_queue_cap: 64,
-                        // Must exceed `RegistryConfig::default().service_call_timeout`
-                        // (4 s) so the registry's per-service timeout fires
-                        // first and the connection always sees a router
-                        // reply rather than `CallOutcome::Timeout` (which
-                        // emits no wire frame, by the wire-error invariant).
-                        service_call_timeout: Duration::from_secs(8),
-                    },
-                    _shard: std::marker::PhantomData,
-                });
+                // `tiny_pressure` is the demo preset: max_in_flight=1
+                // with a registry-dominant service_call_timeout, so
+                // overload becomes wire-visible at small bursts.
+                let connection = Connection::<EiffelShard>::new(
+                    ConnectionInit::new(stream, self.router)
+                        .with_config(ConnectionConfig::tiny_pressure()),
+                );
                 batch(vec![
                     spawn(
                         ChildDefinition::new(connection, 64)
@@ -197,8 +184,9 @@ pub(crate) fn run(config: ComparisonConfig) -> SideReport {
         .expect("register service");
 
     // 2) Registry that knows about the service.
-    let mut registry_state = Registry::<EiffelShard>::new(RegistryConfig::default());
-    registry_state.register("echo", service);
+    let registry_state = Registry::<EiffelShard>::builder()
+        .service("echo", service)
+        .build();
     let registry = runtime
         .register_with_capacity::<Registry<EiffelShard>, Infallible>(registry_state, 16)
         .expect("register registry");
