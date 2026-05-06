@@ -369,6 +369,11 @@ where
     ///   has slack, forcing the connection into the
     ///   `IoError(CallError::Io)` close branch under non-overload
     ///   conditions.
+    /// - `read_chunk > 0`. A zero-length `tcp_read` returns
+    ///   `Ok(empty)`, which the client interprets as peer half-close
+    ///   and tears the connection down. Release builds also clamp the
+    ///   read path to `read_chunk.max(1)` to keep this from being a
+    ///   silent EOF if the assert is bypassed.
     /// - `max_frame_size >= MIN_BODY_SIZE` (enforced separately by the
     ///   frame codec).
     pub fn new(init: ClientInit<S>) -> Self {
