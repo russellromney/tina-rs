@@ -13,8 +13,10 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, CallOutcome, DefaultThreadedMailboxFactory, ListenerId, StreamId, ThreadedRuntime,
-    call, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    CallOutcome, DefaultThreadedMailboxFactory, ListenerId, StreamId, TcpAcceptReply,
+    TcpBindReply, TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply,
+    ThreadedRuntime, call, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
+    tcp_write,
 };
 
 use crate::{Command, Report, SCRIPT, parse_commands};
@@ -76,10 +78,10 @@ impl Store {
 #[derive(Debug, Clone)]
 enum ConnectionMsg {
     Begin,
-    Read(Result<Vec<u8>, CallError>),
+    Read(TcpReadReply),
     StoreReturned(CallOutcome<StoreReply>),
-    Wrote(Result<usize, CallError>),
-    Closed(Result<(), CallError>),
+    Wrote(TcpWriteReply),
+    Closed(TcpStreamCloseReply),
 }
 
 /// State that's empty at spawn. Lives in its own struct so the spawn
@@ -185,9 +187,9 @@ impl Connection {
 #[derive(Debug, Clone)]
 enum ListenerMsg {
     Start,
-    Bound(Result<(ListenerId, SocketAddr), CallError>),
-    Accepted(Result<(StreamId, SocketAddr), CallError>),
-    ListenerClosed(Result<(), CallError>),
+    Bound(TcpBindReply),
+    Accepted(TcpAcceptReply),
+    ListenerClosed(TcpListenerCloseReply),
 }
 
 struct Listener {

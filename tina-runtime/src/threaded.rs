@@ -336,6 +336,20 @@ where
         }
     }
 
+    /// Registers a typed result waiter for the isolate at `address` on the
+    /// worker shard. See [`Runtime::observe_result`] for semantics.
+    ///
+    /// Worker stopped → `RuntimeStopped`.
+    pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError> {
+        match self.call(move |runtime| runtime.observe_result::<T, M, R>(address)) {
+            Ok(result) => result,
+            Err(_) => Err(observation::ResultWaitError::RuntimeStopped),
+        }
+    }
+
     /// Attempts one typed ingress handoff through the bounded worker queue.
     ///
     /// Success means the worker accepted ownership of the message command. It
@@ -530,6 +544,12 @@ where
     /// Returns complete trace, failing if the worker can no longer report.
     pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.call(|runtime| runtime.trace().to_vec())
+    }
+
+    /// Returns a counted summary of pressure-shaped trace events.
+    /// See [`Runtime::pressure_summary`].
+    pub fn pressure_summary(&self) -> Result<crate::pressure::PressureSummary, ThreadedRuntimeError> {
+        self.call(|runtime| runtime.pressure_summary())
     }
 
     /// Returns whether the worker still has runtime-owned work pending.

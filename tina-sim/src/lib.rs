@@ -607,7 +607,7 @@ where
     ) -> bool {
         let isolate_id = self.entries[index].id;
         match effect {
-            ErasedEffect::Stop => {
+            ErasedEffect::Stop | ErasedEffect::StopWith => {
                 self.stop_entry(index, isolate_id, cause);
                 true
             }

@@ -100,7 +100,43 @@
 //! ));
 //! ```
 
+use std::any::Any;
+use std::fmt;
 use std::marker::PhantomData;
+
+/// Type-erased payload for [`Effect::StopWith`].
+///
+/// Holds the isolate's final value as `Box<dyn Any + Send>` so [`Effect`]
+/// keeps no `Debug` bound on `T`. The host receives the value through
+/// `runtime.observe_result::<T>(addr)`; type mismatch is a typed wait
+/// outcome, not a panic.
+pub struct StopResult(Box<dyn Any + Send>);
+
+impl StopResult {
+    /// Boxes a typed final value.
+    pub fn new<T: Send + 'static>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    /// Returns the inner boxed `Any` for runtime downcast.
+    pub fn into_any(self) -> Box<dyn Any + Send> {
+        self.0
+    }
+
+    /// Inner value's `TypeId`.
+    pub fn type_id(&self) -> std::any::TypeId {
+        (*self.0).type_id()
+    }
+}
+
+impl fmt::Debug for StopResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StopResult")
+            .field("type_id", &(*self.0).type_id())
+            .finish()
+    }
+}
 
 /// Declares a Tina isolate from an inherent `impl` block.
 ///
@@ -263,6 +299,14 @@ where
     /// Stop the current isolate.
     Stop,
 
+    /// Stop the current isolate and publish a typed final result for a
+    /// host-registered `observe_result::<T>` waiter.
+    ///
+    /// Same lifecycle and `IsolateStopped` event as [`Self::Stop`]. With a
+    /// waiter: deliver `T` on type match, `TypeMismatch` otherwise. Without
+    /// a waiter: drop the value (no replay cache).
+    StopWith(StopResult),
+
     /// Restart this isolate's children according to the runtime's supervision
     /// policy.
     RestartChildren,
@@ -338,6 +382,17 @@ where
     I: Isolate,
 {
     Effect::Stop
+}
+
+/// Stops the current isolate and offers a typed result to a registered
+/// `observe_result::<T>` waiter. Same `IsolateStopped` event as [`stop`].
+/// No waiter or type mismatch → value dropped (no replay cache).
+pub fn stop_with<I, T>(value: T) -> Effect<I>
+where
+    I: Isolate,
+    T: Send + 'static,
+{
+    Effect::StopWith(StopResult::new(value))
 }
 
 /// Returns an effect that asks the runtime to restart this isolate's direct
@@ -1045,6 +1100,6 @@ pub mod prelude {
     pub use crate::{
         Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
         RestartableChildDefinition, Shard, ShardId, SingleShard, batch, isolate, isolate_types,
-        noop, reply, restart_children, send, sequence, spawn, stop,
+        noop, reply, restart_children, send, sequence, spawn, stop, stop_with,
     };
 }

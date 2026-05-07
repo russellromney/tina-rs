@@ -312,6 +312,7 @@ where
         tina::Effect::Send(send) => tina::Effect::Send(send),
         tina::Effect::Spawn(spawn) => tina::Effect::Spawn(spawn),
         tina::Effect::Stop => tina::Effect::Stop,
+        tina::Effect::StopWith(result) => tina::Effect::StopWith(result),
         tina::Effect::RestartChildren => tina::Effect::RestartChildren,
         tina::Effect::Call(call) => tina::Effect::Call(call),
         tina::Effect::Batch(effects) => {

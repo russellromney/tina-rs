@@ -18,12 +18,15 @@
 //! The trace remains the source of audit truth: handles only surface facts
 //! the runtime already records into the trace.
 
+use std::any::TypeId;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
-use tina::{AddressGeneration, IsolateId};
+use tina::{AddressGeneration, IsolateId, StopResult};
 
 use crate::call::{CallError, CallId};
 use crate::trace::CallKind;
@@ -41,6 +44,29 @@ pub enum WaitError {
     /// observations. The fact may still happen and still be traced, but this
     /// waiter was not registered.
     ObservationFull,
+}
+
+/// Outcome of registering or waiting on an [`IsolateResultWaiter`].
+///
+/// `ObservationFull`, `AlreadyClaimed`, `AlreadyStopped` only fire at
+/// register time. The rest only fire on [`IsolateResultWaiter::wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultWaitError {
+    /// `wait` timed out before the isolate stopped.
+    Timeout,
+    /// Runtime dropped or shut down before delivery.
+    RuntimeStopped,
+    /// Observation cap reached; this waiter was not registered.
+    ObservationFull,
+    /// Another result waiter already holds this `(isolate, generation)`.
+    /// Single-claim per address.
+    AlreadyClaimed,
+    /// Isolate is no longer alive at this generation. No replay cache.
+    AlreadyStopped,
+    /// Isolate stopped via `stop()`, not `stop_with(...)`.
+    StoppedWithoutResult,
+    /// `stop_with(v)` value did not match the requested `T`.
+    TypeMismatch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -259,6 +285,124 @@ impl ChildRestartedWaiter {
     }
 }
 
+/// Typed bounded handle that resolves when the targeted isolate stops via
+/// [`tina::stop_with`]. Single-claim per `(IsolateId, AddressGeneration)`;
+/// no replay for late registrants.
+///
+/// Dropping the waiter — or letting `wait` consume it on `Timeout` —
+/// abandons the claim. The next `observe_result` call for the same
+/// address can register fresh; the registry reclaims abandoned slots
+/// instead of returning `AlreadyClaimed`.
+pub struct IsolateResultWaiter<T: Send + 'static> {
+    rx: mpsc::Receiver<ResultDelivery<T>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl<T: Send + 'static> Drop for IsolateResultWaiter<T> {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+enum ResultDelivery<T> {
+    Resolved(T),
+    StoppedWithoutResult,
+    TypeMismatch,
+}
+
+impl<T: Send + 'static> IsolateResultWaiter<T> {
+    /// Waits up to `timeout` for the isolate's typed result.
+    pub fn wait(self, timeout: Duration) -> Result<T, ResultWaitError> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(ResultDelivery::Resolved(value)) => Ok(value),
+            Ok(ResultDelivery::StoppedWithoutResult) => Err(ResultWaitError::StoppedWithoutResult),
+            Ok(ResultDelivery::TypeMismatch) => Err(ResultWaitError::TypeMismatch),
+            Err(RecvTimeoutError::Timeout) => Err(ResultWaitError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(ResultWaitError::RuntimeStopped),
+        }
+    }
+}
+
+impl<T: Send + 'static> std::fmt::Debug for IsolateResultWaiter<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IsolateResultWaiter")
+            .field("type_id", &TypeId::of::<T>())
+            .finish()
+    }
+}
+
+/// Type-erased delivery face. Concrete impl owns the typed sender so the
+/// runtime's notify paths do not need to know `T`.
+trait ResultSender: Send {
+    fn expected_type(&self) -> TypeId;
+    fn deliver_value(self: Box<Self>, value: Box<dyn std::any::Any + Send>);
+    fn deliver_stopped_without_result(self: Box<Self>);
+    fn deliver_type_mismatch(self: Box<Self>);
+}
+
+struct TypedResultSender<T: Send + 'static> {
+    sender: SyncSender<ResultDelivery<T>>,
+}
+
+impl<T: Send + 'static> ResultSender for TypedResultSender<T> {
+    fn expected_type(&self) -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    fn deliver_value(self: Box<Self>, value: Box<dyn std::any::Any + Send>) {
+        match value.downcast::<T>() {
+            Ok(boxed) => {
+                let _ = self.sender.try_send(ResultDelivery::Resolved(*boxed));
+            }
+            Err(_) => {
+                // Defensive: callers check `expected_type()` first.
+                let _ = self.sender.try_send(ResultDelivery::TypeMismatch);
+            }
+        }
+    }
+
+    fn deliver_stopped_without_result(self: Box<Self>) {
+        let _ = self
+            .sender
+            .try_send(ResultDelivery::StoppedWithoutResult);
+    }
+
+    fn deliver_type_mismatch(self: Box<Self>) {
+        let _ = self.sender.try_send(ResultDelivery::TypeMismatch);
+    }
+}
+
+struct IsolateResultSlot {
+    isolate: IsolateId,
+    generation: AddressGeneration,
+    sender: Box<dyn ResultSender>,
+    /// Shared with the waiter; flipped to `false` when the waiter is
+    /// dropped (or `wait` consumed it). Lets the registry reclaim
+    /// abandoned single-claim slots instead of leaking until the
+    /// isolate stops.
+    waiter_alive: Arc<AtomicBool>,
+}
+
+impl IsolateResultSlot {
+    fn is_abandoned(&self) -> bool {
+        !self.waiter_alive.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for IsolateResultSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IsolateResultSlot")
+            .field("isolate", &self.isolate)
+            .field("generation", &self.generation)
+            .field("expected_type", &self.sender.expected_type())
+            .field("waiter_alive", &!self.is_abandoned())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct IsolateCompleteSlot {
     isolate: IsolateId,
@@ -289,6 +433,7 @@ pub(crate) struct ObservationRegistry {
     pending_isolate_complete: Vec<IsolateCompleteSlot>,
     pending_operation_done: Vec<OperationDoneSlot>,
     pending_child_restarted: Vec<ChildRestartedSlot>,
+    pending_isolate_result: Vec<IsolateResultSlot>,
     max_pending: usize,
 }
 
@@ -305,6 +450,10 @@ impl std::fmt::Debug for ObservationRegistry {
             .field(
                 "pending_child_restarted",
                 &self.pending_child_restarted.len(),
+            )
+            .field(
+                "pending_isolate_result",
+                &self.pending_isolate_result.len(),
             )
             .field("max_pending", &self.max_pending)
             .finish()
@@ -342,6 +491,7 @@ impl ObservationRegistry {
             pending_isolate_complete: Vec::new(),
             pending_operation_done: Vec::new(),
             pending_child_restarted: Vec::new(),
+            pending_isolate_result: Vec::new(),
             max_pending,
         }
     }
@@ -399,14 +549,29 @@ impl ObservationRegistry {
         waiter
     }
 
-    fn pending_count(&self) -> usize {
+    /// Drops any `pending_isolate_result` slot whose waiter has been
+    /// dropped/consumed. The other pending vectors hold typed
+    /// `SyncSender`s the runtime can probe via `try_send` at delivery
+    /// time, so they self-clean on first match attempt; result slots
+    /// only see their `(isolate, generation)` when the same address
+    /// re-registers, which left abandoned slots counting toward the
+    /// cap until that happened. Call before any cap check or
+    /// registration path.
+    fn prune_abandoned_result_slots(&mut self) {
+        self.pending_isolate_result
+            .retain(|slot| !slot.is_abandoned());
+    }
+
+    fn pending_count(&mut self) -> usize {
+        self.prune_abandoned_result_slots();
         self.pending_bound.len()
             + self.pending_isolate_complete.len()
             + self.pending_operation_done.len()
             + self.pending_child_restarted.len()
+            + self.pending_isolate_result.len()
     }
 
-    fn is_full(&self) -> bool {
+    fn is_full(&mut self) -> bool {
         self.pending_count() >= self.max_pending
     }
 
@@ -480,6 +645,87 @@ impl ObservationRegistry {
             let _ = slot
                 .sender
                 .try_send(OperationDoneOutcome::Failed { call_id, error });
+        }
+    }
+
+    /// Registers a typed result waiter for `(isolate, generation)`.
+    ///
+    /// Caller must check liveness first; the registry only handles the
+    /// observation cap and single-claim invariant. Returns `ObservationFull`
+    /// or `AlreadyClaimed` on those conditions. Reclaims any prior slot
+    /// whose waiter has been dropped/consumed.
+    pub(crate) fn register_isolate_result<T: Send + 'static>(
+        &mut self,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+    ) -> Result<IsolateResultWaiter<T>, ResultWaitError> {
+        if let Some(index) = self
+            .pending_isolate_result
+            .iter()
+            .position(|slot| slot.isolate == isolate && slot.generation == generation)
+        {
+            if self.pending_isolate_result[index].is_abandoned() {
+                self.pending_isolate_result.swap_remove(index);
+            } else {
+                return Err(ResultWaitError::AlreadyClaimed);
+            }
+        }
+        if self.is_full() {
+            return Err(ResultWaitError::ObservationFull);
+        }
+        let (tx, rx) = mpsc::sync_channel::<ResultDelivery<T>>(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        self.pending_isolate_result.push(IsolateResultSlot {
+            isolate,
+            generation,
+            sender: Box::new(TypedResultSender { sender: tx }),
+            waiter_alive: Arc::clone(&alive),
+        });
+        Ok(IsolateResultWaiter { rx, alive })
+    }
+
+    /// Delivers `result` to a registered waiter, or drops it.
+    ///
+    /// Type match → `Resolved`. Type mismatch → `TypeMismatch` (value
+    /// dropped). No waiter → value dropped. Single-claim is enforced at
+    /// register time so at most one slot can match.
+    pub(crate) fn notify_isolate_result(
+        &mut self,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+        result: StopResult,
+    ) {
+        if let Some(index) = self
+            .pending_isolate_result
+            .iter()
+            .position(|slot| slot.isolate == isolate && slot.generation == generation)
+        {
+            let slot = self.pending_isolate_result.remove(index);
+            let any = result.into_any();
+            if slot.sender.expected_type() == (*any).type_id() {
+                slot.sender.deliver_value(any);
+            } else {
+                slot.sender.deliver_type_mismatch();
+                drop(any);
+            }
+        }
+    }
+
+    /// Resolves any waiter for `(isolate, generation)` as
+    /// `StoppedWithoutResult`. Called when the isolate stops via plain
+    /// `stop()` or any non-result path.
+    pub(crate) fn notify_isolate_stopped_without_result(
+        &mut self,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+    ) {
+        if let Some(index) = self
+            .pending_isolate_result
+            .iter()
+            .position(|slot| slot.isolate == isolate && slot.generation == generation)
+        {
+            let slot = self.pending_isolate_result.remove(index);
+            slot.sender.deliver_stopped_without_result();
         }
     }
 

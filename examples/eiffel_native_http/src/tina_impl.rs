@@ -5,9 +5,10 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
-use http::{Method, StatusCode};
 use tina::prelude::*;
-use tina_http::{HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig};
+use tina_http::{
+    HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatefulRouter,
+};
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 
 use crate::{Report, scripted_client};
@@ -17,6 +18,15 @@ struct Counter {
     value: u32,
 }
 
+fn get_counter(state: &mut Counter, _: &HttpRequest) -> HttpResponse {
+    HttpResponse::text(state.value.to_string())
+}
+
+fn post_counter(state: &mut Counter, _: &HttpRequest) -> HttpResponse {
+    state.value += 1;
+    HttpResponse::text(state.value.to_string())
+}
+
 #[tina::isolate(message = HttpRequest, reply = HttpResponse)]
 impl Counter {
     fn handle(
@@ -24,15 +34,11 @@ impl Counter {
         request: HttpRequest,
         _ctx: &mut Context<'_, SingleShard>,
     ) -> Effect<Self> {
-        let response = match (request.method.clone(), request.path.as_str()) {
-            (Method::GET, "/counter") => HttpResponse::text(self.value.to_string()),
-            (Method::POST, "/counter") => {
-                self.value += 1;
-                HttpResponse::text(self.value.to_string())
-            }
-            _ => HttpResponse::with_status(StatusCode::NOT_FOUND),
-        };
-        reply(response)
+        let router = StatefulRouter::<Counter>::new()
+            .get("/counter", get_counter)
+            .post("/counter", post_counter)
+            .method_not_allowed();
+        reply(router.dispatch(self, &request))
     }
 }
 

@@ -61,6 +61,9 @@ fn main() {
         format_status(baseline.status),
         manifest_label,
     );
+    for line in &baseline.pressure_lines {
+        println!("baseline {line}");
+    }
     println!(
         "result label=contended  spinners={}  duration_ms={} status={} (manifest={})",
         spinner_count,
@@ -68,6 +71,9 @@ fn main() {
         format_status(contended.status),
         manifest_label,
     );
+    for line in &contended.pressure_lines {
+        println!("contended {line}");
+    }
 
     let baseline_passed = baseline.status.success();
     let contended_passed = contended.status.success();
@@ -86,6 +92,7 @@ fn main() {
 struct RunResult {
     duration_ms: u128,
     status: ExitStatus,
+    pressure_lines: Vec<String>,
 }
 
 fn run_target(binary: &PathBuf, spinner_count: usize) -> RunResult {
@@ -106,9 +113,13 @@ fn run_target(binary: &PathBuf, spinner_count: usize) -> RunResult {
         .collect();
 
     let started = Instant::now();
-    let status = Command::new(binary)
+    // Capture stdout so the runner can intercept any `pressure ...`
+    // lines (Phase 059 Rock 9 convention). Other lines pass through
+    // verbatim so specimens that don't emit pressure summaries stay
+    // untouched.
+    let output = Command::new(binary)
         .arg("compare")
-        .status()
+        .output()
         .expect("spawn target comparison");
     let duration = started.elapsed();
 
@@ -120,9 +131,25 @@ fn run_target(binary: &PathBuf, spinner_count: usize) -> RunResult {
     // Sleep for one tick to let any IPC settle.
     thread::sleep(Duration::from_millis(10));
 
+    let mut pressure_lines = Vec::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.starts_with("pressure ") {
+            pressure_lines.push(line.to_string());
+        } else {
+            println!("{line}");
+        }
+    }
+    // Pass any stderr through unchanged.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+
     RunResult {
         duration_ms: duration.as_millis(),
-        status,
+        status: output.status,
+        pressure_lines,
     }
 }
 

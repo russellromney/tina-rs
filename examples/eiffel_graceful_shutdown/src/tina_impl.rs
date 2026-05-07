@@ -11,7 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
-use tina_runtime::{CallError, DefaultThreadedMailboxFactory, ThreadedRuntime, signal_wait, sleep};
+use tina_runtime::{
+    DefaultThreadedMailboxFactory, SignalWaitReply, SleepReply, ThreadedRuntime, signal_wait,
+    sleep,
+};
 
 use crate::{ITEM_INTERVAL_MS, Report, SIGNAL_AFTER_MS, TOTAL_PLANNED_ITEMS};
 
@@ -30,7 +33,7 @@ struct Telemetry {
 #[derive(Debug, Clone, Copy)]
 enum ConsumerMsg {
     Item(#[allow(dead_code)] u32),
-    Done(Result<(), CallError>),
+    Done(SleepReply),
 }
 
 struct Consumer {
@@ -56,7 +59,7 @@ impl Consumer {
 #[derive(Debug, Clone, Copy)]
 enum ProducerMsg {
     Tick(u32),
-    TimerFired(u32, Result<(), CallError>),
+    TimerFired(u32, SleepReply),
     Stop,
 }
 
@@ -110,7 +113,7 @@ impl Producer {
 #[derive(Debug, Clone)]
 enum SignalMsg {
     Begin,
-    Received(Result<String, CallError>),
+    Received(SignalWaitReply),
 }
 
 struct SignalWatcher {
