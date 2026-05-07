@@ -78,6 +78,12 @@ pub struct ReqwestResponse {
 /// Every error path the bridge can produce maps to exactly one variant.
 /// Reqwest-internal errors collapse to [`ReqwestError::Reqwest`] with
 /// the underlying message preserved; the bridge does not swallow.
+///
+/// `PartialEq`/`Eq` compare string-bearing variants
+/// ([`ReqwestError::InvalidRequest`], [`ReqwestError::Reqwest`])
+/// byte-for-byte. Treat those strings as opaque — the underlying
+/// reqwest message text can change between releases. Use
+/// `matches!(err, ReqwestError::Reqwest(_))` for variant-only tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReqwestError {
     /// Worker mailbox or `max_in_flight` cap rejected admission.
@@ -101,17 +107,17 @@ pub enum ReqwestError {
 impl std::fmt::Display for ReqwestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Full => f.write_str("reqwest bridge: bounded ingress full"),
-            Self::Closed => f.write_str("reqwest bridge: worker closed"),
-            Self::Timeout => f.write_str("reqwest bridge: request timed out"),
+            Self::Full => f.write_str("reqwest worker: bounded ingress full"),
+            Self::Closed => f.write_str("reqwest worker: closed"),
+            Self::Timeout => f.write_str("reqwest worker: request timed out"),
             Self::RequestTooLarge => {
-                f.write_str("reqwest bridge: request body exceeds configured limit")
+                f.write_str("reqwest worker: request body exceeds configured limit")
             }
             Self::ResponseTooLarge => {
-                f.write_str("reqwest bridge: response body exceeds configured limit")
+                f.write_str("reqwest worker: response body exceeds configured limit")
             }
-            Self::InvalidRequest(msg) => write!(f, "reqwest bridge: invalid request: {msg}"),
-            Self::Reqwest(msg) => write!(f, "reqwest bridge: reqwest error: {msg}"),
+            Self::InvalidRequest(msg) => write!(f, "reqwest worker: invalid request: {msg}"),
+            Self::Reqwest(msg) => write!(f, "reqwest worker: reqwest error: {msg}"),
         }
     }
 }

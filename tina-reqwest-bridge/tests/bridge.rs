@@ -13,10 +13,11 @@ use http::status::StatusCode;
 use tina::prelude::*;
 use tina_reqwest_bridge::{
     InstalledReqwestBridge, ReqwestAddress, ReqwestConfig, ReqwestConfigError, ReqwestError,
-    ReqwestRequest, ReqwestResponse, ReqwestWorker, RetryPolicy, send_request,
+    ReqwestMsg, ReqwestRequest, ReqwestResponse, ReqwestWorker, RetryPolicy, send_request,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+    ThreadedRuntimeConfig, call,
 };
 
 use common::{
@@ -1051,4 +1052,79 @@ fn invalid_header_fails_closed() {
         CallOutcome::Replied(Err(ReqwestError::InvalidRequest(_)))
     ));
     assert_eq!(metrics.snapshot().invalid, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Raw-path coverage: lock that the worker also accepts the literal
+// `call(addr, ReqwestMsg::Send(req), timeout)` form, not just
+// `send_request`. If `send_request` ever stops being a thin wrap, this
+// test still exercises the raw worker contract.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum RawCallerMsg {
+    Run(ReqwestRequest),
+    Done(Outcome),
+}
+
+struct RawCallerIsolate {
+    worker: ReqwestAddress,
+    timeout: Duration,
+    sink: Arc<Sink>,
+}
+
+impl Isolate for RawCallerIsolate {
+    tina::isolate_types! {
+        message: RawCallerMsg,
+        reply: (),
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<RawCallerMsg>,
+        shard: SingleShard,
+    }
+
+    fn handle(&mut self, msg: RawCallerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+        match msg {
+            RawCallerMsg::Run(request) => {
+                // Deliberately the literal raw form, not `send_request`.
+                call(self.worker, ReqwestMsg::Send(request), self.timeout).reply(RawCallerMsg::Done)
+            }
+            RawCallerMsg::Done(outcome) => {
+                self.sink.put(outcome);
+                stop()
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_call_path_still_works() {
+    let server = FakeServer::spawn(delayed_ok(b"raw", Duration::from_millis(1)));
+    let url = server.url("/raw");
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, ReqwestConfig::default());
+    let sink = Arc::new(Sink::default());
+    let caller_addr = runtime
+        .register_with_capacity::<_, Infallible>(
+            RawCallerIsolate {
+                worker: bridge.address,
+                timeout: Duration::from_secs(2),
+                sink: Arc::clone(&sink),
+            },
+            8,
+        )
+        .expect("register raw caller");
+    runtime
+        .try_send(caller_addr, RawCallerMsg::Run(ReqwestRequest::get(&url)))
+        .expect("kick raw caller");
+    match sink.wait(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(response)) => {
+            assert_eq!(response.body.as_slice(), b"raw");
+        }
+        other => panic!("raw call path failed: {other:?}"),
+    }
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    server.stop();
 }

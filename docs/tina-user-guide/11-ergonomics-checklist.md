@@ -275,40 +275,38 @@ Tina inside a Tokio edge.
 
 Do not do `Arc::try_unwrap` shutdown dances in examples.
 
-### Bridge state aliases and call helpers
+### Bridge state aliases
 
-Use the specimen-facing aliases each bridge crate ships:
+Use `tina_tower_bridge::TinaService<M, R>`. Do not spell out the
+six-generic `TinaTowerService<M, R, SingleShard,
+DefaultThreadedMailboxFactory, ()>`.
 
-- `tina_tower_bridge::TinaService<M, R>` instead of the six-generic
-  `TinaTowerService<M, R, SingleShard, DefaultThreadedMailboxFactory, ()>`.
-- `tina_reqwest_bridge::ReqwestAddress` instead of
-  `Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>`.
-- `tina_reqwest_bridge::ReqwestCallOutcome` for the AppMsg variant
-  payload that holds the reply.
+Use `tina_reqwest_bridge::ReqwestAddress` for the worker address
+field. Do not spell out
+`Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>`.
 
-Use `tina_reqwest_bridge::send_request(addr, request, timeout)` instead
-of hand-wrapping `call(addr, ReqwestMsg::Send(request), timeout)`.
+Use `tina_reqwest_bridge::ReqwestCallOutcome` for the AppMsg variant
+payload that carries the reply.
 
-Use the re-exported `tina_tower_bridge::Service` instead of pulling
-`tower-service` directly into your `Cargo.toml`.
+### Bridge call helpers
 
-Do not pattern-match on the full `CallOutcome<Result<...>>` shape from
-many call sites. If your edge does not need to distinguish bridge
-delivery failures from worker-domain failures, opt in to
-`flatten_outcome(...)` per crate. The flat error type still names
-which layer failed.
+Use `tina_reqwest_bridge::send_request(addr, req, timeout)`. Do not
+hand-wrap `call(addr, ReqwestMsg::Send(req), timeout)`.
 
-### Bridge: the two error layers
+Use the re-exported `tina_tower_bridge::Service`. Do not add a direct
+`tower-service` dep in your `Cargo.toml`.
 
-The default reply shape preserves both layers:
+### Bridge error layering
 
-- outer `CallOutcome::Full | Closed | Timeout` is *bridge delivery*
-  truth (could the IsolateCall reach the worker?);
-- inner `Result<R, BridgeDomainError>` is *worker outcome* truth.
+Match on the layered `CallOutcome<Result<...>>` shape by default. The
+outer arm is *bridge delivery* truth, the inner is *worker outcome*
+truth. Do not collapse them silently.
 
-Do not collapse them silently. If you need a single `Result`, use the
-crate's flatten helper, which preserves the layer in the error
-variant (`Bridge(...)` vs `Worker(...)`).
+For app-edge code that does not need to distinguish, opt in to
+`flatten_outcome(...)`. The flat `ReqwestCallError::Bridge(...)` /
+`Worker(...)` variants still name which layer failed.
+
+See [Bridge Crates](18-bridge-crates.md) for the contract.
 
 ### Ordered effects
 

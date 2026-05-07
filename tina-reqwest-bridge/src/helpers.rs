@@ -94,7 +94,7 @@ pub fn send_request(
 /// outer layer means "the runtime never delivered the request to the
 /// worker"; the inner layer means "the worker accepted and produced
 /// this outcome."
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeFailure {
     /// Target mailbox was full or admission was rejected. The worker
     /// never saw the request.
@@ -111,9 +111,9 @@ pub enum BridgeFailure {
 impl std::fmt::Display for BridgeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Full => f.write_str("bridge ingress full"),
-            Self::Closed => f.write_str("bridge target closed"),
-            Self::Timeout => f.write_str("bridge call timed out"),
+            Self::Full => f.write_str("reqwest bridge: ingress full"),
+            Self::Closed => f.write_str("reqwest bridge: target closed"),
+            Self::Timeout => f.write_str("reqwest bridge: call timed out"),
         }
     }
 }
@@ -138,9 +138,13 @@ pub enum ReqwestCallError {
 
 impl std::fmt::Display for ReqwestCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Delegate to the inner Display; each layer's own Display is
+        // self-naming ("reqwest bridge: ..." for BridgeFailure,
+        // "reqwest worker: ..." for ReqwestError) so we do not double
+        // up on prefixes.
         match self {
-            Self::Bridge(b) => write!(f, "reqwest bridge: {b}"),
-            Self::Worker(e) => write!(f, "reqwest worker: {e}"),
+            Self::Bridge(b) => std::fmt::Display::fmt(b, f),
+            Self::Worker(e) => std::fmt::Display::fmt(e, f),
         }
     }
 }
@@ -150,6 +154,12 @@ impl std::error::Error for ReqwestCallError {}
 impl From<ReqwestError> for ReqwestCallError {
     fn from(e: ReqwestError) -> Self {
         Self::Worker(e)
+    }
+}
+
+impl From<BridgeFailure> for ReqwestCallError {
+    fn from(b: BridgeFailure) -> Self {
+        Self::Bridge(b)
     }
 }
 

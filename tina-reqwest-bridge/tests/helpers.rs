@@ -60,64 +60,57 @@ fn flatten_call_outcome_timeout_becomes_bridge_layer_timeout() {
 }
 
 #[test]
-fn bridge_full_and_worker_full_are_distinct_variants() {
-    // The crucial property: the flatten helper must never collapse the
-    // two layers into the same variant. CallOutcome::Full (bridge) and
-    // ReqwestError::Full (worker) both exist; flatten must keep them
-    // distinguishable in the output.
-    let bridge: ReqwestCallOutcome = CallOutcome::Full;
-    let worker: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::Full));
+fn bridge_full_and_worker_full_have_distinguishable_match_arms() {
+    // The crucial property: a caller pattern-matching on the flat
+    // error must be able to tell bridge-layer Full apart from
+    // worker-layer Full. Different match arms, different log lines.
+    let bridge_flat = flatten_outcome(CallOutcome::Full).unwrap_err();
+    let worker_flat = flatten_outcome(CallOutcome::Replied(Err(ReqwestError::Full))).unwrap_err();
 
-    let flat_bridge = flatten_outcome(bridge).unwrap_err();
-    let flat_worker = flatten_outcome(worker).unwrap_err();
-
-    assert_ne!(
-        flat_bridge, flat_worker,
-        "bridge::Full and worker::Full must remain distinguishable"
-    );
     assert!(matches!(
-        flat_bridge,
+        bridge_flat,
         ReqwestCallError::Bridge(BridgeFailure::Full)
     ));
     assert!(matches!(
-        flat_worker,
+        worker_flat,
         ReqwestCallError::Worker(ReqwestError::Full)
     ));
+
+    // Display strings keep the layer name so log lines stay readable.
+    let bridge_display = format!("{bridge_flat}");
+    let worker_display = format!("{worker_flat}");
+    assert!(bridge_display.contains("bridge"), "{bridge_display}");
+    assert!(worker_display.contains("worker"), "{worker_display}");
+    assert_ne!(bridge_display, worker_display);
 }
 
 #[test]
-fn bridge_timeout_and_worker_timeout_are_distinct_variants() {
-    // Same property for the Timeout pair. The runtime's IsolateCall
-    // deadline (CallOutcome::Timeout) and the worker's per-attempt
-    // timeout (ReqwestError::Timeout) are different events.
-    let bridge: ReqwestCallOutcome = CallOutcome::Timeout;
-    let worker: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::Timeout));
-
-    let flat_bridge = flatten_outcome(bridge).unwrap_err();
-    let flat_worker = flatten_outcome(worker).unwrap_err();
-
-    assert_ne!(flat_bridge, flat_worker);
+fn bridge_timeout_and_worker_timeout_have_distinguishable_match_arms() {
+    let bridge_flat = flatten_outcome(CallOutcome::Timeout).unwrap_err();
+    let worker_flat =
+        flatten_outcome(CallOutcome::Replied(Err(ReqwestError::Timeout))).unwrap_err();
     assert!(matches!(
-        flat_bridge,
+        bridge_flat,
         ReqwestCallError::Bridge(BridgeFailure::Timeout)
     ));
     assert!(matches!(
-        flat_worker,
+        worker_flat,
         ReqwestCallError::Worker(ReqwestError::Timeout)
     ));
 }
 
 #[test]
-fn bridge_closed_and_worker_closed_are_distinct_variants() {
-    // Same property for Closed: bridge "target gone" vs worker
-    // "graceful drain via ReqwestCloser".
-    let bridge: ReqwestCallOutcome = CallOutcome::Closed;
-    let worker: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::Closed));
-
-    let flat_bridge = flatten_outcome(bridge).unwrap_err();
-    let flat_worker = flatten_outcome(worker).unwrap_err();
-
-    assert_ne!(flat_bridge, flat_worker);
+fn bridge_closed_and_worker_closed_have_distinguishable_match_arms() {
+    let bridge_flat = flatten_outcome(CallOutcome::Closed).unwrap_err();
+    let worker_flat = flatten_outcome(CallOutcome::Replied(Err(ReqwestError::Closed))).unwrap_err();
+    assert!(matches!(
+        bridge_flat,
+        ReqwestCallError::Bridge(BridgeFailure::Closed)
+    ));
+    assert!(matches!(
+        worker_flat,
+        ReqwestCallError::Worker(ReqwestError::Closed)
+    ));
 }
 
 #[test]
@@ -125,12 +118,38 @@ fn reqwest_call_error_implements_display_and_error() {
     let err = ReqwestCallError::Bridge(BridgeFailure::Timeout);
     let display = format!("{err}");
     assert!(display.contains("bridge"), "Display: {display}");
+    assert!(
+        !display.contains("worker"),
+        "bridge layer Display must not name the worker layer: {display}"
+    );
 
     let err = ReqwestCallError::Worker(ReqwestError::ResponseTooLarge);
     let display = format!("{err}");
     assert!(display.contains("worker"), "Display: {display}");
+    assert!(
+        !display.contains("bridge:"),
+        "worker layer Display must not double-prefix with bridge: {display}"
+    );
 
     let err: ReqwestCallError = ReqwestError::Timeout.into();
     let _: &dyn std::error::Error = &err;
     let _: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+}
+
+#[test]
+fn from_bridge_failure_into_reqwest_call_error() {
+    let err: ReqwestCallError = BridgeFailure::Closed.into();
+    assert!(matches!(
+        err,
+        ReqwestCallError::Bridge(BridgeFailure::Closed)
+    ));
+}
+
+#[test]
+fn from_reqwest_error_into_reqwest_call_error() {
+    let err: ReqwestCallError = ReqwestError::ResponseTooLarge.into();
+    assert!(matches!(
+        err,
+        ReqwestCallError::Worker(ReqwestError::ResponseTooLarge)
+    ));
 }

@@ -78,6 +78,8 @@ impl Isolate for App {
                     .reply(AppMsg::HttpReturned)
             }
             AppMsg::HttpReturned(outcome) => {
+                // Layered match — the recommended shape. Bridge-layer
+                // and worker-layer failures are visibly distinct.
                 match outcome {
                     CallOutcome::Replied(Ok(response)) => {
                         println!(
@@ -93,6 +95,20 @@ impl Isolate for App {
                     CallOutcome::Closed => println!("err bridge closed"),
                     CallOutcome::Timeout => println!("err call timeout"),
                 }
+                // Or, with the opt-in flatten helper:
+                //
+                // ```ignore
+                // use tina_reqwest_bridge::{flatten_outcome, ReqwestCallError};
+                // match flatten_outcome(outcome) {
+                //     Ok(response)                       => { ... }
+                //     Err(ReqwestCallError::Bridge(b))   => { ... }
+                //     Err(ReqwestCallError::Worker(e))   => { ... }
+                // }
+                // ```
+                //
+                // Use the layered form by default. Use `flatten_outcome`
+                // only when the call site is genuinely an app edge that
+                // does not need to distinguish the two layers.
                 self.done.signal();
                 stop()
             }
