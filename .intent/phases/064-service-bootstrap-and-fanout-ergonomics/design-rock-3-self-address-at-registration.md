@@ -115,9 +115,18 @@ Both panics are loud. We do **not** treat
 "ingress to id with no entry" as a typed `Closed` return — that
 would mask programmer error in the dominant case (typo, dropped
 runtime, address from another shard). A future phase that wants
-to relax this for the panic-during-construct case can introduce
-a typed `RegistrationPending` / `RegistrationFailed` outcome,
-but 064 leaves the panic in place and documents the rule.
+to avoid the unknown-id panic for this exact constructor-failure
+case should add a tombstone / failed-registration state and a
+typed `RegistrationFailed` outcome. That is a different runtime
+model: the runtime would keep a record for an isolate that never
+registered. 064 does not take that on.
+
+Rule for this helper:
+
+> The runtime must not create a hidden usable address after failed
+> registration. Explicit user-shared escape is still possible in
+> Rust, but it is a loud programmer error, not a live or silently
+> closed address.
 
 ### Constructor sends self_addr to another isolate before
 registration commits
@@ -184,8 +193,9 @@ plain `impl Isolate` types too.
 
 ## Rule Check
 
-- "no dangling address after failed registration" — failure cases
-  do not push an entry; `try_send` panics loud.
+- "no hidden usable address after failed registration" — failure
+  cases do not push an entry; explicit user-shared escape panics
+  loud on `try_send`.
 - "no hidden first message" — the helper has no
   `with_initial_message` analog. If the user wants the first
   message to land, they call `try_send` after the helper

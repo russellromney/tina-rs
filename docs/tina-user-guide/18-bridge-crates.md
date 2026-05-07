@@ -160,6 +160,21 @@ let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::defa
 let app = App { http: bridge.address };
 ```
 
+For direct bridge crates, this is the convention:
+
+```text
+install = validate config, register worker, return address + closer + metrics
+close   = stop admitting new work
+drain   = wait bounded time for accepted work
+metrics = bridge view of worker-terminal outcomes
+trace   = runtime truth for dropped callers and late replies
+```
+
+Do not invent a new bridge setup dialect unless the old words lie.
+SQLite first form follows this shape with one blocking connection. A
+future pool-backed SQLite/SQLx bridge can add supplied-client ownership
+rules then; the serial first form should not pretend it owns a pool.
+
 `flatten_outcome(outcome)` is available when the call site does not
 need to distinguish bridge-layer from worker-layer failures.
 

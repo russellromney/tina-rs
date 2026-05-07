@@ -178,12 +178,15 @@ execute(v).await?` — three lines. The Tina version is correct and
 trace-visible at every stage, but the variant count grows
 linearly with stage count.
 
-**Build:** a pipeline-shaped helper that takes a `[StageAddr; N]`
-and the captured deferred reply slot, walking through stages with
-a single continuation message. Must preserve per-stage timeout
-truth and the typed bail-out arms; this is sugar, not a hidden
-state machine. (`SingleCallGate` does not apply here — it solves
-single-in-flight timer gating, not stage chaining.)
+**Decision:** do not build a pipeline helper yet. The long form is
+not merely noise: it names each suspension point and each
+per-stage `Full` / `Closed` / `Timeout` edge. A helper that makes
+Tina look like fake `async` would be worse for humans and LLMs.
+
+**Revisit only if:** a non-pedagogical pipeline repeats enough
+boilerplate that a helper can delete plumbing while keeping every
+stage, timeout, and partial-progress fact visible. The raw
+match-state-machine form remains semantic truth.
 
 ### 12. Rust footgun replication: shared receiver in worker pool
 
@@ -283,11 +286,15 @@ typed downstream timeout reaches the caller before the outer
 times out. With N hops, the slack accumulates and there is no
 helper that names the "outer = innermost + slack" pattern.
 
-**Build:** a small `Deadline` value type carrying `(start: Instant,
-total: Duration)` with `.remaining() -> Duration`. A future
-`call_with_deadline(addr, msg, deadline)` would compute the
-matching `IsolateCall` timeout (slightly larger than the budget
-the callee should use) automatically.
+**Decision:** do not freeze a wall-clock `Deadline` API here.
+Deadline is really a clock-truth problem. A live-only helper could
+exist later, but it must say it has no simulator/replay claim. A
+replayable deadline should wait for the runtime/simulator clock
+model, likely in the DST/replay usability work.
+
+**Revisit when:** the clock source is explicit. Then a small
+`Deadline` value can produce `.remaining() -> Duration` for
+existing call APIs without adding hidden cancellation or retry.
 
 ## Closed
 

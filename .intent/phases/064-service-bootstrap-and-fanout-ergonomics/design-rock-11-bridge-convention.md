@@ -133,8 +133,11 @@ When `tina-sqlite-bridge` lands:
 - `SqliteWorker::install(runtime, config)` returning
   `InstalledSqliteBridge { address, closer, metrics, … }`;
 - `SqliteConfig::validate()` returning typed config errors;
-- `with_supplied_client` constructor accepting a Tokio-owned
-  pool the bridge does not own;
+- no supplied-client / external-pool constructor in the first
+  form. First form owns one blocking `rusqlite::Connection`.
+  If a later pool-backed SQLite/SQLx bridge accepts a supplied
+  client or pool, supplied-client ownership follows the split
+  above;
 - typed `SqliteError::{Closed, Busy, IoError, Decode,
   Constraint, Internal}`;
 - `SqliteMetricsHandle` shape mirroring `ReqwestMetricsHandle`;

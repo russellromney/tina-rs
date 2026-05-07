@@ -11,17 +11,16 @@ Replace per-hop "outer = inner + slack" math in
 Each hop converts to its own remaining `Duration` at the call
 site.
 
-## API (Frozen Here)
+## Candidate API (Not Frozen)
 
 ```rust
-pub struct Deadline { inner: Instant }
+pub struct Deadline { /* clock-backed instant */ }
 
 impl Deadline {
     pub fn after(d: Duration) -> Self;
-    pub fn at(at: Instant) -> Self;
+    pub fn at(/* clock instant */) -> Self;
     pub fn remaining(&self) -> Duration;          // saturating
     pub fn is_expired(&self) -> bool;
-    pub fn into_instant(self) -> Instant;
 }
 ```
 
@@ -35,7 +34,7 @@ sleep(deadline.remaining()).reply(...)
 `Deadline` produces `Duration`s. Runtime call APIs still take
 `Duration`. No second timeout shape.
 
-## Why Live-Only
+## Clock Decision
 
 Wall clock and simulator virtual time are not the same source.
 A `Deadline` that captures `Instant::now()` is wrong inside a
@@ -48,8 +47,14 @@ Two options:
 2. Live-only. Use `Instant`, document as wall-clock helper.
    Simulator code keeps using `Duration` budgets.
 
-Option 2 is cheaper. Plan rule: live-only is allowed if the
-design says so. The design says so.
+064 does **not** choose between them. The API above is a sketch,
+not a frozen public shape.
+
+If a later phase ships `Deadline` as live-only, it must say so
+in the type/docs and must not be used by simulator/replay
+examples. If a later phase wants `Deadline` to participate in
+DST/replay claims, it must first define the runtime/simulator
+clock abstraction and build `Deadline` on that clock.
 
 ## Why Not Shipped
 
@@ -64,7 +69,7 @@ design says so. The design says so.
 ## Tests Required When Shipping
 
 - Past deadline saturates to `Duration::ZERO`.
-- `Deadline::after(0).is_expired() == true`.
-- `Deadline::after(50ms).remaining()` decreases over wall time.
+- zero-duration deadline is expired.
+- remaining time decreases according to the chosen clock.
 - Migrated `eiffel_backpressure_chain` no longer threads a
   per-hop `Duration` through messages.
