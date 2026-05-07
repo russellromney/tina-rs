@@ -11,6 +11,12 @@ comparison and the API/runtime suggestions they imply — live in
 [`FINDINGS.md`](FINDINGS.md). Per-comparison ergonomic notes stay in each
 comparison's own `README.md`.
 
+Before writing or rewriting an example, check the
+[ergonomics checklist](../docs/tina-user-guide/11-ergonomics-checklist.md)
+for the primitives the runtime now ships (mailbox factory, single-shard
+default, observation handles, etc.). It's the "use this, not that"
+shortlist — saves re-discovering each retired hand-rolled pattern.
+
 ## Examples are specimens
 
 > Examples are specimens. Tests are proof. README is discussion.
