@@ -183,6 +183,132 @@ why some are layered is confusing.
   punt until a non-pedagogical user actually mixes the two and
   flinches.
 
+### 8. Tina-owned database client (`tina-sqlx-bridge`)
+
+**Surfaced by:** `eiffel_sqlite_counter`.
+
+There is no native or bridged path for "Tina service talks to a
+database" today. The honest first-form shape used in the specimen
+is one isolate that owns a `rusqlite::Connection` and runs each
+query inline in `handle`. SQLite operations are fast, so this works
+for a single-shard adoption-grade example, but it blocks the shard
+thread for the duration of every query. For a remote DB
+(Postgres) where queries take milliseconds, the same shape would
+violate the bounded-handler-turn contract that makes Tina's other
+patterns honest.
+
+**Build:** `tina-sqlx-bridge` (or first-form `tina-rusqlite-bridge`
+for the sync path) shaped like `tina-reqwest-bridge`:
+
+- Tokio-owned blocking-pool runtime for the actual rusqlite/SQLx
+  calls;
+- bounded ingress (`mailbox_capacity`);
+- typed `SqliteError::*` variants with `Closed` / `Busy` / `IoError`
+  / `Decode` / `Constraint` / `Internal` shapes;
+- visible `Full` / `Closed` / `Timeout`;
+- metrics handle comparable to `ReqwestMetricsHandle`.
+
+ROADMAP phase 055 names this work; this finding is the per-specimen
+witness.
+
+### 9. Self-address-aware spawn / fanout helper
+
+**Surfaced by:** `eiffel_dynamic_worker_pool`,
+`eiffel_sharded_fanout_read`.
+
+A coordinator that wants to spawn N children that send back to it
+must first be told its own `Address`. Today the pattern is a
+bootstrap `Begin { self_addr: Address<CoordMsg> }` message that the
+host sends after `register`. Same shape shows up in
+`eiffel_sharded_fanout_read` as the `Bind { bridge }` handshake.
+The variant exists only to plug the "isolate doesn't know its own
+address until after registration" gap.
+
+**Build:** a `register_with_capacity_using<F>(capacity, f)` form
+where `f: FnOnce(Address<I::Message>) -> I` lets the constructor
+see its own typed address, removing the `Begin/Bind` bootstrap
+variant. Round 2 finding 3 named this for the scatter/gather coord;
+this specimen reinforces it for plain spawn-and-join.
+
+### 10. Spawn API that surfaces the child's address
+
+**Surfaced by:** `eiffel_dynamic_worker_pool`.
+
+`spawn(ChildDefinition::new(...))` returns nothing. The parent does
+not learn the child's `Address`. Today this is OK because the
+parent only needs the child to send messages *back* to the parent
+(the child has the parent's address). But it means the parent
+cannot:
+
+- ask the runtime "is this specific child still alive?" via
+  `observe_isolate_complete(child_addr)`;
+- send the child a follow-up message;
+- aggregate "missing partials" as a typed timeout (the parent
+  doesn't know which child is missing).
+
+Today's workaround is the supervised-worker pattern: the child
+sends a `Boot(self_addr)` message back to a shared `Arc<Mutex<...>>`
+slot. That works for the supervisor case, but it's the wrong
+ergonomics for "spawn N workers and join all results."
+
+**Build:** either `spawn(...)` returns the child's `Address` (would
+require a synchronous spawn API today), or a
+`spawn_observed(child).reply(MyMsg::ChildSpawned)` variant that
+delivers `Address<ChildMsg>` to the parent as a continuation
+message — analogous to `send_observed` and `runtime calls`. This
+also enables a future `JoinSet`-equivalent isolate primitive.
+
+### 11. Deadline as first-class context
+
+**Surfaced by:** `eiffel_backpressure_chain`.
+
+A multi-hop chain has to thread a deadline (or a remaining-budget
+duration) through every call. Today this is `Duration` in the
+request struct + a matching `IsolateCall` timeout, and the outer
+hop's call timeout must be slightly longer than the inner's so the
+typed downstream timeout reaches the caller before the outer
+times out. With N hops, the slack accumulates and there is no
+helper that names the "outer = innermost + slack" pattern.
+
+**Build:** a small `Deadline` value type carrying `(start: Instant,
+total: Duration)` with `.remaining() -> Duration`. A future
+`call_with_deadline(addr, msg, deadline)` would compute the
+matching `IsolateCall` timeout (slightly larger than the budget
+the callee should use) automatically.
+
+### 12. Drain timeout for isolate shutdown
+
+**Surfaced by:** `eiffel_graceful_drain_server`.
+
+The bridge crate (`tina-tokio-bridge::BridgeShutdownReport`) has a
+`drained_within_timeout` flag for the bridge case. The same shape
+applies at the isolate level: a `Drain` message that says "finish
+in-flight, then stop" should accept a deadline, with the report
+saying whether drain completed inside it. Today this is a
+hand-rolled `DrainDeadlineFired` continuation message scheduled via
+`sleep` and a check in the isolate's "is it done" predicate that
+returns true on deadline-fired even when `pending > 0`.
+
+**Build:** a small `DrainGate` helper for isolate state that holds
+the deadline + the pending-count predicate, with an `is_done` /
+`drained_within_timeout` accessor that the handler reuses.
+
+### 13. Single-in-flight timer gate (reinforced)
+
+**Surfaced by:** `eiffel_periodic_batcher` (again).
+
+Round 2 finding 5 already named this from
+`eiffel_rate_limited_worker`. The periodic batcher needs the same
+pattern: a generation counter on `sleep(...).reply(Tick)` so that a
+size-triggered flush can invalidate a still-pending timer's
+eventual `Tick` without canceling the runtime call. The batcher's
+shape is identical to the rate-limited worker's; the user-side
+boilerplate is the same five lines.
+
+The product work named in finding 5 (`SingleSleepGate` /
+`SingleCallGate<R>`) covers this. Reinforcing here to keep the
+"it's everywhere" signal visible.
+
 ## How To Add A Finding
 
 Only add to this file when the finding implies Tina product work. Round 2

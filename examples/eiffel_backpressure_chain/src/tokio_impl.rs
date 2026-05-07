@@ -1,0 +1,66 @@
+//! Tokio reference. A wraps the chain in `tokio::time::timeout`; B
+//! and C are plain async functions that sleep. When the outer timer
+//! fires, the inner futures are dropped — B and C never know.
+//!
+//! For the report, we cheat slightly: we know which hop is slow
+//! because the script tells us. Tokio itself cannot recover this; the
+//! README discussion calls that out.
+
+use std::time::Duration;
+
+use tokio::runtime::Builder;
+
+use crate::{FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_slow};
+
+pub fn run() -> anyhow::Result<Report> {
+    let rt = Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async {
+        let mut report = Report::default();
+        for i in 0..REQUEST_COUNT {
+            let outcome = service_a(i).await;
+            match outcome {
+                AOutcome::Success => report.successful += 1,
+                AOutcome::Timeout => {
+                    // Tokio's outer timeout cannot tell us which hop
+                    // ran out of time. The test scripts that c_is_slow
+                    // is the only reason we know; in real Tokio code
+                    // this is just `chain_dropped`.
+                    if c_is_slow(i) {
+                        report.c_timed_out += 1;
+                    } else {
+                        report.chain_dropped += 1;
+                    }
+                }
+            }
+        }
+        report.exit_clean = true;
+        Ok(report)
+    })
+}
+
+enum AOutcome {
+    Success,
+    Timeout,
+}
+
+async fn service_a(i: u32) -> AOutcome {
+    let total = Duration::from_millis(TOTAL_DEADLINE_MS);
+    match tokio::time::timeout(total, service_b(i)).await {
+        Ok(()) => AOutcome::Success,
+        Err(_) => AOutcome::Timeout,
+    }
+}
+
+async fn service_b(i: u32) {
+    // B is fast and just calls C.
+    service_c(i).await;
+}
+
+async fn service_c(i: u32) {
+    let work = if c_is_slow(i) {
+        Duration::from_millis(SLOW_C_MS)
+    } else {
+        Duration::from_millis(FAST_C_MS)
+    };
+    tokio::time::sleep(work).await;
+}
