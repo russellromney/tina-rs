@@ -96,6 +96,34 @@ impl WebhookServer {
                             let svc = service_fn(move |req: HyperRequest<Incoming>| {
                                 let bodies = Arc::clone(&bodies);
                                 async move {
+                                    // The specimen documents that both
+                                    // sides POST /webhook. A regression
+                                    // to GET, PUT, or the wrong path
+                                    // is an honest test failure — fail
+                                    // here with a 405/404 instead of
+                                    // recording the body and letting
+                                    // the assertion blame the wrong
+                                    // thing.
+                                    if req.method() != hyper::Method::POST {
+                                        return Ok::<_, Infallible>(
+                                            HyperResponse::builder()
+                                                .status(StatusCode::METHOD_NOT_ALLOWED)
+                                                .body(Full::new(Bytes::from_static(
+                                                    b"webhook expects POST",
+                                                )))
+                                                .expect("webhook 405 response"),
+                                        );
+                                    }
+                                    if req.uri().path() != "/webhook" {
+                                        return Ok::<_, Infallible>(
+                                            HyperResponse::builder()
+                                                .status(StatusCode::NOT_FOUND)
+                                                .body(Full::new(Bytes::from_static(
+                                                    b"webhook path not found",
+                                                )))
+                                                .expect("webhook 404 response"),
+                                        );
+                                    }
                                     let body = req
                                         .into_body()
                                         .collect()

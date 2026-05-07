@@ -180,7 +180,7 @@ the specimen confirms.
   real isolate would work — it'd pick one shape and stick with it.
 - Both sides need a `tokio::runtime::Runtime` (the Tokio side
   hosts reqwest directly; the Tina side gets one from
-  `ReqwestWorker::new`). The two-runtimes cost is the bridge's
+  `ReqwestWorker::install`). The two-runtimes cost is the bridge's
   nature; it shows up here as in every other bridge specimen.
 - For a webhook publisher with many concurrent calls, the
   `max_in_flight` knob on the worker becomes load-bearing.
