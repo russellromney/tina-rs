@@ -1,7 +1,8 @@
 //! Tests for the polish helpers: type aliases, send_request, flatten_outcome.
 
 use tina_reqwest_bridge::{
-    BridgeFailure, ReqwestCallError, ReqwestCallOutcome, ReqwestError, ReqwestResponse,
+    BridgeFailure, ReqwestCallError, ReqwestCallOutcome, ReqwestError, ReqwestFatalReason,
+    ReqwestOutcomeClass, ReqwestOutcomeExt, ReqwestResponse, ReqwestTransientReason,
     flatten_outcome,
 };
 use tina_runtime::CallOutcome;
@@ -152,4 +153,139 @@ fn from_reqwest_error_into_reqwest_call_error() {
         err,
         ReqwestCallError::Worker(ReqwestError::ResponseTooLarge)
     ));
+}
+
+// ---------- classify (Phase 062 Rock 6) ----------
+
+fn response_with_status(status: http::StatusCode) -> ReqwestResponse {
+    ReqwestResponse {
+        status,
+        headers: http::HeaderMap::new(),
+        body: Vec::new(),
+    }
+}
+
+#[test]
+fn classify_2xx_is_succeeded() {
+    let outcome: ReqwestCallOutcome =
+        CallOutcome::Replied(Ok(response_with_status(http::StatusCode::OK)));
+    match outcome.classify() {
+        ReqwestOutcomeClass::Succeeded(resp) => assert_eq!(resp.status, http::StatusCode::OK),
+        other => panic!("expected Succeeded, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_503_is_transient_upstream_server() {
+    let outcome: ReqwestCallOutcome =
+        CallOutcome::Replied(Ok(response_with_status(http::StatusCode::SERVICE_UNAVAILABLE)));
+    match outcome.classify() {
+        ReqwestOutcomeClass::Transient(ReqwestTransientReason::UpstreamServer { status }) => {
+            assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        other => panic!("expected Transient(UpstreamServer), got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_404_is_fatal_upstream_client() {
+    let outcome: ReqwestCallOutcome =
+        CallOutcome::Replied(Ok(response_with_status(http::StatusCode::NOT_FOUND)));
+    match outcome.classify() {
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::UpstreamClient { status }) => {
+            assert_eq!(status, http::StatusCode::NOT_FOUND);
+        }
+        other => panic!("expected Fatal(UpstreamClient), got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_bridge_timeout_distinct_from_worker_timeout() {
+    let bridge: ReqwestCallOutcome = CallOutcome::Timeout;
+    let worker: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::Timeout));
+    assert!(matches!(
+        bridge.classify(),
+        ReqwestOutcomeClass::Transient(ReqwestTransientReason::BridgeTimeout)
+    ));
+    assert!(matches!(
+        worker.classify(),
+        ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTimeout)
+    ));
+}
+
+#[test]
+fn classify_reqwest_transport_error_preserves_underlying_message() {
+    let outcome: ReqwestCallOutcome =
+        CallOutcome::Replied(Err(ReqwestError::Reqwest("connect refused".into())));
+    match outcome.classify() {
+        ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTransport(msg)) => {
+            assert_eq!(msg, "connect refused");
+        }
+        other => panic!("expected Transient(WorkerTransport(..)), got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_bridge_full_and_closed_are_fatal() {
+    assert!(matches!(
+        CallOutcome::<Result<ReqwestResponse, ReqwestError>>::Full.classify(),
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::BridgeFull)
+    ));
+    assert!(matches!(
+        CallOutcome::<Result<ReqwestResponse, ReqwestError>>::Closed.classify(),
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::BridgeClosed)
+    ));
+}
+
+#[test]
+fn classify_worker_full_and_closed_are_fatal() {
+    let full: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::Full));
+    let closed: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::Closed));
+    assert!(matches!(
+        full.classify(),
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerFull)
+    ));
+    assert!(matches!(
+        closed.classify(),
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerClosed)
+    ));
+}
+
+#[test]
+fn classify_size_caps_and_invalid_request_are_fatal() {
+    let req_large: ReqwestCallOutcome =
+        CallOutcome::Replied(Err(ReqwestError::RequestTooLarge));
+    let resp_large: ReqwestCallOutcome =
+        CallOutcome::Replied(Err(ReqwestError::ResponseTooLarge));
+    let invalid: ReqwestCallOutcome =
+        CallOutcome::Replied(Err(ReqwestError::InvalidRequest("bad url".into())));
+
+    assert!(matches!(
+        req_large.classify(),
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::RequestTooLarge)
+    ));
+    assert!(matches!(
+        resp_large.classify(),
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::ResponseTooLarge)
+    ));
+    match invalid.classify() {
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::InvalidRequest(msg)) => {
+            assert_eq!(msg, "bad url");
+        }
+        other => panic!("expected Fatal(InvalidRequest(..)), got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_transient_reason_debug_includes_underlying_detail() {
+    // The principal log shape is `tracing::warn!("{reason:?}")` —
+    // make sure the Debug output isn't a bare unit-variant name when
+    // the underlying error carried a message.
+    let outcome: ReqwestCallOutcome =
+        CallOutcome::Replied(Err(ReqwestError::Reqwest("dns lookup failed".into())));
+    let debug = format!("{:?}", outcome.classify());
+    assert!(
+        debug.contains("dns lookup failed"),
+        "Debug must surface the underlying transport message: {debug}"
+    );
 }

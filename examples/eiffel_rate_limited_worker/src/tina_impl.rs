@@ -29,13 +29,12 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, ThreadedSendObservedError,
-    ThreadedTrySendError, sleep,
+    DefaultThreadedMailboxFactory, HostBurstOutcomes, SingleCallGate, SleepReply, ThreadedRuntime,
+    sleep,
 };
 
 use crate::{BURST_JOBS, QUEUE_CAPACITY, RATE_WINDOW_MS, Report};
@@ -61,10 +60,13 @@ struct Worker {
     rate_window: Duration,
     report: Report,
     processed: u32,
-    /// Submits accepted by the worker but not yet processed. Bounded
-    /// by the mailbox cap — the host stops sending past
-    /// [`QUEUE_CAPACITY`].
-    pending: u32,
+    /// Single-in-flight timer guard. Bounded by the mailbox cap — the
+    /// host stops sending past [`QUEUE_CAPACITY`].
+    ///
+    /// Phase-062 Rock 5: the `pending` / `was_idle` invariant is named
+    /// by [`tina_runtime::SingleCallGate`] instead of being repeated
+    /// inline.
+    gate: SingleCallGate,
     /// `Some(n)` after [`WorkerMsg::BurstClosed`] arrives, naming the
     /// final admitted count the worker should stop at. `None` while
     /// the host is still bursting.
@@ -81,12 +83,11 @@ impl Worker {
             WorkerMsg::Submit(index) => {
                 self.report.jobs_admitted += 1;
                 self.last_index = Some(index);
-                let was_idle = self.pending == 0;
-                self.pending += 1;
-                // One in-flight Tick at a time. Without this guard,
-                // every Submit would schedule its own sleep and the
-                // rate limit would not exist.
-                if was_idle {
+                // SingleCallGate names the "one in-flight Tick at a
+                // time" invariant. `submit()` returns true on the
+                // very first piece of work and false while a Tick is
+                // still racing the rate window.
+                if self.gate.submit() {
                     sleep(self.rate_window).reply(WorkerMsg::Tick)
                 } else {
                     noop()
@@ -101,12 +102,12 @@ impl Worker {
                     return stop_with(self.report);
                 }
                 self.processed += 1;
-                self.pending -= 1;
                 self.report.jobs_processed = self.processed;
+                let more_work = self.gate.complete();
                 if self.is_done() {
                     self.report.exit_clean = true;
                     stop_with(self.report)
-                } else if self.pending > 0 {
+                } else if more_work {
                     sleep(self.rate_window).reply(WorkerMsg::Tick)
                 } else {
                     noop()
@@ -128,7 +129,7 @@ impl Worker {
 impl Worker {
     fn is_done(&self) -> bool {
         match self.expected {
-            Some(expected) => self.pending == 0 && self.processed >= expected,
+            Some(expected) => self.gate.is_idle() && self.processed >= expected,
             None => false,
         }
     }
@@ -144,7 +145,7 @@ pub fn run() -> anyhow::Result<Report> {
         rate_window: Duration::from_millis(RATE_WINDOW_MS),
         report: Report::default(),
         processed: 0,
-        pending: 0,
+        gate: SingleCallGate::new(),
         expected: None,
         last_index: None,
     };
@@ -156,77 +157,43 @@ pub fn run() -> anyhow::Result<Report> {
         .observe_result::<Report, _, _>(worker_addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    // Producer: non-blocking burst. Each `try_send_and_observe_with`
-    // queues a command on the worker. The worker drains the whole
-    // burst before stepping the isolate, so the mailbox fills up to
-    // `QUEUE_CAPACITY` and every send past that surfaces
-    // `MailboxFull` through the observer callback.
-    let admitted = Arc::new(AtomicU32::new(0));
-    let mailbox_full = Arc::new(AtomicU32::new(0));
-    let observed = Arc::new(AtomicU32::new(0));
-    let mut ingress_full = 0u32;
-
+    // Producer: non-blocking burst. The worker drains the whole
+    // command burst before stepping the isolate, so the mailbox fills
+    // up to `QUEUE_CAPACITY` and every send past that surfaces
+    // `MailboxFull` through the per-send observer the helper installs.
+    //
+    // Phase-062 Rock 3: `try_send_outcome` + `HostBurstOutcomes`
+    // replace the hand-rolled per-send closure / atomics / observed
+    // barrier. The accumulator preserves every truth-typed outcome
+    // (admitted, mailbox_full, mailbox_closed, ingress_full,
+    // worker_stopped); none of them are collapsed.
+    let outcomes = HostBurstOutcomes::new();
     for n in 0..BURST_JOBS {
-        let admitted_obs = Arc::clone(&admitted);
-        let mailbox_full_obs = Arc::clone(&mailbox_full);
-        let observed_obs = Arc::clone(&observed);
-        let observer = move |outcome: Result<(), ThreadedSendObservedError>| {
-            match outcome {
-                Ok(()) => {
-                    admitted_obs.fetch_add(1, Ordering::Release);
-                }
-                Err(_) => {
-                    mailbox_full_obs.fetch_add(1, Ordering::Release);
-                }
-            }
-            observed_obs.fetch_add(1, Ordering::Release);
-        };
-        match runtime.try_send_and_observe_with(worker_addr, WorkerMsg::Submit(n), observer) {
-            Ok(()) => {}
-            Err(ThreadedTrySendError::IngressFull) => {
-                ingress_full += 1;
-                observed.fetch_add(1, Ordering::Release);
-            }
-            Err(e) => return Err(anyhow::anyhow!("try_send_and_observe_with: {e}")),
-        }
+        let _ = runtime.try_send_outcome(worker_addr, WorkerMsg::Submit(n), &outcomes);
     }
-
-    // Wait for every observer to fire. Each one runs on the worker
-    // thread; the burst is small so this is fast.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while observed.load(Ordering::Acquire) < BURST_JOBS && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    if observed.load(Ordering::Acquire) < BURST_JOBS {
-        return Err(anyhow::anyhow!(
-            "observers did not all fire within 2s ({}/{})",
-            observed.load(Ordering::Acquire),
-            BURST_JOBS,
-        ));
-    }
-
-    let admitted_n = admitted.load(Ordering::Acquire);
+    outcomes
+        .wait_complete(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("host burst observers did not fire: {e}"))?;
+    let burst = outcomes.snapshot();
+    let admitted_n = burst.admitted;
 
     // Tell the worker the burst is closed. The mailbox might still
     // hold up to `QUEUE_CAPACITY` admitted Submits, draining at one
     // per `RATE_WINDOW`, so retry until a slot opens. Worst-case wait
     // is `QUEUE_CAPACITY * RATE_WINDOW`, plus jitter.
-    let close_deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match runtime.send_and_observe(worker_addr, WorkerMsg::BurstClosed(admitted_n)) {
-            Ok(()) => break,
-            Err(ThreadedSendObservedError::MailboxFull)
-            | Err(ThreadedSendObservedError::IngressFull) => {
-                if Instant::now() >= close_deadline {
-                    return Err(anyhow::anyhow!(
-                        "could not deliver BurstClosed within 2s; mailbox stayed full"
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(e) => return Err(anyhow::anyhow!("BurstClosed send: {e}")),
-        }
-    }
+    //
+    // Phase-062 Rock 4: `send_observed_until` is the BurstClosed-style
+    // helper. It retries on Full/IngressFull until the deadline and
+    // returns typed Closed / WorkerStopped / Timeout. No hidden queue;
+    // the control message rides the same bounded data mailbox.
+    runtime
+        .send_observed_until(
+            worker_addr,
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_millis(2),
+            || WorkerMsg::BurstClosed(admitted_n),
+        )
+        .map_err(|e| anyhow::anyhow!("could not deliver BurstClosed: {e}"))?;
 
     let report = waiter
         .wait(Duration::from_secs(5))
@@ -234,7 +201,12 @@ pub fn run() -> anyhow::Result<Report> {
 
     let final_report = Report {
         jobs_admitted: admitted_n,
-        jobs_full: mailbox_full.load(Ordering::Acquire) + ingress_full,
+        // The producer's "full" bucket is visible overload at submit:
+        // mailbox cap reached *or* worker ingress queue at cap. Both
+        // are honest backpressure the host saw before the worker drained
+        // the message. `mailbox_closed` and `worker_stopped` would
+        // surface here too if the worker had stopped mid-burst.
+        jobs_full: burst.mailbox_full + burst.ingress_full,
         jobs_processed: report.jobs_processed,
         exit_clean: report.exit_clean,
     };
