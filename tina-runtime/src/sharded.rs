@@ -964,4 +964,63 @@ mod tests {
     fn addr<M: 'static>(shard: u32, isolate: u64) -> Address<M> {
         Address::new(ShardId::new(shard), tina::IsolateId::new(isolate))
     }
+
+    // ---- Proptest: placement properties over random shard lists + keys ----
+
+    use proptest::collection::{btree_set, vec};
+    use proptest::prelude::*;
+
+    fn arb_shard_list() -> impl Strategy<Value = Vec<ShardId>> {
+        // Up to 8 distinct shard ids in random u32 range; shuffled so the
+        // ordered list is non-monotonic.
+        btree_set(0u32..1000, 1..=8)
+            .prop_flat_map(|set| {
+                let v: Vec<u32> = set.into_iter().collect();
+                Just(v).prop_shuffle()
+            })
+            .prop_map(|raws| raws.into_iter().map(ShardId::new).collect())
+    }
+
+    fn arb_keys() -> impl Strategy<Value = Vec<String>> {
+        vec("[a-z]{1,8}", 1..64)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Property 1: `owner_for_bytes` is closed over `placement.shards()`.
+        /// Property 2: same key always maps to same shard (deterministic).
+        #[test]
+        fn placement_owner_is_in_shard_list_and_deterministic(
+            shards in arb_shard_list(),
+            keys in arb_keys(),
+        ) {
+            let placement = ShardPlacement::new("p", shards.clone()).unwrap();
+            let shard_set: BTreeSet<ShardId> = shards.iter().copied().collect();
+            for key in &keys {
+                let owner_a = placement.owner_for_str(key);
+                let owner_b = placement.owner_for_str(key);
+                prop_assert!(shard_set.contains(&owner_a));
+                prop_assert_eq!(owner_a, owner_b);
+            }
+        }
+
+        /// Property 3: with enough random keys, every shard in a
+        /// reasonably-sized placement is reachable. The key budget scales
+        /// with shard count so the chance of a missed shard under FNV-1a
+        /// stays vanishingly small.
+        #[test]
+        fn placement_reaches_every_shard_with_enough_random_keys(
+            shards in arb_shard_list(),
+        ) {
+            let placement = ShardPlacement::new("p", shards.clone()).unwrap();
+            let key_budget = (shards.len() * 50).max(50);
+            let mut reached = BTreeSet::new();
+            for n in 0..key_budget {
+                let key = format!("k-{n}");
+                reached.insert(placement.owner_for_str(&key));
+            }
+            prop_assert_eq!(reached.len(), shards.len());
+        }
+    }
 }

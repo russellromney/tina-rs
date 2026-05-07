@@ -151,6 +151,16 @@ These are local multi-shard patterns. They are **not** a distributed
 database, **not** consensus, **not** remoting, **not** automatic
 rebalancing.
 
+A worked example lives in `examples/eiffel_sharded_keyspace`: a paired
+Tokio (`Vec<Arc<Mutex<HashMap>>>` with hand-rolled FNV-1a placement) and
+Tina (`ShardPlacement` + `ShardServiceTable` + per-shard `Store` isolates
+with owner re-check) implementation that runs the same `SET / GET / DEL
+/ SUM / QUIT` script and produces the same `Report`. The Tina side uses
+`call(addr, msg, timeout).reply(continuation)` for keyed access and a
+sequential per-shard fanout for `SUM`. The richer parallel
+scatter/gather form (with `send_observed` and a typed bridge isolate)
+is proven in `tina-runtime/tests/sharded_primitives.rs`.
+
 ## Macro Rule
 
 A future `#[service]` macro may hide byte encoding.

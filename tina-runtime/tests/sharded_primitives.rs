@@ -117,6 +117,10 @@ enum CounterMsg {
     Get {
         reply_to: Address<CounterCoordMsg>,
     },
+    /// Test-only: stop the counter so its mailbox closes. Used to drive
+    /// the restart/regeneration partial-failure path (next sends return
+    /// `SendOutcome::Closed`).
+    StopForTest,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +182,7 @@ impl Isolate for ShardedCounter {
                     value: self.value,
                 },
             ),
+            CounterMsg::StopForTest => stop(),
         }
     }
 }
@@ -1415,4 +1420,56 @@ fn scatter_gather_records_full_when_target_mailbox_is_saturated() {
         report.outcomes
     );
     assert_eq!(report.outcomes.len(), 3);
+}
+
+#[test]
+fn scatter_gather_records_closed_when_target_isolate_has_stopped() {
+    // Restart/regeneration story: a target counter stops (its mailbox
+    // closes). A subsequent fanout from the coord must surface
+    // `SendOutcome::Closed` for that target, NOT silently retry or skip
+    // it. The other two counters still reply.
+    let mut runtime = MultiShardRuntime::new(
+        [AppShard(3), AppShard(17), AppShard(91)],
+        TestMailboxFactory,
+    );
+    let placement = ShardPlacement::new(
+        "fanout",
+        vec![ShardId::new(3), ShardId::new(17), ShardId::new(91)],
+    )
+    .unwrap();
+    let table = register_counter_table(&mut runtime, &placement, 16);
+
+    // Stop the shard-3 counter. After run_until_idle, its address is
+    // closed and any further send to it returns SendOutcome::Closed.
+    runtime
+        .try_send(
+            table.address_for(ShardId::new(3)).unwrap(),
+            CounterMsg::StopForTest,
+        )
+        .unwrap();
+    run_until_idle(&mut runtime);
+
+    let targets: Vec<ShardId> = placement.shards().to_vec();
+    let config = ScatterGatherConfig {
+        max_targets: targets.len(),
+        collector_capacity: targets.len(),
+        per_target_timeout: Duration::from_millis(50),
+        aggregate_timeout: Duration::from_millis(100),
+    };
+    config.validate().unwrap();
+
+    let report = run_scatter_obs(&mut runtime, table, targets, config, ShardId::new(3));
+    assert_eq!(report.closed_count(), 1, "report = {report:?}");
+    assert_eq!(report.replied_count(), 2);
+    assert_eq!(report.full_count(), 0);
+    assert_eq!(report.timeout_count(), 0);
+    assert_eq!(report.missing_shard_count(), 0);
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .any(|(s, o)| *s == ShardId::new(3) && matches!(o, ScatterGatherTargetOutcome::Closed)),
+        "expected Closed for shard 3, got {:?}",
+        report.outcomes
+    );
 }

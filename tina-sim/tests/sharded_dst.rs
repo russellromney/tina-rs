@@ -20,7 +20,11 @@ use std::time::Duration;
 
 use tina::{Address, prelude::*};
 use tina_runtime::RuntimeCall;
-use tina_runtime::sharded::{ShardPlacement, ShardServiceTable, WrongShard};
+use tina_runtime::sharded::{
+    ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement,
+    ShardServiceTable, WrongShard,
+};
+use tina_runtime::sleep_then;
 use tina_sim::{
     FaultConfig, LocalSendFaultMode, MultiShardSimulator, MultiShardSimulatorConfig,
     SimulatorConfig,
@@ -365,4 +369,242 @@ fn replay_artifact_captures_simulator_config_for_partial_aggregate_seed_recovery
     let artifact = sim.replay_artifact();
     assert_eq!(artifact.simulator_config(), &config);
     assert!(artifact.final_time() >= Duration::ZERO);
+}
+
+// ---------- Aggregate-timeout DST ----------
+//
+// Sim-only: register a `QuietCounter` on one shard that absorbs `Get`
+// without replying. The coord schedules `sleep_then(aggregate_timeout)`
+// at fanout time. After two replies arrive from the live counters, the
+// coord still has one pending target. We advance virtual time past the
+// aggregate deadline; the timer fires; the coord marks the still-pending
+// target as `AggregateTimeout` and emits the report.
+
+/// Counter that ignores messages — simulates a stuck/slow shard for the
+/// aggregate-timeout test.
+struct QuietCounter;
+
+impl Isolate for QuietCounter {
+    tina::isolate_types! {
+        message: CounterMsg,
+        reply: (),
+        send: Outbound<TrackerMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<CounterMsg>,
+        shard: AppShard,
+    }
+
+    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        // Drop the message on the floor. No reply, no error — the
+        // coord's aggregate-timeout timer is the only thing that fires.
+        noop()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ScatterCoordMsg {
+    Bind { bridge: Address<TrackerMsg> },
+    Start,
+    AggregateExpired,
+    Reply(TrackerMsg),
+}
+
+struct ScatterCoord {
+    table: ShardServiceTable<CounterMsg>,
+    bridge: Option<Address<TrackerMsg>>,
+    config: ScatterGatherConfig,
+    targets: Vec<ShardId>,
+    pending_replies: Vec<ShardId>,
+    outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<u64>)>,
+    report_into: Rc<RefCell<Option<ScatterGatherReport<u64>>>>,
+}
+
+impl Isolate for ScatterCoord {
+    tina::isolate_types! {
+        message: ScatterCoordMsg,
+        reply: (),
+        send: Outbound<CounterMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<ScatterCoordMsg>,
+        shard: AppShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            ScatterCoordMsg::Bind { bridge } => {
+                self.bridge = Some(bridge);
+                noop()
+            }
+            ScatterCoordMsg::Start => {
+                let bridge = self.bridge.expect("bind before start");
+                let mut effects: Vec<Effect<Self>> = Vec::new();
+                let limit = self.config.max_targets.min(self.targets.len());
+                for shard in self.targets.iter().copied().take(limit) {
+                    if let Ok(address) = self.table.address_for(shard) {
+                        self.pending_replies.push(shard);
+                        effects.push(send(address, CounterMsg::Get { reply_to: bridge }));
+                    } else {
+                        self.outcomes
+                            .push((shard, ScatterGatherTargetOutcome::MissingShard));
+                    }
+                }
+                // Schedule the aggregate timeout as a self-message.
+                effects.push(sleep_then(
+                    self.config.aggregate_timeout,
+                    ScatterCoordMsg::AggregateExpired,
+                ));
+                batch(effects)
+            }
+            ScatterCoordMsg::Reply(reply) => {
+                if let TrackerMsg::GetResult { shard, value } = reply {
+                    if let Some(pos) = self.pending_replies.iter().position(|s| *s == shard) {
+                        self.pending_replies.swap_remove(pos);
+                        self.outcomes
+                            .push((shard, ScatterGatherTargetOutcome::Replied(value)));
+                    }
+                }
+                self.maybe_emit_report();
+                noop()
+            }
+            ScatterCoordMsg::AggregateExpired => {
+                // Convert any still-pending targets to AggregateTimeout
+                // and emit the report.
+                let pending = std::mem::take(&mut self.pending_replies);
+                for shard in pending {
+                    self.outcomes
+                        .push((shard, ScatterGatherTargetOutcome::AggregateTimeout));
+                }
+                self.maybe_emit_report();
+                noop()
+            }
+        }
+    }
+}
+
+impl ScatterCoord {
+    fn maybe_emit_report(&mut self) {
+        if !self.pending_replies.is_empty() {
+            return;
+        }
+        if self.report_into.borrow().is_some() {
+            return;
+        }
+        let mut outcomes = std::mem::take(&mut self.outcomes);
+        outcomes.sort_by_key(|(s, _)| s.get());
+        *self.report_into.borrow_mut() = Some(ScatterGatherReport {
+            config: self.config,
+            outcomes,
+        });
+    }
+}
+
+struct ReplyBridge {
+    coord: Address<ScatterCoordMsg>,
+}
+
+impl Isolate for ReplyBridge {
+    tina::isolate_types! {
+        message: TrackerMsg,
+        reply: (),
+        send: Outbound<ScatterCoordMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<TrackerMsg>,
+        shard: AppShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        send(self.coord, ScatterCoordMsg::Reply(msg))
+    }
+}
+
+#[test]
+fn scatter_gather_records_aggregate_timeout_when_target_does_not_reply() {
+    let mut sim = sim_with(SimulatorConfig::default());
+    let placement = placement();
+
+    // Place real counters on shards 11 and 33; place a Quiet counter on
+    // shard 22 that absorbs Get without replying.
+    let mut entries = Vec::new();
+    for shard in placement.shards() {
+        let shard = *shard;
+        let address = if shard == ShardId::new(22) {
+            sim.register_with_capacity_on::<QuietCounter, CounterMsg, TrackerMsg>(
+                shard,
+                QuietCounter,
+                16,
+            )
+        } else {
+            sim.register_with_capacity_on::<ShardedCounter, CounterMsg, TrackerMsg>(
+                shard,
+                ShardedCounter {
+                    placement: placement.clone(),
+                    value: 0,
+                },
+                16,
+            )
+        };
+        entries.push((shard, address));
+    }
+    let table = ShardServiceTable::new(placement.clone(), entries).unwrap();
+
+    let aggregate_timeout = Duration::from_millis(200);
+    let config = ScatterGatherConfig {
+        max_targets: placement.shards().len(),
+        collector_capacity: placement.shards().len(),
+        per_target_timeout: Duration::from_millis(50),
+        aggregate_timeout,
+    };
+    config.validate().unwrap();
+
+    let report_slot: Rc<RefCell<Option<ScatterGatherReport<u64>>>> = Rc::new(RefCell::new(None));
+    let coord = sim.register_with_capacity_on::<ScatterCoord, ScatterCoordMsg, CounterMsg>(
+        ShardId::new(11),
+        ScatterCoord {
+            table: table.clone(),
+            bridge: None,
+            config,
+            targets: placement.shards().to_vec(),
+            pending_replies: Vec::new(),
+            outcomes: Vec::with_capacity(config.max_targets),
+            report_into: Rc::clone(&report_slot),
+        },
+        16,
+    );
+    let bridge = sim.register_with_capacity_on::<ReplyBridge, TrackerMsg, ScatterCoordMsg>(
+        ShardId::new(11),
+        ReplyBridge { coord },
+        16,
+    );
+
+    sim.try_send(coord, ScatterCoordMsg::Bind { bridge })
+        .unwrap();
+    sim.try_send(coord, ScatterCoordMsg::Start).unwrap();
+
+    // `run_until_quiescent` auto-advances virtual time to the next due
+    // timer when no other work is pending, so the aggregate-timeout
+    // timer fires inside this call. The QuietCounter never replies; the
+    // coord marks shard 22 as AggregateTimeout when the timer arrives.
+    sim.run_until_quiescent();
+    assert!(
+        sim.now() >= aggregate_timeout,
+        "virtual time must have advanced past aggregate_timeout, was {:?}",
+        sim.now()
+    );
+
+    let report = report_slot
+        .borrow_mut()
+        .take()
+        .expect("aggregate timer must fire and emit report");
+    assert_eq!(report.replied_count(), 2, "report = {report:?}");
+    assert_eq!(report.aggregate_timeout_count(), 1);
+    assert_eq!(report.full_count(), 0);
+    assert_eq!(report.closed_count(), 0);
+    assert_eq!(report.timeout_count(), 0);
+    assert_eq!(report.missing_shard_count(), 0);
+    assert!(
+        report.outcomes.iter().any(|(s, o)| *s == ShardId::new(22)
+            && matches!(o, ScatterGatherTargetOutcome::AggregateTimeout)),
+        "expected AggregateTimeout for shard 22, got {:?}",
+        report.outcomes
+    );
 }
