@@ -36,7 +36,7 @@ Already exists:
 Expected before or during this phase:
 
 - 047 bridge lifecycle cleanup;
-- tracing context basics from 049 if ready;
+- tracing context basics if ready;
 - stable pressure vocabulary: `Full`, `Closed`, `Timeout`.
 
 ## Coordination
@@ -46,7 +46,7 @@ Expected before or during this phase:
 Coordinate with:
 
 - 047 for bridge lifecycle and shutdown shape;
-- 049 for tracing context;
+- future tracing integration for context propagation;
 - 048 for native HTTP docs contrast.
 
 Adapter dependencies should be optional features. Native Tina crates must not

@@ -57,7 +57,7 @@ Still recurring:
 - No hiding `Full`, `Closed`, `Timeout`, or partial failure.
 - No new web framework.
 - No gRPC or streaming RPC.
-- No North Sea / `io_uring` work.
+- No I/O substrate work.
 - No broad performance claim.
 - No giant macro that makes trace truth hard to see.
 

@@ -265,8 +265,8 @@ Grug boundary:
    - request id belongs in spans/events/log fields, not aggregate metric
      dimensions.
 
-   This can build on 049 tracing work if present. If 049 is not merged, leave a
-   small adapter behind a feature or a documented follow-up.
+   This can build on future tracing work if present. If tracing is not ready,
+   leave a small adapter behind a feature or a documented follow-up.
 
 8. **Registry Ping / Readiness First Form**
 

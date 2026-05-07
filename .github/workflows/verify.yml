@@ -29,5 +29,11 @@ jobs:
       - name: Install Rust nightly
         run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
 
+      - name: Betelgeuse Linux backend smoke
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -p tina-runtime --test betelgeuse_backend_ci
+          cargo test -p tina-runtime --test tcp_echo threaded_runtime_tcp_echo_round_trips_reference_workload
+
       - name: Verify workspace
         run: make verify

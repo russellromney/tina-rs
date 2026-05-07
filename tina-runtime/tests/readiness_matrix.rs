@@ -136,9 +136,9 @@ fn rows() -> Vec<MatrixRow> {
             glommio_note: "Glommio comparison is platform-gated and not part of default verify.",
         },
         MatrixRow {
-            capability: "io_uring backend",
+            capability: "Tina-owned io_uring backend",
             status: ReadinessStatus::NotClaimed,
-            evidence: "North Sea future phase; portable backend only in Baobab",
+            evidence: "Betelgeuse owns the native Linux backend; Tina gates only its adapter semantics",
             tina: None,
             tokio_note: "Tokio uses platform reactors; no Tina user-level claim here.",
             glommio_note: "Glommio is Linux/io_uring-shaped; Baobab rows are platform-gated.",
@@ -257,7 +257,7 @@ fn baobab_readiness_matrix_matches_public_capabilities() {
         if row.capability == "glommio comparison" {
             assert_eq!(row.status, ReadinessStatus::PlatformGated);
         }
-        if row.capability == "io_uring backend" {
+        if row.capability == "Tina-owned io_uring backend" {
             assert_eq!(row.status, ReadinessStatus::NotClaimed);
         }
     }

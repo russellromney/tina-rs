@@ -54,7 +54,7 @@ Recurring pain from Eiffel:
 ## Non-Goals
 
 - No native HTTP server. That is 048.
-- No `io_uring` backend. That is 049/North Sea.
+- No I/O substrate work.
 - No broad flow macro.
 - No new unbounded observer queue.
 - No hidden retry, hidden timeout, hidden load buffer, or hidden task.
@@ -69,8 +69,8 @@ Recurring pain from Eiffel:
 Parallel lanes may prototype HTTP or substrate work, but they do not stabilize
 around missing 047 pieces until 047 lands or the contract is agreed.
 
-If 048 or 049 discovers that 047 needs a different primitive, record it in this
-phase review before changing core runtime meaning.
+If 048 or later substrate work discovers that 047 needs a different primitive,
+record it in this phase review before changing core runtime meaning.
 
 ## Rules
 

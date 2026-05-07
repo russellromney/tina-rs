@@ -141,8 +141,7 @@ server body.
 - No Axum clone.
 - No full routing framework.
 - No native DB driver.
-- No `io_uring` requirement. Portable backend first; North Sea can accelerate
-  later.
+- No I/O substrate requirement. Betelgeuse owns the live backend.
 - No broad production-ready HTTP claim.
 - No HTTP/1.1 completeness claim.
 - No pipelining in the first form unless explicitly chosen after the basic
@@ -380,7 +379,7 @@ server body.
 - The bridge remains useful for Axum/Tower ecosystem integration, but is no
   longer the only HTTP story.
 - Native HTTP has enough shape to pressure future DB, HTTP client, connection
-  pool, streaming, and North Sea work.
+  pool, streaming, and backend work.
 - Tina is closer to "as easy as Tokio for normal services," but still does not
   claim full Tokio ecosystem replacement.
 

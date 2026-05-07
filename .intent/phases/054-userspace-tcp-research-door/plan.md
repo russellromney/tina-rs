@@ -19,14 +19,13 @@ Near-grug:
 
 Expected before this matters:
 
-- North Sea `io_uring` path is understood;
+- Betelgeuse native Linux path runs in CI;
 - native HTTP/RPC have real pressure cases;
-- cost smoke shows where kernel TCP/io_uring is or is not enough;
+- cost smoke shows where kernel TCP is or is not enough;
 - capability reports can tell backend truth.
 
-Do not start this phase until 049 has North Sea cost rows and at least one
-native HTTP/RPC pressure case suggests kernel TCP or `io_uring` is the actual
-bottleneck.
+Do not start this phase until at least one native HTTP/RPC pressure case
+suggests kernel TCP is the actual bottleneck.
 
 ## Non-Goals
 
@@ -92,7 +91,7 @@ bottleneck.
 
    - Tina does not ship userspace TCP;
    - Tina's model could host such a backend later;
-   - North Sea/kernel TCP is the real path now.
+   - kernel TCP over Betelgeuse is the real path now.
 
 ## Required Proof
 

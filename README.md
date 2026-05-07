@@ -281,7 +281,7 @@ Not yet:
 
 * native HTTP/2 / gRPC service stack (planned, see [ROADMAP.md](ROADMAP.md));
 * native database client (PG wire / SQLite); current path is the bridge to `sqlx`/`tokio-postgres`;
-* `io_uring` substrate (Linux); current backend is portable;
+* broad Linux performance claim; Linux already uses Betelgeuse's native backend;
 * remoting or clustering;
 * time-windowed restart budgets (runtime-lifetime budgets only today);
 * production performance claim;

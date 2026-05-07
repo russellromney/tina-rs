@@ -53,7 +53,7 @@ const BLUE_WHALE_CHECKLIST: &[BlueWhaleItem] = &[
     BlueWhaleItem {
         name: "network/storage backend",
         status: BlueWhaleStatus::Partial,
-        evidence: "portable Betelgeuse-backed driver exists; io_uring backend is North Sea future work",
+        evidence: "portable Betelgeuse-backed driver exists; Linux and macOS use Betelgeuse native backends",
     },
     BlueWhaleItem {
         name: "NUMA",

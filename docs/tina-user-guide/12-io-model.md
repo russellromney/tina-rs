@@ -19,9 +19,9 @@ Tina has three important layers:
 - Betelgeuse is the canonical portable live I/O machine under `tina-runtime`.
 - `tina-sim` is the deterministic simulator for replay and DST.
 
-On Linux, Betelgeuse uses `io_uring`. On macOS, it uses `kqueue`. North Sea is
-now shorthand for proving and tuning the Linux Betelgeuse path, not for
-building a duplicate backend unless evidence forces that.
+On Linux, Betelgeuse uses its native Linux backend. On macOS, Betelgeuse uses
+its native Darwin backend. Tina does not plan a duplicate I/O substrate unless
+Betelgeuse cannot satisfy a named Tina contract.
 
 ## What Betelgeuse Does Here
 

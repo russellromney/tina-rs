@@ -41,7 +41,7 @@ Expected before this phase starts:
 ## Non-Goals
 
 - No native HTTP implementation. That is 048.
-- No `io_uring` backend. That is 049.
+- No I/O substrate work.
 - No ecosystem bridge adapters. That is 051.
 - No Tina RPC product surface. That is 052.
 - No sharded primitive library. That is 053.
