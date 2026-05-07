@@ -7,8 +7,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeMessage, BridgeRequest, BridgeResponder};
-use tina_tower_bridge::TinaTowerService;
-use tower_service::Service;
+use tina_tower_bridge::{Service, TinaTowerService};
 
 // --- shared echo + slow isolates ----------------------------------------
 

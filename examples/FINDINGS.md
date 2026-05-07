@@ -151,46 +151,37 @@ but the rewrite surfaced fresh paper cuts that still need work.
 
 **What still feels rough:**
 
-- The state type signature is brutal:
-  `TinaTowerService<RoomRequest, RoomReply, SingleShard, DefaultThreadedMailboxFactory, ()>`.
-  Six generic params, two defaulted; the trailing `()` is `AR`, which
-  almost no user can name from memory. A friendlier specimen-facing
-  alias on the bridge crate (or a builder that produces a type that
-  isn't six generics deep) would be a real win.
-- Every Axum handler that uses `Service::call` ends with `let mut svc = svc;`
-  on its first line, because Axum's `State<S>` extracts the value, not
-  `&mut S`, and `Service::call` requires `&mut self`. Trivial but cluttery
-  — every Tina-bridged handler in the repo will have this line.
+- ~~The state type signature is brutal: six generic params with the
+  trailing `()` for `AR`.~~ **Resolved in the bridge polish slice:**
+  `tina_tower_bridge::TinaService<M, R>` is the specimen-facing alias
+  for the SingleShard / DefaultThreadedMailboxFactory case.
+  Specimen state types now read as `TinaService<RoomRequest, RoomReply>`.
+- ~~The example needs three crate deps + a direct `tower-service`
+  import.~~ **Resolved in the bridge polish slice:**
+  `tina_tower_bridge` re-exports `Service`, so handlers
+  `use tina_tower_bridge::{Service, TinaService};` and the example
+  Cargo.toml drops the direct `tower-service` dep entirely.
+- Every Axum handler that uses `Service::call` still ends with
+  `let mut svc = svc;` because Axum's `State<S>` extracts the value,
+  not `&mut S`, and `Service::call` requires `&mut self`. Trivial but
+  cluttery. Documented in the bridge crate; no fix yet.
 - We still need a `tokio::runtime::Runtime` to host axum *and* the Tina
   runtime thread underneath. Two runtimes per process is the bridge's
   nature, but for a tiny stateful counter it's a lot of moving parts.
-  No fix in this slice; flagging the comprehension cost again.
 - Setup is still two-step: `BridgeHost::register_bridge(...)` then
   `TinaTowerService::new(bridge)`. The reqwest-bridge crate ships an
   `install(&runtime, config)` helper that returns the wired-up trio
   in one call. `tina-tokio-bridge` could expose the same thing.
-- The example needs both `tina-tokio-bridge` (for `BridgeHost` /
-  `BridgeRequest`) **and** `tina-tower-bridge` (for `TinaTowerService`)
-  in `Cargo.toml`, plus a direct `tower-service = "0.3"` dep so the
-  handler can `use tower_service::Service`. Three crates and a Tower
-  trait import for what feels like one feature. Re-exporting
-  `tower_service::Service` from `tina-tower-bridge` would shave one
-  line and one dep.
 - For WebSocket (`eiffel_ws_room`), the reader and writer halves each
   need their own `svc.clone()` because Tower's `&mut self` is
-  per-clone, not shared. This is the standard Tower idiom but it's
-  not obvious from a quick read; it took a real moment to realise the
-  obvious "share via `&mut`" path doesn't compile.
+  per-clone, not shared. Now documented in the `tina-tower-bridge`
+  crate docs ("Cloning and `&mut self`" section), but the pattern is
+  still a learning bump.
 
 **Build (still open):**
 
-- friendlier specimen-facing type alias or builder for
-  `TinaTowerService` (or a re-export that hides the six generics behind
-  a single name);
 - consider `tina_tokio_bridge::install(...)` paralleling the reqwest
   bridge's `install` to collapse the two-step setup;
-- re-export `tower_service::Service` from `tina-tower-bridge` so
-  examples don't need a separate `tower-service` dep;
 - rewrite remaining bridge-shaped examples (`eiffel_outbound_*`,
   `eiffel_real_io_chat`) once the next bridge surface lands;
 - document signal-handler coexistence when Tokio and Tina live in one

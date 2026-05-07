@@ -68,9 +68,9 @@ cargo run --manifest-path examples/eiffel_ws_room/Cargo.toml -- tina
   needed because Tower's `&mut self` is per-clone, not shared, and
   the reader/writer halves run on different async tasks. The pattern
   is standard Tower but it took a real moment to realise the obvious
-  "share via `&mut`" path doesn't compile. Worth a doc paragraph in
-  `tina-tower-bridge` for the WebSocket case specifically.
-- The `RoomService` type signature inherits the same six-generic
-  brutality as the counter:
-  `TinaTowerService<RoomRequest, RoomReply, SingleShard, DefaultThreadedMailboxFactory, ()>`.
-  A specimen-facing alias on the bridge crate would help here too.
+  "share via `&mut`" path doesn't compile. Now documented in
+  `tina-tower-bridge`'s "Cloning and `&mut self`" section, with a
+  fan-out snippet specifically for this WebSocket shape.
+- The `RoomService` type used to inherit the same six-generic
+  brutality as the counter; the bridge polish slice replaced it
+  with `TinaService<RoomRequest, RoomReply>`.

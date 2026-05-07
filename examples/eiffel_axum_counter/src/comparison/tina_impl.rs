@@ -8,9 +8,8 @@ use axum::routing::{get, post};
 use tina::prelude::*;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeRequest};
-use tina_tower_bridge::TinaTowerService;
+use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
-use tower_service::Service;
 
 use super::{SideReport, scripted_client};
 
@@ -47,8 +46,7 @@ impl Counter {
     }
 }
 
-type CounterService =
-    TinaTowerService<CounterRequest, CounterReply, SingleShard, DefaultThreadedMailboxFactory, ()>;
+type CounterService = TinaService<CounterRequest, CounterReply>;
 
 /// Map a typed `BridgeError` to an HTTP status. The mapping is a
 /// table, not a string match: Full and Closed are 503 (we are not

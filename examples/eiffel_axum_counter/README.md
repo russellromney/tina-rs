@@ -81,24 +81,14 @@ cargo run --manifest-path examples/eiffel_axum_counter/Cargo.toml -- tina
   up with **two** runtimes (Tina's own thread + a Tokio current-thread
   runtime). That is the bridge's nature, but it's a real comprehension
   cost the first time you see it.
-- The state type signature is brutal:
-  `TinaTowerService<CounterRequest, CounterReply, SingleShard, DefaultThreadedMailboxFactory, ()>`.
-  Six generic params, two defaulted; the trailing `()` is `AR`, which
-  almost no user can name from memory. A specimen-facing type alias
-  on the bridge crate would shave a long, opaque line.
+- The state type used to be brutal — six generic params with a
+  trailing `()` for `AR`. The bridge polish slice fixed that: the
+  specimen reads `TinaService<CounterRequest, CounterReply>`.
 - Every handler that calls `svc.call(...)` opens with `let mut svc =
   svc;` because Axum's `State<S>` extracts the value, not `&mut S`,
   and `Service::call` requires `&mut self`. Trivial but cluttery —
-  every Tina-bridged Axum handler in the repo is going to have this
-  line.
-- The bridge needs three crate deps and a Tower trait import:
-  `tina-tokio-bridge` (for `BridgeHost` / `BridgeRequest`),
-  `tina-tower-bridge` (for `TinaTowerService`), and direct
-  `tower-service = "0.3"` so the handler can `use tower_service::Service`.
-  Three crates and one trait import for what feels like one feature.
-  Re-exporting `tower_service::Service` from `tina-tower-bridge`
-  would shave one line and one dep.
-- Setup is two-step: `BridgeHost::register_bridge(...)` then
+  every Tina-bridged Axum handler is going to have this line.
+- Setup is still two-step: `BridgeHost::register_bridge(...)` then
   `TinaTowerService::new(bridge)`. The reqwest-bridge crate ships a
   one-call `install(&runtime, config)` helper; `tina-tokio-bridge`
   could expose the same.

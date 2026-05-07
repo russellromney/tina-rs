@@ -29,13 +29,12 @@
 //! ```no_run
 //! use std::time::Duration;
 //! use tina_tokio_bridge::BridgeHandle;
-//! use tina_tower_bridge::TinaTowerService;
-//! use tower_service::Service;
+//! use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 //!
 //! # fn build_handle() -> BridgeHandle<u32, u32, tina::SingleShard, tina_runtime::DefaultThreadedMailboxFactory> { unimplemented!() }
 //! # async fn driver() {
 //! let handle: BridgeHandle<u32, u32, _, _> = build_handle();
-//! let mut svc = TinaTowerService::new(handle);
+//! let mut svc: TinaService<u32, u32> = TinaTowerService::new(handle);
 //! let response = svc.call(7).await.expect("svc call");
 //! # let _ = response;
 //! # }
@@ -108,6 +107,34 @@
 //!   our future on expiry. The cancellation maps to the
 //!   drop-after-admission case: bridge counts a dropped responder.
 //!
+//! # Cloning and `&mut self`
+//!
+//! Tower's [`Service::call`] takes `&mut self`. Cloning a
+//! [`TinaTowerService`] clones the bridge handle (cheap `Arc` clone)
+//! — it does **not** clone the Tina service state behind the bridge.
+//! Two clones share one isolate.
+//!
+//! In Axum / WebSocket handlers, clone per async task or per split
+//! half when you need independent callers:
+//!
+//! ```ignore
+//! let mut sub_svc = svc.clone();
+//! sub_svc.call(RoomRequest::Subscribe(tx)).await?;
+//!
+//! let mut publish_svc = svc.clone();
+//! publish_svc.call(RoomRequest::Publish(text)).await?;
+//! ```
+//!
+//! Axum's `State<S>` extracts the value, not `&mut S`, so handlers
+//! that call the service directly need a one-line rebind:
+//!
+//! ```ignore
+//! async fn handler(State(svc): State<MyService>) -> ... {
+//!     let mut svc = svc;
+//!     svc.call(req).await
+//! }
+//! ```
+//!
 //! See [`tina_tokio_bridge`] for the underlying bridge contract.
 
 use std::future::Future;
@@ -118,7 +145,6 @@ use std::time::Duration;
 use tina::Shard;
 use tina_runtime::MailboxFactory;
 use tina_tokio_bridge::{BridgeError, BridgeHandle, BridgeMessage, BridgeRequest};
-use tower_service::Service;
 
 /// `tower::Service` wrapper around a [`BridgeHandle`].
 ///
@@ -223,3 +249,14 @@ where
         })
     }
 }
+
+/// Re-export of [`tower_service::Service`] so callers do not need a
+/// direct `tower-service` dep.
+pub use tower_service::Service;
+
+/// Specimen-facing alias for the common Tower service shape: single
+/// shard, default threaded mailbox factory, no extra address reply
+/// type. Most Tina specimens want this rather than the full
+/// [`TinaTowerService`] with six explicit generics.
+pub type TinaService<M, R> =
+    TinaTowerService<M, R, tina::SingleShard, tina_runtime::DefaultThreadedMailboxFactory, ()>;

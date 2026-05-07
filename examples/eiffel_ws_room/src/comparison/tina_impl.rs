@@ -10,10 +10,9 @@ use futures_util::{SinkExt, StreamExt};
 use tina::prelude::*;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
 use tina_tokio_bridge::{BridgeHost, BridgeRequest};
-use tina_tower_bridge::TinaTowerService;
+use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::mpsc;
-use tower_service::Service;
 
 use super::{SideReport, run_room_clients};
 
@@ -52,8 +51,7 @@ impl Room {
     }
 }
 
-type RoomService =
-    TinaTowerService<RoomRequest, RoomReply, SingleShard, DefaultThreadedMailboxFactory, ()>;
+type RoomService = TinaService<RoomRequest, RoomReply>;
 
 async fn ws_upgrade(
     State(svc): State<RoomService>,
