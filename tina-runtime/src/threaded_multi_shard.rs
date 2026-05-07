@@ -30,6 +30,7 @@ use crate::local_system::{
 };
 use crate::mailbox::MailboxFactory;
 use crate::observation;
+use crate::observer::TraceObserver;
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -69,6 +70,43 @@ where
 
     /// Starts one live worker thread per shard with explicit queue config.
     pub fn with_config<I>(shards: I, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::with_config_and_optional_trace_observer(shards, mailbox_factory, config, None)
+    }
+
+    /// Same as [`Self::with_config`] but wires a live trace observer
+    /// on every shard before the first event records.
+    ///
+    /// Observer is held outside [`ThreadedRuntimeConfig`] so the
+    /// config stays pure data. The same observer (clone of the same
+    /// `Arc`) runs on each shard worker thread; per-shard event order
+    /// is preserved, but events from different shards interleave
+    /// freely.
+    pub fn with_config_and_trace_observer<I>(
+        shards: I,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Arc<dyn TraceObserver>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::with_config_and_optional_trace_observer(
+            shards,
+            mailbox_factory,
+            config,
+            Some(observer),
+        )
+    }
+
+    fn with_config_and_optional_trace_observer<I>(
+        shards: I,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Option<Arc<dyn TraceObserver>>,
+    ) -> Self
     where
         I: IntoIterator<Item = S>,
     {
@@ -178,6 +216,7 @@ where
                     .get(&shard_id)
                     .expect("shard metrics exist for worker"),
             );
+            let worker_observer = observer.clone();
             handles.push((
                 shard_id,
                 thread::Builder::new()
@@ -203,6 +242,7 @@ where
                         );
                         let mut runtime = runtime;
                         runtime.set_trace_retention(worker_config.trace_retention);
+                        runtime.set_trace_observer(worker_observer);
                         threaded_worker_loop_with_remote(
                             runtime,
                             receiver,

@@ -132,6 +132,10 @@ where
     last_checker_failure: Option<CheckerFailure>,
     deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
     promoted_slots: deferred::PromotedSlots,
+    /// Live trace observer. Same contract as the runtime's; fires
+    /// before the in-memory trace push so DST replay sees the same
+    /// stream a live operator would see.
+    trace_observer: Option<std::sync::Arc<dyn tina_runtime::TraceObserver>>,
 }
 
 impl<S> Simulator<S>
@@ -186,12 +190,25 @@ where
             last_checker_failure: None,
             deferred_registry: std::rc::Rc::new(DeferredSlotRegistry::new()),
             promoted_slots: deferred::PromotedSlots::default(),
+            trace_observer: None,
         }
     }
 
     /// Returns the immutable simulator config for this run.
     pub fn config(&self) -> &SimulatorConfig {
         &self.config
+    }
+
+    /// Installs or removes a live trace observer.
+    ///
+    /// Same contract as the runtime: fires once per event in
+    /// recording order, panics kill the simulator thread. Useful for
+    /// DST adapters that want to compare live and replay event streams.
+    pub fn set_trace_observer(
+        &mut self,
+        observer: Option<std::sync::Arc<dyn tina_runtime::TraceObserver>>,
+    ) {
+        self.trace_observer = observer;
     }
 
     /// Returns the current virtual monotonic time.
@@ -4582,8 +4599,14 @@ where
         kind: RuntimeEventKind,
     ) -> tina_runtime::EventId {
         let id = self.ids.next_event_id();
-        self.trace
-            .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
+        let event = RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind);
+        // Observer first; sim has no retention knob today, so the
+        // in-memory trace push always follows. Panicking observer
+        // kills the sim thread by design.
+        if let Some(obs) = &self.trace_observer {
+            obs.on_event(&event);
+        }
+        self.trace.push(event);
         id
     }
 
