@@ -86,19 +86,24 @@
 //!
 //! # Tower middleware safety
 //!
-//! Most Tower layers compose cleanly. A few introduce queues that
-//! **violate** Tina's "no hidden unbounded queue" rule and should not
-//! be wrapped around `TinaTowerService` without an explicit cap:
+//! Most Tower layers compose cleanly. A few introduce a second
+//! buffer or cap on top of Tina's bounded ingress; pick one source
+//! of truth for overload and document the choice.
 //!
-//! - `tower::buffer::Buffer` defaults to an *unbounded* MPSC channel
-//!   between the buffer task and the inner service. Use it only with
-//!   an explicit `bound` and accept that buffered requests sit outside
-//!   Tina's pressure surface.
+//! - `tower::buffer::Buffer` takes an explicit bound (`Buffer::new(svc, bound)`),
+//!   so the buffer's channel is bounded — no unbounded queue is
+//!   introduced. The thing to remember is that requests waiting in
+//!   the Buffer channel sit *outside* Tina's pressure surface; they
+//!   do not show up in `BridgeMetrics`. Pick the `bound` deliberately
+//!   so total in-flight (Buffer + Tina ingress) stays bounded.
 //! - `tower::load_shed::LoadShed` is fine — it sheds when the inner
 //!   Service is `Pending`, which we never are.
-//! - `tower::limit::ConcurrencyLimit` is fine — it bounds in-flight
-//!   via a Semaphore on top of (not in addition to) Tina's
-//!   `max_in_flight`. Pick one source of truth.
+//! - `tower::limit::ConcurrencyLimit` adds an *outer* in-flight cap
+//!   on top of Tina's bounded mailbox ingress. Two caps now exist:
+//!   the Tower Semaphore and the Tina mailbox capacity. Pick which
+//!   one owns overload semantics — typically set the inner mailbox
+//!   roomy and let `ConcurrencyLimit` shed first, or skip
+//!   `ConcurrencyLimit` and let Tina ingress surface `Full`.
 //! - `tower::timeout::Timeout` is fine — its outer timeout cancels
 //!   our future on expiry. The cancellation maps to the
 //!   drop-after-admission case: bridge counts a dropped responder.
