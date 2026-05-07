@@ -164,11 +164,21 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
     }
 
     /// Builds a worker around a caller-supplied reqwest client and
-    /// Tokio runtime handle. The supplied client *owns its own
-    /// redirect, timeout, and connection-reuse policy* — the bridge's
-    /// [`ReqwestConfig::redirect`] and [`ReqwestConfig::default_timeout`]
-    /// are not applied to it. Set those on the client builder before
-    /// passing it in.
+    /// Tokio runtime handle.
+    ///
+    /// **Ownership split.** The supplied reqwest client owns its own
+    /// *client-level* settings — redirect policy, the reqwest
+    /// `Client::timeout`, connection-reuse, TLS config, proxy. The
+    /// bridge does not re-apply [`ReqwestConfig::redirect`] to it.
+    ///
+    /// The bridge still owns the *Tina-side per-attempt deadline*: every
+    /// request runs under `tokio::time::timeout(per_attempt, ...)` where
+    /// `per_attempt = request.timeout.unwrap_or(config.default_timeout)`,
+    /// regardless of who built the client. So
+    /// [`ReqwestConfig::default_timeout`] still matters even on this
+    /// path: it bounds how long the bridge will wait on one attempt
+    /// before surfacing [`ReqwestError::Timeout`]. Set the supplied
+    /// client's own `Client::timeout` to a value at least as large.
     ///
     /// The caller must keep the underlying `tokio::runtime::Runtime`
     /// alive for the worker's lifetime.

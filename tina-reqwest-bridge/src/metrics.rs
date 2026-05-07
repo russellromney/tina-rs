@@ -5,34 +5,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Snapshot of bridge counters.
 ///
+/// All counters describe **worker-terminal events** — what the worker
+/// observed and what it emitted as its `Effect::Reply`. They do not
+/// reflect what the Tina caller saw. The worker has no signal for the
+/// caller's `IsolateCall` deadline; if the caller has already given up
+/// when the worker fires its Reply, the runtime drops it as
+/// `CallReplyRejected` and that event is visible only in the runtime
+/// trace, not in these counters.
+///
 /// Counters are monotonic except for `current_in_flight`, which is the
 /// instantaneous in-flight count at snapshot time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReqwestMetrics {
-    /// Send requests admitted into the worker (each spawned reqwest
-    /// task counts once, including retry attempts).
+    /// Sends admitted into the worker. Each spawned reqwest task
+    /// counts once, including retry attempts.
     pub admitted: u64,
-    /// Send requests rejected because `max_in_flight` was reached.
+    /// Sends rejected at admission because `max_in_flight` was reached.
     pub full: u64,
-    /// Send requests rejected because the worker was closed.
+    /// Sends rejected at admission because the worker was closed.
     pub closed: u64,
-    /// Requests rejected before reqwest because the body exceeded
+    /// Sends rejected at admission because the body exceeded
     /// `request_body_limit`.
     pub request_too_large: u64,
-    /// Requests rejected by URL/method/header validation before reqwest
-    /// saw them.
+    /// Sends rejected at admission by URL/method/header validation,
+    /// before reqwest saw them.
     pub invalid: u64,
-    /// Reqwest tasks that completed with a successful response (the
-    /// caller saw `Ok(response)`).
+    /// Reqwest tasks the worker terminated with a successful response.
     pub responses: u64,
-    /// Final outcomes that surfaced [`crate::ReqwestError::Timeout`]
-    /// to the caller.
+    /// Reqwest tasks the worker terminated with
+    /// [`crate::ReqwestError::Timeout`].
     pub timeout: u64,
-    /// Final outcomes that surfaced
+    /// Reqwest tasks the worker terminated with
     /// [`crate::ReqwestError::ResponseTooLarge`].
     pub response_too_large: u64,
-    /// Final outcomes that surfaced [`crate::ReqwestError::Reqwest`]
-    /// (any other reqwest-side error).
+    /// Reqwest tasks the worker terminated with
+    /// [`crate::ReqwestError::Reqwest`] (any other reqwest-side error).
     pub reqwest_error: u64,
     /// Retry attempts scheduled (the count of *retries*, not the first
     /// attempt). Always `0` when [`crate::RetryPolicy::None`].

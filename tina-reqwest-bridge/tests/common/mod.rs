@@ -17,6 +17,10 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
+/// Boxed future returned by every fake-server handler in this fixture.
+pub type HandlerFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>>;
+
 /// One small hyper HTTP/1.1 server that returns whatever the handler
 /// closure decides per request.
 pub struct FakeServer {
@@ -89,7 +93,7 @@ impl FakeServer {
             let _ = tx.send(());
         }
         if let Some(join) = self.join.take() {
-            let _ = self.runtime.block_on(async move {
+            self.runtime.block_on(async move {
                 let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
             });
         }
@@ -108,12 +112,7 @@ impl Drop for FakeServer {
 pub fn delayed_ok(
     body: &'static [u8],
     delay: Duration,
-) -> impl Fn(
-    HyperRequest<Incoming>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>>
-+ Send
-+ Sync
-+ 'static {
+) -> impl Fn(HyperRequest<Incoming>) -> HandlerFuture + Send + Sync + 'static {
     move |_req: HyperRequest<Incoming>| {
         let body = body;
         Box::pin(async move {
@@ -122,18 +121,12 @@ pub fn delayed_ok(
                 .status(StatusCode::OK)
                 .body(Full::new(Bytes::from_static(body)))
                 .expect("build response")
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        })
     }
 }
 
 /// Reply 200 OK that drains the request body and echoes its length.
-pub fn echo_body_len() -> impl Fn(
-    HyperRequest<Incoming>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>,
-> + Send
-+ Sync
-+ 'static {
+pub fn echo_body_len() -> impl Fn(HyperRequest<Incoming>) -> HandlerFuture + Send + Sync + 'static {
     move |req: HyperRequest<Incoming>| {
         Box::pin(async move {
             let body = req.into_body().collect().await.expect("collect body");
@@ -142,7 +135,7 @@ pub fn echo_body_len() -> impl Fn(
                 .status(StatusCode::OK)
                 .body(Full::new(Bytes::from(len.to_string())))
                 .expect("build response")
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        })
     }
 }
 
@@ -263,7 +256,7 @@ impl FlakyServer {
             let _ = tx.send(());
         }
         if let Some(join) = self.join.take() {
-            let _ = self.runtime.block_on(async move {
+            self.runtime.block_on(async move {
                 let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
             });
         }
@@ -283,12 +276,7 @@ impl Drop for FlakyServer {
 /// the body is empty.
 pub fn echo_header(
     name: &'static str,
-) -> impl Fn(
-    HyperRequest<Incoming>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>>
-+ Send
-+ Sync
-+ 'static {
+) -> impl Fn(HyperRequest<Incoming>) -> HandlerFuture + Send + Sync + 'static {
     move |req: HyperRequest<Incoming>| {
         let value = req
             .headers()
@@ -301,7 +289,7 @@ pub fn echo_header(
                 .header("x-echoed-from", name)
                 .body(Full::new(Bytes::from(value)))
                 .expect("build response")
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        })
     }
 }
 
@@ -309,31 +297,20 @@ pub fn echo_header(
 pub fn fixed_status(
     status: StatusCode,
     body: &'static [u8],
-) -> impl Fn(
-    HyperRequest<Incoming>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>>
-+ Send
-+ Sync
-+ 'static {
+) -> impl Fn(HyperRequest<Incoming>) -> HandlerFuture + Send + Sync + 'static {
     move |_req: HyperRequest<Incoming>| {
         Box::pin(async move {
             HyperResponse::builder()
                 .status(status)
                 .body(Full::new(Bytes::from_static(body)))
                 .expect("build response")
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        })
     }
 }
 
 /// Echo full request body back as the response body. Useful for POST
 /// roundtrip tests.
-pub fn echo_body() -> impl Fn(
-    HyperRequest<Incoming>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>,
-> + Send
-+ Sync
-+ 'static {
+pub fn echo_body() -> impl Fn(HyperRequest<Incoming>) -> HandlerFuture + Send + Sync + 'static {
     move |req: HyperRequest<Incoming>| {
         Box::pin(async move {
             let bytes = req
@@ -346,6 +323,6 @@ pub fn echo_body() -> impl Fn(
                 .status(StatusCode::OK)
                 .body(Full::new(bytes))
                 .expect("build response")
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        })
     }
 }
