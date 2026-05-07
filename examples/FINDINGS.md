@@ -178,6 +178,41 @@ Chapter 17 ("Pressure Report Convention") in the user guide is the
 blessed shape and explains why this is a *convention* (line
 contract) rather than a *framework* (program contract).
 
+### 10. Reqwest-bridge flatten edge: useful but per-call-site
+
+**Surfaced by:** `eiffel_webhook_publisher`.
+
+The `tina-reqwest-bridge` ergonomics polish shipped
+`flatten_outcome(outcome) -> Result<R, ReqwestCallError>` as an
+opt-in flat-error helper. Building a specimen that uses all three
+call shapes (`send_request`, raw `call(addr, ReqwestMsg::Send(...))`,
+and `send_request` + `flatten_outcome` at the reply translator) made
+it clear that flattening is *useful* — the consumer-side match drops
+from five arms to three without losing the bridge-vs-worker layer
+naming — but the call-site syntax for shape 3 is denser than for
+shapes 1 and 2:
+
+```rust
+.reply(DriverMsg::PostedViaSendRequest)                // shape 1: bare ctor
+.reply(DriverMsg::PostedViaRawCall)                    // shape 2: bare ctor
+.reply(|outcome| DriverMsg::PostedFlattened(flatten_outcome(outcome))) // shape 3: closure
+```
+
+A first-time reader has to look at shape 3 twice. Mixing layered
+and flat call sites in the same isolate without a comment explaining
+why some are layered is confusing.
+
+**Build:**
+
+- Keep `flatten_outcome` opt-in. Do not default it.
+- Document explicitly: "pick layered or flat per call-site cluster,
+  not per-isolate-mixed-mode."
+- Consider a derive-style helper that produces a continuation enum
+  variant + a bare-function translator from one declaration, so
+  shape-3 call sites read the same as shapes 1/2. Not urgent —
+  punt until a non-pedagogical user actually mixes the two and
+  flinches.
+
 ## Resolved Or Retired By Recent Phases
 
 These used to be current pain and should not be copied into new code:
