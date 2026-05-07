@@ -152,6 +152,9 @@ The repository is a Cargo workspace:
 | [`tina-supervisor`](tina-supervisor/) | Supervisor configuration: `RestartPolicy`, `RestartBudget`, `SupervisorConfig`. |
 | [`tina-runtime`](tina-runtime/) | Explicit-step runtime, multi-shard runner, `ThreadedRuntime` over the [Betelgeuse](https://github.com/penberg/betelgeuse) backend, runtime-owned I/O, isolate calls, local snapshot/journal persistence. |
 | [`tina-sim`](tina-sim/) | Deterministic simulator with virtual time, seeded faults, scripted I/O, durable images, and replay. |
+| [`tina-http`](tina-http/) | First-form native HTTP/1.1 server/client/pool pieces built as Tina state machines. |
+| [`tina-rpc`](tina-rpc/) | First-form framed request/reply, service registry, typed service helpers, and bounded RPC semantics. |
+| [`tina-rpc-tokio`](tina-rpc-tokio/) | Tokio async facade over native Tina RPC for ecosystem-edge callers. |
 | [`tina-tokio-bridge`](tina-tokio-bridge/) | Bounded ingress from a host Tokio runtime into a Tina service, for axum/Tower/Hyper integration. |
 
 End consumers depend on `tina` plus one runtime or simulator crate.
@@ -235,8 +238,9 @@ cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- compare
 The [`examples/`](examples/) directory at the repo root contains **Eiffel**:
 paired Tokio-vs-Tina implementations of common service shapes (chat fanout,
 key/value store, axum counter, supervised worker, persistent counter,
-deterministic replay, outbound fetch, graceful shutdown, and more) that
-assert equivalent output between sides. Cross-cutting findings live in
+deterministic replay, outbound fetch, graceful shutdown, and more). They are
+specimens for feel and behavior, not a shared harness prison. Cross-cutting
+findings live in
 [`examples/FINDINGS.md`](examples/FINDINGS.md).
 
 ## Documentation
@@ -252,7 +256,12 @@ assert equivalent output between sides. Cross-cutting findings live in
 | [`docs/tina-user-guide/07-supervision.md`](docs/tina-user-guide/07-supervision.md) | Supervision and restart budgets |
 | [`docs/tina-user-guide/08-simulation-and-dst.md`](docs/tina-user-guide/08-simulation-and-dst.md) | Simulation and DST |
 | [`docs/tina-user-guide/09-tokio-to-tina-porting.md`](docs/tina-user-guide/09-tokio-to-tina-porting.md) | Porting Tokio-shaped code |
-| [`docs/tina-user-guide/10-ergonomics-notes.md`](docs/tina-user-guide/10-ergonomics-notes.md) | Ergonomics notes |
+| [`docs/tina-user-guide/10-service-patterns.md`](docs/tina-user-guide/10-service-patterns.md) | Service patterns |
+| [`docs/tina-user-guide/11-ergonomics-checklist.md`](docs/tina-user-guide/11-ergonomics-checklist.md) | Current ergonomics checklist |
+| [`docs/tina-user-guide/12-io-model.md`](docs/tina-user-guide/12-io-model.md) | I/O model |
+| [`docs/tina-user-guide/13-outcome-glossary.md`](docs/tina-user-guide/13-outcome-glossary.md) | Outcome glossary |
+| [`docs/tina-user-guide/14-lifecycle-and-shutdown.md`](docs/tina-user-guide/14-lifecycle-and-shutdown.md) | Lifecycle and shutdown |
+| [`docs/tina-user-guide/15-service-client-worked-example.md`](docs/tina-user-guide/15-service-client-worked-example.md) | Service-client worked example |
 | [`ROADMAP.md`](ROADMAP.md) | Phases, near-term work, and explicit non-goals |
 | [`CHANGELOG.md`](CHANGELOG.md) | Completed phases |
 
@@ -261,15 +270,16 @@ assert equivalent output between sides. Cross-cutting findings live in
 Implemented today: explicit-step single-shard runtime, multi-shard runner with
 bounded shard-pair queues, `ThreadedRuntime` over Betelgeuse, runtime-owned
 TCP/UDP/DNS/TLS/file/path/process/signal/persistence rails, isolate calls
-with mandatory timeout, supervision with `OneForOne`/`OneForAll`/`RestForOne`
-and runtime-lifetime restart budgets, terminal shutdown reports with
-topology and trace, `tina-sim` with virtual time / seeded faults / scripted
-I/O / replay / DST shrinking, and a narrow Tokio/Tower/Axum bridge with
-typed `Full`/`Closed`/`Timeout` outcomes.
+with mandatory timeout, native first-form HTTP/1.1, framed RPC with typed
+service helpers, supervision with `OneForOne`/`OneForAll`/`RestForOne` and
+runtime-lifetime restart budgets, terminal shutdown reports with topology and
+trace, `tina-sim` with virtual time / seeded faults / scripted I/O / replay /
+DST shrinking, and narrow Tokio bridge crates with typed
+`Full`/`Closed`/`Timeout` outcomes.
 
 Not yet:
 
-* native HTTP / HTTP/2 / gRPC service stack (planned, see [ROADMAP.md](ROADMAP.md));
+* native HTTP/2 / gRPC service stack (planned, see [ROADMAP.md](ROADMAP.md));
 * native database client (PG wire / SQLite); current path is the bridge to `sqlx`/`tokio-postgres`;
 * `io_uring` substrate (Linux); current backend is portable;
 * remoting or clustering;

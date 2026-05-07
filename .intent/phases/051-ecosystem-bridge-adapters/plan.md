@@ -15,6 +15,12 @@ Near-grug:
 
 > Tokio may speak ecosystem. Tina owns state. Bridge shows pressure.
 
+Bridge crates are adoption crates. They are not the native Tina path.
+
+Nearer-grug:
+
+> Bridge may adapt. Bridge may not lie.
+
 ## Baseline
 
 Already exists:
@@ -22,6 +28,7 @@ Already exists:
 - `tina-tokio-bridge`;
 - bounded ingress;
 - timeout/cancel policy;
+- `tina-rpc-tokio` is mostly done as part of the RPC usability work;
 - Axum counter comparison;
 - WebSocket room comparison;
 - Eiffel findings about bridge lifecycle and two-runtime confusion.
@@ -32,6 +39,20 @@ Expected before or during this phase:
 - tracing context basics from 049 if ready;
 - stable pressure vocabulary: `Full`, `Closed`, `Timeout`.
 
+## Coordination
+
+051 can start now.
+
+Coordinate with:
+
+- 047 for bridge lifecycle and shutdown shape;
+- 049 for tracing context;
+- 048 for native HTTP docs contrast.
+
+Adapter dependencies should be optional features. Native Tina crates must not
+pull Axum, Hyper, Reqwest, SQLx, or Tokio-postgres by default.
+AWS SDK dependencies must stay in the AWS bridge crate only.
+
 ## Non-Goals
 
 - No native HTTP server. That is 048.
@@ -40,6 +61,8 @@ Expected before or during this phase:
 - No adapter that loses cancellation/deadline semantics.
 - No broad support for every crate in Rust.
 - No rewrite of Axum, Hyper, Tower, Reqwest, SQLx, or Tonic.
+- No rewrite of the AWS SDK, SigV4 signing, credential loading, or AWS service
+  protocols.
 
 ## Rules
 
@@ -50,6 +73,55 @@ Expected before or during this phase:
 - Shutdown must be one-call boring where possible.
 - Cancellation and deadline mapping must be tested, not guessed.
 - Tracing context may cross the bridge, but must not become hidden global state.
+- Adapter dependencies must not leak into native Tina runtime crates.
+- Domain bridge crates should stay small: adapter glue, not a new framework.
+- A bridge crate may be disposable when a native Tina crate becomes good enough.
+- Every bridge crate must document preserved Tina guarantees and weakened Tina
+  guarantees.
+
+## Crate Shape
+
+Keep one generic bridge crate:
+
+- `tina-tokio-bridge` — generic Tokio/Tina host, bounded call, timeout,
+  shutdown/drain, health, metrics, and `Full`/`Closed`/`Timeout` mapping.
+
+Add small domain bridge crates only where they remove real ceremony:
+
+- `tina-tower-bridge` — expose Tina services as `tower::Service`.
+- `tina-aws-bridge` — bounded AWS SDK worker/pool for S3/DynamoDB/SQS first
+  forms.
+- `tina-reqwest-bridge` — bounded outbound HTTP worker/pool around `reqwest`.
+- `tina-sqlx-bridge` — bounded DB worker/pool around SQLx.
+- `tina-rpc-tokio` — async Tokio facade over native Tina RPC.
+- later: `tina-smol-bridge` — same generic bridge idea for `smol`/`async-io`
+  apps, once Tokio adoption path is boring.
+
+Do not create `tina-axum-bridge` first. If `tina-tower-bridge` is good, Axum can
+be an example/helper. Create an Axum-specific crate only if repeated real use
+shows Tower is too raw.
+
+## Order
+
+Already / landing:
+
+- bridge lifecycle cleanup in `tina-tokio-bridge`;
+- `tina-rpc-tokio` async facade over native RPC.
+
+First remaining bridge crates:
+
+- `tina-tower-bridge`;
+- `tina-reqwest-bridge`;
+- `tina-sqlx-bridge` first form;
+- `tina-aws-bridge`.
+
+Then:
+
+- Axum examples/helpers on top of Tower;
+- WebSocket bridge adapter if Eiffel keeps showing the need;
+- `tina-smol-bridge` after the Tokio bridge path is boring.
+
+Hyper-specific bridge waits unless Tower proves insufficient.
 
 ## Rocks
 
@@ -65,7 +137,31 @@ Expected before or during this phase:
    - terminal trace/report remains available;
    - docs show the normal lifecycle.
 
-2. **Tower Service Adapter**
+2. **`tina-rpc-tokio` Landing Check**
+
+   Treat the mostly-done RPC Tokio facade as the first domain bridge proof.
+
+   Requirements:
+
+   - native Tina RPC remains the source of truth;
+   - async call shape for Tokio users:
+
+     ```rust
+     rpc.call("billing", "charge", &amount)
+         .deadline(Duration::from_millis(250))
+         .await
+     ```
+
+   - one request maps to one bounded Tina call/reply path;
+   - dropped future cancellation rule documented;
+   - late reply discarded visibly;
+   - no silent retry;
+   - typed serialization errors distinct from `Full`/`Closed`/`Timeout`;
+   - crate docs name preserved and weakened Tina guarantees.
+
+   This rock may be a review/finish rock if the crate lands through 058.
+
+3. **`tina-tower-bridge`**
 
    Build a small `tower::Service` adapter.
 
@@ -73,35 +169,44 @@ Expected before or during this phase:
 
    - readiness reflects bounded Tina ingress where possible;
    - call maps to Tina request/reply;
-   - `Full` maps to `Poll::Pending`, error, or typed busy by documented policy;
+   - `Full` maps to an explicit busy/error by default;
+   - `Poll::Pending` is allowed only if readiness is proven not to hide
+     pressure behind an unbounded wait;
    - timeout/deadline behavior is explicit;
-   - cancellation before admission vs. after admission is tested.
+   - cancellation before admission vs. after admission is tested;
+   - request id/trace context is carried as optional metadata, not a global.
 
-3. **Axum Helper**
+   Target caller shape:
 
-   Make the existing good path more copyable.
+   ```rust
+   let mut svc = TinaTowerService::new(bridge_handle, policy);
+   let response = svc.call(request).await?;
+   ```
 
-   Requirements:
+   Target bridge shape:
 
-   - helper/state wrapper for `Router::with_state`;
-   - example handler with `bridge.call(req).await`;
-   - mapping table: Tina outcomes to HTTP status;
-   - docs for cloning handles and shutdown.
+   ```text
+   Tower caller / Axum / Hyper
+     -> tower::Service::poll_ready checks Tina admission policy
+     -> tower::Service::call performs bounded Tina bridge call
+     -> Tina service isolate handles request
+     -> response/error maps back to Tower future
+   ```
 
-4. **Hyper Service Bridge**
+   Pressure rule:
 
-   Support lower-level Hyper users without Axum.
+   ```text
+   Tina Full -> Tower busy/error, not hidden pending forever
+   Tina Closed -> Tower closed/error
+   Tina Timeout -> Tower timeout/error
+   ```
 
-   Requirements:
+   `poll_ready` must not become a secret queue. If it returns `Pending`, the
+   implementation must explain what is being waited on and why it is bounded.
 
-   - request head/body limits explicit;
-   - response maps typed Tina reply;
-   - service full maps to 503 or caller policy;
-   - no hidden body buffering.
+4. **`tina-reqwest-bridge`**
 
-5. **Reqwest / Outbound HTTP Bridge Worker**
-
-   Bridge path for teams that need mature HTTP client features now.
+   Bridge path for teams that need mature outbound HTTP client features now.
 
    Requirements:
 
@@ -109,27 +214,192 @@ Expected before or during this phase:
    - Tina submits bounded outbound request work;
    - full/closed/timeout outcomes visible;
    - response body limit explicit;
+   - redirect policy explicit;
+   - retry policy absent by default or explicitly configured;
    - cancellation and shutdown tested;
    - docs say this is bridge path, not native Tina HTTP client.
 
-6. **SQLx / Tokio-Postgres Bridge Sketch**
+   Target Tina call shape:
 
-   DB is the production adoption trap. Provide a first adapter shape.
+   ```rust
+   call(
+       http,
+       ReqwestMsg::Send {
+           method,
+           url,
+           headers,
+           body,
+       },
+       Duration::from_secs(2),
+   )
+   .reply(AppMsg::HttpReturned)
+   ```
+
+   Target bridge shape:
+
+   ```text
+   Tina service
+     -> bounded call to ReqwestWorker/ReqwestPool
+     -> Tokio/reqwest performs outbound HTTP request
+     -> capped response returns to Tina continuation
+   ```
+
+   First form should be full-response, not streaming:
+
+   ```text
+   request body cap
+   response body cap
+   no hidden redirect/retry unless configured
+   no unbounded waiters
+   ```
+
+   Native 048 HTTP client remains the Tina-owned path. This bridge is for
+   mature ecosystem behavior now.
+
+5. **`tina-sqlx-bridge`**
+
+   DB is the production adoption trap. Provide a runnable first adapter shape.
 
    Requirements:
 
    - bounded DB worker ingress;
    - query timeout;
    - connection-pool capacity visible;
-   - full/closed/busy outcomes visible;
-   - result row/body size limits named;
-   - transaction story either first-form or explicit non-goal.
+   - pool busy/full outcomes visible;
+   - closed connection outcome visible;
+   - row/body size limits named where practical;
+   - transaction story either first-form or explicit non-goal;
+   - cancellation behavior documented: after SQLx has accepted a query, what can
+     and cannot be stopped;
+   - example shows Tina service state calling DB through bounded bridge.
 
-   This may start as a sketch/example if full adapter is too large.
+   Target Tina call shape:
 
-7. **WebSocket Bridge Adapter**
+   ```rust
+   call(
+       db,
+       DbMsg::Execute {
+           statement,
+           params,
+       },
+       Duration::from_millis(250),
+   )
+   .reply(AppMsg::DbReturned)
+   ```
 
-   Improve the current WebSocket comparison into a reusable pattern.
+   Target bridge shape:
+
+   ```text
+   Tina service
+     -> bounded call to DbWorker/DbPool
+     -> Tokio/SQLx pool performs query/execute
+     -> result summary or capped rows return to Tina continuation
+   ```
+
+   First form should stay narrow:
+
+   ```text
+   execute statement
+   fetch one / fetch capped many
+   explicit pool capacity
+   explicit query timeout
+   transaction non-goal unless deliberately included
+   row streaming non-goal in first form
+   ```
+
+   SQLx cancellation is not magic. If the query has reached SQLx/database, the
+   bridge must document whether timeout only stops waiting or also attempts to
+   cancel the database work.
+
+6. **`tina-aws-bridge`**
+
+   The founding wound bridge: AWS SDK calls under Tokio/Hyper can overload in
+   ways that show up as thread contention, latency cliffs, and mystery queues.
+   This bridge contains that behind Tina budgets.
+
+   Requirements:
+
+   - AWS SDK stays underneath; Tina does **not** rebuild SigV4, credentials, or
+     service protocols here;
+   - bridge owns or is given one Tokio runtime/handle for AWS SDK work;
+   - one bounded Tina-facing AWS worker/pool address;
+   - explicit `max_in_flight`;
+   - explicit `max_waiters` or bounded mailbox ingress;
+   - explicit per-operation timeout;
+   - SDK retry policy disabled by default or surfaced as capped config;
+   - operation enum starts narrow:
+     - S3 `PutObject`, `GetObject`, `DeleteObject` first;
+     - DynamoDB `GetItem`/`PutItem` first if needed;
+     - SQS `SendMessage`/`ReceiveMessage` first if needed;
+   - request/body size limits named where practical;
+   - response body cap for S3 `GetObject`;
+   - dropped caller behavior documented:
+     - no magical AWS cancel guarantee after SDK accepts work;
+     - late result is discarded or counted visibly;
+   - shutdown/drain cancels what can be cancelled and reports what remains;
+   - metrics are first-class:
+     - accepted;
+     - full;
+     - closed;
+     - timeout;
+     - sdk_error;
+     - retry_count;
+     - in_flight;
+     - queue_depth;
+     - latency.
+
+   Target Tina call shape:
+
+   ```rust
+   call(
+       aws,
+       AwsMsg::S3PutObject { bucket, key, body },
+       Duration::from_secs(2),
+   )
+   .reply(AppMsg::S3PutDone)
+   ```
+
+   Target bridge shape:
+
+   ```text
+   Tina service
+     -> bounded call to AwsWorker/AwsPool
+     -> Tokio/AWS SDK performs AWS request
+     -> result returns to Tina continuation
+   ```
+
+   First proof should include a fake/local AWS endpoint if possible
+   (LocalStack, MinIO for S3, or a small mock Smithy/HTTP server) so CI does not
+   require real AWS credentials. A real AWS/Fly load probe can come later.
+
+7. **Axum Helper/Example**
+
+   Make the existing good path more copyable without creating a crate too early.
+
+   Requirements:
+
+   - example handler with `bridge.call(req).await`;
+   - mapping table: Tina outcomes to HTTP status;
+   - docs for cloning handles and shutdown;
+   - no Axum-specific crate unless Tower helper is painful in practice.
+
+   Target shape:
+
+   ```rust
+   async fn handler(
+       State(tina): State<TinaAxumState>,
+       Json(req): Json<AppRequest>,
+   ) -> Result<Json<AppReply>, StatusCode> {
+       tina.call(req).await.map(Json).map_err(map_tina_error)
+   }
+   ```
+
+   This should be example/helper glue over `tina-tower-bridge` or
+   `tina-tokio-bridge`, not a new crate first.
+
+8. **WebSocket Bridge Adapter**
+
+   Improve the current WebSocket comparison into a reusable pattern if needed.
 
    Requirements:
 
@@ -138,7 +408,27 @@ Expected before or during this phase:
    - close handshake behavior documented;
    - Tina room/session core remains isolate-owned.
 
-8. **Tracing And Context Across Bridge**
+   Target bridge shape:
+
+   ```text
+   Tokio WebSocket edge
+     -> bounded inbound messages to Tina session/room isolates
+     -> bounded outbound queue per peer
+     -> slow reader gets visible full/close policy
+   ```
+
+   First form should avoid pretending bidirectional streams are easy:
+
+   ```text
+   inbound capacity
+   outbound capacity per peer
+   max message size
+   slow-reader policy
+   close policy
+   shutdown policy
+   ```
+
+9. **Tracing And Context Across Bridge**
 
    Requirements:
 
@@ -147,13 +437,169 @@ Expected before or during this phase:
    - context propagation is optional;
    - simulator/replay story is documented.
 
+10. **`tina-smol-bridge` Sketch**
+
+   Later, maybe. Keep Tina runtime-neutral in posture.
+
+   Requirements:
+
+   - `smol`/`async-io` apps can call Tina services through bounded bridge calls;
+   - no Tokio dependency;
+   - same pressure vocabulary as `tina-tokio-bridge`;
+   - sketch only unless a real app/example needs it.
+
+## IDD Slices
+
+Ship as small PRs. Do not combine unrelated bridge crates just because they are
+all bridges.
+
+1. **051A — Bridge Lifecycle And Contract Docs**
+
+   Scope:
+
+   - confirm `tina-tokio-bridge` lifecycle cleanup from 047;
+   - docs page for generic bridge contract;
+   - table of preserved vs weakened Tina guarantees;
+   - shutdown/drain tests if not already landed.
+
+   Done when:
+
+   - examples no longer need `Arc::try_unwrap` shutdown dances;
+   - pending bridge calls settle visibly;
+   - terminal report/trace remains available.
+
+2. **051B — `tina-rpc-tokio` Landing Review**
+
+   Scope:
+
+   - finish or review the mostly-done RPC Tokio facade;
+   - prove dropped future behavior;
+   - prove `Full`/`Closed`/`Timeout` mapping;
+   - docs say this is async edge facade over native Tina RPC.
+
+   Done when:
+
+   - Tokio caller can `await` a native Tina RPC call;
+   - no hidden queue or retry exists;
+   - cancellation/late reply behavior is tested.
+
+3. **051C — `tina-tower-bridge`**
+
+   Scope:
+
+   - one small crate;
+   - `tower::Service` wrapper over a Tina bridge handle;
+   - readiness/backpressure contract;
+   - minimal Axum example may use this crate, but no Axum crate.
+
+   Done when:
+
+   - Tower service maps Tina `Full`, `Closed`, and `Timeout` explicitly;
+   - readiness does not hide unbounded waiting;
+   - cancellation before/after admission is tested.
+
+4. **051D — `tina-reqwest-bridge`**
+
+   Scope:
+
+   - one small crate;
+   - bounded outbound HTTP request worker/pool around `reqwest`;
+   - response body cap;
+   - redirect/retry policy explicit.
+
+   Done when:
+
+   - Tina service can call outbound HTTP through bounded bridge;
+   - overload is visible;
+   - shutdown cancels or drains honestly;
+   - docs contrast native Tina HTTP client from bridge reqwest worker.
+
+5. **051E — `tina-sqlx-bridge` First Form**
+
+   Scope:
+
+   - one small crate or runnable example if crate is too much for first PR;
+   - bounded query worker/pool around SQLx;
+   - timeout and pool capacity visible;
+   - transaction non-goal or first-form explicit.
+
+   Done when:
+
+   - Tina service can submit a bounded DB query;
+   - pool busy/full is not hidden;
+   - SQLx cancellation limits are documented.
+
+6. **051F — `tina-aws-bridge`**
+
+   Scope:
+
+   - one small crate;
+   - bounded AWS SDK worker/pool;
+   - S3 first form preferred because it tests body size and network pressure;
+   - DynamoDB/SQS can be added if the first slice is still small;
+   - explicit SDK retry policy;
+   - metrics/pressure report.
+
+   Done when:
+
+   - Tina service can submit bounded AWS operation work;
+   - `max_in_flight` and bounded ingress are tested;
+   - timeout and late-result behavior are tested;
+   - SDK retry count is visible or retries are disabled;
+   - CI uses fake/local endpoint, not real AWS credentials.
+
+7. **051G — Optional Bridge Follow-Ups**
+
+   Scope:
+
+   - Axum helper/example on top of Tower;
+   - WebSocket adapter only if repeated use needs it;
+   - `tina-smol-bridge` sketch only.
+
+   Done when:
+
+   - follow-ups either land as small examples/docs or move to a later phase.
+
+## DAG
+
+```text
+051A lifecycle/docs
+  ├─> 051B tina-rpc-tokio review
+  ├─> 051C tower bridge
+  ├─> 051D reqwest bridge
+  ├─> 051E sqlx bridge
+  └─> 051F aws bridge
+
+051C tower bridge
+  └─> 051G Axum helper/example
+
+051D reqwest bridge
+  └─> later native-vs-bridge outbound HTTP docs
+
+051E sqlx bridge
+  └─> informs 055 native DB
+
+051F aws bridge
+  └─> later AWS/Fly overload probe
+```
+
+051B/051C/051D/051E/051F can run mostly in parallel after 051A names the generic
+bridge contract. They should not share implementation files except workspace
+metadata and shared docs.
+
 ## Required Proof
 
 - Bridge examples compile and run.
-- Axum and Tower examples show `Full`, `Closed`, and `Timeout` mapping.
-- Reqwest bridge worker proves bounded outbound call.
-- SQLx/tokio-postgres bridge is either runnable first form or documented sketch
-  with clear missing work.
+- Adapter crates/features do not affect default native Tina builds.
+- Generic bridge docs list preserved and weakened guarantees.
+- Tower example shows `Full`, `Closed`, and `Timeout` mapping.
+- AWS bridge worker proves bounded AWS operation admission and timeout without
+  real AWS credentials in CI.
+- Reqwest bridge worker proves bounded outbound HTTP call.
+- SQLx bridge proves bounded DB query call or lands with a clearly marked
+  runnable first slice plus explicit non-goals.
+- RPC Tokio facade proves async call maps to native Tina RPC without hiding
+  pressure.
 - Shutdown tests prove bridge closes cleanly.
 - Docs clearly separate native Tina path from bridge path.
 

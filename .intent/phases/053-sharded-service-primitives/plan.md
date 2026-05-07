@@ -31,7 +31,8 @@ Compromise:
 
 - use normal Rust `HashMap`, `BTreeMap`, counters, and vectors inside isolates;
 - Tina owns routing, placement, fanout, timeout, full/closed outcomes, and trace;
-- helpers are patterns first, not a hidden distributed database.
+- first form is examples plus small helper types where repetition proves value,
+  not a polished data-structure library.
 
 ## Non-Goals
 
@@ -42,6 +43,8 @@ Compromise:
 - No exactly-once update.
 - No remoting/clustering requirement.
 - No hiding partial failure.
+- No stable placement across shard-count changes unless a specific scheme is
+  introduced and tested.
 
 ## Rules
 
@@ -51,6 +54,7 @@ Compromise:
 - Aggregates report partial success, full, closed, timeout, and failed shard.
 - Hot-key pressure remains visible.
 - State stays owned by isolate/shard.
+- Docs must say these are local multi-shard patterns, not clustering.
 
 ## Rocks
 
@@ -60,6 +64,7 @@ Compromise:
 
    - deterministic key-to-shard mapping;
    - visible placement report;
+   - shard-count-change behavior documented;
    - wrong-shard/wrong-key rejection pattern;
    - tests for stable mapping.
 
@@ -90,7 +95,7 @@ Compromise:
    - bounded fanout;
    - per-target timeout;
    - aggregate timeout;
-   - partial result type;
+   - public or example-owned partial result type;
    - cancellation/shutdown behavior visible;
    - no hidden unbounded reply collection.
 
@@ -128,10 +133,11 @@ Compromise:
 ## Required Proof
 
 - Multi-shard sharded counter works live and in sim.
-- Sharded map routes keys deterministically.
+- Sharded map routes keys deterministically live and in sim.
 - Scatter/gather reports partial outcomes.
 - Hot-key pressure is visible as full/timeout, not hidden buffering.
 - Docs say these are primitives/patterns, not a database.
+- Docs say this is not remoting or clustering.
 
 ## Done Means
 

@@ -24,6 +24,10 @@ Expected before this matters:
 - cost smoke shows where kernel TCP/io_uring is or is not enough;
 - capability reports can tell backend truth.
 
+Do not start this phase until 049 has North Sea cost rows and at least one
+native HTTP/RPC pressure case suggests kernel TCP or `io_uring` is the actual
+bottleneck.
+
 ## Non-Goals
 
 - No DPDK implementation.
@@ -33,6 +37,7 @@ Expected before this matters:
 - No performance claim.
 - No public API promise.
 - No launch blocker.
+- No code changes required.
 
 ## Rules
 
@@ -42,6 +47,7 @@ Expected before this matters:
   progress, runtime-owned buffers, visible cancellation, visible shutdown, and
   capability truth.
 - Platform truth beats ambition.
+- "No" is a valid answer if evidence does not justify the work.
 
 ## Rocks
 
@@ -94,9 +100,12 @@ Expected before this matters:
 - Need-test criteria exist.
 - No code claims userspace TCP support.
 - Roadmap marks this as later research, not planned launch work.
+- Output artifact exists, likely
+  `docs/research/userspace-tcp.md` or this phase's `research.md`.
 
 ## Done Means
 
 - The gap is named honestly.
 - Future workers know what would justify the work.
 - Tina does not cosplay DPDK.
+- The phase may close with "not worth building yet."

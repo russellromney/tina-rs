@@ -77,6 +77,6 @@ It cannot fully prove:
 - cgroup memory kill behavior
 - Fly machine behavior
 
-That is why Eiffel has real I/O comparisons too.
+That is why Tina still needs real I/O pressure tests too.
 
 Use sim for interleavings and logic. Use real processes for physics.

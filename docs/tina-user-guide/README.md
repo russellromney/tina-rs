@@ -2,6 +2,10 @@
 
 Grug guide for using Tina.
 
+This guide is for builders. That includes humans and LLM sessions. It should
+answer "what shape should I write?" before anyone has to read five examples and
+guess.
+
 Tina is small machine:
 
 - isolate owns state
@@ -12,11 +16,14 @@ Tina is small machine:
 - overload should say `Full`, `Closed`, or `Timeout`
 - same isolate should run live and in simulation
 
-This guide is for people porting small Tokio-shaped libraries into Tina and
-writing comparison examples for Eiffel.
+The rule: docs teach the Tina model. Eiffel examples test the model.
+
+If you are an LLM session, or reviewing code written by one, read
+[Agent Quickstart](00-agent-quickstart.md) first. It is the short checklist.
 
 Read in order if new:
 
+0. [Agent Quickstart](00-agent-quickstart.md)
 1. [Mental Model](01-mental-model.md)
 2. [First Isolate](02-first-isolate.md)
 3. [Effects And Runtime Calls](03-effects-and-runtime-calls.md)
@@ -26,10 +33,33 @@ Read in order if new:
 7. [Supervision](07-supervision.md)
 8. [Simulation And DST](08-simulation-and-dst.md)
 9. [Tokio To Tina Porting](09-tokio-to-tina-porting.md)
-10. [Ergonomics Notes](10-ergonomics-notes.md)
+10. [Service Patterns](10-service-patterns.md)
 11. [Ergonomics Checklist](11-ergonomics-checklist.md)
+12. [I/O Model](12-io-model.md)
+13. [Outcome Glossary](13-outcome-glossary.md)
+14. [Lifecycle And Shutdown](14-lifecycle-and-shutdown.md)
+15. [Service Client Worked Example](15-service-client-worked-example.md)
 
 For runnable specimens, see repo-root `examples/`.
 
+If Tina feels awkward, record the paper cut in `examples/FINDINGS.md` or the
+next phase plan. Docs explain the current blessed shape. Docs are not the
+paper-cut inbox.
+
 The docs are intentionally plain. When in doubt, prefer a boring message enum,
 a boring state struct, and a boring handler that returns one explicit effect.
+
+## Pekka Questions
+
+If someone with a runtime/substrate brain reads Tina, they will ask:
+
+- Where does I/O really happen?
+- Which queues are bounded?
+- What wakes the machine?
+- What happens on close while work is pending?
+- What is live behavior, and what is simulation?
+- What perf claim is proved, and what is only possible later?
+
+The short answer: Tina owns semantics and resource truth; Betelgeuse is the
+current portable live I/O substrate; `tina-sim` is the deterministic oracle;
+North Sea later swaps in a Linux `io_uring` backend without changing user code.

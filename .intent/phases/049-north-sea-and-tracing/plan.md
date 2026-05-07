@@ -47,6 +47,17 @@ Missing for ops:
 - OTel/W3C propagation plan;
 - stable event identity/fingerprint path from 047.
 
+## Coordination
+
+049 can start now.
+
+Coordinate with:
+
+- 047 for stable trace fingerprints / event identity;
+- 048 for HTTP streaming and buffer ownership needs;
+- 051 for bridge tracing context;
+- 054 later, because userspace TCP research should wait for North Sea evidence.
+
 ## Non-Goals
 
 - No native HTTP implementation. That is 048.
@@ -100,12 +111,14 @@ Missing for ops:
 
    Candidate:
 
-   - one Linux-only crate/module or test;
+   - default target: a future `tina-runtime-uring` crate or private
+     `tina-runtime` module, whichever is less disruptive for the spike;
    - bind loopback TCP;
    - accept one connection;
    - read bytes;
    - write bytes;
    - close;
+   - cancel or close one pending operation and observe the outcome;
    - explicit step/progress function;
    - no async executor.
 
@@ -164,6 +177,8 @@ Missing for ops:
    - export can be disabled;
    - export has bounded/drop policy;
    - adapter does not change runtime semantics.
+   - at least one test subscriber captures emitted events and asserts key
+     fields.
 
    If 047 stable trace fingerprint is not landed, prototype but do not promise
    stable external identity.

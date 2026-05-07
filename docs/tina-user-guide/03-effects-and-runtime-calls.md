@@ -51,6 +51,62 @@ runtime sends Msg::TimerDone or Msg::TimerFailed
 
 The continuation is a normal message.
 
+## Continuation Carries Call Context
+
+Important grug truth:
+
+`reply(...)` is not only for the first handler turn.
+
+If an isolate is handling a request/reply call, and it returns a runtime call
+with `.reply(...)`, Tina carries the original reply context through that
+continuation chain.
+
+That means a service can do this:
+
+```text
+caller calls store
+store starts journal_append runtime call
+runtime later sends store Journaled
+store replies to original caller
+```
+
+Shape:
+
+```rust
+match msg {
+    StoreMsg::Store(request) => {
+        journal_append(self.path.clone(), request.bytes.clone())
+            .reply(|result| StoreMsg::Journaled(result, request))
+    }
+    StoreMsg::Journaled(Ok(()), request) => {
+        self.apply(request);
+        reply(StoreReply::Stored)
+    }
+    StoreMsg::Journaled(Err(_), _request) => {
+        reply(StoreReply::Failed)
+    }
+}
+```
+
+This is why service-shaped clients work:
+
+```rust
+call(http_client, OutboundCall { target, request }, timeout)
+    .reply(MyMsg::HttpReturned)
+```
+
+The `http_client` isolate may need many TCP turns before it answers. That is
+fine if those turns are built as runtime-call continuations. The original caller
+still receives the final reply or the call times out.
+
+Grug warning:
+
+- Context is carried by Tina continuation machinery.
+- Do not stash arbitrary reply handles in side channels.
+- Do not spawn a separate child just to route one reply back unless topology
+  really needs that.
+- Always keep the caller timeout honest.
+
 ## TCP Read Example
 
 ```rust
@@ -95,7 +151,7 @@ batch(vec![
 ```
 
 Batch is useful. Batch can also make ergonomics feel clunky when many effect
-types are involved. When that happens, write it down in Eiffel notes.
+types are involved. When that happens, write it down as a Tina paper cut.
 
 ## No Async In Handler
 

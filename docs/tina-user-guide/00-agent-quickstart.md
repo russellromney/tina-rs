@@ -1,0 +1,103 @@
+# Agent Quickstart
+
+Read this before writing Tina code.
+
+Tina is not async Rust with different names. Tina is state machines plus
+runtime-owned effects.
+
+## Core Rules
+
+- Handler is sync.
+- Handler owns state.
+- Handler returns one `Effect`.
+- Runtime performs side effects.
+- Runtime later sends continuation messages.
+- Every request/reply has a timeout.
+- Every important queue has a capacity.
+- Overload is a normal result: `Full`, `Closed`, or `Timeout`.
+
+No `.await` in handler. No direct socket reads in handler. No hidden unbounded
+channel unless the boundary is explicitly an adapter.
+
+## Common Imports
+
+```rust
+use std::time::Duration;
+use tina::prelude::*;
+use tina_runtime::{
+    call, noop, reply, send, stop,
+    sleep, tcp_read, tcp_write,
+    CallError, CallOutcome,
+};
+```
+
+Names move sometimes. The shape matters more than the exact path.
+
+## First Shape To Reach For
+
+```rust
+#[derive(Debug, Clone)]
+enum Msg {
+    Start,
+    Done(Result<(), CallError>),
+}
+
+struct Worker;
+
+#[tina_runtime::isolate(message = Msg, shard = AppShard)]
+impl Worker {
+    fn handle(&mut self, msg: Msg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            Msg::Start => sleep(Duration::from_millis(10)).reply(Msg::Done),
+            Msg::Done(Ok(())) => noop(),
+            Msg::Done(Err(_)) => stop(),
+        }
+    }
+}
+```
+
+## Request Reply Shape
+
+Caller:
+
+```rust
+call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
+    .reply(ClientMsg::WorkerReturned)
+```
+
+Worker:
+
+```rust
+match msg {
+    WorkerMsg::Run(job) => reply(self.run(job)),
+}
+```
+
+If the worker needs I/O first, it can still reply later through continuation
+messages. Do not spawn a one-shot child only to route a reply back.
+
+## When Porting Tokio
+
+Map:
+
+| Tokio | Tina |
+| --- | --- |
+| task state across `.await` | isolate fields |
+| `.await` point | next message variant |
+| `tokio::spawn` | child isolate |
+| `mpsc` | bounded mailbox |
+| socket read/write | runtime call effect |
+| `sleep().await` | `sleep(...).reply(...)` |
+| request then await answer | `call(..., timeout).reply(...)` |
+
+## What To Check Before Done
+
+- What is the mailbox capacity?
+- What is the call timeout?
+- What happens when destination is full?
+- What happens when destination is closed?
+- What happens when caller times out but callee later replies?
+- What resource is owned by which isolate?
+- Can the same logic run in `tina-sim`?
+
+If you cannot answer those, the code is not done.

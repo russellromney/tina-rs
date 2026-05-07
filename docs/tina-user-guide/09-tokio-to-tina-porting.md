@@ -73,7 +73,7 @@ The trade is explicit state and runtime control.
 
 ## Comparison Checklist
 
-When doing an Eiffel port, record:
+When porting Tokio-shaped code, record:
 
 - what got shorter in Tokio
 - what got clearer in Tina

@@ -68,9 +68,9 @@ impl Producer {
 }
 ```
 
-This is the heart of the Tokio comparison.
+This is the heart of Tina service shape.
 
-Tokio often accepts into a channel or spawned task until pressure appears
+Many async systems accept into a channel or spawned task until pressure appears
 somewhere else.
 
 Tina should be able to say:
@@ -92,9 +92,9 @@ Handle timeout as normal behavior.
 
 Do not panic on timeout in service code.
 
-## Comparison Rule
+## Measurement Rule
 
-For every Eiffel comparison, collect:
+When testing a Tina service under load, collect:
 
 - accepted work
 - rejected full
@@ -104,8 +104,8 @@ For every Eiffel comparison, collect:
 - exit status
 - crude RSS if the platform gives it
 
-First pass can run without hard memory caps. Later pass uses Linux/Fly/Docker
-limits.
+First pass can run without hard memory caps. Later pressure passes can use
+Linux/Fly/Docker limits.
 
 ## What Counts As Failure
 

@@ -108,4 +108,5 @@ Watch for:
 - accept loop plus spawn requiring `batch`
 - shutdown and close paths feeling verbose
 
-Do not hide pain too early. Eiffel wants to find it.
+Do not hide pain too early. First write the honest state machine. Then extract
+helpers only when the repeated shape is real.
