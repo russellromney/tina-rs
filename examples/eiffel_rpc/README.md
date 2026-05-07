@@ -96,18 +96,22 @@ What feels better:
 
 What feels worse:
 
-- **Tina's setup is more code.** Mailbox + factory boilerplate,
-  a Listener isolate that walks `Bound → Accepted → spawn
-  Connection`, registering a Registry that maps wire service
-  name to dispatch isolate. The Tokio side is `bind/accept/spawn`.
+- **Tina's setup has more pieces.** A Listener isolate that walks
+  `Bound → Accepted → spawn(Connection)`, a Registry that maps
+  wire service name to dispatch isolate, the `SingleService`
+  adapter wrapping `Dispatch`. Each piece is small (047 retired
+  the mailbox-factory and per-shard-type boilerplate, and
+  `runtime.observe_next_bound()` retired the
+  `Arc<Mutex<Option<SocketAddr>>>` side channel) but there are
+  more of them. The Tokio side is `bind / accept / spawn`.
 - **The wire shape is JSON-tuple-encoded.** The macro decodes
   `fn ping(payload: Vec<u8>)` from a JSON `[<bytes>]`. Clients
   must produce that shape. Positional tuples are not additive —
   adding an arg changes the JSON array length and silently
   breaks old clients.
 - **The Tokio side reads cleanly top-to-bottom.** The Tina side
-  has more pieces (Service, Registry, Connection, Listener) and
-  the wiring between them is the cost of the runtime model.
+  has more pieces and the wiring between them is the cost of the
+  runtime model.
 
 What this suggests:
 
@@ -119,7 +123,6 @@ What this suggests:
   surface. The boilerplate it removes is exactly the part that
   rots in hand-written services (method match, decode/encode,
   error mapping).
-- The setup overhead is real and is where future ergonomics
-  work should focus. The runtime + isolate model has a price;
-  the goal isn't to hide it but to keep the per-service cost
-  small.
+- The remaining setup cost is the Listener / Registry / Service
+  separation. That's load-bearing — each piece has a real job —
+  but it's still where future ergonomics work should focus.

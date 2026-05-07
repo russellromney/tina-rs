@@ -13,13 +13,13 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_rpc::{
-    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Dispatch, Encoding, Frame,
-    FrameError, FrameKind, FrameLimits, Json, LENGTH_PREFIX_SIZE, PayloadLimits, Registry,
-    RegistryMsg, RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
+    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Encoding, Frame, FrameError,
+    FrameKind, FrameLimits, Json, LENGTH_PREFIX_SIZE, PayloadLimits, Registry, RegistryMsg,
+    RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
 };
 use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, ListenerId, ThreadedRuntime, ThreadedRuntimeConfig,
-    tcp_accept, tcp_bind, tcp_close_listener,
+    CallError, DefaultThreadedMailboxFactory, ListenerId, ThreadedRuntime, tcp_accept, tcp_bind,
+    tcp_close_listener,
 };
 
 use crate::{Report, RunConfig};
@@ -99,26 +99,15 @@ impl Listener {
 // -------------------------------------------------------------------
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::with_config(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 32,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
 
     // 1. Typed dispatch: the `#[service]` macro emits `EchoService`
     //    with a JSON-tuple decoder for each method's args and a JSON
     //    encoder for each return type.
-    let dispatch: Dispatch<EchoState, Json, SingleShard> =
+    let dispatch =
         EchoService::dispatch::<EchoState, SingleShard>(EchoState, PayloadLimits::default());
     let service = runtime
-        .register_with_capacity::<SingleService<Dispatch<EchoState, Json, SingleShard>, SingleShard>, Infallible>(
-            SingleService::new(dispatch),
-            16,
-        )
+        .register_with_capacity::<_, Infallible>(SingleService::new(dispatch), 16)
         .map_err(|e| anyhow::anyhow!("register service: {e:?}"))?;
 
     // 2. Registry mapping wire service name to the dispatch isolate.
@@ -126,14 +115,14 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         .service("echo", service)
         .build();
     let registry = runtime
-        .register_with_capacity::<Registry<SingleShard>, Infallible>(registry_state, 16)
+        .register_with_capacity::<_, Infallible>(registry_state, 16)
         .map_err(|e| anyhow::anyhow!("register registry: {e:?}"))?;
 
     // 3. Listener that binds, accepts once, and spawns the Connection
     //    isolate that enforces the in-flight cap on the wire.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
     let listener = runtime
-        .register_with_capacity::<Listener, Infallible>(
+        .register_with_capacity::<_, Infallible>(
             Listener {
                 bind_addr,
                 router: registry,
