@@ -68,7 +68,19 @@ impl HttpRequestHead {
             path: self.path,
             version: self.version,
             headers: self.headers,
-            body,
+            body: crate::types::HttpRequestBody::Buffered(body),
+        }
+    }
+
+    /// Builds a request whose body is a streaming source. Used by the
+    /// connection isolate when a body exceeds the buffered threshold.
+    pub fn into_streaming_request(self, stream: crate::streaming::RequestStream) -> HttpRequest {
+        HttpRequest {
+            method: self.method,
+            path: self.path,
+            version: self.version,
+            headers: self.headers,
+            body: crate::types::HttpRequestBody::Stream(stream),
         }
     }
 }
@@ -231,13 +243,18 @@ fn is_origin_form(target: &str) -> bool {
     target.starts_with('/')
 }
 
-/// Serialises a response onto a wire buffer using HTTP/1.1 framing.
+/// Serialises a response head onto a wire buffer using HTTP/1.1 framing.
 ///
-/// First form: always emits `Content-Length`. Never emits chunked
-/// transfer encoding. Adds `Connection: close` when the caller says this
-/// response is the last response on the socket.
-pub fn encode_response(response: &crate::types::HttpResponse, connection_close: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + response.body.len());
+/// Emits status line + headers + `Content-Length` (taken from the
+/// body's declared length) + optional `Connection: close` + the empty
+/// terminator line. Body bytes are *not* appended — the connection
+/// isolate writes them separately so streaming can write chunk by
+/// chunk.
+pub fn encode_response_head(
+    response: &crate::types::HttpResponse,
+    connection_close: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
 
     let version_str = match response.version {
         Version::HTTP_10 => "HTTP/1.0",
@@ -269,13 +286,29 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Content-Length: ");
-    out.extend_from_slice(response.body.len().to_string().as_bytes());
+    out.extend_from_slice(response.body.declared_length().to_string().as_bytes());
     out.extend_from_slice(b"\r\n");
     if connection_close && !wrote_connection {
         out.extend_from_slice(b"Connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&response.body);
+    out
+}
+
+/// Serialises a buffered response (head + body) onto wire bytes.
+///
+/// Convenience for buffered responses; equivalent to
+/// [`encode_response_head`] followed by appending the body bytes.
+/// Panics if the response body is a streaming source — streamed
+/// responses use the head encoder and write chunks separately.
+pub fn encode_response(response: &crate::types::HttpResponse, connection_close: bool) -> Vec<u8> {
+    let mut out = encode_response_head(response, connection_close);
+    match &response.body {
+        crate::types::HttpResponseBody::Buffered(bytes) => out.extend_from_slice(bytes),
+        crate::types::HttpResponseBody::Stream(_) => {
+            panic!("encode_response cannot serialise a streaming body; use encode_response_head")
+        }
+    }
     out
 }
 
@@ -284,7 +317,13 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
 /// Always emits `Content-Length` (zero when no body) and `Connection:
 /// close` — one request per connection, no keep-alive on the client.
 pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + request.body.len());
+    let body_bytes: &[u8] = match &request.body {
+        crate::types::HttpRequestBody::Buffered(bytes) => bytes,
+        crate::types::HttpRequestBody::Stream(_) => {
+            panic!("encode_request cannot serialise a streaming body")
+        }
+    };
+    let mut out = Vec::with_capacity(128 + body_bytes.len());
 
     let version_str = match request.version {
         Version::HTTP_10 => "HTTP/1.0",
@@ -312,11 +351,11 @@ pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Content-Length: ");
-    out.extend_from_slice(request.body.len().to_string().as_bytes());
+    out.extend_from_slice(body_bytes.len().to_string().as_bytes());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&request.body);
+    out.extend_from_slice(body_bytes);
     out
 }
 
@@ -724,7 +763,7 @@ mod tests {
     #[test]
     fn encode_response_produces_valid_wire_bytes() {
         let mut response = crate::types::HttpResponse::with_status(StatusCode::OK);
-        response.body = b"hello".to_vec();
+        response.body = b"hello".to_vec().into();
         let bytes = encode_response(&response, false);
         let text = std::str::from_utf8(&bytes).expect("utf8");
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -743,7 +782,7 @@ mod tests {
     #[test]
     fn encode_response_overrides_framing_headers() {
         let mut response = crate::types::HttpResponse::with_status(StatusCode::OK);
-        response.body = b"hello".to_vec();
+        response.body = b"hello".to_vec().into();
         response.headers.insert(
             http::header::CONTENT_LENGTH,
             HeaderValue::from_static("999"),
@@ -768,7 +807,7 @@ mod tests {
             path: "/x".to_owned(),
             version: Version::HTTP_11,
             headers: HeaderMap::new(),
-            body: Vec::new(),
+            body: crate::types::HttpRequestBody::Buffered(Vec::new()),
         };
         let bytes = encode_request(&req);
         let text = std::str::from_utf8(&bytes).expect("utf8");

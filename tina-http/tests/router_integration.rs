@@ -24,7 +24,8 @@ fn say_hi(_: &HttpRequest) -> HttpResponse {
 }
 
 fn echo_body(req: &HttpRequest) -> HttpResponse {
-    HttpResponse::with_body(StatusCode::OK, req.body.clone())
+    let bytes = req.body.as_buffered().unwrap_or(&[]).to_vec();
+    HttpResponse::with_body(StatusCode::OK, bytes)
 }
 
 struct Service {

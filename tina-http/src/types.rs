@@ -2,16 +2,18 @@
 //! and service isolates.
 //!
 //! Wraps the `http` crate's `Method`, `StatusCode`, `HeaderMap`, and
-//! `Version` types. Body is a bounded `Vec<u8>`; streaming bodies are out
-//! of scope here.
+//! `Version` types. Bodies are either buffered (`Vec<u8>`) or streamed
+//! through a chunk-source isolate.
 
 use http::{HeaderMap, Method, StatusCode, Version};
 
 /// One parsed HTTP/1.x request, ready for service dispatch.
 ///
-/// The connection isolate constructs one of these per request; the service
-/// isolate receives it as its inbound message and replies with an
-/// [`HttpResponse`].
+/// The connection isolate constructs one of these per request; the
+/// service isolate receives it as its inbound message and replies with
+/// an [`HttpResponse`]. Body is either fully buffered or streamed
+/// through a chunk-source isolate — see
+/// [`HttpRequestBody`].
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     /// HTTP method (`GET`, `POST`, ...).
@@ -25,16 +27,94 @@ pub struct HttpRequest {
     /// All headers that arrived on the wire. Parsing rejects requests
     /// whose total header bytes exceed a configured limit.
     pub headers: HeaderMap,
-    /// Bounded request body. The first form requires `Content-Length`;
-    /// chunked transfer encoding is rejected as
-    /// [`RequestParseError::UnsupportedTransferEncoding`].
-    pub body: Vec<u8>,
+    /// Request body. Buffered up to a threshold; larger bodies are
+    /// dispatched as a [`HttpRequestBody::Stream`] the service pulls
+    /// from. Either way, [`HttpLimits::max_body_bytes`] caps the total
+    /// declared `Content-Length`.
+    pub body: HttpRequestBody,
+}
+
+/// Buffered request body or streaming source.
+#[derive(Debug, Clone)]
+pub enum HttpRequestBody {
+    /// All body bytes already accumulated by the connection isolate.
+    Buffered(Vec<u8>),
+    /// Streaming source: the service pulls chunks via
+    /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
+    /// .reply(...)` until `RequestChunkReply::Eof`.
+    Stream(crate::streaming::RequestStream),
+}
+
+impl HttpRequestBody {
+    /// Returns the buffered bytes, or `None` for a streaming body.
+    pub fn as_buffered(&self) -> Option<&[u8]> {
+        match self {
+            Self::Buffered(bytes) => Some(bytes),
+            Self::Stream(_) => None,
+        }
+    }
+
+    /// Returns total declared body length. For `Buffered` this is the
+    /// vec length; for `Stream` it is the declared `Content-Length`.
+    pub fn declared_length(&self) -> usize {
+        match self {
+            Self::Buffered(bytes) => bytes.len(),
+            Self::Stream(s) => s.content_length,
+        }
+    }
+}
+
+impl Default for HttpRequestBody {
+    fn default() -> Self {
+        Self::Buffered(Vec::new())
+    }
+}
+
+impl From<Vec<u8>> for HttpRequestBody {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Buffered(bytes)
+    }
+}
+
+// Equality with byte slices preserves the existing `assert_eq!(req.body,
+// b"...")` test ergonomics. Streaming bodies always compare unequal.
+impl PartialEq<[u8]> for HttpRequestBody {
+    fn eq(&self, other: &[u8]) -> bool {
+        match self {
+            Self::Buffered(bytes) => bytes == other,
+            Self::Stream(_) => false,
+        }
+    }
+}
+
+impl<const N: usize> PartialEq<[u8; N]> for HttpRequestBody {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self == &other[..]
+    }
+}
+
+impl PartialEq<&[u8]> for HttpRequestBody {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self == *other
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for HttpRequestBody {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self == &other[..]
+    }
+}
+
+impl PartialEq<Vec<u8>> for HttpRequestBody {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self == other.as_slice()
+    }
 }
 
 /// One HTTP/1.x response produced by a service isolate.
 ///
-/// The connection isolate serialises this onto the wire. The first form
-/// does not stream response bodies; large responses must fit in memory.
+/// The connection isolate serialises this onto the wire. Body is either
+/// buffered or streamed — see [`HttpResponseBody`].
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     /// Status code.
@@ -43,8 +123,85 @@ pub struct HttpResponse {
     pub version: Version,
     /// Response headers.
     pub headers: HeaderMap,
-    /// Bounded response body.
-    pub body: Vec<u8>,
+    /// Response body.
+    pub body: HttpResponseBody,
+}
+
+/// Buffered response body or streaming source.
+#[derive(Debug, Clone)]
+pub enum HttpResponseBody {
+    /// All response bytes built up-front by the service.
+    Buffered(Vec<u8>),
+    /// Streaming source: the connection isolate pulls chunks via
+    /// `call(stream.source, ResponseChunkMsg::Next, t).reply(...)`
+    /// until `ResponseChunkReply::Eof`.
+    Stream(crate::streaming::ResponseStream),
+}
+
+impl HttpResponseBody {
+    /// Returns the buffered bytes, or `None` for a streaming body.
+    pub fn as_buffered(&self) -> Option<&[u8]> {
+        match self {
+            Self::Buffered(bytes) => Some(bytes),
+            Self::Stream(_) => None,
+        }
+    }
+
+    /// Total declared body length: vec length for `Buffered`, declared
+    /// `content_length` for `Stream`.
+    pub fn declared_length(&self) -> usize {
+        match self {
+            Self::Buffered(bytes) => bytes.len(),
+            Self::Stream(s) => s.content_length,
+        }
+    }
+}
+
+impl Default for HttpResponseBody {
+    fn default() -> Self {
+        Self::Buffered(Vec::new())
+    }
+}
+
+impl From<Vec<u8>> for HttpResponseBody {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Buffered(bytes)
+    }
+}
+
+// Equality with byte slices keeps `assert_eq!(resp.body, b"...")`
+// ergonomic. Streaming bodies always compare unequal.
+impl PartialEq<[u8]> for HttpResponseBody {
+    fn eq(&self, other: &[u8]) -> bool {
+        match self {
+            Self::Buffered(bytes) => bytes == other,
+            Self::Stream(_) => false,
+        }
+    }
+}
+
+impl<const N: usize> PartialEq<[u8; N]> for HttpResponseBody {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self == &other[..]
+    }
+}
+
+impl PartialEq<&[u8]> for HttpResponseBody {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self == *other
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for HttpResponseBody {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self == &other[..]
+    }
+}
+
+impl PartialEq<Vec<u8>> for HttpResponseBody {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self == other.as_slice()
+    }
 }
 
 impl HttpResponse {
@@ -59,7 +216,7 @@ impl HttpResponse {
             status,
             version: Version::HTTP_11,
             headers: HeaderMap::new(),
-            body: Vec::new(),
+            body: HttpResponseBody::default(),
         }
     }
 
@@ -71,7 +228,7 @@ impl HttpResponse {
             http::header::CONTENT_TYPE,
             http::HeaderValue::from_static("text/plain"),
         );
-        response.body = body;
+        response.body = HttpResponseBody::Buffered(body);
         response
     }
 
@@ -79,7 +236,16 @@ impl HttpResponse {
     /// responsible for setting `Content-Type` if relevant.
     pub fn with_body(status: StatusCode, body: Vec<u8>) -> Self {
         let mut response = Self::with_status(status);
-        response.body = body;
+        response.body = HttpResponseBody::Buffered(body);
+        response
+    }
+
+    /// Builds a response with a streaming body. The service must
+    /// register the chunk source isolate separately and supply its
+    /// address.
+    pub fn with_stream(status: StatusCode, stream: crate::streaming::ResponseStream) -> Self {
+        let mut response = Self::with_status(status);
+        response.body = HttpResponseBody::Stream(stream);
         response
     }
 
@@ -126,15 +292,16 @@ impl HttpResponse {
 }
 
 impl HttpRequest {
-    /// Borrows the body as a `&str`. Returns the underlying UTF-8 error if
-    /// the bytes are not valid UTF-8.
-    pub fn body_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.body)
+    /// Borrows the buffered body as `&str`. Returns `None` for streaming
+    /// bodies; returns `Err` for buffered bodies that aren't valid UTF-8.
+    pub fn body_str(&self) -> Option<Result<&str, std::str::Utf8Error>> {
+        self.body.as_buffered().map(std::str::from_utf8)
     }
 
-    /// Returns `true` if the request carries any body bytes.
+    /// Returns `true` if the request carries any body bytes (either
+    /// buffered non-empty, or a stream with non-zero declared length).
     pub fn has_body(&self) -> bool {
-        !self.body.is_empty()
+        self.body.declared_length() > 0
     }
 }
 
@@ -240,6 +407,21 @@ pub struct HttpLimits {
     /// CRLF CRLF). Slow-loris-style clients that drip-feed bytes hit this and
     /// the connection closes without reaching the service.
     pub header_read_timeout: std::time::Duration,
+    /// When `Some(chunk_size)`, the connection isolate dispatches a
+    /// non-empty request body as a [`crate::HttpRequestBody::Stream`]
+    /// source as soon as the head parses, then pulls body bytes from
+    /// the socket on demand. The service drives the pull with
+    /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
+    /// .reply(...)`; each call returns a chunk of up to `chunk_size`
+    /// bytes (or `Eof`). The connection only issues `tcp_read` when
+    /// the buffer is empty and more body is owed, so a slow service
+    /// applies real backpressure to TCP reads and only the in-flight
+    /// chunk is resident.
+    ///
+    /// When `None` (the default), the connection accumulates the full
+    /// body up to `max_body_bytes` and dispatches a
+    /// [`crate::HttpRequestBody::Buffered`].
+    pub inbound_stream_chunk_size: Option<usize>,
 }
 
 impl Default for HttpLimits {
@@ -249,6 +431,7 @@ impl Default for HttpLimits {
             max_body_bytes: 1024 * 1024,
             max_headers: 64,
             header_read_timeout: std::time::Duration::from_secs(10),
+            inbound_stream_chunk_size: None,
         }
     }
 }
@@ -290,6 +473,7 @@ impl HttpServerConfig {
                 max_body_bytes: 64 * 1024,
                 max_headers: 32,
                 header_read_timeout: std::time::Duration::from_millis(500),
+                inbound_stream_chunk_size: None,
             },
             service_call_timeout: std::time::Duration::from_secs(1),
             connection_mailbox_capacity: 8,
@@ -333,6 +517,7 @@ impl HttpClientConfig {
                 max_body_bytes: 64 * 1024,
                 max_headers: 32,
                 header_read_timeout: std::time::Duration::from_millis(500),
+                inbound_stream_chunk_size: None,
             },
             request_timeout: std::time::Duration::from_secs(1),
         }
