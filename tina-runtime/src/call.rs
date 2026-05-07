@@ -1109,7 +1109,7 @@ mod runtime_callable_sealed {
 /// Marker trait identifying `Isolate::Call` types accepted by simulator-
 /// driven and runtime-call-aware contexts.
 ///
-/// Phase 047 Rock 5: this trait is implemented only for [`RuntimeCall`].
+/// This trait is implemented only for [`RuntimeCall`].
 /// Surfaces in simulator and runtime-call bounds get a clearer compile
 /// error than the previous `Call = RuntimeCall<...>` equality mismatch
 /// when an isolate is authored with `#[tina::isolate]` (which defaults
@@ -2484,3 +2484,130 @@ pub fn journal_replay(path: impl Into<PathBuf>) -> TypedCall<JournalReplay> {
         CallOutput::into_journal_replayed,
     )
 }
+
+// ---------------------------------------------------------------------------
+// Type aliases for runtime-call replies.
+//
+// Lets isolate enums spell `Connected(TcpConnectReply)` instead of
+// `Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>)` and
+// keeps the concrete payload visible by way of the alias name.
+// ---------------------------------------------------------------------------
+
+/// The shape every runtime-owned call delivers back: success payload or
+/// typed [`CallError`].
+pub type CallReply<T> = Result<T, CallError>;
+
+/// Reply delivered by [`sleep`].
+pub type SleepReply = CallReply<()>;
+
+/// Reply delivered by [`tcp_bind`].
+pub type TcpBindReply = CallReply<(ListenerId, SocketAddr)>;
+
+/// Reply delivered by [`tcp_accept`].
+pub type TcpAcceptReply = CallReply<(StreamId, SocketAddr)>;
+
+/// Reply delivered by [`tcp_connect`].
+pub type TcpConnectReply = CallReply<(StreamId, SocketAddr, SocketAddr)>;
+
+/// Reply delivered by [`tcp_read`].
+pub type TcpReadReply = CallReply<Vec<u8>>;
+
+/// Reply delivered by [`tcp_write`].
+pub type TcpWriteReply = CallReply<usize>;
+
+/// Reply delivered by [`tcp_close_listener`].
+pub type TcpListenerCloseReply = CallReply<()>;
+
+/// Reply delivered by [`tcp_close_stream`].
+pub type TcpStreamCloseReply = CallReply<()>;
+
+/// Reply delivered by [`udp_bind`].
+pub type UdpBindReply = CallReply<(UdpSocketId, SocketAddr)>;
+
+/// Reply delivered by [`udp_send_to`].
+pub type UdpSendToReply = CallReply<usize>;
+
+/// Reply delivered by [`udp_recv_from`]. The `bool` is `true` on truncated
+/// datagrams.
+pub type UdpRecvFromReply = CallReply<(SocketAddr, Vec<u8>, bool)>;
+
+/// Reply delivered by [`udp_close_socket`].
+pub type UdpCloseSocketReply = CallReply<()>;
+
+/// Reply delivered by [`tls_connect`].
+pub type TlsConnectReply = CallReply<TlsStreamId>;
+
+/// Reply delivered by [`tls_bind`].
+pub type TlsBindReply = CallReply<(TlsListenerId, SocketAddr)>;
+
+/// Reply delivered by [`tls_accept`].
+pub type TlsAcceptReply = CallReply<(TlsStreamId, SocketAddr)>;
+
+/// Reply delivered by [`tls_close_listener`].
+pub type TlsListenerCloseReply = CallReply<()>;
+
+/// Reply delivered by [`tls_read`].
+pub type TlsReadReply = CallReply<Vec<u8>>;
+
+/// Reply delivered by [`tls_write`].
+pub type TlsWriteReply = CallReply<usize>;
+
+/// Reply delivered by [`tls_close`].
+pub type TlsCloseReply = CallReply<()>;
+
+/// Reply delivered by [`snapshot_commit`].
+pub type SnapshotCommitReply = CallReply<()>;
+
+/// Reply delivered by [`snapshot_load`].
+pub type SnapshotLoadReply = CallReply<Option<SnapshotImage>>;
+
+/// Reply delivered by [`journal_append`].
+pub type JournalAppendReply = CallReply<()>;
+
+/// Reply delivered by [`journal_replay`].
+pub type JournalReplayReply = CallReply<JournalReplay>;
+
+/// Reply delivered by [`signal_wait`].
+pub type SignalWaitReply = CallReply<String>;
+
+/// Reply delivered by [`dns_lookup`].
+pub type DnsLookupReply = CallReply<Vec<SocketAddr>>;
+
+/// Reply delivered by [`process_run`].
+pub type ProcessRunReply = CallReply<ProcessRunResult>;
+
+/// Reply delivered by [`file_open`] / [`file_create`].
+pub type FileOpenReply = CallReply<FileId>;
+
+/// Reply delivered by [`file_read`] / [`file_read_at`].
+pub type FileReadReply = CallReply<Vec<u8>>;
+
+/// Reply delivered by [`file_write`] / [`file_write_at`].
+pub type FileWriteReply = CallReply<usize>;
+
+/// Reply delivered by [`file_fsync`].
+pub type FileFsyncReply = CallReply<()>;
+
+/// Reply delivered by [`file_size`].
+pub type FileSizeReply = CallReply<u64>;
+
+/// Reply delivered by [`file_close`].
+pub type FileCloseReply = CallReply<()>;
+
+/// Reply delivered by [`mkdir`].
+pub type MkdirReply = CallReply<()>;
+
+/// Reply delivered by [`path_metadata`].
+pub type PathMetadataReply = CallReply<PathMetadata>;
+
+/// Reply delivered by [`rename_replace`].
+pub type RenameReplaceReply = CallReply<()>;
+
+/// Reply delivered by [`remove_file`].
+pub type RemoveFileReply = CallReply<()>;
+
+/// Reply delivered by [`read_dir`].
+pub type ReadDirReply = CallReply<Vec<PathBuf>>;
+
+/// Reply delivered by [`sync_parent`].
+pub type SyncParentReply = CallReply<()>;

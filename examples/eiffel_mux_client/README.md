@@ -76,14 +76,16 @@ What feels better:
   parses lines, increments a counter. There is nothing to "match
   up" because the client never blocked on a specific id.
 
+What 059 already closed:
+
+- **No `Arc<Mutex<Vec<u32>>>` for the arrival log.** The isolate owns
+  the `Vec<u32>` directly and publishes it via `stop_with(...)` when
+  the connection closes. The host receives the typed value through
+  `runtime.observe_result::<Vec<u32>, _, _>(address)?.wait(...)`.
+  Phase 059 Rock 1.
+
 What feels worse:
 
-- **The arrival log is still a side channel.** The Tina side passes
-  an `Arc<Mutex<Vec<u32>>>` into the isolate so the host can read
-  the result after `observe_isolate_complete`. App-specific data the
-  runtime can't know about — `FINDINGS.md` tracks this as typed
-  isolate result waiter work (047 retired the *runtime-knowable*
-  side channels like bound-address, but not app-data).
 - **The line-parsing loop is hand-rolled.** `position(b == b'\n')`
   + `drain(..=idx)` is fine, but every framed-line client will write
   it. A `tcp_read_lines(stream).reply(...)` shape would be welcome.

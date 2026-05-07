@@ -1436,9 +1436,9 @@ fn local_system_single_shard_is_canonical_live_owner() {
     }));
 }
 
-// Phase 043 Rock 6/7: LocalSystem.topology() must surface every bounded
-// lane capacity, the worker-held / pending-call counts added in Rock 2,
-// and the unclean_reason on the terminal report.
+// LocalSystem.topology() must surface every bounded lane capacity,
+// the worker-held / pending-call counts, and the unclean_reason on
+// the terminal report.
 #[test]
 fn local_system_topology_report_exposes_all_lane_capacities_and_new_counts() {
     let config = LocalSystemConfig {
@@ -1466,7 +1466,7 @@ fn local_system_topology_report_exposes_all_lane_capacities_and_new_counts() {
     assert_eq!(shard.tls_lane().capacity(), 7);
     assert_eq!(shard.process_lane().capacity(), 8);
     assert_eq!(shard.signal_lane().capacity(), 9);
-    // Phase 043 Rock 2 fields are populated and start at zero.
+    // Resource-count fields are populated and start at zero.
     assert_eq!(shard.owned_resource_count(), 0);
     assert_eq!(shard.worker_held_resource_count(), 0);
     assert_eq!(shard.pending_driver_call_count(), 0);
@@ -3106,7 +3106,7 @@ fn remote_queue_pressure_reports_capacity_and_full_counter() {
     }));
 }
 
-// Phase 043 Rock 5: a multi-shard system whose worker thread fails must
+// A multi-shard system whose worker thread fails must
 // reject subsequent ingress to that shard's isolates, while healthy
 // shards keep accepting work.
 #[test]

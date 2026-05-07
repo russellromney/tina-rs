@@ -1,5 +1,8 @@
 //! Threaded runtime and supervise error types extracted from lib.rs (phase 055).
 
+use std::error::Error;
+use std::fmt;
+
 use tina::ShardId;
 
 /// Error returned by setup/control operations on [`crate::ThreadedRuntime`].
@@ -15,9 +18,37 @@ pub enum ThreadedRuntimeError {
     DriverShutdownFailed,
 }
 
+impl fmt::Display for ThreadedRuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkerStopped => {
+                write!(
+                    f,
+                    "worker thread stopped before it could process the command"
+                )
+            }
+            Self::UnknownShard(shard) => {
+                write!(
+                    f,
+                    "shard {} is not owned by this multi-shard runtime",
+                    shard.get()
+                )
+            }
+            Self::DriverShutdownFailed => {
+                write!(
+                    f,
+                    "driver shutdown failed: completion-slot ownership not released"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ThreadedRuntimeError {}
+
 /// Error returned by [`crate::Runtime::try_supervise`] and the threaded equivalents.
 ///
-/// Phase 047 Rock 8: replaces a panic on unknown / stale parent registration
+/// Replaces a panic on unknown / stale parent registration
 /// in `Runtime::supervise` so the explicit-step and threaded surfaces both
 /// have a fallible variant. The panicking [`crate::Runtime::supervise`] is kept
 /// for setup-time assertions.
@@ -28,6 +59,19 @@ pub enum SuperviseError {
     UnknownParent,
 }
 
+impl fmt::Display for SuperviseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownParent => write!(
+                f,
+                "supervise target is not a parent registered with this runtime"
+            ),
+        }
+    }
+}
+
+impl Error for SuperviseError {}
+
 /// Error returned by [`crate::ThreadedRuntime::try_send`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedTrySendError {
@@ -37,6 +81,17 @@ pub enum ThreadedTrySendError {
     /// The worker thread stopped before it could accept the ingress command.
     WorkerStopped,
 }
+
+impl fmt::Display for ThreadedTrySendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IngressFull => write!(f, "worker ingress queue is full"),
+            Self::WorkerStopped => write!(f, "worker thread stopped before ingress was accepted"),
+        }
+    }
+}
+
+impl Error for ThreadedTrySendError {}
 
 /// Error returned by [`crate::ThreadedRuntime::send_and_observe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,4 +107,69 @@ pub enum ThreadedSendObservedError {
 
     /// The worker thread stopped before the send could be observed.
     WorkerStopped,
+}
+
+impl fmt::Display for ThreadedSendObservedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IngressFull => write!(f, "worker ingress queue is full"),
+            Self::MailboxFull => write!(f, "target isolate mailbox is full"),
+            Self::MailboxClosed => write!(f, "target isolate mailbox is closed or stale"),
+            Self::WorkerStopped => {
+                write!(f, "worker thread stopped before the send could be observed")
+            }
+        }
+    }
+}
+
+impl Error for ThreadedSendObservedError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_error<E: Error + 'static>(err: E, must_contain: &str) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains(must_contain),
+            "Display message {msg:?} should contain {must_contain:?}"
+        );
+        // Round-trip into Box<dyn Error> proves the trait impls compose.
+        let _: Box<dyn Error> = Box::new(err);
+    }
+
+    #[test]
+    fn threaded_runtime_error_implements_display_and_error() {
+        assert_error(ThreadedRuntimeError::WorkerStopped, "worker thread");
+        assert_error(
+            ThreadedRuntimeError::UnknownShard(tina::ShardId::new(7)),
+            "shard 7",
+        );
+        assert_error(
+            ThreadedRuntimeError::DriverShutdownFailed,
+            "driver shutdown",
+        );
+    }
+
+    #[test]
+    fn supervise_error_implements_display_and_error() {
+        assert_error(SuperviseError::UnknownParent, "parent");
+    }
+
+    #[test]
+    fn threaded_try_send_error_implements_display_and_error() {
+        assert_error(ThreadedTrySendError::IngressFull, "ingress");
+        assert_error(ThreadedTrySendError::WorkerStopped, "worker thread");
+    }
+
+    #[test]
+    fn threaded_send_observed_error_implements_display_and_error() {
+        assert_error(ThreadedSendObservedError::IngressFull, "ingress");
+        assert_error(ThreadedSendObservedError::MailboxFull, "mailbox is full");
+        assert_error(ThreadedSendObservedError::MailboxClosed, "closed or stale");
+        assert_error(
+            ThreadedSendObservedError::WorkerStopped,
+            "worker thread stopped",
+        );
+    }
 }

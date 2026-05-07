@@ -15,6 +15,10 @@ pub mod tokio_impl;
 
 pub const FETCH_COUNT: u32 = 4;
 pub const RESPONSE: &[u8] = b"OK\n";
+/// Per-`tcp_read` budget for the read-to-EOF loop helper.
+pub const READ_CHUNK: usize = 64;
+/// Cap for the read-to-EOF accumulated buffer.
+pub const RESPONSE_MAX: usize = 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {

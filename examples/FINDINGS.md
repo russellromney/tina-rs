@@ -12,215 +12,171 @@ example's own `README.md`.
 
 ## Product Improvements
 
-### 1. Typed isolate result waiters
+### 1. Typed isolate result waiters — landed in 059 Rock 1
 
-**Surfaced by:** `eiffel_mux_client`, `eiffel_persistent_counter`,
-`eiffel_outbound_fetch`, `eiffel_outbound_http`,
-`eiffel_graceful_shutdown`.
-
-Host/test code still reaches for `Arc<Atomic*>`, `Arc<Mutex<_>>`, per-op
-correlators, or tiny `Driver` isolates when it wants final app data from an
-isolate. Tina can already observe that an isolate stopped; the missing piece is
-the typed value the isolate stopped with.
-
-**Build:** a bounded `IsolateResultWaiter<T>` / typed join-handle shape:
+Closed by Phase 059 Rock 1. Use:
 
 ```rust
-let done = runtime.observe_result(addr);
-let result: T = done.wait(timeout)?;
+// isolate
+stop_with(self.outcome.clone())
+
+// host
+let result = runtime.observe_result::<T, _, _>(addr)?;
+let value = result.wait(timeout)?;
 ```
 
-This should preserve Tina truth: capacity explicit, timeout explicit, stopped /
-closed / dropped outcome typed, trace still says the isolate stopped.
+Bounded one-slot, single-claim per `(isolate, generation)`, no replay
+cache. Eager `AlreadyStopped` / `AlreadyClaimed` / `ObservationFull` at
+register time; `Timeout` / `RuntimeStopped` / `StoppedWithoutResult` /
+`TypeMismatch` at `wait`. Trace still emits `IsolateStopped`; the new
+`EffectKind::StopWith` distinguishes the with-result path.
 
-### 2. Continuation and pipeline sugar
+Already converted: `eiffel_outbound_fetch` (3 atomics removed),
+`eiffel_mux_client` (`Arc<Mutex<Vec<u32>>>` removed).
+`eiffel_persistent_counter`, `eiffel_outbound_http`, and
+`eiffel_graceful_shutdown` use a per-op correlator pattern that is
+*not* a "final value after stop" — those need a separate ergonomics
+pass and are not 059 Rock 1 work.
 
-**Surfaced by:** `eiffel_mini_keyspace`, `eiffel_mux_client`,
-`eiffel_persistent_counter`, `eiffel_outbound_fetch`,
-`eiffel_graceful_shutdown`, `eiffel_outbound_http`.
+### 2. Continuation and pipeline sugar — landed (first form) in 059 Rock 2
 
-The honest Tina shape is good: every runtime call returns as a message. But
-linear protocols still grow enum variants quickly:
-`Begin -> Connected -> Wrote -> Read -> Closed`.
+Closed by Phase 059 Rock 2 as "documented canonical pattern + reply
+aliases" rather than a macro. `tina_runtime` ships per-call-kind
+reply aliases (`TcpConnectReply`, `JournalAppendReply`,
+`SignalWaitReply`, `FileReadReply`, …) so isolate enums spell the
+call kind by name instead of `Result<X, CallError>`. Chapter 16
+("Continuation And Pipeline Patterns") in the user guide is the
+blessed shape for pipeline + list-processing isolates and names the
+four anti-patterns (hidden retry, multi-call effects on one
+resource, async wrapper, shared accumulator).
 
-**Build:** small Tina-shaped sugar for linear chains and "process this list one
-item at a time" flows. This must not become fake async/await and must not hide
-timeouts, `Full`, `Closed`, or trace events.
+Already converted: `eiffel_outbound_fetch`, `eiffel_persistent_counter`,
+`eiffel_mux_client`, `eiffel_graceful_shutdown`, `eiffel_mini_keyspace`,
+`eiffel_real_io_chat`, `eiffel_rpc`.
 
-Good direction:
+Deliberately not shipped: a `pipeline!` macro, a `for_each` helper,
+or anything that would hide per-step trace truth.
 
-- continuation aliases or generated continuation names;
-- a bounded "for each command, call service, accumulate, continue" helper;
-- clearer `sequence(...)` examples for request/reply chains.
+### 3. First-class TCP loop helpers — landed (client-side first form) in 059 Rock 3
 
-### 3. First-class TCP loop helpers
+Closed by Phase 059 Rock 3. `tina_runtime::tcp_loops` ships:
 
-**Surfaced by:** `eiffel_outbound_fetch`, `eiffel_mux_client`, HTTP/RPC work.
+- `TcpWriteAll` — partial-write loop;
+- `TcpReadExact` — partial-read loop with `EarlyEof(partial)` outcome;
+- `TcpReadToEof` — read until empty bytes or a `max` byte cap.
 
-Every real TCP protocol wants write-all, read-exact, read-to-EOF, and framed
-read loops. Today each specimen writes the loop by hand.
+Each helper is a small client-side state machine. Each
+`next_effect`/`advance` step expands to exactly one `tcp_write` /
+`tcp_read`, so partial progress is one trace event per call.
 
-**Build:** Tina runtime-call helpers or reusable state-machine helpers:
+Deferred to a future phase: turning these into runtime-owned
+`CallInput::TcpWriteAll` / `TcpReadExact` / `TcpReadToEof` so the
+isolate dispatches one effect rather than maintaining helper state.
+That's a substrate change (betelgeuse + tina-sim + driver) and Rock 3
+intentionally shipped the smaller form first. `eiffel_outbound_fetch`
+already uses the helpers; framed-read still hand-rolls (see Rock 2's
+"continuation pattern").
 
-```rust
-tcp_write_all(stream, bytes).reply(...)
-tcp_read_exact(stream, len).reply(...)
-tcp_read_to_eof(stream, max).reply(...)
-```
+### 4. Capacity diagnostics and reply-slot budgets — landed in 059 Rock 4
 
-Important constraint: helpers may remove ceremony, but partial progress must
-stay trace-visible. No hidden buffer growth, no hidden retries.
+Closed by Phase 059 Rock 4. `tina_runtime` ships:
 
-### 4. Capacity diagnostics and reply-slot budgets
+- `PressureSummary::from_events(events)` — counted summary of every
+  pressure-shaped trace event (mailbox-full, reply-path-full,
+  send-full, lifecycle-closed);
+- `Runtime::pressure_summary()` / `ThreadedRuntime::pressure_summary()`
+  accessors;
+- `MailboxBudget { incoming, replies }` with `.total()` plus
+  `listener` / `session` / `service` / `fanout` presets that name
+  the arithmetic at the spawn site.
 
-**Surfaced by:** `eiffel_real_io_chat`, `eiffel_mini_keyspace`.
+Chapter 6 ("Boundedness And Overload") rewritten to walk the
+`total = incoming + replies` math and show the diagnostics API.
 
-Mailbox capacity is "incoming messages + replies to my outstanding work." That
-is correct, but users experience it as magic numbers.
+### 5. Bounded host send helpers — landed in 059 Rock 5
+
+Closed by Phase 059 Rock 5 (commit 4a9df12). `ThreadedRuntime::send_blocking`
+/ `send_retrying` are shipped with the contract above intact: bounded wait,
+caller-visible timeout, typed `Sent`/`Full`/`Timeout`/`Closed`/`WorkerStopped`
+outcomes, no hidden queue.
+
+### 6. Tiny native HTTP router — landed in 059 Rock 6
+
+Closed by Phase 059 Rock 6. `tina_http` ships:
+
+- `Router` — stateless `fn(&HttpRequest) -> HttpResponse` handlers;
+- `StatefulRouter<S>` — handlers with `&mut S` access for the
+  in-isolate case where routes mutate state;
+- both expose `.get`/`.post`/`.put`/`.delete`/`.patch` sugar over
+  the generic `.route(method, path, handler)`;
+- opt-in `.method_not_allowed()` distinguishes 405 (path known,
+  method mismatch) from 404 (path unknown).
+
+Already converted: `eiffel_native_http` and `eiffel_outbound_http`
+both use `StatefulRouter<Counter>`.
+
+### 7. Bridge specimen cleanup — landed in 059 Rock 7
+
+Closed by Phase 059 Rock 7. `eiffel_axum_counter` and
+`eiffel_ws_room` rewritten to the specimens-rule shape:
+`src/lib.rs` with shared types/scripted client, top-level
+`tokio_impl.rs` / `tina_impl.rs`, `main.rs` dispatcher,
+`tests/smoke.rs`. The `src/comparison/` harness directories are gone.
+Both still use the blessed `BridgeHost::new` / `register_bridge` /
+`drain_and_shutdown` lifecycle.
+
+Follow-up bridge polish rebased the HTTP-shaped bridge specimens onto
+`tina_tower_bridge::TinaTowerService`, then added the specimen-facing
+`TinaService<M, R>` alias and re-exported Tower's `Service` trait.
+The rough spots left are smaller but real: Axum handlers still use the
+`let mut svc = svc;` Tower idiom, setup is still
+`register_bridge(...)` then `TinaTowerService::new(...)`, and
+WebSocket handlers need service clones because `Service::call` takes
+`&mut self`.
+
+### 8. RPC service topology beyond single — deferred (runtime prerequisite)
+
+Investigated and deferred in Phase 059 Rock 8. A real concurrent
+`PooledService` requires an isolate to hold *multiple* pending
+`IsolateCall` continuations simultaneously (one per in-flight
+`ServiceCall` the pool is dispatching to a worker). Today the
+runtime stores `MessageCallContext` as a single `Option<...>` per
+isolate, so a pool frontend would serialize through one-at-a-time
+and not actually pool concurrent work. The unblocking work is at
+the runtime level, not the rpc level. The sealed-stub
+`PooledService` / `ShardedService` types stay in `tina_rpc` to
+document the planned shape.
 
 **Build:**
 
-- better runtime diagnostics for reply rejected because requester mailbox full;
-- role-based capacity presets or budget helpers;
-- maybe separate `incoming` vs `reply` capacity at registration if the model
-  stays clean;
-- examples that show how to size listener/session/service mailboxes.
-
-Tina should make boundedness obvious, not mystical.
-
-### 5. Bounded host send helpers
-
-**Surfaced by:** `eiffel_supervised_worker`, runtime tests.
-
-Host/test code sometimes wants to submit a message to a threaded runtime and
-wait briefly when ingress is full. Today that becomes a hand-rolled
-`try_send` loop over `IngressFull` with `yield_now()` and a deadline.
-
-**Build:** bounded host-send helpers:
-
-```rust
-runtime.send_blocking(addr, msg, timeout)
-runtime.send_retrying(addr, msg, timeout)
-```
-
-Names are less important than the contract: no hidden queue, timeout visible,
-`Full`/`Timeout`/`Closed`/`WorkerStopped` typed, message ownership clear.
-
-### 6. Tiny native HTTP router
-
-**Surfaced by:** `eiffel_native_http`.
-
-Native HTTP is real now. The remaining boring gap is route matching:
-Tina handlers currently match `(method, path)` by hand.
-
-**Build:** a small Tina HTTP routing helper, not a web framework:
-
-```rust
-HttpRouter::new()
-    .get("/counter", ...)
-    .post("/counter", ...)
-```
-
-or an isolate-friendly mapping that emits user messages. Keep service state in
-isolates. Do not recreate Axum/Tower inside Tina.
-
-### 7. Bridge specimen cleanup
-
-**Surfaced by:** `eiffel_axum_counter`, `eiffel_ws_room`.
-
-The bridge path is still important for adoption, but the remaining bridge
-examples are intentionally deferred until bridge ergonomics settle. They still
-teach useful things, but they have the old `src/comparison/` shape.
-
-**Partial resolution (phase 051C):** the two HTTP-shaped bridge specimens
-(`eiffel_axum_counter`, `eiffel_ws_room`) were rebased onto
-`tina-tower-bridge::TinaTowerService`. The new shape is honestly better,
-but the rewrite surfaced fresh paper cuts that still need work.
-
-**What got better:**
-
-- Handler call sites are now `svc.call(req).await` — same shape Tower
-  middleware speaks. Composing the bridge with rate-limit / timeout /
-  load-shed layers is no longer an open question; it's standard Tower.
-- `BridgeError` finally has `Display` + `std::error::Error`, so
-  `format!("{error}")` works and tower-http `BoxError` accepts our
-  errors. Before this, debugging meant `format!("{error:?}")` everywhere.
-- The error → HTTP status map is now a typed table at the top of each
-  handler instead of one flat `SERVICE_UNAVAILABLE`. `Timeout` mapping
-  to `504` instead of `503` is a small honesty win.
-
-**What still feels rough:**
-
-- ~~The state type signature is brutal: six generic params with the
-  trailing `()` for `AR`.~~ **Resolved in the bridge polish slice:**
-  `tina_tower_bridge::TinaService<M, R>` is the specimen-facing alias
-  for the SingleShard / DefaultThreadedMailboxFactory case.
-  Specimen state types now read as `TinaService<RoomRequest, RoomReply>`.
-- ~~The example needs three crate deps + a direct `tower-service`
-  import.~~ **Resolved in the bridge polish slice:**
-  `tina_tower_bridge` re-exports `Service`, so handlers
-  `use tina_tower_bridge::{Service, TinaService};` and the example
-  Cargo.toml drops the direct `tower-service` dep entirely.
-- Every Axum handler that uses `Service::call` still ends with
-  `let mut svc = svc;` because Axum's `State<S>` extracts the value,
-  not `&mut S`, and `Service::call` requires `&mut self`. Trivial but
-  cluttery. Documented in the bridge crate; no fix yet.
-- We still need a `tokio::runtime::Runtime` to host axum *and* the Tina
-  runtime thread underneath. Two runtimes per process is the bridge's
-  nature, but for a tiny stateful counter it's a lot of moving parts.
-- Setup is still two-step: `BridgeHost::register_bridge(...)` then
-  `TinaTowerService::new(bridge)`. The reqwest-bridge crate ships an
-  `install(&runtime, config)` helper that returns the wired-up trio
-  in one call. `tina-tokio-bridge` could expose the same thing.
-- For WebSocket (`eiffel_ws_room`), the reader and writer halves each
-  need their own `svc.clone()` because Tower's `&mut self` is
-  per-clone, not shared. Now documented in the `tina-tower-bridge`
-  crate docs ("Cloning and `&mut self`" section), but the pattern is
-  still a learning bump.
-
-**Build (still open):**
-
-- consider `tina_tokio_bridge::install(...)` paralleling the reqwest
-  bridge's `install` to collapse the two-step setup;
-- rewrite remaining bridge-shaped examples (`eiffel_outbound_*`,
-  `eiffel_real_io_chat`) once the next bridge surface lands;
-- document signal-handler coexistence when Tokio and Tina live in one
-  process.
-
-### 8. RPC service topology beyond single
-
-**Surfaced by:** `eiffel_rpc`, phase 052/058.
-
-Typed RPC services now feel much better, but `SingleService` is only the first
-topology. Hot services need a way to become a pool or sharded set without the
-registry API changing.
-
-**Build:**
-
-- real `PooledService`;
-- real `ShardedService`;
+- runtime support for N pending `IsolateCall` continuations per
+  isolate, then real `PooledService`;
+- `ShardedService` after sharded primitives (053);
 - explicit mailbox/capacity semantics for each;
 - docs that say how `Full`, `Closed`, `Timeout`, and partial failure behave.
 
 The registry should keep mapping service name to one address. The address may
 be a single service, pool frontend, or shard router.
 
-### 9. Uniform overload reports for pressure runners
+### 9. Uniform overload reports for pressure runners — landed in 059 Rock 9
 
-**Surfaced by:** `eiffel_cpu_run`, `eiffel_mem_run`.
-
-The wrapper runners can say "the specimen still completed under pressure."
-They cannot yet compare accepted/full/closed/timeouts across specimens in one
-small vocabulary.
-
-**Build:** a lightweight report convention for pressure-capable specimens:
+Closed by Phase 059 Rock 9. `tina_runtime` ships
+`PressureReport { side, accepted, full, closed, timeouts, other,
+rss_peak_kb, exit }` plus `format_pressure_line(...)` that produces
+the canonical line:
 
 ```text
-accepted full closed timeouts other rss_peak exit
+pressure side=<name> accepted=N full=N closed=N timeouts=N other=N [rss_peak_kb=N] exit=<status>
 ```
 
-Keep it local and boring. Do not reintroduce a shared harness that constrains
-how examples are written.
+`eiffel_real_io_chat` opts in and prints one line per side.
+`eiffel_cpu_run` captures target stdout, intercepts `pressure ...`
+lines, and re-emits them tagged by run label; non-pressure lines
+pass through unchanged.
+
+Chapter 17 ("Pressure Report Convention") in the user guide is the
+blessed shape and explains why this is a *convention* (line
+contract) rather than a *framework* (program contract).
 
 ## Resolved Or Retired By Recent Phases
 
@@ -235,7 +191,10 @@ These used to be current pain and should not be copied into new code:
 - one-off shard types for single-shard programs: use `SingleShard` or omit
   `shard = ...`;
 - `Arc::try_unwrap` bridge shutdown dances: use the bridge host lifecycle;
-- old shared comparison harnesses: examples are specimens, tests are proof.
+- old shared comparison harnesses: examples are specimens, tests are proof;
+- `Arc<Outcome>` / `Arc<Mutex<Vec<_>>>` for an isolate's *final* app
+  value: use `stop_with(value)` + `runtime.observe_result::<T>(addr)?`
+  (Phase 059 Rock 1).
 
 ## How To Add A Finding
 

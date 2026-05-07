@@ -75,7 +75,7 @@ Still recurring:
 
 ## Rocks
 
-1. **Typed Isolate Result Waiters**
+1. **Typed Isolate Result Waiters** — *landed*
 
    Build a typed host-visible result path for isolates.
 
@@ -85,34 +85,82 @@ Still recurring:
    - examples still use `Arc<Outcome>`, atomics, mpsc channels, or driver
      isolates to retrieve final app data.
 
-   Desired shape:
+   Locked shape:
 
    ```rust
-   let done = runtime.observe_result(addr);
+   // isolate side: new effect that piggybacks on existing Stop
+   stop_with(value)  // T: Send + 'static
+
+   // host side: turbofish-typed observation, returns a Result eagerly
+   let done = runtime.observe_result::<T>(addr)?;
    let value: T = done.wait(timeout)?;
    ```
+
+   Design decisions (locked):
+
+   - `Effect::StopWith(StopResult)` joins `Effect::Stop`. `StopResult` wraps
+     `Box<dyn Any + Send>` with a manual `Debug` (no `Debug` bound on `T`).
+     Avoids threading a result type onto `Address<M, R>` and avoids an
+     `Isolate::Result` associated type with default.
+   - `runtime.observe_result::<T>(addr)` is turbofish-typed; the registry
+     stores the requested `TypeId` plus a type-erased `ResultSender` trait
+     object that owns the typed `SyncSender<ResultDelivery<T>>`.
+   - At register time the runtime checks: isolate is alive at this
+     `(IsolateId, AddressGeneration)`, no waiter is already claimed, and the
+     observation cap is not full. Eager errors return `AlreadyStopped`,
+     `AlreadyClaimed`, or `ObservationFull`.
+   - Single-claim per `(IsolateId, AddressGeneration)`. Second register call
+     returns `AlreadyClaimed`. Result is delivered exactly once.
+   - At delivery time: `Effect::Stop` resolves any registered waiter as
+     `StoppedWithoutResult`. `Effect::StopWith(any)` downcasts against the
+     waiter's stored `TypeId` — match → deliver `T`; mismatch → deliver
+     `TypeMismatch` and drop the value. No registered waiter → drop the
+     value silently. **No post-hoc result replay cache** keeps memory bounded.
+   - `ResultWaitError`: `Timeout`, `RuntimeStopped`, `ObservationFull`,
+     `AlreadyClaimed`, `AlreadyStopped`, `StoppedWithoutResult`,
+     `TypeMismatch`. Three of these (`ObservationFull`, `AlreadyClaimed`,
+     `AlreadyStopped`) only fire at register time; the rest only fire on
+     `wait`.
+   - Existing `IsolateCompleteWaiter` and the trace's `IsolateStopped` event
+     stay unchanged. `observe_result` is additive.
 
    Requirements:
 
    - works for explicit-step and threaded runtimes;
-   - waiter registration is bounded;
-   - timeout is caller-visible;
-   - dropped waiter cleanup is bounded;
-   - stopped-without-result, closed, runtime-shutdown, and timeout outcomes are
-     typed;
+   - waiter registration is bounded by the existing observation cap;
+   - timeout is caller-visible on `wait`;
+   - dropped waiter cleanup happens when the slot's sender is dropped;
+   - stopped-without-result, type mismatch, runtime-shutdown, and timeout
+     outcomes are typed;
    - trace still records isolate stop/completion truth;
-   - no unbounded result registry.
+   - no unbounded result registry; no replay cache.
 
    Proof:
 
-   - focused runtime tests for success, timeout, dropped waiter, isolate stops
-     without result, runtime shutdown;
+   - focused runtime tests for success, timeout, dropped waiter, isolate
+     stops without result, runtime shutdown, `AlreadyStopped` (late
+     register), `AlreadyClaimed`, `ObservationFull`, `TypeMismatch`;
    - update at least two Eiffel specimens that currently carry side-channel
-     final data.
+     final data (target: `eiffel_outbound_fetch`,
+     `eiffel_persistent_counter`).
 
-2. **Continuation And Pipeline Sugar**
+2. **Continuation And Pipeline Sugar** — *landed (first form)*
 
    Reduce ceremony for linear protocols without pretending handlers are async.
+
+   Shipped:
+
+   - per-call-kind reply aliases (`TcpConnectReply`, `JournalAppendReply`,
+     etc.) re-exported from `tina-runtime`. Isolate enums spell the call
+     kind by name instead of `Result<X, CallError>`;
+   - `docs/tina-user-guide/16-continuation-and-pipeline-patterns.md` is
+     the blessed shape for pipeline + list-processing isolates and names
+     the four anti-patterns;
+   - `eiffel_outbound_fetch` (TCP client) and `eiffel_persistent_counter`
+     (list/journal) converted to the aliases.
+
+   Deliberately not shipped: a `pipeline!` macro, a `for_each` helper, or
+   anything that hides per-step trace truth.
 
    Problem:
 
@@ -139,9 +187,23 @@ Still recurring:
    - convert one list-processing specimen and one TCP client specimen;
    - keep the before/after diff honest in the README.
 
-3. **TCP Loop Helpers**
+3. **TCP Loop Helpers** — *landed (client-side first form)*
 
    Ship first-class helpers for boring TCP loops.
+
+   Shipped: `tina_runtime::tcp_loops` module with `TcpWriteAll`,
+   `TcpReadExact`, `TcpReadToEof` as client-side helper structs.
+   Each helper expands to one `tcp_write` / `tcp_read` per
+   `next_effect`/`advance` step, so partial progress remains a real
+   trace event. `eiffel_outbound_fetch` converted; canonical pattern
+   captured in chapter 16.
+
+   Deferred: runtime-owned `CallInput::TcpWriteAll` / `TcpReadExact`
+   / `TcpReadToEof`. That's a substrate change (betelgeuse driver +
+   tina-sim) and the syntax `tcp_write_all(stream, bytes).reply(...)`
+   from the original plan would need new pending-kind machinery.
+   Captured as a follow-up; the helper form is the blessed shape for
+   now.
 
    Problem:
 
@@ -169,9 +231,18 @@ Still recurring:
    - runtime tests for partial write/read, EOF, close while pending, max limit;
    - update `eiffel_outbound_fetch` or another TCP specimen.
 
-4. **Capacity Diagnostics And Reply-Slot Budgets**
+4. **Capacity Diagnostics And Reply-Slot Budgets** — *landed*
 
    Make mailbox sizing less mystical.
+
+   Shipped: `tina_runtime::pressure` module with
+   `PressureSummary::from_events(...)` (and matching
+   `Runtime::pressure_summary()` / `ThreadedRuntime::pressure_summary()`
+   accessors) plus a `MailboxBudget { incoming, replies }` type with
+   listener/session/service/fanout presets. Chapter 6
+   ("Boundedness And Overload") rewritten to walk the
+   `total = incoming + replies` arithmetic and show the diagnostics
+   API.
 
    Problem:
 
@@ -232,9 +303,19 @@ Still recurring:
    - replace at least one manual `IngressFull` retry loop in an Eiffel specimen
      or runtime test.
 
-6. **Tiny Native HTTP Router**
+6. **Tiny Native HTTP Router** — *landed*
 
    Close the obvious HTTP ergonomics gap.
+
+   Shipped:
+
+   - `tina_http::Router` already had basic `(method, path) → fn`
+     dispatch; added sugar (`.get`/`.post`/`.put`/`.delete`/`.patch`)
+     and opt-in `method_not_allowed()` to distinguish 405 from 404;
+   - new `StatefulRouter<S>` for the in-isolate case where routes
+     mutate isolate state, with the same sugar surface;
+   - `eiffel_native_http`'s `Counter::handle` converted from a
+     `match (method, path)` block to a `StatefulRouter<Counter>`.
 
    Problem:
 
@@ -263,9 +344,17 @@ Still recurring:
    - update `eiffel_native_http`;
    - tests for not found, method mismatch, service full/timeout mapping.
 
-7. **Bridge Specimen Rewrite**
+7. **Bridge Specimen Rewrite** — *landed*
 
    Bring deferred bridge examples up to the specimens rule.
+
+   Shipped: `eiffel_axum_counter` and `eiffel_ws_room` rewritten to
+   the canonical specimen shape — `src/lib.rs` with shared
+   types/scripted client, top-level `tokio_impl.rs` /
+   `tina_impl.rs`, `main.rs` dispatcher, `tests/smoke.rs`. The
+   `src/comparison/` harness directories are gone. Both still use
+   the blessed `BridgeHost::new` / `register_bridge` /
+   `drain_and_shutdown` lifecycle.
 
    Scope:
 
@@ -282,9 +371,35 @@ Still recurring:
    - README discusses two-runtime cost, bridge lifecycle, and visible pressure;
    - use blessed bridge lifecycle and RPC bridge APIs.
 
-8. **RPC Service Topology**
+8. **RPC Service Topology** — *deferred (runtime prerequisite)*
 
    Make the 058 topology sketch real enough for hot services.
+
+   Investigated and deferred. The frontend-with-N-workers pattern that
+   `PooledService` would implement requires an isolate to hold
+   *multiple* pending `IsolateCall` continuations simultaneously: one
+   per in-flight ServiceCall the pool is dispatching to a worker.
+   Today `tina-runtime`'s `MessageCallContext` is held as a single
+   `Option<MessageCallContext>` per isolate, so a pool frontend can
+   only wait on one worker reply at a time. Building a "first form"
+   that serializes through one-at-a-time would advertise as a pool
+   while not actually pooling concurrent work.
+
+   Two additional integration questions also still open:
+
+   - Registry's address contract is `Address<ServiceCall, ServiceReply>`,
+     i.e. SingleService-shaped. Any pool that uses the Registry-style
+     wrapper-enum continuation pattern exposes `Address<PooledMsg,
+     ServiceReply>` instead. Bridging that needs either an adapter
+     hop or a Registry-level change.
+   - `ShardedService` depends on the runtime's sharded primitives
+     (053).
+
+   Action: keep the existing sealed-stub `PooledService` /
+   `ShardedService` types (they still document the planned shape and
+   prevent runtime panics from premature use). The unblocking work
+   is "let an isolate hold N pending IsolateCall continuations" —
+   that's the right runtime-level rock to plan next.
 
    Requirements:
 
@@ -299,9 +414,22 @@ Still recurring:
    - unit tests for pool admission and shutdown;
    - Eiffel RPC follow-up if the example teaches something new.
 
-9. **Pressure Report Convention**
+9. **Pressure Report Convention** — *landed*
 
    Give pressure runners one small vocabulary without reviving the harness.
+
+   Shipped:
+
+   - `tina_runtime::PressureReport` + `format_pressure_line(...)`
+     produce the canonical `pressure side=... accepted=N full=N
+     closed=N timeouts=N other=N [rss_peak_kb=N] exit=...` line;
+   - `eiffel_real_io_chat` opts in and prints the line per side;
+   - `eiffel_cpu_run` captures the target's stdout, intercepts
+     `pressure ...` lines, and re-emits them tagged with the run
+     label; non-pressure lines pass through unchanged;
+   - `docs/tina-user-guide/17-pressure-report-convention.md` is the
+     blessed shape and explains why this is a convention, not a
+     framework.
 
    Requirements:
 

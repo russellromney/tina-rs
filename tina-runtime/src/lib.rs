@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use tina::{
     Address, AddressGeneration, ChildRelation, Context, Effect, Isolate, IsolateId, Mailbox,
-    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, TrySendError,
+    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, StopResult, TrySendError,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -59,6 +59,9 @@ mod mailbox;
 mod multi_shard;
 mod observation;
 pub mod persistence;
+pub mod pressure;
+pub mod sharded;
+pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
 mod trace;
@@ -95,23 +98,33 @@ pub use crate::persistence::{
     LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
 };
 pub use call::{
-    CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, FileId, FileOpenOptions,
-    IntoErasedCall, IsolateCall, JournalRecord, JournalReplay, JournalReplayWarning, ListenerId,
-    PathKind, PathMetadata, PersistenceTraceInfo, ProcessRunResult, ProcessStatus, RuntimeCall,
-    RuntimeCallParts, RuntimeCallable, SendOutcome, SnapshotImage, StreamId, TlsListenerId,
-    TlsStreamId, TypedCall, UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync,
-    file_open, file_read, file_read_at, file_size, file_write, file_write_at, journal_append,
-    journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace,
-    send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent,
-    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
-    tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write,
-    udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply, DnsLookupReply, ErasedCall,
+    FileCloseReply, FileFsyncReply, FileId, FileOpenOptions, FileOpenReply, FileReadReply,
+    FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall, JournalAppendReply, JournalRecord,
+    JournalReplay, JournalReplayReply, JournalReplayWarning, ListenerId, MkdirReply, PathKind,
+    PathMetadata, PathMetadataReply, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult,
+    ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply, RuntimeCall,
+    RuntimeCallParts, RuntimeCallable, SendOutcome, SignalWaitReply, SleepReply,
+    SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId, SyncParentReply,
+    TcpAcceptReply, TcpBindReply, TcpConnectReply, TcpListenerCloseReply, TcpReadReply,
+    TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
+    TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
+    TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
+    UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
+    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
+    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
+    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
+    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    udp_recv_from, udp_send_to,
 };
 use driver::DriverCompletion;
 pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
-    OperationDoneWaiter, WaitError,
+    IsolateResultWaiter, OperationDoneWaiter, ResultWaitError, WaitError,
 };
+pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
+pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
@@ -463,6 +476,13 @@ where
         self.trace_dropped
     }
 
+    /// Walks the current trace and returns a counted summary of
+    /// pressure-shaped events (mailbox-full, reply-path-full,
+    /// send-full, lifecycle-closed). See [`PressureSummary`].
+    pub fn pressure_summary(&self) -> pressure::PressureSummary {
+        pressure::PressureSummary::from_events(self.trace.iter())
+    }
+
     /// Registers a typed waiter for the next `tcp_bind` completion.
     ///
     /// Returns a [`BoundAddressWaiter`] that the host can `wait` on to
@@ -520,6 +540,38 @@ where
     ) -> observation::ChildRestartedWaiter {
         self.observation
             .register_child_restarted(parent_address.isolate())
+    }
+
+    /// Registers a typed result waiter for the isolate at `address`.
+    ///
+    /// Resolves when the isolate stops via [`tina::stop_with`] with a value
+    /// of type `T`. Single-claim per `(IsolateId, AddressGeneration)`.
+    /// Eager errors:
+    ///
+    /// - `AlreadyStopped` — isolate is no longer alive at this generation
+    ///   (no replay cache);
+    /// - `AlreadyClaimed` — another waiter holds the slot;
+    /// - `ObservationFull` — observation cap reached.
+    ///
+    /// `wait` outcomes: `Timeout`, `RuntimeStopped`, `StoppedWithoutResult`
+    /// (isolate used `stop()` not `stop_with(_)`), `TypeMismatch`.
+    pub fn observe_result<T, M, R>(
+        &mut self,
+        address: Address<M, R>,
+    ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError>
+    where
+        T: Send + 'static,
+    {
+        let isolate = address.isolate();
+        let generation = address.generation();
+        let alive = self.entries.iter().any(|entry| {
+            entry.id == isolate && entry.generation == generation && !entry.stopped.get()
+        });
+        if !alive {
+            return Err(observation::ResultWaitError::AlreadyStopped);
+        }
+        self.observation
+            .register_isolate_result::<T>(isolate, generation)
     }
 
     /// Sets the trace retention policy for future events.
@@ -748,9 +800,9 @@ where
     /// addresses are programmer errors and panic. Reconfiguring the same parent
     /// replaces the config and resets the runtime-lifetime budget tracker.
     pub fn supervise<M: 'static, R>(&mut self, parent: Address<M, R>, config: SupervisorConfig) {
-        // Phase 047 Rock 8: keep the panicking surface for callers who want
-        // a setup-time assertion, but route the actual work through the
-        // fallible `try_supervise` so the panic message stays in one place.
+        // Keep the panicking surface for callers who want a setup-time
+        // assertion, but route the actual work through the fallible
+        // `try_supervise` so the panic message stays in one place.
         if self.try_supervise(parent, config).is_err() {
             panic!(
                 "supervise expected an address registered with this runtime, got an unknown or stale address",
@@ -761,12 +813,11 @@ where
     /// Configures one registered isolate as supervisor without panicking on
     /// unknown parents.
     ///
-    /// Phase 047 Rock 8 (runtime surface alignment): the panicking
-    /// [`supervise`](Self::supervise) variant remains available for setup
-    /// code that wants the unknown-parent case to be a hard programmer
-    /// error. `try_supervise` is the fallible variant that
-    /// [`ThreadedRuntime`] uses internally so an unknown-parent registration
-    /// does not crash the worker thread.
+    /// The panicking [`supervise`](Self::supervise) variant remains
+    /// available for setup code that wants the unknown-parent case to
+    /// be a hard programmer error. `try_supervise` is the fallible
+    /// variant that [`ThreadedRuntime`] uses internally so an
+    /// unknown-parent registration does not crash the worker thread.
     pub fn try_supervise<M: 'static, R>(
         &mut self,
         parent: Address<M, R>,
@@ -941,6 +992,10 @@ where
         match effect {
             ErasedEffect::Stop => {
                 self.stop_entry(index, isolate_id, cause);
+                true
+            }
+            ErasedEffect::StopWith(result) => {
+                self.stop_entry_with_result(index, isolate_id, cause, result);
                 true
             }
             ErasedEffect::Send(send) => {
@@ -1880,7 +1935,7 @@ where
     }
 
     fn stop_entry(&mut self, index: usize, isolate_id: IsolateId, cause: CauseId) -> EventId {
-        self.stop_entry_with_precollected(index, isolate_id, cause, None)
+        self.stop_entry_full(index, isolate_id, cause, None, None)
     }
 
     fn stop_entry_with_precollected(
@@ -1889,6 +1944,27 @@ where
         isolate_id: IsolateId,
         cause: CauseId,
         precollected: Option<DeliveredMessage>,
+    ) -> EventId {
+        self.stop_entry_full(index, isolate_id, cause, precollected, None)
+    }
+
+    fn stop_entry_with_result(
+        &mut self,
+        index: usize,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        result: StopResult,
+    ) -> EventId {
+        self.stop_entry_full(index, isolate_id, cause, None, Some(result))
+    }
+
+    fn stop_entry_full(
+        &mut self,
+        index: usize,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        precollected: Option<DeliveredMessage>,
+        result: Option<StopResult>,
     ) -> EventId {
         if self.entries[index].stopped.get() {
             let stopped = self.entries[index]
@@ -1902,6 +1978,8 @@ where
                     RuntimeEventKind::MessageAbandoned,
                 );
             }
+            // Late StopWith: isolate already stopped, drop the value.
+            drop(result);
             return stopped;
         }
 
@@ -1909,8 +1987,9 @@ where
         self.entries[index].mailbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
+        let generation = self.entries[index].generation;
         self.observation
-            .notify_isolate_stopped(isolate_id, self.entries[index].generation);
+            .notify_isolate_stopped(isolate_id, generation);
         self.cancel_driver_calls_for_requester(RegisteredAddress {
             shard: self.shard.id(),
             isolate: isolate_id,
@@ -1929,6 +2008,17 @@ where
                 Some(stopped.into()),
                 RuntimeEventKind::MessageAbandoned,
             );
+        }
+        // Result delivery happens last so the host only wakes after every
+        // lifecycle/trace fact is recorded. With no value, drain any
+        // pending result waiter as `StoppedWithoutResult`.
+        match result {
+            Some(value) => self
+                .observation
+                .notify_isolate_result(isolate_id, generation, value),
+            None => self
+                .observation
+                .notify_isolate_stopped_without_result(isolate_id, generation),
         }
         stopped
     }
@@ -2872,6 +2962,7 @@ where
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
         Effect::Stop => ErasedEffect::Stop,
+        Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
         Effect::Batch(effects) => ErasedEffect::Batch(
@@ -2908,6 +2999,7 @@ where
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
         Effect::Stop => ErasedEffect::Stop,
+        Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
         Effect::Batch(effects) => ErasedEffect::Batch(
@@ -2945,6 +3037,7 @@ where
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S, F>>),
     Stop,
+    StopWith(StopResult),
     RestartChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S, F>>),
@@ -2962,6 +3055,7 @@ where
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
             Self::Stop => EffectKind::Stop,
+            Self::StopWith(_) => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,

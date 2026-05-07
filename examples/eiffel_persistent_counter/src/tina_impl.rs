@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, JournalReplay, SnapshotImage, ThreadedRuntime,
-    journal_append, journal_replay, snapshot_commit, snapshot_load,
+    DefaultThreadedMailboxFactory, JournalAppendReply, JournalReplayReply, SnapshotCommitReply,
+    SnapshotLoadReply, ThreadedRuntime, journal_append, journal_replay, snapshot_commit,
+    snapshot_load,
 };
 
 use crate::{PHASE_A_INCREMENTS, PHASE_B_INCREMENTS, Report};
@@ -42,11 +43,11 @@ enum CounterMsg {
     },
     SnapshotLoaded {
         op: u64,
-        result: Result<Option<SnapshotImage>, CallError>,
+        result: SnapshotLoadReply,
     },
     JournalLoaded {
         op: u64,
-        result: Result<JournalReplay, CallError>,
+        result: JournalReplayReply,
     },
     Increment {
         op: u64,
@@ -55,14 +56,14 @@ enum CounterMsg {
         op: u64,
         index: u64,
         value: u64,
-        result: Result<(), CallError>,
+        result: JournalAppendReply,
     },
     CommitSnapshot {
         op: u64,
     },
     SnapshotCommitted {
         op: u64,
-        result: Result<(), CallError>,
+        result: SnapshotCommitReply,
     },
 }
 

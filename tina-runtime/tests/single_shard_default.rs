@@ -1,5 +1,4 @@
-//! Phase 047 Rock 5: built-in SingleShard + macro default + RuntimeCallable
-//! diagnostic.
+//! Built-in SingleShard + macro default + RuntimeCallable diagnostic.
 //!
 //! These tests prove that:
 //! - `#[tina::isolate]` and `#[tina_runtime::isolate]` accept omitting

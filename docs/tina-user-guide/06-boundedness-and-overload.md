@@ -14,17 +14,58 @@ quietly growing hidden queues.
 
 ## Mailbox Capacity
 
-Every isolate mailbox has capacity.
+Every isolate mailbox has capacity. The capacity is one number, but
+it has to absorb two distinct streams of messages:
 
-When spawning children, pass a capacity:
+> total capacity = inbound messages + replies to outstanding runtime calls
+
+If an isolate has 4 inbound senders and runs 2 `tcp_read`s in flight
+at once, both peaks have to fit. A capacity of `4` will reject the
+read replies under load with `CallCompletionRejected { reason:
+MailboxFull }` in the trace.
+
+Use [`MailboxBudget`](https://docs.rs/tina-runtime) at the spawn site
+to make the math obvious:
 
 ```rust
-spawn(ChildDefinition::new(child, 32))
+use tina_runtime::MailboxBudget;
+
+let cap = MailboxBudget::session(
+    /* inbound peer messages */ 4,
+    /* in-flight runtime calls */ 2,
+).total();
+
+spawn(ChildDefinition::new(child, cap))
 ```
 
-Small capacity is good for testing.
+Presets for common shapes:
+
+- `MailboxBudget::listener(max_in_flight_accepts)` — listener that
+  re-arms one `tcp_accept` per ready peer.
+- `MailboxBudget::session(in_flight_peer_messages, in_flight_runtime_calls)`
+  — TCP/HTTP session isolate.
+- `MailboxBudget::service(concurrent_requests, in_flight_runtime_calls)`
+  — request/reply service.
+- `MailboxBudget::fanout(upstream_callers, worker_count)` — frontend
+  that fans out to N workers; each worker reply needs a slot.
 
 If capacity is `1`, the second queued message should hit pressure.
+
+## Pressure Diagnostics
+
+`Runtime::pressure_summary()` and `ThreadedRuntime::pressure_summary()`
+walk the trace and return a counted summary:
+
+```rust
+let summary = runtime.pressure_summary()?;
+assert_eq!(summary.completion_rejected_mailbox_full, 0);
+println!("pressure: {summary}");
+// pressure: completion[mbox_full=0 ...] reply[no_pending=0 ...] send[full=0 closed=0]
+```
+
+`summary.any_full()` is the one-line "did we hit a *Full* anywhere?"
+check. The closed/no-pending counts reflect lifecycle, not capacity,
+so they're broken out separately.
 
 ## Observed Send
 

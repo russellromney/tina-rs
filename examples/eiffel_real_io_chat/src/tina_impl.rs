@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, ListenerId, SendOutcome, StreamId, ThreadedRuntime,
+    DefaultThreadedMailboxFactory, ListenerId, SendOutcome, StreamId, TcpAcceptReply, TcpBindReply,
+    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime,
     send_observed, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
@@ -45,10 +46,10 @@ impl SlowClient {
 #[derive(Debug, Clone)]
 enum ConnectionMsg {
     Begin,
-    Read(Result<Vec<u8>, CallError>),
+    Read(TcpReadReply),
     Observed(SendOutcome),
-    Wrote(Result<usize, CallError>),
-    Closed(Result<(), CallError>),
+    Wrote(TcpWriteReply),
+    Closed(TcpStreamCloseReply),
 }
 
 /// Connection state that starts at zero on every accepted stream.
@@ -130,9 +131,9 @@ impl Connection {
 #[derive(Debug, Clone)]
 enum ListenerMsg {
     Start,
-    Bound(Result<(ListenerId, SocketAddr), CallError>),
-    Accepted(Result<(StreamId, SocketAddr), CallError>),
-    ListenerClosed(Result<(), CallError>),
+    Bound(TcpBindReply),
+    Accepted(TcpAcceptReply),
+    ListenerClosed(TcpListenerCloseReply),
 }
 
 struct Listener {

@@ -1,3 +1,10 @@
+//! Tina side: a `Counter` isolate owns the value; an axum service
+//! reaches it through the blessed `tina_tokio_bridge` lifecycle.
+//!
+//! The bridge is the explicit two-runtime cost: axum lives in a Tokio
+//! runtime, `Counter` lives in a `BridgeHost`-managed Tina runtime,
+//! and `BridgeHandle::call(...)` crosses the boundary per request.
+
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -11,7 +18,7 @@ use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeRequest};
 use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
 
-use super::{SideReport, scripted_client};
+use crate::{Report, scripted_client};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CounterRequest {
@@ -75,7 +82,7 @@ async fn increment_counter(State(svc): State<CounterService>) -> (StatusCode, St
     }
 }
 
-pub(crate) fn run() -> SideReport {
+pub fn run() -> Report {
     let mut host = BridgeHost::new(
         SingleShard,
         DefaultThreadedMailboxFactory,

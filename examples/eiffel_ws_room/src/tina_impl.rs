@@ -1,3 +1,9 @@
+//! Tina side: a `Room` isolate owns the subscriber list. axum sits
+//! in a Tokio runtime and reaches the room through the blessed
+//! `tina_tokio_bridge` lifecycle. Per WebSocket connection: one
+//! `Subscribe` call to register the client's mpsc sender, then one
+//! `Publish` call per inbound message.
+
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -14,7 +20,7 @@ use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::mpsc;
 
-use super::{SideReport, run_room_clients};
+use crate::{Report, run_room_clients};
 
 #[derive(Debug)]
 enum RoomRequest {
@@ -94,7 +100,7 @@ async fn handle_socket(socket: WebSocket, svc: RoomService) {
     let _ = writer.await;
 }
 
-pub(crate) fn run() -> SideReport {
+pub fn run() -> Report {
     let mut host = BridgeHost::new(
         SingleShard,
         DefaultThreadedMailboxFactory,

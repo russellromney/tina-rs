@@ -1,0 +1,16 @@
+//! Smoke tests: each side handles the same scripted three-step
+//! counter request sequence and reports the same statuses/bodies.
+
+use eiffel_axum_counter::{tina_impl, tokio_impl};
+
+#[test]
+fn tokio_smoke() {
+    let report = tokio_impl::run();
+    report.assert_expected();
+}
+
+#[test]
+fn tina_smoke() {
+    let report = tina_impl::run();
+    report.assert_expected();
+}

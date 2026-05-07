@@ -1112,7 +1112,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 043 Rock 2: resource-accounting count rules.
+    // Resource-accounting count rules.
     //
     // One narrow test per lane verifies how each lane contributes to the
     // three independent vocabularies in DriverResourceReport:
@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 043 Rock 4: OS signal capture.
+    // OS signal capture.
     //
     // The dispatcher converts process-wide SIGINT/SIGTERM flag bits set
     // by signal-hook into runtime-owned signal completions. On non-Unix
@@ -1498,7 +1498,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 043 Rock 3: bounded shutdown drain.
+    // Bounded shutdown drain.
     //
     // Each lane's `cancel_pending(deadline)` must return inside the
     // budget even when the worker is stuck, surfacing remaining work via

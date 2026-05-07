@@ -1,57 +1,59 @@
-//! Tina: a `Fetcher` isolate that walks `tcp_connect → tcp_write
-//! (loop on partial writes) → tcp_read (loop until EOF) →
-//! tcp_close_stream` for each iteration. The host watches with
-//! `observe_isolate_complete(fetcher)`; per-fetch results land in a
-//! shared `Outcome` slot (app-specific data the runtime can't know
-//! about; FINDINGS.md tracks it).
+//! Tina: a `Fetcher` isolate that walks `tcp_connect → write_all →
+//! read_to_eof → tcp_close_stream` for each iteration. Phase 059
+//! Rocks 1+3:
+//!
+//! - the partial-write loop and the read-until-EOF loop are owned by
+//!   client-side helpers (`TcpWriteAll`, `TcpReadToEof`) so the
+//!   handler arms collapse to "advance the helper, dispatch the next
+//!   effect or move on";
+//! - the host receives the per-fetch tally through
+//!   `observe_result::<FetchOutcome>(fetcher)` when the isolate
+//!   finishes via `stop_with(self.outcome)`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, StreamId, ThreadedRuntime, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write,
+    DefaultThreadedMailboxFactory, LoopStep, StreamId, TcpConnectReply, TcpReadReply,
+    TcpReadToEof, TcpStreamCloseReply, TcpWriteAll, TcpWriteReply, ThreadedRuntime,
+    tcp_close_stream, tcp_connect,
 };
 
-use crate::{FETCH_COUNT, RESPONSE, Report, TestServer};
+use crate::{FETCH_COUNT, READ_CHUNK, RESPONSE, RESPONSE_MAX, Report, TestServer};
 
-/// Per-iteration tally. App-specific data the runtime can't know;
-/// shared via an `Arc<Outcome>` side channel, same shape as
-/// `eiffel_mux_client::ArrivalLog` and
-/// `eiffel_persistent_counter::Observation`.
-#[derive(Debug, Default)]
-struct Outcome {
-    successful: AtomicU32,
-    failed: AtomicU32,
-    bytes: AtomicUsize,
+/// Per-iteration tally. Owned by the isolate; published to the host via
+/// `stop_with` when the isolate finishes.
+#[derive(Debug, Default, Clone)]
+struct FetchOutcome {
+    successful: u32,
+    failed: u32,
+    bytes: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum FetchMsg {
     Begin,
-    Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    Wrote(Result<usize, CallError>),
-    Read(Result<Vec<u8>, CallError>),
-    Closed(Result<(), CallError>),
+    Connected(TcpConnectReply),
+    Wrote(TcpWriteReply),
+    Read(TcpReadReply),
+    Closed(TcpStreamCloseReply),
 }
 
-/// Per-fetch working state. `Default` so the spawn site doesn't
-/// hand-zero buffers / clear `stream`.
+/// Per-fetch working state. The two loop helpers are `Option`s so a
+/// fresh iteration starts from `None` without inventing a sentinel.
 #[derive(Debug, Default)]
 struct FetchState {
     stream: Option<StreamId>,
-    pending_write: Vec<u8>,
-    response_buf: Vec<u8>,
+    write_all: Option<TcpWriteAll>,
+    read_to_eof: Option<TcpReadToEof>,
 }
 
 struct Fetcher {
     target: SocketAddr,
     remaining: u32,
-    outcome: Arc<Outcome>,
+    outcome: FetchOutcome,
     state: FetchState,
 }
 
@@ -61,60 +63,86 @@ impl Fetcher {
         match msg {
             FetchMsg::Begin => {
                 if self.remaining == 0 {
-                    return stop();
+                    return stop_with(self.outcome.clone());
                 }
                 tcp_connect(self.target).reply(FetchMsg::Connected)
             }
             FetchMsg::Connected(Ok((stream, _local, _peer))) => {
                 self.state.stream = Some(stream);
-                self.state.pending_write = b"GET\n".to_vec();
-                self.state.response_buf.clear();
-                tcp_write(stream, self.state.pending_write.clone()).reply(FetchMsg::Wrote)
+                let mut writer = TcpWriteAll::new(stream, b"GET\n".to_vec());
+                let effect = writer
+                    .next_effect(FetchMsg::Wrote)
+                    .expect("write helper has bytes to ship");
+                self.state.write_all = Some(writer);
+                effect
             }
-            FetchMsg::Wrote(Ok(count)) => {
-                let stream = self.state.stream.expect("stream after connect");
-                if count >= self.state.pending_write.len() {
-                    self.state.pending_write.clear();
-                    tcp_read(stream, 64).reply(FetchMsg::Read)
-                } else {
-                    self.state.pending_write.drain(..count);
-                    tcp_write(stream, self.state.pending_write.clone()).reply(FetchMsg::Wrote)
-                }
-            }
-            FetchMsg::Read(Ok(bytes)) => {
-                let stream = self.state.stream.expect("stream after read");
-                if bytes.is_empty() {
-                    if self.state.response_buf == RESPONSE {
-                        self.outcome.successful.fetch_add(1, Ordering::Relaxed);
-                        self.outcome
-                            .bytes
-                            .fetch_add(self.state.response_buf.len(), Ordering::Relaxed);
-                    } else {
-                        self.outcome.failed.fetch_add(1, Ordering::Relaxed);
+            FetchMsg::Wrote(reply) => {
+                let mut writer = self
+                    .state
+                    .write_all
+                    .take()
+                    .expect("write helper present after Connected");
+                match writer.advance(reply, FetchMsg::Wrote) {
+                    LoopStep::Pending(effect) => {
+                        self.state.write_all = Some(writer);
+                        effect
                     }
-                    tcp_close_stream(stream).reply(FetchMsg::Closed)
-                } else {
-                    self.state.response_buf.extend_from_slice(&bytes);
-                    tcp_read(stream, 64).reply(FetchMsg::Read)
+                    LoopStep::Done(_) => self.start_read(),
+                    LoopStep::Failed(_) => {
+                        self.outcome.failed += 1;
+                        self.close_or_iterate()
+                    }
                 }
             }
-            FetchMsg::Closed(Ok(())) | FetchMsg::Closed(Err(_)) => {
+            FetchMsg::Read(reply) => {
+                let mut reader = self
+                    .state
+                    .read_to_eof
+                    .take()
+                    .expect("read helper present after Wrote");
+                match reader.advance(reply, FetchMsg::Read) {
+                    LoopStep::Pending(effect) => {
+                        self.state.read_to_eof = Some(reader);
+                        effect
+                    }
+                    LoopStep::Done(buffer) => {
+                        if buffer == RESPONSE {
+                            self.outcome.successful += 1;
+                            self.outcome.bytes += buffer.len();
+                        } else {
+                            self.outcome.failed += 1;
+                        }
+                        self.close_or_iterate()
+                    }
+                    LoopStep::Failed(_) => {
+                        self.outcome.failed += 1;
+                        self.close_or_iterate()
+                    }
+                }
+            }
+            FetchMsg::Closed(_) => {
                 self.state.stream = None;
                 self.next_iteration()
             }
             FetchMsg::Connected(Err(_)) => {
-                self.outcome.failed.fetch_add(1, Ordering::Relaxed);
+                self.outcome.failed += 1;
                 self.next_iteration()
-            }
-            FetchMsg::Wrote(Err(_)) | FetchMsg::Read(Err(_)) => {
-                self.outcome.failed.fetch_add(1, Ordering::Relaxed);
-                self.close_or_iterate()
             }
         }
     }
 }
 
 impl Fetcher {
+    fn start_read(&mut self) -> Effect<Self> {
+        let stream = self.state.stream.expect("stream after Connected");
+        let reader = TcpReadToEof::new(stream, RESPONSE_MAX, READ_CHUNK);
+        let effect = reader
+            .next_effect(FetchMsg::Read)
+            .expect("read helper has budget for at least one read");
+        self.state.read_to_eof = Some(reader);
+        effect
+    }
+
     fn close_or_iterate(&mut self) -> Effect<Self> {
         if let Some(stream) = self.state.stream.take() {
             tcp_close_stream(stream).reply(FetchMsg::Closed)
@@ -126,7 +154,7 @@ impl Fetcher {
     fn next_iteration(&mut self) -> Effect<Self> {
         self.remaining -= 1;
         if self.remaining == 0 {
-            stop()
+            stop_with(self.outcome.clone())
         } else {
             tcp_connect(self.target).reply(FetchMsg::Connected)
         }
@@ -138,34 +166,35 @@ pub fn run() -> anyhow::Result<Report> {
     let addr = server.addr;
 
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
-    let outcome = Arc::new(Outcome::default());
     let fetcher = runtime
         .register_with_capacity::<_, Infallible>(
             Fetcher {
                 target: addr,
                 remaining: FETCH_COUNT,
-                outcome: Arc::clone(&outcome),
+                outcome: FetchOutcome::default(),
                 state: FetchState::default(),
             },
             16,
         )
         .map_err(|e| anyhow::anyhow!("register fetcher: {e:?}"))?;
 
-    let fetcher_done = runtime.observe_isolate_complete(fetcher);
+    let result = runtime
+        .observe_result::<FetchOutcome, _, _>(fetcher)
+        .map_err(|e| anyhow::anyhow!("register result waiter: {e:?}"))?;
     runtime
         .try_send(fetcher, FetchMsg::Begin)
         .map_err(|e| anyhow::anyhow!("kick fetcher: {e:?}"))?;
-    fetcher_done
+    let outcome = result
         .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("fetcher finishes: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("fetcher finishes with result: {e:?}"))?;
 
     let _ = runtime.shutdown();
     drop(server);
 
     Ok(Report {
-        successful_fetches: outcome.successful.load(Ordering::Relaxed),
-        failed_fetches: outcome.failed.load(Ordering::Relaxed),
-        bytes_received: outcome.bytes.load(Ordering::Relaxed),
+        successful_fetches: outcome.successful,
+        failed_fetches: outcome.failed,
+        bytes_received: outcome.bytes,
         exit_clean: true,
     })
 }
