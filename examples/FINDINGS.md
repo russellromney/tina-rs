@@ -132,13 +132,69 @@ The bridge path is still important for adoption, but the remaining bridge
 examples are intentionally deferred until bridge ergonomics settle. They still
 teach useful things, but they have the old `src/comparison/` shape.
 
-**Build:**
+**Partial resolution (phase 051C):** the two HTTP-shaped bridge specimens
+(`eiffel_axum_counter`, `eiffel_ws_room`) were rebased onto
+`tina-tower-bridge::TinaTowerService`. The new shape is honestly better,
+but the rewrite surfaced fresh paper cuts that still need work.
 
-- rewrite bridge examples under the specimen rule after the 058 bridge surface
-  is the blessed one;
-- show `BridgeHost` lifecycle clearly;
-- show `BridgeClient::call` / async RPC bridge where relevant;
-- document signal-handler coexistence when Tokio and Tina live in one process.
+**What got better:**
+
+- Handler call sites are now `svc.call(req).await` — same shape Tower
+  middleware speaks. Composing the bridge with rate-limit / timeout /
+  load-shed layers is no longer an open question; it's standard Tower.
+- `BridgeError` finally has `Display` + `std::error::Error`, so
+  `format!("{error}")` works and tower-http `BoxError` accepts our
+  errors. Before this, debugging meant `format!("{error:?}")` everywhere.
+- The error → HTTP status map is now a typed table at the top of each
+  handler instead of one flat `SERVICE_UNAVAILABLE`. `Timeout` mapping
+  to `504` instead of `503` is a small honesty win.
+
+**What still feels rough:**
+
+- The state type signature is brutal:
+  `TinaTowerService<RoomRequest, RoomReply, SingleShard, DefaultThreadedMailboxFactory, ()>`.
+  Six generic params, two defaulted; the trailing `()` is `AR`, which
+  almost no user can name from memory. A friendlier specimen-facing
+  alias on the bridge crate (or a builder that produces a type that
+  isn't six generics deep) would be a real win.
+- Every Axum handler that uses `Service::call` ends with `let mut svc = svc;`
+  on its first line, because Axum's `State<S>` extracts the value, not
+  `&mut S`, and `Service::call` requires `&mut self`. Trivial but cluttery
+  — every Tina-bridged handler in the repo will have this line.
+- We still need a `tokio::runtime::Runtime` to host axum *and* the Tina
+  runtime thread underneath. Two runtimes per process is the bridge's
+  nature, but for a tiny stateful counter it's a lot of moving parts.
+  No fix in this slice; flagging the comprehension cost again.
+- Setup is still two-step: `BridgeHost::register_bridge(...)` then
+  `TinaTowerService::new(bridge)`. The reqwest-bridge crate ships an
+  `install(&runtime, config)` helper that returns the wired-up trio
+  in one call. `tina-tokio-bridge` could expose the same thing.
+- The example needs both `tina-tokio-bridge` (for `BridgeHost` /
+  `BridgeRequest`) **and** `tina-tower-bridge` (for `TinaTowerService`)
+  in `Cargo.toml`, plus a direct `tower-service = "0.3"` dep so the
+  handler can `use tower_service::Service`. Three crates and a Tower
+  trait import for what feels like one feature. Re-exporting
+  `tower_service::Service` from `tina-tower-bridge` would shave one
+  line and one dep.
+- For WebSocket (`eiffel_ws_room`), the reader and writer halves each
+  need their own `svc.clone()` because Tower's `&mut self` is
+  per-clone, not shared. This is the standard Tower idiom but it's
+  not obvious from a quick read; it took a real moment to realise the
+  obvious "share via `&mut`" path doesn't compile.
+
+**Build (still open):**
+
+- friendlier specimen-facing type alias or builder for
+  `TinaTowerService` (or a re-export that hides the six generics behind
+  a single name);
+- consider `tina_tokio_bridge::install(...)` paralleling the reqwest
+  bridge's `install` to collapse the two-step setup;
+- re-export `tower_service::Service` from `tina-tower-bridge` so
+  examples don't need a separate `tower-service` dep;
+- rewrite remaining bridge-shaped examples (`eiffel_outbound_*`,
+  `eiffel_real_io_chat`) once the next bridge surface lands;
+- document signal-handler coexistence when Tokio and Tina live in one
+  process.
 
 ### 8. RPC service topology beyond single
 

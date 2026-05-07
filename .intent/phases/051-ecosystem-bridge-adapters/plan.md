@@ -1,5 +1,20 @@
 # Phase 051: Ecosystem Bridge Adapters
 
+## Status (as of this branch)
+
+- 051A — bridge lifecycle / contract docs: **landed** via 047.
+- 051B — `tina-rpc-tokio` landing review: **landed**.
+- 051C — `tina-tower-bridge`: **landed** (PR #11).
+- 051D — `tina-reqwest-bridge`: **landed** (PR #10).
+- 051G (HTTP-shaped specimens) — `eiffel_axum_counter` and
+  `eiffel_ws_room` rebased onto `TinaTowerService`. **landed in this PR.**
+- 051E — `tina-sqlx-bridge`: **open**.
+- 051F — `tina-aws-bridge`: **open**.
+
+The blessed bridge shape for HTTP-shaped Tina services is now
+`tina-tower-bridge::TinaTowerService`. New specimens should compose
+through that surface.
+
 ## Goal
 
 Make Tokio-shaped ecosystem packages fit around Tina easily.

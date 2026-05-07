@@ -35,9 +35,11 @@ cargo run --manifest-path examples/eiffel_ws_room/Cargo.toml -- tina
   `retain(|tx| tx.send(...).is_ok())` form prunes dead subscribers in the
   same step as the publish. That is satisfying — no separate "garbage
   collect dead subscribers" pass.
-- Same `BridgeHandle` + `BridgeRequest<RoomRequest, RoomReply>` shape as
-  the axum counter. The composition story is now visibly consistent across
-  two HTTP-shaped comparisons.
+- Same `TinaTowerService` + `BridgeRequest<RoomRequest, RoomReply>` shape
+  as the axum counter. The composition story is now visibly consistent
+  across two HTTP-shaped comparisons. Each per-connection task clones
+  the service, which clones the underlying bridge handle — cheap
+  Arc-clone, no admission ceremony.
 - Pressure on slow readers (if we used a bounded channel) would surface as
   a `try_send` failure inside the handler, which is exactly the point.
   This example uses `UnboundedSender` to keep parity with the Tokio side
@@ -61,3 +63,14 @@ cargo run --manifest-path examples/eiffel_ws_room/Cargo.toml -- tina
   with many small frames, the Tokio direct-broadcast path is going to
   win on bytes-per-broadcast latency, and the Tina story has to argue
   visibility instead of speed.
+- Two `svc.clone()`s inside `handle_socket` — one for the Subscribe
+  call before splitting, one for the per-frame Publish loop. They're
+  needed because Tower's `&mut self` is per-clone, not shared, and
+  the reader/writer halves run on different async tasks. The pattern
+  is standard Tower but it took a real moment to realise the obvious
+  "share via `&mut`" path doesn't compile. Worth a doc paragraph in
+  `tina-tower-bridge` for the WebSocket case specifically.
+- The `RoomService` type signature inherits the same six-generic
+  brutality as the counter:
+  `TinaTowerService<RoomRequest, RoomReply, SingleShard, DefaultThreadedMailboxFactory, ()>`.
+  A specimen-facing alias on the bridge crate would help here too.

@@ -10,9 +10,11 @@ publish = false
 tina = { path = "../../tina" }
 tina-runtime = { path = "../../tina-runtime" }
 tina-tokio-bridge = { path = "../../tina-tokio-bridge" }
+tina-tower-bridge = { path = "../../tina-tower-bridge" }
 tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "sync", "time"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "ws"] }
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tower-service = "0.3"
 
 [workspace]

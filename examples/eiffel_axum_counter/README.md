@@ -38,18 +38,30 @@ cargo run --manifest-path examples/eiffel_axum_counter/Cargo.toml -- tina
 
 ### Tina side
 
-- The bridge crate carries its weight. `BridgeHandle::new(...)` produced a
-  `Clone` handle that goes straight into `Router::with_state(...)`, and
-  `bridge.call(req).await` is the whole call site. The fact that this
-  composes with axum's `State` extractor is the strongest thing about the
-  bridge story.
+- The bridge carries its weight. `BridgeHost::register_bridge(...)`
+  hands back a `Clone` handle that gets wrapped in `TinaTowerService`
+  and dropped straight into `Router::with_state(...)`. The handler
+  calls `svc.call(req).await` and that is the entire call site.
+  Composing with axum's `State` extractor is still the strongest part
+  of the bridge story.
 - The `Counter` isolate is a one-liner per arm: pattern-match the request
-  variant, mutate `self.value`, `responder.respond(reply)`, `noop()`. That
-  is genuinely good ergonomics for a stateful HTTP endpoint.
-- `BridgeError::{Full,Closed,Timeout}` reach the handler as a real error
-  variant, so HTTP-shaped pushback is visible at the call site instead of
-  silently buffered. This is the property the Tokio side cannot offer at
-  all.
+  variant, mutate `self.value`, `responder.respond(reply)`, `noop()`.
+  Genuinely good ergonomics for a stateful HTTP endpoint.
+- `BridgeError::{Full,Closed,Timeout}` reach the handler as a real
+  variant, so HTTP-shaped pushback is visible at the call site instead
+  of silently buffered. The error map at the top of `tina_impl.rs` is a
+  small honest table — `Full`/`Closed` → `503`, `Timeout` → `504` —
+  rather than the previous one-status-fits-all collapse. The Tokio side
+  cannot offer this at all.
+- The Tower shape (`Service::call(...)` instead of `bridge.call(...)`)
+  feels right. It's the same surface Tower middleware speaks, so
+  layering rate-limit / timeout / load-shed onto this service is a
+  matter of stacking layers rather than weaving callbacks. That was a
+  real "ah, this is the right abstraction" moment.
+- `BridgeError` finally implements `Display` and `std::error::Error`,
+  so `format!("{error}")` works and tower-http `BoxError` accepts our
+  errors directly. Before this, debugging error variants meant
+  `format!("{error:?}")` everywhere.
 
 ### What was awkward
 
@@ -69,3 +81,24 @@ cargo run --manifest-path examples/eiffel_axum_counter/Cargo.toml -- tina
   up with **two** runtimes (Tina's own thread + a Tokio current-thread
   runtime). That is the bridge's nature, but it's a real comprehension
   cost the first time you see it.
+- The state type signature is brutal:
+  `TinaTowerService<CounterRequest, CounterReply, SingleShard, DefaultThreadedMailboxFactory, ()>`.
+  Six generic params, two defaulted; the trailing `()` is `AR`, which
+  almost no user can name from memory. A specimen-facing type alias
+  on the bridge crate would shave a long, opaque line.
+- Every handler that calls `svc.call(...)` opens with `let mut svc =
+  svc;` because Axum's `State<S>` extracts the value, not `&mut S`,
+  and `Service::call` requires `&mut self`. Trivial but cluttery —
+  every Tina-bridged Axum handler in the repo is going to have this
+  line.
+- The bridge needs three crate deps and a Tower trait import:
+  `tina-tokio-bridge` (for `BridgeHost` / `BridgeRequest`),
+  `tina-tower-bridge` (for `TinaTowerService`), and direct
+  `tower-service = "0.3"` so the handler can `use tower_service::Service`.
+  Three crates and one trait import for what feels like one feature.
+  Re-exporting `tower_service::Service` from `tina-tower-bridge`
+  would shave one line and one dep.
+- Setup is two-step: `BridgeHost::register_bridge(...)` then
+  `TinaTowerService::new(bridge)`. The reqwest-bridge crate ships a
+  one-call `install(&runtime, config)` helper; `tina-tokio-bridge`
+  could expose the same.

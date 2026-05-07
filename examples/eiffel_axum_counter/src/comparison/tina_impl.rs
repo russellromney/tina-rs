@@ -7,8 +7,10 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use tina::prelude::*;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
-use tina_tokio_bridge::{BridgeHandle, BridgeHost, BridgeRequest};
+use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeRequest};
+use tina_tower_bridge::TinaTowerService;
 use tokio::net::TcpListener as TokioTcpListener;
+use tower_service::Service;
 
 use super::{SideReport, scripted_client};
 
@@ -45,20 +47,33 @@ impl Counter {
     }
 }
 
-type CounterBridge =
-    BridgeHandle<CounterRequest, CounterReply, SingleShard, DefaultThreadedMailboxFactory, ()>;
+type CounterService =
+    TinaTowerService<CounterRequest, CounterReply, SingleShard, DefaultThreadedMailboxFactory, ()>;
 
-async fn read_counter(State(bridge): State<CounterBridge>) -> (StatusCode, String) {
-    match bridge.call(CounterRequest::Read).await {
-        Ok(reply) => (StatusCode::OK, reply.value.to_string()),
-        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, format!("{error:?}")),
+/// Map a typed `BridgeError` to an HTTP status. The mapping is a
+/// table, not a string match: Full and Closed are 503 (we are not
+/// taking new work), Timeout is 504 (the upstream did not respond
+/// within the per-call deadline).
+fn map_error(error: BridgeError) -> StatusCode {
+    match error {
+        BridgeError::Full | BridgeError::Closed => StatusCode::SERVICE_UNAVAILABLE,
+        BridgeError::Timeout => StatusCode::GATEWAY_TIMEOUT,
     }
 }
 
-async fn increment_counter(State(bridge): State<CounterBridge>) -> (StatusCode, String) {
-    match bridge.call(CounterRequest::Increment).await {
+async fn read_counter(State(svc): State<CounterService>) -> (StatusCode, String) {
+    let mut svc = svc;
+    match svc.call(CounterRequest::Read).await {
         Ok(reply) => (StatusCode::OK, reply.value.to_string()),
-        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, format!("{error:?}")),
+        Err(error) => (map_error(error), format!("{error}")),
+    }
+}
+
+async fn increment_counter(State(svc): State<CounterService>) -> (StatusCode, String) {
+    let mut svc = svc;
+    match svc.call(CounterRequest::Increment).await {
+        Ok(reply) => (StatusCode::OK, reply.value.to_string()),
+        Err(error) => (map_error(error), format!("{error}")),
     }
 }
 
@@ -72,13 +87,14 @@ pub(crate) fn run() -> SideReport {
             ..Default::default()
         },
     );
-    let bridge: CounterBridge = host
+    let bridge = host
         .register_bridge::<Counter, CounterRequest, CounterReply, Infallible>(
             Counter { value: 0 },
             16,
             Duration::from_secs(2),
         )
         .expect("register counter bridge");
+    let svc: CounterService = TinaTowerService::new(bridge);
 
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -94,7 +110,7 @@ pub(crate) fn run() -> SideReport {
         let app = Router::new()
             .route("/counter", get(read_counter))
             .route("/counter/increment", post(increment_counter))
-            .with_state(bridge);
+            .with_state(svc);
 
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
