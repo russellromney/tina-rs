@@ -149,6 +149,22 @@ async fn poll_ready_returns_ready_ok_when_accepting() {
 }
 
 #[tokio::test]
+async fn is_closed_reflects_close_state() {
+    let host = make_host();
+    let bridge = host
+        .register_bridge::<EchoIsolate, u32, u32, Infallible>(
+            EchoIsolate,
+            4,
+            Duration::from_secs(1),
+        )
+        .expect("register");
+    let svc = TinaTowerService::new(bridge);
+    assert!(!svc.is_closed());
+    svc.close();
+    assert!(svc.is_closed());
+}
+
+#[tokio::test]
 async fn poll_ready_returns_ready_err_after_close() {
     let host = make_host();
     let bridge = host
@@ -326,7 +342,7 @@ async fn drop_future_after_admission_marks_response_dropped() {
     let bridge = host
         .register_bridge::<SlowIsolate, u32, u32, Infallible>(
             SlowIsolate {
-                delay: Duration::from_millis(120),
+                delay: Duration::from_millis(300),
             },
             4,
             Duration::from_secs(2),
@@ -336,25 +352,34 @@ async fn drop_future_after_admission_marks_response_dropped() {
     let mut svc = TinaTowerService::new(bridge.clone());
 
     let task = tokio::spawn(async move { svc.call(3).await });
-    // Wait for admission.
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    let mid = bridge.metrics();
-    assert!(
-        mid.accepted > baseline.accepted,
-        "admission should have happened (accepted={} baseline={})",
-        mid.accepted,
-        baseline.accepted
-    );
+
+    // Poll until admission lands, with a generous deadline for slow CI.
+    let admit_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if bridge.metrics().accepted > baseline.accepted {
+            break;
+        }
+        if std::time::Instant::now() >= admit_deadline {
+            panic!("admission did not land within deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     task.abort();
 
-    // Wait for the slow handler to finish and try to send into the
-    // dropped responder.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let after = bridge.metrics();
-    assert!(
-        after.dropped_responses > baseline.dropped_responses,
-        "after-admission abort must record a dropped response"
-    );
+    // Poll until the late response lands; deadline well past the
+    // 300ms handler delay.
+    let drop_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if bridge.metrics().dropped_responses > baseline.dropped_responses {
+            return;
+        }
+        if std::time::Instant::now() >= drop_deadline {
+            panic!(
+                "dropped_responses did not increment within deadline; metrics={:?}",
+                bridge.metrics()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

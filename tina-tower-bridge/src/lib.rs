@@ -49,6 +49,50 @@
 //! cannot guarantee that no work runs. The Tina handler may still
 //! execute and its reply is discarded by the bridge's metrics path.
 //!
+//! # Preserved Tina guarantees
+//!
+//! - **Bounded ingress**: every `call` goes through the underlying
+//!   bridge handle's `try_send_and_observe`; admission is bounded by
+//!   the Tina mailbox capacity. `Full` is caller-visible.
+//! - **Visible failures**: every error path is a typed
+//!   [`tina_tokio_bridge::BridgeError`] variant.
+//! - **Synchronous handlers**: the wrapped Tina isolate's handler runs
+//!   in one synchronous turn. The Service does not introduce its own
+//!   async work or queues.
+//! - **No hidden Service queue**: this crate adds nothing between
+//!   Tower and the bridge handle. `Service::call` is a thin shell
+//!   around `BridgeHandle::call`.
+//!
+//! # Weakened Tina guarantees
+//!
+//! - **Deterministic replay**: Tower's executor is not observed by
+//!   `tina-sim`. Replay parity is best-effort at the bridge boundary
+//!   only.
+//! - **Tower readiness backpressure**: `poll_ready` does not reflect
+//!   Tina mailbox occupancy or in-flight count. Readiness only signals
+//!   "bridge open" vs "closed". A user expecting Tower's "ask if
+//!   ready, then admit one slot" reservation idiom must remember that
+//!   admission still races on the `call` future.
+//!
+//! # Tower middleware safety
+//!
+//! Most Tower layers compose cleanly. A few introduce queues that
+//! **violate** Tina's "no hidden unbounded queue" rule and should not
+//! be wrapped around `TinaTowerService` without an explicit cap:
+//!
+//! - `tower::buffer::Buffer` defaults to an *unbounded* MPSC channel
+//!   between the buffer task and the inner service. Use it only with
+//!   an explicit `bound` and accept that buffered requests sit outside
+//!   Tina's pressure surface.
+//! - `tower::load_shed::LoadShed` is fine — it sheds when the inner
+//!   Service is `Pending`, which we never are.
+//! - `tower::limit::ConcurrencyLimit` is fine — it bounds in-flight
+//!   via a Semaphore on top of (not in addition to) Tina's
+//!   `max_in_flight`. Pick one source of truth.
+//! - `tower::timeout::Timeout` is fine — its outer timeout cancels
+//!   our future on expiry. The cancellation maps to the
+//!   drop-after-admission case: bridge counts a dropped responder.
+//!
 //! See [`tina_tokio_bridge`] for the underlying bridge contract.
 
 use std::future::Future;
@@ -124,6 +168,14 @@ where
     /// After close, `poll_ready` returns `Ready(Err(Closed))`.
     pub fn close(&self) {
         self.handle.close();
+    }
+
+    /// Whether the underlying bridge handle has been closed.
+    pub fn is_closed(&self) -> bool {
+        matches!(
+            self.handle.health(),
+            tina_tokio_bridge::BridgeHealth::Closed
+        )
     }
 }
 
