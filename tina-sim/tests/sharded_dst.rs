@@ -21,8 +21,8 @@ use std::time::Duration;
 use tina::{Address, prelude::*};
 use tina_runtime::RuntimeCall;
 use tina_runtime::sharded::{
-    ReplyAdapter, ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome,
-    ShardPlacement, ShardServiceTable, WrongShard,
+    ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement,
+    ShardServiceTable, WrongShard,
 };
 use tina_runtime::sleep_then;
 use tina_sim::{
@@ -587,11 +587,11 @@ fn scatter_gather_records_aggregate_timeout_when_target_does_not_reply() {
         },
         16,
     );
-    let bridge = sim.register_with_capacity_on::<
-        ReplyAdapter<TrackerMsg, ScatterCoordMsg, AppShard>,
-        TrackerMsg,
-        ScatterCoordMsg,
-    >(ShardId::new(11), ReplyAdapter::new(coord), 16);
+    let bridge = sim.register_reply_adapter_on::<TrackerMsg, ScatterCoordMsg>(
+        ShardId::new(11),
+        coord,
+        16,
+    );
 
     sim.try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();
@@ -676,11 +676,11 @@ fn scatter_gather_report_in_sim_preserves_caller_supplied_target_order() {
         },
         16,
     );
-    let bridge = sim.register_with_capacity_on::<
-        ReplyAdapter<TrackerMsg, ScatterCoordMsg, AppShard>,
-        TrackerMsg,
-        ScatterCoordMsg,
-    >(ShardId::new(11), ReplyAdapter::new(coord), 16);
+    let bridge = sim.register_reply_adapter_on::<TrackerMsg, ScatterCoordMsg>(
+        ShardId::new(11),
+        coord,
+        16,
+    );
     sim.try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();
     sim.try_send(coord, ScatterCoordMsg::Start).unwrap();

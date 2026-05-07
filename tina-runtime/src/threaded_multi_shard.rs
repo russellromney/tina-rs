@@ -16,7 +16,8 @@ use betelgeuse::io_loop;
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
 use tina_supervisor::SupervisorConfig;
 
-use crate::call::IntoErasedCall;
+use crate::call::{IntoErasedCall, RuntimeCall};
+use crate::sharded::ReplyAdapter;
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
@@ -244,6 +245,48 @@ where
         self.call_on(shard, move |runtime| {
             runtime.register_sendable_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
         })
+    }
+
+    /// Register a [`ReplyAdapter<M, T, S>`] on a chosen shard.
+    ///
+    /// The adapter translates inbound `M` to outbound `T` via the
+    /// user-provided `From<M> for T` and forwards it to `target`.
+    /// Returns the bridge `Address<M>` that callers send to.
+    ///
+    /// Visible inputs: shard, target address, mailbox capacity.
+    /// Hidden state: none beyond the adapter's bounded mailbox.
+    /// No hidden target clone or refresh; no scatter/gather policy
+    /// inside the helper.
+    ///
+    /// Equivalent to but shorter than
+    /// `register_with_capacity_on::<ReplyAdapter<M, T, S>, T>(shard, ReplyAdapter::new(target), capacity)`.
+    /// The helper exists so callers do not have to repeat the
+    /// adapter's full type and the second turbofish for the outbound
+    /// payload.
+    ///
+    /// `shard` is the caller-supplied shard the adapter will live on.
+    /// Co-locating the adapter with the coordinator keeps reply
+    /// translation local; pinning it on the target's shard moves the
+    /// translation off the caller's hot path. The helper does not
+    /// pick for you.
+    #[allow(private_bounds)]
+    pub fn register_reply_adapter_on<M, T>(
+        &self,
+        shard: ShardId,
+        target: Address<T>,
+        mailbox_capacity: usize,
+    ) -> Result<Address<M>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        T: Send + 'static + From<M>,
+        std::convert::Infallible: IntoErasedSpawn<S, F>,
+        RuntimeCall<M>: IntoErasedCall<M>,
+    {
+        self.register_with_capacity_on::<ReplyAdapter<M, T, S>, T>(
+            shard,
+            ReplyAdapter::new(target),
+            mailbox_capacity,
+        )
     }
 
     /// Configures a registered root isolate as supervisor on its owning shard.

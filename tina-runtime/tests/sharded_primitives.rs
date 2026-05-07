@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
 use tina_runtime::sharded::{
-    MissingShard, ReplyAdapter, ScatterGatherConfig, ScatterGatherConfigError, ScatterGatherReport,
+    MissingShard, ScatterGatherConfig, ScatterGatherConfigError, ScatterGatherReport,
     ScatterGatherTargetOutcome, ShardPlacement, ShardServiceTable, WrongShard,
 };
 use tina_runtime::{MailboxFactory, MultiShardRuntime, RuntimeCall, SendOutcome, send_observed};
@@ -887,12 +887,11 @@ fn scatter_gather_aggregate_collects_one_reply_per_target() {
         },
         config.collector_capacity,
     );
-    let bridge = runtime
-        .register_with_capacity_on::<ReplyAdapter<CounterCoordMsg, ScatterCoordMsg, AppShard>, ScatterCoordMsg>(
-            ShardId::new(3),
-            ReplyAdapter::new(coord),
-            config.collector_capacity,
-        );
+    let bridge = runtime.register_reply_adapter_on::<CounterCoordMsg, ScatterCoordMsg>(
+        ShardId::new(3),
+        coord,
+        config.collector_capacity,
+    );
     runtime
         .try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();
@@ -1322,12 +1321,11 @@ fn run_scatter_obs(
         },
         config.collector_capacity,
     );
-    let bridge = runtime
-        .register_with_capacity_on::<ReplyAdapter<CounterCoordMsg, ScatterCoordObsMsg, AppShard>, ScatterCoordObsMsg>(
-            coord_shard,
-            ReplyAdapter::new(coord),
-            config.collector_capacity,
-        );
+    let bridge = runtime.register_reply_adapter_on::<CounterCoordMsg, ScatterCoordObsMsg>(
+        coord_shard,
+        coord,
+        config.collector_capacity,
+    );
     runtime
         .try_send(coord, ScatterCoordObsMsg::Bind { bridge })
         .unwrap();
