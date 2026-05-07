@@ -17,7 +17,7 @@ pub enum ThreadedRuntimeError {
 
 /// Error returned by [`crate::Runtime::try_supervise`] and the threaded equivalents.
 ///
-/// Phase 047 Rock 8: replaces a panic on unknown / stale parent registration
+/// Replaces a panic on unknown / stale parent registration
 /// in `Runtime::supervise` so the explicit-step and threaded surfaces both
 /// have a fallible variant. The panicking [`crate::Runtime::supervise`] is kept
 /// for setup-time assertions.

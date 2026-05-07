@@ -579,8 +579,8 @@ where
             .unwrap_or(0)
     }
 
-    /// Phase 047 Rock 7: one-call drain + shutdown that replaces the
-    /// `Arc::try_unwrap` dance Eiffel examples used to write.
+    /// One-call drain + shutdown that replaces the `Arc::try_unwrap`
+    /// dance Eiffel examples used to write.
     ///
     /// Polls until every `BridgeHandle` clone has been dropped or
     /// `drain_timeout` elapses. If the drain completes, consumes the

@@ -332,7 +332,7 @@ where
     ///
     /// An empty batch is equivalent to [`Noop`](Self::Noop).
     ///
-    /// **Same-stream caveat (Phase 047 Rock 6):** `Batch` does *not* serialize
+    /// **Same-stream caveat:** `Batch` does *not* serialize
     /// runtime calls that target the same I/O resource. Issuing several
     /// `tcp_write` calls against the same `StreamId` inside a single batch is
     /// unsupported — the second runtime call against the same stream lane
@@ -413,7 +413,7 @@ where
     Effect::Batch(effects.into_iter().collect())
 }
 
-/// Phase 047 Rock 6: documented sugar for ordered runtime-call sequences.
+/// Documented sugar for ordered runtime-call sequences.
 ///
 /// `sequence(...)` is equivalent to [`batch`]: the runtime executes the
 /// contained effects in source order, a [`Stop`](Effect::Stop) short-
@@ -690,10 +690,10 @@ pub trait Shard {
 
 /// Built-in single-shard type for programs that have only one shard.
 ///
-/// Phase 047 Rock 5: when `#[tina::isolate]` (or `#[tina_runtime::isolate]`)
-/// is invoked without a `shard = ...` argument, the macro defaults to this
-/// type so single-shard examples and small services do not need to define
-/// a one-off shard struct just to satisfy the macro. Programs that run
+/// When `#[tina::isolate]` (or `#[tina_runtime::isolate]`) is invoked
+/// without a `shard = ...` argument, the macro defaults to this type so
+/// single-shard examples and small services do not need to define a
+/// one-off shard struct just to satisfy the macro. Programs that run
 /// across more than one shard continue to declare their own shard types
 /// explicitly.
 ///

@@ -1,4 +1,4 @@
-//! Phase 059 Rock 3: client-side helpers for boring TCP loops.
+//! Client-side helpers for boring TCP loops.
 //!
 //! Each helper is a tiny state machine that lives inside an isolate's
 //! state struct. The handler dispatches the next runtime call by

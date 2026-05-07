@@ -44,11 +44,10 @@ struct Route {
 
 /// Linear-scan router. First match wins. 404 fallback baked in.
 ///
-/// Phase 059 Rock 6: convenience constructors `get`/`post`/`put`/
-/// `delete`/`patch` exist alongside the generic `route(method,
-/// path, handler)`. With [`Self::method_not_allowed`] the router
-/// distinguishes 404 (path unknown) from 405 (method mismatch on a
-/// known path).
+/// Convenience constructors `get`/`post`/`put`/`delete`/`patch`
+/// exist alongside the generic `route(method, path, handler)`. With
+/// [`Self::method_not_allowed`] the router distinguishes 404 (path
+/// unknown) from 405 (method mismatch on a known path).
 #[derive(Clone)]
 pub struct Router {
     routes: Vec<Route>,

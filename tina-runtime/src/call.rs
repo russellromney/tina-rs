@@ -1109,7 +1109,7 @@ mod runtime_callable_sealed {
 /// Marker trait identifying `Isolate::Call` types accepted by simulator-
 /// driven and runtime-call-aware contexts.
 ///
-/// Phase 047 Rock 5: this trait is implemented only for [`RuntimeCall`].
+/// This trait is implemented only for [`RuntimeCall`].
 /// Surfaces in simulator and runtime-call bounds get a clearer compile
 /// error than the previous `Call = RuntimeCall<...>` equality mismatch
 /// when an isolate is authored with `#[tina::isolate]` (which defaults
@@ -2486,7 +2486,7 @@ pub fn journal_replay(path: impl Into<PathBuf>) -> TypedCall<JournalReplay> {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 059 Rock 2: type aliases for runtime-call replies.
+// Type aliases for runtime-call replies.
 //
 // Lets isolate enums spell `Connected(TcpConnectReply)` instead of
 // `Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>)` and

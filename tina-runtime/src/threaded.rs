@@ -239,7 +239,7 @@ where
 
     /// Configures a registered isolate as supervisor on the worker shard.
     ///
-    /// Phase 047 Rock 8: this method panics on unknown parent (consistent
+    /// This method panics on unknown parent (consistent
     /// with the explicit-step `Runtime::supervise`). Use
     /// [`try_supervise`](Self::try_supervise) for a non-panicking variant
     /// that surfaces unknown / stale parents as a typed
@@ -357,7 +357,7 @@ where
     /// `Full` / `Closed` outcomes are observed on the worker side through trace
     /// or through [`send_and_observe`](Self::send_and_observe).
     ///
-    /// Phase 047 Rock 8 — porting note: this is the fast, fire-and-forget
+    /// Porting note: this is the fast, fire-and-forget
     /// surface. Unlike [`Runtime::try_send`] (the explicit-step equivalent),
     /// `ThreadedRuntime::try_send`:
     ///
@@ -375,7 +375,7 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
-        // Phase 043 Rock 5: a Failed worker rejects ingress immediately
+        // A Failed worker rejects ingress immediately
         // even before the bounded sync_channel has observed Disconnected,
         // so callers cannot enqueue work into a quarantined shard.
         if self.metrics.state() == LiveShardState::Failed {

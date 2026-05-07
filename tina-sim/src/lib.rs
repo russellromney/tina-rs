@@ -235,7 +235,7 @@ where
 
     /// Registers one isolate with an explicit simulator mailbox capacity.
     ///
-    /// Phase 047 Rock 5: the redundant `I::Call: RuntimeCallable` bound
+    /// The redundant `I::Call: RuntimeCallable` bound
     /// surfaces a targeted compile diagnostic when an isolate authored
     /// with `#[tina::isolate(...)]` (which defaults `Call = Infallible`)
     /// is registered with the simulator: instead of an opaque

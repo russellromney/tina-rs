@@ -1,4 +1,4 @@
-//! Phase 047 Rock 7: bridge drain + shutdown tests.
+//! Bridge drain + shutdown tests.
 
 use std::convert::Infallible;
 use std::time::Duration;

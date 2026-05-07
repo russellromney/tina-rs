@@ -268,7 +268,7 @@ where
                 address.shard().get()
             );
         };
-        // Phase 043 Rock 5: reject ingress to a quarantined shard
+        // Reject ingress to a quarantined shard
         // immediately, before the bounded sync_channel has observed
         // Disconnected. Cross-shard senders should not race with the
         // worker's natural exit window.

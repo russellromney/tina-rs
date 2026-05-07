@@ -800,9 +800,9 @@ where
     /// addresses are programmer errors and panic. Reconfiguring the same parent
     /// replaces the config and resets the runtime-lifetime budget tracker.
     pub fn supervise<M: 'static, R>(&mut self, parent: Address<M, R>, config: SupervisorConfig) {
-        // Phase 047 Rock 8: keep the panicking surface for callers who want
-        // a setup-time assertion, but route the actual work through the
-        // fallible `try_supervise` so the panic message stays in one place.
+        // Keep the panicking surface for callers who want a setup-time
+        // assertion, but route the actual work through the fallible
+        // `try_supervise` so the panic message stays in one place.
         if self.try_supervise(parent, config).is_err() {
             panic!(
                 "supervise expected an address registered with this runtime, got an unknown or stale address",
@@ -813,12 +813,11 @@ where
     /// Configures one registered isolate as supervisor without panicking on
     /// unknown parents.
     ///
-    /// Phase 047 Rock 8 (runtime surface alignment): the panicking
-    /// [`supervise`](Self::supervise) variant remains available for setup
-    /// code that wants the unknown-parent case to be a hard programmer
-    /// error. `try_supervise` is the fallible variant that
-    /// [`ThreadedRuntime`] uses internally so an unknown-parent registration
-    /// does not crash the worker thread.
+    /// The panicking [`supervise`](Self::supervise) variant remains
+    /// available for setup code that wants the unknown-parent case to
+    /// be a hard programmer error. `try_supervise` is the fallible
+    /// variant that [`ThreadedRuntime`] uses internally so an
+    /// unknown-parent registration does not crash the worker thread.
     pub fn try_supervise<M: 'static, R>(
         &mut self,
         parent: Address<M, R>,

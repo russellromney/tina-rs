@@ -1,8 +1,8 @@
 //! Typed, bounded host observation handles for runtime facts.
 //!
-//! Phase 047 Rock 4: replace `Arc<Mutex<Option<SocketAddr>>>` and
-//! `Arc<AtomicBool>` side channels in user code with typed handles that the
-//! runtime owns and notifies.
+//! Replaces `Arc<Mutex<Option<SocketAddr>>>` and `Arc<AtomicBool>`
+//! side channels in user code with typed handles that the runtime
+//! owns and notifies.
 //!
 //! Four handles ship in this slice:
 //!

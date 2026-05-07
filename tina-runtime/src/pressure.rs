@@ -1,4 +1,4 @@
-//! Phase 059 Rock 4: capacity diagnostics.
+//! Capacity diagnostics.
 //!
 //! The trace already records every reply-delivery rejection, every
 //! send rejection, and every call-completion rejection. This module
@@ -131,8 +131,8 @@ impl fmt::Display for PressureSummary {
     }
 }
 
-/// Phase 059 Rock 9: shared *convention* (not driver) for one-line
-/// pressure reports printed by Eiffel pressure-capable specimens.
+/// Shared *convention* (not driver) for one-line pressure reports
+/// printed by pressure-capable specimens.
 ///
 /// The line format is intentionally boring `key=value` pairs so the
 /// outer pressure runners (e.g. `eiffel_cpu_run`, `eiffel_mem_run`)

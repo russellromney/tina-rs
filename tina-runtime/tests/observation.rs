@@ -1,4 +1,4 @@
-//! Phase 047 Rock 4: typed observation handle tests.
+//! Typed observation handle tests.
 //!
 //! Slice 1 covers the bound-address waiter; slice 2 (this file's later
 //! tests) covers isolate-complete, operation-done, and child-restarted
@@ -493,7 +493,7 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 059 Rock 1: typed isolate result waiters.
+// Typed isolate result waiters.
 // ---------------------------------------------------------------------------
 
 /// Final value carried back to the host via `stop_with`.
