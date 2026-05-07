@@ -82,7 +82,10 @@
 //!
 //! let audit = Address::new(ShardId::new(0), IsolateId::new(99));
 //! let mut shard = InlineShard;
-//! let mut ctx = Context::new(&mut shard, IsolateId::new(1));
+//! let mut ctx = Context::<_, <Counter as Isolate>::Reply>::new_typed(
+//!     &mut shard,
+//!     IsolateId::new(1),
+//! );
 //! let mut counter = Counter { total: 0, audit };
 //!
 //! match counter.handle(Message::Add(3), &mut ctx) {
@@ -839,6 +842,26 @@ where
     /// honor an [`Effect::Reply`] for the same call. Returning
     /// `Effect::Reply` after `take_reply_slot` is a no-op against the
     /// original caller.
+    ///
+    /// The reply type comes from the context, not from the caller. The
+    /// old "name the isolate again" shape does not compile:
+    ///
+    /// ```compile_fail
+    /// # use tina::{Context, DeferredReply, IsolateId, SingleShard};
+    /// let mut shard = SingleShard;
+    /// let mut ctx = Context::<_, u32>::new_typed(&mut shard, IsolateId::new(1));
+    /// let _slot: Result<DeferredReply<u32>, _> = ctx.take_reply_slot::<()>();
+    /// ```
+    ///
+    /// The correct shape lets Rust infer the slot payload from
+    /// `Context<'_, S, R>`:
+    ///
+    /// ```
+    /// # use tina::{Context, DeferredReply, IsolateId, SingleShard};
+    /// let mut shard = SingleShard;
+    /// let mut ctx = Context::<_, u32>::new_typed(&mut shard, IsolateId::new(1));
+    /// let _slot: Result<DeferredReply<u32>, _> = ctx.take_reply_slot();
+    /// ```
     pub fn take_reply_slot(&mut self) -> Result<DeferredReply<R>, TakeReplySlotError>
     where
         R: 'static,
