@@ -15,10 +15,11 @@ Both sides produce `delivered=2 unavailable=1 timed_out=1 other=0`.
 
 ## What feels good (Tina)
 
-- Layered outcome lets the dispatcher classify with zero ambiguity:
-  `CallOutcome::Replied(Ok(resp))` → check status; `Replied(Err(Timeout))`
-  or top-level `Timeout` → bucket as `timed_out`. No "did the
-  network drop or did we abort?" guesswork.
+- `ReqwestOutcomeExt::classify` (Phase 062 Rock 6) collapses the
+  two-layer outcome into three buckets — `Succeeded(resp)`,
+  `Transient(reason)`, `Fatal(reason)` — with typed reasons that
+  still name *which* layer failed. The dispatcher's bucketer is
+  five short arms.
 - One `send_request(http, req, timeout).reply(ctor)` per endpoint,
   `Effect::Batch(...)` to ship them all. The dispatcher's full
   fanout is six lines.
@@ -28,9 +29,6 @@ Both sides produce `delivered=2 unavailable=1 timed_out=1 other=0`.
 
 ## What feels worse
 
-- The two-layer match is wide: 5+ arms to bucket every outcome.
-  FINDINGS Round 2 finding 6 (retry classifier) covers this; a
-  small classifier helper would shrink dispatcher code.
 - The dispatcher tracks its own `pending` counter to know when to
   stop. A "fanout helper that returns N call effects and resolves
   when all are done" would replace the bookkeeping; in the meantime

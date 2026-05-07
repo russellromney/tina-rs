@@ -39,12 +39,14 @@ FrontendMsg::Shutdown => {
 
 ## What feels worse
 
-- The host has to send `Shutdown` through the same bounded
-  mailbox the regular Submit traffic uses. With six in-flight
-  callers and a 64-slot frontend mailbox there's plenty of room,
-  but a saturated frontend forces the host into a
-  `send_and_observe` retry loop. Same lifecycle paper-cut as
-  `eiffel_graceful_drain_server` (Round 2 finding 12).
+- `Shutdown` rides the same bounded mailbox as the regular
+  `Submit` traffic. With six in-flight callers and a 64-slot
+  frontend mailbox there is plenty of room; the host calls
+  `runtime.send_observed_until(...)` (Phase 062 Rock 4) which
+  retries `MailboxFull` / `IngressFull` up to a deadline. The
+  hand-rolled retry loop is gone, but the underlying lifecycle
+  question (control message through the data mailbox) is the same
+  one in `eiffel_graceful_drain_server` and Round 2 finding 12.
 
 ## Tokio footgun
 

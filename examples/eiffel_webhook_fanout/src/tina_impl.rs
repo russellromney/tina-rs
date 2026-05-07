@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_reqwest_bridge::{
-    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestError, ReqwestRequest, ReqwestWorker,
-    send_request,
+    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestFatalReason, ReqwestOutcomeClass,
+    ReqwestOutcomeExt, ReqwestRequest, ReqwestTransientReason, ReqwestWorker, send_request,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 
 use crate::Report;
 use crate::upstream::{self, Upstream};
@@ -55,18 +55,20 @@ impl Dispatcher {
                 Effect::Batch(calls)
             }
             DispatcherMsg::HookReturned(outcome) => {
-                match outcome {
-                    CallOutcome::Replied(Ok(resp)) if resp.status.is_success() => {
-                        self.counts.delivered += 1;
+                match outcome.classify() {
+                    ReqwestOutcomeClass::Succeeded(_) => self.counts.delivered += 1,
+                    ReqwestOutcomeClass::Transient(ReqwestTransientReason::UpstreamServer {
+                        status,
+                    }) if status.as_u16() == 503 => self.counts.server_unavailable += 1,
+                    ReqwestOutcomeClass::Transient(
+                        ReqwestTransientReason::BridgeTimeout
+                        | ReqwestTransientReason::WorkerTimeout,
+                    ) => self.counts.timed_out += 1,
+                    ReqwestOutcomeClass::Transient(_) => self.counts.other += 1,
+                    ReqwestOutcomeClass::Fatal(ReqwestFatalReason::UpstreamClient { .. }) => {
+                        self.counts.other += 1
                     }
-                    CallOutcome::Replied(Ok(resp)) if resp.status.as_u16() == 503 => {
-                        self.counts.server_unavailable += 1;
-                    }
-                    CallOutcome::Replied(Ok(_)) => self.counts.other += 1,
-                    CallOutcome::Replied(Err(ReqwestError::Timeout)) | CallOutcome::Timeout => {
-                        self.counts.timed_out += 1;
-                    }
-                    _ => self.counts.other += 1,
+                    ReqwestOutcomeClass::Fatal(_) => self.counts.other += 1,
                 }
                 self.pending -= 1;
                 if self.pending == 0 {

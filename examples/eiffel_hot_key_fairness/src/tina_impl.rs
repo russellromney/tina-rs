@@ -1,12 +1,11 @@
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, ThreadedSendObservedError,
-    ThreadedTrySendError, sleep,
+    DefaultThreadedMailboxFactory, HostBurstOutcomes, SingleCallGate, SleepReply, ThreadedRuntime,
+    sleep,
 };
 
 use crate::{COLD_WRITES_PER_SHARD, HOT_WRITES, PER_WRITE_MS, Report, SHARD_MAILBOX, SHARDS};
@@ -24,7 +23,9 @@ enum StoreMsg {
 
 struct Store {
     work: Duration,
-    pending: u32,
+    /// Phase 062 Rock 5: names the "one Tick in flight, plus N
+    /// queued" invariant.
+    gate: SingleCallGate,
     processed: u32,
     expected: Option<u32>,
 }
@@ -38,9 +39,7 @@ impl Store {
     ) -> Effect<Self> {
         match msg {
             StoreMsg::Set => {
-                let was_idle = self.pending == 0;
-                self.pending += 1;
-                if was_idle {
+                if self.gate.submit() {
                     sleep(self.work).reply(StoreMsg::Tick)
                 } else {
                     noop()
@@ -48,13 +47,14 @@ impl Store {
             }
             StoreMsg::Tick(reply) => {
                 if reply.is_err() {
+                    self.gate.cancel_in_flight();
                     return stop();
                 }
                 self.processed += 1;
-                self.pending -= 1;
+                let more = self.gate.complete();
                 if self.is_done() {
                     stop()
-                } else if self.pending > 0 {
+                } else if more {
                     sleep(self.work).reply(StoreMsg::Tick)
                 } else {
                     noop()
@@ -71,7 +71,7 @@ impl Store {
 impl Store {
     fn is_done(&self) -> bool {
         match self.expected {
-            Some(n) => self.pending == 0 && self.processed >= n,
+            Some(n) => self.gate.is_idle() && self.processed >= n,
             None => false,
         }
     }
@@ -90,7 +90,7 @@ pub fn run() -> anyhow::Result<Report> {
                 .register_with_capacity::<_, Infallible>(
                     Store {
                         work: Duration::from_millis(PER_WRITE_MS),
-                        pending: 0,
+                        gate: SingleCallGate::new(),
                         processed: 0,
                         expected: None,
                     },
@@ -100,66 +100,20 @@ pub fn run() -> anyhow::Result<Report> {
         );
     }
 
-    let counters: Vec<_> = (0..SHARDS)
-        .map(|_| {
-            (
-                Arc::new(AtomicU32::new(0)),
-                Arc::new(AtomicU32::new(0)),
-                Arc::new(AtomicU32::new(0)),
-            )
-        })
-        .collect();
+    let outcomes: Vec<HostBurstOutcomes> = (0..SHARDS).map(|_| HostBurstOutcomes::new()).collect();
 
-    let burst = |shard_idx: usize, n: u32| -> anyhow::Result<()> {
-        let (admitted, full, observed) = (
-            Arc::clone(&counters[shard_idx].0),
-            Arc::clone(&counters[shard_idx].1),
-            Arc::clone(&counters[shard_idx].2),
-        );
-        for _ in 0..n {
-            let admitted_obs = Arc::clone(&admitted);
-            let full_obs = Arc::clone(&full);
-            let observed_obs = Arc::clone(&observed);
-            let observer = move |outcome: Result<(), ThreadedSendObservedError>| {
-                match outcome {
-                    Ok(()) => admitted_obs.fetch_add(1, Ordering::Release),
-                    Err(_) => full_obs.fetch_add(1, Ordering::Release),
-                };
-                observed_obs.fetch_add(1, Ordering::Release);
-            };
-            match runtime.try_send_and_observe_with(stores[shard_idx], StoreMsg::Set, observer) {
-                Ok(()) => {}
-                Err(ThreadedTrySendError::IngressFull) => {
-                    full.fetch_add(1, Ordering::Release);
-                    observed.fetch_add(1, Ordering::Release);
-                }
-                Err(e) => return Err(anyhow::anyhow!("burst: {e}")),
-            }
-        }
-        Ok(())
-    };
-
-    burst(0, HOT_WRITES)?;
+    for _ in 0..HOT_WRITES {
+        let _ = runtime.try_send_outcome(stores[0], StoreMsg::Set, &outcomes[0]);
+    }
     for shard in 1..SHARDS as usize {
-        burst(shard, COLD_WRITES_PER_SHARD)?;
+        for _ in 0..COLD_WRITES_PER_SHARD {
+            let _ = runtime.try_send_outcome(stores[shard], StoreMsg::Set, &outcomes[shard]);
+        }
     }
 
-    // Wait for every observer to fire.
-    let total_writes = HOT_WRITES + (SHARDS - 1) * COLD_WRITES_PER_SHARD;
-    let total_observed: u32 = counters
-        .iter()
-        .map(|(_, _, o)| o.load(Ordering::Acquire))
-        .sum();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while total_observed < total_writes
-        && Instant::now() < deadline
-        && counters
-            .iter()
-            .map(|(_, _, o)| o.load(Ordering::Acquire))
-            .sum::<u32>()
-            < total_writes
-    {
-        std::thread::yield_now();
+    for o in &outcomes {
+        o.wait_complete(Duration::from_secs(2))
+            .map_err(|e| anyhow::anyhow!("burst observers: {e}"))?;
     }
 
     // Register stop-watchers FIRST so a fast-draining store cannot
@@ -169,37 +123,30 @@ pub fn run() -> anyhow::Result<Report> {
         .map(|s| runtime.observe_isolate_complete(*s))
         .collect();
 
-    // Drain each store. The mailbox may still hold queued Sets, so
-    // retry until accepted.
+    // Drain each store with the host-counted admitted total. The
+    // mailbox may still hold queued Sets, so retry until accepted.
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    let backoff = Duration::from_millis(2);
     for (idx, s) in stores.iter().enumerate() {
-        let admitted_n = counters[idx].0.load(Ordering::Acquire);
-        let close_deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match runtime.send_and_observe(*s, StoreMsg::Drain(admitted_n)) {
-                Ok(()) => break,
-                Err(ThreadedSendObservedError::MailboxFull)
-                | Err(ThreadedSendObservedError::IngressFull) => {
-                    if Instant::now() >= close_deadline {
-                        return Err(anyhow::anyhow!("could not deliver Drain"));
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(e) => return Err(anyhow::anyhow!("drain send: {e}")),
-            }
-        }
+        let admitted_n = outcomes[idx].snapshot().admitted;
+        runtime
+            .send_observed_until(*s, drain_deadline, backoff, || StoreMsg::Drain(admitted_n))
+            .map_err(|e| anyhow::anyhow!("drain send: {e:?}"))?;
     }
     for w in waiters {
         w.wait(Duration::from_secs(5))
             .map_err(|e| anyhow::anyhow!("store stop: {e:?}"))?;
     }
 
-    let hot_admitted = counters[0].0.load(Ordering::Acquire);
-    let hot_rejected = counters[0].1.load(Ordering::Acquire);
+    let hot_snap = outcomes[0].snapshot();
+    let hot_admitted = hot_snap.admitted;
+    let hot_rejected = hot_snap.mailbox_full + hot_snap.ingress_full;
     let mut cold_admitted = 0u32;
     let mut cold_rejected = 0u32;
-    for (a, f, _) in &counters[1..] {
-        cold_admitted += a.load(Ordering::Acquire);
-        cold_rejected += f.load(Ordering::Acquire);
+    for o in &outcomes[1..] {
+        let s = o.snapshot();
+        cold_admitted += s.admitted;
+        cold_rejected += s.mailbox_full + s.ingress_full;
     }
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {

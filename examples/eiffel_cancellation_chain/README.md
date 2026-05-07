@@ -18,7 +18,11 @@ Tokio: `JoinSet::abort_all()`. Preempts at the next await boundary;
 aborted tasks never deliver.
 
 Tina: the `Stop` envelope on `DriverMsg`, plus
-`runtime.try_send(driver, DriverMsg::Stop)` from the host.
+`runtime.try_send(driver, DriverMsg::Stop)` from the host. The
+driver's `Stop` arm ends with `stop_with(report)` and the host
+reads the typed `Report` through
+`runtime.observe_result::<Report>(driver)` — no
+`Arc<Mutex<Option<Report>>>` side channel.
 
 ## Run
 

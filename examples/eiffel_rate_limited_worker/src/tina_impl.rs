@@ -3,12 +3,11 @@
 //! either kicks off `sleep(RATE_WINDOW)` or buffers as `pending` until
 //! the in-flight Tick lands.
 //!
-//! The producer fires non-blocking `try_send_and_observe_with(...)` so
-//! the worker thread drains the whole command burst before stepping
-//! the isolate. That makes the bounded mailbox visible: jobs past the
-//! cap come back as `MailboxFull` through the per-send observer
-//! callback. `IngressFull` from the command queue is rolled into the
-//! same "full" bucket — both are caller-visible overload at submit.
+//! The producer fires non-blocking `try_send_outcome(...)` against a
+//! shared `HostBurstOutcomes` (Phase 062 Rocks 3 & 4). The worker
+//! drains the whole command burst before stepping the isolate, so
+//! jobs past the cap come back as `MailboxFull` /
+//! `IngressFull` in the typed snapshot — both visible at submit.
 //!
 //! What this teaches:
 //!

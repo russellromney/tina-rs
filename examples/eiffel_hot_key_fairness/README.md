@@ -1,7 +1,7 @@
 # eiffel_hot_key_fairness
 
-Sharded keyspace under skewed traffic: 60 writes to one hot key,
-6 writes each to two cold keys. Each shard has a 4-slot mailbox and
+Sharded keyspace under skewed traffic: 30 writes to one hot key,
+4 writes each to two cold keys. Each shard has a 4-slot mailbox and
 processes at one write per 5 ms. The hot shard must reject some
 writes; the cold shards stay responsive.
 
@@ -17,8 +17,10 @@ Both sides:
   task per shard sleeping `PER_WRITE_MS` per item. Producer uses
   `try_send`.
 - Tina: `Store` isolate per shard, mailbox cap = `SHARD_MAILBOX`,
-  rate-limited via `sleep().reply(Tick)`. Producer uses
-  `try_send_and_observe_with` so per-send `MailboxFull` is visible.
+  rate-limited via `sleep().reply(Tick)`. Producer uses one
+  `HostBurstOutcomes` per shard plus `runtime.try_send_outcome` —
+  the typed snapshot reports `admitted` / `mailbox_full` /
+  `ingress_full` per shard with no observer closure.
 
 The smoke test asserts:
 
@@ -28,17 +30,19 @@ The smoke test asserts:
 
 ## What feels good
 
-- Per-shard pressure surfaces at the producer. The host knows which
-  shard is overloaded without inspecting trace.
+- Per-shard pressure surfaces at the producer. The host reads
+  `HostBurstOutcomes::snapshot()` per shard and gets typed counts
+  for free; no Arc-cloned counters, no manual barrier loop.
+- `send_observed_until` carries the `Drain(admitted)` control
+  message through the same bounded data mailbox without a hand-
+  rolled retry loop.
 - Cold shards are unaffected by the hot shard's overload. The
   bounded mailbox is per-isolate, not global.
 
 ## What feels worse
 
-- Same `Drain` + `expected` pattern as `eiffel_graceful_drain_server`
-  to know when each store finishes its admitted backlog. With three
-  stores, that's three `Drain` sends + three
-  `observe_isolate_complete().wait(...)` calls. The closure in
-  `try_send_and_observe_with` and the per-shard counter triple
-  (`admitted` / `full` / `observed`) is a lot of bookkeeping for a
-  fairness probe.
+- The `Drain(admitted)` envelope is still domain-specific. Each
+  store needs a `Drain` variant to know when it has fully drained
+  its admitted backlog. The same shape shows up in
+  `eiffel_graceful_drain_server` — see Round 2 finding 12 (drain
+  timeout for isolate shutdown).

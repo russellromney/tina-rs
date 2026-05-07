@@ -205,33 +205,21 @@ call, with the trailing `stop()` opt-in via a sibling
 `drain_into_stop_effect(R::Closed)`. Same lifecycle truth, less
 boilerplate.
 
-### 10. `try_send`/`send_and_observe` retry helper at service edge
+### 10. `try_send`/`send_and_observe` retry helper at service edge — closed by Phase 062 Rock 4
 
 **Surfaced by:** `eiffel_hot_key_fairness`,
 `eiffel_graceful_pool_shutdown`,
 `eiffel_rate_limited_worker` (Round 2 already).
 
-The host-side "send a control message through a bounded mailbox
-that may be saturated" pattern keeps appearing:
-
-```rust
-let close_deadline = Instant::now() + Duration::from_secs(2);
-loop {
-    match runtime.send_and_observe(addr, msg.clone()) {
-        Ok(()) => break,
-        Err(MailboxFull) | Err(IngressFull) => {
-            if Instant::now() >= close_deadline { return Err(...); }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        Err(e) => return Err(...),
-    }
-}
-```
-
-**Build:** `runtime.send_blocking(addr, msg, deadline)` (named in
-Round 2 finding 4 / Phase 059 Rock 5, still plan-only as of
-2026-05-07). One sentence that covers the four lines of retry
-pattern, plus a typed `Sent`/`Timeout`/`Closed` outcome.
+Phase 062 Rock 4 ships
+`runtime.send_observed_until(addr, deadline, backoff, || msg)` for
+control messages that ride the same bounded data mailbox as work
+items. It retries on `MailboxFull` / `IngressFull` until the
+deadline and returns a typed
+`SendObservedUntilError::{Timeout, Closed, WorkerStopped}`. Both
+Round 4 specimens (`eiffel_hot_key_fairness` for `Drain(admitted)`
+and `eiffel_graceful_pool_shutdown` for `Shutdown`) now use it;
+the hand-rolled retry loops are gone.
 
 ### 11. Multi-stage pipeline ergonomics
 

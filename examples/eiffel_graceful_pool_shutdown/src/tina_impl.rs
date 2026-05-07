@@ -5,7 +5,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, PendingRepliesTryCaptureError,
-    SleepReply, ThreadedRuntime, ThreadedSendObservedError, call, sleep,
+    SleepReply, ThreadedRuntime, call, sleep,
 };
 
 use crate::{CALLERS, MAX_PENDING, Report, SHUTDOWN_AFTER_MS, WORK_MS, WORKERS};
@@ -216,21 +216,15 @@ pub fn run() -> anyhow::Result<Report> {
 
     std::thread::sleep(Duration::from_millis(SHUTDOWN_AFTER_MS));
 
-    // Send Shutdown; retry on mailbox full.
+    // Shutdown rides the same bounded mailbox as regular Submits.
+    // `send_observed_until` retries on `MailboxFull` / `IngressFull`
+    // up to the deadline.
     let close_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match runtime.send_and_observe(frontend, FrontendMsg::Shutdown) {
-            Ok(()) => break,
-            Err(ThreadedSendObservedError::MailboxFull)
-            | Err(ThreadedSendObservedError::IngressFull) => {
-                if std::time::Instant::now() >= close_deadline {
-                    return Err(anyhow::anyhow!("could not deliver Shutdown"));
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(e) => return Err(anyhow::anyhow!("shutdown send: {e}")),
-        }
-    }
+    runtime
+        .send_observed_until(frontend, close_deadline, Duration::from_millis(2), || {
+            FrontendMsg::Shutdown
+        })
+        .map_err(|e| anyhow::anyhow!("shutdown send: {e:?}"))?;
 
     let outcome = result
         .wait(Duration::from_secs(10))

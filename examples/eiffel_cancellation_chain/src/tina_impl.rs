@@ -74,8 +74,6 @@ enum DriverMsg {
 struct Driver {
     workers: Vec<Address<WorkerMsg, WorkerReply>>,
     replies_before_cancel: u32,
-    cancel_observed: bool,
-    report_into: Arc<std::sync::Mutex<Option<Report>>>,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -100,17 +98,12 @@ impl Driver {
                 }
                 noop()
             }
-            DriverMsg::Stop => {
-                self.cancel_observed = true;
-                let report = Report {
-                    replies_before_cancel: self.replies_before_cancel,
-                    replies_after_cancel: 0,
-                    cancel_observed: true,
-                    exit_clean: true,
-                };
-                *self.report_into.lock().expect("report mutex") = Some(report);
-                stop()
-            }
+            DriverMsg::Stop => stop_with(Report {
+                replies_before_cancel: self.replies_before_cancel,
+                replies_after_cancel: 0,
+                cancel_observed: true,
+                exit_clean: true,
+            }),
         }
     }
 }
@@ -137,21 +130,19 @@ pub fn run() -> anyhow::Result<Report> {
         );
     }
 
-    let report_slot: Arc<std::sync::Mutex<Option<Report>>> = Arc::new(std::sync::Mutex::new(None));
-
     let driver = runtime
         .register_with_capacity::<_, Infallible>(
             Driver {
                 workers,
                 replies_before_cancel: 0,
-                cancel_observed: false,
-                report_into: Arc::clone(&report_slot),
             },
             32,
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let complete = runtime.observe_isolate_complete(driver);
+    let result = runtime
+        .observe_result::<Report, _, _>(driver)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
     runtime
         .try_send(driver, DriverMsg::Begin)
@@ -163,15 +154,9 @@ pub fn run() -> anyhow::Result<Report> {
         .try_send(driver, DriverMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
 
-    complete
+    let report = result
         .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("driver did not stop: {e:?}"))?;
-
-    let report = report_slot
-        .lock()
-        .expect("report mutex")
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("driver produced no report"))?;
+        .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
