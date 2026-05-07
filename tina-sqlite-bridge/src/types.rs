@@ -23,6 +23,78 @@ pub enum SqliteValue {
     Blob(Vec<u8>),
 }
 
+impl SqliteValue {
+    /// `true` iff the value is `Null`.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// Returns the inner `i64` if this is an `Integer`. None otherwise.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner `f64` if this is a `Real`. None otherwise.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Real(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner string if this is `Text`. None otherwise.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner bytes if this is `Blob`. None otherwise.
+    /// (Text whose bytes are not valid UTF-8 is also surfaced as
+    /// `Blob` by the bridge — see the value-decoding rule in
+    /// `worker.rs`.)
+    pub fn as_blob(&self) -> Option<&[u8]> {
+        match self {
+            Self::Blob(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+}
+
+impl From<i64> for SqliteValue {
+    fn from(v: i64) -> Self {
+        Self::Integer(v)
+    }
+}
+
+impl From<f64> for SqliteValue {
+    fn from(v: f64) -> Self {
+        Self::Real(v)
+    }
+}
+
+impl From<String> for SqliteValue {
+    fn from(v: String) -> Self {
+        Self::Text(v)
+    }
+}
+
+impl From<&str> for SqliteValue {
+    fn from(v: &str) -> Self {
+        Self::Text(v.to_string())
+    }
+}
+
+impl From<Vec<u8>> for SqliteValue {
+    fn from(v: Vec<u8>) -> Self {
+        Self::Blob(v)
+    }
+}
+
 /// One bridged SQLite operation.
 ///
 /// Multi-statement SQL is not validated here; rusqlite's
@@ -49,6 +121,59 @@ pub enum SqliteRequest {
         /// and [`SqliteConfig::max_response_rows`].
         max_rows: usize,
     },
+}
+
+impl SqliteRequest {
+    /// `Execute` request with no parameters.
+    pub fn execute(sql: impl Into<String>) -> Self {
+        Self::Execute {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
+    }
+
+    /// `QueryRows` request with no parameters.
+    pub fn query_rows(sql: impl Into<String>, max_rows: usize) -> Self {
+        Self::QueryRows {
+            sql: sql.into(),
+            params: Vec::new(),
+            max_rows,
+        }
+    }
+
+    /// Append one parameter. Chainable.
+    ///
+    /// ```
+    /// use tina_sqlite_bridge::{SqliteRequest, SqliteValue};
+    /// let req = SqliteRequest::execute("INSERT INTO t (k, v) VALUES (?, ?)")
+    ///     .param(1)
+    ///     .param("hello");
+    /// match req {
+    ///     SqliteRequest::Execute { params, .. } => {
+    ///         assert_eq!(params.len(), 2);
+    ///         assert_eq!(params[0], SqliteValue::Integer(1));
+    ///     }
+    ///     _ => unreachable!(),
+    /// }
+    /// ```
+    pub fn param(mut self, value: impl Into<SqliteValue>) -> Self {
+        match &mut self {
+            Self::Execute { params, .. } | Self::QueryRows { params, .. } => {
+                params.push(value.into());
+            }
+        }
+        self
+    }
+
+    /// Replace the parameter list.
+    pub fn params(mut self, values: Vec<SqliteValue>) -> Self {
+        match &mut self {
+            Self::Execute { params, .. } | Self::QueryRows { params, .. } => {
+                *params = values;
+            }
+        }
+        self
+    }
 }
 
 /// One terminal SQLite reply.

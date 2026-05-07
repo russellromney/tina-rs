@@ -9,20 +9,24 @@
 //!
 //! # Use
 //!
+//! Typed-helper path is the obvious one: `execute_call` projects away
+//! the response enum and surfaces `Result<u64, SqliteError>` at the
+//! call site. The full-truth `send_request` path stays available — see
+//! [`mod@helpers`] for when to reach for which.
+//!
 //! ```no_run
 //! use std::convert::Infallible;
 //! use std::time::Duration;
 //!
 //! use tina::prelude::*;
-//! use tina_runtime::RuntimeCall;
+//! use tina_runtime::{CallOutcome, RuntimeCall};
 //! use tina_sqlite_bridge::{
-//!     SqliteAddress, SqliteCallOutcome, SqliteConfig, SqliteRequest, SqliteValue,
-//!     send_request,
+//!     SqliteAddress, SqliteExecutedOutcome, SqliteRequest, execute_call,
 //! };
 //!
 //! enum AppMsg {
 //!     Start,
-//!     DbDone(SqliteCallOutcome),
+//!     DbDone(SqliteExecutedOutcome),
 //! }
 //!
 //! struct App {
@@ -41,16 +45,16 @@
 //!
 //!     fn handle(&mut self, msg: AppMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
 //!         match msg {
-//!             AppMsg::Start => send_request(
+//!             AppMsg::Start => execute_call(
 //!                 self.db,
-//!                 SqliteRequest::Execute {
-//!                     sql: "INSERT INTO t (x) VALUES (?)".into(),
-//!                     params: vec![SqliteValue::Integer(7)],
-//!                 },
+//!                 SqliteRequest::execute("INSERT INTO t (x) VALUES (?)").param(7_i64),
 //!                 Duration::from_secs(2),
 //!             )
 //!             .reply(AppMsg::DbDone),
-//!             AppMsg::DbDone(_) => stop(),
+//!             AppMsg::DbDone(outcome) => match outcome {
+//!                 CallOutcome::Replied(Ok(_rows_changed)) => stop(),
+//!                 _ => stop(),
+//!             },
 //!         }
 //!     }
 //! }
@@ -121,7 +125,9 @@ mod types;
 mod worker;
 
 pub use helpers::{
-    SqliteAddress, SqliteCallOutcome, SqliteResult, execute, query_rows, send_request,
+    ExecuteCall, QueryCall, SqliteAddress, SqliteCallOutcome, SqliteExecutedOutcome,
+    SqliteFatalReason, SqliteOutcomeClass, SqliteOutcomeExt, SqliteResult, SqliteRows,
+    SqliteRowsOutcome, SqliteTransientReason, execute_call, query_call, send_request,
 };
 pub use metrics::{SqliteMetrics, SqliteMetricsHandle};
 pub use types::{

@@ -12,12 +12,10 @@ use std::time::Duration;
 
 use rusqlite::{Connection, params};
 use tina::prelude::*;
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
 use tina_sqlite_bridge::{
-    SqliteAddress, SqliteCallOutcome, SqliteCloser, SqliteConfig, SqliteRequest, SqliteResponse,
-    SqliteValue, SqliteWorker,
+    SqliteAddress, SqliteCloser, SqliteConfig, SqliteExecutedOutcome, SqliteRequest,
+    SqliteRowsOutcome, SqliteWorker, execute_call, query_call,
 };
 
 use crate::{INCREMENTS, Report};
@@ -25,9 +23,9 @@ use crate::{INCREMENTS, Report};
 #[derive(Debug)]
 enum DriverMsg {
     Step,
-    Stepped(SqliteCallOutcome),
+    Stepped(SqliteExecutedOutcome),
     Finalize,
-    Finalized(SqliteCallOutcome),
+    Finalized(SqliteRowsOutcome),
 }
 
 struct Driver {
@@ -54,17 +52,14 @@ impl Isolate for Driver {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DriverMsg::Step => tina_sqlite_bridge::send_request(
+            DriverMsg::Step => execute_call(
                 self.db,
-                SqliteRequest::Execute {
-                    sql: "UPDATE counter SET value = value + 1 WHERE id = 0".into(),
-                    params: vec![],
-                },
+                SqliteRequest::execute("UPDATE counter SET value = value + 1 WHERE id = 0"),
                 self.timeout,
             )
             .reply(DriverMsg::Stepped),
             DriverMsg::Stepped(outcome) => match outcome {
-                CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 1 })) => {
+                CallOutcome::Replied(Ok(1)) => {
                     self.remaining -= 1;
                     // Self-message via zero sleep continuation.
                     let next = if self.remaining == 0 {
@@ -72,8 +67,7 @@ impl Isolate for Driver {
                     } else {
                         DriverMsg::Step
                     };
-                    tina_runtime::sleep(Duration::from_millis(0))
-                        .reply(move |_| next)
+                    tina_runtime::sleep(Duration::from_millis(0)).reply(move |_| next)
                 }
                 other => {
                     eprintln!("eiffel_sqlite_counter (tina): unexpected step outcome {other:?}");
@@ -81,21 +75,17 @@ impl Isolate for Driver {
                     stop_with(self.report)
                 }
             },
-            DriverMsg::Finalize => tina_sqlite_bridge::send_request(
+            DriverMsg::Finalize => query_call(
                 self.db,
-                SqliteRequest::QueryRows {
-                    sql: "SELECT value FROM counter WHERE id = 0".into(),
-                    params: vec![],
-                    max_rows: 1,
-                },
+                SqliteRequest::query_rows("SELECT value FROM counter WHERE id = 0", 1),
                 self.timeout,
             )
             .reply(DriverMsg::Finalized),
             DriverMsg::Finalized(outcome) => {
                 match outcome {
-                    CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => {
-                        if let Some(row) = rows.into_iter().next() {
-                            if let Some(SqliteValue::Integer(v)) = row.into_iter().next() {
+                    CallOutcome::Replied(Ok(rows)) => {
+                        if let Some(row) = rows.rows.into_iter().next() {
+                            if let Some(v) = row.first().and_then(|c| c.as_i64()) {
                                 self.report.final_value = v as u64;
                                 self.report.exit_clean = true;
                             }
