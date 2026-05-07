@@ -1,3 +1,9 @@
+//! Tina under `tina-sim`: a seeded simulator with deterministic
+//! fault injection. Two runs at the same seed produce byte-identical
+//! traces; a different seed produces a different trace fingerprint.
+//! `stable_trace_hash` (047 Rock 3) is the canonical replay
+//! fingerprint — no `format!("{event:?}").hash(...)`.
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -6,14 +12,24 @@ use tina::prelude::*;
 use tina_runtime::{sleep, stable_trace_hash};
 use tina_sim::{FaultConfig, FaultMode, LocalSendFaultMode, Simulator, SimulatorConfig};
 
-use super::TinaReport;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub seed_a: u64,
+    pub run_a1_event_count: usize,
+    pub run_a2_event_count: usize,
+    pub run_a1_fingerprint: u64,
+    pub run_a2_fingerprint: u64,
+    pub seed_b: u64,
+    pub run_b1_event_count: usize,
+    pub run_b1_fingerprint: u64,
+    pub messages_received: usize,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum ProducerMsg {
     Tick(u32),
 }
 
-#[derive(Debug)]
 struct Producer {
     sink: Address<SinkMsg>,
     remaining: u32,
@@ -63,13 +79,13 @@ fn run_once(seed: u64) -> (usize, u64, usize) {
     let config = SimulatorConfig {
         seed,
         faults: FaultConfig {
-            // Make the seed do real work: 1-in-3 timer wakes get pushed by an
-            // extra tick of virtual time, deterministically chosen by seed.
+            // Make the seed do real work: 1-in-3 timer wakes get
+            // pushed by an extra tick of virtual time, deterministically
+            // chosen by seed.
             timer_wake: FaultMode::DelayBy {
                 one_in: 3,
                 by: Duration::from_millis(1),
             },
-            // Same shape on local sends.
             local_send: LocalSendFaultMode::DelayByRounds {
                 one_in: 4,
                 rounds: 1,
@@ -87,7 +103,6 @@ fn run_once(seed: u64) -> (usize, u64, usize) {
         },
         16,
     );
-
     let producer = sim.register_with_mailbox_capacity(Producer { sink, remaining: 5 }, 16);
 
     sim.try_send(producer, ProducerMsg::Tick(0)).expect("kick");
@@ -99,7 +114,7 @@ fn run_once(seed: u64) -> (usize, u64, usize) {
     (trace.len(), fingerprint, received_count)
 }
 
-pub(crate) fn run() -> TinaReport {
+pub fn run() -> anyhow::Result<Report> {
     let seed_a = 42;
     let seed_b = 99;
 
@@ -107,7 +122,7 @@ pub(crate) fn run() -> TinaReport {
     let (run_a2_event_count, run_a2_fingerprint, _) = run_once(seed_a);
     let (run_b1_event_count, run_b1_fingerprint, _) = run_once(seed_b);
 
-    TinaReport {
+    Ok(Report {
         seed_a,
         run_a1_event_count,
         run_a2_event_count,
@@ -117,5 +132,5 @@ pub(crate) fn run() -> TinaReport {
         run_b1_event_count,
         run_b1_fingerprint,
         messages_received,
-    }
+    })
 }
