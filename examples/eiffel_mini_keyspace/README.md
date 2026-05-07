@@ -1,96 +1,116 @@
-# Eiffel Mini Keyspace
+# eiffel_mini_keyspace
 
-Paired Tokio-vs-Tina implementation of a tiny Redis-shaped key/value service.
-
-This is an ergonomics and feature comparison, not a load test. The protocol is
-line-oriented and intentionally tiny:
+Same scripted Redis-shaped workload, two implementations, real
+loopback TCP:
 
 ```text
-SET key value
-GET key
-DEL key
+SET llama hay
+GET llama
+GET missing
+DEL llama
+GET llama
 QUIT
 ```
 
-Run both sides:
+The wire protocol is line-oriented and tiny on purpose. The
+comparison is about how each runtime owns the `BTreeMap`, not about
+performance.
 
-```bash
-cargo run --manifest-path examples/eiffel_mini_keyspace/Cargo.toml -- compare
-```
+## Run
 
-Run one side:
-
-```bash
+```sh
+cargo run --manifest-path examples/eiffel_mini_keyspace/Cargo.toml -- both
 cargo run --manifest-path examples/eiffel_mini_keyspace/Cargo.toml -- tokio
 cargo run --manifest-path examples/eiffel_mini_keyspace/Cargo.toml -- tina
 ```
 
-Both sides emit the same response and produce identical
-`SideReport { ok=1, values=1, misses=2, deleted=1 }` numbers; the runs are
-asserted in `print_report` to keep the comparison honest.
+You'll see the same counts on both sides:
 
-## What this comparison taught us
+```
+comparison=eiffel_mini_keyspace side=tokio ok=1 values=1 misses=2 deleted=1
+comparison=eiffel_mini_keyspace side=tina  ok=1 values=1 misses=2 deleted=1
+```
 
-### Tokio side
+## Read
 
-- Trivial. ~50 lines: bind, accept, `read_to_end`, run a `BTreeMap`, write the
-  response. Sequential async/await with one `BTreeMap` owned by the task is the
-  most ergonomic shape Rust offers for this problem.
-- State ownership is implicit. The map lives on the stack of the connection
-  task. There is no story for "what isolate owns this state" — there is just
-  the task that happens to be running.
-- Easy to write, easy to misuse: it would be just as easy to wrap the map in
-  `Arc<Mutex<_>>` and share it across handlers, which is exactly the kind of
-  shared-mutable trap Tina is built to prevent.
+- [`src/tokio_impl.rs`](src/tokio_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs)
 
-### Tina side
+Both files are self-contained — server, client, classification.
 
-What worked well:
+## Tokio shape
 
-- The `Store` isolate genuinely owns the `BTreeMap`. There is no possible way
-  for another isolate to touch it. That is the property we want, and the
-  `#[isolate(message = …, reply = …)]` macro made declaring it cheap.
-- `call(addr, msg, timeout).reply(map_outcome)` is a clean way to express
-  request/reply at the boundary between the connection state machine and the
-  store. The continuation is just another message variant.
-- The `Connection` isolate as an explicit state machine
-  (`Begin → Read → (StoreReturned)* → Wrote → Closed`) reads naturally once
-  written. Each transition is one match arm and one effect.
+One async block. `BTreeMap<String, String>` lives on the stack of the
+connection task. `read_to_end`, `for command in parse_commands(...)`,
+`match command`, `write_all`. Sequential, ergonomic, and structurally
+indistinguishable from "what someone would write at 10pm." There is
+no story for "what owns this state" — there's just the task.
 
-What was awkward or surprising:
+When you run it: every command executes, the response goes out, the
+counts come back exactly as scripted.
 
-- Driving "process the next command" required a hand-rolled `next_effect()`
-  helper that pops a command off `VecDeque<Command>` and either issues another
-  `call(...)` or transitions to `tcp_write`. There is no built-in "loop" or
-  "for each" effect; the recursion through self-sent messages or helper
-  methods is the only option, and it is verbose.
-- `CallOutcome<StoreReply>` has to be unwrapped via `into_result()` and matched
-  on every variant. For a store that always replies, the timeout/cancel arms
-  are effectively dead code, but you still have to write them.
-- Capacities matter and are easy to get wrong. The connection mailbox needs
-  enough room for the inbound `StoreReturned` callbacks plus the trailing
-  `Wrote`/`Closed` messages; we picked 16 and moved on, but a smaller number
-  silently breaks the run. There is no obvious "right" default for this.
-- ~~A custom `Mailbox` + `MailboxFactory` pair is required just to instantiate
-  `ThreadedRuntime`.~~ **Resolved in phase 047:** the comparison now uses
-  `tina_runtime::DefaultThreadedMailboxFactory`. The 40-line `KeyspaceMailbox` /
-  `KeyspaceMailboxFactory` boilerplate is gone.
-- ~~The bound listener address has to be smuggled out through an
-  `Arc<Mutex<Option<SocketAddr>>>`.~~ **Resolved in phase 047:** the host now
-  calls `runtime.observe_next_bound()` and `waiter.wait(timeout)` instead. The
-  `BoundAddr` type alias, the `Arc<Mutex<Option<SocketAddr>>>` allocation, and
-  the `bound_addr` field on the `Listener` isolate are all gone.
-- Shutdown still relies on `complete_trace()` polling for a specific
-  `CallKind::TcpStreamClose` event. Useful for tests, but not a story we want
-  to ship. Phase 047 added operation-done waiters for narrower host waits;
-  a richer terminal/shutdown waiter is still future work.
-- ~~The `#[isolate(... shard = KeyspaceShard)]` attribute requires every
-  isolate to declare a shard even when there is only one.~~ **Resolved in
-  phase 047:** the example now omits `shard = ...` and uses `SingleShard`.
+## Tina shape
 
-### Suggested follow-ups for Tina (recorded for the roadmap)
+Three isolates, each owns one thing:
 
-- Keep improving host observation shapes for shutdown/terminal facts.
-- Consider sugar for "issue a sequence of calls then write a buffer" — the
-  `next_effect()` shape will recur in nearly every connection-handling
-  isolate.
+- **`Store`** — owns the `BTreeMap`. Only way in or out is via
+  `StoreMsg` / `StoreReply`. Nothing else can read or change it.
+- **`Connection`** — owns the accepted TCP stream and a queue of
+  parsed commands. Walks `Begin → Read → (StoreReturned)* → Wrote →
+  Closed`. Each command is one `call(self.store, ..., timeout)`.
+- **`Listener`** — `tcp_bind` → `tcp_accept` → `spawn(Connection)`.
+
+`call(addr, msg, timeout).reply(continuation)` is how each command
+crosses into the store and back. The continuation is just another
+message variant.
+
+When you run it: identical wire output and identical counts. Same
+script, different shape underneath.
+
+## Discussion
+
+What feels better:
+
+- **Owned state by construction.** `Store` is the only thing that
+  can read or change `values`. There is no syntactic path to
+  `Arc<Mutex<_>>`. The Tokio version could grow that wart any time
+  someone needs to share the map with another task; the Tina version
+  cannot.
+- **Request/reply at a boundary reads honestly.** `call(addr, msg,
+  timeout).reply(map_outcome)` is verbose vs `await`, but it's also
+  one message in, one message out, no hidden state machine, no
+  implicit cancellation point.
+- **The connection state machine is one match.** `Begin → Read →
+  StoreReturned → Wrote → Closed` is one arm per transition. Once
+  written, it's the easier-to-trace piece in the whole example.
+
+What feels worse:
+
+- **Three isolates for a single connection.** Tokio is one async
+  block. Tina has Store + Connection + Listener. Each piece is small
+  (047 retired the mailbox-factory, per-shard-type, and bound-address
+  side channels) but there are more of them.
+- **"Process the next command" is hand-rolled.** The Connection's
+  `next_effect()` helper pops a command off the queue and tail-calls
+  itself through self-sent messages. There is no built-in iteration
+  combinator for "for each command, do `call(...)` then continue."
+  This shape is going to recur in every connection handler.
+- **`CallOutcome<StoreReply>` carries `Timeout` / `Closed` arms that
+  effectively never fire.** For a store that always replies, the
+  failure arms are dead code, but the type forces every call site to
+  match them. (FINDINGS.md tracks this as "result-shaped continuations
+  carry dead Err arms.")
+
+What this suggests:
+
+- The owned-state-via-isolates pattern is the right default for any
+  long-lived service state. The `Store` isolate is the cleanest piece
+  in this comparison.
+- The "process a list of things" recursion (`next_effect`) is the
+  next ergonomics frontier. A combinator that expressed "for each
+  command, call the store, accumulate the reply" would shrink every
+  connection-handling isolate.
+- The runtime knows when in-process calls cannot time out (the
+  callee doesn't reply on a timer). Surfacing that as a narrower
+  outcome type would retire a lot of the dead-code matches in
+  connection state machines.
