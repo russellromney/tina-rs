@@ -1,0 +1,654 @@
+//! Per-`RuntimeEvent` emission.
+//!
+//! [`emit_event`] turns one [`RuntimeEvent`] into one [`tracing::Event`].
+//! [`emit_events`] iterates a slice. The match on
+//! [`RuntimeEventKind`] is exhaustive: a new variant in `tina-runtime`
+//! forces a compile error here, which is on purpose.
+//!
+//! Field shape and rule are documented on the crate root.
+
+use std::fmt;
+
+use tina_runtime::{
+    CallCompletionRejectedReason, CallError, CallKind, CallReplyRejectedReason,
+    DeferredReplyRejectedReason, EffectKind, RestartSkippedReason, RuntimeEvent, RuntimeEventKind,
+    SendRejectedReason, SupervisionRejectedReason, TraceSnapshot,
+};
+use tracing::{Level, event};
+
+use crate::RUNTIME_TRACE_TARGET;
+
+/// Field wrapper for the optional cause id.
+///
+/// Renders as the bare number when a cause exists, and as `-` when it
+/// does not. Keeps `cause_id` honest (no zero-as-absent sentinel) while
+/// avoiding the noisier `Some(N)` / `None` Debug shape that `Option`
+/// would produce by default.
+struct CauseField(Option<u64>);
+
+impl fmt::Debug for CauseField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(id) => write!(formatter, "{id}"),
+            None => formatter.write_str("-"),
+        }
+    }
+}
+
+/// Emits one [`tracing::Event`] for `event`.
+///
+/// Field set is described on the crate root. `cause_id` is rendered as
+/// the bare number when present and `-` when absent — never `0`.
+/// Numeric IDs (event/cause/call/slot/isolate) are correlation fields,
+/// not metric labels.
+pub fn emit_event(event: &RuntimeEvent) {
+    let event_id = event.id().get();
+    let cause_id = CauseField(event.cause().map(|c| c.event().get()));
+    let shard = event.shard().get();
+    let isolate = event.isolate().get();
+
+    match event.kind() {
+        RuntimeEventKind::MailboxAccepted => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "mailbox_accepted",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::HandlerStarted => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "handler_started",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::HandlerPanicked => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::ERROR,
+            kind = "handler_panicked",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::HandlerFinished { effect } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "handler_finished",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            effect = effect_kind_name(effect),
+        ),
+        RuntimeEventKind::EffectObserved { effect } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "effect_observed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            effect = effect_kind_name(effect),
+        ),
+        RuntimeEventKind::SendDispatchAttempted {
+            target_shard,
+            target_isolate,
+            target_generation,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "send_dispatch_attempted",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            target_shard = target_shard.get(),
+            target_isolate = target_isolate.get(),
+            target_generation = target_generation.get(),
+        ),
+        RuntimeEventKind::SendAccepted {
+            target_shard,
+            target_isolate,
+            target_generation,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "send_accepted",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            target_shard = target_shard.get(),
+            target_isolate = target_isolate.get(),
+            target_generation = target_generation.get(),
+        ),
+        RuntimeEventKind::SendRejected {
+            target_shard,
+            target_isolate,
+            target_generation,
+            reason,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "send_rejected",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            target_shard = target_shard.get(),
+            target_isolate = target_isolate.get(),
+            target_generation = target_generation.get(),
+            reason = send_rejected_reason_name(reason),
+        ),
+        RuntimeEventKind::Spawned { child_isolate } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "spawned",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            child_isolate = child_isolate.get(),
+        ),
+        RuntimeEventKind::SupervisorRestartTriggered {
+            policy,
+            failed_child,
+            failed_ordinal,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::DEBUG,
+            kind = "supervisor_restart_triggered",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            policy = ?policy,
+            failed_child = failed_child.get(),
+            failed_ordinal = failed_ordinal as u64,
+        ),
+        RuntimeEventKind::SupervisorRestartRejected {
+            failed_child,
+            failed_ordinal,
+            reason,
+        } => match reason {
+            SupervisionRejectedReason::BudgetExceeded {
+                attempted_restart,
+                max_restarts,
+            } => event!(
+                target: RUNTIME_TRACE_TARGET,
+                Level::WARN,
+                kind = "supervisor_restart_rejected",
+                event_id,
+                cause_id = ?cause_id,
+                shard,
+                isolate,
+                failed_child = failed_child.get(),
+                failed_ordinal = failed_ordinal as u64,
+                reason = "BudgetExceeded",
+                attempted_restart,
+                max_restarts,
+            ),
+            SupervisionRejectedReason::SupervisorStopped => event!(
+                target: RUNTIME_TRACE_TARGET,
+                Level::WARN,
+                kind = "supervisor_restart_rejected",
+                event_id,
+                cause_id = ?cause_id,
+                shard,
+                isolate,
+                failed_child = failed_child.get(),
+                failed_ordinal = failed_ordinal as u64,
+                reason = "SupervisorStopped",
+            ),
+        },
+        RuntimeEventKind::RestartChildAttempted {
+            child_ordinal,
+            old_isolate,
+            old_generation,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "restart_child_attempted",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            child_ordinal = child_ordinal as u64,
+            old_isolate = old_isolate.get(),
+            old_generation = old_generation.get(),
+        ),
+        RuntimeEventKind::RestartChildSkipped {
+            child_ordinal,
+            old_isolate,
+            old_generation,
+            reason,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::DEBUG,
+            kind = "restart_child_skipped",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            child_ordinal = child_ordinal as u64,
+            old_isolate = old_isolate.get(),
+            old_generation = old_generation.get(),
+            reason = restart_skipped_reason_name(reason),
+        ),
+        RuntimeEventKind::RestartChildCompleted {
+            child_ordinal,
+            old_isolate,
+            old_generation,
+            new_isolate,
+            new_generation,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "restart_child_completed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            child_ordinal = child_ordinal as u64,
+            old_isolate = old_isolate.get(),
+            old_generation = old_generation.get(),
+            new_isolate = new_isolate.get(),
+            new_generation = new_generation.get(),
+        ),
+        RuntimeEventKind::IsolateStopped => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::DEBUG,
+            kind = "isolate_stopped",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::MessageAbandoned => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "message_abandoned",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::CallDispatchAttempted { call_id, call_kind } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "call_dispatch_attempted",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            call_kind = call_kind_name(call_kind),
+        ),
+        RuntimeEventKind::CallCompleted { call_id, call_kind } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "call_completed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            call_kind = call_kind_name(call_kind),
+        ),
+        RuntimeEventKind::CallFailed {
+            call_id,
+            call_kind,
+            reason,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::ERROR,
+            kind = "call_failed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            call_kind = call_kind_name(call_kind),
+            error = call_error_name(reason),
+        ),
+        RuntimeEventKind::CallCompletionRejected {
+            call_id,
+            call_kind,
+            reason,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "call_completion_rejected",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            call_kind = call_kind_name(call_kind),
+            reason = call_completion_rejected_reason_name(reason),
+        ),
+        RuntimeEventKind::CallReplyRejected { call_id, reason } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "call_reply_rejected",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            reason = call_reply_rejected_reason_name(reason),
+        ),
+        RuntimeEventKind::SnapshotCommitted => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "snapshot_committed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::SnapshotCommitFailed { reason } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "snapshot_commit_failed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            error = call_error_name(reason),
+        ),
+        RuntimeEventKind::JournalAppended { record_index } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "journal_appended",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            record_index,
+        ),
+        RuntimeEventKind::JournalAppendFailed {
+            record_index,
+            reason,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "journal_append_failed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            record_index,
+            error = call_error_name(reason),
+        ),
+        RuntimeEventKind::RecoveryStarted => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "recovery_started",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::RecoveryFinished => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "recovery_finished",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
+        RuntimeEventKind::RecoveryFailed { reason } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::ERROR,
+            kind = "recovery_failed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            error = call_error_name(reason),
+        ),
+        RuntimeEventKind::DeferredReplyCaptured { slot_id, call_id } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "deferred_reply_captured",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            slot_id = slot_id.get(),
+            call_id = call_id.get(),
+        ),
+        RuntimeEventKind::DeferredReplySent { slot_id, call_id } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "deferred_reply_sent",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            slot_id = slot_id.get(),
+            call_id = call_id.get(),
+        ),
+        RuntimeEventKind::DeferredReplyRejected {
+            slot_id,
+            call_id,
+            reason,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "deferred_reply_rejected",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            slot_id = slot_id.get(),
+            call_id = call_id.get(),
+            reason = deferred_reply_rejected_reason_name(reason),
+        ),
+        RuntimeEventKind::DeferredReplyDropped { slot_id, call_id } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "deferred_reply_dropped",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            slot_id = slot_id.get(),
+            call_id = call_id.get(),
+        ),
+    }
+}
+
+/// Emits one [`tracing::Event`] per item in `events`.
+///
+/// Iteration order is preserved; emission is synchronous.
+pub fn emit_events<'a, I>(events: I)
+where
+    I: IntoIterator<Item = &'a RuntimeEvent>,
+{
+    for event in events {
+        emit_event(event);
+    }
+}
+
+/// Emits a [`TraceSnapshot`].
+///
+/// When the snapshot is partial (one or more shards could not report
+/// their tail), one synthetic `WARN`-level event is emitted *before*
+/// the per-event walk:
+///
+/// ```text
+/// kind="trace_snapshot_partial" missing_shards=[0,2]
+/// ```
+///
+/// `trace_snapshot_partial` is a snapshot-level meta-fact, not a
+/// `RuntimeEventKind` — it surfaces the truth that
+/// [`TraceSnapshot::missing_shards`] would otherwise drop on the
+/// floor. Consumers that filter by `kind` should treat it as a signal
+/// that the following events are not the full story.
+pub fn emit_trace_snapshot(snapshot: &TraceSnapshot) {
+    if snapshot.is_partial() {
+        emit_partial_marker(snapshot.missing_shards());
+    }
+    emit_events(snapshot.events().iter());
+}
+
+/// Emits the partial-snapshot marker for `missing_shards` without
+/// walking any events.
+///
+/// Public so a host that builds its own composite snapshot (e.g. a
+/// local + remote merge) can emit the same warning shape without
+/// going through [`TraceSnapshot`]. Named honestly: this is the
+/// marker only.
+pub fn emit_partial_marker(missing_shards: &[tina::ShardId]) {
+    let ids: Vec<u32> = missing_shards.iter().map(|s| s.get()).collect();
+    event!(
+        target: RUNTIME_TRACE_TARGET,
+        Level::WARN,
+        kind = "trace_snapshot_partial",
+        missing_shards = ?ids,
+    );
+}
+
+/// Stable string name for an [`EffectKind`]. Exposed so external
+/// observers can construct the same field values when correlating.
+pub fn effect_kind_name(kind: EffectKind) -> &'static str {
+    match kind {
+        EffectKind::Noop => "noop",
+        EffectKind::Reply => "reply",
+        EffectKind::Send => "send",
+        EffectKind::Spawn => "spawn",
+        EffectKind::Stop => "stop",
+        EffectKind::StopWith => "stop_with",
+        EffectKind::RestartChildren => "restart_children",
+        EffectKind::Call => "call",
+        EffectKind::Batch => "batch",
+        EffectKind::ReplyTo => "reply_to",
+    }
+}
+
+/// Stable string name for a [`CallKind`].
+pub fn call_kind_name(kind: CallKind) -> &'static str {
+    match kind {
+        CallKind::TcpBind => "tcp_bind",
+        CallKind::TcpAccept => "tcp_accept",
+        CallKind::TcpConnect => "tcp_connect",
+        CallKind::TcpRead => "tcp_read",
+        CallKind::TcpWrite => "tcp_write",
+        CallKind::TcpListenerClose => "tcp_listener_close",
+        CallKind::TcpStreamClose => "tcp_stream_close",
+        CallKind::UdpBind => "udp_bind",
+        CallKind::UdpSendTo => "udp_send_to",
+        CallKind::UdpRecvFrom => "udp_recv_from",
+        CallKind::UdpSocketClose => "udp_socket_close",
+        CallKind::TlsConnect => "tls_connect",
+        CallKind::TlsBind => "tls_bind",
+        CallKind::TlsAccept => "tls_accept",
+        CallKind::TlsListenerClose => "tls_listener_close",
+        CallKind::TlsRead => "tls_read",
+        CallKind::TlsWrite => "tls_write",
+        CallKind::TlsClose => "tls_close",
+        CallKind::DnsLookup => "dns_lookup",
+        CallKind::SignalWait => "signal_wait",
+        CallKind::ProcessRun => "process_run",
+        CallKind::FileOpen => "file_open",
+        CallKind::FileReadAt => "file_read_at",
+        CallKind::FileWriteAt => "file_write_at",
+        CallKind::FileFsync => "file_fsync",
+        CallKind::FileSize => "file_size",
+        CallKind::FileClose => "file_close",
+        CallKind::Mkdir => "mkdir",
+        CallKind::PathMetadata => "path_metadata",
+        CallKind::RenameReplace => "rename_replace",
+        CallKind::RemoveFile => "remove_file",
+        CallKind::ReadDir => "read_dir",
+        CallKind::SyncParent => "sync_parent",
+        CallKind::SnapshotCommit => "snapshot_commit",
+        CallKind::SnapshotLoad => "snapshot_load",
+        CallKind::JournalAppend => "journal_append",
+        CallKind::JournalReplay => "journal_replay",
+        CallKind::Sleep => "sleep",
+        CallKind::ObservedSend => "observed_send",
+        CallKind::IsolateCall => "isolate_call",
+    }
+}
+
+/// Stable string name for a [`SendRejectedReason`].
+pub fn send_rejected_reason_name(reason: SendRejectedReason) -> &'static str {
+    match reason {
+        SendRejectedReason::Full => "Full",
+        SendRejectedReason::Closed => "Closed",
+    }
+}
+
+/// Stable string name for a [`CallCompletionRejectedReason`].
+pub fn call_completion_rejected_reason_name(reason: CallCompletionRejectedReason) -> &'static str {
+    match reason {
+        CallCompletionRejectedReason::MailboxFull => "MailboxFull",
+        CallCompletionRejectedReason::RequesterClosed => "RequesterClosed",
+        CallCompletionRejectedReason::ResourceClosed => "ResourceClosed",
+    }
+}
+
+/// Stable string name for a [`CallReplyRejectedReason`].
+pub fn call_reply_rejected_reason_name(reason: CallReplyRejectedReason) -> &'static str {
+    match reason {
+        CallReplyRejectedReason::NoPendingCall => "NoPendingCall",
+        CallReplyRejectedReason::ReplyPathFull => "ReplyPathFull",
+        CallReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
+    }
+}
+
+/// Stable string name for a [`DeferredReplyRejectedReason`].
+pub fn deferred_reply_rejected_reason_name(reason: DeferredReplyRejectedReason) -> &'static str {
+    match reason {
+        DeferredReplyRejectedReason::CallerClosed => "CallerClosed",
+        DeferredReplyRejectedReason::ReplyPathFull => "ReplyPathFull",
+        DeferredReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
+        DeferredReplyRejectedReason::TypeMismatch => "TypeMismatch",
+    }
+}
+
+/// Stable string name for a [`RestartSkippedReason`].
+pub fn restart_skipped_reason_name(reason: RestartSkippedReason) -> &'static str {
+    match reason {
+        RestartSkippedReason::NotRestartable => "NotRestartable",
+    }
+}
+
+/// Stable string name for a [`CallError`].
+pub fn call_error_name(error: CallError) -> &'static str {
+    match error {
+        CallError::InvalidResource => "InvalidResource",
+        CallError::NotFound => "NotFound",
+        CallError::Io => "Io",
+        CallError::Unsupported => "Unsupported",
+        CallError::ResourceBusy => "ResourceBusy",
+        CallError::CorruptRecord => "CorruptRecord",
+        CallError::CommitUncertain => "CommitUncertain",
+        CallError::StorageFull => "StorageFull",
+        CallError::StorageClosed => "StorageClosed",
+        CallError::TargetFull => "TargetFull",
+        CallError::TargetClosed => "TargetClosed",
+        CallError::Timeout => "Timeout",
+        CallError::DnsFull => "DnsFull",
+        CallError::DnsClosed => "DnsClosed",
+        CallError::TlsFull => "TlsFull",
+        CallError::TlsClosed => "TlsClosed",
+        CallError::TlsCertificate => "TlsCertificate",
+        CallError::TlsName => "TlsName",
+        CallError::TlsHandshake => "TlsHandshake",
+        CallError::SignalFull => "SignalFull",
+        CallError::SignalClosed => "SignalClosed",
+        CallError::ProcessFull => "ProcessFull",
+        CallError::ProcessClosed => "ProcessClosed",
+        CallError::KillUncertain => "KillUncertain",
+    }
+}

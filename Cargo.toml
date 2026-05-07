@@ -14,6 +14,7 @@ members = [
     "tina-supervisor",
     "tina-tokio-bridge",
     "tina-tower-bridge",
+    "tina-tracing",
 ]
 exclude = [
     "examples/eiffel_real_io_chat",
