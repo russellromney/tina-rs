@@ -208,9 +208,28 @@ Hyper-specific bridge waits unless Tower proves insufficient.
 
    Bridge path for teams that need mature outbound HTTP client features now.
 
+   First form is concrete, not clever:
+
+   ```text
+   crate: tina-reqwest-bridge
+   exports:
+     ReqwestWorker
+     ReqwestConfig
+     ReqwestMsg
+     ReqwestRequest
+     ReqwestResponse
+     ReqwestError
+     ReqwestMetrics
+   ```
+
    Requirements:
 
    - Tokio/reqwest worker owns reqwest client;
+   - config either takes an existing `reqwest::Client` or builds one from
+     `ReqwestConfig`;
+   - config names `mailbox_capacity`, `max_in_flight`,
+     `request_body_limit`, `response_body_limit`, `default_timeout`,
+     redirect policy, and retry policy;
    - Tina submits bounded outbound request work;
    - full/closed/timeout outcomes visible;
    - response body limit explicit;
@@ -247,11 +266,51 @@ Hyper-specific bridge waits unless Tower proves insufficient.
    First form should be full-response, not streaming:
 
    ```text
-   request body cap
-   response body cap
+   operations:
+     Send { request }
+
+   request:
+     method
+     url
+     headers
+     body Vec<u8>
+     timeout override optional
+
+   response:
+     status
+     headers
+     body Vec<u8>, capped by response_body_limit
+
+   errors:
+     Full
+     Closed
+     Timeout
+     RequestTooLarge
+     ResponseTooLarge
+     InvalidRequest
+     Reqwest
+
+   no streaming
    no hidden redirect/retry unless configured
    no unbounded waiters
    ```
+
+   Dropped caller rule:
+
+   - before admission: no work starts;
+   - after admission but before reqwest accepts: best-effort cancel;
+   - after reqwest accepts: timeout/cancel may only stop waiting. Late result is
+     discarded and counted in metrics.
+
+   Required proof:
+
+   - fake local HTTP server test for success;
+   - response cap test;
+   - full/timeout/closed tests;
+   - dropped-caller/late-result behavior test;
+   - shutdown/drain report test;
+   - one small Tina service example that calls the bridge through
+     `call(...).reply(...)`.
 
    Native 048 HTTP client remains the Tina-owned path. This bridge is for
    mature ecosystem behavior now.
@@ -259,6 +318,27 @@ Hyper-specific bridge waits unless Tower proves insufficient.
 5. **`tina-sqlx-bridge`**
 
    DB is the production adoption trap. Provide a runnable first adapter shape.
+
+   First form is concrete Postgres only. Do not start generic over every
+   `sqlx::Database`; that will turn a bridge into an abstraction contest.
+
+   ```text
+   crate: tina-sqlx-bridge
+   first feature: postgres
+   exports:
+     PgDbWorker
+     PgDbConfig
+     PgDbMsg
+     PgDbRequest
+     PgDbResponse
+     PgDbValue
+     PgDbError
+     PgDbMetrics
+   ```
+
+   The user passes an existing `sqlx::PgPool` or a config that builds one.
+   Pool size remains visible as SQLx pool config; Tina-facing ingress remains
+   visible as mailbox/worker config. Both matter.
 
    Requirements:
 
@@ -278,8 +358,8 @@ Hyper-specific bridge waits unless Tower proves insufficient.
    ```rust
    call(
        db,
-       DbMsg::Execute {
-           statement,
+       PgDbMsg::Execute {
+           sql,
            params,
        },
        Duration::from_millis(250),
@@ -299,17 +379,58 @@ Hyper-specific bridge waits unless Tower proves insufficient.
    First form should stay narrow:
 
    ```text
-   execute statement
-   fetch one / fetch capped many
-   explicit pool capacity
-   explicit query timeout
-   transaction non-goal unless deliberately included
-   row streaming non-goal in first form
+   operations:
+     Execute { sql, params }
+     FetchOne { sql, params, row_size_limit }
+     FetchMany { sql, params, max_rows, row_size_limit }
+
+   params:
+     first form uses PgDbValue enum, not user structs:
+       Null
+       Bool
+       I64
+       F64
+       String
+       Bytes
+
+   rows:
+     Vec<PgDbRow>
+     PgDbRow = Vec<(String, PgDbValue)>
+     no derive-to-user-struct in first form
+
+   results:
+     rows_affected for Execute
+     zero-row / too-many-row outcomes explicit for FetchOne
+     row_count and truncated flag for FetchMany
+
+   limits:
+     explicit pool capacity
+     explicit query timeout
+     max rows
+     per-row/per-field byte caps where practical
+
+   non-goals:
+     transactions
+     row streaming
+     user struct mapping
+     generic SQLx database support
+     database cancellation guarantee
    ```
 
    SQLx cancellation is not magic. If the query has reached SQLx/database, the
-   bridge must document whether timeout only stops waiting or also attempts to
-   cancel the database work.
+   first form treats timeout as "Tina stopped waiting." Late result is discarded
+   and counted. Database-side cancellation can be a later explicit operation
+   after Postgres cancellation semantics are designed.
+
+   Required proof:
+
+   - compile-gated Postgres tests or a local Postgres/SQLx test fixture if CI
+     supports it;
+   - pure unit tests for value conversion and row caps;
+   - fake worker tests for full/closed/timeout and dropped caller behavior;
+   - one runnable example with a Tina service calling `Execute` and
+     `FetchOne`;
+   - docs naming preserved Tina guarantees and weakened SQLx/DB guarantees.
 
 6. **`tina-aws-bridge`**
 
