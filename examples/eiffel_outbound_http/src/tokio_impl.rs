@@ -1,8 +1,5 @@
-//! Tokio side of the outbound-HTTP comparison.
-//!
-//! Hosts an `axum` counter server, then drives it via `reqwest` as the
-//! outbound HTTP client. Walks the same scripted endpoint sequence the
-//! Tina side runs.
+//! Tokio reference: `axum` server + `reqwest` outbound client, both
+//! on a `current_thread` runtime.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
 
-use super::SideReport;
+use crate::Report;
 
 #[derive(Debug, Default)]
 struct CounterState {
@@ -47,15 +44,11 @@ async fn fallback() -> impl IntoResponse {
     StatusCode::NOT_FOUND
 }
 
-pub(crate) fn run() -> SideReport {
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
     let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let (report_tx, report_rx) = std::sync::mpsc::channel::<SideReport>();
+    let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
 
     let server_handle = thread::spawn(move || {
         runtime.block_on(async move {
@@ -67,7 +60,6 @@ pub(crate) fn run() -> SideReport {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let local = listener.local_addr().expect("local addr");
             addr_tx.send(local).expect("publish addr");
-            // Run client work on the same Tokio runtime the server uses.
             let server_task = tokio::spawn(async move {
                 serve(listener, app)
                     .with_graceful_shutdown(async move {
@@ -83,33 +75,26 @@ pub(crate) fn run() -> SideReport {
         });
     });
 
-    let _server_addr = addr_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("server addr");
-    let report = report_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("client report");
+    let _ = addr_rx.recv_timeout(Duration::from_secs(2))?;
+    let report = report_rx.recv_timeout(Duration::from_secs(5))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     while !server_handle.is_finished() && Instant::now() < deadline {
         thread::yield_now();
     }
-    server_handle.join().expect("server thread joined cleanly");
+    server_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("server thread panicked"))?;
 
-    report
+    Ok(report)
 }
 
-async fn scripted_client(addr: SocketAddr) -> SideReport {
-    let client = reqwest::Client::builder()
-        .build()
-        .expect("reqwest client");
+async fn scripted_client(addr: SocketAddr) -> Report {
+    let client = reqwest::Client::builder().build().expect("reqwest client");
     let base = format!("http://{addr}");
 
-    let mut report = SideReport {
-        successful_get: 0,
-        successful_post: 0,
-        final_counter_value: 0,
-        got_404_for_missing: false,
+    let mut report = Report {
         exit_clean: true,
+        ..Report::default()
     };
 
     let r0 = client

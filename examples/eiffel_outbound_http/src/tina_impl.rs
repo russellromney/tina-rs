@@ -1,8 +1,8 @@
-//! Tina side of the outbound-HTTP comparison.
-//!
-//! Hosts a native [`HttpListener`] with a counter service, then drives
-//! it via the service-shaped [`HttpClient`] as the outbound client.
-//! Walks the same scripted endpoint sequence the Tokio side runs.
+//! Tina: native `tina_http::HttpListener` server + native
+//! `tina_http::HttpClient` outbound client. Each scripted request
+//! is bridged from the host thread into the runtime via a tiny
+//! `Driver` isolate that does `call(client, ..., timeout)` and
+//! forwards the outcome through `std::sync::mpsc`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -16,11 +16,14 @@ use tina_http::{
     HttpRequest, HttpResponse, HttpServerConfig,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, call,
 };
 
-use super::SideReport;
+use crate::Report;
+
+// -------------------------------------------------------------------
+// Counter service.
+// -------------------------------------------------------------------
 
 #[derive(Debug, Default)]
 struct Counter {
@@ -46,6 +49,13 @@ impl Counter {
     }
 }
 
+// -------------------------------------------------------------------
+// Driver: a one-shot isolate that takes one HTTP call, awaits its
+// `CallOutcome`, and forwards the result to the host thread via
+// std mpsc. The pattern keeps `run_request` simple: each call is a
+// fresh isolate that lives for exactly one request.
+// -------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 enum DriverMsg {
     Begin {
@@ -70,11 +80,7 @@ impl Isolate for Driver {
         shard: SingleShard,
     }
 
-    fn handle(
-        &mut self,
-        msg: DriverMsg,
-        _ctx: &mut Context<'_, SingleShard>,
-    ) -> Effect<Self> {
+    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             DriverMsg::Begin {
                 client,
@@ -105,11 +111,11 @@ fn run_request(
     client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
     target: SocketAddr,
     request: HttpRequest,
-) -> Result<HttpResponse, HttpClientError> {
+) -> anyhow::Result<Result<HttpResponse, HttpClientError>> {
     let (tx, rx) = mpsc::channel();
     let driver = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 16)
-        .expect("register driver");
+        .register_with_capacity::<_, Infallible>(Driver { sender: tx }, 16)
+        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
     runtime
         .try_send(
             driver,
@@ -119,109 +125,110 @@ fn run_request(
                 request,
             },
         )
-        .expect("send Begin");
-    rx.recv_timeout(Duration::from_secs(5))
-        .expect("driver result")
+        .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
+    Ok(rx.recv_timeout(Duration::from_secs(5))?)
 }
 
-pub(crate) fn run() -> SideReport {
-    let runtime = ThreadedRuntime::with_config(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 64,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+// -------------------------------------------------------------------
+// Run
+// -------------------------------------------------------------------
 
-    // Server side: counter service + listener.
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+
+    // Server: counter service + listener.
     let counter = runtime
-        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
-        .expect("register counter");
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+        .register_with_capacity::<_, Infallible>(Counter::default(), 16)
+        .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
     let server_config = HttpServerConfig::dev();
     let listener_addr = runtime
-        .register_with_capacity::<HttpListener<SingleShard>, _>(
-            HttpListener::<SingleShard>::with_config(bind_addr, counter, server_config),
+        .register_with_capacity::<_, _>(
+            HttpListener::<SingleShard>::with_config(
+                "127.0.0.1:0".parse()?,
+                counter,
+                server_config,
+            ),
             server_config.listener_mailbox_capacity,
         )
-        .expect("register listener");
+        .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
     let bound = runtime.observe_next_bound();
     runtime
         .try_send(listener_addr, HttpListenerMsg::Start)
-        .expect("send Start");
+        .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
     let server_addr = bound
         .wait(Duration::from_secs(2))
-        .expect("listener publishes bound address");
+        .map_err(|e| anyhow::anyhow!("listener bind: {e:?}"))?;
 
-    // Client side: long-lived service-shaped HttpClient.
+    // Client: long-lived service-shaped HttpClient.
     let client = runtime
-        .register_with_capacity::<HttpClient<SingleShard>, Infallible>(
+        .register_with_capacity::<_, Infallible>(
             HttpClient::<SingleShard>::new(HttpClientConfig::dev()),
             16,
         )
-        .expect("register client");
+        .map_err(|e| anyhow::anyhow!("register client: {e:?}"))?;
 
-    let mut report = SideReport {
-        successful_get: 0,
-        successful_post: 0,
-        final_counter_value: 0,
-        got_404_for_missing: false,
+    let mut report = Report {
         exit_clean: true,
+        ..Report::default()
     };
 
+    // Initial GET — counter=0.
     let r0 = run_request(
         &runtime,
         client,
         server_addr,
         HttpRequest::get("/counter").header("Host", "x").build(),
-    )
+    )?
     .expect("initial GET");
     if r0.status == StatusCode::OK {
         report.successful_get += 1;
     }
+    let body0 = r0.body.as_buffered().unwrap_or(&[]);
     assert_eq!(
-        std::str::from_utf8(&r0.body).unwrap_or("").trim(),
+        std::str::from_utf8(body0).unwrap_or("").trim(),
         "0",
-        "initial GET should report counter=0"
+        "initial GET should report counter=0",
     );
 
+    // Three POSTs.
     for _ in 0..3 {
         let r = run_request(
             &runtime,
             client,
             server_addr,
             HttpRequest::post("/counter").header("Host", "x").build(),
-        )
+        )?
         .expect("POST");
         if r.status == StatusCode::OK {
             report.successful_post += 1;
         }
     }
 
+    // Final GET — should be 3.
     let r4 = run_request(
         &runtime,
         client,
         server_addr,
         HttpRequest::get("/counter").header("Host", "x").build(),
-    )
+    )?
     .expect("final GET");
     if r4.status == StatusCode::OK {
         report.successful_get += 1;
     }
-    report.final_counter_value = std::str::from_utf8(&r4.body)
+    let body4 = r4.body.as_buffered().unwrap_or(&[]);
+    report.final_counter_value = std::str::from_utf8(body4)
         .unwrap_or("0")
         .trim()
         .parse()
         .unwrap_or(0);
 
+    // 404 for missing path.
     let r5 = run_request(
         &runtime,
         client,
         server_addr,
         HttpRequest::get("/missing").header("Host", "x").build(),
-    )
+    )?
     .expect("404 GET");
     if r5.status == StatusCode::NOT_FOUND {
         report.got_404_for_missing = true;
@@ -229,8 +236,8 @@ pub(crate) fn run() -> SideReport {
 
     runtime
         .try_send(listener_addr, HttpListenerMsg::Stop)
-        .expect("send Stop");
-    let _ = runtime.shutdown().expect("runtime shutdown");
+        .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
+    let _ = runtime.shutdown();
 
-    report
+    Ok(report)
 }
