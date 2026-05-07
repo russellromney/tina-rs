@@ -836,7 +836,7 @@ where
     /// Records desired worker core ownership as advisory intent.
     ///
     /// The current portable backend does not hard-pin the worker. Topology
-    /// reports show [`AffinityStatus::AdvisoryOnly`] when this is set.
+    /// reports show [`crate::AffinityStatus::AdvisoryOnly`] when this is set.
     pub const fn configured_core(mut self, core: usize) -> Self {
         self.config.configured_core = Some(core);
         self

@@ -233,7 +233,7 @@ pub struct RuntimeCapabilities {
 }
 
 impl RuntimeCapabilities {
-    /// Returns the current live [`ThreadedRuntime`] capability table.
+    /// Returns the current live [`crate::ThreadedRuntime`] capability table.
     pub const fn threaded(storage_lane_capacity: usize) -> Self {
         Self::threaded_with_capacities(
             storage_lane_capacity,

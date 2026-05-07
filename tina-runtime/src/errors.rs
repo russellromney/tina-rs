@@ -2,7 +2,7 @@
 
 use tina::ShardId;
 
-/// Error returned by setup/control operations on [`ThreadedRuntime`].
+/// Error returned by setup/control operations on [`crate::ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedRuntimeError {
     /// The worker thread stopped before it could accept or answer the command.
@@ -15,11 +15,11 @@ pub enum ThreadedRuntimeError {
     DriverShutdownFailed,
 }
 
-/// Error returned by [`Runtime::try_supervise`] and the threaded equivalents.
+/// Error returned by [`crate::Runtime::try_supervise`] and the threaded equivalents.
 ///
 /// Phase 047 Rock 8: replaces a panic on unknown / stale parent registration
 /// in `Runtime::supervise` so the explicit-step and threaded surfaces both
-/// have a fallible variant. The panicking [`Runtime::supervise`] is kept
+/// have a fallible variant. The panicking [`crate::Runtime::supervise`] is kept
 /// for setup-time assertions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuperviseError {
@@ -28,7 +28,7 @@ pub enum SuperviseError {
     UnknownParent,
 }
 
-/// Error returned by [`ThreadedRuntime::try_send`].
+/// Error returned by [`crate::ThreadedRuntime::try_send`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedTrySendError {
     /// The bounded worker ingress queue is full.
@@ -38,7 +38,7 @@ pub enum ThreadedTrySendError {
     WorkerStopped,
 }
 
-/// Error returned by [`ThreadedRuntime::send_and_observe`].
+/// Error returned by [`crate::ThreadedRuntime::send_and_observe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedSendObservedError {
     /// The bounded worker ingress queue is full.

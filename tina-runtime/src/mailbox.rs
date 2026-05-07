@@ -17,7 +17,7 @@ pub trait MailboxFactory {
     /// The type parameter is the runtime's storage type for that mailbox.
     /// Runtime-created isolate mailboxes may store erased message boxes
     /// internally even when user code handles a concrete message type.
-    /// User-provided mailboxes passed to [`Runtime::register`] remain typed
+    /// User-provided mailboxes passed to [`crate::Runtime::register`] remain typed
     /// by the isolate message type.
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>>;
 }
@@ -30,7 +30,7 @@ pub trait MailboxFactory {
 /// factories still work; this is a default, not a requirement.
 ///
 /// `DefaultMailboxFactory` is `!Send`. Use [`DefaultThreadedMailboxFactory`]
-/// when constructing a [`ThreadedRuntime`] or any runtime that requires a
+/// when constructing a [`crate::ThreadedRuntime`] or any runtime that requires a
 /// `Send + 'static` factory.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultMailboxFactory;
@@ -86,7 +86,7 @@ impl<T> Mailbox<T> for DefaultMailbox<T> {
 /// Blessed in-process bounded mailbox factory for `Send + 'static` runtimes.
 ///
 /// Backed by `Arc<Mutex<VecDeque<T>>>` so the factory and its mailboxes can
-/// cross thread boundaries — required by [`ThreadedRuntime`] and other live
+/// cross thread boundaries — required by [`crate::ThreadedRuntime`] and other live
 /// substrates that move work onto a worker thread. Capacity is explicit, FIFO
 /// is preserved, and close is idempotent. Custom factories still work; this
 /// is a default for examples and small services.

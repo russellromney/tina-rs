@@ -121,7 +121,7 @@ where
 /// handle only communicates through a bounded command queue, so ingress
 /// pressure remains visible instead of falling into an unbounded executor
 /// backlog. This is the Betelgeuse live substrate shape; the
-/// explicit-step [`Runtime`] and [`MultiShardRuntime`] remain the semantic
+/// explicit-step [`crate::Runtime`] and [`crate::MultiShardRuntime`] remain the semantic
 /// oracle.
 pub struct ThreadedRuntime<S, F>
 where
@@ -281,7 +281,7 @@ where
     /// will wait for the *next* bind, not the one that just happened.
     ///
     /// If the worker is already stopped, the returned waiter resolves
-    /// immediately to [`WaitError::RuntimeStopped`] when `wait` is called —
+    /// immediately to [`crate::WaitError::RuntimeStopped`] when `wait` is called —
     /// the waiter itself is the single source of truth for "did this bind
     /// happen", so no extra registration error is surfaced here.
     pub fn observe_next_bound(&self) -> BoundAddressWaiter {
@@ -296,7 +296,7 @@ where
     ///
     /// See [`Runtime::observe_isolate_complete`] for semantics. If the worker
     /// is already stopped the returned waiter resolves immediately to
-    /// [`WaitError::RuntimeStopped`].
+    /// [`crate::WaitError::RuntimeStopped`].
     pub fn observe_isolate_complete<M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,
