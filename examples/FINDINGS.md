@@ -349,3 +349,11 @@ Round 1 list, kept short here; the long form is in
 - per-comparison shard types: use `SingleShard` for one-shard programs and
   `tina_runtime::sharded::ShardPlacement` / `ShardServiceTable` for
   multi-shard placement.
+- hand-written `impl Isolate for X { tina::isolate_types! { ... } fn handle(...) }`
+  blocks: use `#[tina::isolate(message = M, ...)]` for pure send/reply
+  isolates and `#[tina_runtime::isolate(message = M, ...)]` for
+  isolates whose `handle` calls `sleep(...)` or `call(...)`. The
+  runtime path infers `Call = RuntimeCall<M>`; the `tina` path
+  defaults `Call = Infallible`. Round 3's ergonomics pass converted
+  four such blocks across `eiffel_tower_timeout_counter`,
+  `eiffel_backpressure_chain`, and `eiffel_dynamic_worker_pool`.
