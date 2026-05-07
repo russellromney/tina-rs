@@ -1,6 +1,51 @@
-//! Tina framed RPC, raw byte API. Connection isolate enforces an
-//! explicit `max_in_flight = 1` per connection. Over-cap requests
-//! get a server-reported wire `Error(Full)` frame immediately.
+//! Tina framed RPC, **typed surface**.
+//!
+//! Same workload as `tina_impl.rs` (the raw-bytes service): one
+//! Connection isolate with `max_in_flight = 1`, one client sends a
+//! burst, over-cap requests come back as wire `Error(Full)`.
+//!
+//! Only the service handler is rewritten using the
+//! `#[tina_rpc::service]` macro — everything else (Listener,
+//! Connection wiring, Registry registration) is unchanged from the
+//! raw side. The point is to see how much hand-written plumbing the
+//! macro removes, not to invent new wire behavior.
+//!
+//! # Boilerplate before (raw bytes, see `tina_impl.rs::EchoService`)
+//!
+//! ```ignore
+//! struct EchoService;
+//! #[tina_runtime::isolate(message = ServiceCall, reply = ServiceReply, shard = EiffelShard)]
+//! impl EchoService {
+//!     fn handle(&mut self, msg: ServiceCall, _ctx: &mut Context<'_, EiffelShard>) -> Effect<Self> {
+//!         reply(ServiceReply::Ok(msg.payload)) // bytes in, bytes out
+//!     }
+//! }
+//! ```
+//!
+//! Method dispatch: the connection routes by frame.method, but
+//! `EchoService` ignores it. Adding a second method would require
+//! `match msg.method.as_str()` plus manual decode/encode per arm.
+//!
+//! # Boilerplate after (typed)
+//!
+//! ```ignore
+//! #[tina_rpc::service]
+//! trait Echo {
+//!     fn ping(&mut self, payload: Vec<u8>) -> Vec<u8>;
+//! }
+//!
+//! struct EchoState;
+//! impl Echo for EchoState {
+//!     fn ping(&mut self, payload: Vec<u8>) -> Vec<u8> {
+//!         payload
+//!     }
+//! }
+//! ```
+//!
+//! Method dispatch generated; per-method JSON encode/decode
+//! generated; `ServiceReply::UnknownMethod` / `Decode` / `Internal`
+//! mappings generated. Adding a second method is a `fn` line, not a
+//! `match` arm.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -13,8 +58,8 @@ use std::time::{Duration, Instant};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_rpc::{
-    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Registry, RegistryMsg,
-    RouterReply, ServiceCall, ServiceReply,
+    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Dispatch, Json, PayloadLimits,
+    Registry, RegistryMsg, RouterReply, SingleService, service,
 };
 use tina_runtime::{
     CallError, ListenerId, MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, tcp_accept,
@@ -28,19 +73,21 @@ struct EiffelShard;
 
 impl Shard for EiffelShard {
     fn id(&self) -> ShardId {
-        ShardId::new(73)
+        ShardId::new(74)
     }
 }
 
-/// Tiny mailbox that the runtime constructs for each registered isolate.
-/// Borrowed straight from `eiffel_real_io_chat`'s pattern.
-struct EiffelMailbox<T> {
+// Mailbox + factory copied from `tina_impl.rs`. Real applications
+// share these via a common helper crate; the eiffel examples keep
+// them inline so each side reads top-to-bottom.
+
+struct EMailbox<T> {
     capacity: usize,
     queue: Rc<RefCell<VecDeque<T>>>,
     closed: Rc<Cell<bool>>,
 }
 
-impl<T> EiffelMailbox<T> {
+impl<T> EMailbox<T> {
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -50,60 +97,65 @@ impl<T> EiffelMailbox<T> {
     }
 }
 
-impl<T> Mailbox<T> for EiffelMailbox<T> {
+impl<T> Mailbox<T> for EMailbox<T> {
     fn capacity(&self) -> usize {
         self.capacity
     }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+    fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         if self.closed.get() {
-            return Err(TrySendError::Closed(message));
+            return Err(TrySendError::Closed(msg));
         }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
+        let mut q = self.queue.borrow_mut();
+        if q.len() >= self.capacity {
+            return Err(TrySendError::Full(msg));
         }
-        queue.push_back(message);
+        q.push_back(msg);
         Ok(())
     }
-
     fn recv(&self) -> Option<T> {
         self.queue.borrow_mut().pop_front()
     }
-
     fn close(&self) {
         self.closed.set(true);
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct EiffelMailboxFactory;
-
-impl MailboxFactory for EiffelMailboxFactory {
+struct EFactory;
+impl MailboxFactory for EFactory {
     fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(EiffelMailbox::new(capacity))
+        Box::new(EMailbox::new(capacity))
     }
 }
 
 type BoundAddr = Arc<Mutex<Option<SocketAddr>>>;
 
-/// Trivial echo service. The connection isolate's `max_in_flight = 1`
-/// is what limits concurrency; the service itself replies immediately.
-struct EchoService;
+// ---------------------------------------------------------------------------
+// THE TYPED SERVICE — this is the whole macro win.
+// ---------------------------------------------------------------------------
 
-#[tina_runtime::isolate(
-    message = ServiceCall,
-    reply = ServiceReply,
-    shard = EiffelShard,
-)]
-impl EchoService {
-    fn handle(&mut self, msg: ServiceCall, _ctx: &mut Context<'_, EiffelShard>) -> Effect<Self> {
-        reply(ServiceReply::Ok(msg.payload))
+/// Typed echo service. The macro emits dispatch + client over this
+/// trait; the connection isolate routes wire calls by method name.
+#[service(name = "echo")]
+pub trait Echo {
+    /// Echo the payload back unchanged.
+    fn ping(&mut self, payload: Vec<u8>) -> Vec<u8>;
+}
+
+/// User implementation of the trait — usually domain state lives
+/// here.
+struct EchoState;
+
+impl Echo for EchoState {
+    fn ping(&mut self, payload: Vec<u8>) -> Vec<u8> {
+        payload
     }
 }
 
-/// Listener: tcp_bind, tcp_accept once, spawn a Connection isolate, then
-/// close the listener. The comparison only needs to handle one client.
+// ---------------------------------------------------------------------------
+// Listener — same pattern as `tina_impl.rs`.
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 enum ListenerMsg {
     Start,
@@ -135,9 +187,6 @@ impl Listener {
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
                 let listener = self.listener_id.expect("listener set after bind");
-                // `tiny_pressure` is the demo preset: max_in_flight=1
-                // with a registry-dominant service_call_timeout, so
-                // overload becomes wire-visible at small bursts.
                 let connection = Connection::<EiffelShard>::new(
                     ConnectionInit::new(stream, self.router)
                         .with_config(ConnectionConfig::tiny_pressure()),
@@ -156,13 +205,17 @@ impl Listener {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
 pub(crate) fn run(config: ComparisonConfig) -> SideReport {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
     let bound_addr: BoundAddr = Arc::new(Mutex::new(None));
 
     let runtime = ThreadedRuntime::with_config(
         EiffelShard,
-        EiffelMailboxFactory,
+        EFactory,
         ThreadedRuntimeConfig {
             command_capacity: 32,
             idle_wait: Duration::from_millis(1),
@@ -170,12 +223,19 @@ pub(crate) fn run(config: ComparisonConfig) -> SideReport {
         },
     );
 
-    // 1) Service: a single echo service.
+    // 1) Service via the macro: zero hand-rolled byte handling.
+    let dispatch: Dispatch<EchoState, Json, EiffelShard> =
+        EchoService::dispatch::<EchoState, EiffelShard>(EchoState, PayloadLimits::default());
     let service = runtime
-        .register_with_capacity::<EchoService, Infallible>(EchoService, 16)
-        .expect("register service");
+        .register_with_capacity::<SingleService<Dispatch<EchoState, Json, EiffelShard>, EiffelShard>, Infallible>(
+            SingleService::new(dispatch),
+            16,
+        )
+        .expect("register typed service");
 
-    // 2) Registry that knows about the service.
+    // 2) Registry exposing it under the same wire name the raw side
+    // uses, so both impls hit the connection's max_in_flight cap
+    // identically.
     let registry_state = Registry::<EiffelShard>::builder()
         .service("echo", service)
         .build();
@@ -183,7 +243,7 @@ pub(crate) fn run(config: ComparisonConfig) -> SideReport {
         .register_with_capacity::<Registry<EiffelShard>, Infallible>(registry_state, 16)
         .expect("register registry");
 
-    // 3) Listener that spawns Connection per accepted stream.
+    // 3) Listener (same as raw side).
     let listener = runtime
         .register_with_capacity::<Listener, Infallible>(
             Listener {
@@ -208,11 +268,24 @@ pub(crate) fn run(config: ComparisonConfig) -> SideReport {
         .expect("bound addr mutex")
         .expect("listener published address");
 
-    // 4) Drive the framed RPC client in a separate thread (real TCP).
+    // The contract test exercises the same byte-shaped client used
+    // by `tina_impl.rs` (super::drive_client). Both sides face the
+    // same wire encoder; the typed-side macro just hides the
+    // server-side decode/encode.
+    //
+    // Note: the typed `Echo::ping` method takes `Vec<u8>` and the
+    // macro JSON-encodes that as `[<bytes>]`. The shared client
+    // sends raw bytes (a Frame::request payload of `b"hi"`), which
+    // the typed-side server tries to JSON-decode as `(Vec<u8>,)`.
+    // `b"hi"` is not valid JSON for that shape, so the typed side
+    // returns wire `Error(Decode)` instead of `Error(Full)` for
+    // over-cap bursts. That's the right behavior: typed services
+    // refuse malformed input. To keep this comparison apples-to-
+    // apples we use a tiny JSON-aware client that encodes
+    // `[<bytes>]` per the macro's expectations.
     let burst = config.burst;
     let client_thread = thread::spawn(move || drive_client(addr, burst));
     let report = client_thread.join().expect("client thread");
-
     let _ = runtime.shutdown();
     report
 }

@@ -1,4 +1,4 @@
-//! Service registry isolate (Rock 3).
+//! Service registry isolate.
 //!
 //! Owns a service-name → service-isolate-address table. Connection isolates
 //! forward each [`crate::RouterRequest`] to the registry; the registry looks

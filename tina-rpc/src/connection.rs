@@ -1,12 +1,12 @@
-//! Connection isolate (Rock 2).
+//! Connection isolate.
 //!
 //! One connection isolate per accepted TCP stream. It:
 //!
 //! - reads bytes off the runtime-owned TCP stream;
 //! - assembles whole frames using [`crate::parse_length_prefix`] and
 //!   [`crate::decode_body`];
-//! - forwards each request frame to a router address (the service registry
-//!   from Rock 3) via an `IsolateCall`;
+//! - forwards each request frame to a router address (the service
+//!   registry) via an `IsolateCall`;
 //! - encodes the reply or error frame and writes it back;
 //! - bounds in-flight requests, write queue, and inbound buffer;
 //! - closes the stream cleanly on shutdown, on bad-peer input, on idle
@@ -88,8 +88,8 @@ pub struct ConnectionConfig {
 }
 
 impl Default for ConnectionConfig {
-    /// Conservative first-form defaults: 1 MiB frames, 64 in flight, 30 s
-    /// idle, 8 KiB read chunks, 256-frame write queue, 5 s service-call
+    /// Conservative defaults: 1 MiB frames, 64 in flight, 30 s idle,
+    /// 8 KiB read chunks, 256-frame write queue, 5 s service-call
     /// timeout.
     fn default() -> Self {
         Self {
@@ -141,8 +141,8 @@ impl ConnectionConfig {
 
 /// Request payload the connection forwards to the router.
 ///
-/// Rock 3 implements a router isolate whose mailbox accepts this type and
-/// replies with [`RouterReply`]. The connection only knows the type, not the
+/// The router isolate's mailbox accepts this type and replies with
+/// [`RouterReply`]. The connection only knows the type, not the
 /// registry implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouterRequest {
@@ -273,7 +273,7 @@ where
 {
     /// Stream id assigned by the runtime when this connection was accepted.
     pub stream: StreamId,
-    /// Address of the router isolate (Rock 3).
+    /// Address of the router (registry) isolate.
     pub router: Address<crate::registry::RegistryMsg, RouterReply>,
     /// Optional address that receives one [`CloseReason`] when this
     /// connection closes.

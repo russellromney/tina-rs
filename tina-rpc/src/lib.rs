@@ -2,47 +2,49 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-//! Tina framed request/reply, first form (phase 052).
+//! Tina framed request/reply.
 //!
-//! This crate is a probe, not a product. It is **not gRPC** and **not a general
-//! RPC framework**. It answers one narrow question:
+//! Not gRPC. Not a general RPC framework. The narrow question this
+//! crate answers:
 //!
-//! > Can Tina model bounded request/reply over a byte stream, with timeouts and
-//! > visible overload?
+//! > Can Tina model bounded request/reply over a byte stream, with
+//! > timeouts and visible overload?
 //!
-//! The wire format is deliberately boring. The semantics lean on the existing
-//! Tina runtime: typed isolate addresses, isolate calls with timeout, and the
-//! `Full` / `Closed` / `Timeout` outcomes. This crate does not own sockets,
-//! schedule tasks, or hide queues — those concerns stay in
-//! [`tina_runtime`](https://docs.rs/tina-runtime).
+//! Wire format is deliberately boring; semantics lean on the existing
+//! Tina runtime — typed isolate addresses, isolate calls with timeout,
+//! and the `Full` / `Closed` / `Timeout` outcomes. This crate owns no
+//! sockets, schedules no tasks, hides no queues — those concerns stay
+//! in [`tina_runtime`](https://docs.rs/tina-runtime).
 //!
 //! # No public wire compatibility promise
 //!
-//! First form may change. Encode/decode functions are stable for one phase
-//! only; do not persist frames or expose them to untrusted peers.
+//! Encode/decode is not stable across releases; do not persist frames
+//! or expose them to untrusted peers.
 //!
-//! # First-form scope
+//! # Scope
 //!
-//! - Frame format with length prefix, version, request id, kind, service name,
-//!   method name, server-reported error code, and opaque payload bytes.
-//! - Decode-before-allocate: the length prefix is checked against
+//! - Frame format: length prefix, version, request id, kind, service
+//!   name, method name, server-reported error code, opaque payload.
+//! - Decode-before-allocate: length prefix is checked against
 //!   `max_frame_size` before any body buffer is allocated.
-//! - Server-reported error codes only. Client-observed conditions (`timeout`,
-//!   `connection_closed`) never appear as wire frames.
-//! - Pluggable payload encoding via [`Encoding`]. First impl: [`Json`].
-//!   Encode/decode enforces `max_size` before invoking the underlying
-//!   serializer.
-//!
-//! - Connection isolate ([`Connection`]) per accepted TCP stream, with
-//!   bounded in-flight, write queue, idle timeout, and observable close
-//!   paths.
-//! - Service registry ([`Registry`]) that maps service names to uniform
-//!   `Address<ServiceCall, ServiceReply>` and forwards via isolate-call.
-//! - Client stub ([`Client`]) per outbound TCP stream, with bounded
-//!   in-flight multiplexing, per-request deadlines, out-of-order reply
-//!   matching, and visible failure of pending calls on close.
-//!
-//! Out of scope: simulation (Rock 6), Eiffel comparison (Rock 7).
+//! - Server-reported error codes only. Client-observed conditions
+//!   (`timeout`, `connection_closed`) never appear as wire frames.
+//! - Pluggable payload encoding via [`Encoding`]; ships [`Json`].
+//!   Encode/decode enforces `max_size`.
+//! - Connection isolate ([`Connection`]) per accepted TCP stream:
+//!   bounded in-flight, write queue, idle timeout, observable close.
+//! - Service registry ([`Registry`]) maps names to
+//!   `Address<ServiceCall, ServiceReply>`; forwards via isolate-call.
+//! - Client stub ([`Client`]) per outbound TCP stream: bounded
+//!   in-flight multiplexing, per-request deadlines, out-of-order
+//!   reply matching, visible failure of pending calls on close.
+//! - Topology adapters ([`SingleService`], plus [`PooledService`]
+//!   and [`ShardedService`] type reservations) — the
+//!   `#[tina_rpc::service]` macro emits over them. See [`mod@service`]
+//!   for the topology rationale.
+//! - Typed dispatch core ([`MethodTable`], [`Dispatch`]) — runtime-free
+//!   typed call routing. The `#[tina_rpc::service]` macro emits over
+//!   this.
 //!
 //! # Example
 //!
@@ -83,9 +85,11 @@
 
 mod client;
 mod connection;
+mod dispatch;
 mod encoding;
 mod frame;
 mod registry;
+pub mod service;
 
 pub use client::{
     Client, ClientConfig, ClientInit, ClientMsg, ClientRequest, ClientResult, ClientResultMsg,
@@ -95,6 +99,7 @@ pub use connection::{
     BadPeerReason, CloseReason, Connection, ConnectionConfig, ConnectionInit, ConnectionMsg,
     RouterReply, RouterRequest,
 };
+pub use dispatch::{Dispatch, Method, MethodTable, PayloadLimits};
 pub use encoding::{Encoding, EncodingError, EncodingErrorKind, Json};
 pub use frame::{
     DecodeError, EncodeError, FRAME_VERSION_V1, Frame, FrameError, FrameKind, FrameLimits,
@@ -104,3 +109,5 @@ pub use frame::{
 pub use registry::{
     Registry, RegistryBuilder, RegistryConfig, RegistryMsg, ServiceCall, ServiceReply,
 };
+pub use service::{PooledService, ServiceConfig, ServiceHandler, ShardedService, SingleService};
+pub use tina_rpc_macros::service;

@@ -1,0 +1,27 @@
+[package]
+name = "tina-rpc-tokio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tokio async-bridge adapter for tina-rpc clients"
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina = { path = "../tina" }
+tina-runtime = { path = "../tina-runtime" }
+tina-rpc = { path = "../tina-rpc" }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }

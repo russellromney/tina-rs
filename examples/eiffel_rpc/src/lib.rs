@@ -1,4 +1,4 @@
-//! Phase 052 Rock 7 RPC overload comparison.
+//! Tina-vs-Tokio RPC overload comparison.
 //!
 //! See the crate-level [README](https://github.com/russellromney/tina-rs/blob/main/examples/eiffel_rpc/README.md)
 //! for usage. The library target exists so integration tests can pin

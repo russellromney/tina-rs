@@ -1,0 +1,17 @@
+[package]
+name = "tina-rpc-macros"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Proc macros for tina-rpc service traits"
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "parsing"] }

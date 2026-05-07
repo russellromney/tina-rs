@@ -2,9 +2,13 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use tina_rpc::{Frame, FrameError, FrameKind, FrameLimits, LENGTH_PREFIX_SIZE, encode, parse_length_prefix, decode_body};
+use tina_rpc::{
+    Frame, FrameError, FrameKind, FrameLimits, LENGTH_PREFIX_SIZE, decode_body, encode,
+    parse_length_prefix,
+};
 
 mod tina_impl;
+mod tina_typed_impl;
 mod tokio_impl;
 
 /// Comparison parameters.
@@ -39,11 +43,14 @@ impl SideReport {
     /// either a `Reply` (the one that grabbed the in-flight slot) or
     /// an `Error(Full)` (every over-cap request). With
     /// `Connection::max_in_flight = 1`, exactly one `ok` and the rest
-    /// `full`. A regression that breaks this is a Rock-2/Rock-3
-    /// regression.
+    /// `full`.
     pub fn assert_tina_contract(&self, burst: usize) {
         assert_eq!(self.ok, 1, "expected ok=1 for tina; got {self:?}");
-        assert_eq!(self.full, burst - 1, "expected full=burst-1 for tina; got {self:?}");
+        assert_eq!(
+            self.full,
+            burst - 1,
+            "expected full=burst-1 for tina; got {self:?}"
+        );
         assert_eq!(self.other, 0, "expected other=0 for tina; got {self:?}");
     }
 
@@ -62,6 +69,18 @@ pub fn run_tina_side(burst: usize) -> SideReport {
 
 pub fn run_tokio_side(burst: usize) -> SideReport {
     tokio_impl::run(ComparisonConfig { burst })
+}
+
+/// Runs the macro-driven typed-service variant. The wire client
+/// sends raw byte payloads (matching `tina_impl`), so the typed
+/// side returns wire `Error(Decode)` for every request — the
+/// macro's JSON tuple decoder rejects non-JSON bytes. The smoke
+/// test asserts the *typed surface* compiles, registers, and
+/// routes; round-trip parity with `tina_impl` is left for a
+/// JSON-aware client (use `tina-rpc-tokio::BridgeClient` with the
+/// macro-generated `*_request` helpers).
+pub fn run_tina_typed_side(burst: usize) -> SideReport {
+    tina_typed_impl::run(ComparisonConfig { burst })
 }
 
 /// Encodes `burst` request frames concatenated into one buffer with

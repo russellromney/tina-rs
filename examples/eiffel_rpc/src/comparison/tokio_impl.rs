@@ -43,8 +43,8 @@ async fn serve(stream: tokio::net::TcpStream, config: ComparisonConfig) {
     let (mut reader, mut writer) = stream.into_split();
 
     // Unbounded request queue + single worker. Every request is accepted
-    // and eventually replied to. This is the "silent buffering" path
-    // that Tina's framed first form refuses to implement.
+    // and eventually replied to — the silent-buffering path that Tina's
+    // framed RPC refuses to implement.
     let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
     let writer_task = tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
