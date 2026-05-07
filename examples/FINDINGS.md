@@ -117,7 +117,8 @@ to drop a single in-flight call without stopping itself.
 
 ### 9. Drain helper for `PendingReplies` at service stop
 
-**Surfaced by:** `eiffel_graceful_pool_shutdown`.
+**Surfaced by:** `eiffel_graceful_pool_shutdown`,
+`eiffel_graceful_drain_server`.
 
 `PendingReplies::drain()` returns `Vec<(K, DeferredReply<R>)>`,
 which the user has to map into `Effect::Batch(reply_to(slot,
@@ -131,11 +132,23 @@ effects.push(stop());
 Effect::Batch(effects)
 ```
 
-**Build:** `pending.drain_into_effect(R::Closed) -> Effect<I>` (or
-similarly named) that returns the matching `Effect::Batch` in one
-call, with the trailing `stop()` opt-in via a sibling
-`drain_into_stop_effect(R::Closed)`. Same lifecycle truth, less
-boilerplate.
+The same area also wants a *deadline* — a drain that says "finish
+in-flight work, but give up after T". Today that's a hand-rolled
+`DrainDeadlineFired` continuation message scheduled via `sleep`
+plus a check in the isolate's "is it done" predicate that returns
+true on deadline-fired even when `pending > 0`. The
+`tina-tokio-bridge::BridgeShutdownReport::drained_within_timeout`
+flag is the bridge-side version of the same idea.
+
+**Build:**
+
+- `pending.drain_into_effect(R::Closed) -> Effect<I>` (or
+  similarly named) that returns the matching `Effect::Batch` in
+  one call, with the trailing `stop()` opt-in via a sibling
+  `drain_into_stop_effect(R::Closed)`.
+- An isolate-state `DrainGate` helper that holds the deadline +
+  the pending-count predicate, with an `is_done` /
+  `drained_within_timeout` accessor that the handler reuses.
 
 ### 11. Multi-stage pipeline ergonomics
 
@@ -174,6 +187,80 @@ This is a positive observation about Tina's model. The build is
 documentation, not new product work — call it out in the user
 guide's lifecycle chapter as a contrast with the Tokio shape.
 
+### 13. Tina-owned database client (`tina-sqlx-bridge`)
+
+**Surfaced by:** `eiffel_sqlite_counter`.
+
+There is no native or bridged path for "Tina service talks to a
+database" today. The honest first-form shape used in the specimen
+is one isolate that owns a `rusqlite::Connection` and runs each
+query inline in `handle`. SQLite operations are fast, so this works
+for a single-shard adoption-grade example, but it blocks the shard
+thread for the duration of every query. For a remote DB
+(Postgres) where queries take milliseconds, the same shape would
+violate the bounded-handler-turn contract that makes Tina's other
+patterns honest.
+
+**Build:** `tina-sqlx-bridge` (or first-form `tina-rusqlite-bridge`
+for the sync path) shaped like `tina-reqwest-bridge`:
+
+- Tokio-owned blocking-pool runtime for the actual rusqlite/SQLx
+  calls;
+- bounded ingress (`mailbox_capacity`);
+- typed `SqliteError::*` variants with `Closed` / `Busy` / `IoError`
+  / `Decode` / `Constraint` / `Internal` shapes;
+- visible `Full` / `Closed` / `Timeout`;
+- metrics handle comparable to `ReqwestMetricsHandle`.
+
+ROADMAP phase 063 names this work; this finding is the per-specimen
+witness.
+
+### 14. Spawn API surfaces the child's address
+
+**Surfaced by:** `eiffel_dynamic_worker_pool`.
+
+`spawn(ChildDefinition::new(...))` returns nothing. The parent does
+not learn the child's `Address`. Today this is OK because the
+parent only needs the child to send messages *back* to the parent
+(the child has the parent's address). But it means the parent
+cannot:
+
+- ask the runtime "is this specific child still alive?" via
+  `observe_isolate_complete(child_addr)`;
+- send the child a follow-up message;
+- aggregate "missing partials" as a typed timeout (the parent
+  doesn't know which child is missing).
+
+Today's workaround is the supervised-worker pattern: the child
+sends a `Boot(self_addr)` message back to a shared `Arc<Mutex<...>>`
+slot. That works for the supervisor case, but it's the wrong
+ergonomics for "spawn N workers and join all results."
+
+**Build:** either `spawn(...)` returns the child's `Address` (would
+require a synchronous spawn API today), or a
+`spawn_observed(child).reply(MyMsg::ChildSpawned)` variant that
+delivers `Address<ChildMsg>` to the parent as a continuation
+message — analogous to `send_observed` and `runtime calls`. This
+also enables a future `JoinSet`-equivalent isolate primitive.
+
+### 15. Deadline as first-class context
+
+**Surfaced by:** `eiffel_backpressure_chain`.
+
+A multi-hop chain has to thread a deadline (or a remaining-budget
+duration) through every call. Today this is `Duration` in the
+request struct + a matching `IsolateCall` timeout, and the outer
+hop's call timeout must be slightly longer than the inner's so the
+typed downstream timeout reaches the caller before the outer
+times out. With N hops, the slack accumulates and there is no
+helper that names the "outer = innermost + slack" pattern.
+
+**Build:** a small `Deadline` value type carrying `(start: Instant,
+total: Duration)` with `.remaining() -> Duration`. A future
+`call_with_deadline(addr, msg, deadline)` would compute the
+matching `IsolateCall` timeout (slightly larger than the budget
+the callee should use) automatically.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
@@ -206,13 +293,14 @@ so the helper removes bookkeeping, not the worker roundtrip.
 ### 5. Single-in-flight gate for timer-driven workers — Phase 062 Rock 5
 
 Surfaced by `eiffel_rate_limited_worker`,
-`eiffel_hot_key_fairness`. `tina_runtime::SingleCallGate` names the
-"at most one timer/call in flight, plus N queued" invariant.
-`submit()` returns `true` when the caller should schedule;
-`complete()` returns `true` when more work is queued and the next
-timer should be scheduled. The gate is plain data — it does not
-own the timer or the trace; the caller still writes
-`sleep(...).reply(...)` so every event is visible.
+`eiffel_hot_key_fairness`, and reinforced by
+`eiffel_periodic_batcher` / `eiffel_graceful_drain_server`.
+`tina_runtime::SingleCallGate` names the "at most one timer/call in
+flight, plus N queued" invariant. `submit()` returns `true` when
+the caller should schedule; `complete()` returns `true` when more
+work is queued and the next timer should be scheduled. The gate is
+plain data — it does not own the timer or the trace; the caller
+still writes `sleep(...).reply(...)` so every event is visible.
 
 ### 6. Bridge call retry classifier — Phase 062 Rock 6
 

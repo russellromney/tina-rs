@@ -1,0 +1,148 @@
+//! Tina side. The `Coordinator` isolate dynamically spawns
+//! `WORKER_COUNT` `Worker` children via `spawn(ChildDefinition::new(
+//! ..., capacity).with_initial_message(WorkerMsg::Compute))`. Each
+//! worker computes the sum of its slice and `send`s the partial back
+//! to the coordinator's address. The coordinator collects partials
+//! and `stop_with(report)` when every child has replied.
+
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tina::prelude::*;
+use tina::ChildDefinition;
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+
+use crate::{Report, WORK_VALUES, WORKER_COUNT};
+
+// ---------- Worker isolate ----------
+
+#[derive(Debug, Clone)]
+enum WorkerMsg {
+    /// Initial message: compute the partial and send it back.
+    Compute,
+}
+
+struct Worker {
+    parent: Address<CoordMsg>,
+    chunk: Vec<u64>,
+}
+
+#[tina::isolate(message = WorkerMsg, send = tina::Outbound<CoordMsg>)]
+impl Worker {
+    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Compute => {
+                let partial: u64 = self.chunk.iter().copied().sum();
+                send(self.parent, CoordMsg::WorkerDone(partial))
+            }
+        }
+    }
+}
+
+// ---------- Coordinator isolate ----------
+
+#[derive(Debug, Clone)]
+pub enum CoordMsg {
+    /// Host injects the coordinator's own address (chicken-and-egg
+    /// at registration time — the children need a typed address to
+    /// send their partials back, but the coord doesn't know its own
+    /// address until after `register`).
+    Begin {
+        self_addr: Address<CoordMsg>,
+    },
+    /// One child finished. Carries its partial sum.
+    WorkerDone(u64),
+}
+
+struct Coordinator {
+    expected: u32,
+    received: u32,
+    sum: u64,
+    chunks: Vec<Vec<u64>>,
+    report: Report,
+}
+
+#[tina_runtime::isolate(
+    message = CoordMsg,
+    spawn = ChildDefinition<Worker>,
+)]
+impl Coordinator {
+    fn handle(&mut self, msg: CoordMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+        match msg {
+            CoordMsg::Begin { self_addr } => {
+                let mut effects = Vec::with_capacity(self.chunks.len());
+                for chunk in self.chunks.drain(..) {
+                    effects.push(spawn(
+                        ChildDefinition::new(
+                            Worker {
+                                parent: self_addr,
+                                chunk,
+                            },
+                            4,
+                        )
+                        .with_initial_message(WorkerMsg::Compute),
+                    ));
+                }
+                batch(effects)
+            }
+            CoordMsg::WorkerDone(partial) => {
+                self.received += 1;
+                self.sum += partial;
+                if self.received >= self.expected {
+                    self.report.results_collected = self.received;
+                    self.report.total_sum = self.sum;
+                    self.report.exit_clean = true;
+                    stop_with(self.report)
+                } else {
+                    noop()
+                }
+            }
+        }
+    }
+}
+
+// ---------- Run ----------
+
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+
+    let chunk_size = WORK_VALUES.len() / WORKER_COUNT as usize;
+    let chunks: Vec<Vec<u64>> = (0..WORKER_COUNT as usize)
+        .map(|i| WORK_VALUES[i * chunk_size..(i + 1) * chunk_size].to_vec())
+        .collect();
+
+    let coord_addr = runtime
+        .register_with_capacity::<_, Infallible>(
+            Coordinator {
+                expected: WORKER_COUNT,
+                received: 0,
+                sum: 0,
+                chunks,
+                report: Report::default(),
+            },
+            // Mailbox sized for `Begin` + every worker's `WorkerDone`.
+            (WORKER_COUNT + 4) as usize,
+        )
+        .map_err(|e| anyhow::anyhow!("register coordinator: {e:?}"))?;
+
+    let waiter = runtime
+        .observe_result::<Report, _, _>(coord_addr)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+
+    runtime
+        .try_send(coord_addr, CoordMsg::Begin { self_addr: coord_addr })
+        .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
+
+    let report = waiter
+        .wait(Duration::from_secs(5))
+        .map_err(|e| anyhow::anyhow!("coord did not finish: {e:?}"))?;
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    Ok(report)
+}
