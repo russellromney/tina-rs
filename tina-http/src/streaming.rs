@@ -1,9 +1,22 @@
 //! Streaming body types for HTTP requests and responses.
 //!
 //! A body is either fully buffered (`Vec<u8>`) or streamed through a
-//! chunk-source isolate. The source is a service-shaped isolate the
-//! consumer pulls from with `call(source, ChunkMsg::Next, t).reply(...)`
-//! until `Eof`.
+//! chunk-source isolate.
+//!
+//! # Source-call shape
+//!
+//! - **Response streaming** (service produces). The service registers
+//!   a chunk-source isolate whose `Message = ResponseChunkMsg` and
+//!   `Reply = ResponseChunkReply`. The connection pulls with
+//!   `call(stream.source, ResponseChunkMsg::Next, t).reply(...)`.
+//!
+//! - **Request streaming** (service consumes). The connection isolate
+//!   itself is the chunk source; its `Message = HttpConnectionMsg`,
+//!   `Reply = RequestChunkReply`. The service pulls with
+//!   `call(stream.source, HttpConnectionMsg::body_next(), t).reply(...)`.
+//!   This asymmetry exists because the connection has to fold the
+//!   chunk-request variant into its existing message type to keep the
+//!   socket and chunk pulls on a single mailbox.
 //!
 //! # Wire framing
 //!
@@ -15,8 +28,8 @@
 //!
 //! # Backpressure
 //!
-//! Pull-based: the consumer issues one `Next` at a time, only after the
-//! previous chunk has been fully written (response side) or fully
+//! Pull-based: the consumer issues one `Next` at a time, only after
+//! the previous chunk has been fully written (response side) or fully
 //! processed (request side). The chunk source can take any amount of
 //! time to produce the next chunk; the consumer naturally waits.
 
@@ -52,14 +65,10 @@ pub struct ResponseStream {
     pub source: Address<ResponseChunkMsg, ResponseChunkReply>,
 }
 
-/// Pulled by a service from an inbound body chunk source.
-#[derive(Debug, Clone)]
-pub enum RequestChunkMsg {
-    /// Request the next chunk of request body bytes.
-    Next,
-}
-
-/// Reply to [`RequestChunkMsg::Next`].
+/// Reply produced by an inbound chunk source. The service receives
+/// this on the call chain rooted at
+/// `crate::HttpConnectionMsg::RequestBodyNext` (or its `body_next()`
+/// constructor).
 #[derive(Debug, Clone)]
 pub enum RequestChunkReply {
     /// One chunk of body bytes.
@@ -70,20 +79,21 @@ pub enum RequestChunkReply {
 
 /// A streaming request body: declared length plus a source isolate.
 ///
-/// The source is the connection isolate itself — its address typed with
-/// `HttpConnectionMsg` as the message type and `RequestChunkReply` as
-/// the reply. The service pulls chunks via:
+/// The source is the connection isolate itself — its address typed
+/// with `crate::HttpConnectionMsg` as the message type and
+/// [`RequestChunkReply`] as the reply. The service pulls chunks via:
 ///
 /// ```rust,ignore
-/// call(stream.source, HttpConnectionMsg::RequestBodyNext, timeout)
+/// use tina_http::HttpConnectionMsg;
+/// call(stream.source, HttpConnectionMsg::body_next(), timeout)
 ///     .reply(MyMsg::ChunkArrived)
 /// ```
 ///
-/// Wrapping the chunk request in `HttpConnectionMsg` lets the
-/// connection isolate serve both its TCP continuations and the
-/// service's chunk pulls from a single mailbox. A purpose-built chunk
-/// source isolate would be cleaner but requires a runtime affordance
-/// to publish its address back to the connection at spawn time.
+/// `HttpConnectionMsg::body_next()` is a convenience constructor for
+/// the `HttpConnectionMsg::RequestBodyNext` variant. Wrapping the
+/// chunk request inside the connection's own message type lets the
+/// connection serve both its TCP continuations and the service's
+/// chunk pulls from a single mailbox.
 #[derive(Debug, Clone)]
 pub struct RequestStream {
     /// Declared `Content-Length` from the wire.

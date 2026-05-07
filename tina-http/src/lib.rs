@@ -41,8 +41,7 @@ pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
 pub use router::{RouteHandler, Router};
 pub use streaming::{
-    RequestChunkMsg, RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply,
-    ResponseStream,
+    RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
 pub use types::{
     HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody, HttpResponse,

@@ -40,8 +40,8 @@ pub enum HttpRequestBody {
     /// All body bytes already accumulated by the connection isolate.
     Buffered(Vec<u8>),
     /// Streaming source: the service pulls chunks via
-    /// `call(stream.source, RequestChunkMsg::Next, t).reply(...)`
-    /// until `RequestChunkReply::Eof`.
+    /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
+    /// .reply(...)` until `RequestChunkReply::Eof`.
     Stream(crate::streaming::RequestStream),
 }
 

@@ -346,20 +346,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 // typed self-address. Subsequent body bytes are
                 // pulled from the socket lazily as the service calls
                 // `RequestBodyNext`.
-                let prebuf_end = self.read_buf.len().min(self.head_len + head.content_length);
-                let prebuffered: Vec<u8> = if prebuf_end > self.head_len {
-                    self.read_buf[self.head_len..prebuf_end].to_vec()
-                } else {
-                    Vec::new()
-                };
+                // Reuse `read_buf`'s allocation as the inbound buffer:
+                // truncate to body_end, drain off the head, and keep
+                // the remaining body bytes. `read_buf` is replaced
+                // with an empty Vec so the per-connection memory
+                // story is just `inbound_buffer`.
+                let body_end = self.head_len + head.content_length;
+                let mut buf = std::mem::take(&mut self.read_buf);
+                let prebuf_end = buf.len().min(body_end);
+                buf.truncate(prebuf_end);
+                buf.drain(..self.head_len.min(buf.len()));
                 self.inbound_total = head.content_length;
-                self.inbound_received = prebuffered.len();
+                self.inbound_received = buf.len();
                 self.inbound_delivered = 0;
-                self.inbound_buffer = prebuffered;
+                self.inbound_buffer = buf;
                 self.inbound_chunk_size = chunk_size.max(1);
-                // Done with the parse-time buffer; future body reads
-                // accumulate into `inbound_buffer` directly.
-                self.read_buf.clear();
                 let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
                     tina::Address::new_with_generation(
                         self.shard_id_for_self(),
@@ -376,9 +377,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 // Buffered: by the time we get here `read_buf` already
                 // holds the full body — `maybe_dispatch_or_read_more`
                 // returns to `read_more` until the buffer is full.
+                //
+                // Reuse `read_buf`'s allocation as the body and drop
+                // anything else, so the per-connection memory budget
+                // is just the body we hand to the service, not
+                // `read_buf + body`.
                 let body_end = self.head_len + head.content_length;
-                let body = self.read_buf[self.head_len..body_end].to_vec();
-                head.into_request(body)
+                let mut buf = std::mem::take(&mut self.read_buf);
+                buf.truncate(body_end);
+                buf.drain(..self.head_len);
+                head.into_request(buf)
             }
         };
         call(self.service, M::from(request), self.service_call_timeout)
