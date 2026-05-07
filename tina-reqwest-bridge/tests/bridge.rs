@@ -12,12 +12,11 @@ use http::header::HeaderName;
 use http::status::StatusCode;
 use tina::prelude::*;
 use tina_reqwest_bridge::{
-    InstalledReqwestBridge, ReqwestConfig, ReqwestConfigError, ReqwestError, ReqwestMsg,
-    ReqwestRequest, ReqwestResponse, ReqwestWorker, RetryPolicy,
+    InstalledReqwestBridge, ReqwestAddress, ReqwestConfig, ReqwestConfigError, ReqwestError,
+    ReqwestRequest, ReqwestResponse, ReqwestWorker, RetryPolicy, send_request,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
 use common::{
@@ -64,7 +63,7 @@ enum CallerMsg {
 }
 
 struct CallerIsolate {
-    worker: Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
+    worker: ReqwestAddress,
     timeout: Duration,
     sink: Arc<Sink>,
 }
@@ -82,7 +81,7 @@ impl Isolate for CallerIsolate {
     fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             CallerMsg::Run(request) => {
-                call(self.worker, ReqwestMsg::Send(request), self.timeout).reply(CallerMsg::Done)
+                send_request(self.worker, request, self.timeout).reply(CallerMsg::Done)
             }
             CallerMsg::Done(outcome) => {
                 self.sink.put(outcome);
@@ -113,7 +112,7 @@ fn install_bridge(
 
 fn register_caller(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    worker: Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
+    worker: ReqwestAddress,
     sink: Arc<Sink>,
     timeout: Duration,
 ) -> Address<CallerMsg, ()> {

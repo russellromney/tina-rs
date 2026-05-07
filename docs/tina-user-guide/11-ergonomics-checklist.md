@@ -275,6 +275,41 @@ Tina inside a Tokio edge.
 
 Do not do `Arc::try_unwrap` shutdown dances in examples.
 
+### Bridge state aliases and call helpers
+
+Use the specimen-facing aliases each bridge crate ships:
+
+- `tina_tower_bridge::TinaService<M, R>` instead of the six-generic
+  `TinaTowerService<M, R, SingleShard, DefaultThreadedMailboxFactory, ()>`.
+- `tina_reqwest_bridge::ReqwestAddress` instead of
+  `Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>`.
+- `tina_reqwest_bridge::ReqwestCallOutcome` for the AppMsg variant
+  payload that holds the reply.
+
+Use `tina_reqwest_bridge::send_request(addr, request, timeout)` instead
+of hand-wrapping `call(addr, ReqwestMsg::Send(request), timeout)`.
+
+Use the re-exported `tina_tower_bridge::Service` instead of pulling
+`tower-service` directly into your `Cargo.toml`.
+
+Do not pattern-match on the full `CallOutcome<Result<...>>` shape from
+many call sites. If your edge does not need to distinguish bridge
+delivery failures from worker-domain failures, opt in to
+`flatten_outcome(...)` per crate. The flat error type still names
+which layer failed.
+
+### Bridge: the two error layers
+
+The default reply shape preserves both layers:
+
+- outer `CallOutcome::Full | Closed | Timeout` is *bridge delivery*
+  truth (could the IsolateCall reach the worker?);
+- inner `Result<R, BridgeDomainError>` is *worker outcome* truth.
+
+Do not collapse them silently. If you need a single `Result`, use the
+crate's flatten helper, which preserves the layer in the error
+variant (`Bridge(...)` vs `Worker(...)`).
+
 ### Ordered effects
 
 Use `tina::sequence(...)` for "do these effects one after another."

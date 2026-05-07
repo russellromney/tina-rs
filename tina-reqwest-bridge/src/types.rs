@@ -78,7 +78,7 @@ pub struct ReqwestResponse {
 /// Every error path the bridge can produce maps to exactly one variant.
 /// Reqwest-internal errors collapse to [`ReqwestError::Reqwest`] with
 /// the underlying message preserved; the bridge does not swallow.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReqwestError {
     /// Worker mailbox or `max_in_flight` cap rejected admission.
     Full,

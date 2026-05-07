@@ -14,17 +14,16 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_reqwest_bridge::{
-    ReqwestConfig, ReqwestError, ReqwestMsg, ReqwestRequest, ReqwestResponse, ReqwestWorker,
+    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestRequest, ReqwestWorker, send_request,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
 #[derive(Debug)]
 enum AppMsg {
     Start(String),
-    HttpReturned(CallOutcome<Result<ReqwestResponse, ReqwestError>>),
+    HttpReturned(ReqwestCallOutcome),
 }
 
 #[derive(Default)]
@@ -57,7 +56,7 @@ impl DoneSignal {
 }
 
 struct App {
-    http: Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
+    http: ReqwestAddress,
     done: Arc<DoneSignal>,
 }
 
@@ -75,12 +74,8 @@ impl Isolate for App {
         match msg {
             AppMsg::Start(url) => {
                 println!("fetching {url}");
-                call(
-                    self.http,
-                    ReqwestMsg::Send(ReqwestRequest::get(&url)),
-                    Duration::from_secs(5),
-                )
-                .reply(AppMsg::HttpReturned)
+                send_request(self.http, ReqwestRequest::get(&url), Duration::from_secs(5))
+                    .reply(AppMsg::HttpReturned)
             }
             AppMsg::HttpReturned(outcome) => {
                 match outcome {

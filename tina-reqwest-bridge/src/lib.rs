@@ -9,7 +9,7 @@
 //!
 //! # Use
 //!
-//! Build a worker, register it on a Tina runtime, then `call(...)` it
+//! Build a worker, register it on a Tina runtime, then `send_request`
 //! from any Tina handler:
 //!
 //! ```no_run
@@ -18,18 +18,17 @@
 //!
 //! use tina::prelude::*;
 //! use tina_reqwest_bridge::{
-//!     ReqwestConfig, ReqwestError, ReqwestMsg, ReqwestRequest, ReqwestResponse,
-//!     ReqwestWorker,
+//!     ReqwestAddress, ReqwestCallOutcome, ReqwestRequest, send_request,
 //! };
-//! use tina_runtime::{CallOutcome, RuntimeCall, call};
+//! use tina_runtime::RuntimeCall;
 //!
 //! enum AppMsg {
 //!     Start,
-//!     HttpReturned(CallOutcome<Result<ReqwestResponse, ReqwestError>>),
+//!     HttpReturned(ReqwestCallOutcome),
 //! }
 //!
 //! struct App {
-//!     http: Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
+//!     http: ReqwestAddress,
 //! }
 //!
 //! impl Isolate for App {
@@ -44,9 +43,9 @@
 //!
 //!     fn handle(&mut self, msg: AppMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
 //!         match msg {
-//!             AppMsg::Start => call(
+//!             AppMsg::Start => send_request(
 //!                 self.http,
-//!                 ReqwestMsg::Send(ReqwestRequest::get("http://127.0.0.1:0/")),
+//!                 ReqwestRequest::get("http://127.0.0.1:0/"),
 //!                 Duration::from_secs(2),
 //!             )
 //!             .reply(AppMsg::HttpReturned),
@@ -55,6 +54,18 @@
 //!     }
 //! }
 //! ```
+//!
+//! The reply shape preserves both error layers separately:
+//!
+//! - outer [`tina_runtime::CallOutcome::Full`] / `Closed` / `Timeout` is
+//!   *bridge-delivery* truth (could the IsolateCall reach the worker);
+//! - inner [`ReqwestError`] is *worker-outcome* truth (did reqwest
+//!   succeed, time out, hit a body cap, etc.).
+//!
+//! See [`flatten_outcome`] for an opt-in helper that collapses both
+//! layers into a single `Result<ReqwestResponse, ReqwestCallError>`
+//! while still naming which layer failed. The default path keeps the
+//! layers distinct.
 //!
 //! # Preserved Tina guarantees
 //!
@@ -136,10 +147,15 @@
 //! never retried by the worker — it is the explicit pressure signal
 //! and the caller decides what to do.
 
+mod helpers;
 mod metrics;
 mod types;
 mod worker;
 
+pub use helpers::{
+    BridgeFailure, ReqwestAddress, ReqwestCallError, ReqwestCallOutcome, ReqwestResult,
+    flatten_outcome, send_request,
+};
 pub use metrics::{ReqwestMetrics, ReqwestMetricsHandle};
 pub use types::{
     RedirectPolicy, ReqwestConfig, ReqwestConfigError, ReqwestError, ReqwestRequest,
