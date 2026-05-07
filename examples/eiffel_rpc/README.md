@@ -1,80 +1,62 @@
-# eiffel_rpc — Tina-vs-Tokio RPC overload comparison
+# eiffel_rpc
 
-Same wire protocol on both sides ([`tina_rpc`] frame format), same workload
-(one client connection, M parallel requests against a server with bounded
-in-flight). Two implementations:
+Same workload, two implementations:
 
-- `tina_impl` — Tina framed RPC, raw byte API. Connection isolate has
-  `max_in_flight = 1`; over-cap requests get a server-reported wire
-  `Error(Full)` frame immediately.
-- `tokio_impl` — Tokio reference. Server decodes frames, dispatches each
-  one to an unbounded `mpsc` channel. A single worker drains the channel
-  in order. The unbounded queue accepts every request and the worker
-  replies to all of them; the wire never carries a `Full` error.
-
-The point: framed RPC makes overload **wire-visible**. The Tokio
-reference silently buffers behind an unbounded queue. Same workload,
-observably different behavior.
+- One client connection sends a burst of N requests in one TCP write.
+- The server has bounded concurrency: only one request can be
+  "in flight" at a time.
+- Read both sides; see how each one expresses that bound.
 
 ## Run
 
-This example is workspace-excluded (matching the other `eiffel_*`
-examples), so run it via `--manifest-path` from the repo root or `cd`
-in first:
-
 ```sh
-# From the repo root:
-cargo run --manifest-path examples/eiffel_rpc/Cargo.toml                       # both sides
-cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- tina               # tina only
-cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- tokio              # tokio only
-cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- compare 8          # 8-burst
-
-# Or from inside the example dir:
-cd examples/eiffel_rpc && cargo run -- compare 8
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- both
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- tokio
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- tina
+cargo run --manifest-path examples/eiffel_rpc/Cargo.toml -- both 8
 ```
 
-Each side prints one line of the same shape:
+You'll see one line per side:
 
 ```
 comparison=eiffel_rpc side=tokio burst=4 ok=4 full=0 other=0
-comparison=eiffel_rpc side=tina burst=4 ok=1 full=3 other=0
+comparison=eiffel_rpc side=tina  burst=4 ok=1 full=3 other=0
 ```
 
-`ok` counts wire `Reply` frames received. `full` counts server-reported
-`Error(Full)` frames. `other` counts any unexpected frame kind / decode
-error. The interesting difference is on the `tina` row: `full=3` is the
-visible-overload signal that the `tokio` row never produces.
+`ok` is `Reply` frames received. `full` is server-reported wire
+`Error(Full)` frames. `other` covers anything unexpected so totals
+never silently shrink.
 
-## Typed surface (`tina_typed_impl`)
+## Read
 
-The `#[tina_rpc::service]` macro removes hand-rolled byte plumbing.
-The same Echo workload, written two ways:
+- [`src/tokio_impl.rs`](src/tokio_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs)
 
-**Raw bytes** (`tina_impl.rs::EchoService`):
+Both files are self-contained — server, client, classification.
+
+## Tokio shape
+
+Tokio looks like a normal async server: `TcpListener::bind`, an
+`mpsc::unbounded_channel` between the request-reading task and a
+single worker, a `tokio::spawn` for each side. The "bounded
+concurrency" is implicit — there's one worker draining one channel.
+The channel is unbounded.
+
+When you run it, `full=0` always. Every request is accepted, queued,
+eventually replied to. Overload doesn't show up on the wire because
+the queue absorbs it. If the producer outruns the worker, the queue
+just grows.
+
+## Tina shape
+
+Tina uses the `#[tina_rpc::service]` macro to define the service:
 
 ```rust
-struct EchoService;
-
-#[tina_runtime::isolate(message = ServiceCall, reply = ServiceReply, shard = EiffelShard)]
-impl EchoService {
-    fn handle(&mut self, msg: ServiceCall, _ctx: &mut Context<'_, EiffelShard>) -> Effect<Self> {
-        reply(ServiceReply::Ok(msg.payload))
-    }
-}
-```
-
-The handler ignores `msg.method`; adding a second method means
-`match msg.method.as_str()` plus per-arm decode/encode/error mapping.
-
-**Typed** (`tina_typed_impl.rs::Echo`):
-
-```rust
-#[tina_rpc::service]
+#[service]
 trait Echo {
     fn ping(&mut self, payload: Vec<u8>) -> Vec<u8>;
 }
 
-struct EchoState;
 impl Echo for EchoState {
     fn ping(&mut self, payload: Vec<u8>) -> Vec<u8> {
         payload
@@ -82,28 +64,62 @@ impl Echo for EchoState {
 }
 ```
 
-Method name comes from the `fn`. Per-method JSON encode/decode is
-generated. `ServiceReply::UnknownMethod` / `Decode` / `Internal`
-mappings are generated. Adding a second method is one line.
+That's the whole service definition. The macro emits the dispatcher
+and per-method JSON encode/decode. The handler is the user's `impl`.
 
-The typed module compiles end-to-end and registers with the same
-`SingleService` adapter and `Registry` as the raw side; the contract
-test in `tests/contract.rs` continues to pin the raw side's
-`ok=1, full=N-1` shape so the byte API stays proved.
+The bound — "one in flight per connection" — lives on
+`Connection::tiny_pressure()`, a config preset on the connection
+isolate that wraps the TCP stream. Over-cap requests come back as
+wire `Error(Full)` frames immediately. The client sees them on the
+read side of the same socket.
 
-**Remaining pain**:
+When you run it, `full=N-1` always. The first request grabs the
+slot, gets a `Reply`. The next N-1 come back as `Error(Full)`. The
+overload is on the wire.
 
-- Wire shape is positional tuples (`(arg1, arg2, ..)` → JSON `[a, b]`).
-  Adding/removing args changes the array length and breaks existing
-  clients silently. A struct-shaped, name-keyed payload would be
-  additive-friendly; the wire carries no public compatibility promise
-  today.
-- The typed `Echo::ping(payload: Vec<u8>) -> Vec<u8>` JSON-wraps the
-  bytes, so the typed-side wire bytes differ from the raw side. The
-  comparison harness's shared `drive_client` sends raw frame payloads;
-  to round-trip the typed side end-to-end, callers should reach for
-  the `tina-rpc-tokio` `BridgeClient` which uses the macro-generated
-  `*_request` / `*_decode_reply` helpers.
-- Bridge `await` API lives in `tina-rpc-tokio::BridgeClient`. Retry
-  policy is in `tina-rpc-tokio::call_with_retry`. Tracing fields are
-  emitted from the bridge under the `tracing` feature.
+## Discussion
+
+What feels better:
+
+- **Tina makes overload visible.** "Server is at capacity" is a
+  frame the client can read. The Tokio version requires
+  out-of-band knowledge — looking at queue length, latency
+  histograms, cgroup memory — to detect the same condition.
+- **The `#[service]` macro removes byte plumbing.** Server-side
+  dispatch, args/return JSON encoding, error mapping — all
+  generated. Adding a second method is one `fn` line.
+- **The Tina connection's bound is a number, not an architecture
+  choice.** `tiny_pressure()` sets `max_in_flight = 1` for the
+  demo; production presets are higher but still finite. There's
+  no "and then we added a queue and a worker" story — the bound
+  is the bound.
+
+What feels worse:
+
+- **Tina's setup is more code.** Mailbox + factory boilerplate,
+  a Listener isolate that walks `Bound → Accepted → spawn
+  Connection`, registering a Registry that maps wire service
+  name to dispatch isolate. The Tokio side is `bind/accept/spawn`.
+- **The wire shape is JSON-tuple-encoded.** The macro decodes
+  `fn ping(payload: Vec<u8>)` from a JSON `[<bytes>]`. Clients
+  must produce that shape. Positional tuples are not additive —
+  adding an arg changes the JSON array length and silently
+  breaks old clients.
+- **The Tokio side reads cleanly top-to-bottom.** The Tina side
+  has more pieces (Service, Registry, Connection, Listener) and
+  the wiring between them is the cost of the runtime model.
+
+What this suggests:
+
+- The bounded-in-flight + wire-error pattern is the right
+  default for backpressure-sensitive RPC. Tokio's unbounded
+  queue is a footgun that production code papers over with
+  observability — Tina makes the condition addressable.
+- The `#[service]` macro is the right place for the typed
+  surface. The boilerplate it removes is exactly the part that
+  rots in hand-written services (method match, decode/encode,
+  error mapping).
+- The setup overhead is real and is where future ergonomics
+  work should focus. The runtime + isolate model has a price;
+  the goal isn't to hide it but to keep the per-service cost
+  small.
