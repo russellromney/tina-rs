@@ -40,7 +40,7 @@
 //!   reply matching, visible failure of pending calls on close.
 //! - Topology adapters ([`SingleService`], plus [`PooledService`]
 //!   and [`ShardedService`] type reservations) — the
-//!   `#[tina_rpc::service]` macro emits over them. See [`service`]
+//!   `#[tina_rpc::service]` macro emits over them. See [`mod@service`]
 //!   for the topology rationale.
 //! - Typed dispatch core ([`MethodTable`], [`Dispatch`]) — runtime-free
 //!   typed call routing. The `#[tina_rpc::service]` macro emits over

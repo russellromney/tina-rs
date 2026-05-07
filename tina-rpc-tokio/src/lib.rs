@@ -307,7 +307,7 @@ where
     /// [`BridgeError::Full`] **synchronously**, before any
     /// `ClientMsg::Request` hits the runtime. Cancelling an awaiting
     /// future releases its admission slot **immediately** via the
-    /// [`CancelGuard`] drop — the underlying request continues at the
+    /// cancellation guard — the underlying request continues at the
     /// `Client` until its deadline elapses, and the late reply is
     /// discarded by the shim. Must be `> 0`.
     ///

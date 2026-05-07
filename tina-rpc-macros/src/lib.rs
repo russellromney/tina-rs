@@ -22,18 +22,18 @@ use syn::{
 /// companion structs:
 ///
 /// - `<Trait>Service` — `dispatch::<H, Sh>(state, limits)` builds a
-///   [`tina_rpc::Dispatch`] from a user impl `H: <Trait>` plus
+///   `tina_rpc::Dispatch` from a user impl `H: <Trait>` plus
 ///   `tina_rpc::PayloadLimits`. Drop into a topology adapter
-///   ([`tina_rpc::SingleService`]) and register with the runtime.
+///   (`tina_rpc::SingleService`) and register with the runtime.
 ///
 /// - `<Trait>Client` — per-method `name_request(...)` builders that
-///   produce a [`tina_rpc::ClientRequest`] with the args tuple
+///   produce a `tina_rpc::ClientRequest` with the args tuple
 ///   pre-encoded, plus `name_decode_reply(...)` for the inverse.
 ///   Caller still owns deadline, correlator, reply_to, and the
-///   wiring to the [`tina_rpc::Client`] isolate.
+///   wiring to the `tina_rpc::Client` isolate.
 ///
 /// Synchronous trait methods only. JSON is the default
-/// [`tina_rpc::Encoding`] (the only one shipped today); other
+/// `tina_rpc::Encoding` (the only one shipped today); other
 /// encodings can be requested via
 /// `#[tina_rpc::service(encoding = SomeOther)]`.
 #[proc_macro_attribute]

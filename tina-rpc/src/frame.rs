@@ -205,7 +205,7 @@ impl Frame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLimits {
     /// Maximum body size in bytes (everything after the length prefix). Must
-    /// be at least [`MIN_BODY_SIZE`] and at most `u32::MAX as usize`.
+    /// be at least `MIN_BODY_SIZE` and at most `u32::MAX as usize`.
     pub max_frame_size: usize,
 }
 
@@ -243,7 +243,7 @@ pub enum EncodeError {
         /// Configured maximum.
         max: usize,
     },
-    /// `FrameLimits::max_frame_size` was below [`MIN_BODY_SIZE`].
+    /// `FrameLimits::max_frame_size` was below `MIN_BODY_SIZE`.
     LimitsTooSmall {
         /// Configured maximum.
         max: usize,
@@ -294,7 +294,7 @@ impl StdError for EncodeError {}
 pub enum DecodeError {
     /// Input was shorter than the length prefix.
     LengthPrefixTruncated,
-    /// Length prefix declared a body smaller than [`MIN_BODY_SIZE`].
+    /// Length prefix declared a body smaller than `MIN_BODY_SIZE`.
     BodyTooSmall {
         /// Declared body length.
         len: usize,
@@ -315,7 +315,7 @@ pub enum DecodeError {
         /// Bytes actually available after the prefix.
         got: usize,
     },
-    /// `FrameLimits::max_frame_size` was below [`MIN_BODY_SIZE`].
+    /// `FrameLimits::max_frame_size` was below `MIN_BODY_SIZE`.
     LimitsTooSmall {
         /// Configured maximum.
         max: usize,
