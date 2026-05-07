@@ -1,36 +1,38 @@
-use std::env;
-use std::process::ExitCode;
+use eiffel_persistent_counter::{Report, tina_impl, tokio_impl};
 
-mod comparison;
+fn main() -> anyhow::Result<()> {
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "both".to_string());
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    let mode = args.get(1).map(String::as_str).unwrap_or("compare");
-
-    match mode {
-        "tokio" => {
-            let report = comparison::tokio_impl::run();
-            comparison::print_report("tokio", &report);
-            ExitCode::SUCCESS
-        }
-        "tina" => {
-            let report = comparison::tina_impl::run();
-            comparison::print_report("tina", &report);
-            ExitCode::SUCCESS
-        }
-        "compare" => {
-            let tokio_report = comparison::tokio_impl::run();
-            comparison::print_report("tokio", &tokio_report);
-            let tina_report = comparison::tina_impl::run();
-            comparison::print_report("tina", &tina_report);
-            comparison::assert_equivalent(&tokio_report, &tina_report);
-            println!("\nboth sides recovered the same value across a simulated process restart.");
-            ExitCode::SUCCESS
+    match mode.as_str() {
+        "tokio" => print_side("tokio", tokio_impl::run()?),
+        "tina" => print_side("tina", tina_impl::run()?),
+        "both" => {
+            print_side("tokio", tokio_impl::run()?);
+            print_side("tina", tina_impl::run()?);
         }
         other => {
-            eprintln!("usage: eiffel-persistent-counter [tokio|tina|compare]");
-            eprintln!("unknown mode: {other}");
-            ExitCode::FAILURE
+            anyhow::bail!(
+                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-persistent-counter [tokio|tina|both]"
+            );
         }
     }
+    Ok(())
+}
+
+fn print_side(side: &str, report: Report) {
+    println!(
+        "comparison=eiffel_persistent_counter side={} \
+         phase_a_final={} snapshot_committed={} \
+         phase_b_recovered={} phase_b_final={} \
+         journal_records_phase_b={} exit_clean={}",
+        side,
+        report.phase_a_final,
+        report.snapshot_committed,
+        report.phase_b_recovered,
+        report.phase_b_final,
+        report.journal_records_phase_b,
+        report.exit_clean,
+    );
 }

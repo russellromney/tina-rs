@@ -27,6 +27,7 @@ Read in order if new:
 8. [Simulation And DST](08-simulation-and-dst.md)
 9. [Tokio To Tina Porting](09-tokio-to-tina-porting.md)
 10. [Ergonomics Notes](10-ergonomics-notes.md)
+11. [Ergonomics Checklist](11-ergonomics-checklist.md)
 
 For runnable specimens, see repo-root `examples/`.
 

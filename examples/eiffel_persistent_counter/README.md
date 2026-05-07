@@ -1,135 +1,120 @@
-# Eiffel Persistent Counter
+# eiffel_persistent_counter
 
-Paired Tokio-vs-Tina implementation of a counter that survives a simulated
-process restart via snapshot + journal.
+A counter that survives a simulated process restart via snapshot +
+journal. Phase A starts fresh, applies 5 increments, takes a
+snapshot. Phase B simulates a restart, recovers from disk, applies
+3 more increments. Final value should be 8.
 
-The script for both sides is the same:
+The comparison: each side has the *same* on-disk story (snapshot
+file + append-only journal); the difference is who owns the framing.
+Tokio writes the bytes by hand. Tina uses runtime-owned
+`snapshot_*` and `journal_*` calls.
 
-```text
-phase A: fresh data dir, recover (empty), increment 5 times, commit snapshot
-phase B: same data dir, recover (snapshot=5), increment 3 times, exit
-```
+## Run
 
-Both sides emit the same numbers, asserted in `assert_equivalent`:
-
-```text
-phase_a_final=5 snapshot_committed=true
-phase_b_recovered=5 phase_b_final=8
-journal_records_phase_b=3 exit_clean=true
-```
-
-Run both sides:
-
-```bash
-cargo run --manifest-path examples/eiffel_persistent_counter/Cargo.toml -- compare
-```
-
-Run one side:
-
-```bash
+```sh
+cargo run --manifest-path examples/eiffel_persistent_counter/Cargo.toml -- both
 cargo run --manifest-path examples/eiffel_persistent_counter/Cargo.toml -- tokio
 cargo run --manifest-path examples/eiffel_persistent_counter/Cargo.toml -- tina
 ```
 
-## What this comparison taught us
+Both sides report:
 
-### Tokio side
+```
+phase_a_final=5 snapshot_committed=true phase_b_recovered=5
+phase_b_final=8 journal_records_phase_b=3 exit_clean=true
+```
 
-- The framing is yours. There is no `tokio::persistence`. We invent the
-  layout (16-byte snapshot header + 16-byte journal records), the
-  ordering (write before update in memory), the recovery rule (apply
-  records with `index > last_journal_index`), the snapshot commit shape
-  (write to `.tmp`, rename, *probably* fsync the parent), and the corrupt
-  /torn-tail policy (panic vs. truncate vs. ignore). Every one of these
-  is a one-line decision that becomes a one-week incident if you get it
-  wrong.
-- "Atomic snapshot" is a vibe, not an API. We use rename-on-write. We
-  do not fsync the parent directory. The code admits this in a comment.
-  A junior engineer reading this would not necessarily realize the
-  difference.
-- Async-fs is not really helping here. `tokio::fs::File` plus
-  `sync_all` does the right thing, but the ergonomics are the same as
-  `std::fs` with extra `.await`s. The persistence story does not get
-  better by being async.
-- The shape transfers. We could pull in `sled` or `redb` and outsource
-  most of the framing decisions, but that is a different blast radius.
-  The Tokio side here is "what people actually write when they don't
-  want a database".
+## Read
 
-### Tina side
+- [`src/tokio_impl.rs`](src/tokio_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs)
 
-What worked well:
+Both files are self-contained — recovery, increments, snapshot.
 
-- `snapshot_load` / `snapshot_commit` / `journal_append` / `journal_replay`
-  are runtime-owned calls returning typed continuations. The
-  `snapshot.last_journal_index` field links the two — a snapshot
-  *knows* which journal records it supersedes, which is exactly the
-  information a recovery rule needs and exactly what hand-rolled Tokio
-  code forgets to record half the time.
-- Each operation is one match arm + one continuation message. The state
-  machine is legible: `Recover -> SnapshotLoaded -> JournalLoaded ->
-  (idle)`. `Increment -> AppendDurable -> publish`. `CommitSnapshot ->
-  SnapshotCommitted -> publish`. This is the keyspace pattern again,
-  applied to durability instead of network I/O.
-- "Append before apply" is enforced by the message shape. We *cannot*
-  update `self.value` until `AppendDurable(Ok(()))` returns, because
-  that's the only message variant where the new value is known. The
-  Tokio version could trivially be written in the wrong order and only
-  break under crash; the Tina version cannot.
-- `JournalReplayWarning::TruncatedTail` is a typed warning, not a
-  silent decision. The runtime tells you a partial write was detected
-  and it kept the valid prefix. That's a real property the hand-rolled
-  Tokio version simply doesn't have unless someone wrote it.
+## Tokio shape
 
-What was awkward or surprising:
+`tokio::fs` for the snapshot file and the journal file. Every byte
+layout is the example's choice; every sync point is the example's
+responsibility:
 
-- `CounterMsg` ballooned. Each operation needs:
-  1. an inbound request variant (`Increment { op }`),
-  2. a runtime-call continuation variant (`AppendDurable { op, index,
-     value, result }`),
-  3. for recovery, a chain (`Recover -> SnapshotLoaded -> JournalLoaded`
-     all need to thread the same `op`).
-  This is the "Continuation Enum Growth" sharp edge from the user
-  guide's ergonomics page, but it lands harder here than in the
-  keyspace example because durability genuinely needs more steps.
-- We carry an `op: u64` correlation id through every continuation so
-  the driver thread can know when the *specific* operation it requested
-  has finished. There is no first-class "wait for this call to finish"
-  primitive at the public threaded-runtime API surface. This is the
-  third-party shape of the same problem `eiffel_supervised_worker`
-  hit (slot + generation) and `eiffel_mini_keyspace` hit (`BoundAddr`
-  + trace polling): the runtime knows when work is done, but the
-  driver-thread side has to reach in and observe a side channel.
-- `journal_append(path, index, bytes)` takes the index from the user.
-  Forgetting `next_index = self.last_journal_index + 1` and writing
-  `0` instead would silently never recover. The sequencing
-  responsibility is shared between the user and the runtime, which is
-  fine but worth flagging.
-- "Simulated process restart" still requires shutting down the whole
-  `ThreadedRuntime` and creating a new one against the same data dir.
-  We split the work into two `run_phase()` calls. This works, but it
-  reads more like "two embedded services" than "one service across a
-  restart" — there is no public "warm-restart" or "re-recover" path on
-  a live runtime. Probably correct (you really do want a fresh runtime
-  on real restart), but the example's narrative has to make this clear
-  every time.
-- The `Mailbox` + `MailboxFactory` boilerplate is here too, for the
-  fourth example in a row.
-- Continuation closures need to capture state. `journal_append(...)
-  .reply(move |result| CounterMsg::AppendDurable { op, index, value,
-  result })` is reasonable, but you build that closure per call, and
-  it grows quickly when the variant has more fields.
+- `commit_snapshot` writes a temp file, calls `flush`, calls
+  `sync_all`, then `rename`. (And does not fsync the parent
+  directory — but a real shop should. Whether *this* shop thought
+  to is the property Tina centralizes.)
+- `append_journal` opens with `create + append`, writes 16 bytes,
+  flushes, syncs.
+- `recover` reads the snapshot, validates the length is exactly 16,
+  reads the journal, validates the length is a multiple of 16,
+  walks records, takes any with `index > last_journal_index`.
 
-### Tokio shape vs. Tina shape, in one paragraph
+It works. Every decision is visible. That's also the cost: every
+decision is the example's, and a different shop will make slightly
+different ones.
 
-The Tokio side is what people write when they don't want to take a
-dependency on a database — and the shape is competent and small, but
-every framing/ordering/durability decision is up to the author and
-absent from the type system. The Tina side has more variants, more
-ceremony, and a fatter `CounterMsg`, but `snapshot_commit` linking
-`last_journal_index` to a journal `record_index` is an actual
-correctness property: you cannot recover into the wrong state by
-forgetting to record which records the snapshot already covers. The
-Tokio side fits in a one-page review; the Tina side fits in a one-page
-review too, but the second page (the runtime helpers) was already
-reviewed once on your behalf.
+## Tina shape
+
+A `Counter` isolate using runtime-owned primitives:
+
+- `snapshot_load(path).reply(...)` and `snapshot_commit(path,
+  bytes, last_index).reply(...)` — the runtime owns the temp-file +
+  rename + fsync dance.
+- `journal_append(path, index, bytes).reply(...)` and
+  `journal_replay(path).reply(...)` — the runtime owns record
+  framing, torn-tail detection, replay walk.
+- The `Counter` isolate just sequences these calls and tracks
+  `(value, last_journal_index)` as state.
+
+The host correlates "did my op finish?" via a `u64` op id threaded
+through every continuation message and read back from a shared
+`Observation` slot. That's app-specific data the runtime can't know
+about — `FINDINGS.md` tracks this as typed isolate result waiter work.
+
+## Discussion
+
+What feels better:
+
+- **The runtime owns durability.** Tina's `snapshot_commit` and
+  `journal_append` make the temp-file + fsync + rename + parent
+  fsync decisions once. The Tokio version makes them at every call
+  site, and reasonable engineers will quietly disagree on what the
+  decisions should be.
+- **Append-before-apply is enforced by message shape.** The Tina
+  counter cannot update `self.state.value` until `AppendDurable(Ok(()))`
+  arrives. The "durable first, then visible" property is a state
+  machine, not a discipline. The Tokio version's "increment in
+  memory, then await fsync" is the correct ordering by convention
+  only.
+- **Recovery is a sequence of effects.** `Recover →
+  SnapshotLoaded → JournalLoaded → publish` reads as a state
+  machine, with each step's failure handled per-arm.
+
+What feels worse:
+
+- **The `op` correlator + `Observation` slot is real boilerplate.**
+  Every operation has to thread a `u64` op id through its
+  continuations and write a final value back through atomics. That
+  pattern recurs across persistent-state isolates. A typed
+  observation handle that resolves to the isolate's outcome (with a
+  `Result<T, E>` payload) would retire it.
+- **The continuation enum has 7 variants for 3 user-facing
+  operations.** Each runtime call needs a reply variant; the
+  Recover op alone touches three. A combinator that chained "do
+  `journal_replay`, then publish" would compress the state machine.
+- **Result-shaped variants stack up `Err(_)` arms that all do the
+  same thing.** The bottom of the match has four `Err(_)` arms
+  that collapse into one `publish(op); noop()`. `FINDINGS.md` tracks
+  the broader continuation/pipeline sugar work.
+
+What this suggests:
+
+- The runtime-as-source-of-durability-decisions is the right call.
+  Centralizing fsync / temp-rename / record framing in
+  `tina-runtime` is the kind of work that doesn't fit anywhere else.
+- The `op` correlator + atomic publish slot is the same shape as
+  the side channel from `eiffel_mux_client`'s arrival log. A typed
+  "operation done" handle that carries a typed result would close
+  the loop on both.
+- Continuation enum growth keeps showing up. A combinator that
+  hides the per-step variant for "linear pipelines" would help
+  here, in `eiffel_mini_keyspace`, and in `eiffel_mux_client`.

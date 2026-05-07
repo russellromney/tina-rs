@@ -1,59 +1,37 @@
-use std::env;
-use std::process::{Command, ExitCode, Stdio};
+use eiffel_graceful_shutdown::{Report, tina_impl, tokio_impl};
 
-mod comparison;
+/// Each side installs its own process-wide signal handler. Running
+/// both in the same process means one side's handler fires during
+/// the other's run, so we deliberately do not expose a `both` mode
+/// here — run them as separate processes (or rely on `cargo test`
+/// running the per-side smoke tests, each in its own process).
+fn main() -> anyhow::Result<()> {
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "tokio".to_string());
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    let mode = args.get(1).map(String::as_str).unwrap_or("compare");
-
-    match mode {
-        "tokio" => {
-            let report = comparison::tokio_impl::run();
-            comparison::print_machine_report("tokio", &report);
-            comparison::print_human_report("tokio", &report);
-            ExitCode::SUCCESS
-        }
-        "tina" => {
-            let report = comparison::tina_impl::run();
-            comparison::print_machine_report("tina", &report);
-            comparison::print_human_report("tina", &report);
-            ExitCode::SUCCESS
-        }
-        "compare" => {
-            // Subprocesses keep each side's signal-handler installation
-            // isolated. Running them in the same process risks chained
-            // SIGINT handlers from one side firing during the other.
-            let exe = env::current_exe().expect("current exe");
-            let tokio_report = run_subprocess(&exe, "tokio");
-            comparison::print_human_report("tokio", &tokio_report);
-            let tina_report = run_subprocess(&exe, "tina");
-            comparison::print_human_report("tina", &tina_report);
-            comparison::assert_equivalent(&tokio_report, &tina_report);
-            println!(
-                "\nboth services drained their pending work after a real SIGINT and exited cleanly."
-            );
-            ExitCode::SUCCESS
-        }
+    match mode.as_str() {
+        "tokio" => print_side("tokio", tokio_impl::run()?),
+        "tina" => print_side("tina", tina_impl::run()?),
         other => {
-            eprintln!("usage: eiffel-graceful-shutdown [tokio|tina|compare]");
-            eprintln!("unknown mode: {other}");
-            ExitCode::FAILURE
+            anyhow::bail!(
+                "unknown mode {other:?}; expected tokio or tina (no `both` — see lib.rs). \
+                 usage: eiffel-graceful-shutdown [tokio|tina]"
+            );
         }
     }
+    Ok(())
 }
 
-fn run_subprocess(exe: &std::path::Path, side: &str) -> comparison::SideReport {
-    let output = Command::new(exe)
-        .arg(side)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .unwrap_or_else(|err| panic!("spawn {side} subprocess: {err:?}"));
-    if !output.status.success() {
-        panic!("{side} subprocess failed: {}", output.status);
-    }
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    comparison::parse_machine_report(&stdout)
-        .unwrap_or_else(|| panic!("{side} subprocess produced no machine report:\n{stdout}"))
+fn print_side(side: &str, report: Report) {
+    println!(
+        "comparison=eiffel_graceful_shutdown side={} items_produced={} items_processed={} \
+         signal_received={} remaining_in_queue={} exit_clean={}",
+        side,
+        report.items_produced,
+        report.items_processed,
+        report.signal_received,
+        report.items_remaining_in_queue_at_exit,
+        report.exit_clean,
+    );
 }

@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+anyhow = "1"
 tina = { path = "../../tina" }
 tina-runtime = { path = "../../tina-runtime" }
 tina-rpc = { path = "../../tina-rpc" }

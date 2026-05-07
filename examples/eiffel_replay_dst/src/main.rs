@@ -1,38 +1,46 @@
-use std::env;
-use std::process::ExitCode;
+use eiffel_replay_dst::{tina_impl, tokio_impl};
 
-mod comparison;
+fn main() -> anyhow::Result<()> {
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "both".to_string());
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    let mode = args.get(1).map(String::as_str).unwrap_or("compare");
-
-    match mode {
-        "tokio" => {
-            let report = comparison::tokio_impl::run();
-            comparison::print_tokio_report(&report);
-            ExitCode::SUCCESS
-        }
-        "tina" => {
-            let report = comparison::tina_impl::run();
-            comparison::print_tina_report(&report);
-            ExitCode::SUCCESS
-        }
-        "compare" => {
-            let tina_report = comparison::tina_impl::run();
-            comparison::print_tina_report(&tina_report);
-            let tokio_report = comparison::tokio_impl::run();
-            comparison::print_tokio_report(&tokio_report);
-            comparison::assert_replay_distinction(&tina_report, &tokio_report);
-            println!(
-                "\nTina under tina-sim replays byte-identical traces; Tokio's wall-clock timings drifted."
-            );
-            ExitCode::SUCCESS
+    match mode.as_str() {
+        "tokio" => print_tokio(tokio_impl::run()?),
+        "tina" => print_tina(tina_impl::run()?),
+        "both" => {
+            print_tina(tina_impl::run()?);
+            print_tokio(tokio_impl::run()?);
         }
         other => {
-            eprintln!("usage: eiffel-replay-dst [tokio|tina|compare]");
-            eprintln!("unknown mode: {other}");
-            ExitCode::FAILURE
+            anyhow::bail!(
+                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-replay-dst [tokio|tina|both]"
+            );
         }
     }
+    Ok(())
+}
+
+fn print_tina(report: tina_impl::Report) {
+    println!(
+        "comparison=eiffel_replay_dst side=tina seed_a={} run_a1_events={} run_a2_events={} \
+         fingerprints_match={} seed_b={} run_b1_fingerprint_differs={} messages_received={}",
+        report.seed_a,
+        report.run_a1_event_count,
+        report.run_a2_event_count,
+        report.run_a1_fingerprint == report.run_a2_fingerprint,
+        report.seed_b,
+        report.run_b1_fingerprint != report.run_a1_fingerprint,
+        report.messages_received,
+    );
+}
+
+fn print_tokio(report: tokio_impl::Report) {
+    let messages_match = report.run1_messages == report.run2_messages;
+    let timings_match = report.run1_micros == report.run2_micros;
+    println!(
+        "comparison=eiffel_replay_dst side=tokio messages_match={messages_match} timings_match={timings_match} \
+         run1_us={:?} run2_us={:?}",
+        report.run1_micros, report.run2_micros,
+    );
 }
