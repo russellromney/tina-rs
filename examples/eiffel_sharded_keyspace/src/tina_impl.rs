@@ -235,9 +235,8 @@ pub fn run() -> anyhow::Result<Report> {
     // One `Store` per shard, table built over the same ordered shard
     // list. `try_from_placement` runs the registration closure for each
     // shard and folds any per-shard error into a typed
-    // `ServiceTableBuildError`. `ThreadedRuntimeError` does not yet
-    // impl `std::error::Error`, so wrap the result in `anyhow!` rather
-    // than `.context(...)` here.
+    // `ServiceTableBuildError<ThreadedRuntimeError>`, which now impls
+    // `Display + std::error::Error` so `.context(...)` composes cleanly.
     let placement_for_register = placement.clone();
     let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
         runtime.register_with_capacity_on::<Store, Infallible>(
@@ -249,7 +248,7 @@ pub fn run() -> anyhow::Result<Report> {
             32,
         )
     })
-    .map_err(|e| anyhow::anyhow!("register stores per shard: {e:?}"))?;
+    .context("register stores per shard")?;
 
     // Driver lives on the first shard; it walks the script one
     // command at a time via `call(...).reply(...)`.
