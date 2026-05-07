@@ -1,0 +1,162 @@
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+//! `tower::Service` adapter for Tina bridge handles.
+//!
+//! Wraps a [`tina_tokio_bridge::BridgeHandle`] in a value that
+//! implements [`tower_service::Service`], so Tower-shaped HTTP stacks
+//! (Axum, Hyper, Tower middleware) can call into a Tina service the
+//! same way they call any other backend.
+//!
+//! # Pressure rule
+//!
+//! ```text
+//! Tina Full     -> Service future returns Err(BridgeError::Full)
+//! Tina Closed   -> Service future returns Err(BridgeError::Closed)
+//! Tina Timeout  -> Service future returns Err(BridgeError::Timeout)
+//! ```
+//!
+//! `poll_ready` is **never** `Pending`. It returns `Ready(Ok(()))` when
+//! the bridge is open and `Ready(Err(Closed))` when it has been closed.
+//! Admission backpressure surfaces on the `call`-side future as
+//! `Err(Full)`, never as `Pending`. This is deliberate: Tina ingress
+//! cannot back-press a Tower readiness check without an unbounded
+//! wait, and the plan rule is that bridges show pressure rather than
+//! hide it.
+//!
+//! # Use
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use tina_tokio_bridge::BridgeHandle;
+//! use tina_tower_bridge::TinaTowerService;
+//! use tower_service::Service;
+//!
+//! # fn build_handle() -> BridgeHandle<u32, u32, tina::SingleShard, tina_runtime::DefaultThreadedMailboxFactory> { unimplemented!() }
+//! # async fn driver() {
+//! let handle: BridgeHandle<u32, u32, _, _> = build_handle();
+//! let mut svc = TinaTowerService::new(handle);
+//! let response = svc.call(7).await.expect("svc call");
+//! # let _ = response;
+//! # }
+//! ```
+//!
+//! # Cancellation
+//!
+//! Dropping the call future *before* it is first polled never starts
+//! work. After the future is polled once, the bridge has begun the
+//! `try_send_and_observe` admission; after that, dropping the future
+//! cannot guarantee that no work runs. The Tina handler may still
+//! execute and its reply is discarded by the bridge's metrics path.
+//!
+//! See [`tina_tokio_bridge`] for the underlying bridge contract.
+
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use tina::Shard;
+use tina_runtime::MailboxFactory;
+use tina_tokio_bridge::{BridgeError, BridgeHandle, BridgeMessage, BridgeRequest};
+use tower_service::Service;
+
+/// `tower::Service` wrapper around a [`BridgeHandle`].
+///
+/// Cloneable; each clone shares the same bridge handle and metrics.
+pub struct TinaTowerService<M, R, S, F, AR = (), TM = BridgeRequest<M, R>>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    handle: BridgeHandle<M, R, S, F, AR, TM>,
+    per_call_timeout: Option<Duration>,
+    _marker: PhantomData<fn(M, R, AR, TM)>,
+}
+
+impl<M, R, S, F, AR, TM> Clone for TinaTowerService<M, R, S, F, AR, TM>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            per_call_timeout: self.per_call_timeout,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<M, R, S, F, AR, TM> TinaTowerService<M, R, S, F, AR, TM>
+where
+    M: Send + 'static,
+    R: Send + 'static,
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+    AR: Send + 'static,
+    TM: BridgeMessage + Send + 'static,
+{
+    /// Wraps `handle`. The Service uses the bridge handle's default
+    /// timeout for every `call`.
+    pub fn new(handle: BridgeHandle<M, R, S, F, AR, TM>) -> Self {
+        Self {
+            handle,
+            per_call_timeout: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Sets a per-`call` timeout that overrides the bridge handle's
+    /// default. Returns the same service for chaining.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.per_call_timeout = Some(timeout);
+        self
+    }
+
+    /// Borrows the underlying bridge handle.
+    pub fn handle(&self) -> &BridgeHandle<M, R, S, F, AR, TM> {
+        &self.handle
+    }
+
+    /// Marks the underlying bridge handle (and every clone) as closed.
+    /// After close, `poll_ready` returns `Ready(Err(Closed))`.
+    pub fn close(&self) {
+        self.handle.close();
+    }
+}
+
+impl<M, R, S, F, AR, TM> Service<M> for TinaTowerService<M, R, S, F, AR, TM>
+where
+    M: Send + 'static,
+    R: Send + 'static,
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+    AR: Send + 'static,
+    TM: BridgeMessage + Send + 'static,
+{
+    type Response = R;
+    type Error = BridgeError;
+    type Future = Pin<Box<dyn Future<Output = Result<R, BridgeError>> + Send>>;
+
+    /// Returns `Ready(Ok)` when the bridge is open, `Ready(Err(Closed))`
+    /// once it has been closed. Never returns `Pending`.
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.handle.health() {
+            tina_tokio_bridge::BridgeHealth::Accepting => Poll::Ready(Ok(())),
+            tina_tokio_bridge::BridgeHealth::Closed => Poll::Ready(Err(BridgeError::Closed)),
+        }
+    }
+
+    fn call(&mut self, request: M) -> Self::Future {
+        let handle = self.handle.clone();
+        let per_call = self.per_call_timeout;
+        Box::pin(async move {
+            match per_call {
+                Some(timeout) => handle.call_with_timeout(request, timeout).await,
+                None => handle.call(request).await,
+            }
+        })
+    }
+}

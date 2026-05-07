@@ -11,6 +11,7 @@ members = [
     "tina-sim",
     "tina-supervisor",
     "tina-tokio-bridge",
+    "tina-tower-bridge",
 ]
 exclude = [
     "examples/eiffel_real_io_chat",
