@@ -616,9 +616,7 @@ fn result_waiter_dropped_does_not_block_isolate_stop() {
         )
         .expect("kick producer");
 
-    stopped
-        .wait(Duration::from_secs(3))
-        .expect("isolate stops");
+    stopped.wait(Duration::from_secs(3)).expect("isolate stops");
 
     let _ = runtime.shutdown();
 }
@@ -685,9 +683,7 @@ fn observe_result_is_already_stopped_when_isolate_already_finished() {
     runtime
         .try_send(producer, ResultMsg::FinishWithoutResult)
         .expect("kick producer");
-    stopped
-        .wait(Duration::from_secs(3))
-        .expect("isolate stops");
+    stopped.wait(Duration::from_secs(3)).expect("isolate stops");
 
     // A late registration cannot replay any value the isolate might have
     // produced.

@@ -364,9 +364,7 @@ impl<T: Send + 'static> ResultSender for TypedResultSender<T> {
     }
 
     fn deliver_stopped_without_result(self: Box<Self>) {
-        let _ = self
-            .sender
-            .try_send(ResultDelivery::StoppedWithoutResult);
+        let _ = self.sender.try_send(ResultDelivery::StoppedWithoutResult);
     }
 
     fn deliver_type_mismatch(self: Box<Self>) {
@@ -451,10 +449,7 @@ impl std::fmt::Debug for ObservationRegistry {
                 "pending_child_restarted",
                 &self.pending_child_restarted.len(),
             )
-            .field(
-                "pending_isolate_result",
-                &self.pending_isolate_result.len(),
-            )
+            .field("pending_isolate_result", &self.pending_isolate_result.len())
             .field("max_pending", &self.max_pending)
             .finish()
     }

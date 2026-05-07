@@ -65,10 +65,7 @@ impl<I: Isolate> std::fmt::Debug for ReadExactStep<I> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pending(_) => formatter.write_str("Pending(<effect>)"),
-            Self::Done(buffer) => formatter
-                .debug_tuple("Done")
-                .field(&buffer.len())
-                .finish(),
+            Self::Done(buffer) => formatter.debug_tuple("Done").field(&buffer.len()).finish(),
             Self::EarlyEof(buffer) => formatter
                 .debug_tuple("EarlyEof")
                 .field(&buffer.len())
@@ -187,9 +184,7 @@ impl TcpReadExact {
         if self.buffer.len() >= self.target_len {
             None
         } else {
-            Some(
-                tcp_read(self.stream, self.target_len - self.buffer.len()).reply(on_progress),
-            )
+            Some(tcp_read(self.stream, self.target_len - self.buffer.len()).reply(on_progress))
         }
     }
 

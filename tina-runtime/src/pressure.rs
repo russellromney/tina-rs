@@ -178,12 +178,7 @@ pub struct PressureReport<'a> {
 pub fn format_pressure_line(report: &PressureReport<'_>) -> String {
     let mut line = format!(
         "pressure side={} accepted={} full={} closed={} timeouts={} other={}",
-        report.side,
-        report.accepted,
-        report.full,
-        report.closed,
-        report.timeouts,
-        report.other,
+        report.side, report.accepted, report.full, report.closed, report.timeouts, report.other,
     );
     if let Some(kb) = report.rss_peak_kb {
         line.push_str(&format!(" rss_peak_kb={kb}"));

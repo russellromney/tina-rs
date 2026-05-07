@@ -375,9 +375,7 @@ mod tests {
 
     #[test]
     fn method_not_allowed_distinguishes_405_from_404() {
-        let router = Router::new()
-            .get("/hi", say_hi)
-            .method_not_allowed();
+        let router = Router::new().get("/hi", say_hi).method_not_allowed();
 
         let req = HttpRequest::post("/hi").build();
         let resp = router.dispatch(&req);

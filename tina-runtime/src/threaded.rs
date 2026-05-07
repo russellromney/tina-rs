@@ -548,7 +548,9 @@ where
 
     /// Returns a counted summary of pressure-shaped trace events.
     /// See [`Runtime::pressure_summary`].
-    pub fn pressure_summary(&self) -> Result<crate::pressure::PressureSummary, ThreadedRuntimeError> {
+    pub fn pressure_summary(
+        &self,
+    ) -> Result<crate::pressure::PressureSummary, ThreadedRuntimeError> {
         self.call(|runtime| runtime.pressure_summary())
     }
 

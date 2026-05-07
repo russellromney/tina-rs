@@ -60,6 +60,7 @@ mod multi_shard;
 mod observation;
 pub mod persistence;
 pub mod pressure;
+pub mod sharded;
 pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
@@ -563,10 +564,9 @@ where
     {
         let isolate = address.isolate();
         let generation = address.generation();
-        let alive = self
-            .entries
-            .iter()
-            .any(|entry| entry.id == isolate && entry.generation == generation && !entry.stopped.get());
+        let alive = self.entries.iter().any(|entry| {
+            entry.id == isolate && entry.generation == generation && !entry.stopped.get()
+        });
         if !alive {
             return Err(observation::ResultWaitError::AlreadyStopped);
         }
