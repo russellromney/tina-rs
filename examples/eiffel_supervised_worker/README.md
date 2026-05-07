@@ -1,129 +1,119 @@
-# Eiffel Supervised Worker
+# eiffel_supervised_worker
 
-Paired Tokio-vs-Tina implementation of a worker that processes a queue of
-jobs and panics on a "poison" job. The point of the comparison is not the
-panic — it is what each side has to write to recover from the panic and
-keep processing the next job.
-
-The job script is fixed:
+A worker that processes a fixed job script and panics on every
+`Job::Poison`. The comparison is not the panic — it's what each side
+has to write to recover from the panic and keep processing the next
+job.
 
 ```text
 Work(1)
 Work(2)
-Poison
+Poison    <- worker panics here
 Work(3)
-Poison
+Poison    <- and again here
 Work(4)
 Work(5)
 ```
 
-Both sides emit the same numbers and the run is asserted in
-`assert_equivalent`:
+Both sides should produce:
 
 ```text
 processed=5 poisoned=2 restarts=2 exit_clean=true
 ```
 
-Run both sides:
+Two panic messages print to stderr per side. That's the worker
+genuinely dying — the comparison is whether the supervisor (Tokio:
+hand-rolled; Tina: built-in) brings it back cleanly.
 
-```bash
-cargo run --manifest-path examples/eiffel_supervised_worker/Cargo.toml -- compare
-```
+## Run
 
-Run one side:
-
-```bash
+```sh
+cargo run --manifest-path examples/eiffel_supervised_worker/Cargo.toml -- both
 cargo run --manifest-path examples/eiffel_supervised_worker/Cargo.toml -- tokio
 cargo run --manifest-path examples/eiffel_supervised_worker/Cargo.toml -- tina
 ```
 
-(Two panic backtraces print to stderr per side. That is the worker dying;
-the test harness still completes successfully.)
+## Read
 
-## What this comparison taught us
+- [`src/tokio_impl.rs`](src/tokio_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs)
 
-### Tokio side
+Both files are self-contained — supervisor loop, worker, accounting.
 
-- Recovery is hand-rolled. The pattern is: outer `loop`, `tokio::spawn` a
-  worker task, `JoinHandle::await` it, on `JoinError::is_panic()` count a
-  restart and respawn. None of this is in the `tokio` crate; it is just
-  what every shop independently writes when they decide their service
-  should not die from one bad message.
-- Channel ownership becomes load-bearing. If the worker owns the receiver,
-  the channel dies with the worker and the rest of the queue is lost. The
-  fix is to wrap the receiver in `Arc<Mutex<_>>` so successive workers
-  share it. That is a real foot-gun: the obvious shape silently drops
-  work.
-- Counters become load-bearing. The worker mutates state when it crashes.
-  We share `Arc<AtomicU32>` so the supervisor outside can still read the
-  numbers after the panic. With anything more complex than counters
-  (e.g., a partial result needed for a reply), reconstructing post-panic
-  state is the application's problem.
-- The "shouldn't have happened" case is invisible. There is no Tokio
-  primitive that says "this task was restarted N times" — every restart
-  is something the supervisor in our code chose to do, with our own
-  budget logic. Two shops will write two different versions of this
-  loop.
+## Tokio shape
 
-### Tina side
+A hand-rolled supervisor: `tokio::spawn` the worker, `await` its
+`JoinHandle`, check `is_panic()`, respawn with the same channel and
+the same shared counters. The state that survives the panic
+(`Arc<Mutex<Receiver>>`, `Arc<AtomicU32>` counters) lives in the
+supervisor scope, not the worker scope, because anything in the
+worker scope dies with the worker.
 
-What worked well:
+You write the policy. There is no notion of a *budget* — if the
+worker panics in a loop, this code respawns forever.
 
-- `RestartableChildDefinition::new(|| Worker { ... }, mailbox_capacity)`
-  plus `runtime.supervise(parent, SupervisorConfig::new(OneForOne,
-  RestartBudget::new(N)))` is the entire restart story. Two lines. The
-  policy is named (`OneForOne`) and the budget is finite; both are
-  visible in source and in the trace.
-- The `RuntimeEventKind::SupervisorRestartTriggered { policy, ... }`
-  event is in the trace. We assert the restart count from the trace, not
-  from a counter we maintained ourselves. That is a real property: the
-  runtime *knows* a restart happened, in its own observable timeline.
-- `RestartableChildDefinition` takes a factory closure. Each restart
-  rebuilds the worker from scratch — no implicit "carry-over" state.
-  This is the right default for "did the worker get into a bad state?".
-- `with_initial_message(|| WorkerMsg::Boot)` runs every time, so the new
-  incarnation can re-publish its address into the shared slot exactly
-  once per Boot. No surprise.
+## Tina shape
 
-What was awkward or surprising:
+A worker, a parent, and a supervisor config:
 
-- The driver thread still needs the *current* worker's address, so there
-  is still a small `Arc<Mutex<Option<Address<...>>>>` slot for the child
-  to publish its boot address. **Partly resolved in phase 047:** the
-  old `AtomicU64` generation counter is gone; the driver now registers
-  `runtime.observe_child_restarted(parent)` before sending a poison job.
-- `ThreadedTrySendError` only carries `IngressFull` and `WorkerStopped`
-  — no `Closed`. Sending to an address whose isolate has already died
-  returns `Ok(())` from the ingress, and the runtime drops the message
-  silently on the worker side. That is fine for "send to current
-  worker", but it is a different shape from the explicit-step
-  `Runtime::try_send`, which returns the message on `Closed`. Two
-  similar APIs with different failure surfaces is the kind of thing
-  `tina-runtime` users will trip on.
-- `try_send` consumes the message even on `IngressFull`. To retry on
-  full, the message must be `Copy` or hand-rebuilt. For a `Job` that's
-  fine; for anything heavier, it is friction.
-- ~~The four-line copy of `WorkerMailbox` + `WorkerMailboxFactory`
-  boilerplate is here too.~~ **Resolved in phase 047:** the comparison
-  uses `DefaultThreadedMailboxFactory`.
-- ~~Driving the comparison requires `complete_trace()` polling to notice
-  the next restart event.~~ **Resolved for this use in phase 047:**
-  `observe_child_restarted(parent)` gives the driver a typed waiter for
-  each restart. The trace is still used as audit truth for the final count.
-- `runtime.supervise(...)` returns `Result<(), ThreadedRuntimeError>`
-  while the inner explicit-step `Runtime::supervise(...)` returns `()`.
-  The `.expect("supervise parent")` at every call site is small but
-  asymmetric.
+- **`Worker`** — owns no state worth preserving. Panics on
+  `Job::Poison`. The runtime catches the panic.
+- **`Parent`** — spawns the worker as a `RestartableChildDefinition`
+  with an initial `WorkerMsg::Boot`. Each restart re-runs the
+  factory closure to produce a fresh `Worker`.
+- **`runtime.try_supervise(parent, SupervisorConfig::new(OneForOne,
+  RestartBudget::new(N)))`** — the budget is typed and finite. If
+  the worker exceeds N restarts, the supervisor stops trying.
+- **`runtime.observe_child_restarted(parent).wait(timeout)`** — the
+  ground-truth signal that a restart happened, used per-`Poison`
+  job. No `AtomicU64` generation counter, no trace polling.
 
-### Tokio shape vs. Tina shape, in one paragraph
+The host loops over the script: send a job; if it was a `Poison`,
+wait for the restart waiter to fire and re-read the worker's address
+from a one-shot publish slot.
 
-Tokio gives you the primitives — spawn, JoinHandle, JoinError — and the
-*policy* (when to restart, how many times, what to restart) is yours to
-write, every time, slightly differently. Tina gives you the policy
-(`OneForOne`, `RestartBudget`) and the *visibility* (a trace event the
-runtime emits whether or not your code tracks it), and asks you to write
-the worker like it might genuinely die. The Tokio version compiled in 30
-seconds and is correct enough; it would be fragile in a production shop
-without a careful review. The Tina version asserts its restart count
-from the runtime trace, which is a property no amount of careful Tokio
-code can offer.
+## Discussion
+
+What feels better:
+
+- **Restart budget is typed and finite.** `RestartBudget::new(N)`
+  caps the supervisor. Tokio's hand-rolled loop has no equivalent —
+  you'd add a counter, but every codebase reinvents it slightly
+  differently.
+- **`OneForOne` is a name, not a recipe.** The policy lives on the
+  supervisor config, separate from the loop body. In Tokio you
+  re-discover what "one-for-one" means at every site.
+- **`observe_child_restarted` is ground truth.** The host waits for
+  a typed event the runtime emits. No "did it work?" guessing, no
+  trace polling, no atomic generation counters.
+- **The worker stays trivial.** No supervisor logic in the worker;
+  no `catch_unwind`; no respawn loop. Tina's runtime catches the
+  panic at the isolate boundary and reboots cleanly.
+
+What feels worse:
+
+- **The "first worker address" still uses a side channel.**
+  `Arc<Mutex<Option<WorkerAddr>>>` because Tina doesn't yet ship an
+  observe-child-spawned waiter for the *initial* spawn. Each restart
+  *publishes* through the same slot when its `Boot` message fires.
+  FINDINGS.md tracks this as the remaining child-observation gap.
+- **`send_until_accepted` is a manual ingress-full retry loop.**
+  `runtime.try_send` returns `IngressFull` when the worker's mailbox
+  ingress is saturated; we yield + retry. Bounded inboxes mean this
+  shape is real, but every supervisor will write it the same way —
+  a small "send-with-retry" helper would be welcome.
+- **Wait for "next worker boot" after restart.** Same shape as the
+  initial wait, polling `slot.current()` for a *different* address.
+  Same root cause: no child-spawned waiter yet.
+
+What this suggests:
+
+- The supervisor + restart budget is the right shape. The Tokio
+  hand-rolled loop is exactly the kind of thing that quietly
+  diverges across codebases; Tina names it once.
+- The next ergonomics win for supervised systems is a
+  child-spawned / first-boot observation handle. Once that lands,
+  the `WorkerSlot` side channel and both `wait_until` calls can go.
+- A higher-level "send with bounded backoff" would retire
+  `send_until_accepted` across every example that touches a bounded
+  ingress.
