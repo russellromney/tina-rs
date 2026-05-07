@@ -148,6 +148,29 @@ exercise it in the example — we already track produced/processed
 via telemetry — but it's worth flagging as the kind of primitive
 that only exists when the runtime knows about the work it owns.
 
+### Tina can be shorter than Tokio when the work is genuinely stateful
+*Surfaced by:* `eiffel_native_http`.
+
+`eiffel_native_http` is the first specimen where the Tina side has
+*fewer* lines than the Tokio side: 73 vs 87 for an HTTP/1.1 counter.
+The Tina side is `Counter` (one `#[isolate]` impl with a
+`(method, path)` match) plus an
+`HttpListener::with_config(addr, counter, HttpServerConfig::dev())`.
+The Tokio side is `axum::Router` plus an `Arc<CounterState>` plus
+two extractor handlers plus a `with_graceful_shutdown` hook plus a
+side-thread runtime to host the server while the test client runs.
+
+The runtime model carries its own ergonomics weight when the work
+is *really* stateful. Owning a `u32` directly (`self.value += 1`)
+beats `Arc<AtomicU32>` + extractor State + handler function. This
+isn't going to be true for every workload — most of the existing
+comparisons are still longer on the Tina side because the runtime
+adds setup cost (Listener, Registry, Connection isolates) that
+pays back at scale, not in a 50-line example. But it shows the
+trend line: as the runtime model retires accidental complexity
+elsewhere (mailbox factory, side channels, manual shard types via
+047), the per-example Tina cost keeps shrinking.
+
 ## What feels bad (papercuts)
 
 ### Mailbox boilerplate per example — resolved in Phase 047
@@ -168,7 +191,8 @@ runtimes. Capacity is still explicit at registration and spawn.
 ### The runtime knows; the user has to scrape — partly resolved in Phase 047
 *Surfaced by:* `eiffel_mini_keyspace`, `eiffel_real_io_chat`,
 `eiffel_mux_client`, `eiffel_supervised_worker`, `eiffel_persistent_counter`,
-`eiffel_outbound_fetch`, `eiffel_graceful_shutdown`, `eiffel_replay_dst`.
+`eiffel_outbound_fetch`, `eiffel_outbound_http`, `eiffel_graceful_shutdown`,
+`eiffel_replay_dst`.
 
 The most-recurring papercut in the suite. Before Phase 047, the runtime *had* the
 information the driver thread needs — every comparison's "wait for X
@@ -193,7 +217,14 @@ own variant:
   *specific* increment has finished.
 - `eiffel_outbound_fetch`: `Arc<AtomicBool>` `done` flag the driver
   spins on while the fetcher isolate completes. **Resolved:**
-  `observe_isolate_complete()`.
+  `observe_isolate_complete()` for the *completion* signal; the
+  per-fetch `Arc<Outcome>` (successful / failed / bytes counters)
+  is still app data.
+- `eiffel_outbound_http`: per-request `std::sync::mpsc` channel +
+  short-lived `Driver` isolate that does `call(client, ...,
+  timeout).reply(Returned)` and forwards the result. The pattern is
+  the documented bridge between sync host code and isolate-driven
+  `call(...)`; small but recurs at every sync-host call site.
 - `eiffel_graceful_shutdown`: `Arc<Telemetry>` with four atomics
   (produced, processed, signal_received, producer_stopped) plus a
   three-condition spin-loop on the driver thread.
@@ -206,15 +237,23 @@ own variant:
   the trace because there was no stable event hash. **Resolved:**
   `RuntimeEvent::stable_hash()` and `stable_trace_hash()`.
 
-Eight comparisons, all reaching for the same missing primitive from
+Nine comparisons, all reaching for the same missing primitive from
 slightly different angles. The runtime already has the information;
 example code shouldn't be the one polling for it.
 
 **Phase 047 replacement:** typed bounded waiters for bound address,
 isolate complete, operation done, and child restarted; plus stable trace
 hashing. Remaining pain: richer child-spawn observation, terminal/shutdown
-waiters, and app-specific facts such as mux arrival order still need either
-ordinary state or a future observability shape.
+waiters, sync-host bridging for in-process `call(...)`, and app-specific
+facts (mux arrival order, per-fetch outcomes, per-op telemetry) still
+need either ordinary state or a future observability shape. After the
+specimens-rewrite pass, the cleanest unifying primitive would be a
+typed observation handle that resolves to the isolate's *final state*
+(a typed `Result<AppData, ObservationError>`), retiring the
+`Arc<Outcome>` / `Arc<Telemetry>` / `Driver`-isolate-+-mpsc patterns
+across `eiffel_mux_client`, `eiffel_persistent_counter`,
+`eiffel_outbound_fetch`, `eiffel_outbound_http`, and
+`eiffel_graceful_shutdown` at once.
 
 ### Tokio + Tina signal handlers do not coexist cleanly in one process
 *Surfaced by:* `eiffel_graceful_shutdown`.
@@ -327,6 +366,87 @@ match arms for failure modes that effectively never fire.
   `Result<(), Infallible>`-shaped narrower outcome for
   effectively-infallible runtime calls.
 
+### `Result<T, CallError>` payloads dead-code-flagged when both arms `stop()`
+*Surfaced by:* `eiffel_mux_client`, `eiffel_outbound_fetch`.
+
+A close cousin of the entry above. When a continuation variant
+carries `Result<T, CallError>` but the handler treats both `Ok` and
+`Err` as terminal — collapse-into-`stop()`-or-cleanup — `clippy`
+flags the inner field as dead code. Pattern:
+
+```rust
+ConnectionMsg::Closed(_) => {
+    self.state.stream = None;
+    self.next_iteration()
+}
+```
+
+`clippy` complains that `Result<(), CallError>`'s contents are
+"intentionally ignored." Fix: match `Ok(())` and `Err(_)` arms
+explicitly, even if both bodies are identical:
+
+```rust
+ConnectionMsg::Closed(Ok(())) | ConnectionMsg::Closed(Err(_)) => {
+    self.state.stream = None;
+    self.next_iteration()
+}
+```
+
+This is the spelled-out form that makes the typed payload "active"
+in dead-code analysis. Same pattern works for the original
+`IoFailed`-style collapse seen in the Listener arms.
+
+**Improvement:** mostly stylistic — the new ergonomics-checklist
+entry "Continuation messages for runtime calls" pins the explicit
+`Ok` / `Err` arm pattern. A "call that always succeeds" outcome
+type (above) would retire the issue entirely for runtime calls
+that genuinely can't fail.
+
+### Hand-zeroed counter fields at every isolate spawn site
+*Surfaced by:* `eiffel_real_io_chat`, `eiffel_mini_keyspace`,
+`eiffel_mux_client`, `eiffel_persistent_counter`,
+`eiffel_outbound_fetch`.
+
+Pre-rewrite, each example's isolate spawn site listed its
+zero-initialized counters by hand:
+
+```rust
+Connection {
+    stream,
+    slow_client: self.slow_client,
+    requested_burst: 0,
+    observed: 0,
+    accepted: 0,
+    full: 0,
+    closed: 0,
+}
+```
+
+Five default-init lines per spawn, on top of the required-state
+fields. Two-fold smell: the spawn site is louder than it needs to
+be, and the redundant counter `observed = accepted + full + closed`
+gets re-introduced at every site.
+
+**Resolved (style):** group the default-zero fields into a
+`Default`-derived sub-struct:
+
+```rust
+#[derive(Debug, Default)]
+struct Counts { burst: usize, accepted: usize, full: usize, closed: usize }
+
+struct Connection {
+    stream: StreamId,
+    slow_client: Address<DeliverMsg>,
+    counts: Counts,
+}
+
+// Spawn site:
+Connection { stream, slow_client: self.slow_client, counts: Counts::default() }
+```
+
+The new ergonomics-checklist entry "Default-zero state on isolates"
+codifies it. Every specimen rewrite uses it where it applies.
+
 ### Bridge-hosted services: two runtimes that don't compose cleanly
 *Surfaced by:* `eiffel_axum_counter`, `eiffel_ws_room`, `eiffel_mux_client`.
 
@@ -362,7 +482,8 @@ not native Tina HTTP.
 
 ### Continuation enum growth
 *Surfaced by:* `eiffel_persistent_counter`, `eiffel_outbound_fetch`,
-`eiffel_mini_keyspace`.
+`eiffel_mini_keyspace`, `eiffel_mux_client`, `eiffel_graceful_shutdown`,
+`eiffel_outbound_http`.
 
 The user-guide ergonomics page already lists this; the new comparisons
 confirm it lands harder when the protocol has more than three steps.
@@ -370,9 +491,23 @@ confirm it lands harder when the protocol has more than three steps.
 AppendDurable → publish`, plus the recovery chain `Recover →
 SnapshotLoaded → JournalLoaded`. `FetchMsg` ballooned to `Begin →
 Connected → Wrote → Read → Closed` plus their `Ok`/`Err` arms.
+`MuxMsg`, `ProducerMsg`/`ConsumerMsg`/`SignalMsg`, and
+`DriverMsg`/`HttpClientMsg` add another four sets of "one variant per
+runtime call" enums.
 
-**Improvement:** typed continuation aliases or a generated-name
-helper, as already noted in `docs/tina-user-guide/10-ergonomics-notes.md`.
+**Resolved (style):** the new
+[`docs/tina-user-guide/11-ergonomics-checklist.md`](../docs/tina-user-guide/11-ergonomics-checklist.md)
+entry "Continuation messages for runtime calls" pins the canonical
+shape — `Read(Result<Vec<u8>, CallError>)` carrying the runtime-call
+result directly, `.reply(Variant::Read)` passing the variant
+constructor, error arms collapsed into one `stop()`. Every specimen
+rewrite uses it.
+
+**Still open (primitive):** typed continuation aliases or a
+generated-name helper, as noted in
+[`docs/tina-user-guide/10-ergonomics-notes.md`](../docs/tina-user-guide/10-ergonomics-notes.md).
+The spelled-out shape is consistent now; the real win would be sugar
+that hides the per-step variant for linear pipelines.
 
 ### No `read_to_end` / `write_all` at the runtime-call layer — partly resolved in Phase 047
 *Surfaced by:* `eiffel_outbound_fetch`.
@@ -583,49 +718,84 @@ shape is the same one Tina services already use everywhere else.
 
 Counted by how many comparisons surfaced the issue. Several of these
 collapse to a smaller number of underlying primitives, called out in
-parentheses.
+parentheses. **Updated after the specimens-rewrite pass:** counts
+reflect the current state, with style-only resolutions noted where
+047 / the ergonomics checklist closed the gap.
 
-1. **Continuation enum aliases / sugar, plus a narrower outcome type
-   when failure modes are constrained.** *Four comparisons.*
-   `CounterMsg` and `FetchMsg` ballooned with `Result<_, CallError>`-
-   shaped continuations whose `Err` arms are dead code; same shape
-   shows up on `sleep(...).reply(...)` continuations. Already filed
-   in `docs/tina-user-guide/10-ergonomics-notes.md`; the new
-   comparisons confirm it lands harder with more protocol steps.
-2. **Sugar / docs for "sequence of calls then continue," and an
-   explicit contract for `batch(...)` on same-stream effects.** *Two
-   comparisons.* `next_effect()` recursive helper in keyspace; the
-   wedge that hit `eiffel_mux_client` when batching same-stream
-   writes alongside a read.
-3. **More host observation shapes.** Phase 047 covers the repeated
-   runtime-known facts, but app-specific facts and initial child-spawn
-   address publication still need hand-written state.
-4. **Unify `ThreadedTrySendError` / `Runtime::try_send` failure
+1. **Typed observation handle that resolves to the isolate's final
+   state.** *Five comparisons.*
+   (`eiffel_mux_client`, `eiffel_persistent_counter`,
+   `eiffel_outbound_fetch`, `eiffel_outbound_http`,
+   `eiffel_graceful_shutdown`.)
+   The single biggest unifying primitive. Every isolate that has
+   "the host wants to read app data after I stop" reaches for the
+   same shape: `Arc<AtomicU32>` / `Arc<Mutex<Vec<_>>>` / a per-op
+   correlator + atomic-publish slot, or — for sync host bridging
+   — a `Driver` isolate + `std::sync::mpsc`. A typed
+   `IsolateResultWaiter<T>` whose `wait(timeout)` resolves to the
+   isolate's final state would retire all of them.
+
+2. **Continuation enum sugar / narrower outcome types.** *Six
+   comparisons.* `CounterMsg`, `FetchMsg`, `MuxMsg`, `ProducerMsg`,
+   `DriverMsg`, plus `eiffel_mini_keyspace`'s `next_effect()`
+   recursion. **Style resolved:** the
+   [ergonomics checklist](../docs/tina-user-guide/11-ergonomics-checklist.md)
+   pins `Result<T, CallError>` variants + variant-constructor
+   `.reply(...)`. **Primitive open:** typed continuation aliases
+   or a "linear pipeline" combinator that hides the per-step
+   variant.
+
+3. **Reply-slot accounting in mailbox sizing.** *Two comparisons.*
+   Every `call(...).reply(...)` and observed send consumes one
+   slot in the *requester's* mailbox; the chat example wedged on
+   this in its first draft. **Partly resolved:** documented in
+   `docs/mailbox-capacity.md` with role-based sizing guidance.
+   Diagnostic improvements + an optional separate "reply capacity"
+   budget on registration would close it further.
+
+4. **Sugar / docs for "sequence of calls then continue," and an
+   explicit contract for `batch(...)` on same-stream effects.**
+   *Two comparisons.* `next_effect()` recursive helper in
+   keyspace; the wedge that hit `eiffel_mux_client` when batching
+   same-stream writes alongside a read. **Partly resolved:**
+   `tina::sequence(...)` documented; same-stream caveat called out
+   on `Effect::Batch`. Still no combinator for "for each command,
+   call store, accumulate."
+
+5. **`tcp_read_to_eof` / `tcp_write_all` companions.** *Two
+   comparisons.* `eiffel_outbound_fetch` hand-rolls the partial-
+   write loop and the read-to-EOF loop. **Partly resolved:** user
+   patterns in `docs/tcp-loops.md`. Driver-level helpers
+   deliberately deferred to keep per-step trace events visible.
+
+6. **Bless a "first-child-spawned" observation handle.** *One
+   comparison.* `eiffel_supervised_worker`'s `WorkerSlot` is the
+   one remaining `Arc<Mutex<Option<Address>>>` side channel after
+   `observe_child_restarted()` retired the generation counter.
+
+7. **Unify `ThreadedTrySendError` / `Runtime::try_send` failure
    surfaces and `runtime.supervise(...)` / `Runtime::supervise(...)`
    return types.** *One comparison* but a type-level papercut that
-   will trip every porter, and the type system will not catch the
-   semantic difference between "fire-and-forget" and "explicit
-   closed signal."
-5. **Reply-slot accounting in mailbox sizing.** *Two comparisons.*
-   The hidden rule that every `call(...).reply(...)` and observed
-   send consumes one slot in the *requester's* mailbox; the chat
-   example wedged on this in its first draft. Either better
-   diagnostics, a separate "reply capacity" budget, or explicit
-   sizing guidance in the user guide.
-6. **`tcp_read_to_eof` / `tcp_write_all` companions.** *One
-   comparison*, but every TCP client will re-implement these.
-7. **Better diagnostic when `#[tina::isolate(...)]` is registered
-    with `Simulator`.** *One comparison*; the current generic-bound
-    mismatch is hard to read.
+   will trip every porter. **Partly resolved:** `try_supervise(...)`
+   ships on both surfaces; `try_send` semantic difference is now
+   documented in the doc strings.
+
 8. **Bless the "fresh runtime per phase" pattern (or expose a
-    `simulate_restart()`) for persistence tests.** *One comparison.*
+   `simulate_restart()`) for persistence tests.** *One comparison.*
+
 9. **Document the Tokio + Tina signal-handler coexistence pattern,
-    optionally expose `runtime.unregister_signal_handlers()`.** *One
-    comparison.*
-10. **Uniform overload-counter shape (accepted/full/closed/timeouts)
-    on per-comparison `SideReport`s, so `eiffel_cpu_run` and
-    `eiffel_mem_run` can diff baseline vs. constrained.** *Two
-    runners.*
+   optionally expose `runtime.unregister_signal_handlers()`.**
+   *One comparison.* `eiffel_graceful_shutdown` deliberately drops
+   the `both` mode for this reason.
+
+10. **Tiny routing shape for `tina_http`.** *One comparison.*
+    `eiffel_native_http`'s server handler matches on
+    `(method, path)` arms; an axum-style declarative router would
+    close the last per-line gap to `axum::Router`.
+
+11. **Uniform overload-counter shape on per-comparison `Report`s,
+    so `eiffel_cpu_run` and `eiffel_mem_run` can diff baseline vs.
+    constrained.** *Two runners.*
 
 ## How to add to this file
 
