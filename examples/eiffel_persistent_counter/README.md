@@ -68,9 +68,7 @@ A `Counter` isolate using runtime-owned primitives:
 The host correlates "did my op finish?" via a `u64` op id threaded
 through every continuation message and read back from a shared
 `Observation` slot. That's app-specific data the runtime can't know
-about — FINDINGS.md tracks this under "result-shaped continuations
-need a per-op correlator until a richer typed observation handle
-ships."
+about — `FINDINGS.md` tracks this as typed isolate result waiter work.
 
 ## Discussion
 
@@ -105,8 +103,8 @@ What feels worse:
   `journal_replay`, then publish" would compress the state machine.
 - **Result-shaped variants stack up `Err(_)` arms that all do the
   same thing.** The bottom of the match has four `Err(_)` arms
-  that collapse into one `publish(op); noop()`. (FINDINGS.md tracks
-  "result-shaped continuations carry dead `Err` arms.")
+  that collapse into one `publish(op); noop()`. `FINDINGS.md` tracks
+  the broader continuation/pipeline sugar work.
 
 What this suggests:
 

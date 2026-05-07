@@ -20,8 +20,8 @@ use crate::{REQUEST_IDS, Report, spawn_responder};
 
 /// Arrival log shared with the host so it can read the result after
 /// the client isolate stops. App-specific data the runtime can't
-/// know about; FINDINGS.md tracks it under "app-specific facts still
-/// need ordinary state."
+/// know about; `FINDINGS.md` tracks this as typed isolate result
+/// waiter work.
 type ArrivalLog = Arc<Mutex<Vec<u32>>>;
 
 #[derive(Debug, Clone)]

@@ -96,7 +96,7 @@ What feels worse:
   `Arc<Mutex<Option<WorkerAddr>>>` because Tina doesn't yet ship an
   observe-child-spawned waiter for the *initial* spawn. Each restart
   *publishes* through the same slot when its `Boot` message fires.
-  FINDINGS.md tracks this as the remaining child-observation gap.
+  `FINDINGS.md` tracks the broader typed-result / observation gap.
 - **`send_until_accepted` is a manual ingress-full retry loop.**
   `runtime.try_send` returns `IngressFull` when the worker's mailbox
   ingress is saturated; we yield + retry. Bounded inboxes mean this

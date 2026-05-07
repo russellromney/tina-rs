@@ -6,9 +6,8 @@
 //! The host correlates "did my op finish?" via a `u64` op id
 //! threaded through every continuation message and read back from a
 //! shared `Observation` slot. App-specific data the runtime can't
-//! know about; FINDINGS.md tracks this under "result-shaped
-//! continuations need a per-op correlator until a richer typed
-//! observation handle ships."
+//! know about; `FINDINGS.md` tracks this as typed isolate result
+//! waiter work.
 
 use std::convert::Infallible;
 use std::path::PathBuf;

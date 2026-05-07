@@ -98,8 +98,8 @@ What feels worse:
 - **`CallOutcome<StoreReply>` carries `Timeout` / `Closed` arms that
   effectively never fire.** For a store that always replies, the
   failure arms are dead code, but the type forces every call site to
-  match them. (FINDINGS.md tracks this as "result-shaped continuations
-  carry dead Err arms.")
+  match them. `FINDINGS.md` tracks the broader continuation/pipeline
+  sugar work.
 
 What this suggests:
 

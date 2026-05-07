@@ -81,10 +81,9 @@ What feels worse:
 - **The arrival log is still a side channel.** The Tina side passes
   an `Arc<Mutex<Vec<u32>>>` into the isolate so the host can read
   the result after `observe_isolate_complete`. App-specific data the
-  runtime can't know about — FINDINGS.md tracks this under
-  "app-specific facts still need ordinary state" (047 retired the
-  *runtime-knowable* side channels like bound-address, but not
-  app-data).
+  runtime can't know about — `FINDINGS.md` tracks this as typed
+  isolate result waiter work (047 retired the *runtime-knowable*
+  side channels like bound-address, but not app-data).
 - **The line-parsing loop is hand-rolled.** `position(b == b'\n')`
   + `drain(..=idx)` is fine, but every framed-line client will write
   it. A `tcp_read_lines(stream).reply(...)` shape would be welcome.

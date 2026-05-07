@@ -82,8 +82,8 @@ What feels worse:
   for "this isolate's work has settled" would close it.
 - **No `both` mode.** Tokio's `tokio::signal::ctrl_c` and
   `tina_runtime::signal_wait` both install process-wide handlers
-  that don't cleanly coexist (FINDINGS.md "Tokio + Tina signal
-  handlers do not coexist cleanly in one process"). For the
+  that don't cleanly coexist (`FINDINGS_HISTORY.md` has the long
+  note; current bridge cleanup keeps the public docs honest). For the
   smoke-test isolation, `cargo test -- --test-threads=1` is
   sufficient because each test fires its own SIGINT during its
   own run.

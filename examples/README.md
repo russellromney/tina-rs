@@ -8,8 +8,9 @@ better model.
 
 Cross-cutting ergonomic findings — patterns that show up in more than one
 comparison and the API/runtime suggestions they imply — live in
-[`FINDINGS.md`](FINDINGS.md). Per-comparison ergonomic notes stay in each
-comparison's own `README.md`.
+[`FINDINGS.md`](FINDINGS.md). The longer field journal and resolved
+archaeology live in [`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md).
+Per-comparison ergonomic notes stay in each comparison's own `README.md`.
 
 Before writing or rewriting an example, check the
 [ergonomics checklist](../docs/tina-user-guide/11-ergonomics-checklist.md)

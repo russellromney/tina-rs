@@ -128,7 +128,8 @@ impl Connection {
     ///
     /// Recursion via self-sent messages or a method like this is the
     /// current way to express "process a list of things" — there is
-    /// no built-in iteration combinator yet (FINDINGS.md tracks it).
+    /// no built-in iteration combinator yet (`FINDINGS.md` tracks it
+    /// under continuation/pipeline sugar).
     fn next_effect(&mut self) -> Effect<Self> {
         let Some(command) = self.state.commands.pop_front() else {
             return tcp_write(self.stream, std::mem::take(&mut self.state.response))
