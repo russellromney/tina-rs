@@ -33,12 +33,15 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// What each side observed end-to-end.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
-    /// Total attempts made. Both sides retry on `503`, so this should
-    /// be `FLAKY_503_RUNS + 1` when retry succeeds and `MAX_ATTEMPTS`
-    /// when it gives up at the budget.
+    /// Total attempts made. Both sides retry on a transient outcome,
+    /// so this should be `FLAKY_503_RUNS + 1` when retry succeeds and
+    /// `MAX_ATTEMPTS` when it gives up at the budget.
     pub attempts_made: u32,
-    /// Number of `503` responses seen during the retry loop.
-    pub transient_503_count: u32,
+    /// Number of transient outcomes the retry loop saw. The flaky
+    /// upstream only exercises HTTP `503`s in this specimen, but the
+    /// retry classifier counts any transient: server `5xx`, bridge
+    /// timeout, reqwest transport error.
+    pub transient_failures: u32,
     /// Whether the final attempt produced `200 OK`.
     pub final_ok: bool,
     /// Whether each side reached the end of `run` without bailing out.
@@ -50,7 +53,7 @@ pub struct Report {
 pub fn expected_report() -> Report {
     Report {
         attempts_made: FLAKY_503_RUNS + 1,
-        transient_503_count: FLAKY_503_RUNS,
+        transient_failures: FLAKY_503_RUNS,
         final_ok: true,
         exit_clean: true,
     }

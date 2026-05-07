@@ -20,6 +20,10 @@
 //!   the isolate serializes submits over the rate window — without
 //!   it, multiple `sleep` continuations would fire in parallel and
 //!   the rate limit would not exist.
+//! - **End-of-burst as a Tina message.** The host signals "no more
+//!   submits" via [`WorkerMsg::BurstClosed`] (sent through the same
+//!   bounded mailbox) so the worker stops the moment its `processed`
+//!   count catches up — no `Arc<AtomicU32>` side channel.
 //! - **Final value via `stop_with`.** The host reads the worker's
 //!   processed count through `runtime.observe_result::<Report>`.
 
@@ -38,16 +42,22 @@ use crate::{BURST_JOBS, QUEUE_CAPACITY, RATE_WINDOW_MS, Report};
 
 #[derive(Debug)]
 enum WorkerMsg {
-    /// One job submission from the host.
+    /// One job submission from the host. The `u32` is the job index;
+    /// the worker only logs it (and we deliberately bind it in the
+    /// handler so the payload stays a real lesson, not a unit hole).
     Submit(u32),
-    /// Sleep continuation marking "this job is done."
+    /// Sleep continuation marking "this job is done." Carries
+    /// `SleepReply` so the canonical reply alias is visible at the
+    /// reply site; the handler pattern-matches it.
     Tick(SleepReply),
+    /// Host has finished bursting; the value names the final admitted
+    /// count so the worker can stop the moment its `processed` count
+    /// catches up. Sent through the same bounded mailbox the submits
+    /// went through.
+    BurstClosed(u32),
 }
 
 struct Worker {
-    /// Host writes the final admitted count here once the burst is
-    /// done. Worker reads it on every Tick to decide whether to stop.
-    expected_total: Arc<AtomicU32>,
     rate_window: Duration,
     report: Report,
     processed: u32,
@@ -55,14 +65,22 @@ struct Worker {
     /// by the mailbox cap — the host stops sending past
     /// [`QUEUE_CAPACITY`].
     pending: u32,
+    /// `Some(n)` after [`WorkerMsg::BurstClosed`] arrives, naming the
+    /// final admitted count the worker should stop at. `None` while
+    /// the host is still bursting.
+    expected: Option<u32>,
+    /// Last job index the worker processed. Tracked so `Submit(u32)`
+    /// is bound and read deliberately rather than ignored.
+    last_index: Option<u32>,
 }
 
 #[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
     fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
-            WorkerMsg::Submit(_) => {
+            WorkerMsg::Submit(index) => {
                 self.report.jobs_admitted += 1;
+                self.last_index = Some(index);
                 let was_idle = self.pending == 0;
                 self.pending += 1;
                 // One in-flight Tick at a time. Without this guard,
@@ -74,12 +92,18 @@ impl Worker {
                     noop()
                 }
             }
-            WorkerMsg::Tick(_) => {
+            WorkerMsg::Tick(reply) => {
+                // The sleep is plain time. If it was cancelled (e.g.,
+                // runtime shutdown), bail out cleanly rather than
+                // pretend a job finished.
+                if reply.is_err() {
+                    self.report.exit_clean = false;
+                    return stop_with(self.report);
+                }
                 self.processed += 1;
                 self.pending -= 1;
                 self.report.jobs_processed = self.processed;
-                let expected = self.expected_total.load(Ordering::Acquire);
-                if expected > 0 && self.processed >= expected {
+                if self.is_done() {
                     self.report.exit_clean = true;
                     stop_with(self.report)
                 } else if self.pending > 0 {
@@ -88,6 +112,24 @@ impl Worker {
                     noop()
                 }
             }
+            WorkerMsg::BurstClosed(admitted) => {
+                self.expected = Some(admitted);
+                if self.is_done() {
+                    self.report.exit_clean = true;
+                    stop_with(self.report)
+                } else {
+                    noop()
+                }
+            }
+        }
+    }
+}
+
+impl Worker {
+    fn is_done(&self) -> bool {
+        match self.expected {
+            Some(expected) => self.pending == 0 && self.processed >= expected,
+            None => false,
         }
     }
 }
@@ -98,13 +140,13 @@ pub fn run() -> anyhow::Result<Report> {
         DefaultThreadedMailboxFactory,
     ));
 
-    let expected_total = Arc::new(AtomicU32::new(0));
     let worker = Worker {
-        expected_total: Arc::clone(&expected_total),
         rate_window: Duration::from_millis(RATE_WINDOW_MS),
         report: Report::default(),
         processed: 0,
         pending: 0,
+        expected: None,
+        last_index: None,
     };
     let worker_addr = runtime
         .register_with_capacity::<_, Infallible>(worker, QUEUE_CAPACITY)
@@ -164,7 +206,27 @@ pub fn run() -> anyhow::Result<Report> {
     }
 
     let admitted_n = admitted.load(Ordering::Acquire);
-    expected_total.store(admitted_n, Ordering::Release);
+
+    // Tell the worker the burst is closed. The mailbox might still
+    // hold up to `QUEUE_CAPACITY` admitted Submits, draining at one
+    // per `RATE_WINDOW`, so retry until a slot opens. Worst-case wait
+    // is `QUEUE_CAPACITY * RATE_WINDOW`, plus jitter.
+    let close_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match runtime.send_and_observe(worker_addr, WorkerMsg::BurstClosed(admitted_n)) {
+            Ok(()) => break,
+            Err(ThreadedSendObservedError::MailboxFull)
+            | Err(ThreadedSendObservedError::IngressFull) => {
+                if Instant::now() >= close_deadline {
+                    return Err(anyhow::anyhow!(
+                        "could not deliver BurstClosed within 2s; mailbox stayed full"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => return Err(anyhow::anyhow!("BurstClosed send: {e}")),
+        }
+    }
 
     let report = waiter
         .wait(Duration::from_secs(5))

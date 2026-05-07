@@ -125,7 +125,11 @@ impl Caller {
         match msg {
             CallerMsg::Begin => self.send_attempt(),
             CallerMsg::HttpReturned(outcome) => self.absorb(outcome),
-            CallerMsg::BackoffElapsed(_) => self.send_attempt(),
+            // The backoff is plain time. If the sleep was cancelled
+            // (e.g., runtime shutdown), bail out instead of issuing
+            // another attempt — finishes the trace cleanly.
+            CallerMsg::BackoffElapsed(Ok(())) => self.send_attempt(),
+            CallerMsg::BackoffElapsed(Err(_)) => self.finish(false),
         }
     }
 }
@@ -162,7 +166,7 @@ impl Caller {
         };
 
         if transient {
-            self.report.transient_503_count += 1;
+            self.report.transient_failures += 1;
             if self.report.attempts_made >= MAX_ATTEMPTS {
                 return self.finish(false);
             }

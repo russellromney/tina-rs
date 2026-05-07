@@ -103,7 +103,7 @@ async fn scripted_client(addr: SocketAddr) -> Report {
                 return report;
             }
             Ok(status) if status.is_server_error() => {
-                report.transient_503_count += 1;
+                report.transient_failures += 1;
             }
             Ok(_) | Err(_) => {
                 // Fatal: don't retry. Loop exits with final_ok = false.

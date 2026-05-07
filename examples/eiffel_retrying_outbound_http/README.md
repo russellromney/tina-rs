@@ -5,7 +5,7 @@ Tokio-vs-Tina caller-owned retry against a flaky HTTP upstream.
 The upstream returns `503` for the first two requests and `200 OK`
 after that. Both sides drive the same script: try, classify, retry on
 transient, give up at the budget. Both end up with
-`attempts_made=3, transient_503_count=2, final_ok=true`.
+`attempts_made=3, transient_failures=2, final_ok=true`.
 
 ## Run
 
@@ -17,8 +17,8 @@ cargo test --manifest-path examples/eiffel_retrying_outbound_http/Cargo.toml
 Both sides:
 
 ```
-side=tokio attempts_made=3 transient_503_count=2 final_ok=true exit_clean=true
-side=tina  attempts_made=3 transient_503_count=2 final_ok=true exit_clean=true
+side=tokio attempts_made=3 transient_failures=2 final_ok=true exit_clean=true
+side=tina  attempts_made=3 transient_failures=2 final_ok=true exit_clean=true
 ```
 
 ## Read
@@ -44,20 +44,23 @@ does *not* retry. A small `Caller` isolate owns the retry loop:
 enum CallerMsg {
     Begin,
     HttpReturned(ReqwestCallOutcome),
-    BackoffElapsed(Result<(), CallError>),
+    BackoffElapsed(SleepReply),
 }
 ```
 
 The handler is one match per variant:
 
-- `Begin` and `BackoffElapsed` both call `send_request(...).reply(HttpReturned)`.
+- `Begin` and `BackoffElapsed(Ok(()))` both call `send_request(...).reply(HttpReturned)`.
+- `BackoffElapsed(Err(_))` (sleep cancelled) finishes immediately —
+  matched separately so `SleepReply` is bound and read deliberately.
 - `HttpReturned` classifies the outcome. Transient (any `5xx`,
   bridge timeout, reqwest transport) -> `sleep(BACKOFF).reply(BackoffElapsed)`
   if the budget is left, otherwise finish.
 - Everything else is fatal: finish immediately.
 
-The host blocks on a `mpsc::Receiver<Report>` while the isolate runs.
-That is the same one-shot bridge used by `eiffel_outbound_http`.
+The host reads the final `Report` via `runtime.observe_result::<Report>(caller_addr)`
+(Phase 059 Rock 1). The Caller ends with `stop_with(self.report)` —
+no `mpsc`, no atomics, no shared state.
 
 ## Discussion
 
@@ -92,9 +95,6 @@ What feels worse:
   and `BackoffElapsed` are three explicit continuation points for
   what is two `await`s in async/await form. The `BackoffElapsed`
   variant exists only because timer wakes are messages.
-- **The host still bridges through `mpsc::Sender<Report>`.** Same
-  pattern as `eiffel_outbound_http`. A typed
-  `IsolateResultWaiter<T>` would shrink this to one line.
 
 What this suggests:
 

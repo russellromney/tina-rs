@@ -25,10 +25,10 @@ fn main() -> anyhow::Result<()> {
 fn print_side(side: &str, report: Report) {
     println!(
         "comparison=eiffel_retrying_outbound_http side={} attempts_made={} \
-         transient_503_count={} final_ok={} exit_clean={}",
+         transient_failures={} final_ok={} exit_clean={}",
         side,
         report.attempts_made,
-        report.transient_503_count,
+        report.transient_failures,
         report.final_ok,
         report.exit_clean,
     );
