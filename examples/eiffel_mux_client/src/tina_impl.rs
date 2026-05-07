@@ -1,3 +1,9 @@
+//! Tina: a single `MuxClient` isolate owns the connection. The
+//! parser, the read buffer, and the pending counter all live behind
+//! the same mailbox — no shared `HashMap`, no oneshot per request.
+//! Out-of-order arrival just works: the runtime delivers `tcp_read`
+//! replies as bytes land, and the handler walks complete lines.
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -6,16 +12,19 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, StreamId, ThreadedRuntime, ThreadedRuntimeConfig,
-    tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    CallError, DefaultThreadedMailboxFactory, StreamId, ThreadedRuntime, tcp_close_stream,
+    tcp_connect, tcp_read, tcp_write,
 };
 
-use super::{REQUEST_IDS, SideReport, spawn_responder};
+use crate::{REQUEST_IDS, Report, spawn_responder};
 
+/// Arrival log shared with the host so it can read the result after
+/// the client isolate stops. App-specific data the runtime can't
+/// know about; FINDINGS.md tracks it under "app-specific facts still
+/// need ordinary state."
 type ArrivalLog = Arc<Mutex<Vec<u32>>>;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum MuxMsg {
     Begin,
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
@@ -24,13 +33,20 @@ enum MuxMsg {
     Closed(Result<(), CallError>),
 }
 
-#[derive(Debug)]
+/// State that's empty/derivable at spawn. The host configures
+/// `target` and the shared `arrivals` log; everything else is
+/// `Default` and the spawn site reads `state: ClientState::default()`.
+#[derive(Debug, Default)]
+struct ClientState {
+    stream: Option<StreamId>,
+    read_buf: Vec<u8>,
+}
+
 struct MuxClient {
     target: SocketAddr,
-    stream: Option<StreamId>,
     arrivals: ArrivalLog,
-    pending: usize,
-    read_buf: Vec<u8>,
+    expected: usize,
+    state: ClientState,
 }
 
 #[tina_runtime::isolate(message = MuxMsg)]
@@ -39,49 +55,49 @@ impl MuxClient {
         match msg {
             MuxMsg::Begin => tcp_connect(self.target).reply(MuxMsg::Connected),
             MuxMsg::Connected(Ok((stream, _local, _peer))) => {
-                self.stream = Some(stream);
+                self.state.stream = Some(stream);
                 let mut payload = Vec::new();
                 for &id in &REQUEST_IDS {
                     payload.extend_from_slice(format!("REQ {id}\n").as_bytes());
                 }
                 tcp_write(stream, payload).reply(MuxMsg::Wrote)
             }
-            MuxMsg::Connected(Err(_)) => stop(),
             MuxMsg::Wrote(Ok(_)) => {
-                let stream = self.stream.expect("stream set after connect");
+                let stream = self.state.stream.expect("stream set after connect");
                 tcp_read(stream, 4096).reply(MuxMsg::Read)
             }
-            MuxMsg::Wrote(Err(_)) => stop(),
             MuxMsg::Read(Ok(bytes)) => {
-                self.read_buf.extend_from_slice(&bytes);
-                while let Some(idx) = self.read_buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = self.read_buf.drain(..=idx).collect();
+                self.state.read_buf.extend_from_slice(&bytes);
+                while let Some(idx) = self.state.read_buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = self.state.read_buf.drain(..=idx).collect();
                     let trimmed = std::str::from_utf8(&line[..line.len() - 1])
-                        .expect("line is utf8")
+                        .expect("line utf8")
                         .trim();
                     if let Some(rest) = trimmed.strip_prefix("RESP ") {
-                        let id: u32 = rest.parse().expect("response id parses");
+                        let id: u32 = rest.parse().expect("RESP <id>");
                         self.arrivals.lock().expect("arrivals lock").push(id);
-                        self.pending = self.pending.saturating_sub(1);
                     }
                 }
-
-                if self.pending == 0 {
-                    let stream = self.stream.expect("stream set after connect");
+                let received = self.arrivals.lock().expect("arrivals lock").len();
+                let stream = self.state.stream.expect("stream set after connect");
+                if received >= self.expected {
                     tcp_close_stream(stream).reply(MuxMsg::Closed)
                 } else {
-                    let stream = self.stream.expect("stream set after connect");
                     tcp_read(stream, 4096).reply(MuxMsg::Read)
                 }
             }
-            MuxMsg::Read(Err(_)) | MuxMsg::Closed(_) => stop(),
+            MuxMsg::Closed(Ok(())) => stop(),
+            MuxMsg::Connected(Err(_))
+            | MuxMsg::Wrote(Err(_))
+            | MuxMsg::Read(Err(_))
+            | MuxMsg::Closed(Err(_)) => stop(),
         }
     }
 }
 
-pub(crate) fn run() -> SideReport {
-    // Server lives in a Tokio runtime on a dedicated thread; we hand the
-    // address back to the Tina-driven client.
+pub fn run() -> anyhow::Result<Report> {
+    // The responder lives in a Tokio runtime on a dedicated thread;
+    // we hand the address back to the Tina-driven client via std mpsc.
     let (server_addr_tx, server_addr_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(1);
     let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel::<()>();
     let server_thread = thread::spawn(move || {
@@ -90,54 +106,41 @@ pub(crate) fn run() -> SideReport {
             .build()
             .expect("server runtime");
         runtime.block_on(async move {
-            let (addr, handle) = spawn_responder().await;
+            let (addr, handle) = spawn_responder().await.expect("responder spawn");
             server_addr_tx.send(addr).expect("publish server addr");
             let _ = server_done_rx.await;
             handle.abort();
             let _ = handle.await;
         });
     });
-
-    let target = server_addr_rx.recv().expect("server address arrives");
+    let target = server_addr_rx.recv()?;
 
     let arrivals: ArrivalLog = Arc::default();
-    let runtime = ThreadedRuntime::with_config(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 32,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
     let address = runtime
-        .register_with_capacity::<MuxClient, Infallible>(
+        .register_with_capacity::<_, Infallible>(
             MuxClient {
                 target,
-                stream: None,
                 arrivals: Arc::clone(&arrivals),
-                pending: REQUEST_IDS.len(),
-                read_buf: Vec::new(),
+                expected: REQUEST_IDS.len(),
+                state: ClientState::default(),
             },
             16,
         )
-        .expect("register mux client");
+        .map_err(|e| anyhow::anyhow!("register mux client: {e:?}"))?;
+
     let client_done = runtime.observe_isolate_complete(address);
     runtime
         .try_send(address, MuxMsg::Begin)
-        .expect("kick mux client");
-
+        .map_err(|e| anyhow::anyhow!("kick mux client: {e:?}"))?;
     client_done
         .wait(Duration::from_secs(3))
-        .expect("mux client finishes");
+        .map_err(|e| anyhow::anyhow!("mux client finishes: {e:?}"))?;
 
     let _ = runtime.shutdown();
     let _ = server_done_tx.send(());
     let _ = server_thread.join();
 
     let arrival_order = arrivals.lock().expect("arrivals lock").clone();
-    SideReport {
-        arrival_order,
-        request_ids: REQUEST_IDS.to_vec(),
-    }
+    Ok(Report { arrival_order })
 }
