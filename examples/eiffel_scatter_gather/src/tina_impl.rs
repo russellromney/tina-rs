@@ -53,8 +53,13 @@ enum CoordMsg {
     WorkerDone(u64, CallOutcome<WorkerReply>),
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AggregateReply(u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateReply {
+    /// Sum of per-worker contributions for this query.
+    Ok(u64),
+    /// Coordinator's pending box was full; query was not admitted.
+    Full,
+}
 
 #[derive(Debug)]
 struct PartialQuery {
@@ -98,9 +103,10 @@ impl Coordinator {
                             .collect();
                         Effect::Batch(calls)
                     }
-                    // Pending box full or the slot was already taken:
-                    // reply Full to the caller without capturing.
-                    Err(PendingRepliesTryCaptureError::Full) => reply(AggregateReply(0)),
+                    // Pending box full: reply Full to the caller
+                    // without capturing. The caller observes a typed
+                    // overload distinct from a successful aggregate.
+                    Err(PendingRepliesTryCaptureError::Full) => reply(AggregateReply::Full),
                     Err(other) => panic!("unexpected try_capture error: {other:?}"),
                 }
             }
@@ -116,7 +122,7 @@ impl Coordinator {
                 if partial.remaining == 0 {
                     let done = self.partials.remove(idx);
                     if let Some(slot) = self.pending.take(&qid) {
-                        return reply_to(slot, AggregateReply(done.sum));
+                        return reply_to(slot, AggregateReply::Ok(done.sum));
                     }
                 }
                 noop()
@@ -172,12 +178,13 @@ impl Driver {
             DriverMsg::Returned(i, outcome) => {
                 let payload = self.payloads[i];
                 match outcome {
-                    CallOutcome::Replied(AggregateReply(sum))
+                    CallOutcome::Replied(AggregateReply::Ok(sum))
                         if sum == expected_aggregate(payload) =>
                     {
                         self.outcome.correct += 1;
                     }
-                    CallOutcome::Replied(_) => self.outcome.wrong += 1,
+                    CallOutcome::Replied(AggregateReply::Ok(_)) => self.outcome.wrong += 1,
+                    CallOutcome::Replied(AggregateReply::Full) => self.outcome.failed += 1,
                     _ => self.outcome.failed += 1,
                 }
                 self.remaining -= 1;

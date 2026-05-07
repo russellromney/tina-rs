@@ -820,6 +820,21 @@ where
             return;
         };
 
+        let payload_type_id = (*message).type_id();
+        if payload_type_id != record.shared.expected_reply_type_id() {
+            record.shared.set_state(tina::DeferredSlotState::Closed);
+            self.push_event(
+                isolate_id,
+                Some(cause),
+                RuntimeEventKind::DeferredReplyRejected {
+                    slot_id: record.slot_id,
+                    call_id: record.call_id,
+                    reason: tina_runtime::DeferredReplyRejectedReason::TypeMismatch,
+                },
+            );
+            return;
+        }
+
         match record.routing {
             deferred::DeferredRouting::Local => {
                 if self.complete_isolate_call(record.call_id, cause, CallOutcome::Replied(message))
@@ -1286,11 +1301,13 @@ where
                 send,
                 timeout,
                 translator,
+                expected_reply_type_id,
             } => self.dispatch_isolate_call(
                 dispatch_context,
                 send,
                 timeout,
                 translator,
+                expected_reply_type_id,
                 route_remote,
             ),
         }
@@ -1515,6 +1532,7 @@ where
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
+        expected_reply_type_id: std::any::TypeId,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let target_shard = send.target_shard;
@@ -1564,6 +1582,7 @@ where
                         insertion_order,
                         continuation_context: context.continuation_context,
                         translator: Some(translator),
+                        expected_reply_type_id,
                     });
                 }
                 Err(reason) => {
@@ -1625,6 +1644,7 @@ where
                     insertion_order,
                     continuation_context: context.continuation_context,
                     translator: Some(translator),
+                    expected_reply_type_id,
                 });
             }
             Err(reason) => {
@@ -3716,11 +3736,21 @@ where
                 },
             ),
         };
+        let expected_reply_type_id = match routing {
+            CallRouting::Local => self
+                .pending_isolate_calls
+                .iter()
+                .find(|p| p.call_id == call_id)
+                .map(|p| p.expected_reply_type_id)
+                .unwrap_or_else(std::any::TypeId::of::<()>),
+            CallRouting::Remote { .. } => std::any::TypeId::of::<()>(),
+        };
         Some(MessageCaller::new(
             std::rc::Rc::clone(&self.deferred_registry),
             call_id.get(),
             isolate_id,
             routing,
+            expected_reply_type_id,
         ))
     }
 

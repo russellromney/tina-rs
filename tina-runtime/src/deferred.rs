@@ -410,12 +410,14 @@ mod pending_replies_tests {
     use tina::{DeferredSlotShared, DeferredSlotState};
 
     fn fake_slot(id: u64) -> DeferredReply<u32> {
-        let shared = std::sync::Arc::new(DeferredSlotShared::new(id));
+        let shared =
+            std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
         deferred_from_handle(handle_from_shared(shared))
     }
 
     fn fake_slot_closed(id: u64) -> DeferredReply<u32> {
-        let shared = std::sync::Arc::new(DeferredSlotShared::new(id));
+        let shared =
+            std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
         shared.set_state(DeferredSlotState::Closed);
         deferred_from_handle(handle_from_shared(shared))
     }

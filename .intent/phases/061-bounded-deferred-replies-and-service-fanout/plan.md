@@ -291,7 +291,7 @@ advanced escape hatch. Make the bounded helper the blessed user path.
    ```text
    DeferredReplyCaptured
    DeferredReplySent
-   DeferredReplyRejected { reason: CallerClosed | Timeout | AlreadyReplied }
+   DeferredReplyRejected { reason: CallerClosed | ReplyPathFull | RequesterShardClosed }
    DeferredReplyDropped
    ```
 

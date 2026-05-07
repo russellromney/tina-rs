@@ -100,7 +100,7 @@
 //! ));
 //! ```
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -1285,6 +1285,14 @@ impl DeferredReplyHandle {
 pub struct DeferredSlotShared {
     slot_id: u64,
     state: AtomicU8,
+    /// `TypeId` of the original caller's expected reply payload. The
+    /// runtime sets this from the dispatching `Address<_, R>`'s `R`,
+    /// not from whatever the captured handler claims via
+    /// `take_reply_slot::<I>`. The runtime checks erased payloads
+    /// against this id before invoking the original caller's
+    /// translator, so wrong-type replies surface as a typed trace
+    /// fact rather than panicking the translator.
+    expected_reply_type_id: TypeId,
 }
 
 const SLOT_STATE_OPEN: u8 = 0;
@@ -1294,16 +1302,22 @@ const SLOT_STATE_CLOSED: u8 = 2;
 impl DeferredSlotShared {
     /// Builds an `Open` shared slot. Runtime-only constructor.
     #[doc(hidden)]
-    pub fn new(slot_id: u64) -> Self {
+    pub fn new(slot_id: u64, expected_reply_type_id: TypeId) -> Self {
         Self {
             slot_id,
             state: AtomicU8::new(SLOT_STATE_OPEN),
+            expected_reply_type_id,
         }
     }
 
     /// Returns the slot identifier.
     pub fn slot_id(&self) -> u64 {
         self.slot_id
+    }
+
+    /// Returns the original caller's expected reply payload `TypeId`.
+    pub fn expected_reply_type_id(&self) -> TypeId {
+        self.expected_reply_type_id
     }
 
     /// Reads the current state.
@@ -1367,6 +1381,11 @@ pub struct MessageCaller {
     call_id: u64,
     capturing_isolate: IsolateId,
     routing: CallRouting,
+    /// `TypeId` of the original caller's expected reply payload, as
+    /// declared by the dispatching `Address<_, R>`. The runtime
+    /// supplies this when constructing the caller; the captured slot
+    /// inherits it.
+    expected_reply_type_id: TypeId,
 }
 
 impl MessageCaller {
@@ -1377,12 +1396,14 @@ impl MessageCaller {
         call_id: u64,
         capturing_isolate: IsolateId,
         routing: CallRouting,
+        expected_reply_type_id: TypeId,
     ) -> Self {
         Self {
             registry,
             call_id,
             capturing_isolate,
             routing,
+            expected_reply_type_id,
         }
     }
 
@@ -1397,7 +1418,10 @@ impl MessageCaller {
     /// can be taken at most once per message.
     fn capture(self) -> DeferredReplyHandle {
         let slot_id = self.registry.allocate_slot_id();
-        let shared = Arc::new(DeferredSlotShared::new(slot_id));
+        let shared = Arc::new(DeferredSlotShared::new(
+            slot_id,
+            self.expected_reply_type_id,
+        ));
         self.registry.register_pending(PendingCapture {
             slot_id,
             call_id: self.call_id,

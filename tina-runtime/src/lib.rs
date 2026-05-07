@@ -333,6 +333,10 @@ struct PendingIsolateCall {
     insertion_order: u64,
     continuation_context: Option<MessageCallContext>,
     translator: Option<ErasedIsolateCallTranslator>,
+    /// `TypeId::of::<R>()` for the dispatching `Address<_, R>`. Used
+    /// to typecheck deferred-reply payloads before they reach the
+    /// translator's downcast.
+    expected_reply_type_id: std::any::TypeId,
 }
 
 impl std::fmt::Debug for PendingIsolateCall {
@@ -1033,11 +1037,26 @@ where
                 },
             ),
         };
+        // For Local routes, look up the original caller's expected
+        // reply TypeId from the pending isolate call. Cross-shard
+        // callers are refused at capture time, so the placeholder
+        // here is unreachable in practice; we still pick a stable
+        // sentinel TypeId so the constructor signature is total.
+        let expected_reply_type_id = match routing {
+            CallRouting::Local => self
+                .pending_isolate_calls
+                .iter()
+                .find(|p| p.call_id == call_id)
+                .map(|p| p.expected_reply_type_id)
+                .unwrap_or_else(std::any::TypeId::of::<()>),
+            CallRouting::Remote { .. } => std::any::TypeId::of::<()>(),
+        };
         Some(MessageCaller::new(
             Rc::clone(&self.deferred_registry),
             call_id.get(),
             isolate_id,
             routing,
+            expected_reply_type_id,
         ))
     }
 
@@ -1342,6 +1361,24 @@ where
             return;
         };
 
+        // Typecheck the payload before invoking the original caller's
+        // translator. The translator's downcast would panic on a wrong
+        // type; this surfaces as a typed Rejected event instead.
+        let payload_type_id = message.payload_type_id();
+        if payload_type_id != record.shared.expected_reply_type_id() {
+            record.shared.set_state(DeferredSlotState::Closed);
+            self.push_event(
+                isolate_id,
+                Some(cause),
+                RuntimeEventKind::DeferredReplyRejected {
+                    slot_id: record.slot_id,
+                    call_id: record.call_id,
+                    reason: DeferredReplyRejectedReason::TypeMismatch,
+                },
+            );
+            return;
+        }
+
         // Slot is live. Reply through it.
         match record.routing {
             deferred::DeferredRouting::Local => {
@@ -1460,12 +1497,14 @@ where
                 send,
                 timeout,
                 translator,
+                expected_reply_type_id,
             } => {
                 self.dispatch_isolate_call(
                     dispatch_context,
                     send,
                     timeout,
                     translator,
+                    expected_reply_type_id,
                     route_remote,
                 );
             }
@@ -1701,6 +1740,7 @@ where
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
+        expected_reply_type_id: std::any::TypeId,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let target_shard = send.target_shard;
@@ -1762,6 +1802,7 @@ where
                     insertion_order,
                     continuation_context: context.continuation_context,
                     translator: Some(translator),
+                    expected_reply_type_id,
                 });
             }
             Err(reason) => {
@@ -3550,6 +3591,13 @@ impl ErasedMessage {
         match self {
             Self::Local(message) => message,
             Self::Sendable(message) => message,
+        }
+    }
+
+    fn payload_type_id(&self) -> std::any::TypeId {
+        match self {
+            Self::Local(message) => (**message).type_id(),
+            Self::Sendable(message) => (**message).type_id(),
         }
     }
 

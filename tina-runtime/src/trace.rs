@@ -94,6 +94,14 @@ pub enum DeferredReplyRejectedReason {
 
     /// The requester shard was closed before the reply could be routed.
     RequesterShardClosed,
+
+    /// The reply payload type did not match the dispatching
+    /// `Address<_, R>`'s `R`. Surfaces when a handler captured a
+    /// slot for the wrong isolate type or rebuilt a slot with the
+    /// wrong reply parameter via `runtime_internal`. The original
+    /// caller's translator would have panicked on downcast; this
+    /// reject defangs the panic and drops the payload.
+    TypeMismatch,
 }
 
 /// Trace-level kind of a runtime-owned call.
@@ -757,6 +765,7 @@ fn deferred_reply_rejected_tag(reason: DeferredReplyRejectedReason) -> u8 {
         DeferredReplyRejectedReason::CallerClosed => 1,
         DeferredReplyRejectedReason::ReplyPathFull => 2,
         DeferredReplyRejectedReason::RequesterShardClosed => 3,
+        DeferredReplyRejectedReason::TypeMismatch => 4,
     }
 }
 

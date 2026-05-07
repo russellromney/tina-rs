@@ -132,6 +132,7 @@ pub(crate) struct PendingIsolateCall {
     pub(crate) insertion_order: u64,
     pub(crate) continuation_context: Option<MessageCallContext>,
     pub(crate) translator: Option<ErasedIsolateCallTranslator>,
+    pub(crate) expected_reply_type_id: std::any::TypeId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -508,6 +509,7 @@ where
                     message,
                     timeout,
                     translator,
+                    expected_reply_type_id,
                 } => ErasedCall {
                     kind: ErasedCallKind::IsolateCall {
                         send: ErasedSend {
@@ -520,6 +522,7 @@ where
                         translator: Box::new(move |outcome| {
                             Box::new(translator(outcome)) as Box<dyn Any>
                         }),
+                        expected_reply_type_id,
                     },
                 },
             };
@@ -683,6 +686,7 @@ pub(crate) enum ErasedCallKind {
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 
