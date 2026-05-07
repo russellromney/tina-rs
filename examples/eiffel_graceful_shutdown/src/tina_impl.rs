@@ -1,3 +1,9 @@
+//! Tina: three isolates — `Producer` ticks out items, `Consumer`
+//! drains them, `SignalWatcher` runs `signal_wait("sigint",
+//! timeout)` and on receipt sends `Stop` to the producer. The
+//! producer respects `Stop` (no new items); the consumer keeps
+//! draining until everything in flight is processed.
+
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -5,13 +11,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
-use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, signal_wait,
-    sleep,
-};
+use tina_runtime::{CallError, DefaultThreadedMailboxFactory, ThreadedRuntime, signal_wait, sleep};
 
-use super::{ITEM_INTERVAL_MS, SIGNAL_AFTER_MS, SideReport, TOTAL_PLANNED_ITEMS};
+use crate::{ITEM_INTERVAL_MS, Report, SIGNAL_AFTER_MS, TOTAL_PLANNED_ITEMS};
 
+/// Side channel for the host to read final counts. Same shape as
+/// the other examples' app-data slots.
 #[derive(Default)]
 struct Telemetry {
     produced: AtomicU32,
@@ -20,9 +25,11 @@ struct Telemetry {
     producer_stopped: AtomicBool,
 }
 
+// ---------- Consumer ----------
+
 #[derive(Debug, Clone, Copy)]
 enum ConsumerMsg {
-    Item(u32),
+    Item(#[allow(dead_code)] u32),
     Done(Result<(), CallError>),
 }
 
@@ -34,16 +41,17 @@ struct Consumer {
 impl Consumer {
     fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
-            ConsumerMsg::Item(_n) => sleep(Duration::from_millis(1)).reply(ConsumerMsg::Done),
-            ConsumerMsg::Done(result) => {
-                if result.is_ok() {
-                    self.telemetry.processed.fetch_add(1, Ordering::Relaxed);
-                }
+            ConsumerMsg::Item(_) => sleep(Duration::from_millis(1)).reply(ConsumerMsg::Done),
+            ConsumerMsg::Done(Ok(())) => {
+                self.telemetry.processed.fetch_add(1, Ordering::Relaxed);
                 noop()
             }
+            ConsumerMsg::Done(Err(_)) => noop(),
         }
     }
 }
+
+// ---------- Producer ----------
 
 #[derive(Debug, Clone, Copy)]
 enum ProducerMsg {
@@ -73,8 +81,8 @@ impl Producer {
                 sleep(Duration::from_millis(ITEM_INTERVAL_MS))
                     .reply(move |result| ProducerMsg::TimerFired(n, result))
             }
-            ProducerMsg::TimerFired(n, result) => {
-                if self.stopped || n >= self.target || result.is_err() {
+            ProducerMsg::TimerFired(n, Ok(())) => {
+                if self.stopped || n >= self.target {
                     return noop();
                 }
                 self.telemetry.produced.fetch_add(1, Ordering::Relaxed);
@@ -85,6 +93,7 @@ impl Producer {
                         .reply(move |result| ProducerMsg::TimerFired(next, result)),
                 ])
             }
+            ProducerMsg::TimerFired(_, Err(_)) => noop(),
             ProducerMsg::Stop => {
                 self.stopped = true;
                 self.telemetry
@@ -95,6 +104,8 @@ impl Producer {
         }
     }
 }
+
+// ---------- SignalWatcher ----------
 
 #[derive(Debug, Clone)]
 enum SignalMsg {
@@ -117,7 +128,7 @@ impl SignalWatcher {
             SignalMsg::Begin => {
                 signal_wait("sigint", Duration::from_secs(10)).reply(SignalMsg::Received)
             }
-            SignalMsg::Received(Ok(_name)) => {
+            SignalMsg::Received(Ok(_)) => {
                 self.telemetry
                     .signal_received
                     .store(true, Ordering::Release);
@@ -128,30 +139,23 @@ impl SignalWatcher {
     }
 }
 
-pub(crate) fn run() -> SideReport {
-    let runtime = ThreadedRuntime::with_config(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+// ---------- Run ----------
 
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
     let telemetry = Arc::new(Telemetry::default());
 
     let consumer = runtime
-        .register_with_capacity::<Consumer, Infallible>(
+        .register_with_capacity::<_, Infallible>(
             Consumer {
                 telemetry: Arc::clone(&telemetry),
             },
             (TOTAL_PLANNED_ITEMS as usize) + 4,
         )
-        .expect("register consumer");
+        .map_err(|e| anyhow::anyhow!("register consumer: {e:?}"))?;
 
     let producer = runtime
-        .register_with_capacity::<Producer, _>(
+        .register_with_capacity::<_, _>(
             Producer {
                 consumer,
                 telemetry: Arc::clone(&telemetry),
@@ -160,33 +164,34 @@ pub(crate) fn run() -> SideReport {
             },
             16,
         )
-        .expect("register producer");
+        .map_err(|e| anyhow::anyhow!("register producer: {e:?}"))?;
 
     let watcher = runtime
-        .register_with_capacity::<SignalWatcher, _>(
+        .register_with_capacity::<_, _>(
             SignalWatcher {
                 producer,
                 telemetry: Arc::clone(&telemetry),
             },
             8,
         )
-        .expect("register signal watcher");
+        .map_err(|e| anyhow::anyhow!("register watcher: {e:?}"))?;
 
     runtime
         .try_send(producer, ProducerMsg::Tick(0))
-        .expect("kick producer");
+        .map_err(|e| anyhow::anyhow!("kick producer: {e:?}"))?;
     runtime
         .try_send(watcher, SignalMsg::Begin)
-        .expect("kick watcher");
+        .map_err(|e| anyhow::anyhow!("kick watcher: {e:?}"))?;
 
-    // Operator: simulate a real Ctrl-C from outside the runtime.
+    // Operator: simulate Ctrl-C from outside the runtime.
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(SIGNAL_AFTER_MS));
         signal_hook::low_level::raise(signal_hook::consts::SIGINT).expect("raise SIGINT");
     });
 
-    // Wait for: signal observed AND producer marked stopped AND consumer has
-    // caught up with producer.
+    // Wait for: signal observed AND producer stopped AND consumer
+    // has caught up. App-data side channel — same pattern as
+    // `eiffel_persistent_counter::Observation`.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let stopped = telemetry.producer_stopped.load(Ordering::Acquire);
@@ -194,28 +199,27 @@ pub(crate) fn run() -> SideReport {
         let processed = telemetry.processed.load(Ordering::Acquire);
         let signal = telemetry.signal_received.load(Ordering::Acquire);
         if stopped && signal && processed >= produced && produced > 0 {
-            // Allow a couple of cycles for any in-flight Done message.
+            // One last yield in case a `Done` is in flight.
             thread::sleep(Duration::from_millis(5));
-            let processed_again = telemetry.processed.load(Ordering::Acquire);
-            if processed_again == produced {
+            if telemetry.processed.load(Ordering::Acquire) == produced {
                 break;
             }
         }
         if Instant::now() > deadline {
-            panic!(
-                "graceful drain timed out: signal={signal} stopped={stopped} produced={produced} processed={processed}"
+            anyhow::bail!(
+                "graceful drain timed out: signal={signal} stopped={stopped} produced={produced} processed={processed}",
             );
         }
         thread::yield_now();
     }
 
-    let _ = runtime.shutdown().expect("runtime shutdown");
+    let _ = runtime.shutdown();
 
-    SideReport {
+    Ok(Report {
         items_produced: telemetry.produced.load(Ordering::Relaxed),
         items_processed: telemetry.processed.load(Ordering::Relaxed),
         signal_received: telemetry.signal_received.load(Ordering::Acquire),
         items_remaining_in_queue_at_exit: 0,
         exit_clean: true,
-    }
+    })
 }

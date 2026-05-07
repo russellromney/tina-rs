@@ -1,3 +1,7 @@
+//! Tokio reference: producer task + consumer task + a `select!` on
+//! `tokio::signal::ctrl_c()`. Closing the producer's sender lets the
+//! consumer drain and exit.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -6,17 +10,14 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-use super::{ITEM_INTERVAL_MS, SIGNAL_AFTER_MS, SideReport, TOTAL_PLANNED_ITEMS};
+use crate::{ITEM_INTERVAL_MS, Report, SIGNAL_AFTER_MS, TOTAL_PLANNED_ITEMS};
 
-pub(crate) fn run() -> SideReport {
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    runtime.block_on(async_run())
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    Ok(runtime.block_on(async_run()))
 }
 
-async fn async_run() -> SideReport {
+async fn async_run() -> Report {
     let (tx, mut rx) = mpsc::channel::<u32>(TOTAL_PLANNED_ITEMS as usize + 1);
     let signal_received = Arc::new(AtomicBool::new(false));
     let items_produced = Arc::new(AtomicU32::new(0));
@@ -46,7 +47,7 @@ async fn async_run() -> SideReport {
                     }
                 }
             }
-            // Closing the sender lets the consumer know to drain and exit.
+            // Closing the sender lets the consumer drain and exit.
             drop(tx);
         }
     });
@@ -64,9 +65,6 @@ async fn async_run() -> SideReport {
         let items_processed = Arc::clone(&items_processed);
         async move {
             while let Some(_item) = rx.recv().await {
-                // Pretend each item takes a little work. The point of this
-                // sleep is to give the scheduler somewhere to interleave;
-                // the demo holds even with zero work per item.
                 sleep(Duration::from_millis(1)).await;
                 items_processed.fetch_add(1, Ordering::Relaxed);
             }
@@ -76,7 +74,7 @@ async fn async_run() -> SideReport {
     let _ = producer.await;
     let _ = consumer.await;
 
-    SideReport {
+    Report {
         items_produced: items_produced.load(Ordering::Relaxed),
         items_processed: items_processed.load(Ordering::Relaxed),
         signal_received: signal_received.load(Ordering::Acquire),
