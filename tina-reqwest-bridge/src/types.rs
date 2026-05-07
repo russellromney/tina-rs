@@ -138,28 +138,46 @@ impl Default for RedirectPolicy {
 
 /// Retry handling.
 ///
-/// First form keeps retry off by default. When configured, retries are
-/// bounded and only fire on retryable outcomes; nothing is hidden.
+/// Default is no retry. When configured, the worker uses the
+/// per-attempt timeout from the request (or `default_timeout`) and
+/// retries up to `max_attempts` total attempts with `delay` between
+/// them. Each attempt resets its own clock.
+///
+/// # Bound
+///
+/// Total wall-clock for one bridged call is at most:
+///
+/// ```text
+/// max_attempts * per_attempt_timeout + (max_attempts - 1) * delay
+/// ```
+///
+/// # Idempotency
+///
+/// Configuring retry is the user's promise that the configured
+/// requests are safe to repeat. The bridge does not inspect method,
+/// path, or headers to decide. If a request must not retry, set
+/// [`RetryPolicy::None`] for that worker or run it through a separate
+/// worker.
+///
+/// # Not retried
+///
+/// `Full`, `Closed`, `RequestTooLarge`, `ResponseTooLarge`, and
+/// `InvalidRequest` are never retried by the worker. They are
+/// caller-visible decisions. In particular `Full` is the explicit
+/// pressure signal — the caller decides what to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryPolicy {
     /// No retry. One attempt, surface the outcome.
     None,
-    /// Retry up to `attempts - 1` times, with `delay` between attempts,
-    /// only when the outcome is one of:
-    ///
-    /// - [`ReqwestError::Full`] (configured-on)
-    /// - [`ReqwestError::Timeout`] (configured-on)
-    /// - [`ReqwestError::Reqwest`] connection-class errors (configured-on)
+    /// Bounded retry on transient transport-level failures.
     Bounded {
         /// Total attempts including the first. Must be `>= 1`.
-        attempts: u8,
+        max_attempts: u8,
         /// Delay between attempts.
         delay: Duration,
-        /// Retry [`ReqwestError::Full`].
-        on_full: bool,
         /// Retry [`ReqwestError::Timeout`].
         on_timeout: bool,
-        /// Retry [`ReqwestError::Reqwest`] (connection / IO class only).
+        /// Retry [`ReqwestError::Reqwest`] (connect / IO class only).
         on_reqwest_io: bool,
     },
 }
@@ -170,6 +188,49 @@ impl Default for RetryPolicy {
         Self::None
     }
 }
+
+/// Reasons a [`ReqwestConfig`] cannot produce a working worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReqwestConfigError {
+    /// `mailbox_capacity` is `0`.
+    ZeroMailboxCapacity,
+    /// `max_in_flight` is `0`.
+    ZeroMaxInFlight,
+    /// `poll_interval` is `Duration::ZERO`. The poll loop would not
+    /// yield to other isolates.
+    ZeroPollInterval,
+    /// `mailbox_capacity` exceeds the cap kept to avoid accidentally
+    /// wiring an effectively unbounded queue.
+    MailboxCapacityTooLarge {
+        /// Requested capacity.
+        requested: usize,
+        /// Maximum permitted capacity.
+        cap: usize,
+    },
+    /// `default_timeout` is `Duration::ZERO`.
+    ZeroDefaultTimeout,
+    /// `RetryPolicy::Bounded { max_attempts: 0 }`.
+    ZeroRetryAttempts,
+}
+
+impl std::fmt::Display for ReqwestConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroMailboxCapacity => f.write_str("mailbox_capacity must be >= 1"),
+            Self::ZeroMaxInFlight => f.write_str("max_in_flight must be >= 1"),
+            Self::ZeroPollInterval => f.write_str("poll_interval must be > 0"),
+            Self::MailboxCapacityTooLarge { requested, cap } => {
+                write!(f, "mailbox_capacity {requested} exceeds cap {cap}")
+            }
+            Self::ZeroDefaultTimeout => f.write_str("default_timeout must be > 0"),
+            Self::ZeroRetryAttempts => {
+                f.write_str("RetryPolicy::Bounded.max_attempts must be >= 1")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReqwestConfigError {}
 
 /// Bridge worker configuration.
 ///
@@ -284,21 +345,32 @@ impl ReqwestConfig {
         self
     }
 
-    /// Validates the config and clamps `mailbox_capacity` to
-    /// [`MAX_MAILBOX_CAPACITY`].
-    pub(crate) fn validated(mut self) -> Self {
+    /// Validates the config without modifying it. Returns a typed
+    /// error when any required budget is `0` or out of range.
+    pub fn validate(&self) -> Result<(), ReqwestConfigError> {
         if self.mailbox_capacity == 0 {
-            self.mailbox_capacity = 1;
+            return Err(ReqwestConfigError::ZeroMailboxCapacity);
         }
         if self.mailbox_capacity > MAX_MAILBOX_CAPACITY {
-            self.mailbox_capacity = MAX_MAILBOX_CAPACITY;
+            return Err(ReqwestConfigError::MailboxCapacityTooLarge {
+                requested: self.mailbox_capacity,
+                cap: MAX_MAILBOX_CAPACITY,
+            });
         }
         if self.max_in_flight == 0 {
-            self.max_in_flight = 1;
+            return Err(ReqwestConfigError::ZeroMaxInFlight);
         }
         if self.poll_interval.is_zero() {
-            self.poll_interval = Duration::from_micros(100);
+            return Err(ReqwestConfigError::ZeroPollInterval);
         }
-        self
+        if self.default_timeout.is_zero() {
+            return Err(ReqwestConfigError::ZeroDefaultTimeout);
+        }
+        if let RetryPolicy::Bounded { max_attempts, .. } = self.retry {
+            if max_attempts == 0 {
+                return Err(ReqwestConfigError::ZeroRetryAttempts);
+            }
+        }
+        Ok(())
     }
 }

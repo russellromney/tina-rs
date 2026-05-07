@@ -120,16 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
-    let (worker, metrics) = ReqwestWorker::<SingleShard>::new(ReqwestConfig::default())
-        .map_err(|e| format!("worker: {e}"))?;
-    let cap = worker.mailbox_capacity();
-    let worker_addr = runtime
-        .register_with_capacity::<_, Infallible>(worker, cap)
-        .map_err(|e| format!("register worker: {e:?}"))?;
+    let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
+        .map_err(|e| format!("install bridge: {e}"))?;
 
     let done = Arc::new(DoneSignal::default());
     let app = App {
-        http: worker_addr,
+        http: bridge.address,
         done: Arc::clone(&done),
     };
     let app_addr = runtime
@@ -141,10 +137,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("try_send: {e:?}"))?;
     done.wait(Duration::from_secs(15));
 
-    let snapshot = metrics.snapshot();
+    let snapshot = bridge.metrics.snapshot();
     println!(
-        "metrics: admitted={} responses={} timeout={} reqwest_err={}",
-        snapshot.admitted, snapshot.responses, snapshot.timeout, snapshot.reqwest_error
+        "metrics: admitted={} responses={} timeout={} reqwest_err={} retries={}",
+        snapshot.admitted,
+        snapshot.responses,
+        snapshot.timeout,
+        snapshot.reqwest_error,
+        snapshot.retries
     );
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {

@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -158,5 +158,194 @@ impl Beacon {
 
     pub fn fire(&self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Counter shared between test code and a fake server. Each request
+/// reads the current count, decides what to do, then increments.
+#[derive(Debug, Default, Clone)]
+pub struct Counter(pub Arc<AtomicUsize>);
+
+impl Counter {
+    pub fn read(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn bump(&self) -> usize {
+        self.0.fetch_add(1, Ordering::AcqRel)
+    }
+}
+
+/// TCP listener that drops the first `drop_first` connections (closes
+/// the socket without reading or writing) and then accepts subsequent
+/// ones with a handler.
+///
+/// Used to force reqwest into transport-level errors so retry-on-IO
+/// can be tested deterministically.
+pub struct FlakyServer {
+    pub addr: SocketAddr,
+    pub accepted: Counter,
+    shutdown: Option<oneshot::Sender<()>>,
+    runtime: Arc<Runtime>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl FlakyServer {
+    /// `drop_first` connections close immediately; subsequent ones get
+    /// handled by `handler`.
+    pub fn spawn<H, F>(drop_first: usize, handler: H) -> Self
+    where
+        H: Fn(HyperRequest<Incoming>) -> F + Send + Sync + 'static,
+        F: std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send + 'static,
+    {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .expect("flaky tokio runtime"),
+        );
+        let (addr_tx, addr_rx) = oneshot::channel::<SocketAddr>();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let handler = Arc::new(handler);
+        let runtime_for_spawn = Arc::clone(&runtime);
+        let counter = Counter::default();
+        let counter_for_task = counter.clone();
+        let join = runtime.spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("flaky bind");
+            let addr = listener.local_addr().expect("flaky local addr");
+            addr_tx.send(addr).expect("flaky send addr");
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accept = listener.accept() => {
+                        let (stream, _peer) = match accept {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let attempt = counter_for_task.bump();
+                        if attempt < drop_first {
+                            // Close the connection without speaking
+                            // any HTTP. Reqwest sees a transport-level
+                            // failure (EOF before headers).
+                            drop(stream);
+                            continue;
+                        }
+                        let handler = Arc::clone(&handler);
+                        runtime_for_spawn.spawn(async move {
+                            let io = TokioIo::new(stream);
+                            let svc = service_fn(move |req| {
+                                let handler = Arc::clone(&handler);
+                                async move { Ok::<_, Infallible>(handler(req).await) }
+                            });
+                            let _ = http1::Builder::new().serve_connection(io, svc).await;
+                        });
+                    }
+                }
+            }
+        });
+        let addr = addr_rx.blocking_recv().expect("flaky bound address");
+        Self {
+            addr,
+            accepted: counter,
+            shutdown: Some(shutdown_tx),
+            runtime,
+            join: Some(join),
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.addr, path)
+    }
+
+    pub fn stop(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = self.runtime.block_on(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
+            });
+        }
+    }
+}
+
+impl Drop for FlakyServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Reply 200 OK and echo a single header value back as the body. The
+/// header name is matched case-insensitively. If the header is absent
+/// the body is empty.
+pub fn echo_header(
+    name: &'static str,
+) -> impl Fn(
+    HyperRequest<Incoming>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>>
++ Send
++ Sync
++ 'static {
+    move |req: HyperRequest<Incoming>| {
+        let value = req
+            .headers()
+            .get(name)
+            .map(|v| v.as_bytes().to_vec())
+            .unwrap_or_default();
+        Box::pin(async move {
+            HyperResponse::builder()
+                .status(StatusCode::OK)
+                .header("x-echoed-from", name)
+                .body(Full::new(Bytes::from(value)))
+                .expect("build response")
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+    }
+}
+
+/// Reply with a fixed status and body.
+pub fn fixed_status(
+    status: StatusCode,
+    body: &'static [u8],
+) -> impl Fn(
+    HyperRequest<Incoming>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>>
++ Send
++ Sync
++ 'static {
+    move |_req: HyperRequest<Incoming>| {
+        Box::pin(async move {
+            HyperResponse::builder()
+                .status(status)
+                .body(Full::new(Bytes::from_static(body)))
+                .expect("build response")
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+    }
+}
+
+/// Echo full request body back as the response body. Useful for POST
+/// roundtrip tests.
+pub fn echo_body() -> impl Fn(
+    HyperRequest<Incoming>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>,
+> + Send
++ Sync
++ 'static {
+    move |req: HyperRequest<Incoming>| {
+        Box::pin(async move {
+            let bytes = req
+                .into_body()
+                .collect()
+                .await
+                .expect("collect body")
+                .to_bytes();
+            HyperResponse::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(bytes))
+                .expect("build response")
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
     }
 }

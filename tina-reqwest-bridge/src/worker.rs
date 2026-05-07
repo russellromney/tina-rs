@@ -10,14 +10,15 @@ use std::time::{Duration, Instant};
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::Client;
 use tina::prelude::*;
-use tina_runtime::{RuntimeCall, sleep};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 
 use crate::metrics::{MetricsInner, ReqwestMetricsHandle};
 use crate::types::{
-    RedirectPolicy, ReqwestConfig, ReqwestError, ReqwestRequest, ReqwestResponse, RetryPolicy,
+    RedirectPolicy, ReqwestConfig, ReqwestConfigError, ReqwestError, ReqwestRequest,
+    ReqwestResponse, RetryPolicy,
 };
 
 /// Messages handled by [`ReqwestWorker`].
@@ -28,30 +29,34 @@ pub enum ReqwestMsg {
     /// Internal sleep wakeup. User code must not construct.
     #[doc(hidden)]
     Poll(u64),
-    /// Stop accepting new sends. Abort in-flight tasks. Idempotent.
+    /// Drain. Stop admitting new sends. In-flight requests run to
+    /// natural completion or per-attempt timeout. Idempotent. Equivalent
+    /// to calling [`ReqwestCloser::close`].
     Close,
 }
 
 enum SlotKind {
+    /// One reqwest task is running on the Tokio runtime.
     InFlight {
+        attempt_started_at: Instant,
         receiver: oneshot::Receiver<Result<ReqwestResponse, ReqwestError>>,
         abort: AbortHandle,
     },
+    /// Waiting for a retry delay before spawning the next attempt.
     PendingRetry {
         request: ReqwestRequest,
-        scheduled_at: Instant,
-        delay: Duration,
+        attempt_due_at: Instant,
     },
 }
 
 struct Slot {
     kind: SlotKind,
-    started_at: Instant,
-    timeout: Duration,
-    /// Retry attempts left after this one. 0 = no more retry.
+    per_attempt_timeout: Duration,
+    /// Retry attempts remaining after the current one completes.
     attempts_remaining: u8,
     retry_delay: Duration,
-    /// Saved for retry. None when retry is off.
+    /// Saved request used to build retry attempts. None when retry is
+    /// off or the retry budget has been exhausted.
     saved_request: Option<ReqwestRequest>,
 }
 
@@ -69,14 +74,83 @@ pub struct ReqwestWorker<S: Shard + 'static> {
     next_id: u64,
     closed: Arc<AtomicBool>,
     metrics: Arc<MetricsInner>,
-    _owned_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    _owned_runtime: Option<OwnedRuntime>,
     _shard: PhantomData<S>,
+}
+
+/// Wraps an owned `tokio::runtime::Runtime` so that drop on the Tina
+/// shard thread returns immediately instead of blocking on pending
+/// tasks.
+struct OwnedRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// Result of [`ReqwestWorker::install`].
+pub struct InstalledReqwestBridge<S: Shard + 'static> {
+    /// Tina address callers use with `call(...)`.
+    pub address: Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
+    /// Closer for graceful drain.
+    pub closer: ReqwestCloser,
+    /// Metrics handle.
+    pub metrics: ReqwestMetricsHandle,
+    _shard: PhantomData<S>,
+}
+
+/// Reasons [`ReqwestWorker::install`] cannot register the worker.
+#[derive(Debug)]
+pub enum InstallError {
+    /// Config rejected by [`ReqwestConfig::validate`].
+    Config(ReqwestConfigError),
+    /// Reqwest client or Tokio runtime construction failed.
+    Build(ReqwestError),
+    /// Tina runtime registration failed.
+    Register(ThreadedRuntimeError),
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(e) => write!(f, "reqwest bridge install: {e}"),
+            Self::Build(e) => write!(f, "reqwest bridge install: {e}"),
+            Self::Register(e) => write!(f, "reqwest bridge install: register: {e:?}"),
+        }
+    }
+}
+
+impl std::error::Error for InstallError {}
+
+impl From<ReqwestConfigError> for InstallError {
+    fn from(e: ReqwestConfigError) -> Self {
+        Self::Config(e)
+    }
+}
+
+impl From<ReqwestError> for InstallError {
+    fn from(e: ReqwestError) -> Self {
+        Self::Build(e)
+    }
+}
+
+impl From<ThreadedRuntimeError> for InstallError {
+    fn from(e: ThreadedRuntimeError) -> Self {
+        Self::Register(e)
+    }
 }
 
 impl<S: Shard + 'static> ReqwestWorker<S> {
     /// Builds a worker that owns its own Tokio runtime and reqwest
-    /// client.
+    /// client honoring `config`. The bridge config's redirect, timeout,
+    /// and retry knobs all apply to the constructed client.
     pub fn new(config: ReqwestConfig) -> Result<(Self, ReqwestMetricsHandle), ReqwestError> {
+        config
+            .validate()
+            .map_err(|e| ReqwestError::InvalidRequest(format!("config: {e}")))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
@@ -85,29 +159,35 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             .map_err(|e| ReqwestError::Reqwest(format!("tokio runtime build: {e}")))?;
         let handle = runtime.handle().clone();
         let client = build_client(&config)?;
-        let runtime = Arc::new(runtime);
-        let (worker, metrics) =
-            Self::with_parts_inner(config, client, handle, Some(Arc::clone(&runtime)));
+        let owned = OwnedRuntime(Some(runtime));
+        let (worker, metrics) = Self::assemble(config, client, handle, Some(owned));
         Ok((worker, metrics))
     }
 
     /// Builds a worker around a caller-supplied reqwest client and
-    /// Tokio runtime handle. Caller keeps the runtime alive.
-    pub fn with_parts(
+    /// Tokio runtime handle. The supplied client *owns its own
+    /// redirect, timeout, and connection-reuse policy* — the bridge's
+    /// [`ReqwestConfig::redirect`] and [`ReqwestConfig::default_timeout`]
+    /// are not applied to it. Set those on the client builder before
+    /// passing it in.
+    ///
+    /// The caller must keep the underlying `tokio::runtime::Runtime`
+    /// alive for the worker's lifetime.
+    pub fn with_supplied_client(
         config: ReqwestConfig,
         client: Client,
         runtime: Handle,
-    ) -> (Self, ReqwestMetricsHandle) {
-        Self::with_parts_inner(config, client, runtime, None)
+    ) -> Result<(Self, ReqwestMetricsHandle), ReqwestConfigError> {
+        config.validate()?;
+        Ok(Self::assemble(config, client, runtime, None))
     }
 
-    fn with_parts_inner(
+    fn assemble(
         config: ReqwestConfig,
         client: Client,
         runtime: Handle,
-        owned_runtime: Option<Arc<tokio::runtime::Runtime>>,
+        owned_runtime: Option<OwnedRuntime>,
     ) -> (Self, ReqwestMetricsHandle) {
-        let config = config.validated();
         let metrics_inner = Arc::new(MetricsInner::default());
         let metrics = ReqwestMetricsHandle {
             inner: Arc::clone(&metrics_inner),
@@ -126,13 +206,12 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         (worker, metrics)
     }
 
-    /// Configured mailbox capacity, for use at registration.
+    /// Configured mailbox capacity. Use when registering manually.
     pub fn mailbox_capacity(&self) -> usize {
         self.config.mailbox_capacity
     }
 
-    /// Cloneable closer that flips the worker into the closed state
-    /// from outside the hosting runtime.
+    /// Cloneable closer for graceful drain.
     pub fn closer(&self) -> ReqwestCloser {
         ReqwestCloser {
             closed: Arc::clone(&self.closed),
@@ -155,18 +234,16 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             return reply::<Self>(Err(ReqwestError::Full));
         }
 
-        let (attempts_remaining, retry_delay, save_for_retry) = match self.config.retry {
-            RetryPolicy::None => (0u8, Duration::ZERO, false),
+        let (attempts_remaining, retry_delay) = match self.config.retry {
+            RetryPolicy::None => (0u8, Duration::ZERO),
             RetryPolicy::Bounded {
-                attempts, delay, ..
-            } => {
-                let remaining = attempts.saturating_sub(1);
-                (remaining, delay, remaining > 0)
-            }
+                max_attempts,
+                delay,
+                ..
+            } => (max_attempts.saturating_sub(1), delay),
         };
-        let timeout = request.timeout.unwrap_or(self.config.default_timeout);
-        let started_at = Instant::now();
-        let saved = if save_for_retry {
+        let per_attempt_timeout = request.timeout.unwrap_or(self.config.default_timeout);
+        let saved_request = if attempts_remaining > 0 {
             Some(request.clone())
         } else {
             None
@@ -175,9 +252,8 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             request,
             attempts_remaining,
             retry_delay,
-            timeout,
-            started_at,
-            saved,
+            per_attempt_timeout,
+            saved_request,
         )
     }
 
@@ -186,14 +262,13 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         request: ReqwestRequest,
         attempts_remaining: u8,
         retry_delay: Duration,
-        timeout: Duration,
-        started_at: Instant,
+        per_attempt_timeout: Duration,
         saved_request: Option<ReqwestRequest>,
     ) -> Effect<Self> {
         let request_for_reqwest = match build_reqwest_request(&self.client, &request) {
             Ok(req) => req,
             Err(err) => {
-                self.metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                self.tally_error(&err);
                 return reply::<Self>(Err(err));
             }
         };
@@ -204,20 +279,27 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         let (tx, rx) = oneshot::channel();
         let client = self.client.clone();
         let task_handle = self.runtime.spawn(async move {
-            let result = execute(client, request_for_reqwest, response_limit, timeout).await;
+            let result = execute(
+                client,
+                request_for_reqwest,
+                response_limit,
+                per_attempt_timeout,
+            )
+            .await;
             let _ = tx.send(result);
         });
         let abort = task_handle.abort_handle();
+        let attempt_started_at = Instant::now();
 
         self.in_flight.insert(
             id,
             Slot {
                 kind: SlotKind::InFlight {
+                    attempt_started_at,
                     receiver: rx,
                     abort,
                 },
-                started_at,
-                timeout,
+                per_attempt_timeout,
                 attempts_remaining,
                 retry_delay,
                 saved_request,
@@ -225,6 +307,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         );
         let in_flight = self.in_flight.len() as u64;
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+        self.metrics.set_in_flight(in_flight);
         self.metrics.note_in_flight(in_flight);
 
         sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
@@ -235,8 +318,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         request: ReqwestRequest,
         attempts_remaining: u8,
         retry_delay: Duration,
-        timeout: Duration,
-        started_at: Instant,
+        per_attempt_timeout: Duration,
     ) -> Effect<Self> {
         if retry_delay.is_zero() {
             let saved = if attempts_remaining > 0 {
@@ -248,28 +330,29 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 request,
                 attempts_remaining,
                 retry_delay,
-                timeout,
-                started_at,
+                per_attempt_timeout,
                 saved,
             );
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
+        let attempt_due_at = Instant::now() + retry_delay;
         self.in_flight.insert(
             id,
             Slot {
                 kind: SlotKind::PendingRetry {
                     request,
-                    scheduled_at: Instant::now(),
-                    delay: retry_delay,
+                    attempt_due_at,
                 },
-                started_at,
-                timeout,
+                per_attempt_timeout,
                 attempts_remaining,
                 retry_delay,
                 saved_request: None,
             },
         );
+        let in_flight = self.in_flight.len() as u64;
+        self.metrics.set_in_flight(in_flight);
+        self.metrics.note_in_flight(in_flight);
         sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
     }
 
@@ -279,62 +362,55 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             None => return noop(),
         };
 
-        if self.closed.load(Ordering::Acquire) {
-            if let SlotKind::InFlight { abort, .. } = &slot.kind {
-                abort.abort();
-            }
-            self.metrics.closed.fetch_add(1, Ordering::Relaxed);
-            return reply::<Self>(Err(ReqwestError::Closed));
-        }
-
         let Slot {
             kind,
-            started_at,
-            timeout,
+            per_attempt_timeout,
             attempts_remaining,
             retry_delay,
-            mut saved_request,
+            saved_request,
         } = slot;
 
         match kind {
             SlotKind::InFlight {
+                attempt_started_at,
                 mut receiver,
                 abort,
             } => match receiver.try_recv() {
                 Ok(result) => self.deliver(
-                    started_at,
-                    timeout,
+                    per_attempt_timeout,
                     attempts_remaining,
                     retry_delay,
                     saved_request,
                     result,
                 ),
                 Err(oneshot::error::TryRecvError::Empty) => {
-                    if started_at.elapsed() >= timeout {
+                    if attempt_started_at.elapsed() >= per_attempt_timeout {
                         abort.abort();
-                        self.metrics.timeout.fetch_add(1, Ordering::Relaxed);
-                        if let Some(saved) = saved_request.take() {
-                            if let RetryPolicy::Bounded { on_timeout, .. } = self.config.retry {
-                                if on_timeout && attempts_remaining > 0 {
-                                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                                    return self.schedule_retry(
-                                        saved,
-                                        attempts_remaining - 1,
-                                        retry_delay,
-                                        timeout,
-                                        Instant::now(),
-                                    );
-                                }
-                            }
+                        if let (Some(saved), true) = (
+                            saved_request,
+                            attempts_remaining > 0 && retry_on_timeout(&self.config.retry),
+                        ) {
+                            self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                            return self.schedule_retry(
+                                saved,
+                                attempts_remaining - 1,
+                                retry_delay,
+                                per_attempt_timeout,
+                            );
                         }
+                        self.metrics.timeout.fetch_add(1, Ordering::Relaxed);
+                        self.note_terminal();
                         return reply::<Self>(Err(ReqwestError::Timeout));
                     }
                     self.in_flight.insert(
                         id,
                         Slot {
-                            kind: SlotKind::InFlight { receiver, abort },
-                            started_at,
-                            timeout,
+                            kind: SlotKind::InFlight {
+                                attempt_started_at,
+                                receiver,
+                                abort,
+                            },
+                            per_attempt_timeout,
                             attempts_remaining,
                             retry_delay,
                             saved_request,
@@ -343,18 +419,29 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
-                    self.metrics.reqwest_error.fetch_add(1, Ordering::Relaxed);
-                    reply::<Self>(Err(ReqwestError::Reqwest(
-                        "reqwest task ended without result".into(),
-                    )))
+                    let err = ReqwestError::Reqwest("reqwest task ended without result".into());
+                    if let (Some(saved), true) = (
+                        saved_request,
+                        attempts_remaining > 0 && retry_on_reqwest_io(&self.config.retry),
+                    ) {
+                        self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                        return self.schedule_retry(
+                            saved,
+                            attempts_remaining - 1,
+                            retry_delay,
+                            per_attempt_timeout,
+                        );
+                    }
+                    self.tally_error(&err);
+                    self.note_terminal();
+                    reply::<Self>(Err(err))
                 }
             },
             SlotKind::PendingRetry {
                 request,
-                scheduled_at,
-                delay,
+                attempt_due_at,
             } => {
-                if scheduled_at.elapsed() >= delay {
+                if Instant::now() >= attempt_due_at {
                     let saved = if attempts_remaining > 0 {
                         Some(request.clone())
                     } else {
@@ -364,8 +451,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         request,
                         attempts_remaining,
                         retry_delay,
-                        timeout,
-                        started_at,
+                        per_attempt_timeout,
                         saved,
                     )
                 } else {
@@ -374,11 +460,9 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         Slot {
                             kind: SlotKind::PendingRetry {
                                 request,
-                                scheduled_at,
-                                delay,
+                                attempt_due_at,
                             },
-                            started_at,
-                            timeout,
+                            per_attempt_timeout,
                             attempts_remaining,
                             retry_delay,
                             saved_request,
@@ -392,40 +476,26 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
 
     fn deliver(
         &mut self,
-        started_at: Instant,
-        timeout: Duration,
+        per_attempt_timeout: Duration,
         attempts_remaining: u8,
         retry_delay: Duration,
         saved_request: Option<ReqwestRequest>,
         result: Result<ReqwestResponse, ReqwestError>,
     ) -> Effect<Self> {
-        if started_at.elapsed() > timeout {
-            self.metrics.late_results.fetch_add(1, Ordering::Relaxed);
-        }
-
         if let Err(err) = &result {
             if attempts_remaining > 0 {
-                if let (
-                    Some(saved),
-                    RetryPolicy::Bounded {
-                        on_full,
-                        on_timeout,
-                        on_reqwest_io,
-                        ..
-                    },
-                ) = (saved_request.as_ref(), &self.config.retry)
-                {
-                    if is_retryable(err, *on_full, *on_timeout, *on_reqwest_io) {
-                        self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        let request = saved.clone();
-                        return self.schedule_retry(
-                            request,
-                            attempts_remaining - 1,
-                            retry_delay,
-                            timeout,
-                            started_at,
-                        );
-                    }
+                if let (Some(saved), true) = (
+                    saved_request.as_ref(),
+                    is_retryable(err, &self.config.retry),
+                ) {
+                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    let request = saved.clone();
+                    return self.schedule_retry(
+                        request,
+                        attempts_remaining - 1,
+                        retry_delay,
+                        per_attempt_timeout,
+                    );
                 }
             }
         }
@@ -436,7 +506,13 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             }
             Err(err) => self.tally_error(err),
         }
+        self.note_terminal();
         reply::<Self>(result)
+    }
+
+    fn note_terminal(&self) {
+        let in_flight = self.in_flight.len() as u64;
+        self.metrics.set_in_flight(in_flight);
     }
 
     fn tally_error(&self, err: &ReqwestError) {
@@ -451,23 +527,57 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
+}
 
-    fn close(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        for slot in self.in_flight.values() {
-            if let SlotKind::InFlight { abort, .. } = &slot.kind {
-                abort.abort();
-            }
-        }
+fn is_retryable(err: &ReqwestError, policy: &RetryPolicy) -> bool {
+    match err {
+        ReqwestError::Timeout => retry_on_timeout(policy),
+        ReqwestError::Reqwest(_) => retry_on_reqwest_io(policy),
+        _ => false,
     }
 }
 
-fn is_retryable(err: &ReqwestError, on_full: bool, on_timeout: bool, on_reqwest_io: bool) -> bool {
-    match err {
-        ReqwestError::Full => on_full,
-        ReqwestError::Timeout => on_timeout,
-        ReqwestError::Reqwest(_) => on_reqwest_io,
-        _ => false,
+fn retry_on_timeout(policy: &RetryPolicy) -> bool {
+    matches!(
+        policy,
+        RetryPolicy::Bounded {
+            on_timeout: true,
+            ..
+        }
+    )
+}
+
+fn retry_on_reqwest_io(policy: &RetryPolicy) -> bool {
+    matches!(
+        policy,
+        RetryPolicy::Bounded {
+            on_reqwest_io: true,
+            ..
+        }
+    )
+}
+
+impl<S: Shard + Send + 'static> ReqwestWorker<S> {
+    /// One-call helper: validate config, build the worker, register it
+    /// on `runtime`, and return the address, closer, and metrics handle.
+    pub fn install<F>(
+        runtime: &ThreadedRuntime<S, F>,
+        config: ReqwestConfig,
+    ) -> Result<InstalledReqwestBridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        config.validate()?;
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::new(config)?;
+        let closer = worker.closer();
+        let address = runtime.register_with_capacity::<_, Infallible>(worker, cap)?;
+        Ok(InstalledReqwestBridge {
+            address,
+            closer,
+            metrics,
+            _shard: PhantomData,
+        })
     }
 }
 
@@ -486,7 +596,7 @@ impl<S: Shard + 'static> Isolate for ReqwestWorker<S> {
             ReqwestMsg::Send(request) => self.admit_initial(request),
             ReqwestMsg::Poll(id) => self.poll(id),
             ReqwestMsg::Close => {
-                self.close();
+                self.closed.store(true, Ordering::Release);
                 noop()
             }
         }
@@ -494,6 +604,11 @@ impl<S: Shard + 'static> Isolate for ReqwestWorker<S> {
 }
 
 /// Cloneable handle that flips the worker into the closed state.
+///
+/// Closing is a graceful drain: new sends reply
+/// [`ReqwestError::Closed`], in-flight requests run to natural
+/// completion (or per-attempt timeout). To force-cancel in-flight
+/// work, drop the hosting Tina runtime.
 #[derive(Debug, Clone)]
 pub struct ReqwestCloser {
     closed: Arc<AtomicBool>,
@@ -539,7 +654,7 @@ fn build_reqwest_request(
         Err(e) => return Err(ReqwestError::InvalidRequest(format!("method: {e}"))),
     };
     let mut builder = client.request(method, url);
-    builder = builder.headers(clone_headers(&request.headers));
+    builder = builder.headers(clone_headers(&request.headers)?);
     if !request.body.is_empty() {
         builder = builder.body(request.body.clone());
     }
@@ -551,17 +666,18 @@ fn build_reqwest_request(
         .map_err(|e| ReqwestError::Reqwest(format!("build request: {e}")))
 }
 
-fn clone_headers(src: &HeaderMap) -> HeaderMap {
+fn clone_headers(src: &HeaderMap) -> Result<HeaderMap, ReqwestError> {
     let mut out = HeaderMap::with_capacity(src.len());
     for (name, value) in src.iter() {
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_str().as_bytes()),
-            HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            out.append(n, v);
-        }
+        let n = HeaderName::from_bytes(name.as_str().as_bytes()).map_err(|e| {
+            ReqwestError::InvalidRequest(format!("header name '{}': {e}", name.as_str()))
+        })?;
+        let v = HeaderValue::from_bytes(value.as_bytes()).map_err(|e| {
+            ReqwestError::InvalidRequest(format!("header value for '{}': {e}", name.as_str()))
+        })?;
+        out.append(n, v);
     }
-    out
+    Ok(out)
 }
 
 async fn execute(

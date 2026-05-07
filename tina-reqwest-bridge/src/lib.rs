@@ -111,13 +111,32 @@
 //!
 //! - Before admission: no work starts. The mailbox or `max_in_flight`
 //!   cap rejects synchronously.
-//! - After admission, before reqwest accepts: the worker spawns the
-//!   reqwest task. Closing the worker aborts the task; the caller sees
-//!   [`ReqwestError::Closed`].
-//! - After reqwest accepts: timeout or close stops waiting. The bridge
-//!   aborts the task best-effort, but bytes already on the wire stay
-//!   on the wire. Late results are discarded; counted in
-//!   [`ReqwestMetrics::late_results`].
+//! - After admission, before reqwest accepts: the worker has spawned
+//!   the reqwest task. The per-attempt timeout aborts it; the bridge
+//!   surfaces [`ReqwestError::Timeout`].
+//! - After reqwest accepts: same — timeout aborts the task. Bytes
+//!   already on the wire stay on the wire. The bridge does not observe
+//!   the Tina caller's `IsolateCall` deadline directly; if the caller
+//!   has already given up, the worker's eventual Reply is dropped by
+//!   the runtime as `CallReplyRejected` and is visible in the trace,
+//!   not in bridge metrics.
+//!
+//! # Close
+//!
+//! Closing the worker (via [`ReqwestCloser::close`] or
+//! [`ReqwestMsg::Close`]) is a graceful drain: new sends reply
+//! [`ReqwestError::Closed`], in-flight requests run to natural
+//! completion (or hit their per-attempt timeout). To force-cancel
+//! in-flight work, drop the hosting Tina runtime.
+//!
+//! # Retry
+//!
+//! See [`RetryPolicy`]. Default is no retry. When configured, retries
+//! are bounded, fire only on transport-level failures
+//! ([`ReqwestError::Timeout`] and [`ReqwestError::Reqwest`]), and each
+//! attempt resets its own per-attempt clock. [`ReqwestError::Full`] is
+//! never retried by the worker — it is the explicit pressure signal
+//! and the caller decides what to do.
 
 mod metrics;
 mod types;
@@ -125,6 +144,7 @@ mod worker;
 
 pub use metrics::{ReqwestMetrics, ReqwestMetricsHandle};
 pub use types::{
-    RedirectPolicy, ReqwestConfig, ReqwestError, ReqwestRequest, ReqwestResponse, RetryPolicy,
+    RedirectPolicy, ReqwestConfig, ReqwestConfigError, ReqwestError, ReqwestRequest,
+    ReqwestResponse, RetryPolicy,
 };
-pub use worker::{ReqwestCloser, ReqwestMsg, ReqwestWorker};
+pub use worker::{InstallError, InstalledReqwestBridge, ReqwestCloser, ReqwestMsg, ReqwestWorker};
