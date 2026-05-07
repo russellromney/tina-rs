@@ -23,12 +23,9 @@
 //! ```
 
 use std::convert::Infallible;
-use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
@@ -38,7 +35,6 @@ use tina_runtime::{
     ThreadedTrySendError,
 };
 use tokio::sync::oneshot;
-use tower_service::Service;
 
 /// Error returned by a Tokio-to-Tina bridge call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -917,32 +913,5 @@ where
                 state.metrics.timeout.fetch_add(1, Ordering::Relaxed);
             }
         }
-    }
-}
-
-impl<M, R, S, F, AR, TM> Service<M> for BridgeHandle<M, R, S, F, AR, TM>
-where
-    M: Send + 'static,
-    R: Send + 'static,
-    S: Shard + Send + 'static,
-    F: MailboxFactory + Send + 'static,
-    AR: Send + 'static,
-    TM: BridgeMessage + Send + 'static,
-{
-    type Response = R;
-    type Error = BridgeError;
-    type Future = Pin<Box<dyn Future<Output = Result<R, BridgeError>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.state.is_closed() {
-            Poll::Ready(Err(BridgeError::Closed))
-        } else {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    fn call(&mut self, request: M) -> Self::Future {
-        let handle = self.clone();
-        Box::pin(async move { BridgeHandle::call(&handle, request).await })
     }
 }
