@@ -124,6 +124,37 @@ impl fmt::Display for ThreadedSendObservedError {
 
 impl Error for ThreadedSendObservedError {}
 
+/// Error returned by [`crate::ThreadedRuntime::send_observed_until`].
+///
+/// Phase 062 Rock 4 retry helper. The helper retries on `MailboxFull`
+/// and `IngressFull` until the caller-supplied deadline; a deadline
+/// miss surfaces as [`Self::Timeout`]. `Closed` and `WorkerStopped`
+/// are returned eagerly — the helper does not retry those because the
+/// target/worker is no longer accepting at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendObservedUntilError {
+    /// Deadline elapsed while still racing the mailbox/ingress for a slot.
+    Timeout,
+    /// Target isolate mailbox reported closed/stale.
+    Closed,
+    /// Worker thread stopped before the send could be observed.
+    WorkerStopped,
+}
+
+impl fmt::Display for SendObservedUntilError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "deadline elapsed before mailbox accepted the message"),
+            Self::Closed => write!(f, "target isolate mailbox is closed or stale"),
+            Self::WorkerStopped => {
+                write!(f, "worker thread stopped before the send could be observed")
+            }
+        }
+    }
+}
+
+impl Error for SendObservedUntilError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

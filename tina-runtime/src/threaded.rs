@@ -20,8 +20,10 @@ use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::{self, BetelgeuseDriver};
 use crate::errors::{
-    SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+    SendObservedUntilError, SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError,
+    ThreadedTrySendError,
 };
+use crate::host_burst::HostBurstOutcomes;
 use crate::live_report::{LiveShardMetrics, LiveShardState, LiveTopologyReport};
 use crate::local_system::{
     LocalSystemState, LocalSystemTerminalReport, ThreadedCommandFn, ThreadedIoLoopFactory,
@@ -465,6 +467,110 @@ where
         O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
         self.try_send_and_observe_with_preflight(address, message, |_| None, observer)
+    }
+
+    /// Retries [`send_and_observe`](Self::send_and_observe) on
+    /// `MailboxFull` / `IngressFull` until the message lands or the
+    /// deadline elapses (Phase 062 Rock 4).
+    ///
+    /// Convention: this is the host-side helper for "control" messages
+    /// like `BurstClosed(n)` that travel through the same bounded
+    /// mailbox as data. The helper does not introduce a second mailbox
+    /// or hidden queue. If the data mailbox is full of admitted work,
+    /// the helper waits — which is the honest backpressure shape.
+    ///
+    /// Outcomes:
+    ///
+    /// - `Ok(())` — the message was admitted into the mailbox.
+    /// - [`SendObservedUntilError::Timeout`] — deadline elapsed while
+    ///   still racing a `Full` mailbox / ingress.
+    /// - [`SendObservedUntilError::Closed`] — the target isolate's
+    ///   mailbox reported closed or stale; not retried.
+    /// - [`SendObservedUntilError::WorkerStopped`] — worker thread is
+    ///   gone; not retried.
+    ///
+    /// `make_message` is a closure called once per attempt so the helper
+    /// can move ownership through `send_and_observe` without forcing a
+    /// `Clone` constraint on `M`.
+    pub fn send_observed_until<M, R, MakeMsg>(
+        &self,
+        address: Address<M, R>,
+        deadline: Instant,
+        backoff: Duration,
+        mut make_message: MakeMsg,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        MakeMsg: FnMut() -> M,
+    {
+        loop {
+            match self.send_and_observe(address, make_message()) {
+                Ok(()) => return Ok(()),
+                Err(ThreadedSendObservedError::MailboxFull)
+                | Err(ThreadedSendObservedError::IngressFull) => {
+                    if Instant::now() >= deadline {
+                        return Err(SendObservedUntilError::Timeout);
+                    }
+                    thread::sleep(backoff);
+                }
+                Err(ThreadedSendObservedError::MailboxClosed) => {
+                    return Err(SendObservedUntilError::Closed);
+                }
+                Err(ThreadedSendObservedError::WorkerStopped) => {
+                    return Err(SendObservedUntilError::WorkerStopped);
+                }
+            }
+        }
+    }
+
+    /// Attempts one typed ingress send and accumulates the outcome into a
+    /// shared [`HostBurstOutcomes`] counter (Phase 062 Rock 3).
+    ///
+    /// Convenience over [`try_send_and_observe_with`](Self::try_send_and_observe_with):
+    /// hides the per-send observer closure, the Arc-cloned counters, and the
+    /// manual "observed barrier" the caller used to spell out by hand. Every
+    /// truth-typed outcome stays distinct in the snapshot — `MailboxFull`,
+    /// `MailboxClosed`, `IngressFull`, `WorkerStopped`, and `admitted` are
+    /// counted independently.
+    ///
+    /// Pattern:
+    ///
+    /// ```ignore
+    /// let outcomes = HostBurstOutcomes::new();
+    /// for n in 0..N {
+    ///     let _ = runtime.try_send_outcome(addr, Msg::Submit(n), &outcomes);
+    /// }
+    /// outcomes.wait_complete(deadline)?;
+    /// let snap = outcomes.snapshot();
+    /// ```
+    ///
+    /// The return value mirrors `try_send_and_observe_with`: `Ok(())` means
+    /// the bounded ingress queue accepted the command (the observer will
+    /// fire later on the worker thread); `Err(IngressFull)` /
+    /// `Err(WorkerStopped)` mean the host-side handoff failed and the
+    /// observer will *not* fire — these errors are also folded into the
+    /// shared counters so [`HostBurstOutcomes::wait_complete`] still drains
+    /// cleanly.
+    pub fn try_send_outcome<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        outcomes: &HostBurstOutcomes,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+    {
+        outcomes.note_submitted();
+        let observer = outcomes.observer();
+        match self.try_send_and_observe_with(address, message, observer) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                outcomes.note_host_side_error(error);
+                Err(error)
+            }
+        }
     }
 
     /// Attempts one typed ingress send with a worker-side preflight check.

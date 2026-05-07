@@ -53,6 +53,7 @@ mod capabilities;
 mod clock;
 mod driver;
 mod errors;
+mod host_burst;
 mod live_report;
 mod local_system;
 mod mailbox;
@@ -61,14 +62,18 @@ mod observation;
 pub mod persistence;
 pub mod pressure;
 pub mod sharded;
+mod single_call_gate;
 pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
 mod trace;
 
 pub use errors::{
-    SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+    SendObservedUntilError, SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError,
+    ThreadedTrySendError,
 };
+pub use host_burst::{HostBurstOutcomes, HostBurstSnapshot, HostBurstWaitError};
+pub use single_call_gate::SingleCallGate;
 pub use local_system::{
     LocalMultiShardSystem, LocalMultiShardSystemShutdown, LocalSystem, LocalSystemConfig,
     LocalSystemConfigError, LocalSystemMultiShardBuilder, LocalSystemShutdown,

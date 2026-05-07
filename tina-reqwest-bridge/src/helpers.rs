@@ -39,6 +39,7 @@
 
 use std::time::Duration;
 
+use http::status::StatusCode;
 use tina::Address;
 use tina_runtime::{CallOutcome, IsolateCall, call};
 
@@ -190,5 +191,155 @@ pub fn flatten_outcome(outcome: ReqwestCallOutcome) -> Result<ReqwestResponse, R
         CallOutcome::Full => Err(ReqwestCallError::Bridge(BridgeFailure::Full)),
         CallOutcome::Closed => Err(ReqwestCallError::Bridge(BridgeFailure::Closed)),
         CallOutcome::Timeout => Err(ReqwestCallError::Bridge(BridgeFailure::Timeout)),
+    }
+}
+
+// ---------- Classification (Phase 062 Rock 6) ----------
+
+/// Three-way classification of a [`ReqwestCallOutcome`].
+///
+/// Caller-side retry loops typically only care about three buckets:
+/// did the call succeed, was the failure transient (worth retrying),
+/// or was it fatal? The typed multi-arm match against the layered
+/// `ReqwestCallOutcome` still works — this is opt-in sugar that
+/// preserves both layers internally and names *why* via the typed
+/// reason payloads.
+///
+/// **The classifier does not retry.** It does not know your idempotency
+/// rules, your retry budget, or your backoff. It just labels each
+/// outcome.
+///
+/// # Default policy
+///
+/// - **5xx upstream:** `Transient(UpstreamServer { status })`. 5xx is
+///   "server is unhappy, try again". If your service has stricter
+///   rules (e.g. treat `501 Not Implemented` as fatal), match the
+///   reason and downgrade.
+/// - **non-5xx non-2xx:** `Fatal(UpstreamClient { status })`. 4xx is
+///   the client's fault and retrying without changing the request will
+///   reproduce the failure.
+/// - **bridge `Timeout`:** `Transient(BridgeTimeout)`. The bridge gave
+///   up waiting; the worker may have completed but we did not see it.
+/// - **worker `Timeout`:** `Transient(WorkerTimeout)`. The reqwest call
+///   exceeded its per-request deadline.
+/// - **worker `Reqwest`:** `Transient(WorkerTransport)`. Connect / IO
+///   class errors are typically retryable.
+/// - **bridge `Full` / `Closed`, worker `Full` / `Closed`,
+///   `RequestTooLarge`, `ResponseTooLarge`, `InvalidRequest`:**
+///   fatal — retrying without changing pressure or the request itself
+///   will reproduce them.
+#[derive(Debug, Clone)]
+pub enum ReqwestOutcomeClass {
+    /// Upstream returned a 2xx success.
+    Succeeded(ReqwestResponse),
+    /// Failure that retrying the same request might fix.
+    Transient(ReqwestTransientReason),
+    /// Failure that retrying the same request will not fix.
+    Fatal(ReqwestFatalReason),
+}
+
+/// Why the classifier judged the outcome retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReqwestTransientReason {
+    /// Upstream returned a 5xx status.
+    UpstreamServer {
+        /// The 5xx status code returned by the upstream.
+        status: StatusCode,
+    },
+    /// IsolateCall deadline elapsed before the worker replied. The
+    /// worker may still be processing; the bridge stopped waiting.
+    BridgeTimeout,
+    /// The reqwest worker's per-attempt timeout elapsed.
+    WorkerTimeout,
+    /// reqwest returned a transport-class error (connect / IO / decode).
+    WorkerTransport,
+}
+
+/// Why the classifier judged the outcome non-retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReqwestFatalReason {
+    /// Upstream returned a non-2xx non-5xx status (e.g. 4xx).
+    UpstreamClient {
+        /// The non-2xx non-5xx status code returned by the upstream.
+        status: StatusCode,
+    },
+    /// Bridge ingress rejected admission: bounded mailbox full.
+    BridgeFull,
+    /// Bridge ingress rejected admission: target stale or closed.
+    BridgeClosed,
+    /// Worker rejected at the `max_in_flight` cap.
+    WorkerFull,
+    /// Worker has been closed.
+    WorkerClosed,
+    /// Request body exceeded the configured cap.
+    RequestTooLarge,
+    /// Response body exceeded the configured cap.
+    ResponseTooLarge,
+    /// Request validation failed (bad URL, invalid method, etc.).
+    InvalidRequest,
+}
+
+/// Extension trait that adds [`Self::classify`] to
+/// [`ReqwestCallOutcome`].
+///
+/// Use:
+///
+/// ```ignore
+/// use tina_reqwest_bridge::ReqwestOutcomeExt;
+///
+/// match outcome.classify() {
+///     ReqwestOutcomeClass::Succeeded(resp) => finish_ok(resp),
+///     ReqwestOutcomeClass::Transient(_) if budget_left() => retry(),
+///     ReqwestOutcomeClass::Transient(_) | ReqwestOutcomeClass::Fatal(_) => fail(),
+/// }
+/// ```
+pub trait ReqwestOutcomeExt {
+    /// Classify the outcome into Succeeded / Transient / Fatal.
+    fn classify(self) -> ReqwestOutcomeClass;
+}
+
+impl ReqwestOutcomeExt for ReqwestCallOutcome {
+    fn classify(self) -> ReqwestOutcomeClass {
+        match self {
+            CallOutcome::Replied(Ok(response)) => {
+                if response.status.is_success() {
+                    ReqwestOutcomeClass::Succeeded(response)
+                } else if response.status.is_server_error() {
+                    ReqwestOutcomeClass::Transient(ReqwestTransientReason::UpstreamServer {
+                        status: response.status,
+                    })
+                } else {
+                    ReqwestOutcomeClass::Fatal(ReqwestFatalReason::UpstreamClient {
+                        status: response.status,
+                    })
+                }
+            }
+            CallOutcome::Replied(Err(ReqwestError::Timeout)) => {
+                ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTimeout)
+            }
+            CallOutcome::Replied(Err(ReqwestError::Reqwest(_))) => {
+                ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTransport)
+            }
+            CallOutcome::Replied(Err(ReqwestError::Full)) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerFull)
+            }
+            CallOutcome::Replied(Err(ReqwestError::Closed)) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerClosed)
+            }
+            CallOutcome::Replied(Err(ReqwestError::RequestTooLarge)) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::RequestTooLarge)
+            }
+            CallOutcome::Replied(Err(ReqwestError::ResponseTooLarge)) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::ResponseTooLarge)
+            }
+            CallOutcome::Replied(Err(ReqwestError::InvalidRequest(_))) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::InvalidRequest)
+            }
+            CallOutcome::Timeout => {
+                ReqwestOutcomeClass::Transient(ReqwestTransientReason::BridgeTimeout)
+            }
+            CallOutcome::Full => ReqwestOutcomeClass::Fatal(ReqwestFatalReason::BridgeFull),
+            CallOutcome::Closed => ReqwestOutcomeClass::Fatal(ReqwestFatalReason::BridgeClosed),
+        }
     }
 }

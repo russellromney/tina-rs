@@ -85,12 +85,6 @@ What feels better:
 
 What feels worse:
 
-- **`ReqwestCallOutcome` is a long type to write at every match.**
-  The shape `CallOutcome<Result<ReqwestResponse, ReqwestError>>`
-  with the two layers is honest, but matching it against six arms
-  reads heavier than `Result<reqwest::Response, reqwest::Error>`.
-  The `ReqwestCallOutcome` alias helps; it does not erase the
-  arms.
 - **Retry needs three message variants.** `Begin`, `HttpReturned`,
   and `BackoffElapsed` are three explicit continuation points for
   what is two `await`s in async/await form. The `BackoffElapsed`
@@ -98,18 +92,21 @@ What feels worse:
 
 What this suggests:
 
-- The two-layer outcome is the right shape for app code that wants
-  to react differently to "bridge full" vs "upstream 503". Most app
-  code does not. A small "treat as transient" classifier built into
-  `tina-reqwest-bridge` would let users write
-  `if matches!(outcome.classify(), Class::Transient { .. }) { retry }`
-  without opening every variant.
 - Tina-shaped retry sugar (Eiffel finding #2 — continuation /
   pipeline sugar) would help here. The variant trio
   `Begin`/`HttpReturned`/`BackoffElapsed` is the canonical "linear
   protocol" shape; a small "for each attempt with this backoff,
   call this address, classify, finish" helper would remove two
   variants without hiding the trace.
+
+What Phase 062 Rock 6 changed:
+
+- **The six-arm classifier is gone.** `outcome.classify()` returns a
+  three-way `ReqwestOutcomeClass::{Succeeded, Transient, Fatal}` that
+  preserves the bridge-vs-worker layering through typed reason
+  payloads (`BridgeTimeout` vs `WorkerTimeout`, `BridgeFull` vs
+  `WorkerFull`, etc.). The raw `ReqwestCallOutcome` and `flatten_outcome`
+  paths are unchanged — the classifier is opt-in sugar.
 
 ## What this is not
 

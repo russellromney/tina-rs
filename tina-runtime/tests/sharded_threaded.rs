@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
 use tina_runtime::sharded::{ShardPlacement, ShardServiceTable, WrongShard};
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime};
+use tina_runtime::{MailboxFactory, ResultWaitError, RuntimeCall, ThreadedMultiShardRuntime};
 
 #[derive(Debug, Clone, Copy)]
 struct AppShard(u32);
@@ -276,6 +276,163 @@ fn threaded_multishard_sharded_counter_aggregates_match_placement() {
     assert_eq!(total as usize, keys.len());
 
     let _ = runtime.shutdown();
+}
+
+// ---------- observe_result on ThreadedMultiShardRuntime ----------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FanoutReport {
+    sum: u64,
+    shards: u32,
+}
+
+#[derive(Debug)]
+enum WorkerMsg {
+    Finish(FanoutReport),
+    Plain,
+    MismatchedType,
+}
+
+struct Worker;
+
+impl Isolate for Worker {
+    tina::isolate_types! {
+        message: WorkerMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<WorkerMsg>,
+        shard: AppShard,
+    }
+
+    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Finish(report) => stop_with(report),
+            WorkerMsg::Plain => stop(),
+            // u64 != FanoutReport — TypeMismatch on the host.
+            WorkerMsg::MismatchedType => stop_with(99u64),
+        }
+    }
+}
+
+fn make_multi_shard() -> ThreadedMultiShardRuntime<AppShard, WorkerMailboxFactory> {
+    ThreadedMultiShardRuntime::new(
+        [AppShard(11), AppShard(22), AppShard(33)],
+        WorkerMailboxFactory,
+    )
+}
+
+#[test]
+fn threaded_multishard_observe_result_resolves_typed_value_on_owning_shard() {
+    let runtime = make_multi_shard();
+    // Pick the middle shard so routing isn't trivially shard 0.
+    let worker = runtime
+        .register_with_capacity_on::<Worker, _>(ShardId::new(22), Worker, 8)
+        .expect("register worker");
+
+    let waiter = runtime
+        .observe_result::<FanoutReport, _, _>(worker)
+        .expect("register result waiter");
+
+    let report = FanoutReport { sum: 600, shards: 3 };
+    runtime
+        .try_send(worker, WorkerMsg::Finish(report.clone()))
+        .expect("kick worker");
+
+    let got = waiter.wait(Duration::from_secs(3)).expect("waiter resolves");
+    assert_eq!(got, report);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn threaded_multishard_observe_result_times_out_when_no_stop() {
+    let runtime = make_multi_shard();
+    let worker = runtime
+        .register_with_capacity_on::<Worker, _>(ShardId::new(22), Worker, 8)
+        .expect("register worker");
+
+    let waiter = runtime
+        .observe_result::<FanoutReport, _, _>(worker)
+        .expect("register result waiter");
+    let outcome = waiter.wait(Duration::from_millis(50));
+    assert_eq!(outcome, Err(ResultWaitError::Timeout));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn threaded_multishard_observe_result_already_claimed_when_two_waiters_register() {
+    let runtime = make_multi_shard();
+    let worker = runtime
+        .register_with_capacity_on::<Worker, _>(ShardId::new(33), Worker, 8)
+        .expect("register worker");
+
+    let _first = runtime
+        .observe_result::<FanoutReport, _, _>(worker)
+        .expect("first register succeeds");
+
+    let second = runtime.observe_result::<FanoutReport, _, _>(worker);
+    assert_eq!(second.err(), Some(ResultWaitError::AlreadyClaimed));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn threaded_multishard_observe_result_stopped_without_result() {
+    let runtime = make_multi_shard();
+    let worker = runtime
+        .register_with_capacity_on::<Worker, _>(ShardId::new(11), Worker, 8)
+        .expect("register worker");
+
+    let waiter = runtime
+        .observe_result::<FanoutReport, _, _>(worker)
+        .expect("register result waiter");
+    runtime
+        .try_send(worker, WorkerMsg::Plain)
+        .expect("kick worker");
+
+    let outcome = waiter.wait(Duration::from_secs(3));
+    assert_eq!(outcome, Err(ResultWaitError::StoppedWithoutResult));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn threaded_multishard_observe_result_type_mismatch_when_value_is_wrong_type() {
+    let runtime = make_multi_shard();
+    let worker = runtime
+        .register_with_capacity_on::<Worker, _>(ShardId::new(11), Worker, 8)
+        .expect("register worker");
+
+    let waiter = runtime
+        .observe_result::<FanoutReport, _, _>(worker)
+        .expect("register result waiter");
+    runtime
+        .try_send(worker, WorkerMsg::MismatchedType)
+        .expect("kick worker");
+
+    let outcome = waiter.wait(Duration::from_secs(3));
+    assert_eq!(outcome, Err(ResultWaitError::TypeMismatch));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn threaded_multishard_observe_result_runtime_stopped_when_runtime_dropped() {
+    let runtime = make_multi_shard();
+    let worker = runtime
+        .register_with_capacity_on::<Worker, _>(ShardId::new(22), Worker, 8)
+        .expect("register worker");
+
+    let waiter = runtime
+        .observe_result::<FanoutReport, _, _>(worker)
+        .expect("register result waiter");
+
+    drop(runtime);
+
+    let outcome = waiter.wait(Duration::from_secs(1));
+    assert_eq!(outcome, Err(ResultWaitError::RuntimeStopped));
 }
 
 #[test]

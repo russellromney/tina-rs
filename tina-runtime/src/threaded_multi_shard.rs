@@ -29,6 +29,7 @@ use crate::local_system::{
     TraceSnapshot,
 };
 use crate::mailbox::MailboxFactory;
+use crate::observation;
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -301,6 +302,30 @@ where
                 }
                 Err(ThreadedTrySendError::WorkerStopped)
             }
+        }
+    }
+
+    /// Registers a typed result waiter for the isolate at `address` on the
+    /// shard that owns it.
+    ///
+    /// Routes the registration to the address's owning shard worker,
+    /// matching the way [`Self::try_send`] routes ingress. Same vocabulary
+    /// as [`crate::ThreadedRuntime::observe_result`]:
+    ///
+    /// - eager errors: `AlreadyStopped`, `AlreadyClaimed`, `ObservationFull`;
+    /// - `wait` outcomes: `Timeout`, `RuntimeStopped`, `StoppedWithoutResult`,
+    ///   `TypeMismatch`.
+    ///
+    /// Worker stopped or shard unknown -> `RuntimeStopped`.
+    pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError> {
+        match self.call_on(address.shard(), move |runtime| {
+            runtime.observe_result::<T, M, R>(address)
+        }) {
+            Ok(result) => result,
+            Err(_) => Err(observation::ResultWaitError::RuntimeStopped),
         }
     }
 
