@@ -1,71 +1,42 @@
-use std::process::Command;
+use eiffel_real_io_chat::{Report, RunConfig, tina_impl, tokio_impl};
 
-mod comparison;
-
-fn main() {
+fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let mode = args.next().unwrap_or_else(|| "compare".to_string());
+    let mode = args.next().unwrap_or_else(|| "both".to_string());
     let burst = args
         .next()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("burst argument must be usize")
-        })
-        .unwrap_or(comparison::ComparisonConfig::default().burst);
+        .map(|v| v.parse::<usize>().expect("burst must be usize"))
+        .unwrap_or(RunConfig::default().burst);
+    let config = RunConfig {
+        burst,
+        ..Default::default()
+    };
 
     match mode.as_str() {
-        "compare" => run_process_comparison(burst),
-        "tokio" => print_side("tokio", burst, comparison::run_tokio_side(burst)),
-        "tina" => print_side(
-            "tina",
-            burst,
-            comparison::run_tina_side(comparison::ComparisonConfig {
-                burst,
-                ..Default::default()
-            }),
-        ),
+        "tokio" => print_side("tokio", config, tokio_impl::run(config)?),
+        "tina" => print_side("tina", config, tina_impl::run(config)?),
+        "both" => {
+            print_side("tokio", config, tokio_impl::run(config)?);
+            print_side("tina", config, tina_impl::run(config)?);
+        }
         other => {
-            panic!(
-                "unknown mode {other:?}; expected compare, tokio, or tina. usage: eiffel-real-io-chat [compare|tokio|tina] [burst]"
+            anyhow::bail!(
+                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-real-io-chat [tokio|tina|both] [burst]"
             );
         }
     }
+    Ok(())
 }
 
-fn run_process_comparison(burst: usize) {
-    let exe = std::env::current_exe().expect("current executable path");
-    for side in ["tokio", "tina"] {
-        let output = Command::new(&exe)
-            .arg(side)
-            .arg(burst.to_string())
-            .output()
-            .unwrap_or_else(|error| panic!("spawn {side} comparison process: {error}"));
-        if !output.status.success() {
-            panic!(
-                "{side} comparison process failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-}
-
-fn print_side(side: &str, burst: usize, report: comparison::SideReport) {
+fn print_side(side: &str, config: RunConfig, report: Report) {
     println!(
-        "comparison=eiffel_real_io_chat pid={} burst={} side={} accepted={} full={} closed={} delivered={} buffered={} real_tcp_calls={} visible_full={} response={}",
-        std::process::id(),
-        burst,
+        "comparison=eiffel_real_io_chat side={} burst={} accepted={} full={} closed={} delivered={} buffered={}",
         side,
+        config.burst,
         report.accepted,
         report.full,
         report.closed,
         report.delivered,
         report.buffered,
-        report.saw_real_tcp_calls,
-        report.saw_visible_full,
-        String::from_utf8_lossy(&report.response).trim_end(),
     );
 }
