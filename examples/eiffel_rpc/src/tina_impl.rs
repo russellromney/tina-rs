@@ -5,37 +5,24 @@
 //! The next N-1 arrive while that one is in flight and come back as
 //! wire `Error(Full)` — overload becomes a frame, not a stuck queue.
 
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::prelude::*;
 use tina_rpc::{
     Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Dispatch, Frame, FrameError,
     FrameKind, FrameLimits, Json, LENGTH_PREFIX_SIZE, PayloadLimits, Registry, RegistryMsg,
     RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
 };
 use tina_runtime::{
-    CallError, ListenerId, MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, tcp_accept,
-    tcp_bind, tcp_close_listener,
+    CallError, DefaultThreadedMailboxFactory, ListenerId, ThreadedRuntime, ThreadedRuntimeConfig,
+    tcp_accept, tcp_bind, tcp_close_listener,
 };
 
 use crate::{Report, RunConfig};
-
-#[derive(Debug, Default)]
-struct EiffelShard;
-
-impl Shard for EiffelShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(73)
-    }
-}
 
 // -------------------------------------------------------------------
 // Typed echo service. The `#[service]` macro emits a dispatcher and
@@ -57,58 +44,6 @@ impl Echo for EchoState {
 }
 
 // -------------------------------------------------------------------
-// Mailbox + factory boilerplate (shared with other eiffel examples).
-// -------------------------------------------------------------------
-
-struct EMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> EMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for EMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-    fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(msg));
-        }
-        let mut q = self.queue.borrow_mut();
-        if q.len() >= self.capacity {
-            return Err(TrySendError::Full(msg));
-        }
-        q.push_back(msg);
-        Ok(())
-    }
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EFactory;
-
-impl MailboxFactory for EFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(EMailbox::new(capacity))
-    }
-}
-
-// -------------------------------------------------------------------
 // Listener: bind, accept once, spawn one Connection isolate with
 // `tiny_pressure` (max_in_flight = 1), then close the listener.
 // -------------------------------------------------------------------
@@ -123,28 +58,25 @@ enum ListenerMsg {
 
 struct Listener {
     bind_addr: SocketAddr,
-    bound_addr: Arc<Mutex<Option<SocketAddr>>>,
     router: Address<RegistryMsg, RouterReply>,
     listener_id: Option<ListenerId>,
 }
 
 #[tina_runtime::isolate(
     message = ListenerMsg,
-    spawn = ChildDefinition<Connection<EiffelShard>>,
-    shard = EiffelShard,
+    spawn = ChildDefinition<Connection<SingleShard>>,
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, EiffelShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
-            ListenerMsg::Bound(Ok((listener, local_addr))) => {
+            ListenerMsg::Bound(Ok((listener, _local_addr))) => {
                 self.listener_id = Some(listener);
-                *self.bound_addr.lock().expect("bound addr mutex") = Some(local_addr);
                 tcp_accept(listener).reply(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
                 let listener = self.listener_id.expect("listener set after bind");
-                let connection = Connection::<EiffelShard>::new(
+                let connection = Connection::<SingleShard>::new(
                     ConnectionInit::new(stream, self.router)
                         .with_config(ConnectionConfig::tiny_pressure()),
                 );
@@ -168,8 +100,8 @@ impl Listener {
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
     let runtime = ThreadedRuntime::with_config(
-        EiffelShard,
-        EFactory,
+        SingleShard,
+        DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: 32,
             idle_wait: Duration::from_millis(1),
@@ -180,32 +112,30 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
     // 1. Typed dispatch: the `#[service]` macro emits `EchoService`
     //    with a JSON-tuple decoder for each method's args and a JSON
     //    encoder for each return type.
-    let dispatch: Dispatch<EchoState, Json, EiffelShard> =
-        EchoService::dispatch::<EchoState, EiffelShard>(EchoState, PayloadLimits::default());
+    let dispatch: Dispatch<EchoState, Json, SingleShard> =
+        EchoService::dispatch::<EchoState, SingleShard>(EchoState, PayloadLimits::default());
     let service = runtime
-        .register_with_capacity::<SingleService<Dispatch<EchoState, Json, EiffelShard>, EiffelShard>, Infallible>(
+        .register_with_capacity::<SingleService<Dispatch<EchoState, Json, SingleShard>, SingleShard>, Infallible>(
             SingleService::new(dispatch),
             16,
         )
         .map_err(|e| anyhow::anyhow!("register service: {e:?}"))?;
 
     // 2. Registry mapping wire service name to the dispatch isolate.
-    let registry_state = Registry::<EiffelShard>::builder()
+    let registry_state = Registry::<SingleShard>::builder()
         .service("echo", service)
         .build();
     let registry = runtime
-        .register_with_capacity::<Registry<EiffelShard>, Infallible>(registry_state, 16)
+        .register_with_capacity::<Registry<SingleShard>, Infallible>(registry_state, 16)
         .map_err(|e| anyhow::anyhow!("register registry: {e:?}"))?;
 
     // 3. Listener that binds, accepts once, and spawns the Connection
     //    isolate that enforces the in-flight cap on the wire.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
-    let bound_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let listener = runtime
         .register_with_capacity::<Listener, Infallible>(
             Listener {
                 bind_addr,
-                bound_addr: Arc::clone(&bound_addr),
                 router: registry,
                 listener_id: None,
             },
@@ -213,17 +143,16 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
+    // Register the bound-address waiter *before* triggering the bind so
+    // the registration lands in the runtime's command queue ahead of
+    // the bind completion.
+    let bound = runtime.observe_next_bound();
     runtime
         .try_send(listener, ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
-
-    wait_until(Duration::from_secs(3), "listener bind", || {
-        bound_addr.lock().expect("bound addr mutex").is_some()
-    })?;
-    let addr = bound_addr
-        .lock()
-        .expect("bound addr mutex")
-        .expect("listener published address");
+    let addr = bound
+        .wait(Duration::from_secs(3))
+        .map_err(|e| anyhow::anyhow!("listener bind: {e:?}"))?;
 
     // 4. Drive the burst from a blocking std::net client. The client
     //    encodes args as a JSON tuple `[<payload_bytes>]` to match the
@@ -298,18 +227,4 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
         }
     }
     Ok(report)
-}
-
-fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F) -> anyhow::Result<()>
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    while !predicate() {
-        if Instant::now() > deadline {
-            anyhow::bail!("wait_until({label}) timed out");
-        }
-        thread::yield_now();
-    }
-    Ok(())
 }
