@@ -44,5 +44,7 @@ The smoke test asserts:
 - The `Drain(admitted)` envelope is still domain-specific. Each
   store needs a `Drain` variant to know when it has fully drained
   its admitted backlog. The same shape shows up in
-  `eiffel_graceful_drain_server` — see Round 2 finding 12 (drain
-  timeout for isolate shutdown).
+  `eiffel_graceful_pool_shutdown` — every long-lived isolate that
+  the host wants to stop gracefully has to define its own
+  control message. See FINDINGS finding 9 (drain helper for
+  `PendingReplies` at service stop) for the related product gap.

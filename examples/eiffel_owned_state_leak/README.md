@@ -75,7 +75,11 @@ that the snippet does *not* compile.
 
 ## Findings touched
 
-- See FINDINGS Round 2 finding 15 (compile-fail trybuild harness).
+This specimen does not surface a Tina product gap — it documents
+the existing type-system contract. The four `compile_fail` doctests
+are themselves the evidence; they would start passing-as-compilable
+(and therefore failing-as-tests) if a future Tina release relaxed
+any of the bounds.
 
 ## What this is not
 

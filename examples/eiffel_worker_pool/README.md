@@ -36,9 +36,9 @@ worker each client mapped to.
 ## What feels worse
 
 - The frontend has to thread `qid` through a closure passed to
-  `RuntimeCall::isolate_call(...).reply(move |outcome| ...)`. The
-  closure-form `.reply` pattern from FINDINGS Round 2 finding 7
-  shows up here.
+  `call(worker, ..., timeout).reply(move |outcome| FrontendMsg::WorkerDone(qid, outcome))`.
+  The closure-form `.reply` is the price for stuffing a correlator
+  into the continuation message.
 - `Frontend::Submit / WorkerDone` enum still carries the message
   shape; a sugar that hides "id-correlated dispatch" behind one
   helper would help.
