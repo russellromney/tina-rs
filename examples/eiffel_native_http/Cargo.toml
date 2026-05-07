@@ -7,9 +7,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+anyhow = "1"
+axum = "0.7"
+http = { version = "1", default-features = false, features = ["std"] }
 tina = { path = "../../tina" }
 tina-http = { path = "../../tina-http" }
 tina-runtime = { path = "../../tina-runtime" }
-http = { version = "1", default-features = false, features = ["std"] }
-axum = "0.7"
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }

@@ -1,3 +1,7 @@
+//! Tokio reference: `axum::Router` Counter on
+//! `tokio::net::TcpListener`, hit by the shared scripted client over
+//! a real socket.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -13,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
 
-use super::{SideReport, scripted_client};
+use crate::{Report, scripted_client};
 
 #[derive(Debug, Default)]
 struct CounterState {
@@ -24,7 +28,6 @@ impl CounterState {
     fn read(&self) -> u32 {
         self.value.load(Ordering::Relaxed)
     }
-
     fn increment(&self) -> u32 {
         self.value.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -42,12 +45,8 @@ async fn fallback() -> impl IntoResponse {
     StatusCode::NOT_FOUND
 }
 
-pub(crate) fn run() -> SideReport {
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
     let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -70,18 +69,17 @@ pub(crate) fn run() -> SideReport {
         });
     });
 
-    let server_addr = addr_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("server addr");
-
+    let server_addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
     let report = scripted_client(server_addr);
-
     let _ = shutdown_tx.send(());
+
     let deadline = Instant::now() + Duration::from_secs(2);
     while !server_handle.is_finished() && Instant::now() < deadline {
         thread::yield_now();
     }
-    server_handle.join().expect("server thread joined cleanly");
+    server_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("server thread panicked"))?;
 
-    report
+    Ok(report)
 }
