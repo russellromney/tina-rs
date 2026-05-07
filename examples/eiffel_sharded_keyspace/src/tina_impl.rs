@@ -83,23 +83,15 @@ impl Store {
     fn handle(&mut self, msg: StoreMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
             StoreMsg::Set { key, value } => {
-                let owner = self.placement.owner_for_str(&key);
-                if owner != ctx.shard_id() {
-                    return reply(StoreReply::WrongShard(WrongShard {
-                        expected: owner,
-                        actual: ctx.shard_id(),
-                    }));
+                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
+                    return reply(StoreReply::WrongShard(w));
                 }
                 self.values.insert(key, value);
                 reply(StoreReply::Ok)
             }
             StoreMsg::Get { key } => {
-                let owner = self.placement.owner_for_str(&key);
-                if owner != ctx.shard_id() {
-                    return reply(StoreReply::WrongShard(WrongShard {
-                        expected: owner,
-                        actual: ctx.shard_id(),
-                    }));
+                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
+                    return reply(StoreReply::WrongShard(w));
                 }
                 match self.values.get(&key) {
                     Some(value) => reply(StoreReply::Value(value.clone())),
@@ -107,12 +99,8 @@ impl Store {
                 }
             }
             StoreMsg::Del { key } => {
-                let owner = self.placement.owner_for_str(&key);
-                if owner != ctx.shard_id() {
-                    return reply(StoreReply::WrongShard(WrongShard {
-                        expected: owner,
-                        actual: ctx.shard_id(),
-                    }));
+                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
+                    return reply(StoreReply::WrongShard(w));
                 }
                 if self.values.remove(&key).is_some() {
                     reply(StoreReply::Deleted)
@@ -244,24 +232,24 @@ pub fn run() -> anyhow::Result<Report> {
     )
     .context("placement")?;
 
-    // Register one `Store` per shard. Capture `(shard, address)` so the
-    // service table can be built over the same ordered shard list.
-    let mut entries = Vec::new();
-    for shard in placement.shards() {
-        let address = runtime
-            .register_with_capacity_on::<Store, Infallible>(
-                *shard,
-                Store {
-                    placement: placement.clone(),
-                    values: BTreeMap::new(),
-                },
-                32,
-            )
-            .map_err(|e| anyhow::anyhow!("register store on shard {}: {e:?}", shard.get()))?;
-        entries.push((*shard, address));
-    }
-    let table = ShardServiceTable::new(placement.clone(), entries)
-        .context("service table from placement + entries")?;
+    // One `Store` per shard, table built over the same ordered shard
+    // list. `try_from_placement` runs the registration closure for each
+    // shard and folds any per-shard error into a typed
+    // `ServiceTableBuildError`. `ThreadedRuntimeError` does not yet
+    // impl `std::error::Error`, so wrap the result in `anyhow!` rather
+    // than `.context(...)` here.
+    let placement_for_register = placement.clone();
+    let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
+        runtime.register_with_capacity_on::<Store, Infallible>(
+            shard,
+            Store {
+                placement: placement_for_register.clone(),
+                values: BTreeMap::new(),
+            },
+            32,
+        )
+    })
+    .map_err(|e| anyhow::anyhow!("register stores per shard: {e:?}"))?;
 
     // Driver lives on the first shard; it walks the script one
     // command at a time via `call(...).reply(...)`.

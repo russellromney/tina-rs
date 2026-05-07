@@ -15,11 +15,17 @@
 //! key before mutate. Fanout is bounded. Aggregate says partial truth.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::marker::PhantomData;
 use std::time::Duration;
 
-use tina::{Address, ShardId};
+use tina::{
+    Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard, ShardId, prelude::send,
+};
+
+use crate::call::RuntimeCall;
 
 // ---------------------------------------------------------------
 // Placement
@@ -168,6 +174,42 @@ impl ShardPlacement {
         self.owner_for_bytes(key.as_bytes())
     }
 
+    /// Returns `Ok(owner)` if `actual_shard` is the placement-derived
+    /// owner of `key`, or `Err(WrongShard { expected, actual })` if not.
+    ///
+    /// Owner re-check is the load-bearing safety invariant for sharded
+    /// service isolates: every keyed handler must check this before
+    /// mutating shard-local state, otherwise a routing bug becomes
+    /// silent state corruption. This helper folds the canonical
+    /// `if owner != ctx.shard_id() { return Err(WrongShard { ... }) }`
+    /// pattern into one call.
+    pub fn require_owner_bytes(
+        &self,
+        key: &[u8],
+        actual_shard: ShardId,
+    ) -> Result<ShardId, WrongShard> {
+        let owner = self.owner_for_bytes(key);
+        if owner == actual_shard {
+            Ok(owner)
+        } else {
+            Err(WrongShard {
+                expected: owner,
+                actual: actual_shard,
+            })
+        }
+    }
+
+    /// Returns `Ok(owner)` if `actual_shard` is the placement-derived
+    /// owner of `key`, or `Err(WrongShard { expected, actual })` if not.
+    /// String form of [`Self::require_owner_bytes`].
+    pub fn require_owner_str(
+        &self,
+        key: &str,
+        actual_shard: ShardId,
+    ) -> Result<ShardId, WrongShard> {
+        self.require_owner_bytes(key.as_bytes(), actual_shard)
+    }
+
     /// Returns a static placement report.
     pub fn report(&self) -> ShardPlacementReport {
         ShardPlacementReport {
@@ -260,6 +302,38 @@ impl fmt::Display for ShardServiceTableError {
 
 impl Error for ShardServiceTableError {}
 
+/// Errors returned by [`ShardServiceTable::try_from_placement`].
+///
+/// `E` is the registration-closure error type (e.g.
+/// `ThreadedRuntimeError`). `Register(e)` carries it through;
+/// `Table(e)` is a structural mismatch from
+/// [`ShardServiceTable::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceTableBuildError<E> {
+    /// One of the per-shard registrations failed.
+    Register(E),
+    /// The structural `new` invariant rejected the assembled entries.
+    Table(ShardServiceTableError),
+}
+
+impl<E: fmt::Display> fmt::Display for ServiceTableBuildError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Register(e) => write!(f, "shard registration failed: {e}"),
+            Self::Table(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ServiceTableBuildError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Register(e) => Some(e),
+            Self::Table(e) => Some(e),
+        }
+    }
+}
+
 /// Explicit ordered map from [`ShardId`] to a typed service [`Address`].
 ///
 /// The table holds the same shard list, in the same order, as its placement.
@@ -310,6 +384,57 @@ impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
             addresses,
             index,
         })
+    }
+
+    /// Builds a service table by registering one address per shard via
+    /// the given closure. Use this with the explicit-step
+    /// [`crate::MultiShardRuntime`], whose `register_with_capacity_on`
+    /// returns `Address<M, R>` directly.
+    ///
+    /// ```ignore
+    /// let table = ShardServiceTable::from_placement(placement, |shard| {
+    ///     runtime.register_with_capacity_on::<Store, _>(shard, Store::new(), 32)
+    /// })?;
+    /// ```
+    pub fn from_placement<F>(
+        placement: ShardPlacement,
+        mut register: F,
+    ) -> Result<Self, ShardServiceTableError>
+    where
+        F: FnMut(ShardId) -> Address<M, R>,
+    {
+        let entries: Vec<(ShardId, Address<M, R>)> = placement
+            .shards()
+            .iter()
+            .copied()
+            .map(|s| (s, register(s)))
+            .collect();
+        Self::new(placement, entries)
+    }
+
+    /// Same as [`Self::from_placement`] but the registration closure
+    /// can fail. Use this with [`crate::ThreadedMultiShardRuntime`],
+    /// whose `register_with_capacity_on` returns
+    /// `Result<Address<M, R>, ThreadedRuntimeError>`.
+    ///
+    /// ```ignore
+    /// let table = ShardServiceTable::try_from_placement(placement, |shard| {
+    ///     runtime.register_with_capacity_on::<Store, _>(shard, Store::new(), 32)
+    /// })?;
+    /// ```
+    pub fn try_from_placement<F, E>(
+        placement: ShardPlacement,
+        mut register: F,
+    ) -> Result<Self, ServiceTableBuildError<E>>
+    where
+        F: FnMut(ShardId) -> Result<Address<M, R>, E>,
+    {
+        let mut entries = Vec::with_capacity(placement.shards().len());
+        for shard in placement.shards().iter().copied() {
+            let address = register(shard).map_err(ServiceTableBuildError::Register)?;
+            entries.push((shard, address));
+        }
+        Self::new(placement, entries).map_err(ServiceTableBuildError::Table)
     }
 
     /// Returns the underlying placement.
@@ -493,14 +618,23 @@ pub enum ScatterGatherTargetOutcome<T> {
 
 /// Partial-aggregate report from a scatter/gather fanout.
 ///
-/// The `outcomes` vector length is bounded by `config.max_targets`. There is
-/// no hidden buffering; what is not in this report did not happen. The
-/// vector preserves the caller-supplied target order.
+/// `outcomes` length is bounded by `config.max_targets`. There is no
+/// hidden buffering; what is not in this report did not happen.
+///
+/// **Ordering contract:** `outcomes` preserves caller-supplied target
+/// order. If the coordinator was started with target list
+/// `[shard_a, shard_b, shard_c]`, the report's `outcomes` is `[(shard_a,
+/// outcome_a), (shard_b, outcome_b), (shard_c, outcome_c)]` regardless of
+/// the order in which replies arrived. This makes per-target results
+/// addressable by index without a `BTreeMap` lookup, and keeps log
+/// output deterministic across runs and seeds. Coordinator
+/// implementations must preserve this order at emission time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScatterGatherReport<T> {
     /// Config the fanout ran under.
     pub config: ScatterGatherConfig,
-    /// Per-target outcomes in caller-supplied order.
+    /// Per-target outcomes in caller-supplied target-list order. See
+    /// the struct doc for the ordering contract.
     pub outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<T>)>,
 }
 
@@ -650,6 +784,80 @@ impl HotKeyAttemptReport {
     }
 }
 
+// ---------------------------------------------------------------
+// Reply adapter
+// ---------------------------------------------------------------
+
+/// Generic isolate that translates one message type into another and
+/// forwards.
+///
+/// The structural reply-typing problem: a coordinator sends `M` to a
+/// shard service that replies with `R`, but the coordinator's mailbox
+/// is typed for some richer message type `T` that wraps `R` (e.g.
+/// `T::Reply(R)`). Tina's typed addresses don't let an `Address<R>`
+/// accept replies for `Address<T>`, so a small bridge isolate has to
+/// translate. `ReplyAdapter<M, T, S>` is that bridge as a shipped
+/// primitive instead of hand-written boilerplate.
+///
+/// `M: Into<T>` — the user provides one `impl From<M> for T` and the
+/// adapter does the rest. `register_on` registers the adapter on a
+/// shard with explicit mailbox capacity and returns the
+/// `Address<M>` callers send to. There is no hidden queue beyond the
+/// adapter's mailbox; capacity is explicit and `Full`/`Closed` surface
+/// through the runtime's normal send behavior.
+///
+/// Same-shard use is the common case (a coord registers its adapter
+/// on its own shard so reply translation is local). Cross-shard use is
+/// supported as long as both `M` and `T` are `Send`.
+pub struct ReplyAdapter<M, T, S>
+where
+    M: 'static,
+    T: 'static + From<M>,
+    S: Shard + 'static,
+{
+    target: Address<T>,
+    _marker: PhantomData<(fn(M), S)>,
+}
+
+impl<M, T, S> ReplyAdapter<M, T, S>
+where
+    M: 'static,
+    T: 'static + From<M>,
+    S: Shard + 'static,
+{
+    /// Creates a new adapter pointing at `target`. Pair with the
+    /// runtime's `register_with_capacity_on(...)` to put it on a shard.
+    pub fn new(target: Address<T>) -> Self {
+        Self {
+            target,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<M, T, S> Isolate for ReplyAdapter<M, T, S>
+where
+    M: 'static,
+    T: 'static + From<M>,
+    S: Shard + 'static,
+{
+    type Message = M;
+    type Reply = ();
+    type Send = TinaOutbound<T>;
+    type Spawn = Infallible;
+    // `RuntimeCall<M>` (rather than `Infallible`) so the same primitive
+    // is accepted by the simulator, the explicit-step `MultiShardRuntime`,
+    // and `ThreadedMultiShardRuntime` without per-runtime variants. The
+    // adapter never actually issues a runtime call; the channel exists to
+    // satisfy the simulator's `RuntimeCallable` bound.
+    type Call = RuntimeCall<M>;
+    type Shard = S;
+
+    fn handle(&mut self, msg: M, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+        send(self.target, msg.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +963,50 @@ mod tests {
     }
 
     #[test]
+    fn placement_require_owner_returns_ok_when_actual_matches_placement() {
+        let p = ShardPlacement::new("p", shards(&[3, 17, 91])).unwrap();
+        // Find a key whose owner is shard 17.
+        let key = (0..100u32)
+            .map(|n| format!("k-{n}"))
+            .find(|k| p.owner_for_str(k) == ShardId::new(17))
+            .unwrap();
+        assert_eq!(
+            p.require_owner_str(&key, ShardId::new(17)).unwrap(),
+            ShardId::new(17)
+        );
+        assert_eq!(
+            p.require_owner_bytes(key.as_bytes(), ShardId::new(17))
+                .unwrap(),
+            ShardId::new(17)
+        );
+    }
+
+    #[test]
+    fn placement_require_owner_returns_wrong_shard_on_mismatch() {
+        let p = ShardPlacement::new("p", shards(&[3, 17])).unwrap();
+        // Find a key owned by shard 3 and probe it on shard 17.
+        let key = (0..100u32)
+            .map(|n| format!("k-{n}"))
+            .find(|k| p.owner_for_str(k) == ShardId::new(3))
+            .unwrap();
+        let err = p
+            .require_owner_str(&key, ShardId::new(17))
+            .expect_err("wrong shard");
+        assert_eq!(
+            err,
+            WrongShard {
+                expected: ShardId::new(3),
+                actual: ShardId::new(17),
+            }
+        );
+        // Bytes form agrees with the str form.
+        let err_bytes = p
+            .require_owner_bytes(key.as_bytes(), ShardId::new(17))
+            .expect_err("wrong shard (bytes)");
+        assert_eq!(err, err_bytes);
+    }
+
+    #[test]
     fn placement_accepts_runtime_derived_name() {
         // Plain `String` is accepted, not just `&'static str`.
         let dynamic_name = format!("dynamic-{}", 42);
@@ -796,6 +1048,66 @@ mod tests {
             table.address_for(ShardId::new(99)).unwrap_err(),
             MissingShard(ShardId::new(99))
         );
+    }
+
+    #[test]
+    fn service_table_from_placement_registers_one_address_per_shard() {
+        let placement = ShardPlacement::new("p", shards(&[3, 17, 91])).unwrap();
+        let mut next_isolate = 100u64;
+        let table = ShardServiceTable::<u32>::from_placement(placement, |shard| {
+            let addr = addr::<u32>(shard.get(), next_isolate);
+            next_isolate += 1;
+            addr
+        })
+        .unwrap();
+        // Addresses are parallel to placement.shards() in caller-supplied
+        // order; isolate ids match the order the closure was called.
+        assert_eq!(table.placement().shards(), &shards(&[3, 17, 91]));
+        assert_eq!(
+            table.address_for(ShardId::new(3)).unwrap().isolate(),
+            tina::IsolateId::new(100)
+        );
+        assert_eq!(
+            table.address_for(ShardId::new(17)).unwrap().isolate(),
+            tina::IsolateId::new(101)
+        );
+        assert_eq!(
+            table.address_for(ShardId::new(91)).unwrap().isolate(),
+            tina::IsolateId::new(102)
+        );
+    }
+
+    #[test]
+    fn service_table_try_from_placement_propagates_registration_error() {
+        let placement = ShardPlacement::new("p", shards(&[3, 17])).unwrap();
+        let err = ShardServiceTable::<u32>::try_from_placement(placement, |shard| {
+            if shard == ShardId::new(17) {
+                Err("dead worker")
+            } else {
+                Ok(addr::<u32>(shard.get(), 1))
+            }
+        })
+        .unwrap_err();
+        match err {
+            ServiceTableBuildError::Register(e) => assert_eq!(e, "dead worker"),
+            other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_table_try_from_placement_succeeds_when_every_shard_registers() {
+        let placement = ShardPlacement::new("p", shards(&[3, 17, 91])).unwrap();
+        let table = ShardServiceTable::<u32>::try_from_placement::<_, ()>(placement, |shard| {
+            Ok(addr::<u32>(shard.get(), 7))
+        })
+        .unwrap();
+        assert_eq!(table.placement().shards().len(), 3);
+        for shard in [3, 17, 91] {
+            assert_eq!(
+                table.address_for(ShardId::new(shard)).unwrap().isolate(),
+                tina::IsolateId::new(7)
+            );
+        }
     }
 
     #[test]

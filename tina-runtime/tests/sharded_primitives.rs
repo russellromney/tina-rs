@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
 use tina_runtime::sharded::{
-    MissingShard, ScatterGatherConfig, ScatterGatherConfigError, ScatterGatherReport,
+    MissingShard, ReplyAdapter, ScatterGatherConfig, ScatterGatherConfigError, ScatterGatherReport,
     ScatterGatherTargetOutcome, ShardPlacement, ShardServiceTable, WrongShard,
 };
 use tina_runtime::{MailboxFactory, MultiShardRuntime, RuntimeCall, SendOutcome, send_observed};
@@ -153,16 +153,12 @@ impl Isolate for ShardedCounter {
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             CounterMsg::Inc { key, reply_to } => {
-                let owner = self.placement.owner_for_str(&key);
-                if owner != ctx.shard_id() {
+                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
                     return send(
                         reply_to,
                         CounterCoordMsg::IncResult {
                             shard: ctx.shard_id(),
-                            outcome: Err(WrongShard {
-                                expected: owner,
-                                actual: ctx.shard_id(),
-                            }),
+                            outcome: Err(w),
                         },
                     );
                 }
@@ -404,15 +400,8 @@ impl Isolate for ShardedMap {
                 value,
                 reply_to,
             } => {
-                let owner = self.placement.owner_for_str(&key);
-                if owner != ctx.shard_id() {
-                    return send(
-                        reply_to,
-                        MapCoordMsg::Put(Err(WrongShard {
-                            expected: owner,
-                            actual: ctx.shard_id(),
-                        })),
-                    );
+                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
+                    return send(reply_to, MapCoordMsg::Put(Err(w)));
                 }
                 self.values.insert(key, value);
                 send(reply_to, MapCoordMsg::Put(Ok(ctx.shard_id())))
@@ -422,16 +411,12 @@ impl Isolate for ShardedMap {
                 // when the request landed on the wrong shard would make a
                 // routing bug indistinguishable from a real absent key —
                 // exactly the partial-failure fog this phase rejects.
-                let owner = self.placement.owner_for_str(&key);
-                if owner != ctx.shard_id() {
+                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
                     return send(
                         reply_to,
                         MapCoordMsg::Get {
                             shard: ctx.shard_id(),
-                            outcome: Err(WrongShard {
-                                expected: owner,
-                                actual: ctx.shard_id(),
-                            }),
+                            outcome: Err(w),
                         },
                     );
                 }
@@ -445,15 +430,8 @@ impl Isolate for ShardedMap {
                 )
             }
             MapMsg::Del { key, reply_to } => {
-                let owner = self.placement.owner_for_str(&key);
-                if owner != ctx.shard_id() {
-                    return send(
-                        reply_to,
-                        MapCoordMsg::Del(Err(WrongShard {
-                            expected: owner,
-                            actual: ctx.shard_id(),
-                        })),
-                    );
+                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
+                    return send(reply_to, MapCoordMsg::Del(Err(w)));
                 }
                 let removed = self.values.remove(&key).is_some();
                 send(reply_to, MapCoordMsg::Del(Ok(removed)))
@@ -726,9 +704,21 @@ struct ScatterCoord {
     table: ShardServiceTable<CounterMsg>,
     bridge: Option<Address<CounterCoordMsg>>,
     config: ScatterGatherConfig,
+    targets_in_order: Vec<ShardId>,
     pending_targets: Vec<ShardId>,
     outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<u64>)>,
     report_into: Rc<RefCell<Option<ScatterGatherReport<u64>>>>,
+}
+
+/// Reorder per-target outcomes to match the caller-supplied target
+/// list. Entries whose shard is not in `targets` (defensive — should
+/// not happen) sink to the end.
+fn sort_outcomes_by_target_list<T>(
+    mut outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<T>)>,
+    targets: &[ShardId],
+) -> Vec<(ShardId, ScatterGatherTargetOutcome<T>)> {
+    outcomes.sort_by_key(|(s, _)| targets.iter().position(|t| *t == *s).unwrap_or(usize::MAX));
+    outcomes
 }
 
 #[derive(Debug, Clone)]
@@ -736,6 +726,15 @@ enum ScatterCoordMsg {
     Bind { bridge: Address<CounterCoordMsg> },
     Start,
     Reply(CounterCoordMsg),
+}
+
+// Wires `ReplyAdapter<CounterCoordMsg, ScatterCoordMsg, AppShard>` —
+// the shipped primitive does the translation; the test only declares
+// the variant.
+impl From<CounterCoordMsg> for ScatterCoordMsg {
+    fn from(msg: CounterCoordMsg) -> Self {
+        ScatterCoordMsg::Reply(msg)
+    }
 }
 
 impl Isolate for ScatterCoord {
@@ -761,9 +760,17 @@ impl Isolate for ScatterCoord {
                     .config
                     .max_targets
                     .min(self.table.placement().shards().len());
-                for shard in self.table.placement().shards().iter().take(limit) {
-                    self.pending_targets.push(*shard);
-                    let address = self.table.address_for(*shard).expect("shard in table");
+                self.targets_in_order = self
+                    .table
+                    .placement()
+                    .shards()
+                    .iter()
+                    .copied()
+                    .take(limit)
+                    .collect();
+                for shard in self.targets_in_order.iter().copied() {
+                    self.pending_targets.push(shard);
+                    let address = self.table.address_for(shard).expect("shard in table");
                     effects.push(send(address, CounterMsg::Get { reply_to: bridge }));
                 }
                 batch(effects)
@@ -777,8 +784,10 @@ impl Isolate for ScatterCoord {
                     }
                 }
                 if self.pending_targets.is_empty() {
-                    let mut outcomes = std::mem::take(&mut self.outcomes);
-                    outcomes.sort_by_key(|(s, _)| s.get());
+                    let outcomes = sort_outcomes_by_target_list(
+                        std::mem::take(&mut self.outcomes),
+                        &self.targets_in_order,
+                    );
                     let report = ScatterGatherReport {
                         config: self.config,
                         outcomes,
@@ -791,24 +800,10 @@ impl Isolate for ScatterCoord {
     }
 }
 
-struct ReplyBridge {
-    coord: Address<ScatterCoordMsg>,
-}
-
-impl Isolate for ReplyBridge {
-    tina::isolate_types! {
-        message: CounterCoordMsg,
-        reply: (),
-        send: Outbound<ScatterCoordMsg>,
-        spawn: Infallible,
-        call: Infallible,
-        shard: AppShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        send(self.coord, ScatterCoordMsg::Reply(msg))
-    }
-}
+// `ReplyBridge` used to be hand-written here. It is now the shipped
+// `ReplyAdapter<CounterCoordMsg, ScatterCoordMsg, AppShard>` primitive —
+// see the `register_with_capacity_on::<ReplyAdapter<_, _, _>, _>(...)` call
+// in `scatter_gather_aggregate_collects_one_reply_per_target`.
 
 #[test]
 fn scatter_gather_aggregate_collects_one_reply_per_target() {
@@ -863,17 +858,19 @@ fn scatter_gather_aggregate_collects_one_reply_per_target() {
             table: table.clone(),
             bridge: None,
             config,
+            targets_in_order: Vec::new(),
             pending_targets: Vec::new(),
             outcomes: Vec::with_capacity(config.max_targets),
             report_into: Rc::clone(&report_slot),
         },
         config.collector_capacity,
     );
-    let bridge = runtime.register_with_capacity_on::<ReplyBridge, ScatterCoordMsg>(
-        ShardId::new(3),
-        ReplyBridge { coord },
-        config.collector_capacity,
-    );
+    let bridge = runtime
+        .register_with_capacity_on::<ReplyAdapter<CounterCoordMsg, ScatterCoordMsg, AppShard>, ScatterCoordMsg>(
+            ShardId::new(3),
+            ReplyAdapter::new(coord),
+            config.collector_capacity,
+        );
     runtime
         .try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();
@@ -1170,6 +1167,13 @@ enum ScatterCoordObsMsg {
     Reply(CounterCoordMsg),
 }
 
+// Wires `ReplyAdapter<CounterCoordMsg, ScatterCoordObsMsg, AppShard>`.
+impl From<CounterCoordMsg> for ScatterCoordObsMsg {
+    fn from(msg: CounterCoordMsg) -> Self {
+        ScatterCoordObsMsg::Reply(msg)
+    }
+}
+
 impl Isolate for ScatterCoordObs {
     tina::isolate_types! {
         message: ScatterCoordObsMsg,
@@ -1257,8 +1261,8 @@ impl ScatterCoordObs {
         if self.report_into.borrow().is_some() {
             return;
         }
-        let mut outcomes = std::mem::take(&mut self.outcomes);
-        outcomes.sort_by_key(|(s, _)| s.get());
+        let outcomes =
+            sort_outcomes_by_target_list(std::mem::take(&mut self.outcomes), &self.targets);
         let report = ScatterGatherReport {
             config: self.config,
             outcomes,
@@ -1267,24 +1271,9 @@ impl ScatterCoordObs {
     }
 }
 
-struct ObsBridge {
-    coord: Address<ScatterCoordObsMsg>,
-}
-
-impl Isolate for ObsBridge {
-    tina::isolate_types! {
-        message: CounterCoordMsg,
-        reply: (),
-        send: Outbound<ScatterCoordObsMsg>,
-        spawn: Infallible,
-        call: Infallible,
-        shard: AppShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        send(self.coord, ScatterCoordObsMsg::Reply(msg))
-    }
-}
+// `ObsBridge` was previously hand-written; it is now the shipped
+// `ReplyAdapter<CounterCoordMsg, ScatterCoordObsMsg, AppShard>` primitive
+// (see `run_scatter_obs` below).
 
 fn run_scatter_obs(
     runtime: &mut MultiShardRuntime<AppShard, TestMailboxFactory>,
@@ -1307,11 +1296,12 @@ fn run_scatter_obs(
         },
         config.collector_capacity,
     );
-    let bridge = runtime.register_with_capacity_on::<ObsBridge, ScatterCoordObsMsg>(
-        coord_shard,
-        ObsBridge { coord },
-        config.collector_capacity,
-    );
+    let bridge = runtime
+        .register_with_capacity_on::<ReplyAdapter<CounterCoordMsg, ScatterCoordObsMsg, AppShard>, ScatterCoordObsMsg>(
+            coord_shard,
+            ReplyAdapter::new(coord),
+            config.collector_capacity,
+        );
     runtime
         .try_send(coord, ScatterCoordObsMsg::Bind { bridge })
         .unwrap();
@@ -1420,6 +1410,48 @@ fn scatter_gather_records_full_when_target_mailbox_is_saturated() {
         report.outcomes
     );
     assert_eq!(report.outcomes.len(), 3);
+}
+
+#[test]
+fn scatter_gather_report_preserves_caller_supplied_target_order() {
+    // Public ordering contract: ScatterGatherReport.outcomes appears in
+    // the order targets were supplied to the coordinator, regardless of
+    // shard-id sort or reply-arrival order. This test passes a
+    // deliberately non-shard-id-sorted target list and verifies the
+    // report comes back in that exact order.
+    let mut runtime = MultiShardRuntime::new(
+        [AppShard(3), AppShard(17), AppShard(91)],
+        TestMailboxFactory,
+    );
+    let placement = ShardPlacement::new(
+        "fanout",
+        vec![ShardId::new(3), ShardId::new(17), ShardId::new(91)],
+    )
+    .unwrap();
+    let table = register_counter_table(&mut runtime, &placement, 16);
+
+    // Targets in deliberately scrambled order (high → low).
+    let targets = vec![ShardId::new(91), ShardId::new(3), ShardId::new(17)];
+    let config = ScatterGatherConfig {
+        max_targets: targets.len(),
+        collector_capacity: targets.len(),
+        per_target_timeout: Duration::from_millis(50),
+        aggregate_timeout: Duration::from_millis(100),
+    };
+    config.validate().unwrap();
+
+    let report = run_scatter_obs(
+        &mut runtime,
+        table,
+        targets.clone(),
+        config,
+        ShardId::new(3),
+    );
+    let report_shard_order: Vec<ShardId> = report.outcomes.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        report_shard_order, targets,
+        "report.outcomes must follow caller-supplied target order"
+    );
 }
 
 #[test]

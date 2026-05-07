@@ -21,8 +21,8 @@ use std::time::Duration;
 use tina::{Address, prelude::*};
 use tina_runtime::RuntimeCall;
 use tina_runtime::sharded::{
-    ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement,
-    ShardServiceTable, WrongShard,
+    ReplyAdapter, ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome,
+    ShardPlacement, ShardServiceTable, WrongShard,
 };
 use tina_runtime::sleep_then;
 use tina_sim::{
@@ -409,6 +409,14 @@ enum ScatterCoordMsg {
     Reply(TrackerMsg),
 }
 
+// Wires `ReplyAdapter<TrackerMsg, ScatterCoordMsg, AppShard>`. The adapter
+// translates the counter's reply type into the coord's wider message type.
+impl From<TrackerMsg> for ScatterCoordMsg {
+    fn from(msg: TrackerMsg) -> Self {
+        ScatterCoordMsg::Reply(msg)
+    }
+}
+
 struct ScatterCoord {
     table: ShardServiceTable<CounterMsg>,
     bridge: Option<Address<TrackerMsg>>,
@@ -489,8 +497,15 @@ impl ScatterCoord {
         if self.report_into.borrow().is_some() {
             return;
         }
+        // Preserve caller-supplied target order in the report (the
+        // public ordering contract).
         let mut outcomes = std::mem::take(&mut self.outcomes);
-        outcomes.sort_by_key(|(s, _)| s.get());
+        outcomes.sort_by_key(|(s, _)| {
+            self.targets
+                .iter()
+                .position(|t| *t == *s)
+                .unwrap_or(usize::MAX)
+        });
         *self.report_into.borrow_mut() = Some(ScatterGatherReport {
             config: self.config,
             outcomes,
@@ -498,24 +513,10 @@ impl ScatterCoord {
     }
 }
 
-struct ReplyBridge {
-    coord: Address<ScatterCoordMsg>,
-}
-
-impl Isolate for ReplyBridge {
-    tina::isolate_types! {
-        message: TrackerMsg,
-        reply: (),
-        send: Outbound<ScatterCoordMsg>,
-        spawn: Infallible,
-        call: RuntimeCall<TrackerMsg>,
-        shard: AppShard,
-    }
-
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
-        send(self.coord, ScatterCoordMsg::Reply(msg))
-    }
-}
+// `ReplyBridge` was previously hand-written; it is now the shipped
+// `ReplyAdapter<TrackerMsg, ScatterCoordMsg, AppShard>` primitive (see
+// the `register_with_capacity_on::<ReplyAdapter<_, _, _>, _, _>(...)`
+// call below).
 
 #[test]
 fn scatter_gather_records_aggregate_timeout_when_target_does_not_reply() {
@@ -570,11 +571,11 @@ fn scatter_gather_records_aggregate_timeout_when_target_does_not_reply() {
         },
         16,
     );
-    let bridge = sim.register_with_capacity_on::<ReplyBridge, TrackerMsg, ScatterCoordMsg>(
-        ShardId::new(11),
-        ReplyBridge { coord },
-        16,
-    );
+    let bridge = sim.register_with_capacity_on::<
+        ReplyAdapter<TrackerMsg, ScatterCoordMsg, AppShard>,
+        TrackerMsg,
+        ScatterCoordMsg,
+    >(ShardId::new(11), ReplyAdapter::new(coord), 16);
 
     sim.try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();

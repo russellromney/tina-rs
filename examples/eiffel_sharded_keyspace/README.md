@@ -26,20 +26,26 @@ writing to the wrong shard — there is no per-shard owner, no typed
 
 ```rust
 let placement = ShardPlacement::new("eiffel-sharded-keyspace", shard_ids)?;
-let table = ShardServiceTable::new(placement.clone(), entries)?;
+
+// One Store isolate per shard; the table is built straight from the
+// placement via the registration closure. No manual entries vec, no
+// .clone() dance.
+let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
+    runtime.register_with_capacity_on::<Store, _>(shard, Store::new(), 32)
+})?;
 
 // Driver routes keyed requests through the table:
 call(table.address_for_str(&key), StoreMsg::Set { key, value }, timeout)
     .reply(DriverMsg::StoreReturned)
 ```
 
-Each shard is a real `Store` isolate that owns its own `BTreeMap` and
-re-checks placement on every keyed operation:
+Each shard is a real `Store` isolate that owns its own `BTreeMap`. Owner
+re-check uses the shipped helper, which folds the canonical
+`if owner != ctx.shard_id()` pattern into one call:
 
 ```rust
-let owner = self.placement.owner_for_str(&key);
-if owner != ctx.shard_id() {
-    return reply(StoreReply::WrongShard(WrongShard { expected: owner, actual: ctx.shard_id() }));
+if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
+    return reply(StoreReply::WrongShard(w));
 }
 ```
 
