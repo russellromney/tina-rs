@@ -50,10 +50,15 @@ use tina_supervisor::SupervisorConfig;
 use betelgeuse::{IOLoopHandle, io_loop};
 
 mod call;
+mod clock;
 mod driver;
 mod observation;
 pub mod persistence;
 mod trace;
+
+#[cfg(test)]
+use clock::ManualClock;
+use clock::{Clock, MonotonicClock};
 
 pub use crate::persistence::{
     LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
@@ -564,58 +569,6 @@ impl RuntimeCapabilities {
             ),
             durability: DurabilityCapability::local(),
         }
-    }
-}
-
-/// Runtime-owned clock abstraction.
-///
-/// Production uses a monotonic wall-clock. Tests may inject a manual clock
-/// so timer behavior can be driven deterministically without real sleeps.
-trait Clock: std::fmt::Debug {
-    fn now(&self) -> Instant;
-}
-
-#[derive(Debug)]
-struct MonotonicClock;
-
-impl Clock for MonotonicClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct ManualClock {
-    base: Instant,
-    offset: Cell<Duration>,
-}
-
-#[cfg(test)]
-impl ManualClock {
-    fn new() -> Self {
-        Self {
-            base: Instant::now(),
-            offset: Cell::new(Duration::ZERO),
-        }
-    }
-
-    fn advance(&self, by: Duration) {
-        self.offset.set(self.offset.get() + by);
-    }
-}
-
-#[cfg(test)]
-impl Clock for ManualClock {
-    fn now(&self) -> Instant {
-        self.base + self.offset.get()
-    }
-}
-
-#[cfg(test)]
-impl Clock for Rc<ManualClock> {
-    fn now(&self) -> Instant {
-        self.base + self.offset.get()
     }
 }
 
