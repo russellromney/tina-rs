@@ -1,36 +1,35 @@
-use std::env;
-use std::process::ExitCode;
+use eiffel_native_http::{Report, tina_impl, tokio_impl};
 
-mod comparison;
+fn main() -> anyhow::Result<()> {
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "both".to_string());
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    let mode = args.get(1).map(String::as_str).unwrap_or("compare");
-
-    match mode {
-        "tokio" => {
-            let report = comparison::tokio_impl::run();
-            comparison::print_report("tokio", &report);
-            ExitCode::SUCCESS
-        }
-        "tina" => {
-            let report = comparison::tina_impl::run();
-            comparison::print_report("tina", &report);
-            ExitCode::SUCCESS
-        }
-        "compare" => {
-            let tokio_report = comparison::tokio_impl::run();
-            comparison::print_report("tokio", &tokio_report);
-            let tina_report = comparison::tina_impl::run();
-            comparison::print_report("tina", &tina_report);
-            comparison::assert_equivalent(&tokio_report, &tina_report);
-            println!("\nboth servers responded the same way to the same scripted client.");
-            ExitCode::SUCCESS
+    match mode.as_str() {
+        "tokio" => print_side("tokio", tokio_impl::run()?),
+        "tina" => print_side("tina", tina_impl::run()?),
+        "both" => {
+            print_side("tokio", tokio_impl::run()?);
+            print_side("tina", tina_impl::run()?);
         }
         other => {
-            eprintln!("usage: eiffel-native-http [tokio|tina|compare]");
-            eprintln!("unknown mode: {other}");
-            ExitCode::FAILURE
+            anyhow::bail!(
+                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-native-http [tokio|tina|both]"
+            );
         }
     }
+    Ok(())
+}
+
+fn print_side(side: &str, report: Report) {
+    println!(
+        "comparison=eiffel_native_http side={} successful_get={} successful_post={} \
+         final_counter_value={} got_404_for_missing={} exit_clean={}",
+        side,
+        report.successful_get,
+        report.successful_post,
+        report.final_counter_value,
+        report.got_404_for_missing,
+        report.exit_clean,
+    );
 }

@@ -1,146 +1,98 @@
-# Eiffel Replay DST
+# eiffel_replay_dst
 
-Paired Tokio-vs-Tina demonstration of the *capability* the two ecosystems
-do not share: deterministic replay.
+A demonstration of the *capability* the two ecosystems don't share:
+deterministic replay.
 
-This is not a benchmark. The point is the property:
+The Tina side runs under `tina-sim` with seeded fault injection. Two
+runs at the same seed produce byte-identical traces — same length,
+same `stable_trace_hash`. A run at a *different* seed produces a
+different fingerprint, which proves the property is non-trivial.
 
-```text
-tina-sim:  same seed in -> byte-identical trace out, every time
-tokio:     same logic in -> wall-clock timings drift even on the same machine
-```
+The Tokio side runs the same nominal workload twice. Messages are
+deterministic; wall-clock timings are not.
 
-The workload is small on purpose:
+## Run
 
-- one `Producer` isolate that ticks 6 times, sleeping 1–3 ms between
-  each send;
-- one `Sink` isolate that records arrivals;
-- a `FaultConfig` that deterministically delays 1-in-3 timer wakes and
-  1-in-4 local sends — the seed is "load-bearing" so different seeds
-  produce different traces.
-
-The Tokio side runs the same shape on `Builder::new_current_thread()`
-with `tokio::time::sleep`. It is correct (same message sequence each
-run) but the wall-clock arrival times drift.
-
-Run both sides:
-
-```bash
-cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- compare
-```
-
-Run one side:
-
-```bash
+```sh
+cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- both
 cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- tokio
 cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- tina
 ```
 
-Sample output:
+You'll see something like:
 
-```text
-side=tina seed=42 run1_events=64 run2_events=64 fingerprints_match=true \
-  seed_b=99 run_b1_fingerprint_differs_from_a=true messages_received=6
-side=tokio messages_match=true timings_match=false \
-  run1_us=[18, 14503, 27266, 44592, 50258, 57334] \
-  run2_us=[10,  3936, 14795, 20037, 25104, 31129]
+```
+side=tina  seed_a=42 run_a1_events=64 run_a2_events=64 fingerprints_match=true
+           seed_b=99 run_b1_fingerprint_differs=true messages_received=6
+side=tokio messages_match=true timings_match=false
+           run1_us=[8, 3142, 8200, 12699, 16521, 25867]
+           run2_us=[18, 3837, 8908, 12119, 15787, 20855]
 ```
 
-The `assert_replay_distinction` check pins three properties at once:
+`fingerprints_match=true` is the Tina property. `timings_match=false`
+is the Tokio property — and the README *won't* assert it (under
+unusually quiet systems both runs can land on identical microsecond
+boundaries by accident; the smoke test asserts only what's
+non-flakey).
 
-1. The Tina trace fingerprint is byte-identical across two runs of
-   the same seed.
-2. The Tina trace fingerprint *differs* across two distinct seeds, so
-   property (1) is non-trivial.
-3. The Tokio side is functionally correct (same message ordering)
-   even though its wall-clock timings drift.
+## Read
 
-## What this comparison taught us
+- [`src/tokio_impl.rs`](src/tokio_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs)
 
-### Tokio side
+## Tokio shape
 
-- The Tokio side has no analogue. Tokio does not provide a
-  deterministic-time-source replay mode; even `start_paused: true`
-  on the test runtime is a paused-clock affordance, not a seeded
-  scheduler. We just run the same workload twice and watch the
-  microseconds wander.
-- The drift is real but small. On a quiet laptop, two back-to-back
-  runs of a six-message producer can land within a few hundred
-  microseconds of each other or many tens of milliseconds apart,
-  with no obvious pattern. There is no story for "make the next run
-  reproduce the bug we just saw".
-- This is the part of Tina's pitch the user has to be told about.
-  The other comparisons (chat, keyspace, axum, supervised worker,
-  persistent counter) all show *visible behavior* differences. This
-  one is invisible until something has gone wrong, which is exactly
-  when you most want it.
+A `current_thread` runtime; a producer task that writes 6 numbers
+into an mpsc with 1–3ms sleeps; a consumer that records each message
+plus its `Instant::now().elapsed()`. Run twice. Messages stay
+stable; timings drift because there is no virtual clock.
 
-### Tina side
+## Tina shape
 
-What worked well:
+`tina_sim::Simulator` with seeded fault injection: 1-in-3 timer
+wakes get pushed by an extra millisecond, deterministically chosen
+by the seed; 1-in-4 local sends get delayed by a round. The seed is
+the input; the trace is the output.
 
-- `Simulator::new(shard, config)` plus `register_with_mailbox_capacity`
-  plus `try_send` plus `run_until_quiescent` is the entire bootstrap.
-  No threads, no runtime config, no tokio. The whole comparison runs
-  on one OS thread, completes in microseconds, and produces a trace
-  the test can hash.
-- `SimulatorConfig::seed` plus `FaultConfig::{timer_wake, local_send}`
-  is the seam where deterministic perturbation lives. Set the same
-  seed → identical trace. Change the seed → different trace.
-  Property and counter-property assertable in one report.
-- `sim.trace()` returns `&[RuntimeEvent]` directly. Phase 047 added
-  `stable_trace_hash(...)`, so the fingerprint no longer depends on
-  `Debug` formatting or `DefaultHasher`. Five lines of code; the rest
-  of the runtime did the work.
-- `tina_runtime::sleep(Duration).reply(...)` is *also* what runs in
-  live `ThreadedRuntime` — same handler code, same effect type. The
-  comparison's punchline is that the shape under tina-sim is the same
-  shape under tina-runtime, which is what makes the replay claim
-  meaningful in production.
+The fingerprint comes from `tina_runtime::stable_trace_hash(...)`
+(047 Rock 3) — a deterministic hash over the typed trace events,
+not `format!("{event:?}").hash(...)`.
 
-What was awkward or surprising:
+## Discussion
 
-- `Sink` had to use `#[tina_runtime::isolate(...)]` rather than the
-  pure `#[tina::isolate(...)]`. The former wires
-  `Call = RuntimeCall<Msg>` which `Simulator::register_with_mailbox_capacity`
-  requires; the latter wires `Call = Infallible` and the simulator
-  rejects it with a `type mismatch resolving <Sink as
-  Isolate>::Call == RuntimeCall<SinkMsg>`. The error names the
-  required bound, but a first-time reader would not know which macro
-  to switch to. A "use tina_runtime::isolate for anything that lives
-  in a Simulator" diagnostic would help; alternatively, lifting the
-  `Call` requirement on the simulator would.
-- The fault config is opaque on first read. `LocalSendFaultMode::
-  DelayByRounds { one_in: 4, rounds: 1 }` is a real and useful
-  perturbation, but the *meaning* ("1 in every 4 sends gets pushed
-  back by 1 delivery round, deterministically chosen by seed") has
-  to be looked up. Naming is fine; documentation that lists "what
-  changes when I bump `one_in`" would shorten the on-ramp.
-- ~~Building the trace fingerprint via `format!("{event:?}").hash(...)`
-  works but is slightly cheesy.~~ **Resolved in phase 047:**
-  `RuntimeEvent::stable_hash()` and `stable_trace_hash(...)` give this
-  comparison a first-class trace fingerprint.
-- The simulator does not expose a "current virtual time" accessor at
-  the public API surface (or if it does, it isn't named in the
-  examples). The only way to reason about *when* an event happened
-  is to read the event itself. Fine for fingerprints; awkward for
-  ergonomics like "wait for time X".
-- All three runs (`run_a1`, `run_a2`, `run_b1`) fully construct a new
-  `Simulator`. There is no "run twice with the same history"
-  affordance at this layer (`run_twice_same_history` exists in the
-  DST helpers, but it is `#[cfg(test)]` and behind types we cannot
-  reach from a downstream crate). The example's
-  `run_once(seed) -> (events, fingerprint)` plus three calls is
-  fine, but the public surface for "I want this exact replay
-  property" is not yet front-and-center.
+What feels better:
 
-### Tokio shape vs. Tina shape, in one paragraph
+- **Replay is a primitive, not a discipline.** Same seed, same
+  trace, byte-for-byte. There is no "be careful where you reach for
+  `Instant::now()`" rule because the simulator doesn't have a
+  wall clock to reach for.
+- **`stable_trace_hash` is the canonical fingerprint.** No
+  `format!("{event:?}")` hashing; the runtime owns the stable
+  serialization.
+- **Faults are knobs, not happenstance.** `FaultMode::DelayBy {
+  one_in: 3, by: 1ms }` makes the seed do real work — the test isn't
+  asserting on a quiet system.
 
-The Tokio side prints two arrays of microsecond-jittered timings
-that nobody can stare at and turn into a reproducer. The Tina side
-prints one fingerprint that matches between two runs and changes
-when you change the seed; the same handler code, sent through
-`Simulator` instead of `ThreadedRuntime`, is the test harness. That
-is the property the rest of Eiffel relies on: every other
-comparison in this directory could, in principle, be replayed under
-seeded faults the same way.
+What feels worse:
+
+- **Two parallel report shapes.** Each side observes a different
+  thing (Tina: trace fingerprints; Tokio: timings drift), so each
+  has its own `Report`. The shared template doesn't fit; the
+  smoke tests are structurally different.
+- **Continuation `_ => Tick(next)` discards `sleep`'s `Result`.**
+  Per the new checklist, runtime-call replies should carry
+  `Result<T, CallError>`; here we map the unit success to a typed
+  `Tick(u32)` directly. For sleep this is OK (the producer treats
+  any sleep failure as "still tick"), but it's the same pattern
+  that `IoFailed` had before we cleaned it up elsewhere.
+
+What this suggests:
+
+- The replay property is the strongest single argument for the
+  Tina runtime model. It's also the property that's hardest to
+  *show* without a comparison; this example is the canonical "look
+  at the same fingerprint twice" demo.
+- The fault-injection knobs (`FaultMode::DelayBy`,
+  `LocalSendFaultMode::DelayByRounds`) are the surface most worth
+  growing for serious DST work — different fault modes per call
+  kind, scenario presets, etc.

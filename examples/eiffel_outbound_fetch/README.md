@@ -1,122 +1,91 @@
-# Eiffel Outbound Fetch
+# eiffel_outbound_fetch
 
-Paired Tokio-vs-Tina implementation of the *client* side of TCP. Up
-until now every Eiffel comparison has put Tina on the server side
-(chat fanout, keyspace, axum counter, supervised worker, persistent
-counter, replay DST). This one swaps the role: a tiny test server
-spins up, and both sides act as a client that connects, writes a
-small request, reads the response, and closes.
+Tina as a *TCP client*: connect to a real loopback server N times,
+send a one-line request, drain the response, classify outcomes.
+Tokio writes the same shape with `TcpStream::connect + write_all +
+read_to_end` in a `for` loop. Tina writes a `Fetcher` isolate that
+walks `tcp_connect → tcp_write (loop on partial writes) → tcp_read
+(loop until EOF) → tcp_close_stream` per iteration.
 
-The script is fixed:
+## Run
 
-```text
-- spin up a loopback test server that accepts FETCH_COUNT (=4) connections
-- each connection: read the client request, write "OK\n", close
-- client side: open FETCH_COUNT connections to that addr, sequentially,
-  collect every "OK\n"
-```
-
-Both sides emit the same numbers and the run is asserted in
-`assert_equivalent`:
-
-```text
-successful=4 failed=0 bytes=12 exit_clean=true
-```
-
-Run both sides:
-
-```bash
-cargo run --manifest-path examples/eiffel_outbound_fetch/Cargo.toml -- compare
-```
-
-Run one side:
-
-```bash
+```sh
+cargo run --manifest-path examples/eiffel_outbound_fetch/Cargo.toml -- both
 cargo run --manifest-path examples/eiffel_outbound_fetch/Cargo.toml -- tokio
 cargo run --manifest-path examples/eiffel_outbound_fetch/Cargo.toml -- tina
 ```
 
-## What this comparison taught us
+Both sides report:
 
-### Tokio side
+```
+side=tokio successful=4 failed=0 bytes=12 exit_clean=true
+side=tina  successful=4 failed=0 bytes=12 exit_clean=true
+```
 
-- Trivial. Three lines per fetch:
-  ```rust
-  let mut stream = TcpStream::connect(addr).await?;
-  stream.write_all(b"GET\n").await?;
-  stream.read_to_end(&mut buf).await?;
-  ```
-  This is the shape Tokio is most graceful at and Tina is most
-  verbose at. The async/await preserves the linear flow of the
-  client protocol exactly the way you'd want to read it.
-- `read_to_end` is the move people learn last but want first. It
-  papers over the EOF/length-prefix question entirely; the server
-  closes the stream when it's done, the read returns, the client
-  parses what it got.
-- Errors fall out as `?`. On the happy path the operator visually
-  isn't visible; on the unhappy path `match` works fine. The
-  comparison reports `failed_fetches` from a single `match` arm.
+## Read
 
-### Tina side
+- [`src/tokio_impl.rs`](src/tokio_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs)
+- [`src/lib.rs`](src/lib.rs) — the shared `TestServer` (just the
+  test target; doesn't constrain client implementation).
 
-What worked well:
+## Tokio shape
 
-- The `Fetcher` isolate is genuinely a TCP client written as a state
-  machine: `Begin -> Connected -> Wrote -> Read* -> Closed -> Begin`.
-  Every step of the protocol is a match arm; the handler is one
-  function. Once the shape is in your head, it reads honestly: this
-  is what TCP looks like when no part of it is hidden.
-- `tcp_connect(addr).reply(FetchMsg::Connected)` is the same shape as
-  `tcp_bind` and `tcp_accept` from the server-side comparisons.
-  Naming is consistent; the reply continuation pattern transfers
-  directly. *Tina-as-client and Tina-as-server are the same Tina.*
-- `Connected(Ok((stream, _local, _peer)))` gives both endpoints back
-  to user code. `tokio::net::TcpStream::connect` returns just the
-  stream; you have to call `.local_addr()` separately. Small win,
-  but a real one for code that wants to log or correlate.
-- The "iterate" pattern (next_iteration after each close) folds back
-  into `tcp_connect` cleanly. The state machine doesn't grow when
-  iterating; a counter-decrement and one re-connect effect are all
-  it takes.
+A `for _ in 0..FETCH_COUNT { fetch_one().await }` loop. `fetch_one`
+is `TcpStream::connect → write_all → read_to_end`. Anything that
+returns `Err` collapses into a `failed += 1`.
 
-What was awkward or surprising:
+## Tina shape
 
-- `tcp_read` returning `Vec<u8>` of zero bytes for EOF is the right
-  signal but it has to be hand-detected. There is no equivalent of
-  `read_to_end` at the runtime-call layer — every example has to
-  loop on `tcp_read` until it sees an empty payload, and
-  `response_buf.extend_from_slice(&bytes)` is hand-rolled
-  buffering. This is a genuine ergonomic tax for small client
-  protocols.
-- Write loop. `tcp_write` returns `Ok(count)` and may write less than
-  the buffer; the example handles partial writes with
-  `pending_write.drain(..count)` plus a self-loop into `Wrote`. The
-  Tokio side has `write_all`. Tina does not, at the runtime-call
-  surface. Probably correct — `write_all` hides retries — but the
-  pattern is going to be in every Tina TCP client.
-- ~~Same `Mailbox` + `MailboxFactory` boilerplate as the other four
-  comparisons.~~ **Resolved in phase 047:** the example uses
-  `DefaultThreadedMailboxFactory`.
-- `FetchMsg` ballooned: `Begin`, `Connected`, `Wrote`, `Read`,
-  `Closed`. Plus their `Ok`/`Err` arms. This is the
-  "Continuation Enum Growth" sharp edge from the user guide,
-  applied to a five-step protocol.
-- ~~The driver thread waits on a shared `AtomicBool::done` flag.~~
-  **Resolved in phase 047:** the driver registers
-  `runtime.observe_isolate_complete(fetcher)` before kicking the isolate
-  and waits on the typed waiter instead.
+A `Fetcher` isolate with a state machine:
 
-### Tokio shape vs. Tina shape, in one paragraph
+- `Begin → tcp_connect.reply(Connected)`.
+- `Connected(Ok(...)) → tcp_write(GET).reply(Wrote)`. Partial writes
+  re-issue `tcp_write` on the remaining bytes.
+- `Wrote(Ok(_)) → tcp_read.reply(Read)`. Empty `Read` is EOF, which
+  classifies the gathered buffer.
+- Either way: `tcp_close_stream.reply(Closed) → next iteration or
+  stop()`.
 
-Tokio wins on raw line count and reads-like-the-protocol clarity for
-client code, full stop. Tina makes you write the state machine
-explicitly — `Begin -> Connected -> Wrote -> Read* -> Closed` — and
-the resulting code is a third again as long. The trade is what the
-state machine *gives you*: every step is a separately observable
-event in the runtime trace, every `Err` branch is forced to be an
-arm rather than a `?` you might forget to grep for, and the same
-isolate runs unchanged under `tina-sim` (see
-`eiffel_replay_dst`). For a quick HTTP client, Tokio is what you
-want. For a long-lived protocol client where every retry, timeout,
-and backoff has to be inspectable, Tina is closer to what you'd
-end up writing on top of Tokio anyway, just made explicit.
+The host watches for completion with
+`runtime.observe_isolate_complete(fetcher).wait(...)`. Per-fetch
+counts land in a shared `Outcome` slot (atomics).
+
+## Discussion
+
+What feels better:
+
+- **Partial writes are visible.** Tina's `tcp_write` returns the
+  number of bytes written; the handler decides whether to issue
+  another `tcp_write` for the remainder. Tokio's `write_all` papers
+  over the loop but you can't observe it. (See `docs/tcp-loops.md`
+  for the canonical pattern.)
+- **Per-step trace events.** Every connect, write, read, and close
+  is a typed runtime event. `complete_trace()` is a real audit log
+  for what happened on the wire.
+
+What feels worse:
+
+- **The `Wrote(Ok(count))` partial-write loop is hand-rolled.**
+  Every TCP client will write it. A `tcp_write_all` driver-level
+  helper is deliberately deferred (047 finding) so that partial-
+  write progress remains observable in the trace; the user-side
+  loop is the documented pattern for now.
+- **The `Read(Ok(bytes))` read-until-EOF loop is hand-rolled.**
+  Same shape, same finding. A `tcp_read_to_eof` would shrink every
+  outbound client.
+- **The `Outcome` side channel.** Per-fetch counts go through atomics
+  on a shared `Arc<Outcome>` because the host needs to read them
+  after the isolate stops. App-specific data the runtime can't know
+  about — same pattern as `eiffel_mux_client::ArrivalLog`.
+
+What this suggests:
+
+- TCP-loop helpers (`tcp_write_all`, `tcp_read_to_eof`) are the
+  next ergonomics step for client isolates. The trade-off is real
+  (helpers hide per-step trace events), but a documented helper
+  with the trade-off named would shrink real code.
+- The "isolate's app-data after it stops" pattern is the same one
+  showing up in mux_client and persistent_counter. A typed
+  observation handle that resolves to the isolate's final state
+  would close the loop.

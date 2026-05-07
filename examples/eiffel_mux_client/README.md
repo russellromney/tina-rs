@@ -1,79 +1,108 @@
-# Eiffel Mux Client
+# eiffel_mux_client
 
-Paired Tokio-vs-Tina implementation of a *multiplexed client* talking to a
-shared Tokio TCP responder. The responder accepts a single connection,
-reads `REQ <id>\n` lines, sleeps for `(40 - id*10)ms`, then writes back
-`RESP <id>\n`. Because higher-id replies have shorter delays, a real
-multiplexed client should observe responses in `[3, 2, 1]` order even
-though the requests were submitted as `[1, 2, 3]`.
+A *multiplexed client*: one TCP connection, three concurrent
+in-flight requests, replies arrive out of order. The responder is
+shared between sides and intentionally delays high-id replies less
+than low-id replies — `id=3 → 10ms`, `id=2 → 20ms`, `id=1 → 30ms`
+— so `arrival_order=[3, 2, 1]` is the proof that real multiplexing
+happened.
 
-Both sides assert the arrival order is exactly `[3, 2, 1]`. If a side
-observes `[1, 2, 3]` the client is not actually multiplexing — it's
-processing one request at a time.
+## Run
 
-Run both sides:
-
-```bash
-cargo run --manifest-path examples/eiffel_mux_client/Cargo.toml -- compare
-```
-
-Run one side:
-
-```bash
+```sh
+cargo run --manifest-path examples/eiffel_mux_client/Cargo.toml -- both
 cargo run --manifest-path examples/eiffel_mux_client/Cargo.toml -- tokio
 cargo run --manifest-path examples/eiffel_mux_client/Cargo.toml -- tina
 ```
 
-## What this comparison taught us
+You'll see the same arrival order on both sides:
 
-### Tokio side
+```
+comparison=eiffel_mux_client side=tokio arrival_order=[3, 2, 1]
+comparison=eiffel_mux_client side=tina  arrival_order=[3, 2, 1]
+```
 
-- The classic shape: one `tokio::spawn` for the reader, a
-  `HashMap<u32, oneshot::Sender>` of pending requests behind an `Arc<Mutex>`,
-  and an explicit `await` on each `oneshot::Receiver`. About 60 lines.
-- The reader task does ID parsing + dispatch; the submitter writes a line
-  and inserts a oneshot. Out-of-order responses fall out of the design
-  with no extra effort.
-- The hidden cost is the `Arc<Mutex<HashMap>>` — every reader-submit
-  interaction goes through it. Easy to write, easy to leak a oneshot
-  forever if no one cleans up on stream close.
+## Read
 
-### Tina side
+- [`src/tokio_impl.rs`](src/tokio_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs)
+- [`src/lib.rs`](src/lib.rs) — the shared Tokio responder both sides
+  connect to (it's the test target, not a client driver).
 
-- The `MuxClient` isolate owns the `StreamId`, the read buffer, and the
-  pending count. There is no shared map and no `Arc<Mutex<_>>` — the
-  state lives behind a single mailbox.
-- Out-of-order arrival just works: the runtime delivers `tcp_read`
-  replies in the order bytes hit the socket, the parser walks complete
-  lines as they appear, and the `arrival_order` records exactly that.
-- The isolate-as-state-machine shape (Begin → Connected → Wrote → Read*
-  → Closed) reads cleanly. Each transition is one match arm.
+Each side is self-contained: server connection, client logic,
+arrival classification.
 
-### What was awkward
+## Tokio shape
 
-- **Cannot batch writes followed by reads on the same stream.** First
-  attempt issued `batch([write1, write2, write3, read])` because the
-  three writes are independent. The runtime wedged. Fix was to
-  concatenate the three requests into one `tcp_write(...)` and chain
-  `tcp_read` after the `Wrote` reply. This is a real ergonomics gap —
-  Tokio's "many concurrent awaits on one stream" pattern doesn't have a
-  clean Tina analogue, so multiplexing currently requires either
-  concatenated payloads or a more careful sequence of effects.
-- **Server in a dedicated Tokio runtime on its own thread.** The Tina
-  side has no native HTTP/multiplex client primitives, so the test
-  harness puts the responder behind its own `block_on(...)` on a
-  separate thread and signals shutdown via `tokio::sync::oneshot`. A
-  first attempt used `std::sync::mpsc::Receiver::recv` to block on
-  shutdown; that froze the responder's runtime because the executor
-  could not progress while the OS thread was blocked on a sync recv.
-  This is a small but real "two runtimes don't compose" footgun.
-- **Side-channel for the arrival log.** The arrivals end up in
-  `Arc<Mutex<Vec<u32>>>` because there is no clean Tina affordance for
-  "harvest results from this isolate when it finishes." Same shape as
-  the bound-addr smuggling we saw in earlier comparisons.
-- ~~Mailbox boilerplate, fifth copy.~~ **Resolved in phase 047:** the
-  client uses `DefaultThreadedMailboxFactory`.
-- **`#[allow(dead_code)]` on the message enum.** The message variants
-  carry `Result<_, CallError>` payloads we don't read, but rustc warns
-  on the unread `Ok` payload — the warning cannot be suppressed at the
-  variant level cleanly without disabling for the whole enum.
+The classic shared-state shape:
+
+- One reader task draining `read_line` in a loop.
+- One writer half producing `REQ <id>\n` per request.
+- An `Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>` linking them so
+  the reader can resolve the right oneshot for each parsed id.
+- A `Vec<oneshot::Receiver<()>>` to await all of them.
+
+Reader and writer touch the shared map; correctness depends on the
+caller setting up the oneshot *before* the write goes out (otherwise
+a fast reply could arrive before the entry exists).
+
+## Tina shape
+
+One isolate (`MuxClient`) owns everything:
+
+- `tcp_connect` → `tcp_write` (whole REQ batch in one buffer) →
+  `tcp_read` loop until enough RESP lines have been parsed →
+  `tcp_close_stream` → `stop()`.
+- The parser, the read buffer, and the arrival counter all live
+  behind the same mailbox. There is no shared map. The runtime
+  delivers `tcp_read` replies as bytes land, and the handler walks
+  complete lines.
+- Out-of-order arrival just works: the responder writes the lines as
+  they're ready, the kernel and Tina runtime deliver the bytes in
+  arrival order, the handler parses them in arrival order.
+
+## Discussion
+
+What feels better:
+
+- **No shared map.** The Tokio version's `Arc<Mutex<HashMap<id,
+  oneshot>>>` is real coupling between two tasks; the Tina version
+  doesn't have a story for "multiple tasks racing to mutate state"
+  because there's only one mailbox. The data is owned, period.
+- **No oneshot-per-request bookkeeping.** Tokio needs N oneshots and
+  N `Receiver::await` calls. Tina just counts arrivals against an
+  expected total in handler state.
+- **Out-of-order arrival doesn't need ceremony.** Tina sees bytes,
+  parses lines, increments a counter. There is nothing to "match
+  up" because the client never blocked on a specific id.
+
+What feels worse:
+
+- **The arrival log is still a side channel.** The Tina side passes
+  an `Arc<Mutex<Vec<u32>>>` into the isolate so the host can read
+  the result after `observe_isolate_complete`. App-specific data the
+  runtime can't know about — `FINDINGS.md` tracks this as typed
+  isolate result waiter work (047 retired the *runtime-knowable*
+  side channels like bound-address, but not app-data).
+- **The line-parsing loop is hand-rolled.** `position(b == b'\n')`
+  + `drain(..=idx)` is fine, but every framed-line client will write
+  it. A `tcp_read_lines(stream).reply(...)` shape would be welcome.
+- **Two runtimes for the Tina side.** The responder lives in a
+  Tokio runtime on a side thread; the client lives in a Tina
+  threaded runtime; they exchange the address via `std::sync::mpsc`.
+  The plumbing is small but it's there because Tina doesn't have a
+  native HTTP/RPC server *here* (this example is about the client
+  only).
+
+What this suggests:
+
+- Tina-as-a-client is genuinely usable for multiplexed protocols.
+  The pattern that requires `Arc<Mutex<HashMap<...>>>` in Tokio just
+  doesn't appear.
+- The remaining ergonomics frontier for clients is line/frame
+  parsing — a small `tcp_read_lines` or framed-codec helper would
+  shrink every connection-handling isolate.
+- The "host needs the isolate's app-data after it stops" pattern is
+  going to recur (mux arrival order, fetch results, etc.). A typed
+  observation handle that resolves to the isolate's final state
+  would close the last side-channel category.

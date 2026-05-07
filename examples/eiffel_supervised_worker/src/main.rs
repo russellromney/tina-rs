@@ -1,38 +1,29 @@
-use std::env;
-use std::process::ExitCode;
+use eiffel_supervised_worker::{Report, tina_impl, tokio_impl};
 
-mod comparison;
+fn main() -> anyhow::Result<()> {
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "both".to_string());
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    let mode = args.get(1).map(String::as_str).unwrap_or("compare");
-
-    match mode {
-        "tokio" => {
-            let report = comparison::tokio_impl::run();
-            comparison::print_report("tokio", &report);
-            ExitCode::SUCCESS
-        }
-        "tina" => {
-            let report = comparison::tina_impl::run();
-            comparison::print_report("tina", &report);
-            ExitCode::SUCCESS
-        }
-        "compare" => {
-            let tokio_report = comparison::tokio_impl::run();
-            comparison::print_report("tokio", &tokio_report);
-            let tina_report = comparison::tina_impl::run();
-            comparison::print_report("tina", &tina_report);
-            comparison::assert_equivalent(&tokio_report, &tina_report);
-            println!(
-                "\nboth sides processed the same jobs and recovered the same number of times."
-            );
-            ExitCode::SUCCESS
+    match mode.as_str() {
+        "tokio" => print_side("tokio", tokio_impl::run()?),
+        "tina" => print_side("tina", tina_impl::run()?),
+        "both" => {
+            print_side("tokio", tokio_impl::run()?);
+            print_side("tina", tina_impl::run()?);
         }
         other => {
-            eprintln!("usage: eiffel-supervised-worker [tokio|tina|compare]");
-            eprintln!("unknown mode: {other}");
-            ExitCode::FAILURE
+            anyhow::bail!(
+                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-supervised-worker [tokio|tina|both]"
+            );
         }
     }
+    Ok(())
+}
+
+fn print_side(side: &str, report: Report) {
+    println!(
+        "comparison=eiffel_supervised_worker side={} processed={} poisoned={} restarts={} exit_clean={}",
+        side, report.processed, report.poisoned, report.restarts, report.exit_clean,
+    );
 }

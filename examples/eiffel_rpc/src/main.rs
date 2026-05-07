@@ -1,54 +1,33 @@
-use std::process::Command;
+use eiffel_rpc::{Report, RunConfig, tina_impl, tokio_impl};
 
-use eiffel_rpc::comparison;
-
-fn main() {
+fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let mode = args.next().unwrap_or_else(|| "compare".to_string());
+    let mode = args.next().unwrap_or_else(|| "both".to_string());
     let burst = args
         .next()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("burst argument must be usize")
-        })
-        .unwrap_or(comparison::ComparisonConfig::default().burst);
+        .map(|v| v.parse::<usize>().expect("burst must be usize"))
+        .unwrap_or(RunConfig::default().burst);
+    let config = RunConfig { burst };
 
     match mode.as_str() {
-        "compare" => run_process_comparison(burst),
-        "tokio" => print_side("tokio", burst, comparison::run_tokio_side(burst)),
-        "tina" => print_side("tina", burst, comparison::run_tina_side(burst)),
+        "tokio" => print_side("tokio", config, tokio_impl::run(config)?),
+        "tina" => print_side("tina", config, tina_impl::run(config)?),
+        "both" => {
+            print_side("tokio", config, tokio_impl::run(config)?);
+            print_side("tina", config, tina_impl::run(config)?);
+        }
         other => {
-            panic!(
-                "unknown mode {other:?}; expected compare, tokio, or tina. usage: eiffel-rpc [compare|tokio|tina] [burst]"
+            anyhow::bail!(
+                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-rpc [tokio|tina|both] [burst]"
             );
         }
     }
+    Ok(())
 }
 
-fn run_process_comparison(burst: usize) {
-    let exe = std::env::current_exe().expect("current executable path");
-    for side in ["tokio", "tina"] {
-        let output = Command::new(&exe)
-            .arg(side)
-            .arg(burst.to_string())
-            .output()
-            .unwrap_or_else(|error| panic!("spawn {side} comparison process: {error}"));
-        if !output.status.success() {
-            panic!(
-                "{side} comparison process failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-}
-
-fn print_side(side: &str, burst: usize, report: comparison::SideReport) {
+fn print_side(side: &str, config: RunConfig, report: Report) {
     println!(
         "comparison=eiffel_rpc side={} burst={} ok={} full={} other={}",
-        side, burst, report.ok, report.full, report.other,
+        side, config.burst, report.ok, report.full, report.other,
     );
 }

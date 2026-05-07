@@ -1,0 +1,136 @@
+//! Tina under `tina-sim`: a seeded simulator with deterministic
+//! fault injection. Two runs at the same seed produce byte-identical
+//! traces; a different seed produces a different trace fingerprint.
+//! `stable_trace_hash` (047 Rock 3) is the canonical replay
+//! fingerprint — no `format!("{event:?}").hash(...)`.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
+use tina::prelude::*;
+use tina_runtime::{sleep, stable_trace_hash};
+use tina_sim::{FaultConfig, FaultMode, LocalSendFaultMode, Simulator, SimulatorConfig};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub seed_a: u64,
+    pub run_a1_event_count: usize,
+    pub run_a2_event_count: usize,
+    pub run_a1_fingerprint: u64,
+    pub run_a2_fingerprint: u64,
+    pub seed_b: u64,
+    pub run_b1_event_count: usize,
+    pub run_b1_fingerprint: u64,
+    pub messages_received: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProducerMsg {
+    Tick(u32),
+}
+
+struct Producer {
+    sink: Address<SinkMsg>,
+    remaining: u32,
+}
+
+#[tina_runtime::isolate(message = ProducerMsg, send = Outbound<SinkMsg>)]
+impl Producer {
+    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+        match msg {
+            ProducerMsg::Tick(count) => {
+                let next = count + 1;
+                let mut effects: Vec<Effect<Self>> = vec![send(self.sink, SinkMsg::Got(count))];
+                if self.remaining > 0 {
+                    self.remaining -= 1;
+                    let delay = Duration::from_millis(1 + u64::from(next % 3));
+                    effects.push(sleep(delay).reply(move |_| ProducerMsg::Tick(next)));
+                }
+                batch(effects)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SinkMsg {
+    Got(u32),
+}
+
+#[derive(Debug, Default)]
+struct Sink {
+    received: Rc<RefCell<Vec<u32>>>,
+}
+
+#[tina_runtime::isolate(message = SinkMsg)]
+impl Sink {
+    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+        match msg {
+            SinkMsg::Got(value) => {
+                self.received.borrow_mut().push(value);
+                noop()
+            }
+        }
+    }
+}
+
+fn run_once(seed: u64) -> (usize, u64, usize) {
+    let config = SimulatorConfig {
+        seed,
+        faults: FaultConfig {
+            // Make the seed do real work: 1-in-3 timer wakes get
+            // pushed by an extra tick of virtual time, deterministically
+            // chosen by seed.
+            timer_wake: FaultMode::DelayBy {
+                one_in: 3,
+                by: Duration::from_millis(1),
+            },
+            local_send: LocalSendFaultMode::DelayByRounds {
+                one_in: 4,
+                rounds: 1,
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut sim = Simulator::new(SingleShard, config);
+
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let sink = sim.register_with_mailbox_capacity(
+        Sink {
+            received: Rc::clone(&received),
+        },
+        16,
+    );
+    let producer = sim.register_with_mailbox_capacity(Producer { sink, remaining: 5 }, 16);
+
+    sim.try_send(producer, ProducerMsg::Tick(0)).expect("kick");
+    sim.run_until_quiescent();
+
+    let trace = sim.trace();
+    let fingerprint = stable_trace_hash(trace.iter());
+    let received_count = received.borrow().len();
+    (trace.len(), fingerprint, received_count)
+}
+
+pub fn run() -> anyhow::Result<Report> {
+    let seed_a = 42;
+    let seed_b = 99;
+
+    let (run_a1_event_count, run_a1_fingerprint, messages_received) = run_once(seed_a);
+    let (run_a2_event_count, run_a2_fingerprint, _) = run_once(seed_a);
+    let (run_b1_event_count, run_b1_fingerprint, _) = run_once(seed_b);
+
+    Ok(Report {
+        seed_a,
+        run_a1_event_count,
+        run_a2_event_count,
+        run_a1_fingerprint,
+        run_a2_fingerprint,
+        seed_b,
+        run_b1_event_count,
+        run_b1_fingerprint,
+        messages_received,
+    })
+}
