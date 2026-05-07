@@ -53,4 +53,4 @@ cargo test --manifest-path examples/eiffel_cancellation_chain/Cargo.toml
 
 ## Findings touched
 
-- See FINDINGS Round 2 finding 14 (external cancellation API).
+- See FINDINGS finding 8 (external cancellation API).

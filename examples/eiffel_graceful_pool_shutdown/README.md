@@ -44,9 +44,11 @@ FrontendMsg::Shutdown => {
   frontend mailbox there is plenty of room; the host calls
   `runtime.send_observed_until(...)` (Phase 062 Rock 4) which
   retries `MailboxFull` / `IngressFull` up to a deadline. The
-  hand-rolled retry loop is gone, but the underlying lifecycle
-  question (control message through the data mailbox) is the same
-  one in `eiffel_graceful_drain_server` and Round 2 finding 12.
+  hand-rolled retry loop is gone, but the underlying shape (a
+  control message rides the data mailbox) is the same one in
+  `eiffel_hot_key_fairness`'s `Drain(admitted)`. See FINDINGS
+  finding 9 (drain helper for `PendingReplies` at service stop)
+  for the related product gap.
 
 ## Tokio footgun
 

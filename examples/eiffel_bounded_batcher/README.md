@@ -37,9 +37,10 @@ cargo test --manifest-path examples/eiffel_bounded_batcher/Cargo.toml
 
 - The batcher mixes "rate-limit timer" state with "pending replies"
   state. The generation counter for the timer (`timer_gen` /
-  `pending_timer_gen`) is the same shape as in
-  `eiffel_periodic_batcher` and `eiffel_rate_limited_worker`. See
-  Round 2 finding 5: a `SingleSleepGate` helper would shrink this.
+  `pending_timer_gen`) handles the case where a size flush
+  invalidates a still-pending Tick. `SingleCallGate` (Phase 062
+  Rock 5) names "one timer in flight, plus N queued" but does not
+  cover stale-tick invalidation, so it does not apply here.
 - `Effect::Batch(reply_to(...))` constructs a Vec of effects per
   flush. Fine for small batches; for thousand-caller batches this
   is real allocation.

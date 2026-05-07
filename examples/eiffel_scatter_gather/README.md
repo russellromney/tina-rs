@@ -52,10 +52,11 @@ What is *not* bounded:
 ## Tina shape
 
 The coordinator captures the caller as a deferred slot via
-`PendingReplies::try_capture(ctx, qid)`. On
-admission failure (`Full`) it answers the caller immediately with
-`reply(AggregateReply(0))` *without* consuming the caller — the
-slot ceremony is conditional on capacity.
+`PendingReplies::try_capture(ctx, qid)`. On admission failure
+(`Full`) it answers the caller immediately with
+`reply(AggregateReply::Full)` *without* consuming the caller —
+the slot ceremony is conditional on capacity. The successful
+aggregate is `AggregateReply::Ok(sum)`.
 
 Each admitted query becomes:
 
@@ -76,7 +77,7 @@ the last per-query reply lands:
 
 ```rust
 let slot = self.pending.take(&qid).unwrap();
-return reply_to(slot, AggregateReply(done.sum));
+return reply_to(slot, AggregateReply::Ok(done.sum));
 ```
 
 What is bounded by name:
