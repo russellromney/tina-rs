@@ -61,5 +61,6 @@ If someone with a runtime/substrate brain reads Tina, they will ask:
 - What perf claim is proved, and what is only possible later?
 
 The short answer: Tina owns semantics and resource truth; Betelgeuse is the
-current portable live I/O substrate; `tina-sim` is the deterministic oracle;
-North Sea later swaps in a Linux `io_uring` backend without changing user code.
+canonical portable live I/O substrate; `tina-sim` is the deterministic oracle;
+North Sea is the future Linux `io_uring` backend under the same driver
+contract.

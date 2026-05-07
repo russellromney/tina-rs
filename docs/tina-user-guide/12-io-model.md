@@ -16,11 +16,12 @@ Tina has three important layers:
 
 - `tina-runtime` owns Tina semantics: effects, scheduling, calls, timeout,
   tracing, shutdown, and resource IDs.
-- Betelgeuse is the current portable live I/O machine under `tina-runtime`.
+- Betelgeuse is the canonical portable live I/O machine under `tina-runtime`.
 - `tina-sim` is the deterministic simulator for replay and DST.
 
 North Sea is the future Linux `io_uring` backend. It should change the
-substrate, not the application shape.
+substrate, not the application shape. Betelgeuse and North Sea should both sit
+under the same Tina driver contract.
 
 ## What Betelgeuse Does Here
 
