@@ -312,57 +312,62 @@ async fn admission_full_returns_synchronously_no_hang() {
 }
 
 #[tokio::test]
-async fn cancelled_call_releases_slot_when_reply_lands() {
-    // Cancelling an awaiting future must mark the pending entry so
-    // that when the eventual reply lands the shim still releases the
-    // admission slot — otherwise a slow stream of cancellations
-    // would leak slots and starve future calls.
+async fn cancelled_call_releases_slot_synchronously() {
+    // The bridge's `CancelGuard` must release the admission slot
+    // synchronously when the awaiting future is dropped — without
+    // waiting for the underlying request to time out at the
+    // `Client`. A late reply for the cancelled correlator is
+    // discarded by the shim.
     let runtime = build_runtime();
-    let stub = register_stub(&runtime, StubBehavior::Echo);
+    let stub = register_stub(&runtime, StubBehavior::NeverReply);
     let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
 
-    // Cancel a call mid-flight by aborting its task. The Echo stub
-    // still emits its reply; the shim sees `Some(None)` and releases
-    // the slot regardless of whether the awaiter is alive.
-    let bridge_clone = bridge.clone();
+    // Hold the only slot with a NeverReply call. If admission did
+    // not release on cancel, the next call would be `Full` for the
+    // entire request deadline (60s) — we'd see it instantly.
+    let bridge_a = bridge.clone();
     let abandoned = tokio::spawn(async move {
-        bridge_clone
+        bridge_a
             .call(
                 |corr, rt| {
-                    EchoClient::say_request("x".into(), Duration::from_secs(60), corr, rt, 1024)
+                    EchoClient::say_request("a".into(), Duration::from_secs(60), corr, rt, 1024)
                 },
                 |bytes| EchoClient::say_decode_reply(bytes, 1024),
             )
             .await
     });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
     abandoned.abort();
     let _ = abandoned.await;
 
-    // Give the runtime a moment to deliver the abandoned reply and
-    // release the slot.
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Slot should be free. The next call must succeed (in the sense
-    // of completing — Echo replies with the request payload, which
-    // is JSON tuple bytes; the macro decoder rejects them, so the
-    // outcome is `Encoding`, not `Full`).
+    // After cancel, the slot is free. A fresh call must be
+    // *admitted* — i.e., it must reach `rx.await` and hang there
+    // (because `NeverReply` never replies). A short timeout proves
+    // admission happened: we expect `Elapsed`, not
+    // `Ok(Err(BridgeError::Full))`.
+    let bridge_b = bridge.clone();
     let outcome = tokio::time::timeout(
-        Duration::from_secs(2),
-        bridge.call(
-            |corr, rt| EchoClient::say_request("y".into(), Duration::from_secs(1), corr, rt, 1024),
+        Duration::from_millis(250),
+        bridge_b.call(
+            |corr, rt| EchoClient::say_request("b".into(), Duration::from_secs(60), corr, rt, 1024),
             |bytes| EchoClient::say_decode_reply(bytes, 1024),
         ),
     )
-    .await
-    .expect("post-cancellation call must not hang");
+    .await;
 
-    assert!(
-        !matches!(outcome, Err(BridgeError::Full)),
-        "expected slot to have been released after cancelled call's reply landed; got {outcome:?}",
-    );
+    match outcome {
+        Err(_elapsed) => {
+            // Admitted; hung on rx.await. ✓
+        }
+        Ok(Err(BridgeError::Full)) => {
+            panic!("post-cancel call returned Full — slot was not released by CancelGuard");
+        }
+        Ok(other) => {
+            panic!("unexpected post-cancel outcome: {other:?}");
+        }
+    }
 }
 
 #[tokio::test]
