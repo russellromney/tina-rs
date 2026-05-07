@@ -39,7 +39,7 @@ atomically per `POST`. The whole thing fits in one async block.
 
 ## Tina shape
 
-Three first-class HTTP isolates, plus one helper:
+Three first-class HTTP isolates, plus a scripting Driver:
 
 - **`Counter`** — `#[isolate(message = HttpRequest, reply =
   HttpResponse)]`. The handler dispatches through a
@@ -52,12 +52,12 @@ Three first-class HTTP isolates, plus one helper:
   registered with `HttpClientConfig::dev()`. Each request goes
   through `call(client, HttpClientMsg::call(target, request),
   timeout)`.
-- **`Driver`** — a one-shot isolate per request that takes a
-  `Begin { client, target, request }`, issues the `call(...)`,
-  awaits `Returned(CallOutcome<...>)`, forwards the result to the
-  host thread via `std::sync::mpsc`, and `stop()`s. The host's
-  `run_request()` helper just spawns one of these per call and
-  blocks on `recv_timeout`.
+- **`Driver`** — single isolate that walks the whole script. A
+  `Step` field tracks where the sequence is; each step dispatches
+  one `call(client, ...).reply(DriverMsg::Returned)`. After the last
+  step the driver `stop_with(report)`s and the host reads the
+  typed `Report` through `runtime.observe_result::<Report>` (Phase
+  059 Rock 1) — no `mpsc::channel`, no per-request bridge.
 
 ## Discussion
 
@@ -70,31 +70,21 @@ What feels better:
   `CallOutcome<Result<HttpResponse, HttpClientError>>`; the
   `Full`, `Closed`, `Timeout` arms surface as typed errors at the
   call site. The `reqwest::Client` version has no equivalent.
+- **One typed final value.** `stop_with(report)` +
+  `observe_result::<Report>` is the whole host-isolate bridge. The
+  earlier `Driver` + `mpsc::Sender` per request is gone.
 - **`HttpServerConfig::dev()` / `HttpClientConfig::dev()`.**
   Roomy presets for examples; `pressure()` is the cap-matters
-  variant (per the new checklist entry on HTTP server / client
+  variant (per the checklist entry on HTTP server / client
   configs).
 
 What feels worse:
 
-- **The `Driver` isolate is the bridge between sync host code and
-  isolate-driven `call(...)`.** It's small (~25 lines) and reusable
-  per call, but it's the friction of "the host wants to await an
-  in-process call" without a typed observation handle for that.
-- **`run_request` blocks on `mpsc::recv_timeout`.** That's the
-  documented pattern for sync host code awaiting a Tina-side call,
-  but a typed `IsolateResultWaiter<T>` would shrink it to one line.
 - **Configuring one runtime to host both server and client** means
   the spawn order matters (server first, then client), and shutdown
   is two `try_send`s plus a `runtime.shutdown()`. Tokio's
   `with_graceful_shutdown` is one bookkeeping line shorter.
-
-What this suggests:
-
-- A typed "wait for this isolate's next call to complete" handle
-  would replace `Driver` + `mpsc` in every example that does sync
-  host-thread bridging (this one, `eiffel_persistent_counter`,
-  `eiffel_outbound_fetch`).
-- The native HTTP server + client pair is a strong demonstration of
-  the runtime: `tina_http` is a real story on top of the same
-  isolate model the rest of the runtime uses.
+- **`Step` enum + `dispatch`/`absorb` is one explicit state
+  machine per scripted scenario.** Tokio's async/await reads
+  linearly. The continuation pattern from chapter 16 of the user
+  guide names this shape; the trace is honest about every step.
