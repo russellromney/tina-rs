@@ -22,6 +22,9 @@ use crate::types::{
 };
 
 /// Messages handled by [`ReqwestWorker`].
+///
+/// Only [`ReqwestMsg::Send`] is constructible by user code. To close
+/// the worker use [`ReqwestCloser::close`].
 #[derive(Debug)]
 pub enum ReqwestMsg {
     /// Issue one outbound HTTP request and reply with the outcome.
@@ -29,10 +32,6 @@ pub enum ReqwestMsg {
     /// Internal sleep wakeup. User code must not construct.
     #[doc(hidden)]
     Poll(u64),
-    /// Drain. Stop admitting new sends. In-flight requests run to
-    /// natural completion or per-attempt timeout. Idempotent. Equivalent
-    /// to calling [`ReqwestCloser::close`].
-    Close,
 }
 
 enum SlotKind {
@@ -595,10 +594,6 @@ impl<S: Shard + 'static> Isolate for ReqwestWorker<S> {
         match msg {
             ReqwestMsg::Send(request) => self.admit_initial(request),
             ReqwestMsg::Poll(id) => self.poll(id),
-            ReqwestMsg::Close => {
-                self.closed.store(true, Ordering::Release);
-                noop()
-            }
         }
     }
 }

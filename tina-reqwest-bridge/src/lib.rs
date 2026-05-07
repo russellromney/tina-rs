@@ -21,13 +21,11 @@
 //!     ReqwestConfig, ReqwestError, ReqwestMsg, ReqwestRequest, ReqwestResponse,
 //!     ReqwestWorker,
 //! };
-//! use tina_runtime::{
-//!     DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig, call,
-//! };
+//! use tina_runtime::{CallOutcome, RuntimeCall, call};
 //!
 //! enum AppMsg {
 //!     Start,
-//!     HttpReturned(Result<ReqwestResponse, ReqwestError>),
+//!     HttpReturned(CallOutcome<Result<ReqwestResponse, ReqwestError>>),
 //! }
 //!
 //! struct App {
@@ -77,8 +75,9 @@
 //!   bridge boundary only.
 //! - Cancellation precision: once the spawned reqwest task starts on
 //!   Tokio, the bridge can abort the task but cannot guarantee that
-//!   bytes are not already on the wire. Late results are discarded
-//!   and counted in metrics.
+//!   bytes are not already on the wire. Late results are dropped at
+//!   the runtime layer (visible as `CallReplyRejected` in the
+//!   trace), not counted in bridge metrics.
 //! - Polling latency: the bridge wakes via Tina's `sleep` to
 //!   re-check the result channel each `poll_interval`. That is
 //!   visible chatter in the trace and adds bounded latency to
@@ -123,8 +122,7 @@
 //!
 //! # Close
 //!
-//! Closing the worker (via [`ReqwestCloser::close`] or
-//! [`ReqwestMsg::Close`]) is a graceful drain: new sends reply
+//! [`ReqwestCloser::close`] is a graceful drain: new sends reply
 //! [`ReqwestError::Closed`], in-flight requests run to natural
 //! completion (or hit their per-attempt timeout). To force-cancel
 //! in-flight work, drop the hosting Tina runtime.
