@@ -105,6 +105,8 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Type-erased payload for [`Effect::StopWith`].
 ///
@@ -818,9 +820,10 @@ where
     /// honor an [`Effect::Reply`] for the same call. Returning
     /// `Effect::Reply` after `take_reply_slot` is a no-op against the
     /// original caller.
-    pub fn take_reply_slot<R>(&mut self) -> Result<DeferredReply<R>, TakeReplySlotError>
+    pub fn take_reply_slot<I>(&mut self) -> Result<DeferredReply<I::Reply>, TakeReplySlotError>
     where
-        R: 'static,
+        I: Isolate<Shard = S>,
+        I::Reply: 'static,
     {
         // Peek routing first so a Remote refusal does not consume the caller.
         match self.caller.as_ref().map(|c| c.routing()) {
@@ -1249,6 +1252,7 @@ impl<R> DeferredReply<R> {
 
     /// Constructs a typed slot from a runtime-allocated handle.
     /// Runtime-only.
+    ///
     #[doc(hidden)]
     pub fn from_handle(handle: DeferredReplyHandle) -> Self {
         Self {
@@ -1262,13 +1266,14 @@ impl<R> DeferredReply<R> {
 ///
 /// Application code does not construct or unwrap this directly; it lives
 /// inside [`DeferredReply<R>`]. Runtime crates allocate it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DeferredReplyHandle {
     shared: Rc<DeferredSlotShared>,
 }
 
 impl DeferredReplyHandle {
     /// Constructs a handle from runtime-owned shared state. Runtime-only.
+    ///
     #[doc(hidden)]
     pub fn from_shared(shared: Rc<DeferredSlotShared>) -> Self {
         Self { shared }

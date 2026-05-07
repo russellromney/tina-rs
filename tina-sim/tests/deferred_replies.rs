@@ -55,7 +55,7 @@ impl Isolate for DeferredSvc {
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             SvcMsg::Capture => {
-                self.slot = Some(ctx.take_reply_slot::<SvcReply>().unwrap());
+                self.slot = Some(ctx.take_reply_slot::<DeferredSvc>().unwrap());
                 noop()
             }
             SvcMsg::ReplyStored => {
@@ -213,6 +213,58 @@ fn sim_dropped_open_slot_emits_dropped_event() {
         )),
         1
     );
+    assert_eq!(out.borrow().as_slice(), [CallOutcome::Closed]);
+}
+
+#[test]
+fn sim_panic_after_capture_drops_slot_and_closes_caller() {
+    #[derive(Debug)]
+    struct PanicAfterCapture;
+
+    impl Isolate for PanicAfterCapture {
+        type Message = SvcMsg;
+        type Reply = SvcReply;
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type Call = RuntimeCall<SvcMsg>;
+        type Shard = DefShard;
+
+        fn handle(
+            &mut self,
+            _msg: Self::Message,
+            ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            let _slot = ctx.take_reply_slot::<PanicAfterCapture>().unwrap();
+            panic!("boom after deferred capture");
+        }
+    }
+
+    let mut sim = Simulator::new(DefShard, SimulatorConfig::default());
+    let svc = sim.register(PanicAfterCapture);
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register(Caller {
+        timeout: Duration::from_secs(60),
+        out: Rc::clone(&out),
+    });
+
+    sim.try_send(caller, CallerMsg::Start(svc)).unwrap();
+    step_to_idle(&mut sim);
+
+    assert_eq!(out.borrow().as_slice(), [CallOutcome::Closed]);
+    assert_eq!(
+        count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::DeferredReplyCaptured { .. }
+        )),
+        1
+    );
+    assert_eq!(
+        count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::DeferredReplyDropped { .. }
+        )),
+        1
+    );
 }
 
 #[test]
@@ -246,7 +298,7 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         ) -> Effect<Self> {
             match msg {
                 HaltMsg::Capture => {
-                    self.slots.push(ctx.take_reply_slot::<HaltReply>().unwrap());
+                    self.slots.push(ctx.take_reply_slot::<HaltSvc>().unwrap());
                     noop()
                 }
                 HaltMsg::Halt => Effect::Stop,
@@ -306,6 +358,8 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         matches!(k, RuntimeEventKind::DeferredReplyDropped { .. })
     });
     assert_eq!(dropped, 2);
+    assert_eq!(outs[0].borrow().as_slice(), [CallOutcome::Closed]);
+    assert_eq!(outs[1].borrow().as_slice(), [CallOutcome::Closed]);
 }
 
 #[test]

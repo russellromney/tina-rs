@@ -332,13 +332,14 @@ where
     ///
     /// Use this instead of hand-rolling
     /// `sweep` / `len < cap` / `take_reply_slot` / `try_insert`.
-    pub fn try_capture<S>(
+    pub fn try_capture<I, S>(
         &mut self,
         ctx: &mut tina::Context<'_, S>,
         key: K,
     ) -> Result<(), TryCaptureError>
     where
         S: tina::Shard + ?Sized,
+        I: tina::Isolate<Reply = R, Shard = S>,
         R: 'static,
     {
         self.sweep();
@@ -356,7 +357,7 @@ where
             return Err(TryCaptureError::Full);
         }
 
-        let slot = match ctx.take_reply_slot::<R>() {
+        let slot = match ctx.take_reply_slot::<I>() {
             Ok(slot) => slot,
             Err(tina::TakeReplySlotError::NoCaller) => return Err(TryCaptureError::NoCaller),
             Err(tina::TakeReplySlotError::CrossShardUnsupported) => {

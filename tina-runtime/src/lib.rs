@@ -958,6 +958,7 @@ where
                         Some(handler_started.into()),
                         RuntimeEventKind::HandlerPanicked,
                     );
+                    self.drop_pending_deferred_captures(handler_panicked.into());
                     self.stop_entry(index, isolate_id, handler_panicked.into());
                     self.supervise_panic(
                         RegisteredAddress {
@@ -1084,18 +1085,47 @@ where
         // Single pass: independent Rcs cannot cascade.
         let dropped = self.promoted_slots.sweep_dropped();
         for record in dropped {
-            if record.shared.state() == DeferredSlotState::Open {
-                record.shared.set_state(DeferredSlotState::Closed);
-                self.push_event(
-                    record.capturing_isolate,
-                    None,
-                    RuntimeEventKind::DeferredReplyDropped {
-                        slot_id: record.slot_id,
-                        call_id: record.call_id,
-                    },
-                );
-            }
+            self.drop_promoted_deferred_slot(record, None);
         }
+    }
+
+    fn drop_pending_deferred_captures(&mut self, cause: CauseId) {
+        for capture in self.deferred_registry.drain_pending() {
+            capture.shared.set_state(DeferredSlotState::Closed);
+            let slot_id = DeferredSlotId::new(capture.slot_id);
+            let call_id = CallId::new(capture.call_id);
+            let captured = self.push_event(
+                capture.capturing_isolate,
+                Some(cause),
+                RuntimeEventKind::DeferredReplyCaptured { slot_id, call_id },
+            );
+            let dropped = self.push_event(
+                capture.capturing_isolate,
+                Some(captured.into()),
+                RuntimeEventKind::DeferredReplyDropped { slot_id, call_id },
+            );
+            self.complete_isolate_call(call_id, dropped.into(), CallOutcome::Closed);
+        }
+    }
+
+    fn drop_promoted_deferred_slot(
+        &mut self,
+        record: deferred::DeferredSlotRecord,
+        cause: Option<CauseId>,
+    ) {
+        if record.shared.state() != DeferredSlotState::Open {
+            return;
+        }
+        record.shared.set_state(DeferredSlotState::Closed);
+        let dropped = self.push_event(
+            record.capturing_isolate,
+            cause,
+            RuntimeEventKind::DeferredReplyDropped {
+                slot_id: record.slot_id,
+                call_id: record.call_id,
+            },
+        );
+        self.complete_isolate_call(record.call_id, dropped.into(), CallOutcome::Closed);
     }
 
     fn execute_effect(
@@ -2235,17 +2265,7 @@ where
         // until the entry record is dropped, so sweep would not
         // notice. Walk the registry directly.
         for record in self.promoted_slots.take_by_isolate(isolate_id) {
-            if record.shared.state() == DeferredSlotState::Open {
-                record.shared.set_state(DeferredSlotState::Closed);
-                self.push_event(
-                    isolate_id,
-                    Some(stopped.into()),
-                    RuntimeEventKind::DeferredReplyDropped {
-                        slot_id: record.slot_id,
-                        call_id: record.call_id,
-                    },
-                );
-            }
+            self.drop_promoted_deferred_slot(record, Some(stopped.into()));
         }
         self.cancel_driver_calls_for_requester(RegisteredAddress {
             shard: self.shard.id(),

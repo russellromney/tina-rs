@@ -70,7 +70,7 @@ impl Isolate for DeferredSvc {
         match msg {
             SvcRequest::Capture(payload) => {
                 self.payload = payload;
-                self.slot = Some(ctx.take_reply_slot::<SvcReply>().unwrap());
+                self.slot = Some(ctx.take_reply_slot::<DeferredSvc>().unwrap());
                 noop()
             }
             SvcRequest::ReplyStored => {
@@ -82,7 +82,7 @@ impl Isolate for DeferredSvc {
                 noop()
             }
             SvcRequest::TakeWithoutCaller => {
-                match ctx.take_reply_slot::<SvcReply>() {
+                match ctx.take_reply_slot::<DeferredSvc>() {
                     Err(TakeReplySlotError::NoCaller) => {
                         self.probe.borrow_mut().take_no_caller_errors += 1;
                     }
@@ -245,9 +245,61 @@ fn dropping_open_deferred_slot_emits_dropped_terminal_fact() {
         )),
         1
     );
-    // Caller never received a reply. It will time out separately; not
-    // asserted here.
-    assert!(outcomes.borrow().is_empty());
+    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Closed]);
+}
+
+#[test]
+fn panic_after_capture_drops_slot_and_closes_caller() {
+    #[derive(Debug)]
+    struct PanicAfterCapture;
+
+    impl Isolate for PanicAfterCapture {
+        type Message = SvcRequest;
+        type Reply = SvcReply;
+        type Send = Outbound<NeverOutbound>;
+        type Spawn = Infallible;
+        type Call = Infallible;
+        type Shard = TestShard;
+
+        fn handle(
+            &mut self,
+            _msg: Self::Message,
+            ctx: &mut Context<'_, Self::Shard>,
+        ) -> Effect<Self> {
+            let _slot = ctx.take_reply_slot::<PanicAfterCapture>().unwrap();
+            panic!("boom after deferred capture");
+        }
+    }
+
+    let (mut runtime, _clock) = new_manual_runtime();
+    let svc = runtime.register(PanicAfterCapture, TestMailbox::new(4));
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        DeferredCaller {
+            timeout: Duration::from_secs(60),
+            outcomes: Rc::clone(&outcomes),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(caller, CallerMsg::Start(svc, 1)).unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Closed]);
+    assert_eq!(
+        count_kind(runtime.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::DeferredReplyCaptured { .. }
+        )),
+        1
+    );
+    assert_eq!(
+        count_kind(runtime.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::DeferredReplyDropped { .. }
+        )),
+        1
+    );
 }
 
 #[test]
@@ -328,7 +380,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
             _msg: Self::Message,
             ctx: &mut Context<'_, Self::Shard>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot::<u32>().unwrap();
+            let _slot = ctx.take_reply_slot::<CaptureThenReply>().unwrap();
             // Drop the slot immediately and try to reply normally —
             // the captured slot's Drop will surface as Dropped event,
             // and Effect::Reply has no caller anymore.
@@ -398,14 +450,13 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         .count();
     assert_eq!(dropped, 1);
 
-    // Reply should NOT have settled the caller — it had no call
-    // context to deliver to.
-    assert!(outcomes.borrow().is_empty());
+    // Dropping the captured slot closes the caller immediately.
+    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Closed]);
 
-    // Caller will time out; advance and check.
+    // Advancing past the old deadline must not produce a ghost timeout.
     clock.advance(Duration::from_millis(30));
     step_to_idle(&mut runtime);
-    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Timeout]);
+    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Closed]);
 }
 
 #[test]
@@ -442,7 +493,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         ) -> Effect<Self> {
             match msg {
                 FrontendMsg::Capture(key) => {
-                    let slot = ctx.take_reply_slot::<FrontendReply>().unwrap();
+                    let slot = ctx.take_reply_slot::<Frontend>().unwrap();
                     if let Err(err) = self.pending.try_insert(key, slot) {
                         // Slot drops on err; surfaces as Dropped event.
                         let _ = err;
@@ -600,7 +651,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
                 FanSvcMsg::Capture => {
                     self.next_id += 1;
                     self.ids.push(self.next_id);
-                    let slot = ctx.take_reply_slot::<FanReply>().unwrap();
+                    let slot = ctx.take_reply_slot::<FanSvc>().unwrap();
                     self.slots.push(slot);
                     noop()
                 }
@@ -790,7 +841,7 @@ impl Isolate for PoolFrontend {
                     // capturing the slot.
                     return tina::reply(FrontendReply::Full);
                 }
-                let slot = ctx.take_reply_slot::<FrontendReply>().unwrap();
+                let slot = ctx.take_reply_slot::<PoolFrontend>().unwrap();
                 let req_id = self.next_req;
                 self.next_req += 1;
                 self.pending
@@ -1004,7 +1055,7 @@ impl Isolate for Coordinator {
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
             CoordMsg::Start(payload) => {
-                self.slot = Some(ctx.take_reply_slot::<AggregateReport>().unwrap());
+                self.slot = Some(ctx.take_reply_slot::<Coordinator>().unwrap());
                 self.collected = vec![None; self.targets.len()];
                 self.remaining = self.targets.len();
                 let mut subcalls = Vec::with_capacity(self.targets.len());
@@ -1209,8 +1260,8 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
 #[test]
 fn service_stop_drops_pending_promises_visibly() {
     // A service that captures slots into its state, then stops on
-    // command. Stopping drops the isolate's state (and the slots'
-    // user-side Rcs); sweep notices and emits Dropped events.
+    // command. Stop drains those slots, emits Dropped, and closes the
+    // original callers.
 
     #[derive(Debug)]
     enum SvcStopMsg {
@@ -1241,7 +1292,7 @@ fn service_stop_drops_pending_promises_visibly() {
         ) -> Effect<Self> {
             match msg {
                 SvcStopMsg::Capture => {
-                    self.slots.push(ctx.take_reply_slot::<StopReply>().unwrap());
+                    self.slots.push(ctx.take_reply_slot::<HaltSvc>().unwrap());
                     noop()
                 }
                 SvcStopMsg::Halt => Effect::Stop,
@@ -1331,6 +1382,8 @@ fn service_stop_drops_pending_promises_visibly() {
         .filter(|e| matches!(e.kind(), RuntimeEventKind::DeferredReplyDropped { .. }))
         .count();
     assert_eq!(dropped, 2, "service stop must drop both pending slots");
+    assert_eq!(out_a.borrow().as_slice(), [CallOutcome::Closed]);
+    assert_eq!(out_b.borrow().as_slice(), [CallOutcome::Closed]);
 }
 
 #[test]
@@ -1397,7 +1450,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum HelpReply {
-        // Captured-and-pending callers stay waiting in this test.
+        // Captured callers stay pending unless the helper rejects.
         #[allow(dead_code)]
         Ok,
         Full,
@@ -1422,7 +1475,10 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
             ctx: &mut Context<'_, Self::Shard>,
         ) -> Effect<Self> {
             match msg {
-                HelpMsg::Capture(id) => match self.pending.try_capture::<TestShard>(ctx, id) {
+                HelpMsg::Capture(id) => match self
+                    .pending
+                    .try_capture::<HelpSvc, TestShard>(ctx, id)
+                {
                     Ok(()) => noop(),
                     Err(crate::PendingRepliesTryCaptureError::Full) => tina::reply(HelpReply::Full),
                     Err(other) => panic!("unexpected try_capture error: {other:?}"),
@@ -1533,7 +1589,10 @@ impl Isolate for BridgeWorker {
 
     fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            BridgeMsg::Submit(id) => match self.pending.try_capture::<TestShard>(ctx, id) {
+            BridgeMsg::Submit(id) => match self
+                .pending
+                .try_capture::<BridgeWorker, TestShard>(ctx, id)
+            {
                 Ok(()) => noop(),
                 Err(crate::PendingRepliesTryCaptureError::Full) => tina::reply(BridgeReply::Full),
                 Err(other) => panic!("unexpected try_capture error: {other:?}"),

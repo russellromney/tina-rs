@@ -464,6 +464,7 @@ where
                         Some(handler_started.into()),
                         RuntimeEventKind::HandlerPanicked,
                     );
+                    self.drop_pending_deferred_captures(panicked.into());
                     self.stop_entry(index, isolate_id, panicked.into());
                     self.supervise_panic(
                         RegisteredAddress {
@@ -3766,18 +3767,47 @@ where
     fn sweep_dropped_deferred_slots(&mut self) {
         let dropped = self.promoted_slots.sweep_dropped();
         for record in dropped {
-            if record.shared.state() == tina::DeferredSlotState::Open {
-                record.shared.set_state(tina::DeferredSlotState::Closed);
-                self.push_event(
-                    record.capturing_isolate,
-                    None,
-                    RuntimeEventKind::DeferredReplyDropped {
-                        slot_id: record.slot_id,
-                        call_id: record.call_id,
-                    },
-                );
-            }
+            self.drop_promoted_deferred_slot(record, None);
         }
+    }
+
+    fn drop_pending_deferred_captures(&mut self, cause: tina_runtime::CauseId) {
+        for capture in self.deferred_registry.drain_pending() {
+            capture.shared.set_state(tina::DeferredSlotState::Closed);
+            let slot_id = tina_runtime::DeferredSlotId::new(capture.slot_id);
+            let call_id = CallId::new(capture.call_id);
+            let captured = self.push_event(
+                capture.capturing_isolate,
+                Some(cause),
+                RuntimeEventKind::DeferredReplyCaptured { slot_id, call_id },
+            );
+            let dropped = self.push_event(
+                capture.capturing_isolate,
+                Some(captured.into()),
+                RuntimeEventKind::DeferredReplyDropped { slot_id, call_id },
+            );
+            self.complete_isolate_call(call_id, dropped.into(), CallOutcome::Closed);
+        }
+    }
+
+    fn drop_promoted_deferred_slot(
+        &mut self,
+        record: deferred::DeferredSlotRecord,
+        cause: Option<tina_runtime::CauseId>,
+    ) {
+        if record.shared.state() != tina::DeferredSlotState::Open {
+            return;
+        }
+        record.shared.set_state(tina::DeferredSlotState::Closed);
+        let dropped = self.push_event(
+            record.capturing_isolate,
+            cause,
+            RuntimeEventKind::DeferredReplyDropped {
+                slot_id: record.slot_id,
+                call_id: record.call_id,
+            },
+        );
+        self.complete_isolate_call(record.call_id, dropped.into(), CallOutcome::Closed);
     }
 
     fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
@@ -4387,17 +4417,7 @@ where
 
         // Drain any deferred reply slots this isolate captured.
         for record in self.promoted_slots.take_by_isolate(isolate_id) {
-            if record.shared.state() == tina::DeferredSlotState::Open {
-                record.shared.set_state(tina::DeferredSlotState::Closed);
-                self.push_event(
-                    isolate_id,
-                    Some(stopped.into()),
-                    RuntimeEventKind::DeferredReplyDropped {
-                        slot_id: record.slot_id,
-                        call_id: record.call_id,
-                    },
-                );
-            }
+            self.drop_promoted_deferred_slot(record, Some(stopped.into()));
         }
         if precollected.is_some() {
             self.push_event(
