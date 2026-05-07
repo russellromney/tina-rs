@@ -195,6 +195,39 @@ where
     }
 }
 
+/// Slot-release rule for the bridge's send observer (mirrors the
+/// shim). The observer fires when the runtime worker reports the
+/// outcome of a `ClientMsg::Request` send; on `Err`, the message
+/// never reached the `Client` and so no shim notification will
+/// arrive for this correlator.
+///
+/// Only `add_permits(1)` when this call *actually* removed the
+/// pending entry. If the awaiting future was already cancelled,
+/// [`CancelGuard::drop`] removed the entry and released the slot;
+/// a second release here would inflate capacity above
+/// `max_in_flight`.
+fn fire_observer_err(
+    pending: &Mutex<PendingMap>,
+    slots: &Semaphore,
+    correlator: u64,
+    err: ThreadedSendObservedError,
+) {
+    let mapped = match err {
+        ThreadedSendObservedError::MailboxFull => ClientResult::Full,
+        ThreadedSendObservedError::MailboxClosed => ClientResult::ConnectionClosed,
+        ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::WorkerStopped => {
+            ClientResult::IoError(tina_runtime::CallError::Io)
+        }
+    };
+    let entry = pending.lock().ok().and_then(|mut p| p.remove(&correlator));
+    if let Some(tx) = entry {
+        let _ = tx.send(mapped);
+        slots.add_permits(1);
+    }
+    // Entry already gone → CancelGuard released the slot. Do not
+    // double-release.
+}
+
 // ---------------------------------------------------------------------------
 // Bridge client
 // ---------------------------------------------------------------------------
@@ -421,29 +454,16 @@ where
         // `Full`/`Closed` is surfaced back to the awaiter rather than
         // silently dropped on the worker thread. When the observer
         // fires `Err`, the message never reached the `Client`, so the
-        // shim will never see this correlator — the observer must
-        // therefore release the admission slot itself.
+        // shim will never see this correlator. Slot accounting
+        // (mirrors the shim): only release when this observer
+        // *actually* removed the pending entry — see
+        // [`fire_observer_err`].
         let pending_for_observer = Arc::clone(&self.inner.pending);
         let slots_for_observer = Arc::clone(&self.inner.slots);
         let observer: Box<dyn FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static> =
             Box::new(move |observed| {
                 if let Err(err) = observed {
-                    let mapped = match err {
-                        ThreadedSendObservedError::MailboxFull => ClientResult::Full,
-                        ThreadedSendObservedError::MailboxClosed => ClientResult::ConnectionClosed,
-                        ThreadedSendObservedError::IngressFull
-                        | ThreadedSendObservedError::WorkerStopped => {
-                            ClientResult::IoError(tina_runtime::CallError::Io)
-                        }
-                    };
-                    let entry = pending_for_observer
-                        .lock()
-                        .ok()
-                        .and_then(|mut p| p.remove(&correlator));
-                    if let Some(tx) = entry {
-                        let _ = tx.send(mapped);
-                    }
-                    slots_for_observer.add_permits(1);
+                    fire_observer_err(&pending_for_observer, &slots_for_observer, correlator, err);
                 }
             });
 
@@ -516,6 +536,15 @@ where
     /// Returns the bridge shim isolate's address.
     pub fn shim_addr(&self) -> Address<ClientResultMsg> {
         self.inner.shim_addr
+    }
+
+    /// Returns the number of admission slots currently available.
+    /// Diagnostic: a healthy bridge satisfies
+    /// `available_slots() <= max_in_flight` at all times. Useful for
+    /// regression tests that prove slot accounting stays bounded
+    /// across cancellation / observer-failure races.
+    pub fn available_slots(&self) -> usize {
+        self.inner.slots.available_permits()
     }
 
     /// Removes the pending entry **and** releases the admission slot.
@@ -909,6 +938,71 @@ mod tests {
         .unwrap();
         assert_eq!(result, 3);
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn observer_err_with_live_entry_releases_one_slot() {
+        // Healthy path: pending entry present (awaiter alive), observer
+        // sees `Err`, takes the entry, sends synthetic, releases slot.
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let slots = Arc::new(Semaphore::new(1));
+
+        // Simulate admission: take the slot.
+        Arc::clone(&slots)
+            .try_acquire_owned()
+            .expect("admission")
+            .forget();
+        assert_eq!(slots.available_permits(), 0);
+
+        // Insert pending entry as if `BridgeClient::call` did.
+        let (tx, mut rx) = oneshot::channel::<ClientResult>();
+        pending.lock().unwrap().insert(7, tx);
+
+        fire_observer_err(&pending, &slots, 7, ThreadedSendObservedError::MailboxFull);
+
+        // Slot released exactly once.
+        assert_eq!(slots.available_permits(), 1);
+        // Synthetic result delivered.
+        let received = rx.try_recv().expect("oneshot delivered");
+        assert_eq!(received, ClientResult::Full);
+        // Pending entry cleaned up.
+        assert!(pending.lock().unwrap().get(&7).is_none());
+    }
+
+    #[test]
+    fn observer_err_with_stale_entry_does_not_release_slot() {
+        // Race we're pinning: `CancelGuard::drop` already removed the
+        // pending entry and released the slot. The observer then
+        // fires `Err` for the same correlator. Without the
+        // "only release if I actually took the entry" rule, this
+        // path would `add_permits(1)` again and inflate capacity
+        // above `max_in_flight`.
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let slots = Arc::new(Semaphore::new(1));
+
+        // Simulate admission: take the slot.
+        Arc::clone(&slots)
+            .try_acquire_owned()
+            .expect("admission")
+            .forget();
+        // Simulate `CancelGuard::drop`: pending entry was never
+        // inserted (or was removed) and slot was returned.
+        slots.add_permits(1);
+        assert_eq!(slots.available_permits(), 1);
+
+        fire_observer_err(
+            &pending,
+            &slots,
+            13,
+            ThreadedSendObservedError::MailboxClosed,
+        );
+
+        // Slot count unchanged — observer must not double-release.
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "stale observer Err released a slot the CancelGuard had already returned",
+        );
     }
 
     #[test]
