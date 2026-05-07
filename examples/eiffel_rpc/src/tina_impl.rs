@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_rpc::{
-    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Dispatch, Frame, FrameError,
-    FrameKind, FrameLimits, Json, LENGTH_PREFIX_SIZE, PayloadLimits, Registry, RegistryMsg,
-    RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
+    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Dispatch, Encoding, Frame,
+    FrameError, FrameKind, FrameLimits, Json, LENGTH_PREFIX_SIZE, PayloadLimits, Registry,
+    RegistryMsg, RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
 };
 use tina_runtime::{
     CallError, DefaultThreadedMailboxFactory, ListenerId, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -174,9 +174,10 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     // The macro's args decoder for `fn ping(payload: Vec<u8>)` is
-    // `(Vec<u8>,)` — a JSON array with one element. Encode that
-    // tuple once and reuse for every frame in the burst.
-    let payload = serde_json::to_vec(&(b"hi".to_vec(),))?;
+    // `(Vec<u8>,)` — a JSON array with one element. Encode it via
+    // the same `Encoding::encode` the macro uses on the server, so
+    // there's no separate "what does the wire expect" question.
+    let payload = Json.encode(&(b"hi".to_vec(),), 1024)?;
 
     let limits = FrameLimits::default();
     let mut request_bytes = Vec::new();
