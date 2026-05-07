@@ -80,7 +80,7 @@ struct Store {
 
 #[tina_runtime::isolate(message = StoreMsg, reply = StoreReply, shard = AppShard)]
 impl Store {
-    fn handle(&mut self, msg: StoreMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: StoreMsg, ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
         match msg {
             StoreMsg::Set { key, value } => {
                 if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
@@ -136,7 +136,7 @@ struct Driver {
 
 #[tina_runtime::isolate(message = DriverMsg, shard = AppShard)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => self.next_step(),
             DriverMsg::StoreReturned(outcome) => {

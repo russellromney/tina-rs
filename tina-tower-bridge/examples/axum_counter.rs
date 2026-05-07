@@ -38,7 +38,7 @@ impl Counter {
     fn handle(
         &mut self,
         msg: BridgeRequest<BrushRequest, BrushReply>,
-        _ctx: &mut Context<'_, SingleShard>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         let (_, responder) = msg.into_parts();
         self.brushes += 1;

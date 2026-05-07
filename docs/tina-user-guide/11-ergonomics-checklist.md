@@ -318,12 +318,12 @@ Do not concatenate three writes into one buffer to avoid a batch.
 
 ### Deferred reply slots
 
-Use `ctx.take_reply_slot::<ThisIsolate>()` and `tina::reply_to(slot, value)` to
+Use `ctx.take_reply_slot()` and `tina::reply_to(slot, value)` to
 answer a caller from a later turn (pool frontend, sharded frontend,
 fanout, bridge worker).
 
 ```rust
-let slot: DeferredReply<MyReply> = ctx.take_reply_slot::<MyService>()?;
+let slot: DeferredReply<MyReply> = ctx.take_reply_slot()?;
 self.pending.try_insert(req_id, slot)?;
 // later:
 return tina::reply_to(self.pending.take(&req_id).unwrap(), MyReply::Ok(v));

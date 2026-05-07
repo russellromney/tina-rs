@@ -123,7 +123,11 @@ struct DurableWorker {
     shard = ServiceShard
 )]
 impl DurableWorker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, ServiceShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Work(request) => {
                 let index = self.next_index;
@@ -172,7 +176,11 @@ struct Router {
     shard = ServiceShard
 )]
 impl Router {
-    fn handle(&mut self, msg: RouterMsg, _ctx: &mut Context<'_, ServiceShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: RouterMsg,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RouterMsg::Submit(request) => self.route(request, 0),
             RouterMsg::Retry(request, attempt) => {
@@ -336,7 +344,11 @@ const READINESS_MAX_FRAME: usize = 64;
     shard = ServiceShard
 )]
 impl ReadinessService {
-    fn handle(&mut self, msg: ReadinessMsg, _ctx: &mut Context<'_, ServiceShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ReadinessMsg,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ReadinessMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("readiness bind addr"))
                 .reply(ReadinessMsg::TcpBound),
@@ -562,7 +574,11 @@ struct AuditSink {
 
 #[tina_runtime::isolate(message = AuditMsg, shard = ServiceShard)]
 impl AuditSink {
-    fn handle(&mut self, msg: AuditMsg, _ctx: &mut Context<'_, ServiceShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: AuditMsg,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             AuditMsg::Record(key) => {
                 self.observed
@@ -597,7 +613,7 @@ impl AuditedWorker {
     fn handle(
         &mut self,
         msg: AuditedWorkerMsg,
-        _ctx: &mut Context<'_, ServiceShard>,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             AuditedWorkerMsg::Work(request) => {
@@ -645,7 +661,7 @@ impl AuditedClient {
     fn handle(
         &mut self,
         msg: AuditedClientMsg,
-        _ctx: &mut Context<'_, ServiceShard>,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             AuditedClientMsg::Start(request) => call(

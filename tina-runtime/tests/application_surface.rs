@@ -146,7 +146,11 @@ struct Worker {
     shard = LocalShard
 )]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Boot => {
                 self.observations
@@ -184,7 +188,11 @@ struct WorkerParent {
     shard = LocalShard
 )]
 impl WorkerParent {
-    fn handle(&mut self, msg: WorkerParentMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerParentMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerParentMsg::Spawn => {
                 let observations = Arc::clone(&self.observations);
@@ -237,7 +245,11 @@ struct Connection {
     shard = LocalShard
 )]
 impl Connection {
-    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ConnectionMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 256).reply(|result| match result {
                 Ok(bytes) => ConnectionMsg::Read(bytes),
@@ -391,7 +403,11 @@ struct Listener {
     shard = LocalShard
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ListenerMsg,
+        ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => {
                 let bind_addr = self.bind_addr;
@@ -464,7 +480,11 @@ struct LongWork;
 
 #[tina_runtime::isolate(message = LongWorkMsg, shard = LocalShard)]
 impl LongWork {
-    fn handle(&mut self, msg: LongWorkMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: LongWorkMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             LongWorkMsg::Start { worker } => batch([
                 sleep(Duration::from_secs(60)).reply(|_| LongWorkMsg::Slept),
@@ -489,7 +509,11 @@ struct StaleProbe {
 
 #[tina_runtime::isolate(message = StaleProbeMsg, shard = LocalShard)]
 impl StaleProbe {
-    fn handle(&mut self, msg: StaleProbeMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: StaleProbeMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             StaleProbeMsg::Probe(target) => {
                 send_observed(target, WorkerMsg::Echo(b"stale".to_vec()))
@@ -523,7 +547,11 @@ struct Router {
 
 #[tina_runtime::isolate(message = RouterMsg, shard = LocalShard)]
 impl Router {
-    fn handle(&mut self, msg: RouterMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: RouterMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RouterMsg::Start => batch([
                 call(
@@ -559,7 +587,11 @@ struct SessionAudit {
 
 #[tina_runtime::isolate(message = SessionAuditMsg, shard = LocalShard)]
 impl SessionAudit {
-    fn handle(&mut self, msg: SessionAuditMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SessionAuditMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         let SessionAuditMsg::Joined(user_id) = msg;
         self.log.lock().expect("audit log mutex").push(user_id);
         noop()
@@ -585,7 +617,11 @@ struct Session {
     shard = LocalShard
 )]
 impl Session {
-    fn handle(&mut self, msg: SessionMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SessionMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SessionMsg::Connected(user_id) => {
                 self.users.push(user_id);

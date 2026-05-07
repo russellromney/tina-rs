@@ -85,7 +85,7 @@ struct Counter {
 
 #[tina_runtime::isolate(message = CounterMsg)]
 impl Counter {
-    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             CounterMsg::Recover { op } => snapshot_load(self.snapshot_path.clone())
                 .reply(move |result| CounterMsg::SnapshotLoaded { op, result }),

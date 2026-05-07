@@ -69,7 +69,7 @@
 //!     shard = InlineShard
 //! )]
 //! impl Counter {
-//!     fn handle(&mut self, msg: Message, _ctx: &mut Context<'_, InlineShard>) -> Effect<Self> {
+//!     fn handle(&mut self, msg: Message, _ctx: &mut Context<'_, InlineShard, Self::Reply>) -> Effect<Self> {
 //!         match msg {
 //!             Message::Add(delta) => {
 //!                 self.total += delta;
@@ -164,7 +164,7 @@ impl fmt::Debug for StopResult {
 ///     async fn handle(
 ///         &mut self,
 ///         _msg: (),
-///         _ctx: &mut tina::Context<'_, DemoShard>,
+///         _ctx: &mut tina::Context<'_, DemoShard, Self::Reply>,
 ///     ) -> tina::Effect<Self> {
 ///         tina::noop()
 ///     }
@@ -204,7 +204,7 @@ type AddressMarker<M, R> = PhantomData<fn(M, R) -> (M, R)>;
 ///     fn handle(
 ///         &mut self,
 ///         _msg: Self::Message,
-///         _ctx: &mut tina::Context<'_, Self::Shard>,
+///         _ctx: &mut tina::Context<'_, Self::Shard, Self::Reply>,
 ///     ) -> tina::Effect<Self> {
 ///         tina::stop()
 ///     }
@@ -273,7 +273,11 @@ pub trait Isolate: Sized {
     type Shard: Shard + ?Sized;
 
     /// Handles one inbound message and returns the next runtime effect.
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self>;
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self>;
 }
 
 /// A closed set of actions that an [`Isolate`] may request from the runtime.
@@ -441,7 +445,7 @@ where
 /// #     type Spawn = std::convert::Infallible;
 /// #     type Call = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
-/// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard>) -> Effect<Self> {
+/// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
 /// #         tina::noop()
 /// #     }
 /// # }
@@ -767,25 +771,41 @@ impl Shard for SingleShard {
 /// `Context` lets a handler inspect its current shard and build typed
 /// [`Address`] values without performing side effects directly.
 #[derive(Debug)]
-pub struct Context<'a, S>
+pub struct Context<'a, S, R = ()>
 where
     S: Shard + ?Sized,
 {
     shard: &'a mut S,
     current_isolate: IsolateId,
     caller: Option<MessageCaller>,
+    _reply: PhantomData<fn(R) -> R>,
 }
 
-impl<'a, S> Context<'a, S>
+impl<'a, S> Context<'a, S, ()>
 where
     S: Shard + ?Sized,
 {
     /// Creates a new handler context for the current isolate.
     pub fn new(shard: &'a mut S, current_isolate: IsolateId) -> Self {
+        Context::new_typed(shard, current_isolate)
+    }
+}
+
+impl<'a, S, R> Context<'a, S, R>
+where
+    S: Shard + ?Sized,
+{
+    /// Creates a new reply-typed handler context for the current isolate.
+    ///
+    /// Runtime crates use this when invoking [`Isolate::handle`] so
+    /// deferred reply slots inherit the current isolate's reply type.
+    #[doc(hidden)]
+    pub fn new_typed(shard: &'a mut S, current_isolate: IsolateId) -> Self {
         Self {
             shard,
             current_isolate,
             caller: None,
+            _reply: PhantomData,
         }
     }
 
@@ -819,10 +839,9 @@ where
     /// honor an [`Effect::Reply`] for the same call. Returning
     /// `Effect::Reply` after `take_reply_slot` is a no-op against the
     /// original caller.
-    pub fn take_reply_slot<I>(&mut self) -> Result<DeferredReply<I::Reply>, TakeReplySlotError>
+    pub fn take_reply_slot(&mut self) -> Result<DeferredReply<R>, TakeReplySlotError>
     where
-        I: Isolate<Shard = S>,
-        I::Reply: 'static,
+        R: 'static,
     {
         // Peek routing first so a Remote refusal does not consume the caller.
         match self.caller.as_ref().map(|c| c.routing()) {
@@ -1204,9 +1223,10 @@ impl AddressGeneration {
 /// state and use [`reply_to`] from a later turn to answer the original
 /// caller. The slot is one-shot: each `reply_to` consumes the slot.
 ///
-/// The slot type carries the caller's expected reply type `R`. Wrong
-/// reply types fail to type-check at the [`reply_to`] call site:
-/// `reply_to::<I>` requires `DeferredReply<I::Reply>`.
+/// The slot type is derived from the current isolate's [`Isolate::Reply`]
+/// through [`Context`]. Handlers do not name the reply type when
+/// capturing a slot, so the normal path cannot accidentally capture a
+/// slot for another isolate's reply payload.
 ///
 /// Lifecycle and trace facts:
 ///
@@ -1286,12 +1306,13 @@ pub struct DeferredSlotShared {
     slot_id: u64,
     state: AtomicU8,
     /// `TypeId` of the original caller's expected reply payload. The
-    /// runtime sets this from the dispatching `Address<_, R>`'s `R`,
-    /// not from whatever the captured handler claims via
-    /// `take_reply_slot::<I>`. The runtime checks erased payloads
-    /// against this id before invoking the original caller's
-    /// translator, so wrong-type replies surface as a typed trace
-    /// fact rather than panicking the translator.
+    /// runtime sets this from the dispatching `Address<_, R>`'s `R`.
+    /// Normal handlers cannot choose a different deferred reply type
+    /// because [`Context::take_reply_slot`] derives it from the current
+    /// isolate. The runtime still checks erased payloads against this
+    /// id before invoking the original caller's translator, so hidden
+    /// runtime-internal misuse surfaces as a typed trace fact rather
+    /// than panicking the translator.
     expected_reply_type_id: TypeId,
 }
 

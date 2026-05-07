@@ -49,7 +49,11 @@ impl Isolate for EchoConnection {
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = ConsumerShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Start => read_call(self.stream),
             ConnectionMsg::ReadCompleted(bytes) => {
@@ -144,7 +148,11 @@ impl Isolate for EchoListener {
     type Call = RuntimeCall<ListenerMsg>;
     type Shard = ConsumerShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerMsg::Bootstrap => {
                 self.self_addr = Some(ctx.me());
@@ -323,7 +331,11 @@ impl Isolate for ObservedTarget {
     type Call = RuntimeCall<ObservedTargetMsg>;
     type Shard = ConsumerShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ObservedTargetMsg::Work => Effect::Noop,
             ObservedTargetMsg::Stop => Effect::Stop,
@@ -350,7 +362,11 @@ impl Isolate for ObservedSender {
     type Call = RuntimeCall<ObservedSenderMsg>;
     type Shard = ConsumerShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ObservedSenderMsg::Start(target) => send_observed(target, ObservedTargetMsg::Work)
                 .reply(ObservedSenderMsg::SendFinished),
@@ -436,7 +452,11 @@ impl Isolate for ReplyWorker {
     type Call = RuntimeCall<WorkerRequest>;
     type Shard = ConsumerShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerRequest::ReplyNow => Effect::Reply(WorkerReply("pong")),
             WorkerRequest::DoNotReply => Effect::Noop,
@@ -470,7 +490,11 @@ impl Isolate for CallerWorker {
     type Call = RuntimeCall<CallerMsg>;
     type Shard = ConsumerShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallerMsg::Start(target, request, timeout) => {
                 call(target, request, timeout).reply(CallerMsg::Returned)

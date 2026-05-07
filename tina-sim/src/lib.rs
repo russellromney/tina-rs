@@ -4900,7 +4900,7 @@ mod tests {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SimTimerMsg::Start => Effect::Call(RuntimeCall::new(
@@ -4929,7 +4929,7 @@ mod tests {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SimStepEvent::Tick => Effect::Noop,
@@ -4951,7 +4951,7 @@ mod tests {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SimRemoteEvent::Kick => send(self.target, SimRemoteEvent::Arrived),
@@ -4984,7 +4984,7 @@ mod tests {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SimRemoteEvent::Arrived
@@ -5010,7 +5010,7 @@ mod tests {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SimShardLocalSupervisionEvent::SpawnChild => {
@@ -5043,7 +5043,7 @@ mod tests {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SimShardLocalSupervisionEvent::Panic => {

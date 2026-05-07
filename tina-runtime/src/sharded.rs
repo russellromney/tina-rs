@@ -878,7 +878,7 @@ where
     type Call = RuntimeCall<M>;
     type Shard = S;
 
-    fn handle(&mut self, msg: M, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(&mut self, msg: M, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         send(self.target, msg.into())
     }
 }

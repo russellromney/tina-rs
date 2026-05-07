@@ -74,7 +74,11 @@ impl Isolate for Coordinator {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CoordinatorEvent::Submit { job_id, value } => send(
                 self.worker,
@@ -151,7 +155,11 @@ impl Isolate for Worker {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerEvent::Run {
                 job_id,
@@ -203,7 +211,11 @@ impl Isolate for TimedCoordinator {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimedCoordinatorEvent::Start => {
                 sleep(self.backoff).reply(|_| TimedCoordinatorEvent::DelayElapsed)
@@ -237,7 +249,11 @@ impl Isolate for TimedWorker {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimedWorkerEvent::Run {
                 job_id,
@@ -287,7 +303,11 @@ impl Isolate for SupervisorObserver {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         self.log.borrow_mut().push(msg);
         noop()
     }
@@ -308,7 +328,11 @@ impl Isolate for RestartableWorker {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RestartableWorkerEvent::Boot => send(
                 self.observer,
@@ -338,7 +362,11 @@ impl Isolate for SupervisedParent {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SupervisorEvent::SpawnOne => spawn(
                 RestartableChildDefinition::new(
@@ -379,7 +407,11 @@ impl Isolate for TcpEchoConnection {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TcpConnectionEvent::Start => tcp_read_call(self.stream),
             TcpConnectionEvent::ReadCompleted(bytes) => {
@@ -471,7 +503,11 @@ impl Isolate for TcpEchoListener {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TcpControlEvent::Bootstrap => {
                 let addr = self.bind_addr;
@@ -566,7 +602,11 @@ impl Isolate for TcpCoordinator {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TcpControlEvent::ListenerFinished => {
                 *self.done.borrow_mut() += 1;
@@ -608,7 +648,11 @@ impl Isolate for DurableTcpFrontend {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DurableTcpFrontendMsg::Start => Effect::Call(RuntimeCall::new(
                 CallInput::TcpBind {
@@ -761,7 +805,11 @@ impl Isolate for DurableStore {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DurableStoreMsg::Append {
                 index,
@@ -806,7 +854,11 @@ impl Isolate for DurableBatchListener {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DurableBatchListenerMsg::Start => Effect::Call(RuntimeCall::new(
                 CallInput::TcpBind {
@@ -908,7 +960,11 @@ impl Isolate for DurableBatchConnection {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DurableBatchConnectionMsg::Start => durable_batch_read_call(self.stream),
             DurableBatchConnectionMsg::Read(Ok(bytes)) if bytes.is_empty() => {
@@ -1009,7 +1065,11 @@ impl Isolate for DurableBatchStore {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DurableBatchStoreMsg::Append { bytes, reply_to } => {
                 self.next_index += 1;

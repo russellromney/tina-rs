@@ -119,7 +119,11 @@ impl Isolate for ClientStub {
     type Call = RuntimeCall<ClientMsg>;
     type Shard = EiffelShard;
 
-    fn handle(&mut self, msg: ClientMsg, _ctx: &mut Context<'_, EiffelShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ClientMsg,
+        _ctx: &mut Context<'_, EiffelShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ClientMsg::Request(req) => {
                 let result = match self.behavior {

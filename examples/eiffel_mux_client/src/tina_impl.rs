@@ -45,7 +45,7 @@ struct MuxClient {
 
 #[tina_runtime::isolate(message = MuxMsg)]
 impl MuxClient {
-    fn handle(&mut self, msg: MuxMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: MuxMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             MuxMsg::Begin => tcp_connect(self.target).reply(MuxMsg::Connected),
             MuxMsg::Connected(Ok((stream, _local, _peer))) => {

@@ -45,7 +45,11 @@ impl Isolate for Sleeper {
     type Call = RuntimeCall<TimerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimerMsg::Start => Effect::Call(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
@@ -93,7 +97,11 @@ impl Isolate for OrderingSleeper {
     type Call = RuntimeCall<OrderingMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             OrderingMsg::Start => {
                 let label = self.label;

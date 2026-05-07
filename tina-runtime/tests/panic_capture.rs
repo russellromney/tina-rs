@@ -135,7 +135,11 @@ impl Isolate for PanicIsolate {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PanicMsg::Panic => panic!("panic inside handler"),
             PanicMsg::Payload(payload) => {
@@ -163,7 +167,11 @@ impl Isolate for PanicSender {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::Kick(value) => {
                 Effect::Send(Outbound::new(self.target, PanicMsg::Data(value)))
@@ -186,7 +194,11 @@ impl Isolate for OrderIsolate {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         self.log.borrow_mut().push(self.name);
         Effect::Noop
     }

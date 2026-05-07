@@ -3211,7 +3211,7 @@ where
         });
 
         let effect = {
-            let mut ctx = Context::new(shard, isolate_id);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }
@@ -3253,7 +3253,7 @@ where
         });
 
         let effect = {
-            let mut ctx = Context::new(shard, isolate_id);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }

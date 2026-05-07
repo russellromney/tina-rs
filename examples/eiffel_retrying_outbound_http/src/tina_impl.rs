@@ -121,7 +121,7 @@ struct Caller {
 
 #[tina_runtime::isolate(message = CallerMsg)]
 impl Caller {
-    fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             CallerMsg::Begin => self.send_attempt(),
             CallerMsg::HttpReturned(outcome) => self.absorb(outcome),

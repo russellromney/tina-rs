@@ -78,7 +78,11 @@ struct Worker {
     shard = LocalShard
 )]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Boot => {
                 self.observations
@@ -113,7 +117,11 @@ struct Parent {
     shard = LocalShard
 )]
 impl Parent {
-    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ParentMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::Spawn => {
                 let observations = Rc::clone(&self.observations);
@@ -162,7 +170,11 @@ struct Connection {
 
 #[tina_runtime::isolate(message = ConnectionMsg, shard = LocalShard)]
 impl Connection {
-    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ConnectionMsg,
+        _ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 256).reply(|result| match result {
                 Ok(bytes) => ConnectionMsg::Read(bytes),
@@ -301,7 +313,11 @@ struct Listener {
     shard = LocalShard
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, ctx: &mut Context<'_, LocalShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ListenerMsg,
+        ctx: &mut Context<'_, LocalShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => {
                 let bind_addr = self.bind_addr;

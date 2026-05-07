@@ -133,7 +133,7 @@ impl PersistService {
     fn handle(
         &mut self,
         msg: PersistBridgeMsg,
-        _ctx: &mut Context<'_, BridgeShard>,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             PersistBridgeMsg::Request(request) => {

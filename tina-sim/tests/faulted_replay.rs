@@ -39,7 +39,11 @@ impl Isolate for Driver {
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SimMsg::Start => Effect::Batch(vec![
                 Effect::Send(Outbound::new(self.protocol, SimMsg::Prepare)),
@@ -63,7 +67,11 @@ impl Isolate for Protocol {
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SimMsg::Prepare => Effect::Send(Outbound::new(self.watcher, SimMsg::Ack)),
             _ => Effect::Noop,
@@ -84,7 +92,11 @@ impl Isolate for Trigger {
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SimMsg::ScheduleCheck => Effect::Send(Outbound::new(self.watcher, SimMsg::Check)),
             _ => Effect::Noop,
@@ -107,7 +119,11 @@ impl Isolate for Watcher {
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SimMsg::Ack => {
                 self.acked = true;
@@ -137,7 +153,11 @@ impl Isolate for Sink {
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         Effect::Noop
     }
 }

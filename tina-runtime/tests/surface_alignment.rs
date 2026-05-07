@@ -27,7 +27,11 @@ struct Inert;
 
 #[tina::isolate(message = ())]
 impl Inert {
-    fn handle(&mut self, _msg: (), _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: (),
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }

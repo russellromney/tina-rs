@@ -188,7 +188,7 @@ Capture the caller as a typed `DeferredReply<R>`, store it, answer
 later:
 
 ```rust
-let slot: DeferredReply<MyReply> = ctx.take_reply_slot::<Self>()?;
+let slot: DeferredReply<MyReply> = ctx.take_reply_slot()?;
 self.pending.try_insert(req_id, slot)?;
 // later turn:
 let slot = self.pending.take(&req_id).expect("slot for id");

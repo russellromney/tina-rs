@@ -124,7 +124,11 @@ impl Isolate for OrderIsolate {
         shard: TestShard,
     }
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         self.log.borrow_mut().push(self.name);
         noop()
     }
@@ -146,7 +150,11 @@ impl Isolate for Driver {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverEvent::Kick(value) => {
                 self.handled.borrow_mut().push(value);
@@ -171,7 +179,11 @@ impl Isolate for Audit {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         let AuditEvent::Record(value) = msg;
         self.seen.borrow_mut().push(value);
         noop()
@@ -191,7 +203,11 @@ impl Isolate for ObservedIsolate {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ObservedMsg::Reply => reply(7),
             ObservedMsg::Restart => restart_children(),

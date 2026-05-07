@@ -38,7 +38,7 @@ struct Worker {
 
 #[tina::isolate(message = WorkerMsg, reply = WorkerReply)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             WorkerMsg::Do(payload) => reply(WorkerReply(payload.wrapping_add(self.id))),
         }
@@ -77,12 +77,12 @@ struct Coordinator {
 
 #[tina_runtime::isolate(message = CoordMsg, reply = AggregateReply)]
 impl Coordinator {
-    fn handle(&mut self, msg: CoordMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: CoordMsg, ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             CoordMsg::Query(payload) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.try_capture::<Coordinator, _>(ctx, qid) {
+                match self.pending.try_capture(ctx, qid) {
                     Ok(()) => {
                         self.partials.push(PartialQuery {
                             qid,
@@ -155,7 +155,7 @@ struct Driver {
 
 #[tina_runtime::isolate(message = DriverMsg)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
                 let coord = self.coord;

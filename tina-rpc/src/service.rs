@@ -228,7 +228,7 @@ where
     type Call = RuntimeCall<ServiceCall>;
     type Shard = S;
 
-    fn handle(&mut self, msg: ServiceCall, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(&mut self, msg: ServiceCall, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         reply::<Self>(self.handler.dispatch(msg))
     }
 }
@@ -416,7 +416,7 @@ mod tests {
         H: ServiceHandler<TestShard>,
     {
         let mut shard = TestShard;
-        let mut ctx = Context::new(&mut shard, IsolateId::new(99));
+        let mut ctx = Context::<_, ServiceReply>::new_typed(&mut shard, IsolateId::new(99));
         adapter.handle(msg, &mut ctx)
     }
 

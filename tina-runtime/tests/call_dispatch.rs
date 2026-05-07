@@ -166,7 +166,11 @@ impl Isolate for Probe {
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ProbeMsg::StartInvalidAccept => Effect::Call(RuntimeCall::new(
                 CallInput::TcpAccept {
@@ -212,7 +216,11 @@ impl Isolate for Binder {
     type Call = RuntimeCall<BinderMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             BinderMsg::StartBind => {
                 let addr = self.bind_addr;
@@ -277,7 +285,11 @@ impl Isolate for Waiter {
     type Call = RuntimeCall<WaiterMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WaiterMsg::StartAccept => Effect::Call(RuntimeCall::new(
                 CallInput::TcpAccept {
@@ -315,7 +327,11 @@ impl Isolate for StreamAcceptor {
     type Call = RuntimeCall<AcceptStreamMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             AcceptStreamMsg::StartAccept => Effect::Call(RuntimeCall::new(
                 CallInput::TcpAccept {
@@ -344,7 +360,11 @@ impl Isolate for Reader {
     type Call = RuntimeCall<ReaderMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ReaderMsg::StartRead => Effect::Call(RuntimeCall::new(
                 CallInput::TcpRead {
@@ -378,7 +398,11 @@ impl Isolate for Writer {
     type Call = RuntimeCall<WriterMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WriterMsg::StartWrite => Effect::Call(RuntimeCall::new(
                 CallInput::TcpWrite {
@@ -412,7 +436,11 @@ impl Isolate for Closer {
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CloserMsg::CloseStream(stream) => Effect::Call(RuntimeCall::new(
                 CallInput::TcpStreamClose { stream },
@@ -1586,7 +1614,11 @@ fn isolate_without_call_effects_compiles_with_infallible() {
         type Call = Infallible;
         type Shard = TestShard;
 
-        fn handle(&mut self, _msg: (), _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
             Effect::Noop
         }
     }

@@ -101,7 +101,11 @@ impl Isolate for RetryWorker {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RetryMsg::TryWork => {
                 self.attempts += 1;
@@ -288,7 +292,11 @@ struct ParityTarget {
 
 #[tina_runtime::isolate(message = ParityTargetMsg, shard = TestShard)]
 impl ParityTarget {
-    fn handle(&mut self, msg: ParityTargetMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ParityTargetMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParityTargetMsg::Data(value) => {
                 self.observed.lock().expect("observed mutex").push(value);
@@ -316,7 +324,11 @@ struct ParityDriver {
     shard = TestShard
 )]
 impl ParityDriver {
-    fn handle(&mut self, msg: ParityDriverMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ParityDriverMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParityDriverMsg::Send(value) => send(self.target, ParityTargetMsg::Data(value)),
             ParityDriverMsg::StopTarget => send(self.target, ParityTargetMsg::Stop),

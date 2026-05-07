@@ -42,7 +42,7 @@ struct Consumer {
 
 #[tina_runtime::isolate(message = ConsumerMsg)]
 impl Consumer {
-    fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ConsumerMsg::Item(_) => sleep(Duration::from_millis(1)).reply(ConsumerMsg::Done),
             ConsumerMsg::Done(Ok(())) => {
@@ -75,7 +75,7 @@ struct Producer {
     send = Outbound<ConsumerMsg>,
 )]
 impl Producer {
-    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ProducerMsg::Tick(n) => {
                 if self.stopped || n >= self.target {
@@ -126,7 +126,7 @@ struct SignalWatcher {
     send = Outbound<ProducerMsg>,
 )]
 impl SignalWatcher {
-    fn handle(&mut self, msg: SignalMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: SignalMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             SignalMsg::Begin => {
                 signal_wait("sigint", Duration::from_secs(10)).reply(SignalMsg::Received)

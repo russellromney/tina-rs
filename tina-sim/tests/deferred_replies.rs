@@ -52,10 +52,14 @@ impl Isolate for DeferredSvc {
     type Call = RuntimeCall<SvcMsg>;
     type Shard = DefShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SvcMsg::Capture => {
-                self.slot = Some(ctx.take_reply_slot::<DeferredSvc>().unwrap());
+                self.slot = Some(ctx.take_reply_slot().unwrap());
                 noop()
             }
             SvcMsg::ReplyStored => {
@@ -90,7 +94,11 @@ impl Isolate for Caller {
     type Call = RuntimeCall<CallerMsg>;
     type Shard = DefShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallerMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
                 svc,
@@ -232,9 +240,9 @@ fn sim_panic_after_capture_drops_slot_and_closes_caller() {
         fn handle(
             &mut self,
             _msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot::<PanicAfterCapture>().unwrap();
+            let _slot = ctx.take_reply_slot().unwrap();
             panic!("boom after deferred capture");
         }
     }
@@ -294,11 +302,11 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 HaltMsg::Capture => {
-                    self.slots.push(ctx.take_reply_slot::<HaltSvc>().unwrap());
+                    self.slots.push(ctx.take_reply_slot().unwrap());
                     noop()
                 }
                 HaltMsg::Halt => Effect::Stop,
@@ -323,7 +331,11 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Spawn = Infallible;
         type Call = RuntimeCall<HCallerMsg>;
         type Shard = DefShard;
-        fn handle(&mut self, msg: Self::Message, _: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
             match msg {
                 HCallerMsg::Start(s) => Effect::Call(RuntimeCall::isolate_call(
                     s,

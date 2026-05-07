@@ -66,11 +66,15 @@ impl Isolate for DeferredSvc {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SvcRequest::Capture(payload) => {
                 self.payload = payload;
-                self.slot = Some(ctx.take_reply_slot::<DeferredSvc>().unwrap());
+                self.slot = Some(ctx.take_reply_slot().unwrap());
                 noop()
             }
             SvcRequest::ReplyStored => {
@@ -82,7 +86,7 @@ impl Isolate for DeferredSvc {
                 noop()
             }
             SvcRequest::TakeWithoutCaller => {
-                match ctx.take_reply_slot::<DeferredSvc>() {
+                match ctx.take_reply_slot() {
                     Err(TakeReplySlotError::NoCaller) => {
                         self.probe.borrow_mut().take_no_caller_errors += 1;
                     }
@@ -117,7 +121,11 @@ impl Isolate for DeferredCaller {
     type Call = RuntimeCall<CallerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallerMsg::Start(svc, payload) => Effect::Call(RuntimeCall::isolate_call(
                 svc,
@@ -264,9 +272,9 @@ fn panic_after_capture_drops_slot_and_closes_caller() {
         fn handle(
             &mut self,
             _msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot::<PanicAfterCapture>().unwrap();
+            let _slot = ctx.take_reply_slot().unwrap();
             panic!("boom after deferred capture");
         }
     }
@@ -378,9 +386,9 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         fn handle(
             &mut self,
             _msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot::<CaptureThenReply>().unwrap();
+            let _slot = ctx.take_reply_slot().unwrap();
             // Drop the slot immediately and try to reply normally —
             // the captured slot's Drop will surface as Dropped event,
             // and Effect::Reply has no caller anymore.
@@ -410,7 +418,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 LocalCallerMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
@@ -489,11 +497,11 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 FrontendMsg::Capture(key) => {
-                    let slot = ctx.take_reply_slot::<Frontend>().unwrap();
+                    let slot = ctx.take_reply_slot().unwrap();
                     if let Err(err) = self.pending.try_insert(key, slot) {
                         // Slot drops on err; surfaces as Dropped event.
                         let _ = err;
@@ -535,7 +543,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 FCallerMsg::Start(svc, k) => Effect::Call(RuntimeCall::isolate_call(
@@ -645,13 +653,13 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 FanSvcMsg::Capture => {
                     self.next_id += 1;
                     self.ids.push(self.next_id);
-                    let slot = ctx.take_reply_slot::<FanSvc>().unwrap();
+                    let slot = ctx.take_reply_slot().unwrap();
                     self.slots.push(slot);
                     noop()
                 }
@@ -699,7 +707,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 FanCallerMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
@@ -794,7 +802,11 @@ impl Isolate for Worker {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Do(id, payload) => tina::reply(WorkerReply::Echo(id, payload)),
         }
@@ -832,7 +844,11 @@ impl Isolate for PoolFrontend {
     type Call = RuntimeCall<FrontendMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FrontendMsg::Client(payload) => {
                 self.pending.sweep();
@@ -841,7 +857,7 @@ impl Isolate for PoolFrontend {
                     // capturing the slot.
                     return tina::reply(FrontendReply::Full);
                 }
-                let slot = ctx.take_reply_slot::<PoolFrontend>().unwrap();
+                let slot = ctx.take_reply_slot().unwrap();
                 let req_id = self.next_req;
                 self.next_req += 1;
                 self.pending
@@ -893,7 +909,11 @@ impl Isolate for PoolCaller {
     type Call = RuntimeCall<PoolCallerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PoolCallerMsg::Start(svc, payload) => Effect::Call(RuntimeCall::isolate_call(
                 svc,
@@ -1008,7 +1028,11 @@ impl Isolate for FanoutTarget {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FanoutTargetMsg::Echo(v) => tina::reply(FanoutTargetReply(v)),
         }
@@ -1052,10 +1076,14 @@ impl Isolate for Coordinator {
     type Call = RuntimeCall<CoordMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CoordMsg::Start(payload) => {
-                self.slot = Some(ctx.take_reply_slot::<Coordinator>().unwrap());
+                self.slot = Some(ctx.take_reply_slot().unwrap());
                 self.collected = vec![None; self.targets.len()];
                 self.remaining = self.targets.len();
                 let mut subcalls = Vec::with_capacity(self.targets.len());
@@ -1118,7 +1146,11 @@ impl Isolate for FanoutCaller {
     type Call = RuntimeCall<FanoutCallerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FanoutCallerMsg::Start(svc, p) => Effect::Call(RuntimeCall::isolate_call(
                 svc,
@@ -1200,7 +1232,7 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
         fn handle(
             &mut self,
             _msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             noop()
         }
@@ -1288,11 +1320,11 @@ fn service_stop_drops_pending_promises_visibly() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SvcStopMsg::Capture => {
-                    self.slots.push(ctx.take_reply_slot::<HaltSvc>().unwrap());
+                    self.slots.push(ctx.take_reply_slot().unwrap());
                     noop()
                 }
                 SvcStopMsg::Halt => Effect::Stop,
@@ -1325,7 +1357,7 @@ fn service_stop_drops_pending_promises_visibly() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 CallerStopMsg::Start(s) => Effect::Call(RuntimeCall::isolate_call(
@@ -1472,13 +1504,10 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                HelpMsg::Capture(id) => match self
-                    .pending
-                    .try_capture::<HelpSvc, TestShard>(ctx, id)
-                {
+                HelpMsg::Capture(id) => match self.pending.try_capture(ctx, id) {
                     Ok(()) => noop(),
                     Err(crate::PendingRepliesTryCaptureError::Full) => tina::reply(HelpReply::Full),
                     Err(other) => panic!("unexpected try_capture error: {other:?}"),
@@ -1517,7 +1546,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 HelpCallerMsg::Start(s, id) => Effect::Call(RuntimeCall::isolate_call(
@@ -1587,12 +1616,13 @@ impl Isolate for BridgeWorker {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
-            BridgeMsg::Submit(id) => match self
-                .pending
-                .try_capture::<BridgeWorker, TestShard>(ctx, id)
-            {
+            BridgeMsg::Submit(id) => match self.pending.try_capture(ctx, id) {
                 Ok(()) => noop(),
                 Err(crate::PendingRepliesTryCaptureError::Full) => tina::reply(BridgeReply::Full),
                 Err(other) => panic!("unexpected try_capture error: {other:?}"),
@@ -1636,7 +1666,7 @@ fn bridge_worker_routes_out_of_order_external_completions_to_callers() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 BCallerMsg::Start(b, id) => Effect::Call(RuntimeCall::isolate_call(
@@ -1722,7 +1752,7 @@ fn bridge_worker_cancelled_caller_does_not_leak_slot() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 BCallerMsg2::Start(b) => Effect::Call(RuntimeCall::isolate_call(
@@ -1817,12 +1847,12 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 WrongMsg::Capture => {
                     // Capture for ActualReply via take_reply_slot.
-                    let real = ctx.take_reply_slot::<WrongSvc>().unwrap();
+                    let real = ctx.take_reply_slot().unwrap();
                     // Escape via runtime_internal: rebuild as
                     // DeferredReply<WrongReply>. This is exactly the
                     // pattern codex called out.
@@ -1876,7 +1906,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 WrongCallerMsg::Start(s) => Effect::Call(RuntimeCall::isolate_call(

@@ -22,7 +22,11 @@ impl Isolate for Sink {
     type Call = Infallible;
     type Shard = SingleShard;
 
-    fn handle(&mut self, _msg: SinkMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: SinkMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }

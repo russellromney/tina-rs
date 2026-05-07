@@ -327,7 +327,11 @@ mod tests {
         type Call = RuntimeCall<Msg>;
         type Shard = tina::SingleShard;
 
-        fn handle(&mut self, _: Msg, _: &mut tina::Context<'_, Self::Shard>) -> Effect<Self> {
+        fn handle(
+            &mut self,
+            _: Msg,
+            _: &mut tina::Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
             tina::noop()
         }
     }

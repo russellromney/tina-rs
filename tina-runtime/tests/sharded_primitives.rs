@@ -155,7 +155,11 @@ impl Isolate for ShardedCounter {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CounterMsg::Inc { key, reply_to } => {
                 if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
@@ -205,7 +209,11 @@ impl Isolate for CounterTracker {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CounterCoordMsg::IncResult { shard, outcome } => match outcome {
                 Ok(()) => self.inc_oks.borrow_mut().push(shard),
@@ -398,7 +406,11 @@ impl Isolate for ShardedMap {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             MapMsg::Put {
                 key,
@@ -468,7 +480,11 @@ impl Isolate for MapTracker {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             MapCoordMsg::Put(Ok(shard)) => self.put_oks.borrow_mut().push(shard),
             MapCoordMsg::Put(Err(w)) => self.put_wrong.borrow_mut().push(w),
@@ -749,7 +765,11 @@ impl Isolate for ScatterCoord {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ScatterCoordMsg::Bind { bridge } => {
                 self.bridge = Some(bridge);
@@ -1186,7 +1206,11 @@ impl Isolate for ScatterCoordObs {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ScatterCoordObsMsg::Bind { bridge } => {
                 self.bridge = Some(bridge);

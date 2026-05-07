@@ -151,7 +151,11 @@ struct Worker {
     shard = DemoShard
 )]
 impl Worker {
-    fn handle(&mut self, msg: WorkerEvent, ctx: &mut Context<'_, DemoShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerEvent,
+        ctx: &mut Context<'_, DemoShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerEvent::Run(Task::Normal(value)) => {
                 self.completed.borrow_mut().push((ctx.isolate_id(), value));
@@ -175,7 +179,11 @@ struct Dispatcher {
     shard = DemoShard
 )]
 impl Dispatcher {
-    fn handle(&mut self, msg: DispatcherEvent, _ctx: &mut Context<'_, DemoShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DispatcherEvent,
+        _ctx: &mut Context<'_, DemoShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DispatcherEvent::SpawnWorker => {
                 let completed = Rc::clone(&self.completed);
@@ -204,7 +212,11 @@ struct Registry {
     shard = DemoShard
 )]
 impl Registry {
-    fn handle(&mut self, msg: RegistryEvent, _ctx: &mut Context<'_, DemoShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: RegistryEvent,
+        _ctx: &mut Context<'_, DemoShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RegistryEvent::Register { slot, address } => {
                 self.addresses.insert(slot, address);

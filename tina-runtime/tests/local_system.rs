@@ -120,7 +120,11 @@ struct LlamaService {
 
 #[tina_runtime::isolate(message = LlamaMsg, shard = AppShard)]
 impl LlamaService {
-    fn handle(&mut self, msg: LlamaMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: LlamaMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             LlamaMsg::Feed(value) => {
                 self.seen.lock().expect("seen lock").push(value);
@@ -152,7 +156,7 @@ impl CrossShardCallWorker {
     fn handle(
         &mut self,
         msg: CrossShardCallWorkerMsg,
-        _ctx: &mut Context<'_, AppShard>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             CrossShardCallWorkerMsg::Echo(bytes) => reply(CrossShardCallReply(bytes)),
@@ -179,7 +183,7 @@ impl CrossShardCallClient {
     fn handle(
         &mut self,
         msg: CrossShardCallClientMsg,
-        _ctx: &mut Context<'_, AppShard>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             CrossShardCallClientMsg::Start(worker) => call(
@@ -215,7 +219,11 @@ struct BlockingService {
 
 #[tina_runtime::isolate(message = BlockingMsg, shard = AppShard)]
 impl BlockingService {
-    fn handle(&mut self, msg: BlockingMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: BlockingMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             BlockingMsg::Hold(entered, release) => {
                 let (entered_lock, entered_cv) = &*entered;
@@ -253,7 +261,11 @@ struct BurstService {
     shard = AppShard
 )]
 impl BurstService {
-    fn handle(&mut self, msg: BurstMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: BurstMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             BurstMsg::SendTwo => batch(vec![
                 send(self.target, BlockingMsg::Note(1)),
@@ -276,7 +288,11 @@ struct TimerService {
 
 #[tina_runtime::isolate(message = TimerMsg, shard = AppShard)]
 impl TimerService {
-    fn handle(&mut self, msg: TimerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TimerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimerMsg::Start => sleep(Duration::from_millis(1)).reply(TimerMsg::Finished),
             TimerMsg::Finished(Ok(())) => {
@@ -311,7 +327,11 @@ struct UdpLoopbackService {
 
 #[tina_runtime::isolate(message = UdpLoopbackMsg, shard = AppShard)]
 impl UdpLoopbackService {
-    fn handle(&mut self, msg: UdpLoopbackMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: UdpLoopbackMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             UdpLoopbackMsg::Start => udp_bind("127.0.0.1:0".parse().expect("loopback addr"))
                 .reply(UdpLoopbackMsg::ReceiverBound),
@@ -384,7 +404,11 @@ struct DnsLookupService {
 
 #[tina_runtime::isolate(message = DnsLookupMsg, shard = AppShard)]
 impl DnsLookupService {
-    fn handle(&mut self, msg: DnsLookupMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DnsLookupMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DnsLookupMsg::Start => {
                 dns_lookup("localhost", 80, Duration::from_secs(1)).reply(DnsLookupMsg::Done)
@@ -424,7 +448,11 @@ struct TlsClientService {
 
 #[tina_runtime::isolate(message = TlsClientMsg, shard = AppShard)]
 impl TlsClientService {
-    fn handle(&mut self, msg: TlsClientMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TlsClientMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TlsClientMsg::Start { addr, cert_der } => {
                 tls_connect(addr, "localhost", vec![cert_der], Duration::from_secs(2))
@@ -514,7 +542,11 @@ struct TlsServerService {
 
 #[tina_runtime::isolate(message = TlsServerMsg, shard = AppShard)]
 impl TlsServerService {
-    fn handle(&mut self, msg: TlsServerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TlsServerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TlsServerMsg::Start => tls_bind(
                 "127.0.0.1:0".parse().expect("loopback"),
@@ -607,7 +639,7 @@ impl SignalUnsupportedService {
     fn handle(
         &mut self,
         msg: SignalUnsupportedMsg,
-        _ctx: &mut Context<'_, AppShard>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             SignalUnsupportedMsg::Start => {
@@ -645,7 +677,11 @@ struct ProcessService {
 
 #[tina_runtime::isolate(message = ProcessMsg, shard = AppShard)]
 impl ProcessService {
-    fn handle(&mut self, msg: ProcessMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ProcessMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ProcessMsg::Echo => process_run(
                 "/bin/echo",
@@ -714,7 +750,11 @@ struct ComposedIoService {
 #[cfg(unix)]
 #[tina_runtime::isolate(message = ComposedIoMsg, shard = AppShard)]
 impl ComposedIoService {
-    fn handle(&mut self, msg: ComposedIoMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ComposedIoMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ComposedIoMsg::Start(path) => {
                 self.journal = Some(path);
@@ -834,7 +874,11 @@ const FILE_SERVICE_PAYLOAD: &[u8] = b"local system file";
 
 #[tina_runtime::isolate(message = FileMsg, shard = AppShard)]
 impl FileService {
-    fn handle(&mut self, msg: FileMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: FileMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FileMsg::Start(path) => {
                 file_create(path.clone()).reply(move |result| FileMsg::Opened(result, path))
@@ -909,7 +953,11 @@ impl FileService {
 
 #[tina_runtime::isolate(message = HeldFileMsg, shard = AppShard)]
 impl HeldFileService {
-    fn handle(&mut self, msg: HeldFileMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: HeldFileMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             HeldFileMsg::Start(path) => file_create(path).reply(HeldFileMsg::Opened),
             HeldFileMsg::Opened(Ok(_file)) => {
@@ -950,7 +998,11 @@ struct DurableWorker {
 
 #[tina_runtime::isolate(message = DurableWorkerMsg, shard = AppShard)]
 impl DurableWorker {
-    fn handle(&mut self, msg: DurableWorkerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DurableWorkerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DurableWorkerMsg::Recover => {
                 snapshot_load(self.snapshot_path.clone()).reply(DurableWorkerMsg::SnapshotLoaded)
@@ -1051,7 +1103,11 @@ struct Frontend {
     shard = AppShard
 )]
 impl Frontend {
-    fn handle(&mut self, msg: FrontendMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: FrontendMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FrontendMsg::Feed(value) => send(self.worker, DurableWorkerMsg::Feed(value)),
         }
@@ -1081,7 +1137,11 @@ struct TcpJournalService {
 
 #[tina_runtime::isolate(message = TcpJournalMsg, shard = AppShard)]
 impl TcpJournalService {
-    fn handle(&mut self, msg: TcpJournalMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TcpJournalMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TcpJournalMsg::Start(journal_path) => {
                 self.journal_path = Some(journal_path);
@@ -1164,7 +1224,7 @@ impl StoragePressureService {
     fn handle(
         &mut self,
         msg: StoragePressureMsg,
-        _ctx: &mut Context<'_, AppShard>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             StoragePressureMsg::Start(path) => batch(vec![
@@ -1216,7 +1276,11 @@ struct CrossShardTcpFrontend {
     shard = AppShard
 )]
 impl CrossShardTcpFrontend {
-    fn handle(&mut self, msg: CrossShardTcpMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CrossShardTcpMsg,
+        ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CrossShardTcpMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("valid loopback"))
                 .reply(CrossShardTcpMsg::Bound),
@@ -1315,7 +1379,7 @@ impl CrossShardPersistWorker {
     fn handle(
         &mut self,
         msg: CrossShardPersistMsg,
-        _ctx: &mut Context<'_, AppShard>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             CrossShardPersistMsg::Persist { bytes, reply_to } => {

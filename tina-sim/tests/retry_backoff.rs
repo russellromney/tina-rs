@@ -47,7 +47,11 @@ impl Isolate for RetryWorker {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RetryEvent::TryWork => {
                 self.attempts += 1;

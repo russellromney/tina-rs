@@ -236,7 +236,11 @@ impl Isolate for RetryWorker {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RetryMsg::TryWork => {
                 self.attempts += 1;
@@ -382,7 +386,11 @@ impl Isolate for LongTimer {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             LongTimerMsg::Start => sleep(Duration::from_secs(60)).reply(|_| LongTimerMsg::Finished),
             LongTimerMsg::Finished => noop(),
@@ -459,7 +467,11 @@ impl Isolate for TcpAcceptWorker {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TcpAcceptMsg::Bind => Effect::Call(RuntimeCall::new(
                 CallInput::TcpBind {
@@ -915,7 +927,11 @@ impl Isolate for Driver {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::FillTwice => {
                 batch([send(self.sink, SinkMsg::Hit), send(self.sink, SinkMsg::Hit)])
@@ -937,7 +953,11 @@ impl Isolate for Sink {
         shard: TestShard,
     }
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }
@@ -1025,7 +1045,11 @@ impl Isolate for Coordinator {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CoordinatorMsg::Submit { job_id, value } => send(
                 self.worker,
@@ -1077,7 +1101,11 @@ impl Isolate for Worker {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Run {
                 job_id,
@@ -1107,7 +1135,11 @@ impl Isolate for WorkSink {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }
@@ -1384,7 +1416,11 @@ impl Isolate for CallTarget {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallTargetMsg::Ask => {
                 *self.hits.lock().expect("hits mutex") += 1;
@@ -1424,7 +1460,11 @@ impl Isolate for CallClient {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallClientMsg::Start => call(self.target, CallTargetMsg::Ask, Duration::from_secs(1))
                 .reply(CallClientMsg::Returned),
@@ -1529,7 +1569,11 @@ impl Isolate for ParkWorker {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParkMsg::Park => {
                 if let Some(parked_tx) = self.parked_tx.take() {
@@ -1563,7 +1607,11 @@ impl Isolate for RemoteBurst {
         shard: WorkShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             BurstMsg::Burst => {
                 batch([send(self.sink, SinkMsg::Hit), send(self.sink, SinkMsg::Hit)])

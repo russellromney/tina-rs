@@ -35,7 +35,7 @@
 //!     fn handle(
 //!         &mut self,
 //!         msg: BridgeRequest<CounterRequest, CounterReply>,
-//!         _ctx: &mut Context<'_, SingleShard>,
+//!         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
 //!     ) -> Effect<Self> {
 //!         let (request, responder) = msg.into_parts();
 //!         self.value += 1;
@@ -383,7 +383,7 @@ where
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut tina::Context<'_, Self::Shard>,
+        ctx: &mut tina::Context<'_, Self::Shard, Self::Reply>,
     ) -> tina::Effect<Self> {
         if msg.bridge_cancelled() {
             return tina::noop();

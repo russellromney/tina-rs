@@ -36,7 +36,11 @@ struct Caller {
 
 #[tina_runtime::isolate(message = CallerMsg)]
 impl Caller {
-    fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CallerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallerMsg::Begin => {
                 let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.fanout as usize);
@@ -110,7 +114,11 @@ struct Callee;
 
 #[tina_runtime::isolate(message = CalleeMsg, reply = u32)]
 impl Callee {
-    fn handle(&mut self, msg: CalleeMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CalleeMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CalleeMsg::Echo(value) => reply(value),
         }
@@ -136,7 +144,11 @@ struct ObsCaller {
 
 #[tina_runtime::isolate(message = ObsMsg)]
 impl ObsCaller {
-    fn handle(&mut self, msg: ObsMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ObsMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ObsMsg::Begin => {
                 let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.burst as usize);
@@ -163,7 +175,11 @@ struct Noise;
 
 #[tina_runtime::isolate(message = NoiseMsg)]
 impl Noise {
-    fn handle(&mut self, _msg: NoiseMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: NoiseMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }

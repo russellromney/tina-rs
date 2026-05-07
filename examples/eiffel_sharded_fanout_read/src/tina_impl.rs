@@ -70,7 +70,7 @@ impl Isolate for ShardCounter {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: ShardCounterMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ShardCounterMsg, ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ShardCounterMsg::Get { reply_to } => send(
                 reply_to,
@@ -125,7 +125,7 @@ impl Isolate for ScatterCoord {
     fn handle(
         &mut self,
         msg: ScatterCoordMsg,
-        _ctx: &mut Context<'_, AppShard>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ScatterCoordMsg::Bind { bridge } => {

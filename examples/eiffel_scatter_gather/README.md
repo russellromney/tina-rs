@@ -52,7 +52,7 @@ What is *not* bounded:
 ## Tina shape
 
 The coordinator captures the caller as a deferred slot via
-`PendingReplies::try_capture::<Coordinator, _>(ctx, qid)`. On
+`PendingReplies::try_capture(ctx, qid)`. On
 admission failure (`Full`) it answers the caller immediately with
 `reply(AggregateReply(0))` *without* consuming the caller — the
 slot ceremony is conditional on capacity.

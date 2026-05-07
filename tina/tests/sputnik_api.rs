@@ -96,7 +96,11 @@ impl Isolate for Worker {
         shard: InlineShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerEvent::Start => noop(),
         }
@@ -113,7 +117,11 @@ impl Isolate for Session {
         shard: InlineShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SessionEvent::Note(note) => {
                 self.notes.push(note.clone());
@@ -188,7 +196,8 @@ impl<T> Mailbox<T> for BoundedMailbox<T> {
 fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
     let audit = Address::new(ShardId::new(3), IsolateId::new(41));
     let mut shard = InlineShard;
-    let mut ctx = Context::new(&mut shard, IsolateId::new(7));
+    let mut ctx =
+        Context::<_, <Session as Isolate>::Reply>::new_typed(&mut shard, IsolateId::new(7));
     let mut session = Session {
         notes: Vec::new(),
         audit,

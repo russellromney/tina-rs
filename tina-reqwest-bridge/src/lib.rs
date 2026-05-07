@@ -41,7 +41,7 @@
 //!         shard: SingleShard,
 //!     }
 //!
-//!     fn handle(&mut self, msg: AppMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+//!     fn handle(&mut self, msg: AppMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
 //!         match msg {
 //!             AppMsg::Start => send_request(
 //!                 self.http,

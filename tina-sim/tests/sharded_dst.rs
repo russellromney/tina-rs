@@ -77,7 +77,11 @@ impl Isolate for ShardedCounter {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CounterMsg::Inc { key, reply_to } => {
                 let owner = self.placement.owner_for_str(&key);
@@ -130,7 +134,11 @@ impl Isolate for Tracker {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TrackerMsg::IncResult { shard, outcome } => match outcome {
                 Ok(()) => self.inc_oks.borrow_mut().push(shard),
@@ -394,7 +402,11 @@ impl Isolate for QuietCounter {
         shard: AppShard,
     }
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         // Drop the message on the floor. No reply, no error — the
         // coord's aggregate-timeout timer is the only thing that fires.
         noop()
@@ -437,7 +449,11 @@ impl Isolate for ScatterCoord {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ScatterCoordMsg::Bind { bridge } => {
                 self.bridge = Some(bridge);
