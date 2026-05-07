@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "eiffel-webhook-fanout"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+http = { version = "1", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+tina = { path = "../../tina" }
+tina-reqwest-bridge = { path = "../../tina-reqwest-bridge" }
+tina-runtime = { path = "../../tina-runtime" }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }

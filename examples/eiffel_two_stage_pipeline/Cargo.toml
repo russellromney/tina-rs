@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "eiffel-two-stage-pipeline"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+tina = { path = "../../tina" }
+tina-runtime = { path = "../../tina-runtime" }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

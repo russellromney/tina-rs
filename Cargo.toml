@@ -36,6 +36,14 @@ exclude = [
     "examples/eiffel_retrying_outbound_http",
     "examples/eiffel_rate_limited_worker",
     "examples/eiffel_sharded_fanout_read",
+    "examples/eiffel_cancellation_chain",
+    "examples/eiffel_owned_state_leak",
+    "examples/eiffel_worker_pool",
+    "examples/eiffel_bounded_batcher",
+    "examples/eiffel_webhook_fanout",
+    "examples/eiffel_hot_key_fairness",
+    "examples/eiffel_two_stage_pipeline",
+    "examples/eiffel_graceful_pool_shutdown",
 ]
 resolver = "2"
 
