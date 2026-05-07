@@ -369,12 +369,12 @@ enum MapMsg {
 
 #[derive(Debug, Clone)]
 enum MapCoordMsg {
-    PutResult(Result<ShardId, WrongShard>),
-    GetResult {
+    Put(Result<ShardId, WrongShard>),
+    Get {
         shard: ShardId,
-        value: Option<String>,
+        outcome: Result<Option<String>, WrongShard>,
     },
-    DelResult(Result<bool, WrongShard>),
+    Del(Result<bool, WrongShard>),
 }
 
 struct ShardedMap {
@@ -403,32 +403,39 @@ impl Isolate for ShardedMap {
                 if owner != ctx.shard_id() {
                     return send(
                         reply_to,
-                        MapCoordMsg::PutResult(Err(WrongShard {
+                        MapCoordMsg::Put(Err(WrongShard {
                             expected: owner,
                             actual: ctx.shard_id(),
                         })),
                     );
                 }
                 self.values.insert(key, value);
-                send(reply_to, MapCoordMsg::PutResult(Ok(ctx.shard_id())))
+                send(reply_to, MapCoordMsg::Put(Ok(ctx.shard_id())))
             }
             MapMsg::Get { key, reply_to } => {
+                // Reads must re-check placement too. Returning `None`
+                // when the request landed on the wrong shard would make a
+                // routing bug indistinguishable from a real absent key —
+                // exactly the partial-failure fog this phase rejects.
                 let owner = self.placement.owner_for_str(&key);
                 if owner != ctx.shard_id() {
                     return send(
                         reply_to,
-                        MapCoordMsg::GetResult {
+                        MapCoordMsg::Get {
                             shard: ctx.shard_id(),
-                            value: None,
+                            outcome: Err(WrongShard {
+                                expected: owner,
+                                actual: ctx.shard_id(),
+                            }),
                         },
                     );
                 }
                 let value = self.values.get(&key).cloned();
                 send(
                     reply_to,
-                    MapCoordMsg::GetResult {
+                    MapCoordMsg::Get {
                         shard: ctx.shard_id(),
-                        value,
+                        outcome: Ok(value),
                     },
                 )
             }
@@ -437,25 +444,33 @@ impl Isolate for ShardedMap {
                 if owner != ctx.shard_id() {
                     return send(
                         reply_to,
-                        MapCoordMsg::DelResult(Err(WrongShard {
+                        MapCoordMsg::Del(Err(WrongShard {
                             expected: owner,
                             actual: ctx.shard_id(),
                         })),
                     );
                 }
                 let removed = self.values.remove(&key).is_some();
-                send(reply_to, MapCoordMsg::DelResult(Ok(removed)))
+                send(reply_to, MapCoordMsg::Del(Ok(removed)))
             }
         }
     }
 }
 
+// Bag<T>: shared, mutable, append-only collection. Cheap factor to keep
+// `MapTracker`'s field types under clippy's `type_complexity` threshold.
+type Bag<T> = Rc<RefCell<Vec<T>>>;
+// Per-shard `Get` outcome: which shard answered, with the placement-
+// re-checked outcome (Ok(value)/Ok(None) on the right shard, Err(WrongShard)
+// otherwise).
+type GetEntry = (ShardId, Result<Option<String>, WrongShard>);
+
 #[derive(Debug, Default)]
 struct MapTracker {
-    put_oks: Rc<RefCell<Vec<ShardId>>>,
-    put_wrong: Rc<RefCell<Vec<WrongShard>>>,
-    gets: Rc<RefCell<Vec<(ShardId, Option<String>)>>>,
-    dels: Rc<RefCell<Vec<Result<bool, WrongShard>>>>,
+    put_oks: Bag<ShardId>,
+    put_wrong: Bag<WrongShard>,
+    gets: Bag<GetEntry>,
+    dels: Bag<Result<bool, WrongShard>>,
 }
 
 impl Isolate for MapTracker {
@@ -470,12 +485,12 @@ impl Isolate for MapTracker {
 
     fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
         match msg {
-            MapCoordMsg::PutResult(Ok(shard)) => self.put_oks.borrow_mut().push(shard),
-            MapCoordMsg::PutResult(Err(w)) => self.put_wrong.borrow_mut().push(w),
-            MapCoordMsg::GetResult { shard, value } => {
-                self.gets.borrow_mut().push((shard, value));
+            MapCoordMsg::Put(Ok(shard)) => self.put_oks.borrow_mut().push(shard),
+            MapCoordMsg::Put(Err(w)) => self.put_wrong.borrow_mut().push(w),
+            MapCoordMsg::Get { shard, outcome } => {
+                self.gets.borrow_mut().push((shard, outcome));
             }
-            MapCoordMsg::DelResult(r) => self.dels.borrow_mut().push(r),
+            MapCoordMsg::Del(r) => self.dels.borrow_mut().push(r),
         }
         noop()
     }
@@ -552,14 +567,14 @@ fn sharded_map_routes_put_get_delete_to_owner_shard() {
             .unwrap();
     }
     run_until_idle(&mut runtime);
-    // Match replies by (owner_shard, value) since the multi-shard runtime
-    // can interleave reply order across shards. We only need to assert
-    // that every expected (owner, value) appears in the gathered set.
-    let mut gathered: Vec<(ShardId, Option<String>)> = gets.borrow().clone();
+    // Match replies by (owner_shard, value). The multi-shard runtime can
+    // interleave reply order across shards, so we only assert that every
+    // expected (owner, Ok(value)) appears in the gathered set.
+    let mut gathered: Vec<GetEntry> = gets.borrow().clone();
     gathered.sort_by_key(|(s, _)| s.get());
-    let mut expected: Vec<(ShardId, Option<String>)> = pairs
+    let mut expected: Vec<GetEntry> = pairs
         .iter()
-        .map(|(k, v)| (placement.owner_for_str(k), Some(v.to_string())))
+        .map(|(k, v)| (placement.owner_for_str(k), Ok(Some(v.to_string()))))
         .collect();
     expected.sort_by_key(|(s, _)| s.get());
     assert_eq!(gathered.len(), expected.len());
@@ -570,6 +585,7 @@ fn sharded_map_routes_put_get_delete_to_owner_shard() {
         );
     }
 
+    // Wrong-shard Put: Put returns Err(WrongShard).
     let key = "alpha";
     let correct = placement.owner_for_str(key);
     let wrong = placement
@@ -595,6 +611,31 @@ fn sharded_map_routes_put_get_delete_to_owner_shard() {
             expected: correct,
             actual: wrong,
         }]
+    );
+
+    // Wrong-shard Get: Get returns Err(WrongShard), not Ok(None). A
+    // routing bug must not look like a real absent key.
+    let baseline_get_count = gets.borrow().len();
+    runtime
+        .try_send(
+            table.address_for(wrong).unwrap(),
+            MapMsg::Get {
+                key: key.to_string(),
+                reply_to: tracker,
+            },
+        )
+        .unwrap();
+    run_until_idle(&mut runtime);
+    let new_gets: Vec<GetEntry> = gets.borrow()[baseline_get_count..].to_vec();
+    assert_eq!(
+        new_gets.as_slice(),
+        &[(
+            wrong,
+            Err(WrongShard {
+                expected: correct,
+                actual: wrong,
+            })
+        )]
     );
 
     for (k, _) in pairs {

@@ -221,11 +221,12 @@ Out-of-scope for first form:
 - Generic `ShardedMap` / `ShardedCounter` product type: not introduced
   until more shipped examples prove the shape is stable.
 
-Surfaced finding:
+Surfaced finding (recorded here, not in `examples/FINDINGS.md` — that
+file is reserved for Eiffel-comparison findings):
 
 - Scatter/gather coordinators need a `ReplyBridge`-style isolate to
   translate replies between typed addresses (the runtime does not let
   one isolate's `Address<X>` accept a reply typed for `Address<Y>`).
-  Every fanout user pattern hits this. Recorded in
-  `examples/FINDINGS.md` as a future ergonomics item — likely a 059
-  candidate.
+  Every fanout user pattern hits this. Likely a 059 ergonomics
+  candidate (e.g., a typed `Address::map_into` or a shipped
+  `ReplyAdapter<From, To>` isolate).
