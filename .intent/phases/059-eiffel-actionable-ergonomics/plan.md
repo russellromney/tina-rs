@@ -41,6 +41,8 @@ Still recurring:
 - linear I/O protocols grow continuation enums quickly;
 - TCP loop patterns repeat;
 - mailbox capacity is correct but still feels like magic arithmetic;
+- host/test code writes poll loops around `ThreadedRuntime::try_send`
+  `IngressFull`;
 - native HTTP routing is still hand-written `(method, path)` matching;
 - bridge examples are still old-shape because bridge ergonomics landed later;
 - RPC topology is single-service only in practice;
@@ -191,7 +193,46 @@ Still recurring:
    - focused capacity tests pin diagnostics;
    - at least one specimen README shows the capacity arithmetic in plain words.
 
-5. **Tiny Native HTTP Router**
+5. **Bounded Host Send Helpers**
+
+   Make host/test sends less hand-rolled without hiding pressure.
+
+   Problem:
+
+   - tests and examples that drive a threaded runtime often write:
+     `loop { match runtime.try_send(...) { Ok(()) => break, IngressFull => yield_now(), ... } }`;
+   - the loop is honest, but repeated and easy to get subtly wrong;
+   - a blocking helper would be nice, but only if it keeps the timeout and
+     `Full`/`Closed` outcomes visible.
+
+   Desired shape:
+
+   ```rust
+   runtime.send_blocking(addr, msg, timeout)?;
+   runtime.send_retrying(addr, msg, timeout)?;
+   ```
+
+   Names are negotiable. Semantics are not.
+
+   Requirements:
+
+   - bounded wait only; timeout required or default config must be inspectable;
+   - no hidden queue beside the runtime ingress;
+   - returns typed `Sent`, `Full`/`Timeout`, `Closed`, and `WorkerStopped`
+     outcomes as appropriate;
+   - preserves message ownership on failure where possible, or documents when
+     the threaded ingress cannot return it;
+   - works for tests and small host drivers; not a replacement for isolate
+     call/reply.
+
+   Proof:
+
+   - focused threaded-runtime tests for success, ingress full then success,
+     timeout, closed/stale target, worker stopped;
+   - replace at least one manual `IngressFull` retry loop in an Eiffel specimen
+     or runtime test.
+
+6. **Tiny Native HTTP Router**
 
    Close the obvious HTTP ergonomics gap.
 
@@ -222,7 +263,7 @@ Still recurring:
    - update `eiffel_native_http`;
    - tests for not found, method mismatch, service full/timeout mapping.
 
-6. **Bridge Specimen Rewrite**
+7. **Bridge Specimen Rewrite**
 
    Bring deferred bridge examples up to the specimens rule.
 
@@ -241,7 +282,7 @@ Still recurring:
    - README discusses two-runtime cost, bridge lifecycle, and visible pressure;
    - use blessed bridge lifecycle and RPC bridge APIs.
 
-7. **RPC Service Topology**
+8. **RPC Service Topology**
 
    Make the 058 topology sketch real enough for hot services.
 
@@ -258,7 +299,7 @@ Still recurring:
    - unit tests for pool admission and shutdown;
    - Eiffel RPC follow-up if the example teaches something new.
 
-8. **Pressure Report Convention**
+9. **Pressure Report Convention**
 
    Give pressure runners one small vocabulary without reviving the harness.
 
@@ -280,16 +321,18 @@ Still recurring:
 
 1. Typed isolate result waiters.
 2. Capacity diagnostics and reply-slot budget docs.
-3. TCP loop helpers.
-4. Continuation/pipeline sugar.
-5. Tiny HTTP router.
-6. Bridge specimen rewrite.
-7. RPC pooled service.
-8. Pressure report convention.
+3. Bounded host send helpers.
+4. TCP loop helpers.
+5. Continuation/pipeline sugar.
+6. Tiny HTTP router.
+7. Bridge specimen rewrite.
+8. RPC pooled service.
+9. Pressure report convention.
 
 Reasoning:
 
-- result waiters and capacity diagnostics delete the most side-channel code;
+- result waiters, capacity diagnostics, and host send helpers delete the most
+  side-channel / host-driver code;
 - TCP/pipeline helpers reduce repeated protocol ceremony;
 - HTTP/router and bridge examples are user-facing polish;
 - RPC topology is important but can depend on 053 if needed;
@@ -309,6 +352,7 @@ Reasoning:
 - A normal Tina service needs fewer side channels.
 - Linear I/O code is less noisy.
 - Capacity failures are easier to diagnose.
+- Host drivers do not hand-roll `IngressFull` retry loops.
 - Native HTTP has a small routing story.
 - Bridge examples show the current blessed bridge shape.
 - The next Eiffel pressure round can focus on behavior under load, not old

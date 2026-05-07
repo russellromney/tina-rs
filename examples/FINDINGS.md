@@ -88,7 +88,25 @@ is correct, but users experience it as magic numbers.
 
 Tina should make boundedness obvious, not mystical.
 
-### 5. Tiny native HTTP router
+### 5. Bounded host send helpers
+
+**Surfaced by:** `eiffel_supervised_worker`, runtime tests.
+
+Host/test code sometimes wants to submit a message to a threaded runtime and
+wait briefly when ingress is full. Today that becomes a hand-rolled
+`try_send` loop over `IngressFull` with `yield_now()` and a deadline.
+
+**Build:** bounded host-send helpers:
+
+```rust
+runtime.send_blocking(addr, msg, timeout)
+runtime.send_retrying(addr, msg, timeout)
+```
+
+Names are less important than the contract: no hidden queue, timeout visible,
+`Full`/`Timeout`/`Closed`/`WorkerStopped` typed, message ownership clear.
+
+### 6. Tiny native HTTP router
 
 **Surfaced by:** `eiffel_native_http`.
 
@@ -106,7 +124,7 @@ HttpRouter::new()
 or an isolate-friendly mapping that emits user messages. Keep service state in
 isolates. Do not recreate Axum/Tower inside Tina.
 
-### 6. Bridge specimen cleanup
+### 7. Bridge specimen cleanup
 
 **Surfaced by:** `eiffel_axum_counter`, `eiffel_ws_room`.
 
@@ -122,7 +140,7 @@ teach useful things, but they have the old `src/comparison/` shape.
 - show `BridgeClient::call` / async RPC bridge where relevant;
 - document signal-handler coexistence when Tokio and Tina live in one process.
 
-### 7. RPC service topology beyond single
+### 8. RPC service topology beyond single
 
 **Surfaced by:** `eiffel_rpc`, phase 052/058.
 
@@ -140,7 +158,7 @@ registry API changing.
 The registry should keep mapping service name to one address. The address may
 be a single service, pool frontend, or shard router.
 
-### 8. Uniform overload reports for pressure runners
+### 9. Uniform overload reports for pressure runners
 
 **Surfaced by:** `eiffel_cpu_run`, `eiffel_mem_run`.
 
