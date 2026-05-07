@@ -763,6 +763,67 @@ where
         Address::new_with_generation(address.shard, address.isolate, address.generation)
     }
 
+    /// Registers one isolate; constructor receives its own typed address.
+    ///
+    /// Replaces the `Begin { self_addr }` / `Bind { self_addr }` bootstrap
+    /// variant: the closure gets the final `Address` and returns the isolate.
+    /// Generation matches plain
+    /// [`register_with_capacity`](Self::register_with_capacity) (initial 0).
+    ///
+    /// Honesty: no message delivers before `construct` returns; the closure
+    /// has no runtime handle, so an address can only escape through user-
+    /// captured shared state. Constructor panic leaks the allocated id (never
+    /// reused) and pushes no entry; a try_send to a leaked address then
+    /// panics like any send to an unknown id.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_using<I, Outbound, Ctor>(
+        &mut self,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Address<I::Message, I::Reply>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+        Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
+    {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
+        let generation = AddressGeneration::new(0);
+        let self_addr = Address::<I::Message, I::Reply>::new_with_generation(
+            self.shard.id(),
+            isolate_id,
+            generation,
+        );
+
+        let mailbox = self
+            .mailbox_factory
+            .create::<Box<dyn Any>>(mailbox_capacity);
+
+        // Constructor panic leaves an allocated id with no entry. id
+        // allocator is monotonic so leaking one is harmless.
+        let isolate = construct(self_addr);
+
+        self.entries.push(RegisteredEntry {
+            id: isolate_id,
+            generation,
+            parent: None,
+            stopped: Cell::new(false),
+            stopped_event: Cell::new(None),
+            mailbox: Box::new(AnyMailboxAdapter { mailbox }),
+            call_contexts: RefCell::new(VecDeque::new()),
+            handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
+                isolate,
+                marker: PhantomData,
+            })),
+        });
+
+        self_addr
+    }
+
     /// Attempts to enqueue a typed message into one registered isolate.
     ///
     /// This is the runtime-side ingress surface for tests and later drivers.

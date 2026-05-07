@@ -208,16 +208,11 @@ where
     }
 
     /// Register a [`ReplyAdapter<M, T, S>`] on a chosen shard.
+    /// Simulator parity for the multi-shard runtime forms.
     ///
-    /// Simulator parity for
-    /// [`MultiShardRuntime::register_reply_adapter_on`] /
-    /// [`ThreadedMultiShardRuntime::register_reply_adapter_on`]: same
-    /// shape, same visible inputs, no hidden state beyond the
-    /// adapter's bounded mailbox.
-    ///
-    /// The adapter translates inbound `M` to outbound `T` via the
-    /// user-provided `From<M> for T` and forwards to `target`.
-    /// Returns the bridge `Address<M>` callers send to.
+    /// Translates inbound `M` to outbound `T` via the user-provided
+    /// `From<M> for T` and forwards to `target`. Returns the bridge
+    /// `Address<M>` callers send to.
     #[allow(private_bounds)]
     pub fn register_reply_adapter_on<M, T>(
         &mut self,

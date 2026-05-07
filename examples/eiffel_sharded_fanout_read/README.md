@@ -75,12 +75,12 @@ Replies translate through `ReplyAdapter<ShardCounterReply,
 ScatterCoordMsg, AppShard>`. The user provides one
 `impl From<ShardCounterReply> for ScatterCoordMsg`; the adapter is
 the shipped primitive that takes care of the address translation.
-
-Phase 064 Rock 4 added `register_reply_adapter_on(shard, target,
-capacity)` on the multi-shard runtimes (threaded, explicit-step,
-and the sim). The adapter still lives in its own bounded mailbox;
-the helper just removes the doubled turbofish — the adapter type
-and the outbound payload type — that registering by hand required.
+Registration uses `runtime.register_reply_adapter_on(shard,
+target, capacity)`, which exists on the multi-shard runtimes
+(threaded, explicit-step, and the sim). The adapter still lives
+in its own bounded mailbox; the helper just removes the doubled
+turbofish — the adapter type and the outbound payload type —
+that registering by hand required.
 
 ## Discussion
 

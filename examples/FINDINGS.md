@@ -50,15 +50,24 @@ Today the answer is a `Bind { bridge }` (or `Begin { self_addr }`) message
 before `Start`. That works but adds a variant whose only job is to land
 "you, isolate, look here for your replies" into the isolate's state.
 
-Phase 062 Rock 2 was designed for this (`register_with_capacity_using<I, E>`
-with a `|self_addr| ...` constructor closure) but did not ship in the
-five-Rock landing.
-
 **Build:** a way for an isolate to learn its own typed address at register
 time — for example, a constructor closure parameter `|self_addr| {
 ScatterCoord { ..., self_addr } }`. Avoids the bind-before-start handshake
 and removes the `Option<Address<...>>` field that's only `None` for one
 turn.
+
+Self-address half shipped on the single-shard runtimes:
+`Runtime::register_with_capacity_using(cap, |self_addr| ...)` and
+the threaded mirror. `eiffel_dynamic_worker_pool` migrated to it;
+the chicken-and-egg `Begin { self_addr }` variant is gone.
+Multi-shard parity (`MultiShardRuntime` /
+`ThreadedMultiShardRuntime` / simulator) is deferred until a
+multi-shard example needs it.
+
+Still open: the cross-isolate handshake half — `Bind { bridge }` in
+`eiffel_sharded_fanout_read` is *not* about self-address, it's about
+two isolates needing each other's addresses at registration. That
+needs a paired-registration primitive or a different shape.
 
 ### 7. Reqwest-bridge flatten edge: useful but per-call-site
 
@@ -145,13 +154,12 @@ flag is the bridge-side version of the same idea.
 - ~~`pending.drain_into_effect(R::Closed) -> Effect<I>` (or
   similarly named) that returns the matching `Effect::Batch` in
   one call, with the trailing `stop()` opt-in via a sibling
-  `drain_into_stop_effect(R::Closed)`.~~ Shipped in Phase 064
-  Rock 1: `PendingReplies::drain_replies` /
-  `drain_replies_with` / `drain_into_effect` /
-  `drain_into_stop` / `drain_with_into_effect` /
-  `drain_with_into_stop`, all typed so a `PendingReplies<K, R>`
-  only produces `Effect<I>` when `I::Reply = R`.
-  `eiffel_graceful_pool_shutdown` uses
+  `drain_into_stop_effect(R::Closed)`.~~ Shipped:
+  `PendingReplies::drain_replies` / `drain_replies_with` /
+  `drain_into_effect` / `drain_into_stop` /
+  `drain_with_into_effect` / `drain_with_into_stop`, all typed
+  so a `PendingReplies<K, R>` only produces `Effect<I>` when
+  `I::Reply = R`. `eiffel_graceful_pool_shutdown` uses
   `pending.drain_into_stop::<Self>(R::Closed)`. The deadline
   half of this finding (DrainGate) folds into finding 15
   (Deadline as first-class context).
@@ -226,7 +234,8 @@ witness.
 
 ### 14. Spawn API surfaces the child's address
 
-**Surfaced by:** `eiffel_dynamic_worker_pool`.
+**Surfaced by:** `eiffel_dynamic_worker_pool`,
+`eiffel_supervised_worker`.
 
 `spawn(ChildDefinition::new(...))` returns nothing. The parent does
 not learn the child's `Address`. Today this is OK because the
@@ -251,6 +260,16 @@ require a synchronous spawn API today), or a
 delivers `Address<ChildMsg>` to the parent as a continuation
 message — analogous to `send_observed` and `runtime calls`. This
 also enables a future `JoinSet`-equivalent isolate primitive.
+
+A *host-side* alternative —
+`runtime.observe_child_started::<M>(parent).wait(timeout)?` —
+was considered and rejected for now: the existing
+`RuntimeEventKind::Spawned { child_isolate }` event has no
+`TypeId` for the child's `Message`, so a typed waiter would
+either need a new field on `Spawned` (a runtime-event change)
+or a caller-asserted `M` (not honest under the LLM rule). Pick
+the typed-event vs. continuation form when the supervisor/spawn
+API gets revisited.
 
 ### 15. Deadline as first-class context
 

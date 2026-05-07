@@ -44,18 +44,16 @@ impl Worker {
 
 #[derive(Debug, Clone)]
 pub enum CoordMsg {
-    /// Host injects the coordinator's own address (chicken-and-egg
-    /// at registration time — the children need a typed address to
-    /// send their partials back, but the coord doesn't know its own
-    /// address until after `register`).
-    Begin {
-        self_addr: Address<CoordMsg>,
-    },
+    /// Host kicks off the fanout. Phase 064 Rock 3 removed the old
+    /// `Begin { self_addr }` ceremony — the coord now learns its own
+    /// address at registration via `register_with_capacity_using`.
+    Start,
     /// One child finished. Carries its partial sum.
     WorkerDone(u64),
 }
 
 struct Coordinator {
+    self_addr: Address<CoordMsg>,
     expected: u32,
     received: u32,
     sum: u64,
@@ -70,18 +68,13 @@ struct Coordinator {
 impl Coordinator {
     fn handle(&mut self, msg: CoordMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
-            CoordMsg::Begin { self_addr } => {
+            CoordMsg::Start => {
+                let parent = self.self_addr;
                 let mut effects = Vec::with_capacity(self.chunks.len());
                 for chunk in self.chunks.drain(..) {
                     effects.push(spawn(
-                        ChildDefinition::new(
-                            Worker {
-                                parent: self_addr,
-                                chunk,
-                            },
-                            4,
-                        )
-                        .with_initial_message(WorkerMsg::Compute),
+                        ChildDefinition::new(Worker { parent, chunk }, 4)
+                            .with_initial_message(WorkerMsg::Compute),
                     ));
                 }
                 batch(effects)
@@ -116,16 +109,17 @@ pub fn run() -> anyhow::Result<Report> {
         .collect();
 
     let coord_addr = runtime
-        .register_with_capacity::<_, Infallible>(
-            Coordinator {
+        .register_with_capacity_using::<Coordinator, Infallible, _>(
+            // Mailbox sized for `Start` + every worker's `WorkerDone`.
+            (WORKER_COUNT + 4) as usize,
+            move |self_addr| Coordinator {
+                self_addr,
                 expected: WORKER_COUNT,
                 received: 0,
                 sum: 0,
                 chunks,
                 report: Report::default(),
             },
-            // Mailbox sized for `Begin` + every worker's `WorkerDone`.
-            (WORKER_COUNT + 4) as usize,
         )
         .map_err(|e| anyhow::anyhow!("register coordinator: {e:?}"))?;
 
@@ -134,8 +128,8 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
     runtime
-        .try_send(coord_addr, CoordMsg::Begin { self_addr: coord_addr })
-        .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
+        .try_send(coord_addr, CoordMsg::Start)
+        .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
 
     let report = waiter
         .wait(Duration::from_secs(5))

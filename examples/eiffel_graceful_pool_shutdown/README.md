@@ -15,8 +15,7 @@ cargo test --manifest-path examples/eiffel_graceful_pool_shutdown/Cargo.toml
 `Frontend` holds `PendingReplies::with_capacity(MAX_PENDING)`. On
 `Shutdown` it drains the box and replies `Closed` to every
 pending caller in one `Effect::Batch` plus a trailing `stop()`,
-expressed with the typed `drain_into_stop` helper (Phase 064
-Rock 1):
+expressed with the typed `drain_into_stop` helper:
 
 ```rust
 FrontendMsg::Shutdown => {
@@ -26,7 +25,7 @@ FrontendMsg::Shutdown => {
 
 The helper is compile-time typed so a `PendingReplies<K, R>`
 only produces `Effect<I>` when `I::Reply = R`. The method name
-says `stop` on purpose — nothing else inside the helper appends
+says `stop` on purpose — nothing else in the helper appends
 `stop()` for you, and the underlying `pending.drain()` /
 `reply_to(slot, ...)` semantics are unchanged.
 
