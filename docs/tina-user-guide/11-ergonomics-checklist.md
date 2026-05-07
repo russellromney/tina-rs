@@ -56,8 +56,75 @@ when the host needs the isolate's typed final value (counters, parsed
 output, accumulated state). Single-claim per `(isolate, generation)`;
 no replay cache.
 
+The same surface is on `ThreadedMultiShardRuntime`: registration is
+routed to the address's owning shard. Passing an address from a
+foreign runtime panics, matching `try_send`'s convention.
+
 Do not pass an `Arc<Outcome>`, `Arc<Mutex<Vec<_>>>`, or atomics into
 the isolate just so the host can read the final value after stop.
+
+### Host bursts of typed sends
+
+Use `runtime.try_send_outcome(addr, msg, &outcomes)` plus
+`HostBurstOutcomes` when the host issues a tight burst and wants
+per-send admission truth (admitted / mailbox_full / mailbox_closed /
+ingress_full / worker_stopped) without writing one observer closure
+per send:
+
+```rust
+let outcomes = HostBurstOutcomes::new();
+for n in 0..N {
+    let _ = runtime.try_send_outcome(addr, Msg::Submit(n), &outcomes);
+}
+outcomes.wait_complete(deadline)?;
+let snap = outcomes.snapshot();
+```
+
+Each per-send outcome stays distinct in the snapshot. The observer
+still fires on the worker thread; the helper removes the per-send
+closure ceremony, not the worker roundtrip.
+
+Do not hand-roll `Arc<AtomicU32>` accept/full/observed counters with
+a `try_send_and_observe_with` closure per send.
+
+### Bounded-wait control message
+
+Use `runtime.send_observed_until(addr, deadline, backoff, || msg)`
+when a host-side control message (`BurstClosed(n)`, `Stop`, `Drain`)
+travels through the same bounded data mailbox. The helper retries on
+`MailboxFull` / `IngressFull` until the deadline and returns typed
+`SendObservedUntilError::{Timeout, Closed, WorkerStopped}`. Each
+attempt is a worker roundtrip; pick a `backoff` that reflects how
+fast the data mailbox actually drains.
+
+Do not hand-roll the same `match send_and_observe { Full | IngressFull
+=> sleep, Closed => bail, ... }` retry loop at every host-side
+shutdown call site.
+
+### Single-in-flight timer
+
+Use `tina_runtime::SingleCallGate` for isolates whose rate-limit
+shape is `sleep(window).reply(Tick)` and must keep at most one timer
+in flight:
+
+```rust
+WorkerMsg::Submit(_) => {
+    if self.gate.submit() { sleep(window).reply(WorkerMsg::Tick) }
+    else { noop() }
+}
+WorkerMsg::Tick(_) => {
+    self.processed += 1;
+    if self.gate.complete() { sleep(window).reply(WorkerMsg::Tick) }
+    else { noop() }
+}
+```
+
+The gate is plain data; it does not own the timer or the message
+type. Every `sleep(...).reply(...)` still appears as one `Sleep`
+trace event.
+
+Do not hand-roll `pending: u32` plus `was_idle = pending == 0` in
+every timer-driven worker.
 
 ### Child restart
 
@@ -305,6 +372,24 @@ truth. Do not collapse them silently.
 For app-edge code that does not need to distinguish, opt in to
 `flatten_outcome(...)`. The flat `ReqwestCallError::Bridge(...)` /
 `Worker(...)` variants still name which layer failed.
+
+For caller-owned retry loops, use `outcome.classify()`
+(`ReqwestOutcomeExt`) to collapse the layered match into three typed
+buckets:
+
+```rust
+match outcome.classify() {
+    ReqwestOutcomeClass::Succeeded(resp) => finish_ok(resp),
+    ReqwestOutcomeClass::Transient(_) => sleep(backoff).reply(Retry),
+    ReqwestOutcomeClass::Fatal(_) => fail(),
+}
+```
+
+The reason payloads keep bridge-vs-worker layering distinct
+(`BridgeTimeout` vs `WorkerTimeout`, `BridgeFull` vs `WorkerFull`,
+etc.) and `WorkerTransport(String)` / `InvalidRequest(String)`
+preserve their underlying message text for logs. The classifier does
+not retry — caller still owns idempotency, budget, and backoff.
 
 See [Bridge Crates](18-bridge-crates.md) for the contract.
 

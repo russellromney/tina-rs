@@ -8,8 +8,28 @@
     `eiffel_retrying_outbound_http`, `eiffel_sharded_fanout_read`. The
     seven Round 2 findings still match the in-tree specimens; no new
     product-shaped pain has appeared.
+  - Rock 1: `ThreadedMultiShardRuntime::observe_result` lifted from
+    the single-shard surface, routed to the owning shard. Panics on
+    unknown shard (matches `try_send`). Sharded specimens rewritten.
+  - Rock 3: `try_send_outcome` + `HostBurstOutcomes` accumulator.
+    Rate-limited worker rewritten.
+  - Rock 4: `send_observed_until` retry helper. BurstClosed loop
+    collapsed to one call.
+  - Rock 5: `SingleCallGate`. Rate-limited worker uses it.
+  - Rock 6: `ReqwestOutcomeExt::classify` with typed reasons
+    (`UpstreamServer { status }`, `BridgeTimeout`, `WorkerTimeout`,
+    `WorkerTransport(msg)`, `BridgeFull`, `BridgeClosed`,
+    `WorkerFull`, `WorkerClosed`, `RequestTooLarge`,
+    `ResponseTooLarge`, `InvalidRequest(msg)`,
+    `UpstreamClient { status }`). `eiffel_retrying_outbound_http`
+    six-arm match collapsed to three.
+  - User guide updated:
+    `docs/tina-user-guide/11-ergonomics-checklist.md` carries
+    "use this, not that" entries for each shipped primitive;
+    `docs/tina-user-guide/18-bridge-crates.md` mentions `classify`
+    next to `flatten_outcome`.
 - In progress:
-  - Low-risk rocks 1, 3, 4, 5, 6.
+  - (none — all in-scope rocks landed)
 - Open:
   - Rocks 2 (self-address) and 8 (scatter/gather helper) are blocked
     on a written design note before any code lands.
