@@ -164,6 +164,31 @@ let report = runtime.topology_report().expect("topology report");
 emit_snapshot(&report);
 ```
 
+## Bridges
+
+`tina-rpc-tokio`, `tina-tokio-bridge`, `tina-tower-bridge`, and
+`tina-reqwest-bridge` each expose an optional `tracing` Cargo
+feature with the same shape:
+
+```toml
+[dependencies]
+tina-rpc-tokio = { version = "...", features = ["tracing"] }
+```
+
+`tina-rpc-tokio` already emits bridge spans
+(`tina_rpc.bridge.call` with `service`, `method`, `correlator`,
+`result_kind`); the other three currently scaffold the feature
+flag without emitting yet. A follow-up pass aligns the field
+vocabulary across all four so a single subscriber sees consistent
+records — runtime trace events under
+`target = "tina_runtime::trace"` and bridge spans under
+`target = "tina_<bridge>.…"` — sharing the same `reason` strings
+where the concept matches.
+
+Until that lands: filter on the targets you have, correlate
+runtime `call_id` ↔ bridge correlator by hand, and treat bridge
+fields as bridge-shaped, not runtime-shaped.
+
 ## What this crate does *not* do
 
 - Install a global subscriber. The only function that does is

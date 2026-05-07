@@ -11,8 +11,11 @@
   byte-equality test on both runtime and sim.
 - Deferred: OpenTelemetry, Prometheus, exporter policy, metric policy,
   cross-version on-the-wire trace formats, span hierarchy beyond
-  shard+isolate scoping, bridge tracing alignment (revisit when a
-  third bridge adopts `tracing` — two crates is coincidence).
+  shard+isolate scoping. **Bridge tracing alignment** is scaffolded
+  (every bridge — `tina-tokio-bridge`, `tina-tower-bridge`,
+  `tina-reqwest-bridge`, `tina-rpc-tokio` — now ships an optional
+  `tracing` feature with the same shape) but no new spans/events are
+  emitted yet; the next pass picks the shared field vocabulary.
 
 ## Goal
 
@@ -398,3 +401,45 @@ Proof:
 - One Eiffel example prints structured tracing output for a real run.
 - No new event kinds added to the runtime. No global subscriber installed
   unless the caller calls `install_global_default_subscriber`.
+
+## Bridge Tracing Scaffolding (Follow-Up Note)
+
+`tina-rpc-tokio` already shipped a `tracing` feature with its own
+field names (`service`, `method`, `correlator`, `result_kind`).
+`tina-tokio-bridge`, `tina-tower-bridge`, and `tina-reqwest-bridge`
+now ship the same optional `tracing = ["dep:tracing"]` shape with no
+spans/events emitted yet.
+
+That gives us four crates with the same surface, ready for a single
+alignment pass instead of four uncoordinated dialects.
+
+The next pass picks the shared vocabulary. Likely shape:
+
+- one span per bridge admission attempt (`tina_<bridge>.admit`).
+- one span per bridge call lifetime (`tina_<bridge>.call`) when the
+  bridge owns a call/correlator concept.
+- shared field names where the concept is the same:
+  - `reason = "Full" | "Closed" | "Timeout" | "ResourceClosed" | …`
+    matches the runtime's typed-reason vocabulary;
+  - `bridge` carries the concrete bridge name as a stable string;
+  - `correlator` (if any) stays a correlation field — never a metric
+    label.
+- bridge-specific fields stay bridge-specific (`service`/`method` for
+  RPC; `method`/`url_host` for reqwest; `tower_layer` for tower) and
+  do not pollute runtime events.
+
+Rules carried forward:
+
+- bridges still do not pull `tracing` in unless their caller turns
+  the feature on;
+- typed `BridgeError`/`ReqwestError`/`tower::Status`-shaped values
+  must continue to surface, not be flattened to a generic `error`;
+- `tina-tracing` stays the runtime-trace adapter; bridge tracing
+  ships from each bridge's own crate to keep dep direction clean.
+
+Proof for the alignment pass (separate phase):
+
+- one runnable example shows runtime + bridge spans interleaved in a
+  single subscriber stream, sharing the `reason` vocabulary;
+- `cargo tree` shows no bridge depends on another bridge's tracing
+  feature.
