@@ -39,7 +39,7 @@ pub use parse::{
 };
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
-pub use router::{RouteHandler, Router};
+pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
 pub use streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };

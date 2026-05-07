@@ -1,4 +1,4 @@
-//! Phase 047 Rock 8: runtime surface alignment.
+//! Runtime surface alignment.
 //!
 //! These tests pin the alignment between explicit-step `Runtime` and
 //! `ThreadedRuntime`:

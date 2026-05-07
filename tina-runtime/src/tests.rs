@@ -2872,7 +2872,7 @@ fn retry_backoff_workload_uses_timer_path() {
 }
 
 // -----------------------------------------------------------------------
-// Phase 043 Rock 2: LocalSystemShutdownReport unclean_reason priority.
+// LocalSystemShutdownReport unclean_reason priority.
 //
 // `from_parts` derives the typed reason from the topology snapshot and
 // any terminal error. The priority order, highest first, is:
@@ -3051,8 +3051,8 @@ fn shutdown_report_owned_remaining_is_lowest_priority_unclean_reason() {
     assert_eq!(report.remaining_owned_resource_count(), 3);
 }
 
-// Phase 043 Rock 6: every bounded lane capacity must be reachable from
-// the topology snapshot, not just ingress and storage.
+// Every bounded lane capacity must be reachable from the topology
+// snapshot, not just ingress and storage.
 #[test]
 fn live_shard_report_exposes_every_lane_capacity() {
     let report = make_shard_report(ShardId::new(1), LiveShardState::Running, 0, 0, 0);
@@ -3085,7 +3085,7 @@ fn shutdown_report_sums_counts_across_shards() {
     );
 }
 
-// Phase 047 Rock 1: blessed default mailbox factories. The single-thread
+// Blessed default mailbox factories. The single-thread
 // default (`DefaultMailboxFactory`) and the threaded variant
 // (`DefaultThreadedMailboxFactory`) each have to honor the explicit
 // capacity, FIFO order, idempotent close, and Full/Closed differentiation

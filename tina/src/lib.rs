@@ -100,7 +100,43 @@
 //! ));
 //! ```
 
+use std::any::Any;
+use std::fmt;
 use std::marker::PhantomData;
+
+/// Type-erased payload for [`Effect::StopWith`].
+///
+/// Holds the isolate's final value as `Box<dyn Any + Send>` so [`Effect`]
+/// keeps no `Debug` bound on `T`. The host receives the value through
+/// `runtime.observe_result::<T>(addr)`; type mismatch is a typed wait
+/// outcome, not a panic.
+pub struct StopResult(Box<dyn Any + Send>);
+
+impl StopResult {
+    /// Boxes a typed final value.
+    pub fn new<T: Send + 'static>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    /// Returns the inner boxed `Any` for runtime downcast.
+    pub fn into_any(self) -> Box<dyn Any + Send> {
+        self.0
+    }
+
+    /// Inner value's `TypeId`.
+    pub fn type_id(&self) -> std::any::TypeId {
+        (*self.0).type_id()
+    }
+}
+
+impl fmt::Debug for StopResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StopResult")
+            .field("type_id", &(*self.0).type_id())
+            .finish()
+    }
+}
 
 /// Declares a Tina isolate from an inherent `impl` block.
 ///
@@ -263,6 +299,14 @@ where
     /// Stop the current isolate.
     Stop,
 
+    /// Stop the current isolate and publish a typed final result for a
+    /// host-registered `observe_result::<T>` waiter.
+    ///
+    /// Same lifecycle and `IsolateStopped` event as [`Self::Stop`]. With a
+    /// waiter: deliver `T` on type match, `TypeMismatch` otherwise. Without
+    /// a waiter: drop the value (no replay cache).
+    StopWith(StopResult),
+
     /// Restart this isolate's children according to the runtime's supervision
     /// policy.
     RestartChildren,
@@ -288,7 +332,7 @@ where
     ///
     /// An empty batch is equivalent to [`Noop`](Self::Noop).
     ///
-    /// **Same-stream caveat (Phase 047 Rock 6):** `Batch` does *not* serialize
+    /// **Same-stream caveat:** `Batch` does *not* serialize
     /// runtime calls that target the same I/O resource. Issuing several
     /// `tcp_write` calls against the same `StreamId` inside a single batch is
     /// unsupported — the second runtime call against the same stream lane
@@ -340,6 +384,17 @@ where
     Effect::Stop
 }
 
+/// Stops the current isolate and offers a typed result to a registered
+/// `observe_result::<T>` waiter. Same `IsolateStopped` event as [`stop`].
+/// No waiter or type mismatch → value dropped (no replay cache).
+pub fn stop_with<I, T>(value: T) -> Effect<I>
+where
+    I: Isolate,
+    T: Send + 'static,
+{
+    Effect::StopWith(StopResult::new(value))
+}
+
 /// Returns an effect that asks the runtime to restart this isolate's direct
 /// children according to supervision policy.
 pub fn restart_children<I>() -> Effect<I>
@@ -358,7 +413,7 @@ where
     Effect::Batch(effects.into_iter().collect())
 }
 
-/// Phase 047 Rock 6: documented sugar for ordered runtime-call sequences.
+/// Documented sugar for ordered runtime-call sequences.
 ///
 /// `sequence(...)` is equivalent to [`batch`]: the runtime executes the
 /// contained effects in source order, a [`Stop`](Effect::Stop) short-
@@ -635,10 +690,10 @@ pub trait Shard {
 
 /// Built-in single-shard type for programs that have only one shard.
 ///
-/// Phase 047 Rock 5: when `#[tina::isolate]` (or `#[tina_runtime::isolate]`)
-/// is invoked without a `shard = ...` argument, the macro defaults to this
-/// type so single-shard examples and small services do not need to define
-/// a one-off shard struct just to satisfy the macro. Programs that run
+/// When `#[tina::isolate]` (or `#[tina_runtime::isolate]`) is invoked
+/// without a `shard = ...` argument, the macro defaults to this type so
+/// single-shard examples and small services do not need to define a
+/// one-off shard struct just to satisfy the macro. Programs that run
 /// across more than one shard continue to declare their own shard types
 /// explicitly.
 ///
@@ -1045,6 +1100,6 @@ pub mod prelude {
     pub use crate::{
         Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
         RestartableChildDefinition, Shard, ShardId, SingleShard, batch, isolate, isolate_types,
-        noop, reply, restart_children, send, sequence, spawn, stop,
+        noop, reply, restart_children, send, sequence, spawn, stop, stop_with,
     };
 }

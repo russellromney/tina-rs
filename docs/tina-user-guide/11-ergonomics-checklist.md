@@ -48,6 +48,17 @@ when an isolate has stopped.
 
 Do not pass an `Arc<AtomicBool>` "done" flag through the isolate.
 
+### Isolate final result
+
+Use `stop_with(value)` from the isolate plus
+`runtime.observe_result::<T, _, _>(addr)?.wait(timeout)` from the host
+when the host needs the isolate's typed final value (counters, parsed
+output, accumulated state). Single-claim per `(isolate, generation)`;
+no replay cache.
+
+Do not pass an `Arc<Outcome>`, `Arc<Mutex<Vec<_>>>`, or atomics into
+the isolate just so the host can read the final value after stop.
+
 ### Child restart
 
 Use `runtime.observe_child_restarted(parent).wait(timeout)` to learn
@@ -78,6 +89,28 @@ Use `tina_http::HttpListener::with_config(...)` with
 Do not hand-thread `HttpLimits`, service-call timeout, and connection
 mailbox capacity through every example unless you are testing those
 knobs directly.
+
+### HTTP routing
+
+For routes that read isolate state, use `StatefulRouter<S>`:
+
+```rust
+use tina_http::StatefulRouter;
+
+let router = StatefulRouter::<Counter>::new()
+    .get("/counter", get_counter)
+    .post("/counter", post_counter)
+    .method_not_allowed();
+reply(router.dispatch(self, &request))
+```
+
+For routes that don't need the isolate's state, use the plain
+`Router` with stateless `fn(&HttpRequest) -> HttpResponse` handlers.
+`method_not_allowed()` distinguishes 405 (path known, method
+mismatch) from 404 (path unknown).
+
+Do not hand-write `match (request.method.clone(), request.path.as_str())`
+in service isolates with more than one or two routes.
 
 ### HTTP requests and responses
 

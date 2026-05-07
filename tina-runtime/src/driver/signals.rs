@@ -7,7 +7,7 @@ use super::*;
 /// runtime step loop can convert them into runtime-owned signal
 /// completions.
 ///
-/// Phase 043 Rock 4 contract:
+/// Contract:
 /// * Unix: register `signal-hook` flag handlers for `SIGINT` and
 ///   `SIGTERM` *per driver*, so every `BetelgeuseDriver` running in a
 ///   process sees every signal. Registrations are released when the

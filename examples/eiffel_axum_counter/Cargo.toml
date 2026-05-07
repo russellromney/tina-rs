@@ -12,5 +12,3 @@ tina-runtime = { path = "../../tina-runtime" }
 tina-tokio-bridge = { path = "../../tina-tokio-bridge" }
 tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "sync"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
-
-[workspace]

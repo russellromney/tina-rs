@@ -239,7 +239,7 @@ where
 
     /// Configures a registered isolate as supervisor on the worker shard.
     ///
-    /// Phase 047 Rock 8: this method panics on unknown parent (consistent
+    /// This method panics on unknown parent (consistent
     /// with the explicit-step `Runtime::supervise`). Use
     /// [`try_supervise`](Self::try_supervise) for a non-panicking variant
     /// that surfaces unknown / stale parents as a typed
@@ -336,6 +336,20 @@ where
         }
     }
 
+    /// Registers a typed result waiter for the isolate at `address` on the
+    /// worker shard. See [`Runtime::observe_result`] for semantics.
+    ///
+    /// Worker stopped → `RuntimeStopped`.
+    pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError> {
+        match self.call(move |runtime| runtime.observe_result::<T, M, R>(address)) {
+            Ok(result) => result,
+            Err(_) => Err(observation::ResultWaitError::RuntimeStopped),
+        }
+    }
+
     /// Attempts one typed ingress handoff through the bounded worker queue.
     ///
     /// Success means the worker accepted ownership of the message command. It
@@ -343,7 +357,7 @@ where
     /// `Full` / `Closed` outcomes are observed on the worker side through trace
     /// or through [`send_and_observe`](Self::send_and_observe).
     ///
-    /// Phase 047 Rock 8 — porting note: this is the fast, fire-and-forget
+    /// Porting note: this is the fast, fire-and-forget
     /// surface. Unlike [`Runtime::try_send`] (the explicit-step equivalent),
     /// `ThreadedRuntime::try_send`:
     ///
@@ -361,7 +375,7 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
-        // Phase 043 Rock 5: a Failed worker rejects ingress immediately
+        // A Failed worker rejects ingress immediately
         // even before the bounded sync_channel has observed Disconnected,
         // so callers cannot enqueue work into a quarantined shard.
         if self.metrics.state() == LiveShardState::Failed {
@@ -530,6 +544,12 @@ where
     /// Returns complete trace, failing if the worker can no longer report.
     pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.call(|runtime| runtime.trace().to_vec())
+    }
+
+    /// Returns a counted summary of pressure-shaped trace events.
+    /// See [`Runtime::pressure_summary`].
+    pub fn pressure_summary(&self) -> Result<crate::pressure::PressureSummary, ThreadedRuntimeError> {
+        self.call(|runtime| runtime.pressure_summary())
     }
 
     /// Returns whether the worker still has runtime-owned work pending.

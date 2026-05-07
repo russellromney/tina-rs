@@ -1,6 +1,6 @@
-//! Phase 047 Rock 6: prove `tina::sequence(...)` is equivalent to
-//! `tina::batch(...)` and behaves the same on common shapes (empty,
-//! single, multi, with `stop()`).
+//! Prove `tina::sequence(...)` is equivalent to `tina::batch(...)`
+//! and behaves the same on common shapes (empty, single, multi,
+//! with `stop()`).
 
 use std::convert::Infallible;
 

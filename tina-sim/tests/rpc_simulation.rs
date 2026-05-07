@@ -1,4 +1,4 @@
-//! Phase 052 Rock 6: deterministic simulation for tina-rpc framed calls.
+//! Deterministic simulation for tina-rpc framed calls.
 //!
 //! These tests wire the [`tina_rpc::Client`] isolate against the simulator's
 //! scripted-TCP layer to exercise end-to-end framed-RPC scenarios required

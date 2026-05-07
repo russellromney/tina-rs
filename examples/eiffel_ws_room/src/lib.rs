@@ -1,3 +1,8 @@
+//! Tina-vs-Tokio: a tiny WebSocket room. Two clients connect, each
+//! publishes one message, both should see both. The Tina side keeps
+//! the subscriber list inside a `Room` isolate and crosses to axum
+//! through the blessed `tina_tokio_bridge` lifecycle.
+
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -6,16 +11,16 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-mod tina_impl;
-mod tokio_impl;
+pub mod tina_impl;
+pub mod tokio_impl;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SideReport {
+pub struct Report {
     pub alpha_inbox: Vec<String>,
     pub bravo_inbox: Vec<String>,
 }
 
-impl SideReport {
+impl Report {
     pub fn assert_expected(&self) {
         let alpha: BTreeSet<&str> = self.alpha_inbox.iter().map(String::as_str).collect();
         let bravo: BTreeSet<&str> = self.bravo_inbox.iter().map(String::as_str).collect();
@@ -25,34 +30,22 @@ impl SideReport {
     }
 }
 
-pub fn run_tokio_side() -> SideReport {
-    tokio_impl::run()
-}
-
-pub fn run_tina_side() -> SideReport {
-    tina_impl::run()
-}
-
-/// Two clients, alpha and bravo, both connect to ws://addr/ws. Alpha sends
-/// "from-alpha"; bravo sends "from-bravo". Each client reads frames until it
-/// has accumulated two text messages or the read deadline expires.
-pub(crate) async fn run_room_clients(addr: SocketAddr) -> SideReport {
+/// Two clients (alpha, bravo) connect, each publishes one text
+/// message, each reads until two text messages have arrived or the
+/// deadline elapses.
+pub async fn run_room_clients(addr: SocketAddr) -> Report {
     let url = format!("ws://{addr}/ws");
     let (alpha_socket, _) = connect_async(&url).await.expect("alpha connect");
     let (bravo_socket, _) = connect_async(&url).await.expect("bravo connect");
 
-    // Wait briefly for both subscriptions to land before any client publishes.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let alpha = tokio::spawn(client_session(alpha_socket, "from-alpha".to_string()));
     let bravo = tokio::spawn(client_session(bravo_socket, "from-bravo".to_string()));
 
-    let alpha_inbox = alpha.await.expect("alpha task");
-    let bravo_inbox = bravo.await.expect("bravo task");
-
-    SideReport {
-        alpha_inbox,
-        bravo_inbox,
+    Report {
+        alpha_inbox: alpha.await.expect("alpha task"),
+        bravo_inbox: bravo.await.expect("bravo task"),
     }
 }
 

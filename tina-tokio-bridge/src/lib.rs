@@ -320,6 +320,7 @@ where
         tina::Effect::Send(send) => tina::Effect::Send(send),
         tina::Effect::Spawn(spawn) => tina::Effect::Spawn(spawn),
         tina::Effect::Stop => tina::Effect::Stop,
+        tina::Effect::StopWith(result) => tina::Effect::StopWith(result),
         tina::Effect::RestartChildren => tina::Effect::RestartChildren,
         tina::Effect::Call(call) => tina::Effect::Call(call),
         tina::Effect::Batch(effects) => {
@@ -586,8 +587,8 @@ where
             .unwrap_or(0)
     }
 
-    /// Phase 047 Rock 7: one-call drain + shutdown that replaces the
-    /// `Arc::try_unwrap` dance Eiffel examples used to write.
+    /// One-call drain + shutdown that replaces the `Arc::try_unwrap`
+    /// dance Eiffel examples used to write.
     ///
     /// Polls until every `BridgeHandle` clone has been dropped or
     /// `drain_timeout` elapses. If the drain completes, consumes the

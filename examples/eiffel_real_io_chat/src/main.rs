@@ -1,4 +1,5 @@
 use eiffel_real_io_chat::{Report, RunConfig, tina_impl, tokio_impl};
+use tina_runtime::{PressureReport, format_pressure_line};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -15,13 +16,14 @@ fn main() -> anyhow::Result<()> {
     match mode.as_str() {
         "tokio" => print_side("tokio", config, tokio_impl::run(config)?),
         "tina" => print_side("tina", config, tina_impl::run(config)?),
-        "both" => {
+        "both" | "compare" => {
             print_side("tokio", config, tokio_impl::run(config)?);
             print_side("tina", config, tina_impl::run(config)?);
         }
         other => {
             anyhow::bail!(
-                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-real-io-chat [tokio|tina|both] [burst]"
+                "unknown mode {other:?}; expected tokio, tina, both, or compare. \
+                 usage: eiffel-real-io-chat [tokio|tina|both|compare] [burst]"
             );
         }
     }
@@ -38,5 +40,20 @@ fn print_side(side: &str, config: RunConfig, report: Report) {
         report.closed,
         report.delivered,
         report.buffered,
+    );
+    // Phase 059 Rock 9: print the canonical key=value line so a
+    // pressure runner can intercept and surface it.
+    println!(
+        "{}",
+        format_pressure_line(&PressureReport {
+            side,
+            accepted: report.accepted as u64,
+            full: report.full as u64,
+            closed: report.closed as u64,
+            timeouts: 0,
+            other: 0,
+            rss_peak_kb: None,
+            exit: "clean",
+        })
     );
 }

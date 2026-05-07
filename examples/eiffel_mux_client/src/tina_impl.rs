@@ -1,50 +1,44 @@
 //! Tina: a single `MuxClient` isolate owns the connection. The
-//! parser, the read buffer, and the pending counter all live behind
-//! the same mailbox — no shared `HashMap`, no oneshot per request.
-//! Out-of-order arrival just works: the runtime delivers `tcp_read`
-//! replies as bytes land, and the handler walks complete lines.
+//! parser, the read buffer, and the arrival log all live behind the
+//! same mailbox — no shared `HashMap`, no oneshot per request, no
+//! `Arc<Mutex<...>>` for the result. The isolate publishes its final
+//! `Vec<u32>` of arrivals via `stop_with` (Phase 059 Rock 1) and the
+//! host receives it through `observe_result`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, StreamId, ThreadedRuntime, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write,
+    DefaultThreadedMailboxFactory, StreamId, TcpConnectReply, TcpReadReply, TcpStreamCloseReply,
+    TcpWriteReply, ThreadedRuntime, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 
 use crate::{REQUEST_IDS, Report, spawn_responder};
 
-/// Arrival log shared with the host so it can read the result after
-/// the client isolate stops. App-specific data the runtime can't
-/// know about; `FINDINGS.md` tracks this as typed isolate result
-/// waiter work.
-type ArrivalLog = Arc<Mutex<Vec<u32>>>;
-
 #[derive(Debug, Clone)]
 enum MuxMsg {
     Begin,
-    Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    Wrote(Result<usize, CallError>),
-    Read(Result<Vec<u8>, CallError>),
-    Closed(Result<(), CallError>),
+    Connected(TcpConnectReply),
+    Wrote(TcpWriteReply),
+    Read(TcpReadReply),
+    Closed(TcpStreamCloseReply),
 }
 
 /// State that's empty/derivable at spawn. The host configures
-/// `target` and the shared `arrivals` log; everything else is
-/// `Default` and the spawn site reads `state: ClientState::default()`.
+/// `target` and `expected`; everything else (including the arrival
+/// log) is `Default`.
 #[derive(Debug, Default)]
 struct ClientState {
     stream: Option<StreamId>,
     read_buf: Vec<u8>,
+    arrivals: Vec<u32>,
 }
 
 struct MuxClient {
     target: SocketAddr,
-    arrivals: ArrivalLog,
     expected: usize,
     state: ClientState,
 }
@@ -75,22 +69,21 @@ impl MuxClient {
                         .trim();
                     if let Some(rest) = trimmed.strip_prefix("RESP ") {
                         let id: u32 = rest.parse().expect("RESP <id>");
-                        self.arrivals.lock().expect("arrivals lock").push(id);
+                        self.state.arrivals.push(id);
                     }
                 }
-                let received = self.arrivals.lock().expect("arrivals lock").len();
                 let stream = self.state.stream.expect("stream set after connect");
-                if received >= self.expected {
+                if self.state.arrivals.len() >= self.expected {
                     tcp_close_stream(stream).reply(MuxMsg::Closed)
                 } else {
                     tcp_read(stream, 4096).reply(MuxMsg::Read)
                 }
             }
-            MuxMsg::Closed(Ok(())) => stop(),
+            MuxMsg::Closed(Ok(())) => stop_with(std::mem::take(&mut self.state.arrivals)),
             MuxMsg::Connected(Err(_))
             | MuxMsg::Wrote(Err(_))
             | MuxMsg::Read(Err(_))
-            | MuxMsg::Closed(Err(_)) => stop(),
+            | MuxMsg::Closed(Err(_)) => stop_with(std::mem::take(&mut self.state.arrivals)),
         }
     }
 }
@@ -115,13 +108,11 @@ pub fn run() -> anyhow::Result<Report> {
     });
     let target = server_addr_rx.recv()?;
 
-    let arrivals: ArrivalLog = Arc::default();
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
     let address = runtime
         .register_with_capacity::<_, Infallible>(
             MuxClient {
                 target,
-                arrivals: Arc::clone(&arrivals),
                 expected: REQUEST_IDS.len(),
                 state: ClientState::default(),
             },
@@ -129,18 +120,19 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register mux client: {e:?}"))?;
 
-    let client_done = runtime.observe_isolate_complete(address);
+    let result = runtime
+        .observe_result::<Vec<u32>, _, _>(address)
+        .map_err(|e| anyhow::anyhow!("register result waiter: {e:?}"))?;
     runtime
         .try_send(address, MuxMsg::Begin)
         .map_err(|e| anyhow::anyhow!("kick mux client: {e:?}"))?;
-    client_done
+    let arrival_order = result
         .wait(Duration::from_secs(3))
-        .map_err(|e| anyhow::anyhow!("mux client finishes: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("mux client finishes with arrivals: {e:?}"))?;
 
     let _ = runtime.shutdown();
     let _ = server_done_tx.send(());
     let _ = server_thread.join();
 
-    let arrival_order = arrivals.lock().expect("arrivals lock").clone();
     Ok(Report { arrival_order })
 }

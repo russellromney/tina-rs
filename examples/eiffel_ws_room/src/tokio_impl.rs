@@ -1,3 +1,6 @@
+//! Tokio side: pure axum + `tokio::sync::broadcast`. The whole
+//! service lives inside one Tokio runtime.
+
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -7,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::broadcast;
 
-use super::{SideReport, run_room_clients};
+use crate::{Report, run_room_clients};
 
 #[derive(Clone)]
 struct RoomState {
@@ -44,7 +47,7 @@ async fn handle_socket(socket: WebSocket, room: RoomState) {
     let _ = writer.await;
 }
 
-pub(crate) fn run() -> SideReport {
+pub fn run() -> Report {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

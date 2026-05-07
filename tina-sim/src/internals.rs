@@ -460,6 +460,9 @@ where
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
         Effect::Stop => ErasedEffect::Stop,
+        // Sim has no host result waiter surface; StopWith stops the isolate
+        // and drops the value. Trace still distinguishes via EffectKind.
+        Effect::StopWith(_) => ErasedEffect::StopWith,
         Effect::RestartChildren => ErasedEffect::RestartChildren,
         Effect::Call(call) => {
             let call = match call.into_runtime_parts() {
@@ -564,6 +567,7 @@ where
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S>>),
     Stop,
+    StopWith,
     RestartChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S>>),
@@ -580,6 +584,7 @@ where
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
             Self::Stop => EffectKind::Stop,
+            Self::StopWith => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,

@@ -58,6 +58,12 @@ pub enum EffectKind {
     /// The handler returned [`tina::Effect::Stop`].
     Stop,
 
+    /// The handler returned [`tina::Effect::StopWith`].
+    ///
+    /// Lifecycle is identical to [`Self::Stop`]; the distinction lets trace
+    /// readers tell whether a host result waiter could be served.
+    StopWith,
+
     /// The handler returned [`tina::Effect::RestartChildren`].
     RestartChildren,
 
@@ -664,6 +670,7 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::RestartChildren => 6,
         EffectKind::Call => 7,
         EffectKind::Batch => 8,
+        EffectKind::StopWith => 9,
     }
 }
 
