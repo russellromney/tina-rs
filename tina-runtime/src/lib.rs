@@ -53,11 +53,16 @@ mod call;
 mod capabilities;
 mod clock;
 mod driver;
+mod errors;
 mod live_report;
 mod mailbox;
 mod observation;
 pub mod persistence;
 mod trace;
+
+pub use errors::{
+    SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+};
 
 pub use live_report::{
     AffinityStatus, LiveQueueReport, LiveRemoteQueueReport, LiveShardReport, LiveShardState,
@@ -3115,58 +3120,6 @@ pub enum LocalSystemConfigError {
     ZeroProcessLaneCapacity,
     /// Signal capacity must be greater than zero.
     ZeroSignalCapacity,
-}
-
-/// Error returned by setup/control operations on [`ThreadedRuntime`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadedRuntimeError {
-    /// The worker thread stopped before it could accept or answer the command.
-    WorkerStopped,
-    /// A multi-shard owner operation targeted a shard this local system does
-    /// not own.
-    UnknownShard(ShardId),
-    /// The worker could not prove backend completion-slot ownership was
-    /// released during shutdown.
-    DriverShutdownFailed,
-}
-
-/// Error returned by [`Runtime::try_supervise`] and the threaded equivalents.
-///
-/// Phase 047 Rock 8: replaces a panic on unknown / stale parent registration
-/// in `Runtime::supervise` so the explicit-step and threaded surfaces both
-/// have a fallible variant. The panicking [`Runtime::supervise`] is kept
-/// for setup-time assertions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SuperviseError {
-    /// The address did not name a parent registered with this runtime
-    /// (unknown isolate id, stale generation, or wrong shard).
-    UnknownParent,
-}
-
-/// Error returned by [`ThreadedRuntime::try_send`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadedTrySendError {
-    /// The bounded worker ingress queue is full.
-    IngressFull,
-
-    /// The worker thread stopped before it could accept the ingress command.
-    WorkerStopped,
-}
-
-/// Error returned by [`ThreadedRuntime::send_and_observe`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadedSendObservedError {
-    /// The bounded worker ingress queue is full.
-    IngressFull,
-
-    /// The target isolate mailbox is full.
-    MailboxFull,
-
-    /// The target isolate is closed or stale.
-    MailboxClosed,
-
-    /// The worker thread stopped before the send could be observed.
-    WorkerStopped,
 }
 
 type ThreadedCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
