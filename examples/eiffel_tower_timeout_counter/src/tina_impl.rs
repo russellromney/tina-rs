@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, RuntimeCall, SleepReply, ThreadedRuntimeConfig, sleep};
+use tina_runtime::{DefaultThreadedMailboxFactory, SleepReply, sleep};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeMessage, BridgeRequest, BridgeResponder};
 use tina_tower_bridge::TinaTowerService;
 use tokio::runtime::Builder;
@@ -66,16 +66,8 @@ struct Counter {
     busy: bool,
 }
 
-impl Isolate for Counter {
-    tina::isolate_types! {
-        message: CounterMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<CounterMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = CounterMsg)]
+impl Counter {
     fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             CounterMsg::Request(req) => {
@@ -126,11 +118,7 @@ pub fn run() -> anyhow::Result<Report> {
         let mut host = BridgeHost::new(
             SingleShard,
             DefaultThreadedMailboxFactory,
-            ThreadedRuntimeConfig {
-                command_capacity: 32,
-                idle_wait: Duration::from_millis(1),
-                ..Default::default()
-            },
+            Default::default(),
         );
         let bridge = host
             .register_bridge::<Counter, BrushRequest, BrushReply, Infallible>(

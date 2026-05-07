@@ -23,8 +23,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, SleepReply, ThreadedRuntime, call,
-    sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, call, sleep,
 };
 
 use crate::{FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_slow};
@@ -39,16 +38,8 @@ enum CMsg {
 
 struct ServiceC;
 
-impl Isolate for ServiceC {
-    tina::isolate_types! {
-        message: CMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<CMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = CMsg)]
+impl ServiceC {
     fn handle(&mut self, msg: CMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             CMsg::Compute { iteration } => {
@@ -90,16 +81,8 @@ struct ServiceB {
     c_addr: Address<CMsg, ()>,
 }
 
-impl Isolate for ServiceB {
-    tina::isolate_types! {
-        message: BMsg,
-        reply: BReply,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<BMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = BMsg, reply = BReply)]
+impl ServiceB {
     fn handle(&mut self, msg: BMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             BMsg::Forward { iteration, budget } => {
@@ -139,16 +122,8 @@ struct ServiceA {
     deadline: Duration,
 }
 
-impl Isolate for ServiceA {
-    tina::isolate_types! {
-        message: AMsg,
-        reply: AReply,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<AMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = AMsg, reply = AReply)]
+impl ServiceA {
     fn handle(&mut self, msg: AMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             AMsg::Submit { iteration } => call(
@@ -192,16 +167,8 @@ struct Driver {
     deadline: Duration,
 }
 
-impl Isolate for Driver {
-    tina::isolate_types! {
-        message: DriverMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = DriverMsg)]
+impl Driver {
     fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => self.next_step(),

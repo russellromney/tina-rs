@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina::ChildDefinition;
-use tina_runtime::{DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 
 use crate::{Report, WORK_VALUES, WORKER_COUNT};
 
@@ -28,16 +28,8 @@ struct Worker {
     chunk: Vec<u64>,
 }
 
-impl Isolate for Worker {
-    tina::isolate_types! {
-        message: WorkerMsg,
-        reply: (),
-        send: tina::Outbound<CoordMsg>,
-        spawn: Infallible,
-        call: RuntimeCall<WorkerMsg>,
-        shard: SingleShard,
-    }
-
+#[tina::isolate(message = WorkerMsg, send = tina::Outbound<CoordMsg>)]
+impl Worker {
     fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             WorkerMsg::Compute => {
