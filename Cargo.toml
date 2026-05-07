@@ -31,6 +31,7 @@ exclude = [
     "examples/eiffel_graceful_shutdown",
     "examples/eiffel_native_http",
     "examples/eiffel_sharded_keyspace",
+    "examples/eiffel_webhook_publisher",
 ]
 resolver = "2"
 
