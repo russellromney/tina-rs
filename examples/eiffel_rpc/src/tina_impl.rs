@@ -53,7 +53,7 @@ enum ListenerMsg {
     Start,
     Bound(Result<(ListenerId, SocketAddr), CallError>),
     Accepted(Result<(tina_runtime::StreamId, SocketAddr), CallError>),
-    ListenerClosed,
+    ListenerClosed(Result<(), CallError>),
 }
 
 struct Listener {
@@ -85,11 +85,13 @@ impl Listener {
                         ChildDefinition::new(connection, 64)
                             .with_initial_message(ConnectionMsg::Begin),
                     ),
-                    tcp_close_listener(listener).reply(|_| ListenerMsg::ListenerClosed),
+                    tcp_close_listener(listener).reply(ListenerMsg::ListenerClosed),
                 ])
             }
-            ListenerMsg::ListenerClosed => stop(),
-            ListenerMsg::Bound(Err(_)) | ListenerMsg::Accepted(Err(_)) => stop(),
+            ListenerMsg::ListenerClosed(Ok(())) => stop(),
+            ListenerMsg::Bound(Err(_))
+            | ListenerMsg::Accepted(Err(_))
+            | ListenerMsg::ListenerClosed(Err(_)) => stop(),
         }
     }
 }
