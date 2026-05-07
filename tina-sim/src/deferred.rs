@@ -6,7 +6,7 @@
 //! pending-capture handoff live in [`tina::DeferredSlotRegistry`]; the
 //! simulator owns its own promoted-slot table for routing and sweeps.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use tina::{DeferredSlotShared, IsolateId};
 
@@ -30,7 +30,7 @@ pub(crate) struct DeferredSlotRecord {
     pub slot_id: DeferredSlotId,
     pub call_id: CallId,
     pub capturing_isolate: IsolateId,
-    pub shared: Rc<DeferredSlotShared>,
+    pub shared: Arc<DeferredSlotShared>,
     pub routing: DeferredRouting,
 }
 
@@ -46,12 +46,12 @@ impl PromotedSlots {
 
     pub fn take_by_handle(
         &mut self,
-        shared: &Rc<DeferredSlotShared>,
+        shared: &Arc<DeferredSlotShared>,
     ) -> Option<DeferredSlotRecord> {
         let pos = self
             .slots
             .iter()
-            .position(|s| Rc::ptr_eq(&s.shared, shared))?;
+            .position(|s| Arc::ptr_eq(&s.shared, shared))?;
         Some(self.slots.remove(pos))
     }
 
@@ -86,7 +86,7 @@ impl PromotedSlots {
         let mut dropped = Vec::new();
         let mut i = 0;
         while i < self.slots.len() {
-            if Rc::strong_count(&self.slots[i].shared) <= 1 {
+            if Arc::strong_count(&self.slots[i].shared) <= 1 {
                 dropped.push(self.slots.remove(i));
             } else {
                 i += 1;

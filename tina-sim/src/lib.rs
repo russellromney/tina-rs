@@ -813,7 +813,7 @@ where
         message: Box<dyn Any>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
-        let shared = handle.shared().clone();
+        let shared = tina::runtime_internal::handle_shared(&handle).clone();
         let Some(record) = self.promoted_slots.take_by_handle(&shared) else {
             // Slot already terminal: caller closed and we already
             // emitted Rejected{CallerClosed}. Drop the payload.

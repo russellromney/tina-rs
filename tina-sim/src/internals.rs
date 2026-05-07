@@ -532,7 +532,7 @@ where
                 .collect(),
         ),
         Effect::ReplyTo(slot, reply) => ErasedEffect::ReplyTo {
-            handle: slot.into_handle(),
+            handle: tina::runtime_internal::deferred_into_handle(slot),
             message: Box::new(reply),
         },
     }

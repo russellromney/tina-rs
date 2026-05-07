@@ -7,7 +7,7 @@
 //!
 //! Promise box belongs near runtime. RPC and bridges merely use box.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use tina::{DeferredSlotShared, IsolateId};
 
@@ -41,7 +41,7 @@ pub(crate) struct DeferredSlotRecord {
     pub slot_id: DeferredSlotId,
     pub call_id: CallId,
     pub capturing_isolate: IsolateId,
-    pub shared: Rc<DeferredSlotShared>,
+    pub shared: Arc<DeferredSlotShared>,
     pub routing: DeferredRouting,
 }
 
@@ -59,12 +59,12 @@ impl PromotedSlots {
     /// Pop and return the slot record matching the given shared handle.
     pub fn take_by_handle(
         &mut self,
-        shared: &Rc<DeferredSlotShared>,
+        shared: &Arc<DeferredSlotShared>,
     ) -> Option<DeferredSlotRecord> {
         let pos = self
             .slots
             .iter()
-            .position(|s| Rc::ptr_eq(&s.shared, shared))?;
+            .position(|s| Arc::ptr_eq(&s.shared, shared))?;
         Some(self.slots.remove(pos))
     }
 
@@ -111,7 +111,7 @@ impl PromotedSlots {
         let mut dropped = Vec::new();
         let mut i = 0;
         while i < self.slots.len() {
-            if Rc::strong_count(&self.slots[i].shared) <= 1 {
+            if Arc::strong_count(&self.slots[i].shared) <= 1 {
                 dropped.push(self.slots.remove(i));
             } else {
                 i += 1;
@@ -406,17 +406,18 @@ where
 #[cfg(test)]
 mod pending_replies_tests {
     use super::*;
-    use tina::{DeferredReplyHandle, DeferredSlotShared, DeferredSlotState};
+    use tina::runtime_internal::{deferred_from_handle, handle_from_shared};
+    use tina::{DeferredSlotShared, DeferredSlotState};
 
     fn fake_slot(id: u64) -> DeferredReply<u32> {
-        let shared = std::rc::Rc::new(DeferredSlotShared::new(id));
-        DeferredReply::from_handle(DeferredReplyHandle::from_shared(shared))
+        let shared = std::sync::Arc::new(DeferredSlotShared::new(id));
+        deferred_from_handle(handle_from_shared(shared))
     }
 
     fn fake_slot_closed(id: u64) -> DeferredReply<u32> {
-        let shared = std::rc::Rc::new(DeferredSlotShared::new(id));
+        let shared = std::sync::Arc::new(DeferredSlotShared::new(id));
         shared.set_state(DeferredSlotState::Closed);
-        DeferredReply::from_handle(DeferredReplyHandle::from_shared(shared))
+        deferred_from_handle(handle_from_shared(shared))
     }
 
     #[test]

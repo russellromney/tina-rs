@@ -1334,7 +1334,7 @@ where
         // Locate by handle identity. If the slot is not in the registry,
         // the caller already closed (and we already emitted the
         // terminal Rejected event). User reply is silently consumed.
-        let shared = handle.shared().clone();
+        let shared = tina::runtime_internal::handle_shared(&handle).clone();
         let Some(record) = self.promoted_slots.take_by_handle(&shared) else {
             // Already terminal: caller closed and we already emitted
             // Rejected{CallerClosed}. The payload is consumed without
@@ -3258,7 +3258,7 @@ where
                 .collect(),
         ),
         Effect::ReplyTo(slot, reply) => ErasedEffect::ReplyTo {
-            handle: slot.into_handle(),
+            handle: tina::runtime_internal::deferred_into_handle(slot),
             message: ErasedMessage::Local(Box::new(reply)),
         },
     }
@@ -3299,7 +3299,7 @@ where
                 .collect(),
         ),
         Effect::ReplyTo(slot, reply) => ErasedEffect::ReplyTo {
-            handle: slot.into_handle(),
+            handle: tina::runtime_internal::deferred_into_handle(slot),
             message: ErasedMessage::Sendable(Box::new(reply)),
         },
     }

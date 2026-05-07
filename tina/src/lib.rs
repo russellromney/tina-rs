@@ -101,7 +101,6 @@
 //! ```
 
 use std::any::Any;
-use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -1243,42 +1242,24 @@ impl<R> DeferredReply<R> {
     pub fn is_open(&self) -> bool {
         self.state() == DeferredSlotState::Open
     }
-
-    /// Returns the underlying type-erased handle. Runtime-only.
-    #[doc(hidden)]
-    pub fn into_handle(self) -> DeferredReplyHandle {
-        self.handle
-    }
-
-    /// Constructs a typed slot from a runtime-allocated handle.
-    /// Runtime-only.
-    ///
-    #[doc(hidden)]
-    pub fn from_handle(handle: DeferredReplyHandle) -> Self {
-        Self {
-            handle,
-            _marker: PhantomData,
-        }
-    }
 }
 
 /// Type-erased handle for a runtime-owned deferred reply slot.
 ///
 /// Application code does not construct or unwrap this directly; it lives
-/// inside [`DeferredReply<R>`]. Runtime crates allocate it.
+/// inside [`DeferredReply<R>`]. Runtime crates allocate it through
+/// [`runtime_internal`].
+///
+/// `DeferredReplyHandle` is intentionally not `Clone`. The user-facing
+/// API exposes only [`slot_id`](Self::slot_id) and
+/// [`state`](Self::state); reconstruction or duplication of slots is
+/// reserved for runtime crates via the [`runtime_internal`] module.
 #[derive(Debug)]
 pub struct DeferredReplyHandle {
-    shared: Rc<DeferredSlotShared>,
+    shared: Arc<DeferredSlotShared>,
 }
 
 impl DeferredReplyHandle {
-    /// Constructs a handle from runtime-owned shared state. Runtime-only.
-    ///
-    #[doc(hidden)]
-    pub fn from_shared(shared: Rc<DeferredSlotShared>) -> Self {
-        Self { shared }
-    }
-
     /// Returns the runtime-assigned slot identifier.
     pub fn slot_id(&self) -> u64 {
         self.shared.slot_id
@@ -1286,24 +1267,29 @@ impl DeferredReplyHandle {
 
     /// Returns the current state of the slot.
     pub fn state(&self) -> DeferredSlotState {
-        self.shared.state.get()
-    }
-
-    /// Returns the shared state. Runtime-only.
-    #[doc(hidden)]
-    pub fn shared(&self) -> &Rc<DeferredSlotShared> {
-        &self.shared
+        self.shared.state()
     }
 }
 
 /// Shared state between a [`DeferredReplyHandle`] in isolate state and
 /// the runtime registry. The runtime mutates `state` to record caller
 /// liveness.
+///
+/// State is an `AtomicU8` so `DeferredSlotShared` is `Sync` and
+/// `Arc<DeferredSlotShared>` is `Send`. The user-side handle then
+/// satisfies `Send + 'static` for `ThreadedRuntime` registration.
+/// Atomic ordering is `Relaxed` because the slot is always handled on
+/// one shard thread; the atomic is the cheapest type the borrow
+/// checker accepts in `Send + Sync` form.
 #[derive(Debug)]
 pub struct DeferredSlotShared {
     slot_id: u64,
-    state: Cell<DeferredSlotState>,
+    state: AtomicU8,
 }
+
+const SLOT_STATE_OPEN: u8 = 0;
+const SLOT_STATE_REPLIED: u8 = 1;
+const SLOT_STATE_CLOSED: u8 = 2;
 
 impl DeferredSlotShared {
     /// Builds an `Open` shared slot. Runtime-only constructor.
@@ -1311,7 +1297,7 @@ impl DeferredSlotShared {
     pub fn new(slot_id: u64) -> Self {
         Self {
             slot_id,
-            state: Cell::new(DeferredSlotState::Open),
+            state: AtomicU8::new(SLOT_STATE_OPEN),
         }
     }
 
@@ -1322,13 +1308,23 @@ impl DeferredSlotShared {
 
     /// Reads the current state.
     pub fn state(&self) -> DeferredSlotState {
-        self.state.get()
+        match self.state.load(Ordering::Relaxed) {
+            SLOT_STATE_OPEN => DeferredSlotState::Open,
+            SLOT_STATE_REPLIED => DeferredSlotState::Replied,
+            SLOT_STATE_CLOSED => DeferredSlotState::Closed,
+            other => unreachable!("invalid slot state byte: {other}"),
+        }
     }
 
     /// Updates the state. Runtime-only.
     #[doc(hidden)]
     pub fn set_state(&self, state: DeferredSlotState) {
-        self.state.set(state);
+        let byte = match state {
+            DeferredSlotState::Open => SLOT_STATE_OPEN,
+            DeferredSlotState::Replied => SLOT_STATE_REPLIED,
+            DeferredSlotState::Closed => SLOT_STATE_CLOSED,
+        };
+        self.state.store(byte, Ordering::Relaxed);
     }
 }
 
@@ -1401,7 +1397,7 @@ impl MessageCaller {
     /// can be taken at most once per message.
     fn capture(self) -> DeferredReplyHandle {
         let slot_id = self.registry.allocate_slot_id();
-        let shared = Rc::new(DeferredSlotShared::new(slot_id));
+        let shared = Arc::new(DeferredSlotShared::new(slot_id));
         self.registry.register_pending(PendingCapture {
             slot_id,
             call_id: self.call_id,
@@ -1409,7 +1405,7 @@ impl MessageCaller {
             shared: shared.clone(),
             routing: self.routing,
         });
-        DeferredReplyHandle::from_shared(shared)
+        runtime_internal::handle_from_shared(shared)
     }
 }
 
@@ -1471,7 +1467,7 @@ pub struct PendingCapture {
     /// Isolate that captured the slot.
     pub capturing_isolate: IsolateId,
     /// Shared state between user-side handle and runtime registry.
-    pub shared: Rc<DeferredSlotShared>,
+    pub shared: Arc<DeferredSlotShared>,
     /// Where to deliver the reply.
     pub routing: CallRouting,
 }
@@ -1508,6 +1504,52 @@ impl DeferredSlotRegistry {
 }
 
 /// The preferred first import for ordinary Tina application code.
+/// Runtime-only conduits for deferred reply slot construction.
+///
+/// This module is **not** a stable public API. It exists so
+/// `tina-runtime` and `tina-sim` can mint deferred reply handles and
+/// extract them from [`DeferredReply`] when erasing effects. Reaching
+/// into it from application code defeats the one-shot type-system
+/// guarantees on [`reply_to`] (a duplicate reply becomes possible if
+/// you rebuild a [`DeferredReply`] out of band) and may deliver
+/// payloads of the wrong type to the runtime, panicking the
+/// per-call translator.
+///
+/// If you find yourself wanting to call anything in here, write a
+/// runtime-side helper instead.
+#[doc(hidden)]
+pub mod runtime_internal {
+    use std::sync::Arc;
+
+    use crate::{DeferredReply, DeferredReplyHandle, DeferredSlotShared};
+
+    /// Build a handle from a runtime-allocated shared slot.
+    pub fn handle_from_shared(shared: Arc<DeferredSlotShared>) -> DeferredReplyHandle {
+        DeferredReplyHandle { shared }
+    }
+
+    /// Borrow the shared slot for routing/sweep checks.
+    pub fn handle_shared(handle: &DeferredReplyHandle) -> &Arc<DeferredSlotShared> {
+        &handle.shared
+    }
+
+    /// Move the handle out of a typed slot. Used by erase paths.
+    pub fn deferred_into_handle<R>(slot: DeferredReply<R>) -> DeferredReplyHandle {
+        slot.handle
+    }
+
+    /// Wrap a handle into a typed slot. Used internally by
+    /// [`crate::Context::take_reply_slot`]; runtime crates do not
+    /// normally need this.
+    pub fn deferred_from_handle<R>(handle: DeferredReplyHandle) -> DeferredReply<R> {
+        DeferredReply {
+            handle,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Common imports for ordinary Tina application code.
 pub mod prelude {
     pub use crate::{
         Address, ChildDefinition, Context, DeferredReply, Effect, Isolate, IsolateId, Outbound,
