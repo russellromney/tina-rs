@@ -59,6 +59,7 @@ mod mailbox;
 mod multi_shard;
 mod observation;
 pub mod persistence;
+pub mod sharded;
 mod threaded;
 mod threaded_multi_shard;
 mod trace;

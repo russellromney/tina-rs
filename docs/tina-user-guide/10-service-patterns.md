@@ -130,6 +130,27 @@ hidden global queue.
 
 Use when state has a natural key.
 
+`tina_runtime::sharded` ships the small contract surface for this shape:
+
+- `ShardPlacement` — deterministic key-to-shard map over an explicit ordered
+  shard list. Visible name, hash scheme, and version.
+- `ShardServiceTable<M, R>` — typed `ShardId -> Address<M, R>` table built
+  over the same shard list. No hidden registry, no `Arc<Mutex<...>>`.
+- `WrongShard { expected, actual }` — owners re-check
+  `placement.owner_for_bytes(key) == ctx.shard_id()` before mutating keyed
+  state and return this typed error on mismatch.
+- `ScatterGatherConfig` + `ScatterGatherReport<T>` — bounded fanout knobs
+  (max_targets, collector mailbox capacity, per-target timeout, aggregate
+  timeout) and a partial-aggregate report (`Replied` / `Full` / `Closed` /
+  `Timeout` / `AggregateTimeout` / `MissingShard`).
+- `HotKeyAttemptReport` — caller-owned retry shape. The helpers never retry
+  on your behalf; the report distinguishes first-attempt full, retry
+  success, retry exhaustion, timeout, and closed.
+
+These are local multi-shard patterns. They are **not** a distributed
+database, **not** consensus, **not** remoting, **not** automatic
+rebalancing.
+
 ## Macro Rule
 
 A future `#[service]` macro may hide byte encoding.

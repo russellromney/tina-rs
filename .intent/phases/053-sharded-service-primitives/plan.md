@@ -144,3 +144,88 @@ Compromise:
 - Users have copyable shard-owned data patterns.
 - Tina looks more Seastar-shaped in the app layer.
 - Placement, pressure, and partial failure stay visible.
+
+## First-form landing notes
+
+`tina_runtime::sharded` ships the small contract surface for phase 053:
+
+- `ShardPlacement` / `ShardPlacementReport` / `ShardHashScheme` — explicit
+  ordered shard list, FNV-1a 64 bytes-mod-count placement, `owner_for_bytes`
+  / `owner_for_str`, name + scheme + version visible on the report. Name
+  is a runtime-derived `String` (not `&'static str`). Empty or duplicate
+  shard lists are typed `ShardPlacementError` and dedup uses `BTreeSet`.
+- `ShardServiceTable<M, R>` — explicit ordered `(ShardId, Address<M, R>)`
+  table that must match the placement shard list verbatim. Lookup is
+  O(log n) via an internal `BTreeMap<ShardId, usize>` index built at
+  construction; no `Arc<Mutex<...>>`, no hidden registry thread. Lookup
+  misses surface `MissingShard`. `address_for_bytes` / `address_for_str`
+  route through placement and cannot fail given the structural invariant.
+- `WrongShard { expected, actual }` — owners must re-check
+  `placement.owner_for_bytes(key) == ctx.shard_id()` before mutating keyed
+  state and return this typed error on mismatch. The runtime cannot prove
+  ownership; only the handler can.
+- `ScatterGatherConfig` — explicit `max_targets`, collector mailbox
+  capacity (>= max_targets), per-target timeout, aggregate timeout.
+  Validated; result vector capacity is bounded by `max_targets`.
+- `ScatterGatherReport<T>` + `ScatterGatherTargetOutcome<T>` —
+  partial-aggregate report that names `Replied` / `Full` / `Closed` /
+  `Timeout` / `AggregateTimeout` / `MissingShard` per target. No hidden
+  unbounded reply collection.
+- `HotKeyAttemptReport` + `HotKeyAttemptOutcome` — caller-owned retry
+  shape. Distinguishes first-attempt accept, first-attempt full, in-loop
+  retry full (`full_retry_total` is recorded explicitly so retries do not
+  silently look like single attempts), retry success, retry exhaustion,
+  timeout, closed.
+- All four error types (`ShardPlacementError`, `ShardServiceTableError`,
+  `MissingShard`, `WrongShard`, `ScatterGatherConfigError`) implement
+  `Display + std::error::Error` so they bubble through `?` into
+  `Box<dyn Error>`.
+
+Proof landed:
+
+- `tina-runtime/src/sharded.rs` unit tests (22): placement empty /
+  duplicate rejects, non-contiguous shard distribution (asserts every
+  shard reachable), referential transparency, report fields, runtime-
+  derived placement names, service-table mismatch, missing-shard,
+  scatter/gather config validation, partial-aggregate counts, hot-key
+  intermediate-and-terminal recording, and `Display + Error` on every
+  error enum.
+- `tina-runtime/tests/sharded_primitives.rs` (11) drives the explicit-step
+  `MultiShardRuntime` for: sharded counter first form, owner re-check
+  returning `WrongShard`, sharded map first form (put/get/del with
+  WrongShard on writes), service-table `MissingShard` lookup, bounded
+  scatter/gather happy-path, scatter/gather **partial-failure** with
+  `MissingShard` (target outside table) and **`Full`** (cap-0 target via
+  `send_observed`), hot-key caller-owned retry loop with strict
+  bookkeeping (Full really observed; retries actually succeed), and
+  hot-key retry exhaustion with budget=0. Includes a frozen FNV-1a
+  byte-identical-with-sim placement check.
+- `tina-runtime/tests/sharded_threaded.rs` (2) drives a real
+  `ThreadedMultiShardRuntime` (Betelgeuse worker threads) over a sharded
+  counter and a `WrongShard` re-check, so the live cross-shard path is
+  proved — not just the deterministic in-process explicit-step runtime.
+- `tina-sim/tests/sharded_dst.rs` (3) proves byte-identical placement
+  (frozen mapping shared with the runtime test), reorder-invariance
+  under `LocalSendFaultMode::DelayByRounds { one_in: 1, rounds: 1 }`
+  with an explicit `assert_ne!` on the trace records (so the test fails
+  if the seeded perturbation does **not** actually move events), and
+  that `MultiShardReplayArtifact` carries the simulator config for
+  partial-aggregate seed recovery.
+
+Out-of-scope for first form:
+
+- DST histories for `Closed` / `Timeout` / `AggregateTimeout` per-target:
+  the report shape is wired and the partial-failure live tests cover
+  `Full` and `MissingShard`. Per-target close + virtual-time aggregate
+  timeout require a richer simulator coord scaffold; left for follow-on.
+- Generic `ShardedMap` / `ShardedCounter` product type: not introduced
+  until more shipped examples prove the shape is stable.
+
+Surfaced finding:
+
+- Scatter/gather coordinators need a `ReplyBridge`-style isolate to
+  translate replies between typed addresses (the runtime does not let
+  one isolate's `Address<X>` accept a reply typed for `Address<Y>`).
+  Every fanout user pattern hits this. Recorded in
+  `examples/FINDINGS.md` as a future ergonomics item — likely a 059
+  candidate.

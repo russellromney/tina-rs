@@ -1,0 +1,967 @@
+//! Sharded service contracts (phase 053).
+//!
+//! Small Seastar-shaped local multi-shard primitives. These helpers are
+//! contracts only: a deterministic key-to-shard map, a typed `ShardId ->
+//! Address` table, a partial-aggregate report shape for bounded
+//! scatter/gather, and a caller-owned hot-key attempt report. They do **not**
+//! carry distributed-database, consensus, remoting, retry, or rebalancing
+//! semantics. Placement, pressure, and partial failure stay user-visible.
+//!
+//! See `docs/tina-user-guide/10-service-patterns.md` for the surrounding
+//! shape: the registry maps a service name to one address; the address may
+//! resolve through a [`ShardServiceTable`].
+//!
+//! Near-grug: key bytes choose shard. Shard owns state. Owner re-checks the
+//! key before mutate. Fanout is bounded. Aggregate says partial truth.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+use std::time::Duration;
+
+use tina::{Address, ShardId};
+
+// ---------------------------------------------------------------
+// Placement
+// ---------------------------------------------------------------
+
+/// Hashing scheme used by [`ShardPlacement::owner_for_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardHashScheme {
+    /// FNV-1a 64-bit on canonical key bytes, modulo the ordered shard list.
+    ///
+    /// FNV-1a is chosen because it is small, sync, no-alloc, and produces
+    /// byte-identical mappings on live and simulated runtimes. It is **not**
+    /// a cryptographic hash and **not** stable under shard-count changes.
+    Fnv1a64ModCount,
+}
+
+impl ShardHashScheme {
+    /// Version of the hash scheme. Bumped if the byte-level mapping changes.
+    pub const VERSION: u32 = 1;
+}
+
+/// Errors when constructing a [`ShardPlacement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardPlacementError {
+    /// The shard list was empty. Placement requires at least one owner.
+    Empty,
+    /// The shard list contained the same id more than once.
+    DuplicateShard(ShardId),
+}
+
+impl fmt::Display for ShardPlacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "shard placement requires at least one shard"),
+            Self::DuplicateShard(id) => {
+                write!(f, "shard placement saw duplicate shard id {}", id.get())
+            }
+        }
+    }
+}
+
+impl Error for ShardPlacementError {}
+
+/// Static report describing a [`ShardPlacement`].
+///
+/// Carries the placement name, hash scheme/version, and the ordered shard
+/// list so live and simulator code can prove byte-identical placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardPlacementReport {
+    name: String,
+    scheme: ShardHashScheme,
+    version: u32,
+    shards: Vec<ShardId>,
+}
+
+impl ShardPlacementReport {
+    /// Returns the placement name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the hash scheme.
+    pub fn scheme(&self) -> ShardHashScheme {
+        self.scheme
+    }
+
+    /// Returns the hash scheme version.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns the ordered shard list.
+    pub fn shards(&self) -> &[ShardId] {
+        &self.shards
+    }
+}
+
+/// Deterministic key-to-shard map over an explicit ordered shard list.
+///
+/// Placement is visible: the shard list, hash scheme, and version are part of
+/// the public API. The map is stable while the shard list is unchanged. It
+/// is **not** stable under shard-count changes; that requires a consistent-
+/// hashing scheme which is not provided here.
+///
+/// Input keys are canonical bytes (or strings). Arbitrary `Hash` values are
+/// not accepted, because their byte representation is not portable across
+/// platforms or `Hasher` implementations.
+#[derive(Debug, Clone)]
+pub struct ShardPlacement {
+    name: String,
+    shards: Vec<ShardId>,
+    scheme: ShardHashScheme,
+}
+
+impl ShardPlacement {
+    /// Creates a placement over the given ordered shard list.
+    ///
+    /// Returns [`ShardPlacementError::Empty`] when the list is empty and
+    /// [`ShardPlacementError::DuplicateShard`] on repeated ids. The shard
+    /// list order is preserved verbatim (no sort).
+    pub fn new(name: impl Into<String>, shards: Vec<ShardId>) -> Result<Self, ShardPlacementError> {
+        if shards.is_empty() {
+            return Err(ShardPlacementError::Empty);
+        }
+        let mut seen = BTreeSet::new();
+        for shard in &shards {
+            if !seen.insert(*shard) {
+                return Err(ShardPlacementError::DuplicateShard(*shard));
+            }
+        }
+        Ok(Self {
+            name: name.into(),
+            shards,
+            scheme: ShardHashScheme::Fnv1a64ModCount,
+        })
+    }
+
+    /// Returns the placement name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the ordered shard list.
+    pub fn shards(&self) -> &[ShardId] {
+        &self.shards
+    }
+
+    /// Returns the hash scheme.
+    pub fn scheme(&self) -> ShardHashScheme {
+        self.scheme
+    }
+
+    /// Returns the owner shard for a canonical byte key.
+    ///
+    /// The mapping is `fnv1a64(key) % shards.len()` over the ordered shard
+    /// list. Live and simulator runtimes must call this on the same bytes
+    /// to get byte-identical placement.
+    pub fn owner_for_bytes(&self, key: &[u8]) -> ShardId {
+        let h = fnv1a64(key);
+        let idx = (h % self.shards.len() as u64) as usize;
+        self.shards[idx]
+    }
+
+    /// Returns the owner shard for a string key (UTF-8 bytes).
+    pub fn owner_for_str(&self, key: &str) -> ShardId {
+        self.owner_for_bytes(key.as_bytes())
+    }
+
+    /// Returns a static placement report.
+    pub fn report(&self) -> ShardPlacementReport {
+        ShardPlacementReport {
+            name: self.name.clone(),
+            scheme: self.scheme,
+            version: ShardHashScheme::VERSION,
+            shards: self.shards.clone(),
+        }
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+// ---------------------------------------------------------------
+// Service table
+// ---------------------------------------------------------------
+
+/// Returned when an isolate processes a key that does not belong to it.
+///
+/// Owners must re-check `placement.owner_for_bytes(key) == ctx.shard_id()`
+/// before mutating keyed state. If the check fails, return this typed error
+/// to the caller. The runtime cannot prove key ownership for the isolate;
+/// only the isolate's handler can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongShard {
+    /// The shard the placement says should own the key.
+    pub expected: ShardId,
+    /// The shard that actually received the message.
+    pub actual: ShardId,
+}
+
+impl fmt::Display for WrongShard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "wrong shard for key: expected {}, actual {}",
+            self.expected.get(),
+            self.actual.get()
+        )
+    }
+}
+
+impl Error for WrongShard {}
+
+/// Returned when a [`ShardServiceTable`] lookup names a shard that is not in
+/// the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingShard(pub ShardId);
+
+impl fmt::Display for MissingShard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "shard {} is not in the service table", self.0.get())
+    }
+}
+
+impl Error for MissingShard {}
+
+/// Errors when constructing a [`ShardServiceTable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardServiceTableError {
+    /// The entries list shard ids did not match the placement shard list,
+    /// either by membership or by order.
+    ShardListMismatch {
+        /// The placement's ordered shard list.
+        placement: Vec<ShardId>,
+        /// The entries' ordered shard list.
+        entries: Vec<ShardId>,
+    },
+}
+
+impl fmt::Display for ShardServiceTableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShardListMismatch { placement, entries } => {
+                write!(
+                    f,
+                    "shard service table entries {entries:?} do not match placement {placement:?}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ShardServiceTableError {}
+
+/// Explicit ordered map from [`ShardId`] to a typed service [`Address`].
+///
+/// The table holds the same shard list, in the same order, as its placement.
+/// There is no hidden registry thread, no `Arc<Mutex<HashMap<...>>>` side
+/// table, and no automatic refresh. Addresses are captured at construction
+/// time. If a service isolate restarts with a new generation, it is the
+/// caller's responsibility to rebuild the table.
+///
+/// Lookup is O(log n) via an internal `BTreeMap<ShardId, usize>` index
+/// built from `placement.shards()` at construction. `address_for_bytes`
+/// is total over correct construction: every owner returned by
+/// `placement.owner_for_bytes` is by definition one of `placement.shards()`,
+/// and `new` builds the index from those exact shards. The implementation
+/// still pessimistically guards the lookup with `expect`, so a future
+/// refactor that breaks the parallel-array invariant fails loudly.
+#[derive(Debug, Clone)]
+pub struct ShardServiceTable<M: 'static, R: 'static = ()> {
+    placement: ShardPlacement,
+    addresses: Vec<Address<M, R>>,
+    index: BTreeMap<ShardId, usize>,
+}
+
+impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
+    /// Creates a service table over the given placement and entries.
+    ///
+    /// The entries' shard ids must match the placement's shard list in the
+    /// same order. Returns [`ShardServiceTableError::ShardListMismatch`]
+    /// otherwise. This is a build-time invariant, not a runtime probe.
+    pub fn new(
+        placement: ShardPlacement,
+        entries: Vec<(ShardId, Address<M, R>)>,
+    ) -> Result<Self, ShardServiceTableError> {
+        let entry_shards: Vec<ShardId> = entries.iter().map(|(s, _)| *s).collect();
+        if entry_shards != placement.shards() {
+            return Err(ShardServiceTableError::ShardListMismatch {
+                placement: placement.shards().to_vec(),
+                entries: entry_shards,
+            });
+        }
+        let mut addresses = Vec::with_capacity(entries.len());
+        let mut index = BTreeMap::new();
+        for (i, (shard, address)) in entries.into_iter().enumerate() {
+            addresses.push(address);
+            index.insert(shard, i);
+        }
+        Ok(Self {
+            placement,
+            addresses,
+            index,
+        })
+    }
+
+    /// Returns the underlying placement.
+    pub fn placement(&self) -> &ShardPlacement {
+        &self.placement
+    }
+
+    /// Returns the ordered address list, parallel to
+    /// `placement().shards()`.
+    pub fn addresses(&self) -> &[Address<M, R>] {
+        &self.addresses
+    }
+
+    /// Looks up the address for `shard`, or returns [`MissingShard`].
+    pub fn address_for(&self, shard: ShardId) -> Result<Address<M, R>, MissingShard>
+    where
+        Address<M, R>: Copy,
+    {
+        match self.index.get(&shard) {
+            Some(i) => Ok(self.addresses[*i]),
+            None => Err(MissingShard(shard)),
+        }
+    }
+
+    /// Returns the service address that owns the given byte key.
+    ///
+    /// Total in correct usage: `placement.owner_for_bytes(key)` returns
+    /// some `s in placement.shards()`, and `new` populated `self.index`
+    /// with exactly those shards. The `expect` below is therefore
+    /// unreachable when the constructor invariant holds, but it is kept
+    /// as a structural guard rather than `unreachable!()` so a future
+    /// refactor that breaks the invariant panics with a clear message
+    /// instead of silently returning a stale address.
+    pub fn address_for_bytes(&self, key: &[u8]) -> Address<M, R>
+    where
+        Address<M, R>: Copy,
+    {
+        let owner = self.placement.owner_for_bytes(key);
+        let i = *self
+            .index
+            .get(&owner)
+            .expect("placement owner is in service table index");
+        self.addresses[i]
+    }
+
+    /// Returns the service address that owns the given string key.
+    pub fn address_for_str(&self, key: &str) -> Address<M, R>
+    where
+        Address<M, R>: Copy,
+    {
+        self.address_for_bytes(key.as_bytes())
+    }
+}
+
+// ---------------------------------------------------------------
+// Scatter / gather
+// ---------------------------------------------------------------
+
+/// Errors when validating a [`ScatterGatherConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScatterGatherConfigError {
+    /// `max_targets` was zero. A scatter with no targets is a programmer
+    /// error.
+    MaxTargetsZero,
+    /// The collector mailbox capacity was below `max_targets`. Reply
+    /// collection must not silently grow; capacity must cover the worst
+    /// case so partial failure stays visible.
+    CollectorCapacityBelowMaxTargets {
+        /// Configured collector capacity.
+        collector_capacity: usize,
+        /// Configured max targets.
+        max_targets: usize,
+    },
+    /// `per_target_timeout` was zero. The runtime cannot prove timeouts
+    /// against a zero deadline.
+    PerTargetTimeoutZero,
+    /// `aggregate_timeout` was below `per_target_timeout`. The aggregate
+    /// must give at least one target deadline of room or partial reports
+    /// become meaningless.
+    AggregateTimeoutBelowPerTargetTimeout {
+        /// Configured aggregate timeout.
+        aggregate_timeout: Duration,
+        /// Configured per-target timeout.
+        per_target_timeout: Duration,
+    },
+}
+
+impl fmt::Display for ScatterGatherConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MaxTargetsZero => write!(f, "scatter/gather max_targets must be > 0"),
+            Self::CollectorCapacityBelowMaxTargets {
+                collector_capacity,
+                max_targets,
+            } => write!(
+                f,
+                "scatter/gather collector_capacity {collector_capacity} < max_targets {max_targets}"
+            ),
+            Self::PerTargetTimeoutZero => {
+                write!(f, "scatter/gather per_target_timeout must be > 0")
+            }
+            Self::AggregateTimeoutBelowPerTargetTimeout {
+                aggregate_timeout,
+                per_target_timeout,
+            } => write!(
+                f,
+                "scatter/gather aggregate_timeout {aggregate_timeout:?} < per_target_timeout {per_target_timeout:?}"
+            ),
+        }
+    }
+}
+
+impl Error for ScatterGatherConfigError {}
+
+/// Bounded scatter/gather configuration.
+///
+/// All knobs are explicit. There is no automatic backoff and no hidden
+/// reply queue. Callers that want retry must own the retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScatterGatherConfig {
+    /// Maximum number of targets per scatter. The result vector capacity is
+    /// bounded by this value.
+    pub max_targets: usize,
+    /// Mailbox capacity for the reply-collecting isolate. Must be at least
+    /// `max_targets` to keep partial failure visible.
+    pub collector_capacity: usize,
+    /// Per-target deadline. After this duration, a missing reply becomes
+    /// [`ScatterGatherTargetOutcome::Timeout`].
+    pub per_target_timeout: Duration,
+    /// Aggregate deadline. After this duration, any still-missing replies
+    /// become [`ScatterGatherTargetOutcome::AggregateTimeout`] and the
+    /// fanout caller stops waiting.
+    pub aggregate_timeout: Duration,
+}
+
+impl ScatterGatherConfig {
+    /// Validates the config. Returns the typed error on bad combinations.
+    pub fn validate(&self) -> Result<(), ScatterGatherConfigError> {
+        if self.max_targets == 0 {
+            return Err(ScatterGatherConfigError::MaxTargetsZero);
+        }
+        if self.collector_capacity < self.max_targets {
+            return Err(ScatterGatherConfigError::CollectorCapacityBelowMaxTargets {
+                collector_capacity: self.collector_capacity,
+                max_targets: self.max_targets,
+            });
+        }
+        if self.per_target_timeout.is_zero() {
+            return Err(ScatterGatherConfigError::PerTargetTimeoutZero);
+        }
+        if self.aggregate_timeout < self.per_target_timeout {
+            return Err(
+                ScatterGatherConfigError::AggregateTimeoutBelowPerTargetTimeout {
+                    aggregate_timeout: self.aggregate_timeout,
+                    per_target_timeout: self.per_target_timeout,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One target's outcome inside a [`ScatterGatherReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScatterGatherTargetOutcome<T> {
+    /// Target replied within its per-target timeout.
+    Replied(T),
+    /// Target's mailbox was full at fanout time.
+    Full,
+    /// Target's address was closed at fanout time, or its shard was
+    /// quarantined.
+    Closed,
+    /// Target did not reply within its per-target timeout.
+    Timeout,
+    /// The aggregate deadline fired before this target replied.
+    AggregateTimeout,
+    /// Target name was not present in the service table; see
+    /// [`MissingShard`].
+    MissingShard,
+}
+
+/// Partial-aggregate report from a scatter/gather fanout.
+///
+/// The `outcomes` vector length is bounded by `config.max_targets`. There is
+/// no hidden buffering; what is not in this report did not happen. The
+/// vector preserves the caller-supplied target order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScatterGatherReport<T> {
+    /// Config the fanout ran under.
+    pub config: ScatterGatherConfig,
+    /// Per-target outcomes in caller-supplied order.
+    pub outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<T>)>,
+}
+
+impl<T> ScatterGatherReport<T> {
+    /// Returns the number of targets that replied.
+    pub fn replied_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::Replied(_)))
+            .count()
+    }
+
+    /// Returns the number of targets that returned [`Full`](ScatterGatherTargetOutcome::Full).
+    pub fn full_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::Full))
+            .count()
+    }
+
+    /// Returns the number of targets that returned [`Closed`](ScatterGatherTargetOutcome::Closed).
+    pub fn closed_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::Closed))
+            .count()
+    }
+
+    /// Returns the number of targets that returned [`Timeout`](ScatterGatherTargetOutcome::Timeout).
+    pub fn timeout_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::Timeout))
+            .count()
+    }
+
+    /// Returns the number of targets cut off by the aggregate timeout.
+    pub fn aggregate_timeout_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::AggregateTimeout))
+            .count()
+    }
+
+    /// Returns the number of targets that named a shard not in the service
+    /// table.
+    pub fn missing_shard_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::MissingShard))
+            .count()
+    }
+
+    /// Iterator over `(ShardId, &T)` for targets that replied.
+    pub fn replied(&self) -> impl Iterator<Item = (ShardId, &T)> {
+        self.outcomes.iter().filter_map(|(s, o)| match o {
+            ScatterGatherTargetOutcome::Replied(t) => Some((*s, t)),
+            _ => None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------
+// Hot-key attempt report (caller-owned retry)
+// ---------------------------------------------------------------
+
+/// Per-attempt outcome for keyed sends/calls under hot-key pressure.
+///
+/// Retry is caller-owned. This enum names the cases an explicit retry loop
+/// must distinguish so the report stays honest. Both intermediate
+/// [`FullRetry`](Self::FullRetry) attempts and terminal outcomes
+/// ([`RetrySucceeded`](Self::RetrySucceeded) /
+/// [`RetryExhausted`](Self::RetryExhausted)) are recorded so the report
+/// shows how much retry pressure the loop saw, not just the final verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotKeyAttemptOutcome {
+    /// First-attempt accept.
+    Accepted,
+    /// First attempt was rejected `Full`.
+    FullFirstAttempt,
+    /// A retry was rejected `Full`.
+    FullRetry,
+    /// Target was closed during the attempt.
+    Closed,
+    /// Caller-owned deadline fired before the attempt was accepted.
+    Timeout,
+    /// Retry succeeded after one or more `Full` rejections.
+    RetrySucceeded,
+    /// Retry budget was exhausted before the attempt was accepted.
+    RetryExhausted,
+}
+
+/// Summary report for a caller-owned retry loop against a hot owner shard.
+///
+/// All retry policy is explicit and visible. The runtime never retries on
+/// the caller's behalf. Counters are partitioned so a non-zero
+/// `full_retry_total` proves the loop actually retried (and was not
+/// silently treated as a single attempt).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotKeyAttemptReport {
+    /// First-attempt accepts (no retry needed).
+    pub accepted_first_attempt: u32,
+    /// First-attempt `Full` rejections (one per retry-loop entry that hit
+    /// pressure on its first probe).
+    pub full_first_attempt: u32,
+    /// Total `Full` rejections observed during retry rounds (every
+    /// in-loop retry that came back `Full`). Does not include the
+    /// first-attempt rejection.
+    pub full_retry_total: u32,
+    /// Retry-loop entries that succeeded after one or more `Full`
+    /// rejections.
+    pub retry_succeeded: u32,
+    /// Retry-loop entries that exhausted the retry budget.
+    pub retry_exhausted: u32,
+    /// Retry-loop entries that hit the caller-owned deadline.
+    pub timeout: u32,
+    /// Retry-loop entries that saw `Closed`.
+    pub closed: u32,
+}
+
+impl HotKeyAttemptReport {
+    /// Records one attempt outcome into the report.
+    pub fn record(&mut self, outcome: HotKeyAttemptOutcome) {
+        match outcome {
+            HotKeyAttemptOutcome::Accepted => self.accepted_first_attempt += 1,
+            HotKeyAttemptOutcome::FullFirstAttempt => self.full_first_attempt += 1,
+            HotKeyAttemptOutcome::FullRetry => self.full_retry_total += 1,
+            HotKeyAttemptOutcome::RetrySucceeded => self.retry_succeeded += 1,
+            HotKeyAttemptOutcome::RetryExhausted => self.retry_exhausted += 1,
+            HotKeyAttemptOutcome::Timeout => self.timeout += 1,
+            HotKeyAttemptOutcome::Closed => self.closed += 1,
+        }
+    }
+
+    /// Number of top-level retry-loop entries (one per hot-key attempt the
+    /// caller drove). Each loop entry produces exactly one terminal
+    /// outcome: `Accepted`, `RetrySucceeded`, `RetryExhausted`, `Timeout`,
+    /// or `Closed`. Intermediate `FullRetry` records do **not** count
+    /// here — they are tracked separately in `full_retry_total` so retry
+    /// pressure stays visible.
+    pub fn loop_entries(&self) -> u32 {
+        self.accepted_first_attempt
+            + self.retry_succeeded
+            + self.retry_exhausted
+            + self.timeout
+            + self.closed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shards(raws: &[u32]) -> Vec<ShardId> {
+        raws.iter().copied().map(ShardId::new).collect()
+    }
+
+    #[test]
+    fn placement_rejects_empty_shard_list() {
+        assert_eq!(
+            ShardPlacement::new("p", vec![]).unwrap_err(),
+            ShardPlacementError::Empty
+        );
+    }
+
+    #[test]
+    fn placement_rejects_duplicate_shard_ids() {
+        let err = ShardPlacement::new("p", shards(&[1, 7, 7])).unwrap_err();
+        assert_eq!(err, ShardPlacementError::DuplicateShard(ShardId::new(7)));
+    }
+
+    #[test]
+    fn placement_preserves_explicit_order() {
+        let p = ShardPlacement::new("p", shards(&[7, 1, 22])).unwrap();
+        assert_eq!(
+            p.shards(),
+            &[ShardId::new(7), ShardId::new(1), ShardId::new(22)]
+        );
+    }
+
+    /// Canonical frozen mapping for the `dst-fanout` placement.
+    ///
+    /// This is the single source of truth for the FNV-1a 64 mod-count
+    /// scheme at version 1. `tina-runtime` integration tests
+    /// (`tests/sharded_primitives.rs`) and `tina-sim` DST tests
+    /// (`tests/sharded_dst.rs`) both freeze the same constants. If the
+    /// hash scheme or version is changed deliberately, this fixture
+    /// fails first; bump `ShardHashScheme::VERSION` and update the
+    /// downstream test files in lockstep.
+    pub(crate) const FROZEN_DST_KEYS: &[&str] = &[
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        "lambda", "mu",
+    ];
+    pub(crate) const FROZEN_DST_SHARDS: [u32; 3] = [11, 22, 33];
+    pub(crate) const FROZEN_DST_OWNERS: [u32; 12] =
+        [11, 33, 33, 22, 33, 33, 11, 11, 11, 33, 33, 11];
+
+    #[test]
+    fn placement_owner_mapping_is_frozen_at_version_1() {
+        let p = ShardPlacement::new(
+            "dst-fanout",
+            FROZEN_DST_SHARDS
+                .iter()
+                .copied()
+                .map(ShardId::new)
+                .collect(),
+        )
+        .unwrap();
+        let owners: Vec<u32> = FROZEN_DST_KEYS
+            .iter()
+            .map(|k| p.owner_for_str(k).get())
+            .collect();
+        assert_eq!(owners, FROZEN_DST_OWNERS.to_vec());
+        // Sanity: every shard in the placement is reachable by at least
+        // one frozen key. This protects against trivial bugs that send
+        // every key to one shard.
+        let unique_owners: BTreeSet<u32> = owners.iter().copied().collect();
+        assert_eq!(unique_owners.len(), FROZEN_DST_SHARDS.len());
+    }
+
+    #[test]
+    fn placement_owner_for_non_contiguous_shard_ids_is_in_set() {
+        let shard_set = shards(&[3, 17, 91]);
+        let p = ShardPlacement::new("p", shard_set.clone()).unwrap();
+        for n in 0..32u32 {
+            let key = format!("k-{n}");
+            let owner = p.owner_for_str(&key);
+            assert!(shard_set.contains(&owner));
+        }
+    }
+
+    #[test]
+    fn placement_reports_carry_name_scheme_version_and_shards() {
+        let p = ShardPlacement::new("by-key", shards(&[3, 17, 91])).unwrap();
+        let report = p.report();
+        assert_eq!(p.name(), "by-key");
+        assert_eq!(report.name(), "by-key");
+        assert_eq!(report.scheme(), ShardHashScheme::Fnv1a64ModCount);
+        assert_eq!(report.version(), ShardHashScheme::VERSION);
+        assert_eq!(
+            report.shards(),
+            &[ShardId::new(3), ShardId::new(17), ShardId::new(91)]
+        );
+    }
+
+    #[test]
+    fn placement_owner_for_str_matches_owner_for_bytes() {
+        let p = ShardPlacement::new("p", shards(&[2, 5])).unwrap();
+        for key in ["", "a", "hello world", "the quick brown fox"] {
+            assert_eq!(p.owner_for_str(key), p.owner_for_bytes(key.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn placement_accepts_runtime_derived_name() {
+        // Plain `String` is accepted, not just `&'static str`.
+        let dynamic_name = format!("dynamic-{}", 42);
+        let p = ShardPlacement::new(dynamic_name.clone(), shards(&[1])).unwrap();
+        assert_eq!(p.name(), dynamic_name);
+    }
+
+    #[test]
+    fn placement_error_implements_std_error() {
+        let err: Box<dyn Error> = Box::new(ShardPlacement::new("p", vec![]).unwrap_err());
+        assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn service_table_rejects_mismatched_shard_list() {
+        let placement = ShardPlacement::new("p", shards(&[3, 17])).unwrap();
+        let entries = vec![
+            (ShardId::new(17), addr::<u32>(17, 1)),
+            (ShardId::new(3), addr::<u32>(3, 2)),
+        ];
+        let err = ShardServiceTable::new(placement, entries).unwrap_err();
+        match err {
+            ShardServiceTableError::ShardListMismatch { placement, entries } => {
+                assert_eq!(placement, shards(&[3, 17]));
+                assert_eq!(entries, shards(&[17, 3]));
+            }
+        }
+    }
+
+    #[test]
+    fn service_table_address_for_missing_shard_is_typed() {
+        let placement = ShardPlacement::new("p", shards(&[3, 17])).unwrap();
+        let entries = vec![
+            (ShardId::new(3), addr::<u32>(3, 1)),
+            (ShardId::new(17), addr::<u32>(17, 2)),
+        ];
+        let table = ShardServiceTable::new(placement, entries).unwrap();
+        assert_eq!(
+            table.address_for(ShardId::new(99)).unwrap_err(),
+            MissingShard(ShardId::new(99))
+        );
+    }
+
+    #[test]
+    fn service_table_address_for_bytes_routes_through_placement() {
+        let placement = ShardPlacement::new("p", shards(&[3, 17, 91])).unwrap();
+        let entries = vec![
+            (ShardId::new(3), addr::<u32>(3, 11)),
+            (ShardId::new(17), addr::<u32>(17, 22)),
+            (ShardId::new(91), addr::<u32>(91, 33)),
+        ];
+        let placement_clone = placement.clone();
+        let table = ShardServiceTable::new(placement, entries).unwrap();
+        for key in ["alpha", "beta", "gamma", "delta"] {
+            let owner = placement_clone.owner_for_str(key);
+            assert_eq!(table.address_for_str(key).shard(), owner);
+        }
+    }
+
+    #[test]
+    fn service_table_error_implements_std_error() {
+        let placement = ShardPlacement::new("p", shards(&[3, 17])).unwrap();
+        let bad_entries = vec![(ShardId::new(99), addr::<u32>(99, 1))];
+        let err: Box<dyn Error> =
+            Box::new(ShardServiceTable::new(placement, bad_entries).unwrap_err());
+        assert!(err.to_string().contains("placement"));
+    }
+
+    #[test]
+    fn missing_shard_implements_std_error() {
+        let err: Box<dyn Error> = Box::new(MissingShard(ShardId::new(7)));
+        assert!(err.to_string().contains("not in"));
+    }
+
+    #[test]
+    fn wrong_shard_implements_std_error() {
+        let err: Box<dyn Error> = Box::new(WrongShard {
+            expected: ShardId::new(3),
+            actual: ShardId::new(7),
+        });
+        assert!(err.to_string().contains("expected 3"));
+    }
+
+    #[test]
+    fn scatter_gather_config_validates_max_targets_nonzero() {
+        let cfg = ScatterGatherConfig {
+            max_targets: 0,
+            collector_capacity: 4,
+            per_target_timeout: Duration::from_millis(10),
+            aggregate_timeout: Duration::from_millis(20),
+        };
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ScatterGatherConfigError::MaxTargetsZero
+        );
+    }
+
+    #[test]
+    fn scatter_gather_config_rejects_collector_capacity_below_max_targets() {
+        let cfg = ScatterGatherConfig {
+            max_targets: 8,
+            collector_capacity: 4,
+            per_target_timeout: Duration::from_millis(10),
+            aggregate_timeout: Duration::from_millis(20),
+        };
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ScatterGatherConfigError::CollectorCapacityBelowMaxTargets {
+                collector_capacity: 4,
+                max_targets: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn scatter_gather_config_rejects_zero_per_target_timeout() {
+        let cfg = ScatterGatherConfig {
+            max_targets: 4,
+            collector_capacity: 4,
+            per_target_timeout: Duration::ZERO,
+            aggregate_timeout: Duration::from_millis(10),
+        };
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ScatterGatherConfigError::PerTargetTimeoutZero
+        );
+    }
+
+    #[test]
+    fn scatter_gather_config_rejects_aggregate_below_per_target() {
+        let cfg = ScatterGatherConfig {
+            max_targets: 4,
+            collector_capacity: 4,
+            per_target_timeout: Duration::from_millis(50),
+            aggregate_timeout: Duration::from_millis(10),
+        };
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ScatterGatherConfigError::AggregateTimeoutBelowPerTargetTimeout {
+                aggregate_timeout: Duration::from_millis(10),
+                per_target_timeout: Duration::from_millis(50),
+            }
+        );
+    }
+
+    #[test]
+    fn scatter_gather_config_error_implements_std_error() {
+        let err: Box<dyn Error> = Box::new(ScatterGatherConfigError::MaxTargetsZero);
+        assert!(err.to_string().contains("max_targets"));
+    }
+
+    #[test]
+    fn scatter_gather_report_counts_outcomes_separately() {
+        let cfg = ScatterGatherConfig {
+            max_targets: 6,
+            collector_capacity: 6,
+            per_target_timeout: Duration::from_millis(10),
+            aggregate_timeout: Duration::from_millis(20),
+        };
+        let report: ScatterGatherReport<u64> = ScatterGatherReport {
+            config: cfg,
+            outcomes: vec![
+                (ShardId::new(1), ScatterGatherTargetOutcome::Replied(7)),
+                (ShardId::new(2), ScatterGatherTargetOutcome::Full),
+                (ShardId::new(3), ScatterGatherTargetOutcome::Closed),
+                (ShardId::new(4), ScatterGatherTargetOutcome::Timeout),
+                (
+                    ShardId::new(5),
+                    ScatterGatherTargetOutcome::AggregateTimeout,
+                ),
+                (ShardId::new(6), ScatterGatherTargetOutcome::MissingShard),
+            ],
+        };
+        assert_eq!(report.replied_count(), 1);
+        assert_eq!(report.full_count(), 1);
+        assert_eq!(report.closed_count(), 1);
+        assert_eq!(report.timeout_count(), 1);
+        assert_eq!(report.aggregate_timeout_count(), 1);
+        assert_eq!(report.missing_shard_count(), 1);
+        let replied: Vec<_> = report.replied().collect();
+        assert_eq!(replied, vec![(ShardId::new(1), &7)]);
+    }
+
+    #[test]
+    fn hot_key_attempt_report_tracks_intermediate_and_terminal_outcomes() {
+        let mut report = HotKeyAttemptReport::default();
+        report.record(HotKeyAttemptOutcome::Accepted);
+        report.record(HotKeyAttemptOutcome::FullFirstAttempt);
+        report.record(HotKeyAttemptOutcome::FullRetry);
+        report.record(HotKeyAttemptOutcome::FullRetry);
+        report.record(HotKeyAttemptOutcome::RetrySucceeded);
+        report.record(HotKeyAttemptOutcome::RetryExhausted);
+        report.record(HotKeyAttemptOutcome::Timeout);
+        report.record(HotKeyAttemptOutcome::Closed);
+        assert_eq!(report.accepted_first_attempt, 1);
+        assert_eq!(report.full_first_attempt, 1);
+        // FullRetry is now counted explicitly so callers can see retry
+        // pressure rather than only the terminal verdict.
+        assert_eq!(report.full_retry_total, 2);
+        assert_eq!(report.retry_succeeded, 1);
+        assert_eq!(report.retry_exhausted, 1);
+        assert_eq!(report.timeout, 1);
+        assert_eq!(report.closed, 1);
+        assert_eq!(report.loop_entries(), 5);
+    }
+
+    fn addr<M: 'static>(shard: u32, isolate: u64) -> Address<M> {
+        Address::new(ShardId::new(shard), tina::IsolateId::new(isolate))
+    }
+}
