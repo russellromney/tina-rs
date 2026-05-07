@@ -60,10 +60,10 @@ This means Rock 3 in this phase ships as
 precision: the observer still fires on the worker thread, but the
 caller no longer hand-rolls one closure per send.
 
-Rocks 4 and 5 stay in scope. Rock 4 collapses to a thin
-`retry_send_observed(addr, msg, deadline)` free function over
-`ThreadedRuntime::send_and_observe` plus a documented convention that
-"BurstClosed-style control" travels through the same data mailbox.
+Rocks 4 and 5 stay in scope. Rock 4 shipped as
+`ThreadedRuntime::send_observed_until(addr, deadline, backoff,
+|| msg)` plus the documented convention that "BurstClosed-style
+control" travels through the same data mailbox.
 
 ## Goal
 
@@ -478,4 +478,3 @@ Dependencies:
 - The deleted ceremony is product ceremony, not truth.
 - Docs teach the new shapes and do not preserve stale examples.
 - No new helper hides retry, overload, timeout, topology, or trace facts.
-

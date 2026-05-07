@@ -237,7 +237,12 @@ fn send_observed_until_returns_closed_when_target_stopped() {
 }
 
 #[test]
-fn send_observed_until_attempts_at_least_once_even_with_past_deadline() {
+fn send_observed_until_past_deadline_returns_timeout_without_attempting() {
+    // Phase-062 P2-2: with a past deadline at entry, the helper must
+    // not enqueue a command (which would race with the bounded recv
+    // and risk delivering the message *and* reporting Timeout). It
+    // must return Timeout up-front so the caller knows the side
+    // effect did not happen.
     let runtime = make_runtime();
     let processed = Arc::new(AtomicU32::new(0));
     let worker = runtime
@@ -249,15 +254,72 @@ fn send_observed_until_attempts_at_least_once_even_with_past_deadline() {
         )
         .expect("register slow");
 
-    // Deadline already in the past. The mailbox has room, so the
-    // first attempt must succeed.
     let result = runtime.send_observed_until(
         worker,
         Instant::now() - Duration::from_secs(1),
         Duration::from_millis(10),
         || SlowMsg::Job(42),
     );
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Err(SendObservedUntilError::Timeout));
+
+    // Give the worker a moment in case any command leaked through;
+    // none should have, so `processed` must stay at 0.
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn send_observed_until_bounds_observation_when_worker_is_slow() {
+    // Worker accepts the command but does not respond before the
+    // deadline elapses. Without per-attempt bounding, recv() would
+    // block until the worker eventually answered, blowing past the
+    // caller's deadline. With per-attempt bounding, the helper
+    // returns Timeout within ~deadline.
+    let runtime = make_runtime();
+    let processed = Arc::new(AtomicU32::new(0));
+    let worker = runtime
+        .register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::clone(&processed),
+            },
+            // cap=1, the burst will fill it quickly so the next
+            // observe waits on a worker that is processing slowly.
+            1,
+        )
+        .expect("register slow");
+
+    // Pre-fill the mailbox so subsequent send_observed_until attempts
+    // see Full and have to retry — which is exactly when a stuck
+    // worker would extend the wait.
+    runtime
+        .try_send(worker, SlowMsg::Job(0))
+        .expect("seed mailbox");
+
+    let started = Instant::now();
+    let cap = Duration::from_millis(150);
+    let result = runtime.send_observed_until(
+        worker,
+        started + cap,
+        Duration::from_millis(20),
+        || SlowMsg::Job(1),
+    );
+    let elapsed = started.elapsed();
+
+    // Either the worker drains and we admit, or we Timeout at the
+    // bounded deadline. Both are acceptable; the load-bearing
+    // property is the elapsed cap.
+    match result {
+        Ok(()) | Err(SendObservedUntilError::Timeout) => {}
+        other => panic!("expected Ok or Timeout, got {other:?}"),
+    }
+    // 2x cap is generous; without per-attempt bounding a wedged
+    // worker could block this for seconds.
+    assert!(
+        elapsed < cap * 2,
+        "send_observed_until exceeded 2x deadline cap: {elapsed:?}"
+    );
 
     let _ = runtime.shutdown();
 }

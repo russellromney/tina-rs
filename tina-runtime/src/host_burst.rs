@@ -112,17 +112,30 @@ impl HostBurstOutcomes {
     /// submitted *so far*", not a moving fence. Don't issue more
     /// `try_send_outcome` calls between calling `wait_complete` and
     /// reading the snapshot.
+    ///
+    /// The wait does not pin a CPU. The fast path (observers already
+    /// fired by the time the host calls in) returns on the first
+    /// atomic load. Otherwise the loop sleeps briefly between checks
+    /// so a stalled or slow worker doesn't burn the host's core for
+    /// the entire `timeout`.
     pub fn wait_complete(&self, timeout: Duration) -> Result<(), HostBurstWaitError> {
         let target = self.inner.submitted.load(Ordering::Acquire);
         let deadline = Instant::now() + timeout;
+        // Sub-millisecond polling: typical bursts resolve in a handful
+        // of iterations on a healthy worker, while a stalled worker
+        // costs at most ~10k wakeups/s instead of pinning a core.
+        let poll_interval = Duration::from_micros(100);
         loop {
             if self.inner.observed.load(Ordering::Acquire) >= target {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(HostBurstWaitError::Timeout);
             }
-            thread::yield_now();
+            // Don't oversleep past the deadline.
+            let remaining = deadline.saturating_duration_since(now);
+            thread::sleep(poll_interval.min(remaining));
         }
     }
 

@@ -92,12 +92,14 @@ What feels worse:
 
 What this suggests:
 
-- Tina-shaped retry sugar (Eiffel finding #2 — continuation /
-  pipeline sugar) would help here. The variant trio
-  `Begin`/`HttpReturned`/`BackoffElapsed` is the canonical "linear
-  protocol" shape; a small "for each attempt with this backoff,
-  call this address, classify, finish" helper would remove two
-  variants without hiding the trace.
+- A future caller-owned retry helper that pairs with
+  `outcome.classify()` could remove the
+  `Begin` / `HttpReturned` / `BackoffElapsed` trio: "for each attempt
+  with this backoff, call this address, classify, finish". That
+  would still keep one trace event per attempt and leave idempotency
+  / budget choices in caller code, so it doesn't cross into the
+  Phase 062 non-goal of hidden retry. Punt until a real caller
+  outside this pedagogical specimen flinches at the variant trio.
 
 What Phase 062 Rock 6 changed:
 

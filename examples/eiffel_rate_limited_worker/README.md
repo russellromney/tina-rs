@@ -55,20 +55,23 @@ holds it together.
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
 limit lives in the worker's own state machine: each `Submit` returns
-`sleep(RATE_WINDOW).reply(Tick)` (with a `pending` guard so only one
-sleep is in flight at a time), and the matching `Tick` increments
+`sleep(RATE_WINDOW).reply(Tick)`. A `SingleCallGate` (Phase-062 Rock 5)
+keeps at most one `sleep` in flight; the matching `Tick` increments
 `processed`. The host closes the burst with a normal Tina message:
 `BurstClosed(admitted)`.
 
 ```rust
 WorkerMsg::Submit(_) => {
     self.report.jobs_admitted += 1;
-    if self.pending == 0 { sleep(self.rate_window).reply(WorkerMsg::Tick) }
+    if self.gate.submit() { sleep(self.rate_window).reply(WorkerMsg::Tick) }
     else { noop() }
 }
 WorkerMsg::Tick(_) => {
     self.processed += 1;
-    if self.is_done() { stop_with(self.report) } else { noop() }
+    let more_work = self.gate.complete();
+    if self.is_done() { stop_with(self.report) }
+    else if more_work { sleep(self.rate_window).reply(WorkerMsg::Tick) }
+    else { noop() }
 }
 WorkerMsg::BurstClosed(admitted) => {
     self.expected = Some(admitted);
