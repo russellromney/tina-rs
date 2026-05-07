@@ -162,6 +162,101 @@ why some are layered is confusing.
   punt until a non-pedagogical user actually mixes the two and
   flinches.
 
+### 8. External cancellation API
+
+**Surfaced by:** `eiffel_cancellation_chain`.
+
+There is no public `runtime.cancel(addr)` and no public
+`IsolateCall::abort()`. The only way to "externally cancel" mid-
+flight work today is to send a domain `Stop` message to the
+requester isolate, which causes it to stop itself. Stopping the
+requester closes its pending IsolateCalls and any worker reply
+that arrives later is rejected as `CallReplyRejected
+{ RequesterClosed }`. That works, but every isolate that wants to
+be externally cancellable has to add its own `Stop` (or
+equivalent) variant.
+
+**Build:** a runtime-level `runtime.cancel(addr) -> CancelOutcome`
+that closes pending IsolateCalls owned by `addr` without
+requiring user-defined cancellation messages. Or a typed
+`IsolateCall::abort(handle)` that the requester can stash and use
+to drop a single in-flight call without stopping itself.
+
+### 9. Drain helper for `PendingReplies` at service stop
+
+**Surfaced by:** `eiffel_graceful_pool_shutdown`,
+`eiffel_graceful_drain_server`.
+
+`PendingReplies::drain()` returns `Vec<(K, DeferredReply<R>)>`,
+which the user has to map into `Effect::Batch(reply_to(slot,
+value))` calls plus a final `stop()`. The service-stop pattern
+is identical at every call site:
+
+```rust
+let mut effects: Vec<_> =
+    self.pending.drain().into_iter().map(|(_, slot)| reply_to(slot, R::Closed)).collect();
+effects.push(stop());
+Effect::Batch(effects)
+```
+
+**Build:** `pending.drain_into_effect(R::Closed) -> Effect<I>` (or
+similarly named) that returns the matching `Effect::Batch` in one
+call, with the trailing `stop()` opt-in via a sibling
+`drain_into_stop_effect(R::Closed)`. Same lifecycle truth, less
+boilerplate.
+
+### 10. `try_send`/`send_and_observe` retry helper at service edge — closed by Phase 062 Rock 4
+
+**Surfaced by:** `eiffel_hot_key_fairness`,
+`eiffel_graceful_pool_shutdown`,
+`eiffel_rate_limited_worker` (Round 2 already).
+
+Phase 062 Rock 4 ships
+`runtime.send_observed_until(addr, deadline, backoff, || msg)` for
+control messages that ride the same bounded data mailbox as work
+items. It retries on `MailboxFull` / `IngressFull` until the
+deadline and returns a typed
+`SendObservedUntilError::{Timeout, Closed, WorkerStopped}`. Both
+Round 4 specimens (`eiffel_hot_key_fairness` for `Drain(admitted)`
+and `eiffel_graceful_pool_shutdown` for `Shutdown`) now use it;
+the hand-rolled retry loops are gone.
+
+### 11. Multi-stage pipeline ergonomics
+
+**Surfaced by:** `eiffel_two_stage_pipeline`.
+
+A 3-stage pipeline reads as 4 enum variants in `PipelineMsg`
+(Submit + Parsed + Validated + Executed), each with its own match
+arm. The Tokio side reads as `parse(i).await?; validate(p).await?;
+execute(v).await?` — three lines. The Tina version is correct and
+trace-visible at every stage, but the variant count grows
+linearly with stage count.
+
+**Build:** the Round 2 finding 5 work (`SingleSleepGate`) plus a
+pipeline-shaped helper that takes a `[StageAddr; N]` and a slot,
+walking through stages with a single continuation message. Must
+preserve per-stage timeout truth and the typed bail-out arms;
+this is sugar, not a hidden state machine.
+
+### 12. Rust footgun replication: shared receiver in worker pool
+
+**Surfaced by:** `eiffel_graceful_pool_shutdown` (Tokio side).
+
+Not a Tina finding per se — but worth recording as the *kind of
+footgun* Tina structurally avoids. The Tokio shutdown path needs
+both `JoinSet::abort_all` AND `drop(rx_arc)`. Forgetting the
+second leaves buffered jobs (and their reply oneshots) alive,
+blocking queued callers forever. The test passes under low burst
+because all jobs were in flight.
+
+Tina's `pending.drain()` + `Effect::Batch(reply_to)` makes this
+class of bug structurally impossible: every captured slot has one
+container, and shutdown is one effect away.
+
+This is a positive observation about Tina's model. The build is
+documentation, not new product work — call it out in the user
+guide's lifecycle chapter as a contrast with the Tokio shape.
+
 ## How To Add A Finding
 
 Only add to this file when the finding implies Tina product work. Round 2
