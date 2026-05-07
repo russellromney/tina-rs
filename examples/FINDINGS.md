@@ -1,186 +1,176 @@
-# Eiffel Findings
+# Eiffel Findings — Round 2
 
-This file is the current action list from Eiffel.
+This file is the current action list. Eiffel examples are specimens: they
+show how Tokio and Tina code feel for the same kind of job. When the same
+Tina pain appears across specimens, it becomes runtime/API work here.
 
-Eiffel examples are specimens: they show how Tokio and Tina code feel for the
-same kind of job. When the same Tina pain appears across specimens, it becomes
-runtime/API work here.
+Round 1 closed in Phase 059 + Phase 053. Those nine items are archived
+verbatim in [`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md); they should not be
+re-opened in this file. Round 2 starts from what the post-053 specimens
+surface.
 
-Resolved history and the longer field journal live in
-[`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md). Per-example notes stay in each
-example's own `README.md`.
+## Round 2 product improvements
 
-## Product Improvements
+### 1. `observe_result` on `ThreadedMultiShardRuntime`
 
-### 1. Typed isolate result waiters — landed in 059 Rock 1
+**Surfaced by:** `eiffel_sharded_fanout_read`, `eiffel_sharded_keyspace`.
 
-Closed by Phase 059 Rock 1. Use:
+`ThreadedRuntime::observe_result::<T, _, _>(addr)?` is the blessed Phase 059
+Rock 1 way to read an isolate's typed final value. It is shipped on the
+single-shard threaded runtime but not on `ThreadedMultiShardRuntime`, so
+multi-shard examples still fall back to `Arc<Mutex<Option<Report>>>`
+polling for the final value. Both 053 examples now do this dance.
+
+**Build:** lift `observe_result` to `ThreadedMultiShardRuntime`. The
+underlying `Runtime::observe_result` already exists; the multi-shard
+threaded shell just needs to route the registration call to the address's
+owning shard the same way `register_with_capacity_on` does today. Same
+contract as the single-shard form.
+
+### 2. ScatterCoord setup is heavy for the happy path
+
+**Surfaced by:** `eiffel_sharded_fanout_read`.
+
+A bounded scatter/gather over three shards needs:
+
+- coord isolate registration with `ScatterCoordMsg::{Bind, Start, Reply}`;
+- a `ReplyAdapter<ShardReply, ScatterCoordMsg, S>` registration and
+  `From<ShardReply> for ScatterCoordMsg` impl;
+- a `Bind { bridge }` send before the `Start`;
+- caller-owned `pending_targets` / `outcomes` bookkeeping until every
+  target is in.
+
+That is the right *shape* for the rich pressure form (per-target timer,
+aggregate timer, partial outcomes), but the ceremony is the same for the
+"three shards, all reply, sum the results" case. The per-call-site setup is
+roughly the size of the actual scatter/gather logic.
+
+**Build:** a small `scatter_gather!` builder or a
+`ScatterCoord::register(table, config, on_complete)` helper that wires the
+adapter, the bind/start handshake, and the `pending_targets` /
+`outcomes` accumulator at the same shard the coord lives on. Must keep the
+typed partial-outcome surface — convenience may not collapse `Full` /
+`Closed` / `Timeout` into one bucket.
+
+### 3. Self-address at registration time
+
+**Surfaced by:** `eiffel_sharded_fanout_read`.
+
+The `ReplyAdapter` pattern needs the coord's own address to wire the
+adapter, and the coord needs the adapter's address before it can fan out.
+Today the answer is a `Bind { bridge }` message before `Start`. That works
+but adds a variant whose only job is to land "you, isolate, look here for
+your replies" into the isolate's state.
+
+**Build:** a way for an isolate to learn its own typed address at register
+time — for example, a constructor closure parameter `|self_addr| {
+ScatterCoord { ..., self_addr } }`. Avoids the bind-before-start handshake
+and removes the `Option<Address<...>>` field that's only `None` for one
+turn.
+
+### 4. Synchronous `try_send_outcome`
+
+**Surfaced by:** `eiffel_rate_limited_worker`.
+
+The threaded runtime offers three send shapes today:
+
+- `try_send` — fire-and-forget; only surfaces `IngressFull` (command queue
+  full), never `MailboxFull`;
+- `send_and_observe` — synchronous; distinguishes `MailboxFull` from
+  `IngressFull` / `Closed`, but each call is a worker-thread roundtrip, so
+  a tight burst from the host is gated by worker step rate. The mailbox
+  never fills, so overload is never visible at the producer;
+- `try_send_and_observe_with` — non-blocking; takes an observer closure
+  that fires on the worker thread later. Visible overload, but the
+  call-site shape is heavy (one closure per send, atomics for accounting,
+  manual barrier wait until every observer has fired).
+
+For the "host bursts N messages, wants to know per-send whether the
+mailbox accepted" pattern, today the answer is `try_send_and_observe_with`
+plus a hand-rolled accounting loop. The natural shape would be a
+synchronous-but-precise `try_send_outcome(addr, msg) -> Result<(),
+SendOutcomeError>` that returns the same `MailboxFull` / `IngressFull` /
+`Closed` typed error as `send_and_observe` *without* the per-call worker
+roundtrip — by checking the mailbox synchronously in the host before
+queueing the command.
+
+**Build:** a synchronous outcome-typed try_send. May reuse the same
+`ThreadedSendObservedError` enum.
+
+The Phase 059 Rock 5 `send_blocking` / `send_retrying` plan also covers
+this surface but is plan-only as of 2026-05-07; closing this finding
+likely closes Rock 5 too.
+
+### 5. Single-in-flight gate for timer-driven workers
+
+**Surfaced by:** `eiffel_rate_limited_worker`.
+
+A worker isolate that uses `sleep(window).reply(Tick)` to rate-limit its
+processing must never have more than one timer in flight, or the rate
+limit collapses (every Submit kicks off its own sleep). The current shape
+is a `pending: u32` counter and a `was_idle = pending == 0` check inside
+the handler. That's correct but it's the same five lines wherever this
+shape appears.
+
+**Build:** a small "single-call gate" helper for isolate state. Could be a
+`SingleCallGate<R>` field that returns either an effect (when idle) or
+records a deferred entry (when busy). On the runtime side, this might be a
+trait `IsolateCallGate` that picks the next deferred entry on completion.
+Should not hide trace truth: every `sleep` is still one trace event.
+
+### 6. Bridge call retry classifier
+
+**Surfaced by:** `eiffel_retrying_outbound_http`.
+
+A caller-owned retry loop against the reqwest bridge has to write a six-arm
+match against `ReqwestCallOutcome` to classify "is this transient?":
+`Replied(Ok(resp))` (check `resp.status.is_server_error()`),
+`Replied(Err(ReqwestError::Timeout | Reqwest(_)))` (transient),
+`Replied(Err(_other))` (fatal), `Timeout` (transient), `Full | Closed`
+(fatal). Most apps want the same three buckets: succeeded / transient /
+fatal.
+
+**Build:** a small classifier helper on `ReqwestCallOutcome`:
 
 ```rust
-// isolate
-stop_with(self.outcome.clone())
-
-// host
-let result = runtime.observe_result::<T, _, _>(addr)?;
-let value = result.wait(timeout)?;
+match outcome.classify() {
+    OutcomeClass::Succeeded(resp)         => ...,
+    OutcomeClass::Transient(reason)       => retry,
+    OutcomeClass::Fatal(reason)           => fail,
+}
 ```
 
-Bounded one-slot, single-claim per `(isolate, generation)`, no replay
-cache. Eager `AlreadyStopped` / `AlreadyClaimed` / `ObservationFull` at
-register time; `Timeout` / `RuntimeStopped` / `StoppedWithoutResult` /
-`TypeMismatch` at `wait`. Trace still emits `IsolateStopped`; the new
-`EffectKind::StopWith` distinguishes the with-result path.
+Where the per-bucket `reason` names which sub-cause hit (`UpstreamServer
+{ status }`, `BridgeTimeout`, `WorkerTimeout`, `Reqwest`, etc.). The
+typed multi-arm match still works — this is opt-in sugar.
 
-Already converted: `eiffel_outbound_fetch` (3 atomics removed),
-`eiffel_mux_client` (`Arc<Mutex<Vec<u32>>>` removed).
-`eiffel_persistent_counter`, `eiffel_outbound_http`, and
-`eiffel_graceful_shutdown` use a per-op correlator pattern that is
-*not* a "final value after stop" — those need a separate ergonomics
-pass and are not 059 Rock 1 work.
+This is a smaller version of "Tina-shaped retry sugar" — not a hidden
+retry helper, just a classifier so caller-owned retry loops are five
+lines instead of fifteen.
 
-### 2. Continuation and pipeline sugar — landed (first form) in 059 Rock 2
+## How To Add A Finding
 
-Closed by Phase 059 Rock 2 as "documented canonical pattern + reply
-aliases" rather than a macro. `tina_runtime` ships per-call-kind
-reply aliases (`TcpConnectReply`, `JournalAppendReply`,
-`SignalWaitReply`, `FileReadReply`, …) so isolate enums spell the
-call kind by name instead of `Result<X, CallError>`. Chapter 16
-("Continuation And Pipeline Patterns") in the user guide is the
-blessed shape for pipeline + list-processing isolates and names the
-four anti-patterns (hidden retry, multi-call effects on one
-resource, async wrapper, shared accumulator).
+Only add to this file when the finding implies Tina product work. Round 2
+is for new pain that the post-053 specimens surface.
 
-Already converted: `eiffel_outbound_fetch`, `eiffel_persistent_counter`,
-`eiffel_mux_client`, `eiffel_graceful_shutdown`, `eiffel_mini_keyspace`,
-`eiffel_real_io_chat`, `eiffel_rpc`.
+```md
+### N. Short product-shaped title
 
-Deliberately not shipped: a `pipeline!` macro, a `for_each` helper,
-or anything that would hide per-step trace truth.
+**Surfaced by:** `example_name`, `other_example`.
 
-### 3. First-class TCP loop helpers — landed (client-side first form) in 059 Rock 3
+What repeated pain we saw.
 
-Closed by Phase 059 Rock 3. `tina_runtime::tcp_loops` ships:
-
-- `TcpWriteAll` — partial-write loop;
-- `TcpReadExact` — partial-read loop with `EarlyEof(partial)` outcome;
-- `TcpReadToEof` — read until empty bytes or a `max` byte cap.
-
-Each helper is a small client-side state machine. Each
-`next_effect`/`advance` step expands to exactly one `tcp_write` /
-`tcp_read`, so partial progress is one trace event per call.
-
-Deferred to a future phase: turning these into runtime-owned
-`CallInput::TcpWriteAll` / `TcpReadExact` / `TcpReadToEof` so the
-isolate dispatches one effect rather than maintaining helper state.
-That's a substrate change (betelgeuse + tina-sim + driver) and Rock 3
-intentionally shipped the smaller form first. `eiffel_outbound_fetch`
-already uses the helpers; framed-read still hand-rolls (see Rock 2's
-"continuation pattern").
-
-### 4. Capacity diagnostics and reply-slot budgets — landed in 059 Rock 4
-
-Closed by Phase 059 Rock 4. `tina_runtime` ships:
-
-- `PressureSummary::from_events(events)` — counted summary of every
-  pressure-shaped trace event (mailbox-full, reply-path-full,
-  send-full, lifecycle-closed);
-- `Runtime::pressure_summary()` / `ThreadedRuntime::pressure_summary()`
-  accessors;
-- `MailboxBudget { incoming, replies }` with `.total()` plus
-  `listener` / `session` / `service` / `fanout` presets that name
-  the arithmetic at the spawn site.
-
-Chapter 6 ("Boundedness And Overload") rewritten to walk the
-`total = incoming + replies` math and show the diagnostics API.
-
-### 5. Bounded host send helpers — landed in 059 Rock 5
-
-Closed by Phase 059 Rock 5 (commit 4a9df12). `ThreadedRuntime::send_blocking`
-/ `send_retrying` are shipped with the contract above intact: bounded wait,
-caller-visible timeout, typed `Sent`/`Full`/`Timeout`/`Closed`/`WorkerStopped`
-outcomes, no hidden queue.
-
-### 6. Tiny native HTTP router — landed in 059 Rock 6
-
-Closed by Phase 059 Rock 6. `tina_http` ships:
-
-- `Router` — stateless `fn(&HttpRequest) -> HttpResponse` handlers;
-- `StatefulRouter<S>` — handlers with `&mut S` access for the
-  in-isolate case where routes mutate state;
-- both expose `.get`/`.post`/`.put`/`.delete`/`.patch` sugar over
-  the generic `.route(method, path, handler)`;
-- opt-in `.method_not_allowed()` distinguishes 405 (path known,
-  method mismatch) from 404 (path unknown).
-
-Already converted: `eiffel_native_http` and `eiffel_outbound_http`
-both use `StatefulRouter<Counter>`.
-
-### 7. Bridge specimen cleanup — landed in 059 Rock 7
-
-Closed by Phase 059 Rock 7. `eiffel_axum_counter` and
-`eiffel_ws_room` rewritten to the specimens-rule shape:
-`src/lib.rs` with shared types/scripted client, top-level
-`tokio_impl.rs` / `tina_impl.rs`, `main.rs` dispatcher,
-`tests/smoke.rs`. The `src/comparison/` harness directories are gone.
-Both still use the blessed `BridgeHost::new` / `register_bridge` /
-`drain_and_shutdown` lifecycle.
-
-Follow-up bridge polish rebased the HTTP-shaped bridge specimens onto
-`tina_tower_bridge::TinaTowerService`, then added the specimen-facing
-`TinaService<M, R>` alias and re-exported Tower's `Service` trait.
-The rough spots left are smaller but real: Axum handlers still use the
-`let mut svc = svc;` Tower idiom, setup is still
-`register_bridge(...)` then `TinaTowerService::new(...)`, and
-WebSocket handlers need service clones because `Service::call` takes
-`&mut self`.
-
-### 8. RPC service topology beyond single — deferred (runtime prerequisite)
-
-Investigated and deferred in Phase 059 Rock 8. A real concurrent
-`PooledService` requires an isolate to hold *multiple* pending
-`IsolateCall` continuations simultaneously (one per in-flight
-`ServiceCall` the pool is dispatching to a worker). Today the
-runtime stores `MessageCallContext` as a single `Option<...>` per
-isolate, so a pool frontend would serialize through one-at-a-time
-and not actually pool concurrent work. The unblocking work is at
-the runtime level, not the rpc level. The sealed-stub
-`PooledService` / `ShardedService` types stay in `tina_rpc` to
-document the planned shape.
-
-**Build:**
-
-- runtime support for N pending `IsolateCall` continuations per
-  isolate, then real `PooledService`;
-- `ShardedService` after sharded primitives (053);
-- explicit mailbox/capacity semantics for each;
-- docs that say how `Full`, `Closed`, `Timeout`, and partial failure behave.
-
-The registry should keep mapping service name to one address. The address may
-be a single service, pool frontend, or shard router.
-
-### 9. Uniform overload reports for pressure runners — landed in 059 Rock 9
-
-Closed by Phase 059 Rock 9. `tina_runtime` ships
-`PressureReport { side, accepted, full, closed, timeouts, other,
-rss_peak_kb, exit }` plus `format_pressure_line(...)` that produces
-the canonical line:
-
-```text
-pressure side=<name> accepted=N full=N closed=N timeouts=N other=N [rss_peak_kb=N] exit=<status>
+**Build:** concrete primitive, API, doc, or test work.
 ```
 
-`eiffel_real_io_chat` opts in and prints one line per side.
-`eiffel_cpu_run` captures target stdout, intercepts `pressure ...`
-lines, and re-emits them tagged by run label; non-pressure lines
-pass through unchanged.
-
-Chapter 17 ("Pressure Report Convention") in the user guide is the
-blessed shape and explains why this is a *convention* (line
-contract) rather than a *framework* (program contract).
+Per-example flavor belongs in the example README. Resolved archaeology
+belongs in `FINDINGS_HISTORY.md`.
 
 ## Resolved Or Retired By Recent Phases
 
-These used to be current pain and should not be copied into new code:
+These used to be current pain and should not be copied into new code.
+Round 1 list, kept short here; the long form is in
+[`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md):
 
 - hand-rolled mailbox factories: use `DefaultMailboxFactory` /
   `DefaultThreadedMailboxFactory`;
@@ -193,24 +183,8 @@ These used to be current pain and should not be copied into new code:
 - `Arc::try_unwrap` bridge shutdown dances: use the bridge host lifecycle;
 - old shared comparison harnesses: examples are specimens, tests are proof;
 - `Arc<Outcome>` / `Arc<Mutex<Vec<_>>>` for an isolate's *final* app
-  value: use `stop_with(value)` + `runtime.observe_result::<T>(addr)?`
-  (Phase 059 Rock 1).
-
-## How To Add A Finding
-
-Only add to this file when the finding implies Tina product work.
-
-Use:
-
-```md
-### N. Short product-shaped title
-
-**Surfaced by:** `example_name`, `other_example`.
-
-What repeated pain we saw.
-
-**Build:** concrete primitive, API, doc, or test work.
-```
-
-Per-example flavor belongs in the example README. Resolved archaeology belongs
-in `FINDINGS_HISTORY.md`.
+  value (single-shard): use `stop_with(value)` +
+  `runtime.observe_result::<T>(addr)?`. (Multi-shard is Round 2 finding 1.)
+- per-comparison shard types: use `SingleShard` for one-shard programs and
+  `tina_runtime::sharded::ShardPlacement` / `ShardServiceTable` for
+  multi-shard placement.

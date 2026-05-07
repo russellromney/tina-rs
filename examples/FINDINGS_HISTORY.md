@@ -1,7 +1,7 @@
 # Eiffel Findings History
 
-This is the longer field journal from the first Eiffel specimens. The current
-action list lives in [`FINDINGS.md`](FINDINGS.md).
+This is the longer field journal from prior Eiffel rounds. The current action
+list lives in [`FINDINGS.md`](FINDINGS.md).
 
 Cross-cutting observations from the Tokio-vs-Tina comparisons in this
 directory. Per-comparison ergonomic notes live in each comparison's own
@@ -12,6 +12,103 @@ imply.
 
 Findings here are dated and signed with the comparison that surfaced them so
 we can track when something keeps reappearing vs. when it was a one-off.
+
+## Round 1 closed items (Phase 059 + Phase 053)
+
+These nine findings were the first Eiffel round's product action list. All
+nine landed in Phase 059 ("Eiffel actionable ergonomics") or Phase 053
+("Sharded service primitives"). Kept here for archaeology; new code should
+not copy the patterns these replaced.
+
+### 1. Typed isolate result waiters — landed in 059 Rock 1
+
+Use:
+
+```rust
+// isolate
+stop_with(self.outcome.clone())
+
+// host
+let result = runtime.observe_result::<T, _, _>(addr)?;
+let value = result.wait(timeout)?;
+```
+
+Bounded one-slot, single-claim per `(isolate, generation)`, no replay cache.
+Eager `AlreadyStopped` / `AlreadyClaimed` / `ObservationFull` at register time;
+`Timeout` / `RuntimeStopped` / `StoppedWithoutResult` / `TypeMismatch` at `wait`.
+Trace still emits `IsolateStopped`; the new `EffectKind::StopWith`
+distinguishes the with-result path. The single-shard `ThreadedRuntime` has it;
+the multi-shard variant does not yet (see Round 2 finding 1).
+
+### 2. Continuation and pipeline sugar — landed (first form) in 059 Rock 2
+
+Closed as "documented canonical pattern + reply aliases" rather than a macro.
+`tina_runtime` ships per-call-kind reply aliases (`TcpConnectReply`,
+`SignalWaitReply`, `FileReadReply`, …) so isolate enums spell the call kind
+by name instead of `Result<X, CallError>`. Chapter 16 ("Continuation And
+Pipeline Patterns") in the user guide is the blessed shape and names the
+four anti-patterns (hidden retry, multi-call effects on one resource, async
+wrapper, shared accumulator).
+
+Deliberately not shipped: a `pipeline!` macro, a `for_each` helper, or
+anything that would hide per-step trace truth.
+
+### 3. First-class TCP loop helpers — landed (client-side first form) in 059 Rock 3
+
+`tina_runtime::tcp_loops` ships `TcpWriteAll`, `TcpReadExact`,
+`TcpReadToEof`. Each helper is a small client-side state machine; each
+`next_effect`/`advance` step expands to exactly one `tcp_write` / `tcp_read`,
+so partial progress is one trace event per call. Driver-level
+`CallInput::TcpWriteAll`/`TcpReadExact`/`TcpReadToEof` deferred — those are a
+substrate change.
+
+### 4. Capacity diagnostics and reply-slot budgets — landed in 059 Rock 4
+
+`tina_runtime` ships `PressureSummary::from_events(events)`,
+`Runtime::pressure_summary()` / `ThreadedRuntime::pressure_summary()`, plus
+`MailboxBudget { incoming, replies }` with `listener` / `session` /
+`service` / `fanout` presets. Chapter 6 ("Boundedness And Overload")
+rewritten to walk the `total = incoming + replies` math.
+
+### 5. Bounded host send helpers — plan-only as of 2026-05-07
+
+`ThreadedRuntime::send_blocking` / `send_retrying` were planned in commit
+4a9df12 but not yet implemented. The closest current shape is
+`send_and_observe` (sync, distinguishes `MailboxFull` from `IngressFull` /
+`Closed`). `try_send_and_observe_with` is the non-blocking observer-callback
+form. See Round 2 finding 4 for the actionable follow-up.
+
+### 6. Tiny native HTTP router — landed in 059 Rock 6
+
+`tina_http` ships `Router` (stateless handlers) and `StatefulRouter<S>`
+(handlers with `&mut S`), both with `.get`/`.post`/`.put`/`.delete`/`.patch`
+sugar over the generic `.route(method, path, handler)`, plus opt-in
+`.method_not_allowed()` to distinguish 405 from 404. `eiffel_native_http` and
+`eiffel_outbound_http` use `StatefulRouter<Counter>`.
+
+### 7. Bridge specimen cleanup — landed in 059 Rock 7
+
+`eiffel_axum_counter` and `eiffel_ws_room` rewritten to the specimens-rule
+shape. Both use the `BridgeHost::new` / `register_bridge` /
+`drain_and_shutdown` lifecycle. Follow-up bridge polish rebased the
+HTTP-shaped bridge specimens onto `tina_tower_bridge::TinaTowerService`,
+added the `TinaService<M, R>` alias, and re-exported Tower's `Service` trait.
+
+### 8. RPC service topology beyond single — partially unblocked by 053
+
+A real concurrent `PooledService` requires an isolate to hold *multiple*
+pending `IsolateCall` continuations simultaneously. Today the runtime stores
+`MessageCallContext` as a single `Option<...>` per isolate, so a pool
+frontend would serialize through one-at-a-time. The unblocking work is at
+the runtime level. `ShardedService` is now feasible on top of phase 053
+sharded primitives but is not in `tina_rpc` itself yet.
+
+### 9. Uniform overload reports for pressure runners — landed in 059 Rock 9
+
+`tina_runtime` ships `PressureReport { side, accepted, full, closed,
+timeouts, other, rss_peak_kb, exit }` plus `format_pressure_line(...)` for
+the `pressure side=...` line. Chapter 17 ("Pressure Report Convention")
+is the blessed shape.
 
 ## What feels good (keep these)
 
