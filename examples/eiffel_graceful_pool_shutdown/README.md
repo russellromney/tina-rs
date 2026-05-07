@@ -14,28 +14,35 @@ cargo test --manifest-path examples/eiffel_graceful_pool_shutdown/Cargo.toml
 
 `Frontend` holds `PendingReplies::with_capacity(MAX_PENDING)`. On
 `Shutdown` it drains the box and replies `Closed` to every
-pending caller in one `Effect::Batch`:
+pending caller in one `Effect::Batch` plus a trailing `stop()`,
+expressed with the typed `drain_into_stop` helper (Phase 064
+Rock 1):
 
 ```rust
 FrontendMsg::Shutdown => {
-    let mut effects = Vec::new();
-    for (_qid, slot) in self.pending.drain() {
-        effects.push(reply_to(slot, FrontendReply::Closed));
-    }
-    effects.push(stop());
-    Effect::Batch(effects)
+    self.pending.drain_into_stop::<Self>(FrontendReply::Closed)
 }
 ```
 
+The helper is compile-time typed so a `PendingReplies<K, R>`
+only produces `Effect<I>` when `I::Reply = R`. The method name
+says `stop` on purpose — nothing else inside the helper appends
+`stop()` for you, and the underlying `pending.drain()` /
+`reply_to(slot, ...)` semantics are unchanged.
+
 ## What feels good
 
-- `pending.drain()` is the canonical "release every captured
-  caller" operation. The terminal reply is a regular
-  `reply_to(slot, ...)` — no special path.
-- After `Shutdown`, the frontend stops cleanly with `stop()`.
-  Callers that submitted *after* the frontend stopped see a typed
-  bridge-layer outcome (mailbox-full or closed) at their original
-  `call(...).reply(...)` site.
+- `drain_into_stop::<Self>(R::Closed)` is the one-liner for the
+  common service-stop pattern. The slot ordering follows the
+  internal slot table (first-allocated first).
+- The terminal reply is still a regular `reply_to(slot, ...)`
+  under the hood — no special path. Use the longer-form
+  `pending.drain()` + manual loop when the per-caller reply
+  needs to carry the key.
+- After `Shutdown`, the frontend stops cleanly. Callers that
+  submitted *after* the frontend stopped see a typed
+  bridge-layer outcome (mailbox-full or closed) at their
+  original `call(...).reply(...)` site.
 
 ## What feels worse
 

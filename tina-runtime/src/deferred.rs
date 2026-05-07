@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use tina::{DeferredSlotShared, IsolateId};
+use tina::{DeferredSlotShared, Effect, Isolate, IsolateId, reply_to, stop};
 
 use crate::call::CallId;
 use crate::trace::DeferredSlotId;
@@ -400,6 +400,114 @@ where
         }
         out
     }
+
+    /// Drain every live slot and produce one [`Effect::ReplyTo`] per
+    /// slot, each carrying the same `value`.
+    ///
+    /// Use when the same terminal marker (e.g. `R::Closed`) goes to
+    /// every pending caller. The slot ordering follows the internal
+    /// table, first-allocated first.
+    ///
+    /// Compile-time typed: a `PendingReplies<K, R>` only produces
+    /// `Effect<I>` when `I::Reply = R`. The caller picks `I` via
+    /// turbofish (`pending.drain_replies::<Self>(R::Closed)`).
+    ///
+    /// No hidden `stop`. Pair with `stop()` or use
+    /// [`drain_into_stop`](Self::drain_into_stop).
+    pub fn drain_replies<I>(&mut self, value: R) -> Vec<Effect<I>>
+    where
+        I: Isolate<Reply = R>,
+        R: Clone,
+    {
+        let mut out = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if let Some(entry) = slot.take() {
+                out.push(reply_to::<I>(entry.reply, value.clone()));
+            }
+        }
+        out
+    }
+
+    /// Drain every live slot, computing the reply value per key.
+    ///
+    /// Use when the per-caller reply depends on the key, or when `R`
+    /// is not `Clone`.
+    pub fn drain_replies_with<I, F>(&mut self, mut f: F) -> Vec<Effect<I>>
+    where
+        I: Isolate<Reply = R>,
+        F: FnMut(K) -> R,
+    {
+        let mut out = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if let Some(entry) = slot.take() {
+                out.push(reply_to::<I>(entry.reply, f(entry.key)));
+            }
+        }
+        out
+    }
+
+    /// Same as [`drain_replies`](Self::drain_replies), wrapped in
+    /// [`Effect::Batch`].
+    ///
+    /// Returns [`Effect::Noop`] when the box was empty so the caller
+    /// can return the effect unconditionally.
+    pub fn drain_into_effect<I>(&mut self, value: R) -> Effect<I>
+    where
+        I: Isolate<Reply = R>,
+        R: Clone,
+    {
+        let effects = self.drain_replies::<I>(value);
+        if effects.is_empty() {
+            Effect::Noop
+        } else {
+            Effect::Batch(effects)
+        }
+    }
+
+    /// Drain into [`Effect::Batch`] with a trailing [`stop()`].
+    ///
+    /// The method name says `stop` on purpose: nothing else in this
+    /// module appends `stop()` for you.
+    ///
+    /// Empty box still produces a batch with a single `stop()` so the
+    /// service stops as advertised.
+    pub fn drain_into_stop<I>(&mut self, value: R) -> Effect<I>
+    where
+        I: Isolate<Reply = R>,
+        R: Clone,
+    {
+        let mut effects = self.drain_replies::<I>(value);
+        effects.push(stop::<I>());
+        Effect::Batch(effects)
+    }
+
+    /// [`drain_replies_with`](Self::drain_replies_with) wrapped in
+    /// [`Effect::Batch`]. Empty box produces [`Effect::Noop`].
+    pub fn drain_with_into_effect<I, F>(&mut self, f: F) -> Effect<I>
+    where
+        I: Isolate<Reply = R>,
+        F: FnMut(K) -> R,
+    {
+        let effects = self.drain_replies_with::<I, F>(f);
+        if effects.is_empty() {
+            Effect::Noop
+        } else {
+            Effect::Batch(effects)
+        }
+    }
+
+    /// [`drain_replies_with`](Self::drain_replies_with) wrapped in
+    /// [`Effect::Batch`] with a trailing [`stop()`]. Empty box still
+    /// stops.
+    pub fn drain_with_into_stop<I, F>(&mut self, f: F) -> Effect<I>
+    where
+        I: Isolate<Reply = R>,
+        F: FnMut(K) -> R,
+    {
+        let mut effects = self.drain_replies_with::<I, F>(f);
+        effects.push(stop::<I>());
+        Effect::Batch(effects)
+    }
 }
 
 #[cfg(test)]
@@ -483,5 +591,160 @@ mod pending_replies_tests {
     #[should_panic]
     fn zero_capacity_panics() {
         let _ = PendingReplies::<u32, u32>::with_capacity(0);
+    }
+
+    /// Minimal Isolate used to type-check effects produced by the
+    /// drain helpers. The handler is unreachable in these tests.
+    #[derive(Debug)]
+    struct TestIso;
+
+    impl tina::Isolate for TestIso {
+        type Message = ();
+        type Reply = u32;
+        type Send = tina::Outbound<std::convert::Infallible>;
+        type Spawn = std::convert::Infallible;
+        type Call = std::convert::Infallible;
+        type Shard = tina::SingleShard;
+
+        fn handle(
+            &mut self,
+            _: (),
+            _: &mut tina::Context<'_, Self::Shard, Self::Reply>,
+        ) -> tina::Effect<Self> {
+            tina::noop()
+        }
+    }
+
+    fn slot_id_of(effect: &tina::Effect<TestIso>) -> Option<u64> {
+        match effect {
+            tina::Effect::ReplyTo(slot, _) => Some(slot.slot_id()),
+            _ => None,
+        }
+    }
+
+    fn reply_value_of(effect: &tina::Effect<TestIso>) -> Option<u32> {
+        match effect {
+            tina::Effect::ReplyTo(_, v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn drain_replies_emits_one_reply_to_per_slot() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(4);
+        box_.try_insert(1, fake_slot(10)).unwrap();
+        box_.try_insert(2, fake_slot(11)).unwrap();
+        box_.try_insert(3, fake_slot(12)).unwrap();
+
+        let effects: Vec<tina::Effect<TestIso>> = box_.drain_replies(99);
+        assert_eq!(effects.len(), 3);
+        for e in &effects {
+            assert_eq!(reply_value_of(e), Some(99));
+        }
+        let mut ids: Vec<u64> = effects.iter().map(|e| slot_id_of(e).unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![10, 11, 12]);
+        assert!(box_.is_empty());
+    }
+
+    #[test]
+    fn drain_replies_empty_returns_empty_vec() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let effects: Vec<tina::Effect<TestIso>> = box_.drain_replies(7);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn drain_replies_with_uses_per_key_value() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(4);
+        box_.try_insert(1, fake_slot(10)).unwrap();
+        box_.try_insert(2, fake_slot(11)).unwrap();
+
+        let effects: Vec<tina::Effect<TestIso>> = box_.drain_replies_with(|k| k * 100);
+        let pairs: Vec<(u64, u32)> = effects
+            .iter()
+            .map(|e| (slot_id_of(e).unwrap(), reply_value_of(e).unwrap()))
+            .collect();
+        // slot 10 carried key 1 -> 100; slot 11 carried key 2 -> 200
+        assert!(pairs.contains(&(10, 100)));
+        assert!(pairs.contains(&(11, 200)));
+        assert!(box_.is_empty());
+    }
+
+    #[test]
+    fn drain_into_effect_empty_is_noop() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let effect: tina::Effect<TestIso> = box_.drain_into_effect(7);
+        assert!(matches!(effect, tina::Effect::Noop));
+    }
+
+    #[test]
+    fn drain_into_effect_nonempty_is_batch_of_replies() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        box_.try_insert(1, fake_slot(10)).unwrap();
+        box_.try_insert(2, fake_slot(11)).unwrap();
+        let effect: tina::Effect<TestIso> = box_.drain_into_effect(0);
+        match effect {
+            tina::Effect::Batch(items) => {
+                assert_eq!(items.len(), 2);
+                for item in &items {
+                    assert!(matches!(item, tina::Effect::ReplyTo(_, _)));
+                }
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_into_stop_appends_stop_after_replies() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        box_.try_insert(1, fake_slot(10)).unwrap();
+        box_.try_insert(2, fake_slot(11)).unwrap();
+        let effect: tina::Effect<TestIso> = box_.drain_into_stop(0);
+        match effect {
+            tina::Effect::Batch(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items[0], tina::Effect::ReplyTo(_, _)));
+                assert!(matches!(items[1], tina::Effect::ReplyTo(_, _)));
+                assert!(matches!(items[2], tina::Effect::Stop));
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_into_stop_empty_box_still_stops() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let effect: tina::Effect<TestIso> = box_.drain_into_stop(0);
+        match effect {
+            tina::Effect::Batch(items) => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0], tina::Effect::Stop));
+            }
+            other => panic!("expected Batch with stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_with_into_stop_uses_per_key_value_then_stops() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        box_.try_insert(5, fake_slot(50)).unwrap();
+        box_.try_insert(6, fake_slot(60)).unwrap();
+        let effect: tina::Effect<TestIso> = box_.drain_with_into_stop(|k| k + 1);
+        match effect {
+            tina::Effect::Batch(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items.last().unwrap(), tina::Effect::Stop));
+                let mut got = std::collections::HashSet::new();
+                for item in &items[..2] {
+                    if let tina::Effect::ReplyTo(_, v) = item {
+                        got.insert(*v);
+                    }
+                }
+                assert!(got.contains(&6));
+                assert!(got.contains(&7));
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
     }
 }

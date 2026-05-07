@@ -142,10 +142,19 @@ flag is the bridge-side version of the same idea.
 
 **Build:**
 
-- `pending.drain_into_effect(R::Closed) -> Effect<I>` (or
+- ~~`pending.drain_into_effect(R::Closed) -> Effect<I>` (or
   similarly named) that returns the matching `Effect::Batch` in
   one call, with the trailing `stop()` opt-in via a sibling
-  `drain_into_stop_effect(R::Closed)`.
+  `drain_into_stop_effect(R::Closed)`.~~ Shipped in Phase 064
+  Rock 1: `PendingReplies::drain_replies` /
+  `drain_replies_with` / `drain_into_effect` /
+  `drain_into_stop` / `drain_with_into_effect` /
+  `drain_with_into_stop`, all typed so a `PendingReplies<K, R>`
+  only produces `Effect<I>` when `I::Reply = R`.
+  `eiffel_graceful_pool_shutdown` uses
+  `pending.drain_into_stop::<Self>(R::Closed)`. The deadline
+  half of this finding (DrainGate) folds into finding 15
+  (Deadline as first-class context).
 - An isolate-state `DrainGate` helper that holds the deadline +
   the pending-count predicate, with an `is_done` /
   `drained_within_timeout` accessor that the handler reuses.

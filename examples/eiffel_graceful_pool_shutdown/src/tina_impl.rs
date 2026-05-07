@@ -96,14 +96,11 @@ impl Frontend {
                 }
             }
             FrontendMsg::Shutdown => {
-                // Drain every pending caller as Closed before stopping.
-                let drained = self.pending.drain();
-                let mut effects = Vec::with_capacity(drained.len() + 1);
-                for (_qid, slot) in drained {
-                    effects.push(reply_to(slot, FrontendReply::Closed));
-                }
-                effects.push(stop());
-                Effect::Batch(effects)
+                // Drain every pending caller as Closed, then stop.
+                // `drain_into_stop` is the typed helper for this exact
+                // shape; the method name says stop on purpose so the
+                // shutdown is not hidden by the helper.
+                self.pending.drain_into_stop::<Self>(FrontendReply::Closed)
             }
         }
     }
