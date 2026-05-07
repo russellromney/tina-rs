@@ -1,12 +1,14 @@
 //! Tina: native `tina_http::HttpListener` server + native
-//! `tina_http::HttpClient` outbound client. Each scripted request
-//! is bridged from the host thread into the runtime via a tiny
-//! `Driver` isolate that does `call(client, ..., timeout)` and
-//! forwards the outcome through `std::sync::mpsc`.
+//! `tina_http::HttpClient` outbound client. The whole scripted
+//! sequence (GET → 3× POST → GET → GET /missing) runs inside a
+//! single `Driver` isolate that walks the steps via
+//! `call(client, ..., timeout).reply(...)` and ends with
+//! `stop_with(report)`. The host reads the report through
+//! `runtime.observe_result::<Report>` — no `mpsc::channel`, no
+//! per-request bridge.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use http::StatusCode;
@@ -53,79 +55,133 @@ impl Counter {
 }
 
 // -------------------------------------------------------------------
-// Driver: long-lived bridge isolate. Each `Begin` carries its own
-// reply `mpsc::Sender`; the sender is threaded through to `Returned`
-// via the reply closure. One Driver registration handles every
-// scripted request.
+// Driver: walks the scripted sequence, accumulates the Report, and
+// `stop_with`s it for the host.
 // -------------------------------------------------------------------
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 type ResponseResult = Result<HttpResponse, HttpClientError>;
 
-#[derive(Debug, Clone)]
-enum DriverMsg {
-    Begin {
-        client: Address<HttpClientMsg, ResponseResult>,
-        target: SocketAddr,
-        request: HttpRequest,
-        sender: mpsc::Sender<ResponseResult>,
-    },
-    Returned {
-        outcome: CallOutcome<ResponseResult>,
-        sender: mpsc::Sender<ResponseResult>,
-    },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    InitialGet,
+    Post(u8),
+    FinalGet,
+    MissingGet,
+    Done,
 }
 
-struct Driver;
+impl Step {
+    fn next(self) -> Step {
+        match self {
+            Step::InitialGet => Step::Post(0),
+            Step::Post(n) if n + 1 < 3 => Step::Post(n + 1),
+            Step::Post(_) => Step::FinalGet,
+            Step::FinalGet => Step::MissingGet,
+            Step::MissingGet | Step::Done => Step::Done,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DriverMsg {
+    Begin,
+    Returned(CallOutcome<ResponseResult>),
+}
+
+struct Driver {
+    client: Address<HttpClientMsg, ResponseResult>,
+    target: SocketAddr,
+    step: Step,
+    report: Report,
+}
 
 #[tina_runtime::isolate(message = DriverMsg)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
-            DriverMsg::Begin {
-                client,
-                target,
-                request,
-                sender,
-            } => call(
-                client,
-                HttpClientMsg::call(target, request),
-                Duration::from_secs(2),
-            )
-            .reply(move |outcome| DriverMsg::Returned { outcome, sender }),
-            DriverMsg::Returned { outcome, sender } => {
-                let result = match outcome {
-                    CallOutcome::Replied(inner) => inner,
-                    CallOutcome::Full => Err(HttpClientError::Busy),
-                    CallOutcome::Closed => Err(HttpClientError::Closed),
-                    CallOutcome::Timeout => Err(HttpClientError::Timeout),
-                };
-                let _ = sender.send(result);
-                noop()
+            DriverMsg::Begin => self.dispatch(),
+            DriverMsg::Returned(outcome) => {
+                self.absorb(outcome);
+                if self.step == Step::Done {
+                    stop_with(self.report)
+                } else {
+                    self.dispatch()
+                }
             }
         }
     }
 }
 
-fn run_request(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    driver: Address<DriverMsg>,
-    client: Address<HttpClientMsg, ResponseResult>,
-    target: SocketAddr,
-    request: HttpRequest,
-) -> anyhow::Result<ResponseResult> {
-    let (tx, rx) = mpsc::channel();
-    runtime
-        .try_send(
-            driver,
-            DriverMsg::Begin {
-                client,
-                target,
-                request,
-                sender: tx,
-            },
+impl Driver {
+    fn dispatch(&mut self) -> Effect<Self> {
+        let request = match self.step {
+            Step::InitialGet | Step::FinalGet => {
+                HttpRequest::get("/counter").header("Host", "x").build()
+            }
+            Step::Post(_) => HttpRequest::post("/counter").header("Host", "x").build(),
+            Step::MissingGet => HttpRequest::get("/missing").header("Host", "x").build(),
+            Step::Done => return stop_with(self.report),
+        };
+        call(
+            self.client,
+            HttpClientMsg::call(self.target, request),
+            REQUEST_TIMEOUT,
         )
-        .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
-    Ok(rx.recv_timeout(Duration::from_secs(5))?)
+        .reply(DriverMsg::Returned)
+    }
+
+    fn absorb(&mut self, outcome: CallOutcome<ResponseResult>) {
+        let response = match outcome {
+            CallOutcome::Replied(Ok(resp)) => resp,
+            _ => {
+                // Any failure halts the script. The smoke test will
+                // assert the partial Report against expected counts.
+                self.step = Step::Done;
+                return;
+            }
+        };
+        match self.step {
+            Step::InitialGet => {
+                if response.status == StatusCode::OK {
+                    self.report.successful_get += 1;
+                }
+                let body = response.body.as_buffered().unwrap_or(&[]);
+                assert_eq!(
+                    std::str::from_utf8(body).unwrap_or("").trim(),
+                    "0",
+                    "initial GET should report counter=0",
+                );
+            }
+            Step::Post(_) => {
+                if response.status == StatusCode::OK {
+                    self.report.successful_post += 1;
+                }
+            }
+            Step::FinalGet => {
+                if response.status == StatusCode::OK {
+                    self.report.successful_get += 1;
+                }
+                let body = response.body.as_buffered().unwrap_or(&[]);
+                self.report.final_counter_value = std::str::from_utf8(body)
+                    .unwrap_or("0")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+            }
+            Step::MissingGet => {
+                if response.status == StatusCode::NOT_FOUND {
+                    self.report.got_404_for_missing = true;
+                }
+            }
+            Step::Done => {}
+        }
+        self.step = self.step.next();
+    }
 }
 
 // -------------------------------------------------------------------
@@ -166,82 +222,32 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register client: {e:?}"))?;
 
-    // Driver: long-lived bridge from the host thread into the runtime.
-    // One registration; every `run_request` reuses it.
     let driver = runtime
-        .register_with_capacity::<_, Infallible>(Driver, 16)
+        .register_with_capacity::<_, Infallible>(
+            Driver {
+                client,
+                target: server_addr,
+                step: Step::InitialGet,
+                report: Report {
+                    exit_clean: true,
+                    ..Report::default()
+                },
+            },
+            16,
+        )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let mut report = Report {
-        exit_clean: true,
-        ..Report::default()
-    };
+    let result = runtime
+        .observe_result::<Report, _, _>(driver)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    // Initial GET — counter=0.
-    let r0 = run_request(
-        &runtime,
-        driver,
-        client,
-        server_addr,
-        HttpRequest::get("/counter").header("Host", "x").build(),
-    )?
-    .expect("initial GET");
-    if r0.status == StatusCode::OK {
-        report.successful_get += 1;
-    }
-    let body0 = r0.body.as_buffered().unwrap_or(&[]);
-    assert_eq!(
-        std::str::from_utf8(body0).unwrap_or("").trim(),
-        "0",
-        "initial GET should report counter=0",
-    );
+    runtime
+        .try_send(driver, DriverMsg::Begin)
+        .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
-    // Three POSTs.
-    for _ in 0..3 {
-        let r = run_request(
-            &runtime,
-            driver,
-            client,
-            server_addr,
-            HttpRequest::post("/counter").header("Host", "x").build(),
-        )?
-        .expect("POST");
-        if r.status == StatusCode::OK {
-            report.successful_post += 1;
-        }
-    }
-
-    // Final GET — should be 3.
-    let r4 = run_request(
-        &runtime,
-        driver,
-        client,
-        server_addr,
-        HttpRequest::get("/counter").header("Host", "x").build(),
-    )?
-    .expect("final GET");
-    if r4.status == StatusCode::OK {
-        report.successful_get += 1;
-    }
-    let body4 = r4.body.as_buffered().unwrap_or(&[]);
-    report.final_counter_value = std::str::from_utf8(body4)
-        .unwrap_or("0")
-        .trim()
-        .parse()
-        .unwrap_or(0);
-
-    // 404 for missing path.
-    let r5 = run_request(
-        &runtime,
-        driver,
-        client,
-        server_addr,
-        HttpRequest::get("/missing").header("Host", "x").build(),
-    )?
-    .expect("404 GET");
-    if r5.status == StatusCode::NOT_FOUND {
-        report.got_404_for_missing = true;
-    }
+    let report = result
+        .wait(Duration::from_secs(10))
+        .map_err(|e| anyhow::anyhow!("driver did not finish: {e:?}"))?;
 
     runtime
         .try_send(listener_addr, HttpListenerMsg::Stop)
