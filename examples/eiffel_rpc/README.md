@@ -1,6 +1,6 @@
 # eiffel_rpc
 
-Same workload, two implementations:
+Same framed request burst, two implementations:
 
 - One client connection sends a burst of N requests in one TCP write.
 - The server has bounded concurrency: only one request can be

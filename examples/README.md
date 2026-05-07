@@ -30,10 +30,12 @@ disclaimers — is bloat.
 ### Rules
 
 - **Each side is a self-contained file.** `tokio_impl.rs` and
-  `tina_impl.rs` are readable top-to-bottom. No shared `drive_client`,
-  no shared `SideReport`, no `mod.rs` that constrains both sides.
-- **Local types stay local.** A small `RunConfig` / `RunReport` per
-  side is fine if it helps. Don't pull them into a shared module.
+  `tina_impl.rs` are readable top-to-bottom. No shared `drive_client`
+  and no shared harness that constrains both sides.
+- **Tiny local shared types are fine.** A small crate-local
+  `RunConfig` / `RunReport` is okay when it makes `main.rs` and smoke
+  tests boring. Do not let those types grow into a shared protocol
+  driver.
 - **No third side.** No `tina_typed_impl.rs` etc. If a feature needs
   its own demo, it gets its own example crate.
 - **`main.rs` is a dispatcher.** Argument is `tokio` / `tina` / `both`.
@@ -66,8 +68,8 @@ examples/foo/
 ```
 
 Each side exposes `pub fn run(config: RunConfig) -> anyhow::Result<RunReport>`
-(or whatever local shape is useful — sides do not have to agree on
-type).
+(or whatever local shape is useful). The shape should make the side
+easy to read, not force parity for its own sake.
 
 ### README template
 
@@ -140,7 +142,7 @@ than that.
 | `eiffel_replay_dst` | Built | Same workload run twice under `tina-sim` with one seed; demonstrates deterministic replay versus the Tokio shape that cannot answer the question. |
 | `eiffel_outbound_fetch` | Built | "Go fetch these endpoints and aggregate" — Tina as a TCP/DNS *client*, compared to `reqwest`/`hyper`. |
 | `eiffel_graceful_shutdown` | Built | Long-lived service with in-flight work receives SIGINT; compares `tokio::signal` + manual drain against Tina's signal capture and bounded shutdown story. |
-| `eiffel_rpc` | Built | Same wire workload, two implementations: Tina framed RPC with bounded in-flight (overload becomes `Error(Full)` on the wire) vs Tokio with an unbounded queue (silently buffers). |
+| `eiffel_rpc` | Built | Same framed request burst, two implementations: Tina framed RPC with bounded in-flight (overload becomes `Error(Full)` on the wire) vs Tokio with an unbounded queue (silently buffers). |
 
 All seven items from the original ROADMAP Eiffel backlog are built, and
 all five forward-backlog items added in this round are also built.
