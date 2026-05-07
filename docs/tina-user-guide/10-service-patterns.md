@@ -174,6 +174,79 @@ sequential per-shard fanout for `SUM`. The richer parallel
 scatter/gather form (with `send_observed` and a `ReplyAdapter`) is
 proven in `tina-runtime/tests/sharded_primitives.rs`.
 
+## Deferred Replies
+
+`call(svc, msg, timeout).reply(...)` works when the service answers in
+one handler turn. Some shapes need to answer later:
+
+- pool frontend, reply arrives from one of N workers
+- sharded frontend, reply arrives from key owner
+- bridge worker, many external requests in flight
+- fanout, aggregate after N partial results
+
+Capture the caller as a typed `DeferredReply<R>`, store it, answer
+later:
+
+```rust
+let slot: DeferredReply<MyReply> = ctx.take_reply_slot::<Self>()?;
+self.pending.try_insert(req_id, slot)?;
+// later turn:
+let slot = self.pending.take(&req_id).expect("slot for id");
+return reply_to(slot, MyReply::Ok(value));
+```
+
+One-shot. After `take_reply_slot`, a stray `Effect::Reply` in the same
+turn is a no-op for that caller.
+
+### Pending box needs a cap
+
+```rust
+PendingReplies::<RequestId, MyReply>::with_capacity(64)
+```
+
+Sweeps abandoned slots before each admission, so timed-out callers do
+not eat capacity. `try_insert` returns `Full` when no slot can be
+reclaimed and `DuplicateKey` when the id is already live.
+
+> Mailbox holds messages. Pending box holds promises. Both need caps.
+
+### Two caps, not one
+
+- **Mailbox** bounds incoming messages.
+- **Pending box** bounds captured callers.
+
+Roomy mailbox + tiny pending box = accepts work, holds few callers.
+The inverse rejects early, holds many. Pick both.
+
+### Trace facts
+
+Every captured slot ends with one of:
+
+- `DeferredReplyCaptured` — slot taken.
+- `DeferredReplySent` — caller got the reply.
+- `DeferredReplyRejected { reason: CallerClosed | ReplyPathFull |
+   RequesterShardClosed | TypeMismatch }` — caller gone, reply path
+  failed, or the reply payload type didn't match the dispatching
+  `Address<_, R>`.
+- `DeferredReplyDropped` — service let the slot drop while caller was
+  still open.
+
+Duplicate replies and post-drop replies are prevented by the type
+system: `reply_to` consumes the `DeferredReply` handle.
+
+### Anti-pattern
+
+Don't roll your own:
+
+```rust
+struct Bad {
+    pending: Arc<Mutex<HashMap<RequestId, OneShot<MyReply>>>>,
+}
+```
+
+No cap, no caller-liveness signal, no terminal trace, no sweep. Use
+`DeferredReply` + `PendingReplies`.
+
 ## Macro Rule
 
 A future `#[service]` macro may hide byte encoding.

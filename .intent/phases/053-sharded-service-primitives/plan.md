@@ -34,6 +34,22 @@ Compromise:
 - first form is examples plus small helper types where repetition proves value,
   not a polished data-structure library.
 
+API home:
+
+- start with a small `tina_runtime::sharded` module for reusable contracts;
+- keep concrete counter/map services example-owned until repetition proves
+  they belong in the crate;
+- exported first-form types should be boring policy/result shapes, not a
+  framework:
+  - `ShardPlacement`;
+  - `ShardPlacementReport`;
+  - `ShardServiceTable`;
+  - `ScatterGatherConfig`;
+  - `ScatterGatherReport`;
+  - partial-outcome enums for full/closed/timeout/failed target;
+- do not export a `ShardedMap` or `ShardedCounter` product type in first form
+  unless examples prove the generic shape is truly stable.
+
 ## Non-Goals
 
 - No durable distributed database.
@@ -50,25 +66,88 @@ Compromise:
 
 - Placement must be visible.
 - Key-to-shard function must be deterministic.
+- Key input is canonical bytes, not arbitrary `Hash`.
+- Owner services validate placement before mutating shard-owned state.
 - Scatter/gather has bounded fanout.
 - Aggregates report partial success, full, closed, timeout, and failed shard.
 - Hot-key pressure remains visible.
+- Retry/backoff is caller policy, never automatic helper fog.
 - State stays owned by isolate/shard.
 - Docs must say these are local multi-shard patterns, not clustering.
 
 ## Rocks
 
-1. **Key Placement Helper**
+1. **API Home And Surface Boundary**
+
+   Required decision:
+
+   - reusable helper contracts live in `tina_runtime::sharded`;
+   - examples own concrete service implementations;
+   - docs name this as "local multi-shard patterns", not a distributed
+     collection library;
+   - public exports are limited to placement/config/report types;
+   - `ShardServiceTable` is an explicit address table, not service discovery;
+   - any generic service wrapper stays private or example-local unless the
+     implementation proves it removes real duplication.
+
+   Done when:
+
+   - module exists or plan explicitly says "example-only first";
+   - public/private line is written down before code lands;
+   - README/user-guide points users at examples for full service shapes.
+
+2. **Key Placement Helper**
 
    Requirements:
 
-   - deterministic key-to-shard mapping;
+   - deterministic key-to-shard mapping over an explicit ordered shard list;
+   - first-form key input is `&[u8]` / `str` via a tiny canonical-bytes helper,
+     not arbitrary `Hash`;
+   - hash function/scheme is named and stable for this phase;
+   - no assumption that `ShardId`s are contiguous or start at zero;
+   - duplicate shard ids rejected at construction;
+   - empty shard list rejected at construction;
+   - placement version/scheme named in the report;
+   - hash input, hash scheme, and shard ordering documented;
    - visible placement report;
-   - shard-count-change behavior documented;
+   - shard-count-change behavior documented as "mapping may change" unless a
+     later stable-ring scheme is introduced;
    - wrong-shard/wrong-key rejection pattern;
-   - tests for stable mapping.
+   - tests for stable mapping over non-contiguous ids;
+   - live and simulator use byte-identical placement for the same shard list.
 
-2. **Sharded Counter First Form**
+   Suggested first form:
+
+   ```rust
+   let placement = ShardPlacement::new([ShardId::new(10), ShardId::new(30)])?;
+   let owner = placement.owner_for_bytes(key.as_bytes());
+   let report = placement.report();
+   ```
+
+3. **Shard Service Table**
+
+   Requirements:
+
+   - explicit ordered `(ShardId, Address<M, R>)` list;
+   - same shard list/order as `ShardPlacement`;
+   - duplicate shard ids rejected;
+   - missing owner shard returns typed `MissingShard`;
+   - stale generation / stopped target surfaces as `Closed`, not refresh magic;
+   - no hidden registry thread;
+   - no `Arc<Mutex<HashMap<...>>>` side registry in examples;
+   - restart refresh is out of scope unless a test explicitly owns it.
+
+   Suggested first form:
+
+   ```rust
+   let services = ShardServiceTable::new([
+       (ShardId::new(10), counter_10),
+       (ShardId::new(30), counter_30),
+   ])?;
+   let target = services.address_for(owner)?;
+   ```
+
+4. **Sharded Counter First Form**
 
    Requirements:
 
@@ -76,39 +155,71 @@ Compromise:
    - read local;
    - aggregate total across shards;
    - partial aggregate reports missing/full/timeout shards;
+   - owner isolate validates `ctx.shard_id() == placement.owner_for_bytes(key)`
+     before mutating keyed state where a key is involved;
+   - wrong owner returns typed `WrongShard { expected, actual }`;
    - simulator tests for reorder/failure.
 
-3. **Sharded Map Pattern**
+5. **Sharded Map Pattern**
 
    Requirements:
 
    - key routes to owner shard;
    - owner isolate uses normal map;
+   - owner isolate re-checks placement before get/put/delete;
+   - wrong owner returns typed `WrongShard { expected, actual }`;
    - get/put/delete with timeout;
    - full/closed/timeout visible;
    - no global lock, no shared map.
 
-4. **Scatter/Gather Helper**
+6. **Scatter/Gather Helper**
 
    Requirements:
 
    - bounded fanout;
+   - explicit `ScatterGatherConfig` or equivalent;
+   - named `max_targets`;
+   - named collector mailbox capacity;
+   - named per-target in-flight cap or proof that at most one call per target
+     is in flight;
+   - named result capacity equal to or below `max_targets`;
    - per-target timeout;
    - aggregate timeout;
    - public or example-owned partial result type;
    - cancellation/shutdown behavior visible;
-   - no hidden unbounded reply collection.
+   - no hidden unbounded reply collection;
+   - requester-full behavior tested: aggregate reply can be rejected and traced;
+   - collector-full behavior tested: helper reports `Full`, not hidden queueing.
 
-5. **Hot-Key Pressure Policy**
+   First-form config shape:
+
+   ```rust
+   pub struct ScatterGatherConfig {
+       pub max_targets: usize,
+       pub collector_mailbox_capacity: usize,
+       pub per_target_timeout: Duration,
+       pub aggregate_timeout: Duration,
+   }
+   ```
+
+   Zero values are config errors, not silent clamps.
+
+7. **Hot-Key Pressure Policy**
 
    Requirements:
 
    - hot owner shard can reject full;
-   - retry/backoff pattern through Tina timers;
+   - retry/backoff pattern through Tina timers is caller-owned and explicit;
+   - no automatic retry inside placement/map/scatter helpers;
+   - user must opt in and therefore owns idempotency/safety;
+   - max attempts is required;
+   - backoff timer outcomes are visible in trace;
    - metrics/report includes full/timeout per shard;
+   - report separates first-attempt `Full`, retry success, retry exhaustion,
+     and timeout;
    - no automatic queue growth.
 
-6. **Examples**
+8. **Examples**
 
    Add examples:
 
@@ -119,23 +230,43 @@ Compromise:
 
    Reuse Eiffel comparison style where useful.
 
-7. **DST**
+9. **DST**
 
    Required histories:
 
    - reorder fanout replies;
    - one shard full;
-   - one shard closed/failed;
+   - one target isolate closed;
+   - simulator-only failed shard, unless a deterministic live failed-shard seam
+     already exists;
    - aggregate timeout;
    - hot key pressure;
    - saved seed for partial aggregate.
+
+   Live failure mechanism:
+
+   - first form uses stopped target isolates or unknown target addresses to
+     prove `Closed`/failed-target reporting without crashing worker threads;
+   - live whole-shard failure is optional and only allowed through an existing
+     deterministic runtime seam;
+   - simulator owns failed-shard DST because it can make that failure
+     repeatable.
 
 ## Required Proof
 
 - Multi-shard sharded counter works live and in sim.
 - Sharded map routes keys deterministically live and in sim.
+- Owner services reject wrong-shard mutation with typed `WrongShard`.
+- Service address table reports missing/stale/closed targets without hidden
+  refresh.
 - Scatter/gather reports partial outcomes.
+- Scatter/gather has explicit capacity tests: max targets, collector full,
+  requester full, aggregate timeout.
 - Hot-key pressure is visible as full/timeout, not hidden buffering.
+- Hot-key retry, when shown, has explicit max attempts and separates first
+  full from retry success/exhaustion.
+- Placement over non-contiguous `ShardId`s is stable for a fixed ordered shard
+  list and canonical key bytes.
 - Docs say these are primitives/patterns, not a database.
 - Docs say this is not remoting or clustering.
 

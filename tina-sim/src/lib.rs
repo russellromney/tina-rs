@@ -50,8 +50,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, AddressGeneration, ChildDefinition, ChildRelation, Isolate, IsolateId,
-    Outbound as TinaOutbound, RestartableChildDefinition, Shard, ShardId, TrySendError,
+    Address, AddressGeneration, CallRouting, ChildDefinition, ChildRelation, DeferredReplyHandle,
+    DeferredSlotRegistry, Isolate, IsolateId, MessageCaller, Outbound as TinaOutbound,
+    RestartableChildDefinition, Shard, ShardId, TrySendError,
 };
 #[cfg(test)]
 use tina::{Context, Effect};
@@ -65,6 +66,7 @@ use tina_runtime::{
 use tina_supervisor::SupervisorConfig;
 
 mod config;
+mod deferred;
 mod internals;
 mod multi_shard;
 
@@ -128,6 +130,8 @@ where
     round_messages: Vec<Option<DeliveredMessage>>,
     next_isolate_call_ordinal: u64,
     last_checker_failure: Option<CheckerFailure>,
+    deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
+    promoted_slots: deferred::PromotedSlots,
 }
 
 impl<S> Simulator<S>
@@ -180,6 +184,8 @@ where
             round_messages: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
             next_isolate_call_ordinal: 0,
             last_checker_failure: None,
+            deferred_registry: std::rc::Rc::new(DeferredSlotRegistry::new()),
+            promoted_slots: deferred::PromotedSlots::default(),
         }
     }
 
@@ -441,10 +447,12 @@ where
                 RuntimeEventKind::HandlerStarted,
             );
 
+            let caller = self.build_message_caller(message.call_context, isolate_id);
+
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
                 catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id)
+                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller)
                 }))
             };
 
@@ -479,11 +487,18 @@ where
                 },
             );
 
+            let captured_any = self.promote_captures(isolate_id, handler_finished.into());
+            let effective_context = if captured_any {
+                None
+            } else {
+                message.call_context
+            };
+
             self.execute_effect(
                 index,
                 handler_finished.into(),
                 effect,
-                message.call_context,
+                effective_context,
                 &mut round_messages,
                 route_remote,
             );
@@ -491,6 +506,9 @@ where
 
         round_messages.clear();
         self.round_messages = round_messages;
+
+        self.sweep_dropped_deferred_slots();
+
         delivered
     }
 
@@ -778,6 +796,101 @@ where
                     }
                 }
                 false
+            }
+            ErasedEffect::ReplyTo { handle, message } => {
+                self.execute_reply_to(isolate_id, cause, handle, message, route_remote);
+                false
+            }
+        }
+    }
+
+    fn execute_reply_to(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+        handle: DeferredReplyHandle,
+        message: Box<dyn Any>,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        let shared = handle.shared().clone();
+        let Some(record) = self.promoted_slots.take_by_handle(&shared) else {
+            // Slot already terminal: caller closed and we already
+            // emitted Rejected{CallerClosed}. Drop the payload.
+            return;
+        };
+
+        match record.routing {
+            deferred::DeferredRouting::Local => {
+                if self.complete_isolate_call(record.call_id, cause, CallOutcome::Replied(message))
+                {
+                    record.shared.set_state(tina::DeferredSlotState::Replied);
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::DeferredReplySent {
+                            slot_id: record.slot_id,
+                            call_id: record.call_id,
+                        },
+                    );
+                } else {
+                    record.shared.set_state(tina::DeferredSlotState::Closed);
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::DeferredReplyRejected {
+                            slot_id: record.slot_id,
+                            call_id: record.call_id,
+                            reason: tina_runtime::DeferredReplyRejectedReason::CallerClosed,
+                        },
+                    );
+                }
+            }
+            deferred::DeferredRouting::Remote {
+                requester,
+                cause: request_cause,
+            } => {
+                let remote_reply = RemoteCallReply {
+                    call_id: record.call_id,
+                    requester,
+                    reply: RemoteCallOutcome::Replied(message),
+                    cause: request_cause,
+                };
+                match route_remote(
+                    self.shard.id(),
+                    QueuedRemoteEnvelope::CallReply(remote_reply),
+                ) {
+                    Ok(()) => {
+                        record.shared.set_state(tina::DeferredSlotState::Replied);
+                        self.push_event(
+                            isolate_id,
+                            Some(cause),
+                            RuntimeEventKind::DeferredReplySent {
+                                slot_id: record.slot_id,
+                                call_id: record.call_id,
+                            },
+                        );
+                    }
+                    Err(reason) => {
+                        let reject_reason = match reason {
+                            SendRejectedReason::Full => {
+                                tina_runtime::DeferredReplyRejectedReason::ReplyPathFull
+                            }
+                            SendRejectedReason::Closed => {
+                                tina_runtime::DeferredReplyRejectedReason::RequesterShardClosed
+                            }
+                        };
+                        record.shared.set_state(tina::DeferredSlotState::Closed);
+                        self.push_event(
+                            isolate_id,
+                            Some(cause),
+                            RuntimeEventKind::DeferredReplyRejected {
+                                slot_id: record.slot_id,
+                                call_id: record.call_id,
+                                reason: reject_reason,
+                            },
+                        );
+                    }
+                }
             }
         }
     }
@@ -3550,6 +3663,7 @@ where
             let translator = entry.translator.take().unwrap_or_else(|| {
                 panic!("translator for call {:?} already consumed", entry.call_id)
             });
+            self.close_deferred_slot_for_call(entry.call_id);
             self.deliver_isolate_call_outcome(
                 IsolateCallDeliveryContext {
                     call_id: entry.call_id,
@@ -3561,6 +3675,108 @@ where
                 CallOutcome::Timeout,
                 translator,
             );
+        }
+    }
+
+    fn close_deferred_slot_for_call(&mut self, call_id: CallId) {
+        if let Some(record) = self.promoted_slots.take_by_local_call_id(call_id) {
+            record.shared.set_state(tina::DeferredSlotState::Closed);
+            self.push_event(
+                record.capturing_isolate,
+                None,
+                RuntimeEventKind::DeferredReplyRejected {
+                    slot_id: record.slot_id,
+                    call_id: record.call_id,
+                    reason: tina_runtime::DeferredReplyRejectedReason::CallerClosed,
+                },
+            );
+        }
+    }
+
+    fn build_message_caller(
+        &self,
+        call_context: Option<MessageCallContext>,
+        isolate_id: IsolateId,
+    ) -> Option<MessageCaller> {
+        let ctx = call_context?;
+        let (call_id, routing) = match ctx {
+            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local),
+            MessageCallContext::Remote {
+                call_id,
+                requester,
+                cause,
+            } => (
+                call_id,
+                CallRouting::Remote {
+                    requester_shard: requester.shard,
+                    requester_isolate: requester.isolate,
+                    requester_generation: requester.generation,
+                    cause: cause.event().get(),
+                },
+            ),
+        };
+        Some(MessageCaller::new(
+            std::rc::Rc::clone(&self.deferred_registry),
+            call_id.get(),
+            isolate_id,
+            routing,
+        ))
+    }
+
+    fn promote_captures(&mut self, isolate_id: IsolateId, cause: tina_runtime::CauseId) -> bool {
+        let captures = self.deferred_registry.drain_pending();
+        if captures.is_empty() {
+            return false;
+        }
+        for capture in captures {
+            let slot_id = tina_runtime::DeferredSlotId::new(capture.slot_id);
+            let call_id = CallId::new(capture.call_id);
+            let routing = match capture.routing {
+                CallRouting::Local => deferred::DeferredRouting::Local,
+                CallRouting::Remote {
+                    requester_shard,
+                    requester_isolate,
+                    requester_generation,
+                    cause: remote_cause,
+                } => deferred::DeferredRouting::Remote {
+                    requester: RegisteredAddress {
+                        shard: requester_shard,
+                        isolate: requester_isolate,
+                        generation: requester_generation,
+                    },
+                    cause: tina_runtime::CauseId::new(tina_runtime::EventId::new(remote_cause)),
+                },
+            };
+            self.push_event(
+                isolate_id,
+                Some(cause),
+                RuntimeEventKind::DeferredReplyCaptured { slot_id, call_id },
+            );
+            self.promoted_slots.push(deferred::DeferredSlotRecord {
+                slot_id,
+                call_id,
+                capturing_isolate: capture.capturing_isolate,
+                shared: capture.shared,
+                routing,
+            });
+        }
+        true
+    }
+
+    fn sweep_dropped_deferred_slots(&mut self) {
+        let dropped = self.promoted_slots.sweep_dropped();
+        for record in dropped {
+            if record.shared.state() == tina::DeferredSlotState::Open {
+                record.shared.set_state(tina::DeferredSlotState::Closed);
+                self.push_event(
+                    record.capturing_isolate,
+                    None,
+                    RuntimeEventKind::DeferredReplyDropped {
+                        slot_id: record.slot_id,
+                        call_id: record.call_id,
+                    },
+                );
+            }
         }
     }
 
@@ -4168,6 +4384,21 @@ where
             isolate: isolate_id,
             generation: self.entries[index].generation,
         });
+
+        // Drain any deferred reply slots this isolate captured.
+        for record in self.promoted_slots.take_by_isolate(isolate_id) {
+            if record.shared.state() == tina::DeferredSlotState::Open {
+                record.shared.set_state(tina::DeferredSlotState::Closed);
+                self.push_event(
+                    isolate_id,
+                    Some(stopped.into()),
+                    RuntimeEventKind::DeferredReplyDropped {
+                        slot_id: record.slot_id,
+                        call_id: record.call_id,
+                    },
+                );
+            }
+        }
         if precollected.is_some() {
             self.push_event(
                 isolate_id,

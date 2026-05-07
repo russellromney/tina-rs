@@ -101,8 +101,10 @@
 //! ```
 
 use std::any::Any;
+use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 /// Type-erased payload for [`Effect::StopWith`].
 ///
@@ -342,6 +344,13 @@ where
     /// `tcp_write(...).reply(...)`, then another from the next handler turn).
     /// See `docs/tcp-loops.md` for canonical patterns.
     Batch(Vec<Effect<I>>),
+
+    /// Reply through a previously captured deferred reply slot.
+    ///
+    /// Equivalent to [`Reply`](Self::Reply) but routes the reply through the
+    /// named slot instead of the current message's caller. The slot is
+    /// one-shot: the runtime consumes it on delivery.
+    ReplyTo(DeferredReply<I::Reply>, I::Reply),
 }
 
 /// Returns an effect that asks the runtime to do nothing else this turn.
@@ -411,6 +420,39 @@ where
     T: IntoIterator<Item = Effect<I>>,
 {
     Effect::Batch(effects.into_iter().collect())
+}
+
+/// Returns an effect that replies through a previously captured deferred slot.
+///
+/// The slot is one-shot. The runtime consumes it whether or not the original
+/// caller is still alive; if the caller already closed (timeout or shutdown),
+/// the reply is rejected and a trace fact records the reason.
+///
+/// `DeferredReply` is not `Clone`, so a duplicate `reply_to` against the
+/// same slot is a compile error rather than a runtime trace fact:
+///
+/// ```compile_fail
+/// # use tina::{DeferredReply, Effect, Isolate, Outbound, reply_to};
+/// # struct S;
+/// # impl Isolate for S {
+/// #     type Message = (); type Reply = u32;
+/// #     type Send = Outbound<std::convert::Infallible>;
+/// #     type Spawn = std::convert::Infallible;
+/// #     type Call = std::convert::Infallible;
+/// #     type Shard = tina::SingleShard;
+/// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard>) -> Effect<Self> {
+/// #         tina::noop()
+/// #     }
+/// # }
+/// fn _double_reply(slot: DeferredReply<u32>) -> (Effect<S>, Effect<S>) {
+///     (reply_to(slot, 1), reply_to(slot, 2)) // borrow of moved value
+/// }
+/// ```
+pub fn reply_to<I>(slot: DeferredReply<I::Reply>, value: I::Reply) -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::ReplyTo(slot, value)
 }
 
 /// Documented sugar for ordered runtime-call sequences.
@@ -730,6 +772,7 @@ where
 {
     shard: &'a mut S,
     current_isolate: IsolateId,
+    caller: Option<MessageCaller>,
 }
 
 impl<'a, S> Context<'a, S>
@@ -741,7 +784,64 @@ where
         Self {
             shard,
             current_isolate,
+            caller: None,
         }
+    }
+
+    /// Attach the current message's caller. Runtime-only constructor.
+    ///
+    /// Used by runtime crates so handlers can capture the caller as a
+    /// deferred reply slot via [`take_reply_slot`](Self::take_reply_slot).
+    /// Ordinary application code does not call this.
+    #[doc(hidden)]
+    pub fn with_caller(mut self, caller: MessageCaller) -> Self {
+        self.caller = Some(caller);
+        self
+    }
+
+    /// Captures the current caller as a one-shot deferred reply slot.
+    ///
+    /// On success, returns a typed [`DeferredReply<R>`] that the handler
+    /// (or a later handler turn on the same isolate) may pass to
+    /// [`reply_to`] to answer the original caller.
+    ///
+    /// Errors:
+    ///
+    /// - [`TakeReplySlotError::NoCaller`]: the current message was a
+    ///   plain send, or the slot was already taken on this turn.
+    /// - [`TakeReplySlotError::CrossShardUnsupported`]: the current
+    ///   call came from another shard. First-form deferred reply
+    ///   slots only support same-shard callers because caller-liveness
+    ///   sweep depends on the local pending-isolate-call table.
+    ///
+    /// Capturing is irreversible: once taken, the runtime will not also
+    /// honor an [`Effect::Reply`] for the same call. Returning
+    /// `Effect::Reply` after `take_reply_slot` is a no-op against the
+    /// original caller.
+    pub fn take_reply_slot<R>(&mut self) -> Result<DeferredReply<R>, TakeReplySlotError>
+    where
+        R: 'static,
+    {
+        // Peek routing first so a Remote refusal does not consume the caller.
+        match self.caller.as_ref().map(|c| c.routing()) {
+            None => return Err(TakeReplySlotError::NoCaller),
+            Some(CallRouting::Remote { .. }) => {
+                return Err(TakeReplySlotError::CrossShardUnsupported);
+            }
+            Some(CallRouting::Local) => {}
+        }
+        let caller = self.caller.take().expect("checked above");
+        let handle = caller.capture();
+        Ok(DeferredReply {
+            handle,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Returns true while the current message still has a caller available
+    /// to capture (i.e. a deferred reply slot can still be taken this turn).
+    pub fn has_caller(&self) -> bool {
+        self.caller.is_some()
     }
 
     /// Returns the identifier of the shard currently executing the handler.
@@ -1095,11 +1195,318 @@ impl AddressGeneration {
     }
 }
 
+/// One-shot typed handle for replying to a captured caller later.
+///
+/// A `DeferredReply<R>` is created by
+/// [`Context::take_reply_slot`]. The handler may store it in isolate
+/// state and use [`reply_to`] from a later turn to answer the original
+/// caller. The slot is one-shot: each `reply_to` consumes the slot.
+///
+/// The slot type carries the caller's expected reply type `R`. Wrong
+/// reply types fail to type-check at the [`reply_to`] call site:
+/// `reply_to::<I>` requires `DeferredReply<I::Reply>`.
+///
+/// Lifecycle and trace facts:
+///
+/// - capture emits `DeferredReplyCaptured`;
+/// - reply through an open slot emits `DeferredReplySent`;
+/// - reply through a slot whose caller already closed emits
+///   `DeferredReplyRejected` with `CallerClosed`;
+/// - dropping a slot whose caller is still open emits
+///   `DeferredReplyDropped`;
+/// - caller timeout/closed first emits `DeferredReplyRejected` with
+///   `CallerClosed`. Later user disposals on that slot emit no further
+///   events — the terminal fact already happened.
+#[derive(Debug)]
+pub struct DeferredReply<R> {
+    handle: DeferredReplyHandle,
+    _marker: PhantomData<fn(R) -> R>,
+}
+
+impl<R> DeferredReply<R> {
+    /// Returns the runtime-assigned slot identifier.
+    pub fn slot_id(&self) -> u64 {
+        self.handle.slot_id()
+    }
+
+    /// Returns the current state of the slot.
+    pub fn state(&self) -> DeferredSlotState {
+        self.handle.state()
+    }
+
+    /// Returns true while a reply through this slot can still reach the
+    /// original caller. False after the caller closed or the slot was
+    /// already replied to.
+    pub fn is_open(&self) -> bool {
+        self.state() == DeferredSlotState::Open
+    }
+
+    /// Returns the underlying type-erased handle. Runtime-only.
+    #[doc(hidden)]
+    pub fn into_handle(self) -> DeferredReplyHandle {
+        self.handle
+    }
+
+    /// Constructs a typed slot from a runtime-allocated handle.
+    /// Runtime-only.
+    #[doc(hidden)]
+    pub fn from_handle(handle: DeferredReplyHandle) -> Self {
+        Self {
+            handle,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Type-erased handle for a runtime-owned deferred reply slot.
+///
+/// Application code does not construct or unwrap this directly; it lives
+/// inside [`DeferredReply<R>`]. Runtime crates allocate it.
+#[derive(Debug, Clone)]
+pub struct DeferredReplyHandle {
+    shared: Rc<DeferredSlotShared>,
+}
+
+impl DeferredReplyHandle {
+    /// Constructs a handle from runtime-owned shared state. Runtime-only.
+    #[doc(hidden)]
+    pub fn from_shared(shared: Rc<DeferredSlotShared>) -> Self {
+        Self { shared }
+    }
+
+    /// Returns the runtime-assigned slot identifier.
+    pub fn slot_id(&self) -> u64 {
+        self.shared.slot_id
+    }
+
+    /// Returns the current state of the slot.
+    pub fn state(&self) -> DeferredSlotState {
+        self.shared.state.get()
+    }
+
+    /// Returns the shared state. Runtime-only.
+    #[doc(hidden)]
+    pub fn shared(&self) -> &Rc<DeferredSlotShared> {
+        &self.shared
+    }
+}
+
+/// Shared state between a [`DeferredReplyHandle`] in isolate state and
+/// the runtime registry. The runtime mutates `state` to record caller
+/// liveness.
+#[derive(Debug)]
+pub struct DeferredSlotShared {
+    slot_id: u64,
+    state: Cell<DeferredSlotState>,
+}
+
+impl DeferredSlotShared {
+    /// Builds an `Open` shared slot. Runtime-only constructor.
+    #[doc(hidden)]
+    pub fn new(slot_id: u64) -> Self {
+        Self {
+            slot_id,
+            state: Cell::new(DeferredSlotState::Open),
+        }
+    }
+
+    /// Returns the slot identifier.
+    pub fn slot_id(&self) -> u64 {
+        self.slot_id
+    }
+
+    /// Reads the current state.
+    pub fn state(&self) -> DeferredSlotState {
+        self.state.get()
+    }
+
+    /// Updates the state. Runtime-only.
+    #[doc(hidden)]
+    pub fn set_state(&self, state: DeferredSlotState) {
+        self.state.set(state);
+    }
+}
+
+/// Lifecycle states a [`DeferredReply`] may pass through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeferredSlotState {
+    /// The slot is still open; a reply can still reach the caller.
+    Open,
+    /// The slot has been replied to (terminal).
+    Replied,
+    /// The original caller already closed (timeout, requester stopped, or
+    /// service stopped). Subsequent replies through this slot are
+    /// rejected; no event fires for the rejection because the closed
+    /// state was already a terminal trace fact.
+    Closed,
+}
+
+/// Reasons [`Context::take_reply_slot`] may refuse a capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TakeReplySlotError {
+    /// The current message has no caller, or the slot was already taken
+    /// on this turn.
+    NoCaller,
+    /// The current call came from a different shard. First-form
+    /// deferred reply slots only support same-shard callers because
+    /// caller-liveness sweep depends on the local pending-isolate-call
+    /// table.
+    CrossShardUnsupported,
+}
+
+/// Runtime-supplied capture hook attached to a [`Context`].
+///
+/// Constructed by runtimes when delivering a call message; consumed by
+/// the first call to [`Context::take_reply_slot`]. Holds primitives
+/// inline plus an `Rc` to the runtime's slot registry — no per-call
+/// boxed closure.
+#[derive(Debug)]
+pub struct MessageCaller {
+    registry: Rc<DeferredSlotRegistry>,
+    call_id: u64,
+    capturing_isolate: IsolateId,
+    routing: CallRouting,
+}
+
+impl MessageCaller {
+    /// Constructs a caller. Runtime-only.
+    #[doc(hidden)]
+    pub fn new(
+        registry: Rc<DeferredSlotRegistry>,
+        call_id: u64,
+        capturing_isolate: IsolateId,
+        routing: CallRouting,
+    ) -> Self {
+        Self {
+            registry,
+            call_id,
+            capturing_isolate,
+            routing,
+        }
+    }
+
+    /// Returns the current call's routing kind. Used by
+    /// [`Context::take_reply_slot`] to refuse cross-shard captures.
+    pub fn routing(&self) -> CallRouting {
+        self.routing
+    }
+
+    /// Allocate the slot, register a pending capture in the runtime's
+    /// registry, return the typed handle. Consumes self so the caller
+    /// can be taken at most once per message.
+    fn capture(self) -> DeferredReplyHandle {
+        let slot_id = self.registry.allocate_slot_id();
+        let shared = Rc::new(DeferredSlotShared::new(slot_id));
+        self.registry.register_pending(PendingCapture {
+            slot_id,
+            call_id: self.call_id,
+            capturing_isolate: self.capturing_isolate,
+            shared: shared.clone(),
+            routing: self.routing,
+        });
+        DeferredReplyHandle::from_shared(shared)
+    }
+}
+
+/// Runtime-neutral routing kind for a message that carries a caller.
+///
+/// Used both by [`MessageCaller::routing`] and by the registry's
+/// pending-capture entries so the runtime can find the matching call
+/// later. Cross-shard data is exposed as primitives so `tina` does not
+/// have to know the runtime's address types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallRouting {
+    /// Caller is on the same shard as the service. Reply settles via
+    /// the local pending-isolate-call table.
+    Local,
+
+    /// Caller is on a different shard. Reply must travel through the
+    /// remote reply path.
+    Remote {
+        /// Requester shard id.
+        requester_shard: ShardId,
+        /// Requester isolate id on its shard.
+        requester_isolate: IsolateId,
+        /// Requester address generation.
+        requester_generation: AddressGeneration,
+        /// Cause id of the original call attempt on the requester
+        /// shard. Opaque to `tina`.
+        cause: u64,
+    },
+}
+
+/// Runtime-owned bookkeeping for in-flight deferred reply captures.
+///
+/// Shared via `Rc` between the runtime's step loop and the
+/// [`MessageCaller`] handed to a service handler. The runtime layers
+/// its own promoted-slot registry on top of this one for routing and
+/// sweeps; tina only owns the slot-id source and the pending-capture
+/// queue that the runtime drains after each handler turn.
+#[derive(Debug, Default)]
+pub struct DeferredSlotRegistry {
+    inner: std::cell::RefCell<DeferredSlotRegistryInner>,
+}
+
+#[derive(Debug, Default)]
+struct DeferredSlotRegistryInner {
+    next_slot_id: u64,
+    pending_captures: Vec<PendingCapture>,
+}
+
+/// One newly captured slot waiting for the runtime to promote.
+///
+/// Runtime drains these after the handler turn to attach routing
+/// records and emit `DeferredReplyCaptured` trace events.
+#[derive(Debug)]
+pub struct PendingCapture {
+    /// Runtime-assigned slot identifier.
+    pub slot_id: u64,
+    /// Original call id this slot answers.
+    pub call_id: u64,
+    /// Isolate that captured the slot.
+    pub capturing_isolate: IsolateId,
+    /// Shared state between user-side handle and runtime registry.
+    pub shared: Rc<DeferredSlotShared>,
+    /// Where to deliver the reply.
+    pub routing: CallRouting,
+}
+
+impl DeferredSlotRegistry {
+    /// Creates a fresh registry with no slots. Runtime-only.
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the next slot id and records its allocation.
+    /// Runtime-only.
+    #[doc(hidden)]
+    pub fn allocate_slot_id(&self) -> u64 {
+        let mut inner = self.inner.borrow_mut();
+        inner.next_slot_id += 1;
+        inner.next_slot_id
+    }
+
+    /// Records a pending capture for the runtime to drain after the
+    /// handler turn. Runtime-only.
+    #[doc(hidden)]
+    pub fn register_pending(&self, capture: PendingCapture) {
+        self.inner.borrow_mut().pending_captures.push(capture);
+    }
+
+    /// Drains and returns every pending capture recorded since the
+    /// last drain. Runtime-only.
+    #[doc(hidden)]
+    pub fn drain_pending(&self) -> Vec<PendingCapture> {
+        std::mem::take(&mut self.inner.borrow_mut().pending_captures)
+    }
+}
+
 /// The preferred first import for ordinary Tina application code.
 pub mod prelude {
     pub use crate::{
-        Address, ChildDefinition, Context, Effect, Isolate, IsolateId, Outbound,
+        Address, ChildDefinition, Context, DeferredReply, Effect, Isolate, IsolateId, Outbound,
         RestartableChildDefinition, Shard, ShardId, SingleShard, batch, isolate, isolate_types,
-        noop, reply, restart_children, send, sequence, spawn, stop, stop_with,
+        noop, reply, reply_to, restart_children, send, sequence, spawn, stop, stop_with,
     };
 }

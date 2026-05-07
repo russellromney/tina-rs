@@ -41,7 +41,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::{
-    Address, AddressGeneration, ChildRelation, Context, Effect, Isolate, IsolateId, Mailbox,
+    Address, AddressGeneration, CallRouting, ChildRelation, Context, DeferredReplyHandle,
+    DeferredSlotRegistry, DeferredSlotState, Effect, Isolate, IsolateId, Mailbox, MessageCaller,
     Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, StopResult, TrySendError,
 };
 use tina_supervisor::SupervisorConfig;
@@ -51,6 +52,7 @@ use betelgeuse::IOLoopHandle;
 mod call;
 mod capabilities;
 mod clock;
+pub mod deferred;
 mod driver;
 mod errors;
 mod live_report;
@@ -118,6 +120,10 @@ pub use call::{
     tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
     udp_recv_from, udp_send_to,
 };
+pub use deferred::{
+    InsertError as PendingRepliesInsertError, PendingReplies,
+    TryCaptureError as PendingRepliesTryCaptureError,
+};
 use driver::DriverCompletion;
 pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
@@ -131,9 +137,10 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
 pub use tina_macros::runtime_isolate as isolate;
 pub use trace::{
-    CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId, EffectKind, EventId,
-    RestartSkippedReason, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-    SupervisionRejectedReason, stable_trace_hash,
+    CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
+    DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
+    RuntimeEvent, RuntimeEventKind, SendRejectedReason, SupervisionRejectedReason,
+    stable_trace_hash,
 };
 
 pub use driver::os_signal_capture_supported;
@@ -210,6 +217,12 @@ where
     driver_completions: Vec<DriverCompletion>,
     next_isolate_call_ordinal: u64,
     observation: observation::ObservationRegistry,
+    /// Tina-owned slot-id source and pending-capture queue. Cloned
+    /// (refcount bump, no allocation) into each per-message
+    /// [`MessageCaller`].
+    deferred_registry: Rc<DeferredSlotRegistry>,
+    /// Promoted-slot table. Owned solely by the runtime.
+    promoted_slots: deferred::PromotedSlots,
 }
 
 #[derive(Debug)]
@@ -435,6 +448,8 @@ where
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,
             observation: observation::ObservationRegistry::new(),
+            deferred_registry: Rc::new(DeferredSlotRegistry::new()),
+            promoted_slots: deferred::PromotedSlots::default(),
         }
     }
 
@@ -926,10 +941,12 @@ where
                 RuntimeEventKind::HandlerStarted,
             );
 
+            let caller = self.build_message_caller(message.call_context, isolate_id);
+
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
                 catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id)
+                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller)
                 }))
             };
 
@@ -964,11 +981,22 @@ where
                 },
             );
 
+            // If the handler captured the caller, promote the new slot
+            // record(s) and zero out the message's call_context so a
+            // stray Effect::Reply does not also fire on the captured
+            // call.
+            let captured_any = self.promote_captures(isolate_id, handler_finished.into());
+            let effective_context = if captured_any {
+                None
+            } else {
+                message.call_context
+            };
+
             self.execute_effect(
                 index,
                 handler_finished.into(),
                 effect,
-                message.call_context,
+                effective_context,
                 &mut round_messages,
                 route_remote,
             );
@@ -976,7 +1004,98 @@ where
 
         round_messages.clear();
         self.round_messages = round_messages;
+
+        self.sweep_dropped_deferred_slots();
+
         delivered
+    }
+
+    fn build_message_caller(
+        &self,
+        call_context: Option<MessageCallContext>,
+        isolate_id: IsolateId,
+    ) -> Option<MessageCaller> {
+        let ctx = call_context?;
+        let (call_id, routing) = match ctx {
+            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local),
+            MessageCallContext::Remote {
+                call_id,
+                requester,
+                cause,
+            } => (
+                call_id,
+                CallRouting::Remote {
+                    requester_shard: requester.shard,
+                    requester_isolate: requester.isolate,
+                    requester_generation: requester.generation,
+                    cause: cause.event().get(),
+                },
+            ),
+        };
+        Some(MessageCaller::new(
+            Rc::clone(&self.deferred_registry),
+            call_id.get(),
+            isolate_id,
+            routing,
+        ))
+    }
+
+    fn promote_captures(&mut self, isolate_id: IsolateId, cause: CauseId) -> bool {
+        let captures = self.deferred_registry.drain_pending();
+        if captures.is_empty() {
+            return false;
+        }
+        for capture in captures {
+            let slot_id = DeferredSlotId::new(capture.slot_id);
+            let call_id = CallId::new(capture.call_id);
+            let routing = match capture.routing {
+                CallRouting::Local => deferred::DeferredRouting::Local,
+                CallRouting::Remote {
+                    requester_shard,
+                    requester_isolate,
+                    requester_generation,
+                    cause: remote_cause,
+                } => deferred::DeferredRouting::Remote {
+                    requester: RegisteredAddress {
+                        shard: requester_shard,
+                        isolate: requester_isolate,
+                        generation: requester_generation,
+                    },
+                    cause: CauseId::new(EventId::new(remote_cause)),
+                },
+            };
+            self.push_event(
+                isolate_id,
+                Some(cause),
+                RuntimeEventKind::DeferredReplyCaptured { slot_id, call_id },
+            );
+            self.promoted_slots.push(deferred::DeferredSlotRecord {
+                slot_id,
+                call_id,
+                capturing_isolate: capture.capturing_isolate,
+                shared: capture.shared,
+                routing,
+            });
+        }
+        true
+    }
+
+    fn sweep_dropped_deferred_slots(&mut self) {
+        // Single pass: independent Rcs cannot cascade.
+        let dropped = self.promoted_slots.sweep_dropped();
+        for record in dropped {
+            if record.shared.state() == DeferredSlotState::Open {
+                record.shared.set_state(DeferredSlotState::Closed);
+                self.push_event(
+                    record.capturing_isolate,
+                    None,
+                    RuntimeEventKind::DeferredReplyDropped {
+                        slot_id: record.slot_id,
+                        call_id: record.call_id,
+                    },
+                );
+            }
+        }
     }
 
     fn execute_effect(
@@ -1166,6 +1285,106 @@ where
                     }
                 }
                 false
+            }
+            ErasedEffect::ReplyTo { handle, message } => {
+                self.execute_reply_to(isolate_id, cause, handle, message, route_remote);
+                false
+            }
+        }
+    }
+
+    fn execute_reply_to(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        handle: DeferredReplyHandle,
+        message: ErasedMessage,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        // Locate by handle identity. If the slot is not in the registry,
+        // the caller already closed (and we already emitted the
+        // terminal Rejected event). User reply is silently consumed.
+        let shared = handle.shared().clone();
+        let Some(record) = self.promoted_slots.take_by_handle(&shared) else {
+            // Already terminal: caller closed and we already emitted
+            // Rejected{CallerClosed}. The payload is consumed without
+            // re-emitting a terminal fact.
+            return;
+        };
+
+        // Slot is live. Reply through it.
+        match record.routing {
+            deferred::DeferredRouting::Local => {
+                if self.complete_isolate_call(
+                    record.call_id,
+                    cause,
+                    CallOutcome::Replied(message.into_any()),
+                ) {
+                    record.shared.set_state(DeferredSlotState::Replied);
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::DeferredReplySent {
+                            slot_id: record.slot_id,
+                            call_id: record.call_id,
+                        },
+                    );
+                } else {
+                    // pending isolate call gone (e.g. requester
+                    // already closed). Surface as CallerClosed.
+                    record.shared.set_state(DeferredSlotState::Closed);
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::DeferredReplyRejected {
+                            slot_id: record.slot_id,
+                            call_id: record.call_id,
+                            reason: DeferredReplyRejectedReason::CallerClosed,
+                        },
+                    );
+                }
+            }
+            deferred::DeferredRouting::Remote {
+                requester,
+                cause: request_cause,
+            } => {
+                let envelope = QueuedRemoteEnvelope::CallReply(RemoteCallReply {
+                    call_id: record.call_id,
+                    requester,
+                    cause: request_cause,
+                    outcome: RemoteCallOutcome::Replied(message),
+                });
+                match route_remote(self.shard.id(), envelope) {
+                    Ok(()) => {
+                        record.shared.set_state(DeferredSlotState::Replied);
+                        self.push_event(
+                            isolate_id,
+                            Some(cause),
+                            RuntimeEventKind::DeferredReplySent {
+                                slot_id: record.slot_id,
+                                call_id: record.call_id,
+                            },
+                        );
+                    }
+                    Err(reason) => {
+                        let reject_reason = match reason {
+                            SendRejectedReason::Full => DeferredReplyRejectedReason::ReplyPathFull,
+                            SendRejectedReason::Closed => {
+                                DeferredReplyRejectedReason::RequesterShardClosed
+                            }
+                        };
+                        record.shared.set_state(DeferredSlotState::Closed);
+                        self.push_event(
+                            isolate_id,
+                            Some(cause),
+                            RuntimeEventKind::DeferredReplyRejected {
+                                slot_id: record.slot_id,
+                                call_id: record.call_id,
+                                reason: reject_reason,
+                            },
+                        );
+                    }
+                }
             }
         }
     }
@@ -1559,6 +1778,7 @@ where
             let translator = entry.translator.take().unwrap_or_else(|| {
                 panic!("translator for call {:?} already consumed", entry.call_id)
             });
+            self.close_deferred_slot_for_call(entry.call_id);
             self.deliver_isolate_call_outcome(
                 entry.call_id,
                 entry.requester,
@@ -1566,6 +1786,25 @@ where
                 CallOutcome::Timeout,
                 translator,
                 entry.continuation_context,
+            );
+        }
+    }
+
+    fn close_deferred_slot_for_call(&mut self, call_id: CallId) {
+        // Local-only: caller-liveness sweep here is driven by this
+        // shard's pending isolate calls. First form refuses cross-shard
+        // captures so every promoted slot is local — see
+        // `PromotedSlots::take_by_local_call_id`.
+        if let Some(record) = self.promoted_slots.take_by_local_call_id(call_id) {
+            record.shared.set_state(DeferredSlotState::Closed);
+            self.push_event(
+                record.capturing_isolate,
+                None,
+                RuntimeEventKind::DeferredReplyRejected {
+                    slot_id: record.slot_id,
+                    call_id: record.call_id,
+                    reason: DeferredReplyRejectedReason::CallerClosed,
+                },
             );
         }
     }
@@ -1990,6 +2229,24 @@ where
         let generation = self.entries[index].generation;
         self.observation
             .notify_isolate_stopped(isolate_id, generation);
+
+        // Drain any deferred reply slots this isolate captured. The
+        // isolate's state (and its DeferredReply Rcs) is not freed
+        // until the entry record is dropped, so sweep would not
+        // notice. Walk the registry directly.
+        for record in self.promoted_slots.take_by_isolate(isolate_id) {
+            if record.shared.state() == DeferredSlotState::Open {
+                record.shared.set_state(DeferredSlotState::Closed);
+                self.push_event(
+                    isolate_id,
+                    Some(stopped.into()),
+                    RuntimeEventKind::DeferredReplyDropped {
+                        slot_id: record.slot_id,
+                        call_id: record.call_id,
+                    },
+                );
+            }
+        }
         self.cancel_driver_calls_for_requester(RegisteredAddress {
             shard: self.shard.id(),
             isolate: isolate_id,
@@ -2833,6 +3090,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        caller: Option<MessageCaller>,
     ) -> ErasedEffect<S, F>;
 }
 
@@ -2885,6 +3143,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        caller: Option<MessageCaller>,
     ) -> ErasedEffect<S, F> {
         let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a handler message with the wrong type")
@@ -2892,6 +3151,9 @@ where
 
         let effect = {
             let mut ctx = Context::new(shard, isolate_id);
+            if let Some(caller) = caller {
+                ctx = ctx.with_caller(caller);
+            }
             self.isolate.handle(*message, &mut ctx)
         };
 
@@ -2923,6 +3185,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        caller: Option<MessageCaller>,
     ) -> ErasedEffect<S, F> {
         let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a handler message with the wrong type")
@@ -2930,6 +3193,9 @@ where
 
         let effect = {
             let mut ctx = Context::new(shard, isolate_id);
+            if let Some(caller) = caller {
+                ctx = ctx.with_caller(caller);
+            }
             self.isolate.handle(*message, &mut ctx)
         };
 
@@ -2971,6 +3237,10 @@ where
                 .map(erase_effect::<I, S, F, Outbound>)
                 .collect(),
         ),
+        Effect::ReplyTo(slot, reply) => ErasedEffect::ReplyTo {
+            handle: slot.into_handle(),
+            message: ErasedMessage::Local(Box::new(reply)),
+        },
     }
 }
 
@@ -3008,6 +3278,10 @@ where
                 .map(erase_effect_sendable::<I, S, F, Outbound>)
                 .collect(),
         ),
+        Effect::ReplyTo(slot, reply) => ErasedEffect::ReplyTo {
+            handle: slot.into_handle(),
+            message: ErasedMessage::Sendable(Box::new(reply)),
+        },
     }
 }
 
@@ -3041,6 +3315,10 @@ where
     RestartChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S, F>>),
+    ReplyTo {
+        handle: DeferredReplyHandle,
+        message: ErasedMessage,
+    },
 }
 
 impl<S, F> ErasedEffect<S, F>
@@ -3059,6 +3337,7 @@ where
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
+            Self::ReplyTo { .. } => EffectKind::ReplyTo,
         }
     }
 }

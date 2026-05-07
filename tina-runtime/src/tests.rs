@@ -874,6 +874,7 @@ fn restart_children_can_restart_child_before_its_first_turn() {
     assert_ne!(runtime.child_record_snapshot()[0].child_isolate, old_child);
 }
 
+mod deferred;
 mod supervision;
 
 #[test]

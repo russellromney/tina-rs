@@ -908,6 +908,7 @@ mod tests {
                     walk(item, shape);
                 }
             }
+            Effect::ReplyTo(_, _) => shape.reply_to += 1,
         }
     }
 
@@ -921,6 +922,7 @@ mod tests {
         stop_with: usize,
         restart: usize,
         call: usize,
+        reply_to: usize,
     }
 
     fn build_request(request_id: u64, service: &str, method: &str, payload: &[u8]) -> Vec<u8> {

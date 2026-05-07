@@ -18,8 +18,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    AddressGeneration, Context, Effect, Isolate, IsolateId, Outbound as TinaOutbound,
-    RestartBudgetState, Shard, ShardId, TrySendError,
+    AddressGeneration, Context, DeferredReplyHandle, Effect, Isolate, IsolateId, MessageCaller,
+    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, TrySendError,
 };
 use tina_runtime::{
     CallId, CallInput, CallKind, CallOutcome, CallOutput, EffectKind, ListenerId,
@@ -375,6 +375,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        caller: Option<MessageCaller>,
     ) -> ErasedEffect<S>;
 }
 
@@ -422,6 +423,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        caller: Option<MessageCaller>,
     ) -> ErasedEffect<S> {
         let message = message.downcast::<Msg>().unwrap_or_else(|_| {
             panic!("simulator attempted to deliver a handler message with the wrong type")
@@ -429,6 +431,9 @@ where
 
         let effect = {
             let mut ctx = Context::new(shard, isolate_id);
+            if let Some(caller) = caller {
+                ctx = ctx.with_caller(caller);
+            }
             self.isolate.handle(*message, &mut ctx)
         };
 
@@ -526,6 +531,10 @@ where
                 .map(erase_effect::<I, S, Msg, Outbound>)
                 .collect(),
         ),
+        Effect::ReplyTo(slot, reply) => ErasedEffect::ReplyTo {
+            handle: slot.into_handle(),
+            message: Box::new(reply),
+        },
     }
 }
 
@@ -571,6 +580,10 @@ where
     RestartChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S>>),
+    ReplyTo {
+        handle: DeferredReplyHandle,
+        message: Box<dyn Any>,
+    },
 }
 
 impl<S> ErasedEffect<S>
@@ -588,6 +601,7 @@ where
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
+            Self::ReplyTo { .. } => EffectKind::ReplyTo,
         }
     }
 }

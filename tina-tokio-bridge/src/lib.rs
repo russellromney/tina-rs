@@ -410,6 +410,7 @@ where
         tina::Effect::Batch(effects) => {
             tina::Effect::Batch(effects.into_iter().map(remap_effect).collect())
         }
+        tina::Effect::ReplyTo(slot, reply) => tina::Effect::ReplyTo(slot, reply),
     }
 }
 
