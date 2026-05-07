@@ -15,9 +15,7 @@ use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpListener, HttpListenerMsg,
     HttpRequest, HttpResponse, HttpServerConfig,
 };
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, call,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call};
 
 use crate::Report;
 
@@ -50,57 +48,54 @@ impl Counter {
 }
 
 // -------------------------------------------------------------------
-// Driver: a one-shot isolate that takes one HTTP call, awaits its
-// `CallOutcome`, and forwards the result to the host thread via
-// std mpsc. The pattern keeps `run_request` simple: each call is a
-// fresh isolate that lives for exactly one request.
+// Driver: long-lived bridge isolate. Each `Begin` carries its own
+// reply `mpsc::Sender`; the sender is threaded through to `Returned`
+// via the reply closure. One Driver registration handles every
+// scripted request.
 // -------------------------------------------------------------------
+
+type ResponseResult = Result<HttpResponse, HttpClientError>;
 
 #[derive(Debug, Clone)]
 enum DriverMsg {
     Begin {
-        client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
+        client: Address<HttpClientMsg, ResponseResult>,
         target: SocketAddr,
         request: HttpRequest,
+        sender: mpsc::Sender<ResponseResult>,
     },
-    Returned(CallOutcome<Result<HttpResponse, HttpClientError>>),
+    Returned {
+        outcome: CallOutcome<ResponseResult>,
+        sender: mpsc::Sender<ResponseResult>,
+    },
 }
 
-struct Driver {
-    sender: mpsc::Sender<Result<HttpResponse, HttpClientError>>,
-}
+struct Driver;
 
-impl Isolate for Driver {
-    tina::isolate_types! {
-        message: DriverMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = DriverMsg)]
+impl Driver {
     fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             DriverMsg::Begin {
                 client,
                 target,
                 request,
+                sender,
             } => call(
                 client,
                 HttpClientMsg::call(target, request),
                 Duration::from_secs(2),
             )
-            .reply(DriverMsg::Returned),
-            DriverMsg::Returned(outcome) => {
+            .reply(move |outcome| DriverMsg::Returned { outcome, sender }),
+            DriverMsg::Returned { outcome, sender } => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
                 };
-                let _ = self.sender.send(result);
-                stop()
+                let _ = sender.send(result);
+                noop()
             }
         }
     }
@@ -108,14 +103,12 @@ impl Isolate for Driver {
 
 fn run_request(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
+    driver: Address<DriverMsg>,
+    client: Address<HttpClientMsg, ResponseResult>,
     target: SocketAddr,
     request: HttpRequest,
-) -> anyhow::Result<Result<HttpResponse, HttpClientError>> {
+) -> anyhow::Result<ResponseResult> {
     let (tx, rx) = mpsc::channel();
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(Driver { sender: tx }, 16)
-        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
     runtime
         .try_send(
             driver,
@@ -123,6 +116,7 @@ fn run_request(
                 client,
                 target,
                 request,
+                sender: tx,
             },
         )
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
@@ -167,6 +161,12 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register client: {e:?}"))?;
 
+    // Driver: long-lived bridge from the host thread into the runtime.
+    // One registration; every `run_request` reuses it.
+    let driver = runtime
+        .register_with_capacity::<_, Infallible>(Driver, 16)
+        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
+
     let mut report = Report {
         exit_clean: true,
         ..Report::default()
@@ -175,6 +175,7 @@ pub fn run() -> anyhow::Result<Report> {
     // Initial GET — counter=0.
     let r0 = run_request(
         &runtime,
+        driver,
         client,
         server_addr,
         HttpRequest::get("/counter").header("Host", "x").build(),
@@ -194,6 +195,7 @@ pub fn run() -> anyhow::Result<Report> {
     for _ in 0..3 {
         let r = run_request(
             &runtime,
+            driver,
             client,
             server_addr,
             HttpRequest::post("/counter").header("Host", "x").build(),
@@ -207,6 +209,7 @@ pub fn run() -> anyhow::Result<Report> {
     // Final GET — should be 3.
     let r4 = run_request(
         &runtime,
+        driver,
         client,
         server_addr,
         HttpRequest::get("/counter").header("Host", "x").build(),
@@ -225,6 +228,7 @@ pub fn run() -> anyhow::Result<Report> {
     // 404 for missing path.
     let r5 = run_request(
         &runtime,
+        driver,
         client,
         server_addr,
         HttpRequest::get("/missing").header("Host", "x").build(),

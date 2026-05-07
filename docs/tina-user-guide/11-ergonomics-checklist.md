@@ -195,6 +195,20 @@ Put request id / correlator in spans, events, or logs as correlation.
 Do not put high-cardinality request ids in Prometheus-style metric
 labels.
 
+### `#[isolate]` attribute: which path?
+
+Use `#[tina_runtime::isolate(message = M)]` if your `handle` calls
+`call(...)` against another isolate. The runtime path infers
+`Call = RuntimeCall<M>` from the body.
+
+Use `#[tina::isolate(message = M, ...)]` for pure
+message/reply/spawn isolates. The `tina` path defaults `Call =
+Infallible`, so `call(...).reply(...)` will not type-check there.
+
+Do not fall back to a hand-written `impl Isolate` with
+`tina::isolate_types! { call: RuntimeCall<M>, ... }` just to use
+`call(...)` — the runtime macro already does that for you.
+
 ### Registering isolates
 
 Use `runtime.register_with_capacity::<_, Infallible>(isolate, cap)`
