@@ -407,16 +407,20 @@ pub struct HttpLimits {
     /// CRLF CRLF). Slow-loris-style clients that drip-feed bytes hit this and
     /// the connection closes without reaching the service.
     pub header_read_timeout: std::time::Duration,
-    /// When `Some(chunk_size)`, the connection isolate dispatches non-empty
-    /// request bodies as [`crate::HttpRequestBody::Stream`] sources from
-    /// which the service pulls `chunk_size`-byte chunks via `call(source,
-    /// HttpConnectionMsg::RequestBodyNext, t).reply(...)`. When `None`,
-    /// the body is dispatched fully buffered (the default first-form
-    /// behaviour). Note: in either form the connection still buffers the
-    /// full body up to `max_body_bytes` from the wire before dispatch —
-    /// streaming exposes incremental consumption at the API layer; lazy
-    /// production from socket-to-service awaits a future runtime
-    /// affordance for spawn-returns-address.
+    /// When `Some(chunk_size)`, the connection isolate dispatches a
+    /// non-empty request body as a [`crate::HttpRequestBody::Stream`]
+    /// source as soon as the head parses, then pulls body bytes from
+    /// the socket on demand. The service drives the pull with
+    /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
+    /// .reply(...)`; each call returns a chunk of up to `chunk_size`
+    /// bytes (or `Eof`). The connection only issues `tcp_read` when
+    /// the buffer is empty and more body is owed, so a slow service
+    /// applies real backpressure to TCP reads and only the in-flight
+    /// chunk is resident.
+    ///
+    /// When `None` (the default), the connection accumulates the full
+    /// body up to `max_body_bytes` and dispatches a
+    /// [`crate::HttpRequestBody::Buffered`].
     pub inbound_stream_chunk_size: Option<usize>,
 }
 

@@ -401,7 +401,6 @@ fn service_full_with_concurrent_peers_replays_deterministically() {
     );
 }
 
-/// Saved seed for a multi-peer interleaving. The fingerprint below was
 /// Saved seed for a multi-peer interleaving. The pinned fingerprint
 /// below was captured under the listed config. If the trace shape
 /// changes (intentional or otherwise) this assertion fails and forces
