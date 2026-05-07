@@ -125,6 +125,15 @@ Closed by Phase 059 Rock 7. `eiffel_axum_counter` and
 Both still use the blessed `BridgeHost::new` / `register_bridge` /
 `drain_and_shutdown` lifecycle.
 
+Follow-up bridge polish rebased the HTTP-shaped bridge specimens onto
+`tina_tower_bridge::TinaTowerService`, then added the specimen-facing
+`TinaService<M, R>` alias and re-exported Tower's `Service` trait.
+The rough spots left are smaller but real: Axum handlers still use the
+`let mut svc = svc;` Tower idiom, setup is still
+`register_bridge(...)` then `TinaTowerService::new(...)`, and
+WebSocket handlers need service clones because `Service::call` takes
+`&mut self`.
+
 ### 8. RPC service topology beyond single — deferred (runtime prerequisite)
 
 Investigated and deferred in Phase 059 Rock 8. A real concurrent

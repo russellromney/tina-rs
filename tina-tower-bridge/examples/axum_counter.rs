@@ -1,5 +1,5 @@
 //! Tiny Axum app where a handler calls into a Tina service through
-//! [`TinaTowerService`].
+//! [`TinaService`].
 //!
 //! Run with:
 //!
@@ -17,9 +17,8 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use tina::prelude::*;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
-use tina_tokio_bridge::{BridgeError, BridgeHandle, BridgeHost, BridgeMessage, BridgeRequest};
-use tina_tower_bridge::TinaTowerService;
-use tower_service::Service;
+use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeRequest};
+use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 
 #[derive(Debug, Default)]
 struct Counter {
@@ -34,64 +33,29 @@ struct BrushReply {
     brushes: u64,
 }
 
-#[derive(Debug)]
-enum CounterMsg {
-    Request(BridgeRequest<BrushRequest, BrushReply>),
-}
-
-impl From<BridgeRequest<BrushRequest, BrushReply>> for CounterMsg {
-    fn from(value: BridgeRequest<BrushRequest, BrushReply>) -> Self {
-        Self::Request(value)
-    }
-}
-
-impl BridgeMessage for CounterMsg {
-    fn bridge_cancelled(&self) -> bool {
-        match self {
-            Self::Request(req) => req.bridge_cancelled(),
-        }
-    }
-}
-
-#[tina_runtime::isolate(message = CounterMsg)]
+#[tina::isolate(message = BridgeRequest<BrushRequest, BrushReply>)]
 impl Counter {
-    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
-        match msg {
-            CounterMsg::Request(req) => {
-                let (_, responder) = req.into_parts();
-                self.brushes += 1;
-                let _ = responder.respond(BrushReply {
-                    brushes: self.brushes,
-                });
-                noop()
-            }
-        }
+    fn handle(
+        &mut self,
+        msg: BridgeRequest<BrushRequest, BrushReply>,
+        _ctx: &mut Context<'_, SingleShard>,
+    ) -> Effect<Self> {
+        let (_, responder) = msg.into_parts();
+        self.brushes += 1;
+        let _ = responder.respond(BrushReply {
+            brushes: self.brushes,
+        });
+        noop()
     }
 }
 
-type CounterBridge = BridgeHandle<
-    BrushRequest,
-    BrushReply,
-    SingleShard,
-    DefaultThreadedMailboxFactory,
-    (),
-    CounterMsg,
->;
-type CounterService = TinaTowerService<
-    BrushRequest,
-    BrushReply,
-    SingleShard,
-    DefaultThreadedMailboxFactory,
-    (),
-    CounterMsg,
->;
+type CounterService = TinaService<BrushRequest, BrushReply>;
 
 async fn brush(State(svc): State<CounterService>) -> Result<String, StatusCode> {
     let mut svc = svc;
     match svc.call(BrushRequest).await {
         Ok(reply) => Ok(format!("brushed {}\n", reply.brushes)),
-        Err(BridgeError::Full) => Err(StatusCode::SERVICE_UNAVAILABLE),
-        Err(BridgeError::Closed) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(BridgeError::Full) | Err(BridgeError::Closed) => Err(StatusCode::SERVICE_UNAVAILABLE),
         Err(BridgeError::Timeout) => Err(StatusCode::GATEWAY_TIMEOUT),
     }
 }
@@ -107,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     );
-    let bridge: CounterBridge = host
+    let bridge = host
         .register_bridge::<Counter, BrushRequest, BrushReply, Infallible>(
             Counter::default(),
             32,

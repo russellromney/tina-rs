@@ -15,7 +15,8 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use tina::prelude::*;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
-use tina_tokio_bridge::{BridgeHandle, BridgeHost, BridgeRequest};
+use tina_tokio_bridge::{BridgeHost, BridgeRequest};
+use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::mpsc;
 
@@ -56,21 +57,21 @@ impl Room {
     }
 }
 
-type RoomBridge =
-    BridgeHandle<RoomRequest, RoomReply, SingleShard, DefaultThreadedMailboxFactory, ()>;
+type RoomService = TinaService<RoomRequest, RoomReply>;
 
 async fn ws_upgrade(
-    State(bridge): State<RoomBridge>,
+    State(svc): State<RoomService>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| handle_socket(socket, bridge))
+    upgrade.on_upgrade(move |socket| handle_socket(socket, svc))
 }
 
-async fn handle_socket(socket: WebSocket, bridge: RoomBridge) {
+async fn handle_socket(socket: WebSocket, svc: RoomService) {
     let (mut write, mut read) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    if bridge.call(RoomRequest::Subscribe(tx)).await.is_err() {
+    let mut sub_svc = svc.clone();
+    if sub_svc.call(RoomRequest::Subscribe(tx)).await.is_err() {
         return;
     }
 
@@ -82,10 +83,13 @@ async fn handle_socket(socket: WebSocket, bridge: RoomBridge) {
         }
     });
 
+    let mut publish_svc = svc.clone();
     while let Some(Ok(message)) = read.next().await {
         match message {
             AxumMessage::Text(text) => {
-                let _ = bridge.call(RoomRequest::Publish(text.to_string())).await;
+                let _ = publish_svc
+                    .call(RoomRequest::Publish(text.to_string()))
+                    .await;
             }
             AxumMessage::Close(_) => break,
             _ => {}
@@ -106,13 +110,14 @@ pub fn run() -> Report {
             ..Default::default()
         },
     );
-    let bridge: RoomBridge = host
+    let bridge = host
         .register_bridge::<Room, RoomRequest, RoomReply, Infallible>(
             Room::default(),
             32,
             Duration::from_secs(2),
         )
         .expect("register room bridge");
+    let svc: RoomService = TinaTowerService::new(bridge);
 
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -125,9 +130,7 @@ pub fn run() -> Report {
             .expect("bind tokio listener");
         let addr = listener.local_addr().expect("tokio listener local addr");
 
-        let app = Router::new()
-            .route("/ws", get(ws_upgrade))
-            .with_state(bridge);
+        let app = Router::new().route("/ws", get(ws_upgrade)).with_state(svc);
 
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
