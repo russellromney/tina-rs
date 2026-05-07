@@ -106,6 +106,11 @@ fn run_until_idle(runtime: &mut MultiShardRuntime<AppShard, TestMailboxFactory>)
     panic!("multi-shard runtime did not quiesce within 64 rounds");
 }
 
+/// `Bag<T>` is shared, mutable, append-only test storage. The type
+/// alias keeps tracker fields under clippy's `type_complexity` threshold
+/// and reads more clearly than a triple-nested generic.
+type Bag<T> = Rc<RefCell<Vec<T>>>;
+
 // ---------- Sharded counter first form ----------
 
 #[derive(Debug, Clone)]
@@ -185,9 +190,9 @@ impl Isolate for ShardedCounter {
 
 #[derive(Debug, Default)]
 struct CounterTracker {
-    inc_oks: Rc<RefCell<Vec<ShardId>>>,
-    inc_wrong: Rc<RefCell<Vec<WrongShard>>>,
-    get_replies: Rc<RefCell<Vec<(ShardId, u64)>>>,
+    inc_oks: Bag<ShardId>,
+    inc_wrong: Bag<WrongShard>,
+    get_replies: Bag<(ShardId, u64)>,
 }
 
 impl Isolate for CounterTracker {
@@ -440,9 +445,6 @@ impl Isolate for ShardedMap {
     }
 }
 
-// Bag<T>: shared, mutable, append-only collection. Cheap factor to keep
-// `MapTracker`'s field types under clippy's `type_complexity` threshold.
-type Bag<T> = Rc<RefCell<Vec<T>>>;
 // Per-shard `Get` outcome: which shard answered, with the placement-
 // re-checked outcome (Ok(value)/Ok(None) on the right shard, Err(WrongShard)
 // otherwise).
@@ -1452,6 +1454,90 @@ fn scatter_gather_report_preserves_caller_supplied_target_order() {
         report_shard_order, targets,
         "report.outcomes must follow caller-supplied target order"
     );
+}
+
+#[test]
+fn scatter_gather_report_ordering_holds_under_mixed_partial_outcomes() {
+    // The ordering contract has to hold even when outcomes flow through
+    // different code paths inside the coord. This test mixes a
+    // `Replied` (real counter), a `MissingShard` (target id not in the
+    // table), and a `Full` (cap-0 saturated counter) in a deliberately
+    // non-sorted target list, then asserts the report comes back in
+    // exactly the supplied target order.
+    let mut runtime = MultiShardRuntime::new(
+        [AppShard(3), AppShard(17), AppShard(91)],
+        TestMailboxFactory,
+    );
+    let placement = ShardPlacement::new(
+        "fanout",
+        vec![ShardId::new(3), ShardId::new(17), ShardId::new(91)],
+    )
+    .unwrap();
+
+    // Counter on shard 3: cap=0 → coord's send_observed sees Full.
+    // Counter on shard 17: normal cap → replies normally.
+    // Shard 91: present in placement but we register no counter for it,
+    // and we leave it OUT of the service table so the coord records
+    // MissingShard for it.
+    let mut entries = Vec::new();
+    for shard in [ShardId::new(3), ShardId::new(17)] {
+        let cap = if shard == ShardId::new(3) { 0 } else { 8 };
+        let address = runtime.register_with_capacity_on::<ShardedCounter, CounterCoordMsg>(
+            shard,
+            ShardedCounter {
+                placement: placement.clone(),
+                value: 0,
+            },
+            cap,
+        );
+        entries.push((shard, address));
+    }
+    // Build a table over a sub-placement that excludes shard 91 so the
+    // coord's `address_for(91)` lookup returns MissingShard.
+    let table_placement =
+        ShardPlacement::new("fanout-subset", vec![ShardId::new(3), ShardId::new(17)]).unwrap();
+    let table = ShardServiceTable::new(table_placement, entries).unwrap();
+
+    // Caller-supplied target order: 91 (MissingShard) → 3 (Full) → 17 (Replied).
+    let targets = vec![ShardId::new(91), ShardId::new(3), ShardId::new(17)];
+    let config = ScatterGatherConfig {
+        max_targets: targets.len(),
+        collector_capacity: targets.len(),
+        per_target_timeout: Duration::from_millis(50),
+        aggregate_timeout: Duration::from_millis(100),
+    };
+    config.validate().unwrap();
+
+    let report = run_scatter_obs(
+        &mut runtime,
+        table,
+        targets.clone(),
+        config,
+        ShardId::new(3),
+    );
+
+    // Ordering: 91, 3, 17 — exactly the target list, regardless of
+    // outcome variant or path through the coord.
+    let report_shard_order: Vec<ShardId> = report.outcomes.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        report_shard_order, targets,
+        "ordering must hold under mixed partial outcomes; got {:?}",
+        report.outcomes
+    );
+
+    // And the right outcome variant landed on each shard.
+    assert!(matches!(
+        report.outcomes[0].1,
+        ScatterGatherTargetOutcome::MissingShard
+    ));
+    assert!(matches!(
+        report.outcomes[1].1,
+        ScatterGatherTargetOutcome::Full
+    ));
+    assert!(matches!(
+        report.outcomes[2].1,
+        ScatterGatherTargetOutcome::Replied(_)
+    ));
 }
 
 #[test]

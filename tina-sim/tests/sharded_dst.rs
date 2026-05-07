@@ -609,3 +609,75 @@ fn scatter_gather_records_aggregate_timeout_when_target_does_not_reply() {
         report.outcomes
     );
 }
+
+#[test]
+fn scatter_gather_report_in_sim_preserves_caller_supplied_target_order() {
+    // The sim coord (`sharded_dst.rs::ScatterCoord`) was refactored to
+    // sort outcomes by target-list position. This test pins that
+    // contract on the sim side: a future refactor that drops the sort
+    // (or sorts by shard id again) fails here, even though the
+    // aggregate-timeout test would still pass.
+    let mut sim = sim_with(SimulatorConfig::default());
+    let placement = placement();
+
+    let mut entries = Vec::new();
+    for shard in placement.shards() {
+        let address = sim.register_with_capacity_on::<ShardedCounter, CounterMsg, TrackerMsg>(
+            *shard,
+            ShardedCounter {
+                placement: placement.clone(),
+                value: 0,
+            },
+            16,
+        );
+        entries.push((*shard, address));
+    }
+    let table = ShardServiceTable::new(placement.clone(), entries).unwrap();
+
+    // Caller-supplied targets in deliberately scrambled order
+    // (descending). placement.shards() is [11, 22, 33].
+    let targets = vec![ShardId::new(33), ShardId::new(11), ShardId::new(22)];
+    let aggregate_timeout = Duration::from_millis(200);
+    let config = ScatterGatherConfig {
+        max_targets: targets.len(),
+        collector_capacity: targets.len(),
+        per_target_timeout: Duration::from_millis(50),
+        aggregate_timeout,
+    };
+    config.validate().unwrap();
+
+    let report_slot: Rc<RefCell<Option<ScatterGatherReport<u64>>>> = Rc::new(RefCell::new(None));
+    let coord = sim.register_with_capacity_on::<ScatterCoord, ScatterCoordMsg, CounterMsg>(
+        ShardId::new(11),
+        ScatterCoord {
+            table: table.clone(),
+            bridge: None,
+            config,
+            targets: targets.clone(),
+            pending_replies: Vec::new(),
+            outcomes: Vec::with_capacity(config.max_targets),
+            report_into: Rc::clone(&report_slot),
+        },
+        16,
+    );
+    let bridge = sim.register_with_capacity_on::<
+        ReplyAdapter<TrackerMsg, ScatterCoordMsg, AppShard>,
+        TrackerMsg,
+        ScatterCoordMsg,
+    >(ShardId::new(11), ReplyAdapter::new(coord), 16);
+    sim.try_send(coord, ScatterCoordMsg::Bind { bridge })
+        .unwrap();
+    sim.try_send(coord, ScatterCoordMsg::Start).unwrap();
+    sim.run_until_quiescent();
+
+    let report = report_slot
+        .borrow_mut()
+        .take()
+        .expect("scatter coord produced a report");
+    let report_shard_order: Vec<ShardId> = report.outcomes.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        report_shard_order, targets,
+        "sim coord must preserve caller-supplied target order; got {:?}",
+        report.outcomes
+    );
+}

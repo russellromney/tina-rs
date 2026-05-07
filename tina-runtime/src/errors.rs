@@ -123,3 +123,53 @@ impl fmt::Display for ThreadedSendObservedError {
 }
 
 impl Error for ThreadedSendObservedError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_error<E: Error + 'static>(err: E, must_contain: &str) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains(must_contain),
+            "Display message {msg:?} should contain {must_contain:?}"
+        );
+        // Round-trip into Box<dyn Error> proves the trait impls compose.
+        let _: Box<dyn Error> = Box::new(err);
+    }
+
+    #[test]
+    fn threaded_runtime_error_implements_display_and_error() {
+        assert_error(ThreadedRuntimeError::WorkerStopped, "worker thread");
+        assert_error(
+            ThreadedRuntimeError::UnknownShard(tina::ShardId::new(7)),
+            "shard 7",
+        );
+        assert_error(
+            ThreadedRuntimeError::DriverShutdownFailed,
+            "driver shutdown",
+        );
+    }
+
+    #[test]
+    fn supervise_error_implements_display_and_error() {
+        assert_error(SuperviseError::UnknownParent, "parent");
+    }
+
+    #[test]
+    fn threaded_try_send_error_implements_display_and_error() {
+        assert_error(ThreadedTrySendError::IngressFull, "ingress");
+        assert_error(ThreadedTrySendError::WorkerStopped, "worker thread");
+    }
+
+    #[test]
+    fn threaded_send_observed_error_implements_display_and_error() {
+        assert_error(ThreadedSendObservedError::IngressFull, "ingress");
+        assert_error(ThreadedSendObservedError::MailboxFull, "mailbox is full");
+        assert_error(ThreadedSendObservedError::MailboxClosed, "closed or stale");
+        assert_error(
+            ThreadedSendObservedError::WorkerStopped,
+            "worker thread stopped",
+        );
+    }
+}

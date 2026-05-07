@@ -334,6 +334,12 @@ impl<E: Error + 'static> Error for ServiceTableBuildError<E> {
     }
 }
 
+impl<E> From<ShardServiceTableError> for ServiceTableBuildError<E> {
+    fn from(err: ShardServiceTableError) -> Self {
+        Self::Table(err)
+    }
+}
+
 /// Explicit ordered map from [`ShardId`] to a typed service [`Address`].
 ///
 /// The table holds the same shard list, in the same order, as its placement.
@@ -635,6 +641,12 @@ pub struct ScatterGatherReport<T> {
     pub config: ScatterGatherConfig,
     /// Per-target outcomes in caller-supplied target-list order. See
     /// the struct doc for the ordering contract.
+    ///
+    /// The field is `pub` so callers can pattern-match, destructure,
+    /// and construct reports directly in tests. Reordering this Vec
+    /// after the coord emits the report **breaks the ordering
+    /// contract**; downstream consumers must treat it as read-only,
+    /// even when they own the `ScatterGatherReport` value.
     pub outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<T>)>,
 }
 
@@ -816,6 +828,12 @@ where
     S: Shard + 'static,
 {
     target: Address<T>,
+    // `fn(M)` rather than `M`: the adapter consumes M (via .into()) but
+    // never stores one. `fn(M)` is auto-Send/Sync regardless of M's
+    // own thread-safety, which is correct since the adapter never holds
+    // an M across a .await/handler boundary. Wrapping with `S` keeps
+    // the shard parameter visible to the type system without imposing
+    // S: Send unconditionally.
     _marker: PhantomData<(fn(M), S)>,
 }
 
@@ -827,7 +845,14 @@ where
 {
     /// Creates a new adapter pointing at `target`. Pair with the
     /// runtime's `register_with_capacity_on(...)` to put it on a shard.
-    pub fn new(target: Address<T>) -> Self {
+    ///
+    /// The `T: From<M>` bound is repeated here (not just on
+    /// `impl Isolate`) so misconfigured types fail at the call site,
+    /// not at the later registration call.
+    pub fn new(target: Address<T>) -> Self
+    where
+        T: From<M>,
+    {
         Self {
             target,
             _marker: PhantomData,
@@ -964,18 +989,21 @@ mod tests {
 
     #[test]
     fn placement_require_owner_returns_ok_when_actual_matches_placement() {
+        // Frozen: under FNV-1a 64 mod 3 over [3, 17, 91], "delta" hashes to
+        // shard 17. Pinning the key removes the linear-search-through-keys
+        // pattern (fragile against future hash changes).
         let p = ShardPlacement::new("p", shards(&[3, 17, 91])).unwrap();
-        // Find a key whose owner is shard 17.
-        let key = (0..100u32)
-            .map(|n| format!("k-{n}"))
-            .find(|k| p.owner_for_str(k) == ShardId::new(17))
-            .unwrap();
         assert_eq!(
-            p.require_owner_str(&key, ShardId::new(17)).unwrap(),
+            p.owner_for_str("delta"),
+            ShardId::new(17),
+            "frozen-key invariant: delta must map to shard 17 under v1"
+        );
+        assert_eq!(
+            p.require_owner_str("delta", ShardId::new(17)).unwrap(),
             ShardId::new(17)
         );
         assert_eq!(
-            p.require_owner_bytes(key.as_bytes(), ShardId::new(17))
+            p.require_owner_bytes("delta".as_bytes(), ShardId::new(17))
                 .unwrap(),
             ShardId::new(17)
         );
@@ -983,14 +1011,16 @@ mod tests {
 
     #[test]
     fn placement_require_owner_returns_wrong_shard_on_mismatch() {
+        // Frozen: under FNV-1a 64 mod 2 over [3, 17], "gamma" hashes to
+        // shard 3. We probe it on shard 17 to force a mismatch.
         let p = ShardPlacement::new("p", shards(&[3, 17])).unwrap();
-        // Find a key owned by shard 3 and probe it on shard 17.
-        let key = (0..100u32)
-            .map(|n| format!("k-{n}"))
-            .find(|k| p.owner_for_str(k) == ShardId::new(3))
-            .unwrap();
+        assert_eq!(
+            p.owner_for_str("gamma"),
+            ShardId::new(3),
+            "frozen-key invariant: gamma must map to shard 3 under v1"
+        );
         let err = p
-            .require_owner_str(&key, ShardId::new(17))
+            .require_owner_str("gamma", ShardId::new(17))
             .expect_err("wrong shard");
         assert_eq!(
             err,
@@ -1001,7 +1031,7 @@ mod tests {
         );
         // Bytes form agrees with the str form.
         let err_bytes = p
-            .require_owner_bytes(key.as_bytes(), ShardId::new(17))
+            .require_owner_bytes("gamma".as_bytes(), ShardId::new(17))
             .expect_err("wrong shard (bytes)");
         assert_eq!(err, err_bytes);
     }

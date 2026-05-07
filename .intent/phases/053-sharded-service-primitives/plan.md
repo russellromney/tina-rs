@@ -221,11 +221,14 @@ Proof landed:
   hot-key caller-owned retry loop with strict bookkeeping (Full really
   observed; retries actually succeed), hot-key cap-0 retries that
   exercise `full_retry_total` against a real runtime, hot-key retry
-  exhaustion with budget=0, and **`scatter_gather_report_preserves_caller_supplied_target_order`**
-  (targets supplied as `[91, 3, 17]` come back in that exact order).
-  Both `ScatterCoord`s in the file now use the shipped `ReplyAdapter`
-  primitive instead of hand-written bridge isolates. Includes a frozen
-  FNV-1a byte-identical-with-sim placement check.
+  exhaustion with budget=0, **`scatter_gather_report_preserves_caller_supplied_target_order`**
+  (targets supplied as `[91, 3, 17]` come back in that exact order),
+  and **`scatter_gather_report_ordering_holds_under_mixed_partial_outcomes`**
+  (mixed `MissingShard`/`Full`/`Replied` in non-sorted target order
+  still preserves the contract). Both `ScatterCoord`s in the file now
+  use the shipped `ReplyAdapter` primitive instead of hand-written
+  bridge isolates. Includes a frozen FNV-1a byte-identical-with-sim
+  placement check.
 - `tina-runtime/tests/sharded_threaded.rs` (2) drives a real
   `ThreadedMultiShardRuntime` (Betelgeuse worker threads) over a sharded
   counter and a `WrongShard` re-check, so the live cross-shard path is
@@ -236,13 +239,15 @@ Proof landed:
   with an explicit `assert_ne!` on the trace records (so the test
   fails if the seeded perturbation does **not** actually move events),
   that `MultiShardReplayArtifact` carries the simulator config for
-  partial-aggregate seed recovery, and **virtual-time
-  `AggregateTimeout`** — a `QuietCounter` absorbs `Get` without
-  replying, the coord schedules `sleep_then(aggregate_timeout)`, virtual
-  time advances past the deadline, and the report records
-  `AggregateTimeout` for the silent target. The aggregate-timeout coord
-  also uses the shipped `ReplyAdapter` to translate counter replies into
-  its own message type.
+  partial-aggregate seed recovery, **virtual-time `AggregateTimeout`**
+  — a `QuietCounter` absorbs `Get` without replying, the coord
+  schedules `sleep_then(aggregate_timeout)`, virtual time advances
+  past the deadline, and the report records `AggregateTimeout` for the
+  silent target — and **`scatter_gather_report_in_sim_preserves_caller_supplied_target_order`**
+  (sim-side ordering contract test, so a future sim-coord refactor
+  can't quietly drop the contract). The aggregate-timeout coord uses
+  the shipped `ReplyAdapter` to translate counter replies into its
+  own message type.
 - `examples/eiffel_sharded_keyspace` (3 smoke tests) is a paired
   Tokio-vs-Tina sharded keyspace. Same SET/GET/DEL/SUM/QUIT script,
   same FNV placement, byte-identical `Report`. Tokio side is
