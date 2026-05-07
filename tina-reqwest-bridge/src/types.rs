@@ -104,8 +104,12 @@ impl std::fmt::Display for ReqwestError {
             Self::Full => f.write_str("reqwest bridge: bounded ingress full"),
             Self::Closed => f.write_str("reqwest bridge: worker closed"),
             Self::Timeout => f.write_str("reqwest bridge: request timed out"),
-            Self::RequestTooLarge => f.write_str("reqwest bridge: request body exceeds configured limit"),
-            Self::ResponseTooLarge => f.write_str("reqwest bridge: response body exceeds configured limit"),
+            Self::RequestTooLarge => {
+                f.write_str("reqwest bridge: request body exceeds configured limit")
+            }
+            Self::ResponseTooLarge => {
+                f.write_str("reqwest bridge: response body exceeds configured limit")
+            }
             Self::InvalidRequest(msg) => write!(f, "reqwest bridge: invalid request: {msg}"),
             Self::Reqwest(msg) => write!(f, "reqwest bridge: reqwest error: {msg}"),
         }
@@ -215,8 +219,8 @@ impl Default for ReqwestConfig {
         Self {
             mailbox_capacity: 64,
             max_in_flight: 16,
-            request_body_limit: 1 << 20,    // 1 MiB
-            response_body_limit: 4 << 20,   // 4 MiB
+            request_body_limit: 1 << 20,  // 1 MiB
+            response_body_limit: 4 << 20, // 4 MiB
             default_timeout: Duration::from_secs(10),
             redirect: RedirectPolicy::default(),
             retry: RetryPolicy::default(),

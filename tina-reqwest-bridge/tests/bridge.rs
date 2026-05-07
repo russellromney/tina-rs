@@ -256,7 +256,10 @@ fn closed_worker_rejects_new_sends() {
 
     closer.close();
     runtime
-        .try_send(caller_addr, CallerMsg::Run(ReqwestRequest::get(&server.url("/x"))))
+        .try_send(
+            caller_addr,
+            CallerMsg::Run(ReqwestRequest::get(&server.url("/x"))),
+        )
         .expect("kick");
     match sink.wait(Duration::from_secs(5)) {
         CallOutcome::Replied(Err(ReqwestError::Closed)) => {}
@@ -286,8 +289,7 @@ fn full_when_max_in_flight_saturated() {
     let config = ReqwestConfig::default()
         .with_max_in_flight(1)
         .with_poll_interval(Duration::from_millis(2));
-    let (worker, metrics) =
-        ReqwestWorker::<SingleShard>::new(config).expect("worker");
+    let (worker, metrics) = ReqwestWorker::<SingleShard>::new(config).expect("worker");
     let cap = worker.mailbox_capacity();
     let worker_addr = runtime
         .register_with_capacity::<_, Infallible>(worker, cap)
@@ -405,8 +407,7 @@ fn shutdown_drains_in_flight_via_close() {
         },
     ));
     let config = ReqwestConfig::default().with_poll_interval(Duration::from_millis(2));
-    let (worker, metrics) =
-        ReqwestWorker::<SingleShard>::new(config).expect("worker");
+    let (worker, metrics) = ReqwestWorker::<SingleShard>::new(config).expect("worker");
     let closer = worker.closer();
     let cap = worker.mailbox_capacity();
     let worker_addr = runtime

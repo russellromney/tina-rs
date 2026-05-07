@@ -94,6 +94,30 @@
 //! reqwest fail  -> ReqwestError::Reqwest(reason)
 //! worker closed -> ReqwestError::Closed
 //! ```
+//!
+//! # Bridge vs native
+//!
+//! `tina-http` provides a native outbound HTTP/1.1 client driven by
+//! Tina's own `tcp_*` runtime calls. That path is deterministic under
+//! `tina-sim`, has no Tokio dependency, and owns every byte. Use it
+//! when those properties matter.
+//!
+//! `tina-reqwest-bridge` wraps mature reqwest. It speaks HTTPS, HTTP/2,
+//! redirects, and connection reuse out of the box. Use it when those
+//! features matter more than determinism. The native client is the
+//! Tina-owned path; this crate is the adoption bridge.
+//!
+//! # Dropped-caller rule
+//!
+//! - Before admission: no work starts. The mailbox or `max_in_flight`
+//!   cap rejects synchronously.
+//! - After admission, before reqwest accepts: the worker spawns the
+//!   reqwest task. Closing the worker aborts the task; the caller sees
+//!   [`ReqwestError::Closed`].
+//! - After reqwest accepts: timeout or close stops waiting. The bridge
+//!   aborts the task best-effort, but bytes already on the wire stay
+//!   on the wire. Late results are discarded; counted in
+//!   [`ReqwestMetrics::late_results`].
 
 mod metrics;
 mod types;

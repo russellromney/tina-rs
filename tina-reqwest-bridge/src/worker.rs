@@ -343,9 +343,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
-                    self.metrics
-                        .reqwest_error
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.reqwest_error.fetch_add(1, Ordering::Relaxed);
                     reply::<Self>(Err(ReqwestError::Reqwest(
                         "reqwest task ended without result".into(),
                     )))
@@ -407,8 +405,15 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
 
         if let Err(err) = &result {
             if attempts_remaining > 0 {
-                if let (Some(saved), RetryPolicy::Bounded { on_full, on_timeout, on_reqwest_io, .. }) =
-                    (saved_request.as_ref(), &self.config.retry)
+                if let (
+                    Some(saved),
+                    RetryPolicy::Bounded {
+                        on_full,
+                        on_timeout,
+                        on_reqwest_io,
+                        ..
+                    },
+                ) = (saved_request.as_ref(), &self.config.retry)
                 {
                     if is_retryable(err, *on_full, *on_timeout, *on_reqwest_io) {
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
@@ -457,12 +462,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
     }
 }
 
-fn is_retryable(
-    err: &ReqwestError,
-    on_full: bool,
-    on_timeout: bool,
-    on_reqwest_io: bool,
-) -> bool {
+fn is_retryable(err: &ReqwestError, on_full: bool, on_timeout: bool, on_reqwest_io: bool) -> bool {
     match err {
         ReqwestError::Full => on_full,
         ReqwestError::Timeout => on_timeout,

@@ -69,9 +69,7 @@ impl FakeServer {
                 }
             }
         });
-        let addr = addr_rx
-            .blocking_recv()
-            .expect("fake server bound address");
+        let addr = addr_rx.blocking_recv().expect("fake server bound address");
         Self {
             addr,
             shutdown: Some(shutdown_tx),
@@ -107,7 +105,15 @@ impl Drop for FakeServer {
 }
 
 /// Reply 200 OK with `body` after `delay`.
-pub fn delayed_ok(body: &'static [u8], delay: Duration) -> impl Fn(HyperRequest<Incoming>) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>> + Send + Sync + 'static {
+pub fn delayed_ok(
+    body: &'static [u8],
+    delay: Duration,
+) -> impl Fn(
+    HyperRequest<Incoming>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>>
++ Send
++ Sync
++ 'static {
     move |_req: HyperRequest<Incoming>| {
         let body = body;
         Box::pin(async move {
@@ -121,7 +127,13 @@ pub fn delayed_ok(body: &'static [u8], delay: Duration) -> impl Fn(HyperRequest<
 }
 
 /// Reply 200 OK that drains the request body and echoes its length.
-pub fn echo_body_len() -> impl Fn(HyperRequest<Incoming>) -> std::pin::Pin<Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>> + Send + Sync + 'static {
+pub fn echo_body_len() -> impl Fn(
+    HyperRequest<Incoming>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = HyperResponse<Full<Bytes>>> + Send>,
+> + Send
++ Sync
++ 'static {
     move |req: HyperRequest<Incoming>| {
         Box::pin(async move {
             let body = req.into_body().collect().await.expect("collect body");
