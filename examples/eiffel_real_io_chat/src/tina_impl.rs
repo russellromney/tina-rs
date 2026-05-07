@@ -45,21 +45,33 @@ impl SlowClient {
 #[derive(Debug, Clone)]
 enum ConnectionMsg {
     Begin,
-    Read(Vec<u8>),
+    Read(Result<Vec<u8>, CallError>),
     Observed(SendOutcome),
-    Wrote(usize),
-    Closed,
-    IoFailed,
+    Wrote(Result<usize, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+/// Connection state that starts at zero on every accepted stream.
+/// Lives in its own struct so the spawn site reads
+/// `counts: Counts::default()` instead of zeroing five fields.
+#[derive(Debug, Default, Clone, Copy)]
+struct Counts {
+    burst: usize,
+    accepted: usize,
+    full: usize,
+    closed: usize,
+}
+
+impl Counts {
+    fn observed(&self) -> usize {
+        self.accepted + self.full + self.closed
+    }
 }
 
 struct Connection {
     stream: StreamId,
     slow_client: Address<DeliverMsg>,
-    requested_burst: usize,
-    observed: usize,
-    accepted: usize,
-    full: usize,
-    closed: usize,
+    counts: Counts,
 }
 
 #[tina_runtime::isolate(
@@ -69,14 +81,11 @@ struct Connection {
 impl Connection {
     fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
-            ConnectionMsg::Begin => tcp_read(self.stream, 32).reply(|result| match result {
-                Ok(bytes) => ConnectionMsg::Read(bytes),
-                Err(_) => ConnectionMsg::IoFailed,
-            }),
-            ConnectionMsg::Read(bytes) => {
-                self.requested_burst = parse_burst(&bytes);
+            ConnectionMsg::Begin => tcp_read(self.stream, 32).reply(ConnectionMsg::Read),
+            ConnectionMsg::Read(Ok(bytes)) => {
+                self.counts.burst = parse_burst(&bytes);
                 batch(
-                    (0..self.requested_burst)
+                    (0..self.counts.burst)
                         .map(|index| {
                             send_observed(self.slow_client, DeliverMsg(index))
                                 .reply(ConnectionMsg::Observed)
@@ -85,35 +94,31 @@ impl Connection {
                 )
             }
             ConnectionMsg::Observed(outcome) => {
-                self.observed += 1;
                 if outcome.is_accepted() {
-                    self.accepted += 1;
+                    self.counts.accepted += 1;
                 } else if outcome.is_full() {
-                    self.full += 1;
+                    self.counts.full += 1;
                 } else {
                     debug_assert!(outcome.is_closed());
-                    self.closed += 1;
+                    self.counts.closed += 1;
                 }
-                if self.observed < self.requested_burst {
+                if self.counts.observed() < self.counts.burst {
                     return noop();
                 }
                 let response = format!(
                     "accepted={} full={} closed={}\n",
-                    self.accepted, self.full, self.closed
+                    self.counts.accepted, self.counts.full, self.counts.closed,
                 )
                 .into_bytes();
-                tcp_write(self.stream, response).reply(|result| match result {
-                    Ok(count) => ConnectionMsg::Wrote(count),
-                    Err(_) => ConnectionMsg::IoFailed,
-                })
+                tcp_write(self.stream, response).reply(ConnectionMsg::Wrote)
             }
-            ConnectionMsg::Wrote(_count) => {
-                tcp_close_stream(self.stream).reply(|result| match result {
-                    Ok(()) => ConnectionMsg::Closed,
-                    Err(_) => ConnectionMsg::IoFailed,
-                })
+            ConnectionMsg::Wrote(Ok(_)) => {
+                tcp_close_stream(self.stream).reply(ConnectionMsg::Closed)
             }
-            ConnectionMsg::Closed | ConnectionMsg::IoFailed => stop(),
+            ConnectionMsg::Closed(Ok(())) => stop(),
+            ConnectionMsg::Read(Err(_))
+            | ConnectionMsg::Wrote(Err(_))
+            | ConnectionMsg::Closed(Err(_)) => stop(),
         }
     }
 }
@@ -157,11 +162,7 @@ impl Listener {
                             Connection {
                                 stream,
                                 slow_client: self.slow_client,
-                                requested_burst: 0,
-                                observed: 0,
-                                accepted: 0,
-                                full: 0,
-                                closed: 0,
+                                counts: Counts::default(),
                             },
                             self.connection_capacity,
                         )

@@ -237,6 +237,57 @@ its docstring — same-stream batches have a caveat).
 
 Do not concatenate three writes into one buffer to avoid a batch.
 
+### Continuation messages for runtime calls
+
+Use `Result<T, CallError>` directly in the message variant, then pass
+the variant constructor to `.reply(...)`:
+
+```rust
+enum ConnMsg {
+    Read(Result<Vec<u8>, CallError>),
+    Wrote(Result<usize, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+tcp_read(stream, max).reply(ConnMsg::Read);
+```
+
+Match `Ok` / `Err` per arm and collapse error arms into one
+`stop()` (or whichever cleanup) at the bottom:
+
+```rust
+ConnMsg::Read(Ok(bytes)) => { ... }
+ConnMsg::Wrote(Ok(_))    => { ... }
+ConnMsg::Closed(Ok(()))  => stop(),
+ConnMsg::Read(Err(_)) | ConnMsg::Wrote(Err(_)) | ConnMsg::Closed(Err(_)) => stop(),
+```
+
+Do not introduce a parallel `IoFailed` variant plus a per-call-site
+closure that re-maps `Err(_)` into it. That doubles the variants and
+adds the same closure to every `.reply(...)` call.
+
+### Default-zero state on isolates
+
+When an isolate carries several counters that all start at zero on
+construction, group them into a `Default`-derived sub-struct so the
+spawn site reads `counts: Counts::default()` instead of zeroing each
+field by hand:
+
+```rust
+#[derive(Debug, Default, Clone, Copy)]
+struct Counts { burst: usize, accepted: usize, full: usize, closed: usize }
+
+struct Connection {
+    stream: StreamId,
+    slow_client: Address<DeliverMsg>,
+    counts: Counts,
+}
+```
+
+Do not redundantly track a sum of other counters. If `observed ==
+accepted + full + closed`, drop `observed` and compute it inline (or
+as a small method on the sub-struct).
+
 ### TCP loops (read-to-eof, write-all)
 
 Follow the canonical patterns in
