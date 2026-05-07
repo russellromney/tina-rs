@@ -62,5 +62,5 @@ If someone with a runtime/substrate brain reads Tina, they will ask:
 
 The short answer: Tina owns semantics and resource truth; Betelgeuse is the
 canonical portable live I/O substrate; `tina-sim` is the deterministic oracle;
-North Sea is the future Linux `io_uring` backend under the same driver
-contract.
+Linux uses Betelgeuse `io_uring`, macOS uses Betelgeuse `kqueue`, and North Sea
+now means proving/tuning the Linux path under the same driver contract.

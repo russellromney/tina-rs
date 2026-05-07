@@ -172,8 +172,9 @@ Sharp edge:
 
    ```text
    Betelgeuse is Tina's canonical portable live backend.
-   North Sea is the future Linux io_uring backend.
-   Both sit under the same Tina driver contract.
+   Linux uses Betelgeuse io_uring.
+   North Sea means proving and tuning that Linux path.
+   A duplicate Tina-owned io_uring backend is evidence-gated.
    ```
 
 ## Required Proof
@@ -191,5 +192,6 @@ Sharp edge:
 - User-visible close/cancel semantics stay unchanged.
 - Tina can honestly say it keeps Betelgeuse completion/resource storage alive
   until backend release.
-- Future North Sea work has a clearer driver contract to implement.
+- Future Linux Betelgeuse / North Sea proof work has a clearer driver contract
+  to satisfy.
 - The next pressure phases can lean harder on live close/cancel behavior.

@@ -50,13 +50,15 @@ Following the abstraction-vs-implementation rule (capability traits live in thei
   only if a named workload proves the producer model needs it
 - `tina-supervisor` — supervision tree mechanism
 - `tina-runtime` — current explicit-step, simulated-driver, and
-  `ThreadedRuntime` implementation over the Betelgeuse backend
-- `tina-runtime-uring` — future Linux `io_uring` driver/substrate backend.
-  When supported, this should become the default local live backend for TCP and
-  storage rails. Tina user code must stay backend-neutral.
+  `ThreadedRuntime` implementation over the Betelgeuse backend. Betelgeuse is
+  Tina's canonical portable live substrate: Linux `io_uring`, macOS `kqueue`,
+  and a simulated backend sit behind the same Tina driver contract.
+- `tina-runtime-uring` — possible future Tina-owned Linux `io_uring`
+  driver/substrate backend only if Betelgeuse cannot satisfy a named Tina
+  contract. This is evidence-gated, not the default plan.
 - `tina-runtime-monoio` / `tina-runtime-glommio` — possible future adapter
-  backends if they preserve Tina's semantics better than a Tina-owned
-  `io_uring` driver
+  backends only if they preserve Tina's semantics better than Betelgeuse for a
+  named workload
 - `tina-runtime-tokio-bridge` — adapter for adopting tina inside an existing Tokio app
 - `tina-sim` — deterministic simulator
 
@@ -214,7 +216,7 @@ framework before public release-story work.
 | **Eiffel Tokio comparison gauntlet** | Build a root-level suite of paired Tokio-vs-Tina implementation comparisons, not a single benchmark. The goal is discovery: find where Tina is wrong, broken, half-formed, awkward, better than Tokio, worse than Tokio, or pointing at a deeper model change. Start with chat/slow-consumer broadcast, mini-redis-style TCP/keyspace sessions, narrow Axum/Tower stateful services, WebSocket bidirectional pressure, and a small multiplexed-client subset. Each comparison should include separate Tokio and Tina processes, the same protocol and metrics format, a load driver, constrained-memory/CPU/overload pressure where practical, visible failure assertions, simulator replay where possible, and notes on ergonomics/model gaps. |
 | **047 Eiffel ergonomics harvest** | Take the repeated pain from `examples/FINDINGS.md` and turn it into small Tina primitives. This is not "write more examples"; it is "make the examples less stupid to write." Ship the boring helpers first: default in-process mailbox factory, explicit mailbox/reply-slot sizing guidance, stable trace fingerprints, host-visible runtime observation handles, single-shard defaults, sequenced-call/TCP helpers, bridge lifecycle cleanup, and aligned threaded-vs-explicit runtime surfaces. Success means Eiffel examples delete side channels and boilerplate while Tina keeps the same bounded/no-hidden-work contract. |
 | **048 native HTTP service stack** | Build the first Tina-owned HTTP/1.1 server path so Tina services do not require Tokio to own the edge. Start small and first-form: parser/framing, `Content-Length`, connection isolate, service handler shape, bounded chunk bodies, visible overload, graceful shutdown, real TCP example, and DST where feasible. This is not HTTP/1.1 completeness, Axum, Tower, HTTP/2, gRPC, or a web framework. It is the first proof that Tina can speak service HTTP itself. |
-| **049 North Sea and tracing** | Build the Linux substrate and ops truth lane: `io_uring` design/spike/integration plan, capability truth, buffer ownership roadmap, platform-gated cost smoke, and `RuntimeEvent` to `tracing` integration. The explicit-step runtime remains the oracle; unsupported platforms stay honest; no DPDK, userspace TCP, zero-copy, or performance claim lands without proof. |
+| **049 Betelgeuse Linux and tracing** | Prove and surface the substrate Tina already has: Betelgeuse provides Linux `io_uring`, macOS `kqueue`, and simulated I/O under Tina's driver contract. Replace the old "build North Sea io_uring" idea with backend capability truth, Linux Betelgeuse pressure rows, simulated-backend hostile tests, long-lived completion-slot/slab planning, `tcp_set_nodelay` audit, and `RuntimeEvent` to `tracing` integration. No duplicate Tina-owned `io_uring` backend unless Betelgeuse cannot satisfy a named Tina contract. |
 | **050 Eiffel round 2: harder pressure** | Second discovery pass *after* 047 lands. Round 1 (the original Eiffel gauntlet) probed the model with small scripted comparisons. Round 2 stresses model claims and missing features the first 11 didn't reach: multi-shard routing, dynamic worker pools, external cancellation, outbound connection pooling, system-of-systems backpressure, streaming/large-payload memory pressure, periodic batching, stateful HTTP sessions, real load drivers, TLS rails, plus adversarial probes that try to break the positive claims. The point is not coverage breadth. The point is two questions: **(a)** did the 047 ergonomics harvest actually fix the surface — do the hand-rolled `Arc<Mutex<Option<_>>>` smuggles, mailbox boilerplate, and trace-polling actually go away in practice — and **(b)** what *else* breaks when the model is pushed harder? Same paired-Tokio-vs-Tina shape (with a small number of intentionally Tina-only adversarial probes), same `examples/FINDINGS.md` discipline. Round-2 backlog is below the Round-1 backlog. |
 | **051 ecosystem bridge adapters** | Make Tokio ecosystem packages fit around Tina without lying. Keep `tina-tokio-bridge` as the generic host/call/lifecycle crate, land/review `tina-rpc-tokio` as the first domain bridge proof from 058, then add small domain bridge crates where they remove real ceremony: `tina-tower-bridge`, `tina-reqwest-bridge`, and `tina-sqlx-bridge`. `tina-aws-bridge` follows as a first-class pressure proof because AWS SDK/Tokio/Hyper overload is a founding case: wrap S3/DynamoDB/SQS operations behind explicit `max_in_flight`, bounded ingress, timeout, retry visibility, and shutdown truth. Axum starts as Tower examples/helpers, not a crate. `tina-smol-bridge` is a later sketch. Every bridge must preserve visible `Full`/`Closed`/`Timeout`, explicit deadlines, bounded ingress, cancellation truth, and shutdown truth. Tokio may own the integration edge; Tina owns bounded service state behind it. |
 | **052 Tina framed calls first form** | Build a small Tina-native framed request/reply probe: boring length-prefixed TCP frames, service/method names, request ids, serde+JSON payload adapter, bounded in-flight calls, typed full/closed/timeout/error replies, client stub, service registry, simulation, and Eiffel comparison. Use off-the-shelf codec/framing pieces when they do not own I/O or scheduling. Not gRPC, not a general RPC framework, not remoting/clustering, not exactly-once, no public wire-compatibility promise. |
@@ -369,7 +371,7 @@ blockers for the first local-runtime story.
 
 | Phase | Purpose |
 |---|---|
-| **054 userspace TCP research door** | Name the future kernel-bypass/userspace TCP contract and the measurements that would justify it. This is deliberately not an implementation phase: no DPDK, no packet parser, no NIC driver, no launch promise. Kernel TCP plus North Sea `io_uring` stays the real path until evidence says otherwise. |
+| **054 userspace TCP research door** | Name the future kernel-bypass/userspace TCP contract and the measurements that would justify it. This is deliberately not an implementation phase: no DPDK, no packet parser, no NIC driver, no launch promise. Kernel TCP plus Betelgeuse's Linux `io_uring` backend stays the real path until evidence says otherwise. |
 | **Jan Peter Balkenende remoting** | Tina runtime to Tina runtime over a network with typed, bounded, traceable remote outcomes. |
 | **Mark Rutte clustering** | Membership and placement after remoting is boring, without weakening local boundedness or stale-address semantics. |
 | **Gemini release story** | Prime-time readiness only after Tina is reasonably complete: guides, invariant docs, semver/publication decision, CI/proof gate, public positioning, and adoption story. |
@@ -387,9 +389,9 @@ These should be resolved before public release or broad adoption claims:
   decision should not outrun an explicit decision.
 - **Set the MSRV/runtime-substrate policy.** The current implementation uses
   nightly-facing Betelgeuse pieces. Public release needs an explicit stable
-  story or an honest nightly-only claim. Linux should prefer the Tina-owned
-  `io_uring` backend once North Sea proves it; other platforms must report
-  their actual backend capability instead of pretending to have `io_uring`.
+  story or an honest nightly-only claim. Linux uses Betelgeuse `io_uring`,
+  macOS uses Betelgeuse `kqueue`, and other platforms must report their actual
+  backend capability instead of pretending to have `io_uring`.
 - **Strengthen CI before release.** Local `make verify` is not enough for a
   public framework claim. CI should exercise the workspace gate and the
   platform-specific substrate paths we intend to support.
