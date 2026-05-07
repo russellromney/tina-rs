@@ -419,6 +419,27 @@ fn threaded_multishard_observe_result_type_mismatch_when_value_is_wrong_type() {
 }
 
 #[test]
+#[should_panic(expected = "unknown shard")]
+fn threaded_multishard_observe_result_panics_on_unknown_shard() {
+    // Programmer error: register on shard A, ask another runtime that
+    // doesn't own A to observe its result. Matches `try_send`'s
+    // panic-on-unknown-shard convention.
+    let owner = ThreadedMultiShardRuntime::new(
+        [AppShard(11), AppShard(22), AppShard(33)],
+        WorkerMailboxFactory,
+    );
+    let worker = owner
+        .register_with_capacity_on::<Worker, _>(ShardId::new(33), Worker, 8)
+        .expect("register worker");
+
+    // Different runtime, only owns shards 100/200 — does not own
+    // shard 33 the address points at.
+    let foreign =
+        ThreadedMultiShardRuntime::new([AppShard(100), AppShard(200)], WorkerMailboxFactory);
+    let _ = foreign.observe_result::<FanoutReport, _, _>(worker);
+}
+
+#[test]
 fn threaded_multishard_observe_result_runtime_stopped_when_runtime_dropped() {
     let runtime = make_multi_shard();
     let worker = runtime

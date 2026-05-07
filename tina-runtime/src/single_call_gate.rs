@@ -55,14 +55,21 @@ impl SingleCallGate {
     /// if more work remains and the caller should schedule another
     /// timer/call; `false` if the gate is now idle.
     ///
-    /// Panics in debug if called with no pending work — the caller
-    /// must call this exactly once per resolved timer.
+    /// # Panics
+    ///
+    /// Panics if called with no pending work. The caller must call
+    /// this exactly once per resolved timer; a double-complete is a
+    /// state-machine bug we want loud, not silent. If the caller
+    /// genuinely needs to drop an in-flight tracked entry without
+    /// scheduling another (e.g. an error bail), use
+    /// [`Self::cancel_in_flight`] instead — that path is
+    /// underflow-safe.
     pub fn complete(&mut self) -> bool {
-        debug_assert!(
+        assert!(
             self.pending > 0,
             "SingleCallGate::complete called with nothing in flight"
         );
-        self.pending = self.pending.saturating_sub(1);
+        self.pending -= 1;
         self.pending > 0
     }
 
@@ -122,5 +129,21 @@ mod tests {
         g.submit();
         g.cancel_in_flight();
         assert_eq!(g.pending(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing in flight")]
+    fn complete_panics_on_double_complete() {
+        let mut g = SingleCallGate::new();
+        g.submit();
+        g.complete();
+        g.complete();
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing in flight")]
+    fn complete_panics_on_idle_gate() {
+        let mut g = SingleCallGate::new();
+        g.complete();
     }
 }

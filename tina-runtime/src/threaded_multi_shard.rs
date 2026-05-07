@@ -316,11 +316,23 @@ where
     /// - `wait` outcomes: `Timeout`, `RuntimeStopped`, `StoppedWithoutResult`,
     ///   `TypeMismatch`.
     ///
-    /// Worker stopped or shard unknown -> `RuntimeStopped`.
+    /// Worker stopped -> `RuntimeStopped`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `address.shard()` is not owned by this runtime — same
+    /// convention as [`Self::try_send`]. Passing an address from a
+    /// different runtime is a programmer error, not a runtime fault.
     pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,
     ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError> {
+        if !self.commands.contains_key(&address.shard()) {
+            panic!(
+                "ThreadedMultiShardRuntime::observe_result targeted unknown shard {}",
+                address.shard().get()
+            );
+        }
         match self.call_on(address.shard(), move |runtime| {
             runtime.observe_result::<T, M, R>(address)
         }) {

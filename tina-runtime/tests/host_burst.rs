@@ -237,6 +237,73 @@ fn send_observed_until_returns_closed_when_target_stopped() {
 }
 
 #[test]
+fn send_observed_until_attempts_at_least_once_even_with_past_deadline() {
+    let runtime = make_runtime();
+    let processed = Arc::new(AtomicU32::new(0));
+    let worker = runtime
+        .register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::clone(&processed),
+            },
+            8,
+        )
+        .expect("register slow");
+
+    // Deadline already in the past. The mailbox has room, so the
+    // first attempt must succeed.
+    let result = runtime.send_observed_until(
+        worker,
+        Instant::now() - Duration::from_secs(1),
+        Duration::from_millis(10),
+        || SlowMsg::Job(42),
+    );
+    assert_eq!(result, Ok(()));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn send_observed_until_does_not_retry_closed() {
+    // The match arms in `send_observed_until` retry only `MailboxFull`
+    // and `IngressFull`. Closed targets must surface immediately so
+    // the caller doesn't burn the deadline on a dead address.
+    let runtime = make_runtime();
+    let processed = Arc::new(AtomicU32::new(0));
+    let worker = runtime
+        .register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::clone(&processed),
+            },
+            8,
+        )
+        .expect("register slow");
+
+    let stopped = runtime.observe_isolate_complete(worker);
+    runtime.try_send(worker, SlowMsg::Stop).expect("kick stop");
+    stopped
+        .wait(Duration::from_secs(3))
+        .expect("worker stops");
+
+    // Generous deadline. If the helper looped on Closed, this would
+    // sleep until the deadline. It must return Closed immediately.
+    let start = Instant::now();
+    let result = runtime.send_observed_until(
+        worker,
+        Instant::now() + Duration::from_secs(10),
+        Duration::from_millis(50),
+        || SlowMsg::Job(0),
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(result, Err(SendObservedUntilError::Closed));
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "Closed must surface immediately, took {elapsed:?}"
+    );
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
 fn host_burst_wait_error_display_names_the_timeout() {
     // Pure API surface: Timeout's Display message is part of the
     // public contract because it shows up in `{e}` formatting.

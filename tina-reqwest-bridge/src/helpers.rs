@@ -239,7 +239,11 @@ pub enum ReqwestOutcomeClass {
 }
 
 /// Why the classifier judged the outcome retryable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` formatting includes the underlying detail (status code,
+/// transport message) so `tracing::warn!("transient: {reason:?}")` is
+/// useful without re-matching the raw outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReqwestTransientReason {
     /// Upstream returned a 5xx status.
     UpstreamServer {
@@ -252,11 +256,17 @@ pub enum ReqwestTransientReason {
     /// The reqwest worker's per-attempt timeout elapsed.
     WorkerTimeout,
     /// reqwest returned a transport-class error (connect / IO / decode).
-    WorkerTransport,
+    /// Carries the underlying message; treat the string as opaque
+    /// (reqwest message text can change between releases).
+    WorkerTransport(String),
 }
 
 /// Why the classifier judged the outcome non-retryable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` formatting includes the underlying detail (status code,
+/// validation message) so log lines stay useful without re-matching
+/// the raw outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReqwestFatalReason {
     /// Upstream returned a non-2xx non-5xx status (e.g. 4xx).
     UpstreamClient {
@@ -276,7 +286,8 @@ pub enum ReqwestFatalReason {
     /// Response body exceeded the configured cap.
     ResponseTooLarge,
     /// Request validation failed (bad URL, invalid method, etc.).
-    InvalidRequest,
+    /// Carries the underlying validation message.
+    InvalidRequest(String),
 }
 
 /// Extension trait that adds [`Self::classify`] to
@@ -317,8 +328,8 @@ impl ReqwestOutcomeExt for ReqwestCallOutcome {
             CallOutcome::Replied(Err(ReqwestError::Timeout)) => {
                 ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTimeout)
             }
-            CallOutcome::Replied(Err(ReqwestError::Reqwest(_))) => {
-                ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTransport)
+            CallOutcome::Replied(Err(ReqwestError::Reqwest(msg))) => {
+                ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTransport(msg))
             }
             CallOutcome::Replied(Err(ReqwestError::Full)) => {
                 ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerFull)
@@ -332,8 +343,8 @@ impl ReqwestOutcomeExt for ReqwestCallOutcome {
             CallOutcome::Replied(Err(ReqwestError::ResponseTooLarge)) => {
                 ReqwestOutcomeClass::Fatal(ReqwestFatalReason::ResponseTooLarge)
             }
-            CallOutcome::Replied(Err(ReqwestError::InvalidRequest(_))) => {
-                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::InvalidRequest)
+            CallOutcome::Replied(Err(ReqwestError::InvalidRequest(msg))) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::InvalidRequest(msg))
             }
             CallOutcome::Timeout => {
                 ReqwestOutcomeClass::Transient(ReqwestTransientReason::BridgeTimeout)

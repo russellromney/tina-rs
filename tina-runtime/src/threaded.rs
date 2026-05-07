@@ -492,6 +492,17 @@ where
     /// `make_message` is a closure called once per attempt so the helper
     /// can move ownership through `send_and_observe` without forcing a
     /// `Clone` constraint on `M`.
+    ///
+    /// **Backoff semantics.** `backoff` is the gap between admission
+    /// attempts, not a CPU-spin guard. Each attempt is a worker-thread
+    /// roundtrip (the same shape as [`Self::send_and_observe`]); the
+    /// helper does not pin a CPU. A `backoff` of `Duration::ZERO`
+    /// degenerates to "back-to-back attempts as fast as the worker can
+    /// drain commands" — rarely what you want, since it churns command
+    /// queue capacity that other ingress could use. Pick a backoff that
+    /// reflects how fast the data mailbox actually drains. The helper
+    /// always issues at least one attempt before returning `Timeout`,
+    /// even if `deadline <= Instant::now()` at entry.
     pub fn send_observed_until<M, R, MakeMsg>(
         &self,
         address: Address<M, R>,
@@ -552,6 +563,14 @@ where
     /// observer will *not* fire — these errors are also folded into the
     /// shared counters so [`HostBurstOutcomes::wait_complete`] still drains
     /// cleanly.
+    ///
+    /// **Message ownership.** This helper consumes `message` and does not
+    /// return it on rejection — same as the underlying
+    /// `try_send_and_observe_with`. If the caller needs to reconstruct or
+    /// re-route the message on `MailboxFull` / `IngressFull` / `Closed`,
+    /// build it inside a `FnMut() -> M` closure outside this helper, or
+    /// use [`Self::send_and_observe`] (which roundtrips through the
+    /// worker per call but returns the typed outcome synchronously).
     pub fn try_send_outcome<M, R>(
         &self,
         address: Address<M, R>,

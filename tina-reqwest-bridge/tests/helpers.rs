@@ -214,13 +214,15 @@ fn classify_bridge_timeout_distinct_from_worker_timeout() {
 }
 
 #[test]
-fn classify_reqwest_transport_error_is_transient() {
+fn classify_reqwest_transport_error_preserves_underlying_message() {
     let outcome: ReqwestCallOutcome =
         CallOutcome::Replied(Err(ReqwestError::Reqwest("connect refused".into())));
-    assert!(matches!(
-        outcome.classify(),
-        ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTransport)
-    ));
+    match outcome.classify() {
+        ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTransport(msg)) => {
+            assert_eq!(msg, "connect refused");
+        }
+        other => panic!("expected Transient(WorkerTransport(..)), got {other:?}"),
+    }
 }
 
 #[test]
@@ -266,8 +268,24 @@ fn classify_size_caps_and_invalid_request_are_fatal() {
         resp_large.classify(),
         ReqwestOutcomeClass::Fatal(ReqwestFatalReason::ResponseTooLarge)
     ));
-    assert!(matches!(
-        invalid.classify(),
-        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::InvalidRequest)
-    ));
+    match invalid.classify() {
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::InvalidRequest(msg)) => {
+            assert_eq!(msg, "bad url");
+        }
+        other => panic!("expected Fatal(InvalidRequest(..)), got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_transient_reason_debug_includes_underlying_detail() {
+    // The principal log shape is `tracing::warn!("{reason:?}")` —
+    // make sure the Debug output isn't a bare unit-variant name when
+    // the underlying error carried a message.
+    let outcome: ReqwestCallOutcome =
+        CallOutcome::Replied(Err(ReqwestError::Reqwest("dns lookup failed".into())));
+    let debug = format!("{:?}", outcome.classify());
+    assert!(
+        debug.contains("dns lookup failed"),
+        "Debug must surface the underlying transport message: {debug}"
+    );
 }
