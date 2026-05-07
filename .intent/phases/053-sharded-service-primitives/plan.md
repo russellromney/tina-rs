@@ -190,34 +190,49 @@ Proof landed:
   scatter/gather config validation, partial-aggregate counts, hot-key
   intermediate-and-terminal recording, and `Display + Error` on every
   error enum.
-- `tina-runtime/tests/sharded_primitives.rs` (11) drives the explicit-step
+- `tina-runtime/tests/sharded_primitives.rs` (13) drives the explicit-step
   `MultiShardRuntime` for: sharded counter first form, owner re-check
   returning `WrongShard`, sharded map first form (put/get/del with
-  WrongShard on writes), service-table `MissingShard` lookup, bounded
-  scatter/gather happy-path, scatter/gather **partial-failure** with
-  `MissingShard` (target outside table) and **`Full`** (cap-0 target via
-  `send_observed`), hot-key caller-owned retry loop with strict
-  bookkeeping (Full really observed; retries actually succeed), and
-  hot-key retry exhaustion with budget=0. Includes a frozen FNV-1a
+  WrongShard on writes **and on reads** — wrong-shard `Get` returns
+  `Err(WrongShard)`, not `Ok(None)`), service-table `MissingShard`
+  lookup, bounded scatter/gather happy-path, scatter/gather
+  **partial-failure** with `MissingShard` (target outside table),
+  **`Full`** (cap-0 target via `send_observed`), and **`Closed`**
+  (target isolate stopped before fanout — restart/regeneration story),
+  hot-key caller-owned retry loop with strict bookkeeping (Full really
+  observed; retries actually succeed), hot-key cap-0 retries that
+  exercise `full_retry_total` against a real runtime, and hot-key
+  retry exhaustion with budget=0. Includes a frozen FNV-1a
   byte-identical-with-sim placement check.
 - `tina-runtime/tests/sharded_threaded.rs` (2) drives a real
   `ThreadedMultiShardRuntime` (Betelgeuse worker threads) over a sharded
   counter and a `WrongShard` re-check, so the live cross-shard path is
   proved — not just the deterministic in-process explicit-step runtime.
-- `tina-sim/tests/sharded_dst.rs` (3) proves byte-identical placement
+- `tina-sim/tests/sharded_dst.rs` (4) proves byte-identical placement
   (frozen mapping shared with the runtime test), reorder-invariance
   under `LocalSendFaultMode::DelayByRounds { one_in: 1, rounds: 1 }`
-  with an explicit `assert_ne!` on the trace records (so the test fails
-  if the seeded perturbation does **not** actually move events), and
+  with an explicit `assert_ne!` on the trace records (so the test
+  fails if the seeded perturbation does **not** actually move events),
   that `MultiShardReplayArtifact` carries the simulator config for
-  partial-aggregate seed recovery.
+  partial-aggregate seed recovery, and **virtual-time
+  `AggregateTimeout`** — a `QuietCounter` absorbs `Get` without
+  replying, the coord schedules `sleep_then(aggregate_timeout)`, virtual
+  time advances past the deadline, and the report records
+  `AggregateTimeout` for the silent target.
+- `examples/eiffel_sharded_keyspace` (3 smoke tests) is a paired
+  Tokio-vs-Tina sharded keyspace. Same SET/GET/DEL/SUM/QUIT script,
+  same FNV placement, byte-identical `Report`. Tokio side is
+  `Vec<Arc<Mutex<HashMap>>>` with hand-rolled placement; Tina side is
+  `ShardPlacement` + `ShardServiceTable` + per-shard `Store` isolates
+  with owner re-check and a `Driver` that walks the script via
+  `call(...).reply(...)` continuations.
 
 Out-of-scope for first form:
 
-- DST histories for `Closed` / `Timeout` / `AggregateTimeout` per-target:
-  the report shape is wired and the partial-failure live tests cover
-  `Full` and `MissingShard`. Per-target close + virtual-time aggregate
-  timeout require a richer simulator coord scaffold; left for follow-on.
+- DST histories for `Closed` / per-target `Timeout`: `Closed` has live
+  coverage via the explicit-step restart test; per-target `Timeout`
+  (distinct from the aggregate timer) needs a richer coord that
+  watches each target deadline separately, left for follow-on.
 - Generic `ShardedMap` / `ShardedCounter` product type: not introduced
   until more shipped examples prove the shape is stable.
 

@@ -1,3 +1,6 @@
+//! Tokio side: pure axum + `Arc<Mutex<CounterState>>` shared between
+//! handlers. The whole service lives inside one Tokio runtime.
+
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -6,7 +9,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use tokio::net::TcpListener as TokioTcpListener;
 
-use super::{SideReport, scripted_client};
+use crate::{Report, scripted_client};
 
 #[derive(Default)]
 struct CounterState {
@@ -26,7 +29,7 @@ async fn increment_counter(State(state): State<AppState>) -> (StatusCode, String
     (StatusCode::OK, guard.value.to_string())
 }
 
-pub(crate) fn run() -> SideReport {
+pub fn run() -> Report {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

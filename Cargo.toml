@@ -6,11 +6,13 @@ members = [
     "tina-mailbox-spsc",
     "tina-rpc",
     "tina-rpc-macros",
+    "tina-reqwest-bridge",
     "tina-rpc-tokio",
     "tina-runtime",
     "tina-sim",
     "tina-supervisor",
     "tina-tokio-bridge",
+    "tina-tower-bridge",
 ]
 exclude = [
     "examples/eiffel_real_io_chat",

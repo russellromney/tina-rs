@@ -42,8 +42,9 @@ atomically per `POST`. The whole thing fits in one async block.
 Three first-class HTTP isolates, plus one helper:
 
 - **`Counter`** — `#[isolate(message = HttpRequest, reply =
-  HttpResponse)]`. The handler matches on `(request.method,
-  request.path)` and returns an `HttpResponse`.
+  HttpResponse)]`. The handler dispatches through a
+  `StatefulRouter<Counter>` (Phase 059 Rock 6) and returns an
+  `HttpResponse`. `.method_not_allowed()` distinguishes 405 from 404.
 - **`HttpListener<SingleShard>`** — bound with
   `HttpServerConfig::dev()`; ties the counter address to the
   network. Address comes back via `runtime.observe_next_bound()`.

@@ -1,17 +1,24 @@
+//! Tina-vs-Tokio: a small counter service exposed over Axum, where
+//! the Tina side keeps the counter in a `Counter` isolate and bridges
+//! requests across the two-runtime boundary via `tina_tokio_bridge`.
+//!
+//! Read [`tokio_impl`] and [`tina_impl`] top-to-bottom; the README
+//! compares feel and discusses the two-runtime cost.
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-mod tina_impl;
-mod tokio_impl;
+pub mod tina_impl;
+pub mod tokio_impl;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SideReport {
+pub struct Report {
     pub statuses: Vec<u16>,
     pub bodies: Vec<String>,
 }
 
-impl SideReport {
+impl Report {
     pub fn assert_expected(&self) {
         assert_eq!(
             self.statuses,
@@ -26,21 +33,10 @@ impl SideReport {
     }
 }
 
-pub fn run_tokio_side() -> SideReport {
-    tokio_impl::run()
-}
-
-pub fn run_tina_side() -> SideReport {
-    tina_impl::run()
-}
-
-/// The three-step scripted HTTP client used by both sides.
-///
-/// 1. POST /counter/increment → "1"
-/// 2. POST /counter/increment → "2"
-/// 3. GET  /counter           → "2"
-pub(crate) fn scripted_client(addr: SocketAddr) -> SideReport {
-    let mut report = SideReport {
+/// Three-step scripted HTTP client used by both sides:
+/// `POST /counter/increment` → `POST /counter/increment` → `GET /counter`.
+pub fn scripted_client(addr: SocketAddr) -> Report {
+    let mut report = Report {
         statuses: Vec::new(),
         bodies: Vec::new(),
     };
@@ -62,14 +58,12 @@ fn http_request(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .expect("set read timeout");
-
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     );
     stream
         .write_all(request.as_bytes())
         .expect("write http request");
-
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
     parse_http_response(&response)
@@ -84,8 +78,7 @@ fn parse_http_response(bytes: &[u8]) -> (u16, String) {
             break;
         }
     }
-    assert!(header_end > 0, "missing header/body delimiter in response");
-
+    assert!(header_end > 0, "missing header/body delimiter");
     let status_line = text.lines().next().expect("status line");
     let status = status_line
         .split_whitespace()

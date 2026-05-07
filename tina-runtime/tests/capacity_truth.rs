@@ -1,4 +1,4 @@
-//! Phase 047 Rock 2: mailbox capacity truth tests.
+//! Mailbox capacity truth tests.
 //!
 //! These tests pin the rule that runtime-call replies, isolate-call
 //! replies, and observed-send replies all land in the requester's mailbox.

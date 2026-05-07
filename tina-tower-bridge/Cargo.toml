@@ -1,0 +1,22 @@
+[package]
+name = "tina-tower-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "tower::Service adapter over a Tina bridge handle"
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina = { path = "../tina" }
+tina-runtime = { path = "../tina-runtime" }
+tina-tokio-bridge = { path = "../tina-tokio-bridge" }
+tower-service = "0.3"
+tokio = { version = "1.48.0", default-features = false, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["full"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }

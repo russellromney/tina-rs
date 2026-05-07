@@ -124,7 +124,7 @@ fn build_isolate(
             "missing required isolate option `message = ...`",
         ));
     };
-    // Phase 047 Rock 5: `shard = ...` is now optional. Single-shard
+    // `shard = ...` is optional. Single-shard
     // programs default to `tina::SingleShard`; multi-shard programs
     // continue to declare their own shard type explicitly. The default is
     // a real type (not a global mutable singleton), so registration still

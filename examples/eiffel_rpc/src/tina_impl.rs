@@ -18,8 +18,8 @@ use tina_rpc::{
     RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
 };
 use tina_runtime::{
-    CallError, DefaultThreadedMailboxFactory, ListenerId, ThreadedRuntime, tcp_accept, tcp_bind,
-    tcp_close_listener,
+    DefaultThreadedMailboxFactory, ListenerId, TcpAcceptReply, TcpBindReply, TcpListenerCloseReply,
+    ThreadedRuntime, tcp_accept, tcp_bind, tcp_close_listener,
 };
 
 use crate::{Report, RunConfig};
@@ -51,9 +51,9 @@ impl Echo for EchoState {
 #[derive(Debug, Clone)]
 enum ListenerMsg {
     Start,
-    Bound(Result<(ListenerId, SocketAddr), CallError>),
-    Accepted(Result<(tina_runtime::StreamId, SocketAddr), CallError>),
-    ListenerClosed(Result<(), CallError>),
+    Bound(TcpBindReply),
+    Accepted(TcpAcceptReply),
+    ListenerClosed(TcpListenerCloseReply),
 }
 
 struct Listener {

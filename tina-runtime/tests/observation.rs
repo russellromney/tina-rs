@@ -1,4 +1,4 @@
-//! Phase 047 Rock 4: typed observation handle tests.
+//! Typed observation handle tests.
 //!
 //! Slice 1 covers the bound-address waiter; slice 2 (this file's later
 //! tests) covers isolate-complete, operation-done, and child-restarted
@@ -16,8 +16,8 @@ use std::time::Duration;
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina::{RestartBudget, RestartPolicy};
 use tina_runtime::{
-    CallError, CallKind, ListenerId, MailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
-    WaitError, sleep, tcp_bind, tcp_close_listener,
+    CallError, CallKind, ListenerId, MailboxFactory, ResultWaitError, ThreadedRuntime,
+    ThreadedRuntimeConfig, WaitError, sleep, tcp_bind, tcp_close_listener,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -490,4 +490,371 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     assert!(crashed.load(Ordering::Relaxed) >= 1);
 
     let _ = runtime.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Typed isolate result waiters.
+// ---------------------------------------------------------------------------
+
+/// Final value carried back to the host via `stop_with`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResultPayload {
+    successes: u32,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
+enum ResultMsg {
+    /// Finish with a typed payload.
+    FinishWithResult(ResultPayload),
+    /// Finish without publishing a typed payload.
+    FinishWithoutResult,
+    /// Finish with a value of a *different* type than the host requested.
+    FinishWithMismatchedType,
+}
+
+#[derive(Debug, Default)]
+struct ResultProducer;
+
+#[tina_runtime::isolate(message = ResultMsg, shard = TestShard)]
+impl ResultProducer {
+    fn handle(&mut self, msg: ResultMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+        match msg {
+            ResultMsg::FinishWithResult(payload) => stop_with(payload),
+            ResultMsg::FinishWithoutResult => stop(),
+            // u64 != ResultPayload — TypeMismatch on the host.
+            ResultMsg::FinishWithMismatchedType => stop_with(99u64),
+        }
+    }
+}
+
+fn spawn_producer(
+    runtime: &ThreadedRuntime<TestShard, TestMailboxFactory>,
+) -> Address<ResultMsg, ()> {
+    runtime
+        .register_with_capacity::<ResultProducer, Infallible>(ResultProducer, 8)
+        .expect("register producer")
+}
+
+#[test]
+fn result_waiter_resolves_with_typed_value() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let waiter = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("register result waiter");
+
+    let payload = ResultPayload {
+        successes: 7,
+        bytes: 1234,
+    };
+    runtime
+        .try_send(producer, ResultMsg::FinishWithResult(payload.clone()))
+        .expect("kick producer");
+
+    let resolved = waiter
+        .wait(Duration::from_secs(3))
+        .expect("waiter resolves");
+    assert_eq!(resolved, payload);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn result_waiter_times_out_when_no_stop() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let waiter = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("register result waiter");
+
+    let outcome = waiter.wait(Duration::from_millis(50));
+    assert_eq!(outcome, Err(ResultWaitError::Timeout));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn result_waiter_runtime_stopped_when_runtime_dropped() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let waiter = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("register result waiter");
+
+    drop(runtime);
+
+    let outcome = waiter.wait(Duration::from_secs(1));
+    assert_eq!(outcome, Err(ResultWaitError::RuntimeStopped));
+}
+
+#[test]
+fn result_waiter_dropped_does_not_block_isolate_stop() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    {
+        let _doomed = runtime
+            .observe_result::<ResultPayload, _, _>(producer)
+            .expect("register result waiter");
+    }
+
+    // Isolate stops cleanly even though waiter went away. Use the standard
+    // complete waiter to confirm the lifecycle event still fired.
+    let stopped = runtime.observe_isolate_complete(producer);
+    runtime
+        .try_send(
+            producer,
+            ResultMsg::FinishWithResult(ResultPayload {
+                successes: 1,
+                bytes: 0,
+            }),
+        )
+        .expect("kick producer");
+
+    stopped.wait(Duration::from_secs(3)).expect("isolate stops");
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn result_waiter_stopped_without_result_when_isolate_uses_plain_stop() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let waiter = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("register result waiter");
+
+    runtime
+        .try_send(producer, ResultMsg::FinishWithoutResult)
+        .expect("kick producer");
+
+    let outcome = waiter.wait(Duration::from_secs(3));
+    assert_eq!(outcome, Err(ResultWaitError::StoppedWithoutResult));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn result_waiter_type_mismatch_when_stop_with_value_is_wrong_type() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let waiter = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("register result waiter");
+
+    runtime
+        .try_send(producer, ResultMsg::FinishWithMismatchedType)
+        .expect("kick producer");
+
+    let outcome = waiter.wait(Duration::from_secs(3));
+    assert_eq!(outcome, Err(ResultWaitError::TypeMismatch));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn observe_result_is_already_claimed_on_second_register() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let _first = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("first register succeeds");
+
+    let second = runtime.observe_result::<ResultPayload, _, _>(producer);
+    assert_eq!(second.err(), Some(ResultWaitError::AlreadyClaimed));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn observe_result_is_already_stopped_when_isolate_already_finished() {
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let stopped = runtime.observe_isolate_complete(producer);
+    runtime
+        .try_send(producer, ResultMsg::FinishWithoutResult)
+        .expect("kick producer");
+    stopped.wait(Duration::from_secs(3)).expect("isolate stops");
+
+    // A late registration cannot replay any value the isolate might have
+    // produced.
+    let late = runtime.observe_result::<ResultPayload, _, _>(producer);
+    assert_eq!(late.err(), Some(ResultWaitError::AlreadyStopped));
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn result_waiter_observes_isolate_already_stopped_when_resolved() {
+    // P2 regression: the result must only resolve after the runtime has
+    // marked the isolate stopped, emitted IsolateStopped, and cancelled
+    // requester-owned driver calls. observe_isolate_complete is the
+    // proxy for "was IsolateStopped emitted yet?"; if the result waiter
+    // wakes first, the complete waiter would still be unresolved.
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let result = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("register result waiter");
+    let stopped = runtime.observe_isolate_complete(producer);
+
+    runtime
+        .try_send(
+            producer,
+            ResultMsg::FinishWithResult(ResultPayload {
+                successes: 1,
+                bytes: 1,
+            }),
+        )
+        .expect("kick producer");
+
+    // Wait for the result first.
+    let _ = result
+        .wait(Duration::from_secs(3))
+        .expect("waiter resolves");
+    // The IsolateStopped event must already be visible: a 0ms wait
+    // should resolve immediately.
+    stopped
+        .wait(Duration::from_millis(0))
+        .expect("isolate is already marked stopped before result observed");
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn dropped_result_waiter_does_not_block_re_registration() {
+    // P2 regression: a dropped/timed-out waiter must not leave a ghost
+    // single-claim slot. A fresh observe_result on the same address
+    // should succeed and resolve normally.
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    {
+        let _doomed = runtime
+            .observe_result::<ResultPayload, _, _>(producer)
+            .expect("first register");
+    }
+
+    // Stale slot is reclaimed on next register.
+    let fresh = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("re-register after drop");
+
+    runtime
+        .try_send(
+            producer,
+            ResultMsg::FinishWithResult(ResultPayload {
+                successes: 9,
+                bytes: 9,
+            }),
+        )
+        .expect("kick producer");
+
+    let value = fresh
+        .wait(Duration::from_secs(3))
+        .expect("fresh waiter resolves");
+    assert_eq!(value.successes, 9);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn timed_out_result_waiter_does_not_block_re_registration() {
+    // Same as the dropped case but going through `wait` + Timeout — the
+    // waiter is consumed by `wait`, abandoning the claim.
+    let runtime = make_runtime();
+    let producer = spawn_producer(&runtime);
+
+    let timed_out = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("first register");
+    assert_eq!(
+        timed_out.wait(Duration::from_millis(20)),
+        Err(ResultWaitError::Timeout)
+    );
+
+    let fresh = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("re-register after timeout");
+
+    runtime
+        .try_send(
+            producer,
+            ResultMsg::FinishWithResult(ResultPayload {
+                successes: 3,
+                bytes: 3,
+            }),
+        )
+        .expect("kick producer");
+
+    let value = fresh
+        .wait(Duration::from_secs(3))
+        .expect("fresh waiter resolves");
+    assert_eq!(value.successes, 3);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn dropped_result_waiters_for_distinct_isolates_do_not_fill_observation_cap() {
+    // P2 regression: dropping a result waiter for one (isolate,
+    // generation) used to leave its slot pinned to the global cap
+    // until the same address re-registered. Many distinct isolates
+    // could thus exhaust the cap purely via abandoned slots. After
+    // the prune-on-cap-check fix, registering and dropping a fresh
+    // waiter for distinct isolates does not raise pending_count.
+    let runtime = make_runtime();
+    // Register and drop result waiters for a sequence of distinct
+    // isolates well past the observation cap.
+    for _ in 0..(2 * 1024) {
+        let producer = spawn_producer(&runtime);
+        {
+            let _doomed = runtime
+                .observe_result::<ResultPayload, _, _>(producer)
+                .expect("register result waiter");
+        }
+        // Stop the producer to keep entry table tidy.
+        let stopped = runtime.observe_isolate_complete(producer);
+        runtime
+            .try_send(producer, ResultMsg::FinishWithoutResult)
+            .expect("kick producer");
+        let _ = stopped.wait(Duration::from_secs(1));
+    }
+
+    // After all of those drops, registering a fresh waiter against a
+    // brand-new isolate must still succeed.
+    let producer = spawn_producer(&runtime);
+    let waiter = runtime
+        .observe_result::<ResultPayload, _, _>(producer)
+        .expect("registering after many abandoned slots succeeds");
+    let _ = waiter; // drop is fine
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn observe_result_is_observation_full_when_cap_reached() {
+    let runtime = make_runtime();
+
+    // Saturate the observation registry with bound waiters.
+    let mut bound_waiters = Vec::new();
+    for _ in 0..1024 {
+        bound_waiters.push(runtime.observe_next_bound());
+    }
+
+    let producer = spawn_producer(&runtime);
+    let outcome = runtime.observe_result::<ResultPayload, _, _>(producer);
+    assert_eq!(outcome.err(), Some(ResultWaitError::ObservationFull));
+
+    let _ = runtime.shutdown();
+    drop(bound_waiters);
 }

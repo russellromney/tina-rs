@@ -900,6 +900,7 @@ mod tests {
             Effect::Send(_) => shape.send += 1,
             Effect::Spawn(_) => shape.spawn += 1,
             Effect::Stop => shape.stop += 1,
+            Effect::StopWith(_) => shape.stop_with += 1,
             Effect::RestartChildren => shape.restart += 1,
             Effect::Call(_) => shape.call += 1,
             Effect::Batch(items) => {
@@ -917,6 +918,7 @@ mod tests {
         send: usize,
         spawn: usize,
         stop: usize,
+        stop_with: usize,
         restart: usize,
         call: usize,
     }
