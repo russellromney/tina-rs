@@ -275,6 +275,39 @@ Tina inside a Tokio edge.
 
 Do not do `Arc::try_unwrap` shutdown dances in examples.
 
+### Bridge state aliases
+
+Use `tina_tower_bridge::TinaService<M, R>`. Do not spell out the
+six-generic `TinaTowerService<M, R, SingleShard,
+DefaultThreadedMailboxFactory, ()>`.
+
+Use `tina_reqwest_bridge::ReqwestAddress` for the worker address
+field. Do not spell out
+`Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>`.
+
+Use `tina_reqwest_bridge::ReqwestCallOutcome` for the AppMsg variant
+payload that carries the reply.
+
+### Bridge call helpers
+
+Use `tina_reqwest_bridge::send_request(addr, req, timeout)`. Do not
+hand-wrap `call(addr, ReqwestMsg::Send(req), timeout)`.
+
+Use the re-exported `tina_tower_bridge::Service`. Do not add a direct
+`tower-service` dep in your `Cargo.toml`.
+
+### Bridge error layering
+
+Match on the layered `CallOutcome<Result<...>>` shape by default. The
+outer arm is *bridge delivery* truth, the inner is *worker outcome*
+truth. Do not collapse them silently.
+
+For app-edge code that does not need to distinguish, opt in to
+`flatten_outcome(...)`. The flat `ReqwestCallError::Bridge(...)` /
+`Worker(...)` variants still name which layer failed.
+
+See [Bridge Crates](18-bridge-crates.md) for the contract.
+
 ### Ordered effects
 
 Use `tina::sequence(...)` for "do these effects one after another."

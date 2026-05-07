@@ -14,17 +14,16 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_reqwest_bridge::{
-    ReqwestConfig, ReqwestError, ReqwestMsg, ReqwestRequest, ReqwestResponse, ReqwestWorker,
+    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestRequest, ReqwestWorker, send_request,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
 #[derive(Debug)]
 enum AppMsg {
     Start(String),
-    HttpReturned(CallOutcome<Result<ReqwestResponse, ReqwestError>>),
+    HttpReturned(ReqwestCallOutcome),
 }
 
 #[derive(Default)]
@@ -57,7 +56,7 @@ impl DoneSignal {
 }
 
 struct App {
-    http: Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
+    http: ReqwestAddress,
     done: Arc<DoneSignal>,
 }
 
@@ -75,14 +74,12 @@ impl Isolate for App {
         match msg {
             AppMsg::Start(url) => {
                 println!("fetching {url}");
-                call(
-                    self.http,
-                    ReqwestMsg::Send(ReqwestRequest::get(&url)),
-                    Duration::from_secs(5),
-                )
-                .reply(AppMsg::HttpReturned)
+                send_request(self.http, ReqwestRequest::get(&url), Duration::from_secs(5))
+                    .reply(AppMsg::HttpReturned)
             }
             AppMsg::HttpReturned(outcome) => {
+                // Layered match — the recommended shape. Bridge-layer
+                // and worker-layer failures are visibly distinct.
                 match outcome {
                     CallOutcome::Replied(Ok(response)) => {
                         println!(
@@ -98,6 +95,20 @@ impl Isolate for App {
                     CallOutcome::Closed => println!("err bridge closed"),
                     CallOutcome::Timeout => println!("err call timeout"),
                 }
+                // Or, with the opt-in flatten helper:
+                //
+                // ```ignore
+                // use tina_reqwest_bridge::{flatten_outcome, ReqwestCallError};
+                // match flatten_outcome(outcome) {
+                //     Ok(response)                       => { ... }
+                //     Err(ReqwestCallError::Bridge(b))   => { ... }
+                //     Err(ReqwestCallError::Worker(e))   => { ... }
+                // }
+                // ```
+                //
+                // Use the layered form by default. Use `flatten_outcome`
+                // only when the call site is genuinely an app edge that
+                // does not need to distinguish the two layers.
                 self.done.signal();
                 stop()
             }
