@@ -2,10 +2,21 @@
 
 ## Status
 
-- Done: Eiffel `eiffel_sqlite_counter` proved the gap.
-- In progress: 061 deferred replies landed; bridge crates have first forms.
-- Open: build the first bounded DB bridge and write down bridge parallelism truth.
-- Deferred: `tina-sqlx-bridge`, native Postgres wire, pooling, migrations, ORM, schema tools.
+- Done: `tina-sqlite-bridge` first form landed. One connection, one
+  blocking std thread, autocommit only. `external_pool_size` and
+  `max_in_flight` pinned to `1` at config validation. Typed
+  `SqliteError` covers admission (`Full`, `Closed`, `InvalidRequest`),
+  per-attempt timeout, response cap, `Busy`, `Constraint`, `Io`,
+  generic `Sqlite`, and `Internal`. Late worker results after a
+  bridge timeout are observed by a watcher thread and counted as
+  `late_results`. Eiffel `eiffel_sqlite_counter` rewired to use the
+  bridge; both Tokio and Tina sides land on `final_value = 50`.
+- Done: Eiffel `eiffel_sqlite_counter` proved the gap, and the rewrite
+  removes inline `rusqlite::Connection::execute` from the handler.
+- Open: write the next-slice plan (Postgres / SQLx / pooled SQLite)
+  once 063 lessons are written down.
+- Deferred: `tina-sqlx-bridge`, native Postgres wire, pooling,
+  migrations, ORM, schema tools, transactions, typed row mapping.
 
 ## Goal
 

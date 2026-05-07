@@ -156,6 +156,7 @@ The repository is a Cargo workspace:
 | [`tina-rpc`](tina-rpc/) | First-form framed request/reply, service registry, typed service helpers, and bounded RPC semantics. |
 | [`tina-rpc-tokio`](tina-rpc-tokio/) | Tokio async facade over native Tina RPC for ecosystem-edge callers. |
 | [`tina-tokio-bridge`](tina-tokio-bridge/) | Bounded ingress from a host Tokio runtime into a Tina service, for axum/Tower/Hyper integration. |
+| [`tina-sqlite-bridge`](tina-sqlite-bridge/) | First-form SQLite worker around `rusqlite`. One connection, one blocking thread, autocommit only, named caps for mailbox / in-flight / pool / pending replies. |
 
 End consumers depend on `tina` plus one runtime or simulator crate.
 

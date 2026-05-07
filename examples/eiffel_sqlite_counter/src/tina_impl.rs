@@ -1,18 +1,9 @@
-//! Tina side. A single `SqliteWorker` isolate owns a
-//! `rusqlite::Connection` and runs each query synchronously inside
-//! its handler. There is no native database bridge yet (see
-//! ROADMAP phase 055 "native database first form" and Round 2
-//! finding 8); this specimen documents the shape today and what is
-//! missing.
-//!
-//! Because rusqlite calls run inline in `handle`, the isolate's
-//! shard thread is blocked for the duration of each query. SQLite
-//! operations are fast in practice (microseconds for a single
-//! `UPDATE`), so for a single-shard adoption-grade specimen this is
-//! acceptable. **It is not the right shape for a multi-shard
-//! production database client**, where blocking the shard thread
-//! prevents *every* other isolate on that shard from running. The
-//! README discussion calls this out.
+//! Tina side. Driver calls into a `tina-sqlite-bridge` worker that
+//! owns the single `rusqlite::Connection` on a blocking thread. Each
+//! SQL op goes through `tina_runtime::call(...)`; the shard thread
+//! never runs SQLite. Compare to `tokio_impl.rs` (`spawn_blocking` +
+//! `Arc<Mutex<Connection>>`): same blocking-thread shape, but the
+//! Tina side names every pressure cap and surfaces typed failures.
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -21,51 +12,102 @@ use std::time::Duration;
 
 use rusqlite::{Connection, params};
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+};
+use tina_sqlite_bridge::{
+    SqliteAddress, SqliteCallOutcome, SqliteCloser, SqliteConfig, SqliteRequest, SqliteResponse,
+    SqliteValue, SqliteWorker,
+};
 
 use crate::{INCREMENTS, Report};
 
 #[derive(Debug)]
-enum SqliteMsg {
-    /// One `UPDATE counter SET value = value + 1` query.
-    Increment,
-    /// Read the final value, populate the `Report`, and `stop_with`.
+enum DriverMsg {
+    Step,
+    Stepped(SqliteCallOutcome),
     Finalize,
+    Finalized(SqliteCallOutcome),
 }
 
-struct SqliteWorker {
-    conn: Connection,
-    /// Local count, kept so the host can spot drift between the
-    /// isolate's view and the database's view at finalize time.
-    local_count: u64,
+struct Driver {
+    db: SqliteAddress,
+    remaining: u32,
+    timeout: Duration,
     report: Report,
+    closer: SqliteCloser,
 }
 
-#[tina_runtime::isolate(message = SqliteMsg)]
-impl SqliteWorker {
-    fn handle(&mut self, msg: SqliteMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+impl Isolate for Driver {
+    tina::isolate_types! {
+        message: DriverMsg,
+        reply: Report,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<DriverMsg>,
+        shard: SingleShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
-            SqliteMsg::Increment => {
-                // Synchronous SQL inside the handler. The shard
-                // thread blocks for the duration. See README.
-                self.conn
-                    .execute("UPDATE counter SET value = value + 1 WHERE id = 0", [])
-                    .expect("update");
-                self.local_count += 1;
-                noop()
-            }
-            SqliteMsg::Finalize => {
-                let value: i64 = self
-                    .conn
-                    .query_row("SELECT value FROM counter WHERE id = 0", [], |row| row.get(0))
-                    .expect("read final value");
-                self.report.final_value = value as u64;
-                self.report.exit_clean = true;
-                debug_assert_eq!(
-                    self.report.final_value, self.local_count,
-                    "isolate counter ({}) and database ({}) should agree",
-                    self.local_count, self.report.final_value,
-                );
+            DriverMsg::Step => tina_sqlite_bridge::send_request(
+                self.db,
+                SqliteRequest::Execute {
+                    sql: "UPDATE counter SET value = value + 1 WHERE id = 0".into(),
+                    params: vec![],
+                },
+                self.timeout,
+            )
+            .reply(DriverMsg::Stepped),
+            DriverMsg::Stepped(outcome) => match outcome {
+                CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 1 })) => {
+                    self.remaining -= 1;
+                    // Self-message via zero sleep continuation.
+                    let next = if self.remaining == 0 {
+                        DriverMsg::Finalize
+                    } else {
+                        DriverMsg::Step
+                    };
+                    tina_runtime::sleep(Duration::from_millis(0))
+                        .reply(move |_| next)
+                }
+                other => {
+                    eprintln!("eiffel_sqlite_counter (tina): unexpected step outcome {other:?}");
+                    self.closer.close();
+                    stop_with(self.report)
+                }
+            },
+            DriverMsg::Finalize => tina_sqlite_bridge::send_request(
+                self.db,
+                SqliteRequest::QueryRows {
+                    sql: "SELECT value FROM counter WHERE id = 0".into(),
+                    params: vec![],
+                    max_rows: 1,
+                },
+                self.timeout,
+            )
+            .reply(DriverMsg::Finalized),
+            DriverMsg::Finalized(outcome) => {
+                match outcome {
+                    CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => {
+                        if let Some(row) = rows.into_iter().next() {
+                            if let Some(SqliteValue::Integer(v)) = row.into_iter().next() {
+                                self.report.final_value = v as u64;
+                                self.report.exit_clean = true;
+                            }
+                        }
+                    }
+                    other => {
+                        eprintln!(
+                            "eiffel_sqlite_counter (tina): unexpected finalize outcome {other:?}"
+                        );
+                    }
+                }
+                self.closer.close();
                 stop_with(self.report)
             }
         }
@@ -75,38 +117,58 @@ impl SqliteWorker {
 pub fn run() -> anyhow::Result<Report> {
     let dir = tempfile::tempdir()?;
     let path: PathBuf = dir.path().join("counter-tina.sqlite");
-    let conn = open_and_init(&path)?;
+    seed_database(&path)?;
 
     let runtime = Arc::new(ThreadedRuntime::new(
         SingleShard,
         DefaultThreadedMailboxFactory,
     ));
 
-    let worker = SqliteWorker {
-        conn,
-        local_count: 0,
+    let cfg = SqliteConfig::path(&path)
+        .with_default_timeout(Duration::from_secs(5))
+        .with_busy_timeout(Duration::from_secs(2))
+        .with_pragma("journal_mode = WAL")
+        .with_poll_interval(Duration::from_millis(1));
+    let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg)
+        .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
+
+    let driver = Driver {
+        db: bridge.address,
+        remaining: INCREMENTS,
+        timeout: Duration::from_secs(5),
         report: Report::default(),
+        closer: bridge.closer.clone(),
     };
-    let addr = runtime
-        .register_with_capacity::<_, Infallible>(worker, 128)
-        .map_err(|e| anyhow::anyhow!("register sqlite worker: {e:?}"))?;
+    let driver_addr = runtime
+        .register_with_capacity::<_, Infallible>(driver, 16)
+        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
     let waiter = runtime
-        .observe_result::<Report, _, _>(addr)
+        .observe_result::<Report, _, _>(driver_addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    for _ in 0..INCREMENTS {
-        runtime
-            .try_send(addr, SqliteMsg::Increment)
-            .map_err(|e| anyhow::anyhow!("try_send Increment: {e:?}"))?;
-    }
     runtime
-        .try_send(addr, SqliteMsg::Finalize)
-        .map_err(|e| anyhow::anyhow!("try_send Finalize: {e:?}"))?;
+        .try_send(driver_addr, DriverMsg::Step)
+        .map_err(|e| anyhow::anyhow!("try_send Step: {e:?}"))?;
 
     let report = waiter
-        .wait(Duration::from_secs(10))
-        .map_err(|e| anyhow::anyhow!("worker did not finish: {e:?}"))?;
+        .wait(Duration::from_secs(30))
+        .map_err(|e| anyhow::anyhow!("driver did not finish: {e:?}"))?;
+
+    let snap = bridge.metrics.snapshot();
+    eprintln!(
+        "eiffel_sqlite_counter (tina) bridge metrics: \
+         admitted={} executed={} rows={} timeouts={} late={} full={} closed={} \
+         high_water={}",
+        snap.admitted,
+        snap.worker_executed,
+        snap.worker_rows,
+        snap.timeouts,
+        snap.late_results,
+        snap.full,
+        snap.closed,
+        snap.in_flight_high_water,
+    );
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
@@ -115,7 +177,7 @@ pub fn run() -> anyhow::Result<Report> {
     Ok(report)
 }
 
-fn open_and_init(path: &std::path::Path) -> anyhow::Result<Connection> {
+fn seed_database(path: &std::path::Path) -> anyhow::Result<()> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);",
@@ -124,5 +186,5 @@ fn open_and_init(path: &std::path::Path) -> anyhow::Result<Connection> {
         "INSERT OR IGNORE INTO counter (id, value) VALUES (0, 0)",
         params![],
     )?;
-    Ok(conn)
+    Ok(())
 }

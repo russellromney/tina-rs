@@ -7,6 +7,7 @@ members = [
     "tina-rpc",
     "tina-rpc-macros",
     "tina-reqwest-bridge",
+    "tina-sqlite-bridge",
     "tina-rpc-tokio",
     "tina-runtime",
     "tina-sim",

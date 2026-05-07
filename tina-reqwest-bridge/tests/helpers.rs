@@ -177,8 +177,9 @@ fn classify_2xx_is_succeeded() {
 
 #[test]
 fn classify_503_is_transient_upstream_server() {
-    let outcome: ReqwestCallOutcome =
-        CallOutcome::Replied(Ok(response_with_status(http::StatusCode::SERVICE_UNAVAILABLE)));
+    let outcome: ReqwestCallOutcome = CallOutcome::Replied(Ok(response_with_status(
+        http::StatusCode::SERVICE_UNAVAILABLE,
+    )));
     match outcome.classify() {
         ReqwestOutcomeClass::Transient(ReqwestTransientReason::UpstreamServer { status }) => {
             assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
@@ -253,10 +254,8 @@ fn classify_worker_full_and_closed_are_fatal() {
 
 #[test]
 fn classify_size_caps_and_invalid_request_are_fatal() {
-    let req_large: ReqwestCallOutcome =
-        CallOutcome::Replied(Err(ReqwestError::RequestTooLarge));
-    let resp_large: ReqwestCallOutcome =
-        CallOutcome::Replied(Err(ReqwestError::ResponseTooLarge));
+    let req_large: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::RequestTooLarge));
+    let resp_large: ReqwestCallOutcome = CallOutcome::Replied(Err(ReqwestError::ResponseTooLarge));
     let invalid: ReqwestCallOutcome =
         CallOutcome::Replied(Err(ReqwestError::InvalidRequest("bad url".into())));
 

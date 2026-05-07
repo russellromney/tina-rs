@@ -154,8 +154,8 @@ mod worker;
 
 pub use helpers::{
     BridgeFailure, ReqwestAddress, ReqwestCallError, ReqwestCallOutcome, ReqwestFatalReason,
-    ReqwestOutcomeClass, ReqwestOutcomeExt, ReqwestResult, ReqwestTransientReason,
-    flatten_outcome, send_request,
+    ReqwestOutcomeClass, ReqwestOutcomeExt, ReqwestResult, ReqwestTransientReason, flatten_outcome,
+    send_request,
 };
 pub use metrics::{ReqwestMetrics, ReqwestMetricsHandle};
 pub use types::{

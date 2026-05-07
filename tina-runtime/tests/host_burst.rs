@@ -221,9 +221,7 @@ fn send_observed_until_returns_closed_when_target_stopped() {
 
     let stopped = runtime.observe_isolate_complete(worker);
     runtime.try_send(worker, SlowMsg::Stop).expect("stop");
-    stopped
-        .wait(Duration::from_secs(3))
-        .expect("worker stops");
+    stopped.wait(Duration::from_secs(3)).expect("worker stops");
 
     let outcome = runtime.send_observed_until(
         worker,
@@ -299,12 +297,10 @@ fn send_observed_until_bounds_observation_when_worker_is_slow() {
 
     let started = Instant::now();
     let cap = Duration::from_millis(150);
-    let result = runtime.send_observed_until(
-        worker,
-        started + cap,
-        Duration::from_millis(20),
-        || SlowMsg::Job(1),
-    );
+    let result =
+        runtime.send_observed_until(worker, started + cap, Duration::from_millis(20), || {
+            SlowMsg::Job(1)
+        });
     let elapsed = started.elapsed();
 
     // Either the worker drains and we admit, or we Timeout at the
@@ -342,9 +338,7 @@ fn send_observed_until_does_not_retry_closed() {
 
     let stopped = runtime.observe_isolate_complete(worker);
     runtime.try_send(worker, SlowMsg::Stop).expect("kick stop");
-    stopped
-        .wait(Duration::from_secs(3))
-        .expect("worker stops");
+    stopped.wait(Duration::from_secs(3)).expect("worker stops");
 
     // Generous deadline. If the helper looped on Closed, this would
     // sleep until the deadline. It must return Closed immediately.

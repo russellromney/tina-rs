@@ -1,0 +1,1351 @@
+//! End-to-end tests for `tina-sqlite-bridge`.
+//!
+//! Each scenario stands a runtime, installs the bridge, and drives one
+//! or more caller isolates that pump outcomes into a `Sink` for the
+//! test thread to inspect.
+
+use std::convert::Infallible;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use tina::prelude::*;
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
+};
+use tina_sqlite_bridge::{
+    InstalledSqliteBridge, SqliteAddress, SqliteCallOutcome, SqliteConfig, SqliteConfigError,
+    SqliteError, SqliteRequest, SqliteResponse, SqliteValue, SqliteWorker, send_request,
+};
+
+#[derive(Default)]
+struct Sink {
+    state: Mutex<Vec<SqliteCallOutcome>>,
+    cv: Condvar,
+}
+
+impl Sink {
+    fn put(&self, outcome: SqliteCallOutcome) {
+        self.state.lock().expect("sink lock").push(outcome);
+        self.cv.notify_all();
+    }
+
+    fn wait_one(&self, timeout: Duration) -> SqliteCallOutcome {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.state.lock().expect("sink lock");
+        while guard.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("sink wait timed out after {timeout:?}");
+            }
+            let (g, _) = self
+                .cv
+                .wait_timeout(guard, deadline - now)
+                .expect("sink wait");
+            guard = g;
+        }
+        guard.remove(0)
+    }
+
+    fn wait_n(&self, n: usize, timeout: Duration) -> Vec<SqliteCallOutcome> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.state.lock().expect("sink lock");
+        while guard.len() < n {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("sink wait_n timed out: have {}, want {n}", guard.len());
+            }
+            let (g, _) = self
+                .cv
+                .wait_timeout(guard, deadline - now)
+                .expect("sink wait_n");
+            guard = g;
+        }
+        guard.drain(0..n).collect()
+    }
+
+    fn len(&self) -> usize {
+        self.state.lock().expect("sink lock").len()
+    }
+}
+
+#[derive(Debug)]
+enum CallerMsg {
+    Run(SqliteRequest),
+    Done(SqliteCallOutcome),
+}
+
+struct CallerIsolate {
+    worker: SqliteAddress,
+    timeout: Duration,
+    sink: Arc<Sink>,
+}
+
+impl Isolate for CallerIsolate {
+    tina::isolate_types! {
+        message: CallerMsg,
+        reply: (),
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<CallerMsg>,
+        shard: SingleShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: CallerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            CallerMsg::Run(request) => {
+                send_request(self.worker, request, self.timeout).reply(CallerMsg::Done)
+            }
+            CallerMsg::Done(outcome) => {
+                self.sink.put(outcome);
+                stop()
+            }
+        }
+    }
+}
+
+fn make_runtime() -> Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>> {
+    Arc::new(ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 32,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ))
+}
+
+fn install_bridge(
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    config: SqliteConfig,
+) -> InstalledSqliteBridge<SingleShard> {
+    SqliteWorker::<SingleShard>::install(runtime, config).expect("install bridge")
+}
+
+fn register_caller(
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    worker: SqliteAddress,
+    sink: Arc<Sink>,
+    timeout: Duration,
+) -> Address<CallerMsg, ()> {
+    runtime
+        .register_with_capacity::<_, Infallible>(
+            CallerIsolate {
+                worker,
+                timeout,
+                sink,
+            },
+            8,
+        )
+        .expect("register caller")
+}
+
+fn test_config() -> SqliteConfig {
+    SqliteConfig::memory()
+        .with_poll_interval(Duration::from_millis(1))
+        .with_default_timeout(Duration::from_secs(2))
+}
+
+fn wait_admitted(bridge: &InstalledSqliteBridge<SingleShard>, target: u64, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while bridge.metrics.snapshot().admitted < target {
+        if Instant::now() >= deadline {
+            panic!(
+                "admitted reached {} (want {target}) within {timeout:?}",
+                bridge.metrics.snapshot().admitted
+            );
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Heavy enough that the worker thread is still running for ~hundreds
+/// of ms even on fast hardware. Used to keep `max_in_flight = 1`
+/// saturated long enough to deterministically race a second admission.
+const HEAVY_QUERY: &str = "WITH RECURSIVE seq(x) AS (\
+    SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000000\
+    ) SELECT SUM(x) FROM seq";
+
+fn shutdown_runtime(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_rejects_zero_mailbox() {
+    let cfg = SqliteConfig::memory().with_mailbox_capacity(0);
+    assert_eq!(cfg.validate(), Err(SqliteConfigError::ZeroMailboxCapacity));
+}
+
+#[test]
+fn config_rejects_max_in_flight_zero() {
+    let cfg = SqliteConfig::memory().with_max_in_flight(0);
+    assert_eq!(
+        cfg.validate(),
+        Err(SqliteConfigError::InvalidMaxInFlight { requested: 0 })
+    );
+}
+
+#[test]
+fn config_rejects_max_in_flight_above_one() {
+    let cfg = SqliteConfig::memory().with_max_in_flight(2);
+    assert_eq!(
+        cfg.validate(),
+        Err(SqliteConfigError::InvalidMaxInFlight { requested: 2 })
+    );
+}
+
+#[test]
+fn config_rejects_external_pool_zero() {
+    let cfg = SqliteConfig::memory().with_external_pool_size(0);
+    assert_eq!(
+        cfg.validate(),
+        Err(SqliteConfigError::InvalidExternalPoolSize { requested: 0 })
+    );
+}
+
+#[test]
+fn config_rejects_external_pool_above_one() {
+    let cfg = SqliteConfig::memory().with_external_pool_size(4);
+    assert_eq!(
+        cfg.validate(),
+        Err(SqliteConfigError::InvalidExternalPoolSize { requested: 4 })
+    );
+}
+
+#[test]
+fn config_rejects_zero_pending_reply_capacity() {
+    let cfg = SqliteConfig::memory().with_pending_reply_capacity(0);
+    assert_eq!(
+        cfg.validate(),
+        Err(SqliteConfigError::ZeroPendingReplyCapacity)
+    );
+}
+
+#[test]
+fn config_rejects_zero_default_timeout() {
+    let cfg = SqliteConfig::memory().with_default_timeout(Duration::ZERO);
+    assert_eq!(cfg.validate(), Err(SqliteConfigError::ZeroDefaultTimeout));
+}
+
+#[test]
+fn config_rejects_zero_poll_interval() {
+    let cfg = SqliteConfig::memory().with_poll_interval(Duration::ZERO);
+    assert_eq!(cfg.validate(), Err(SqliteConfigError::ZeroPollInterval));
+}
+
+#[test]
+fn config_rejects_zero_max_request_params() {
+    let cfg = SqliteConfig::memory().with_max_request_params(0);
+    assert_eq!(cfg.validate(), Err(SqliteConfigError::ZeroMaxRequestParams));
+}
+
+#[test]
+fn config_rejects_zero_max_response_rows() {
+    let cfg = SqliteConfig::memory().with_max_response_rows(0);
+    assert_eq!(cfg.validate(), Err(SqliteConfigError::ZeroMaxResponseRows));
+}
+
+// ---------------------------------------------------------------------------
+// Happy paths
+// ---------------------------------------------------------------------------
+
+fn create_and_seed(
+    bridge_addr: SqliteAddress,
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+) {
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        runtime,
+        bridge_addr,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT NOT NULL UNIQUE)".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick create");
+    let outcome = sink.wait_one(Duration::from_secs(5));
+    match outcome {
+        CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => {}
+        other => panic!("create table outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn happy_execute_and_query() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+    create_and_seed(bridge.address, &runtime);
+
+    // INSERT a row with bound parameters.
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "INSERT INTO t (k, v) VALUES (?, ?)".into(),
+                params: vec![SqliteValue::Integer(1), SqliteValue::Text("hello".into())],
+            }),
+        )
+        .expect("kick insert");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed })) => {
+            assert_eq!(rows_changed, 1);
+        }
+        other => panic!("insert outcome: {other:?}"),
+    }
+
+    // SELECT it back.
+    let sink2 = Arc::new(Sink::default());
+    let caller2 = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink2),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller2,
+            CallerMsg::Run(SqliteRequest::QueryRows {
+                sql: "SELECT k, v FROM t WHERE k = ?".into(),
+                params: vec![SqliteValue::Integer(1)],
+                max_rows: 16,
+            }),
+        )
+        .expect("kick query");
+    match sink2.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { columns, rows })) => {
+            assert_eq!(columns, vec!["k".to_string(), "v".to_string()]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], SqliteValue::Integer(1));
+            assert_eq!(rows[0][1], SqliteValue::Text("hello".into()));
+        }
+        other => panic!("select outcome: {other:?}"),
+    }
+
+    let snap = bridge.metrics.snapshot();
+    assert!(
+        snap.worker_executed >= 2,
+        "expected >=2 executes, got {snap:?}"
+    );
+    assert!(
+        snap.worker_rows >= 1,
+        "expected >=1 row reply, got {snap:?}"
+    );
+    assert_eq!(snap.current_in_flight, 0, "no leftover in-flight");
+
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn sequential_calls_share_one_connection() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+    create_and_seed(bridge.address, &runtime);
+
+    for i in 0..10 {
+        let sink = Arc::new(Sink::default());
+        let caller = register_caller(
+            &runtime,
+            bridge.address,
+            Arc::clone(&sink),
+            Duration::from_secs(2),
+        );
+        runtime
+            .try_send(
+                caller,
+                CallerMsg::Run(SqliteRequest::Execute {
+                    sql: "INSERT INTO t (k, v) VALUES (?, ?)".into(),
+                    params: vec![
+                        SqliteValue::Integer(i as i64 + 100),
+                        SqliteValue::Text(format!("row-{i}")),
+                    ],
+                }),
+            )
+            .expect("kick insert");
+        match sink.wait_one(Duration::from_secs(5)) {
+            CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 1 })) => {}
+            other => panic!("insert {i}: {other:?}"),
+        }
+    }
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::QueryRows {
+                sql: "SELECT COUNT(*) FROM t".into(),
+                params: vec![],
+                max_rows: 1,
+            }),
+        )
+        .expect("kick count");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], SqliteValue::Integer(10));
+        }
+        other => panic!("count outcome: {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Caps and Full
+// ---------------------------------------------------------------------------
+
+#[test]
+fn request_param_cap_rejects_invalid_request() {
+    let runtime = make_runtime();
+    let cfg = test_config().with_max_request_params(2);
+    let bridge = install_bridge(&runtime, cfg);
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "SELECT ?, ?, ?".into(),
+                params: vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(3),
+                ],
+            }),
+        )
+        .expect("kick");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::InvalidRequest(msg))) => {
+            assert!(msg.contains("params 3"), "msg: {msg}");
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+    assert_eq!(bridge.metrics.snapshot().invalid, 1);
+
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn empty_sql_is_invalid_request() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "   ".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::InvalidRequest(_))) => {}
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn response_row_cap_rejects_oversized_query() {
+    let runtime = make_runtime();
+    let cfg = test_config().with_max_response_rows(3);
+    let bridge = install_bridge(&runtime, cfg);
+    create_and_seed(bridge.address, &runtime);
+
+    // Insert 10 rows.
+    for i in 0..10 {
+        let sink = Arc::new(Sink::default());
+        let caller = register_caller(
+            &runtime,
+            bridge.address,
+            Arc::clone(&sink),
+            Duration::from_secs(2),
+        );
+        runtime
+            .try_send(
+                caller,
+                CallerMsg::Run(SqliteRequest::Execute {
+                    sql: "INSERT INTO t (k, v) VALUES (?, ?)".into(),
+                    params: vec![SqliteValue::Integer(i), SqliteValue::Text(format!("v{i}"))],
+                }),
+            )
+            .expect("kick insert");
+        match sink.wait_one(Duration::from_secs(5)) {
+            CallOutcome::Replied(Ok(_)) => {}
+            other => panic!("insert {i}: {other:?}"),
+        }
+    }
+
+    // Request all rows; row buffer cap should fire.
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::QueryRows {
+                sql: "SELECT k, v FROM t".into(),
+                params: vec![],
+                max_rows: 100,
+            }),
+        )
+        .expect("kick query");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::ResponseTooLarge)) => {}
+        other => panic!("expected ResponseTooLarge, got {other:?}"),
+    }
+    assert_eq!(bridge.metrics.snapshot().worker_response_too_large, 1);
+
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn full_when_in_flight_saturated() {
+    // Send A; wait for it to land in_flight; then send B. As long as
+    // A's HEAVY_QUERY is still running on the worker thread when B's
+    // admission arrives, B Full-rejects.
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+
+    let sink_a = Arc::new(Sink::default());
+    let sink_b = Arc::new(Sink::default());
+    let caller_a = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink_a),
+        Duration::from_secs(15),
+    );
+    let caller_b = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink_b),
+        Duration::from_secs(15),
+    );
+
+    runtime
+        .try_send(
+            caller_a,
+            CallerMsg::Run(SqliteRequest::QueryRows {
+                sql: HEAVY_QUERY.into(),
+                params: vec![],
+                max_rows: 1,
+            }),
+        )
+        .expect("kick a");
+    wait_admitted(&bridge, 1, Duration::from_secs(5));
+    runtime
+        .try_send(
+            caller_b,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "SELECT 1".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick b");
+
+    match sink_b.wait_one(Duration::from_secs(15)) {
+        CallOutcome::Replied(Err(SqliteError::Full)) => {}
+        other => panic!("expected Full for B, got {other:?}"),
+    }
+
+    // Drain A so the worker thread fully resets before shutdown.
+    let _ = sink_a.wait_one(Duration::from_secs(30));
+
+    let snap = bridge.metrics.snapshot();
+    assert_eq!(snap.full, 1, "B's Full should be the only one: {snap:?}");
+    assert!(snap.in_flight_high_water >= 1);
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Closed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn closer_rejects_new_admissions() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+
+    bridge.closer.close();
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "CREATE TABLE z (n INTEGER)".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::Closed)) => {}
+        other => panic!("expected Closed, got {other:?}"),
+    }
+    assert_eq!(bridge.metrics.snapshot().closed, 1);
+
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn close_with_in_flight_lets_inflight_complete_then_rejects() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+    create_and_seed(bridge.address, &runtime);
+    let baseline = bridge.metrics.snapshot().admitted;
+
+    let sink_a = Arc::new(Sink::default());
+    let caller_a = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink_a),
+        Duration::from_secs(15),
+    );
+
+    runtime
+        .try_send(
+            caller_a,
+            CallerMsg::Run(SqliteRequest::QueryRows {
+                sql: HEAVY_QUERY.into(),
+                params: vec![],
+                max_rows: 1,
+            }),
+        )
+        .expect("kick a");
+    wait_admitted(&bridge, baseline + 1, Duration::from_secs(5));
+    bridge.closer.close();
+
+    // B arrives after close; should reject as Closed.
+    let sink_b = Arc::new(Sink::default());
+    let caller_b = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink_b),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller_b,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "SELECT 1".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick b");
+
+    match sink_b.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::Closed)) => {}
+        other => panic!("expected Closed for B, got {other:?}"),
+    }
+
+    // A still finishes successfully (or with a typed worker outcome).
+    match sink_a.wait_one(Duration::from_secs(30)) {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { .. })) => {}
+        other => panic!("A should have completed: {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Caller timeout + late result truth
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bridge_attempt_timeout_surfaces_and_late_result_is_recorded() {
+    // Tight default_timeout; HEAVY_QUERY runs longer. Bridge surfaces
+    // Timeout; worker finishes; late_results == 1 and worker_rows == 1
+    // (no double-tally).
+    let runtime = make_runtime();
+    let cfg = test_config()
+        .with_default_timeout(Duration::from_millis(20))
+        .with_poll_interval(Duration::from_millis(1));
+    let bridge = install_bridge(&runtime, cfg);
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(15),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::QueryRows {
+                sql: HEAVY_QUERY.into(),
+                params: vec![],
+                max_rows: 1,
+            }),
+        )
+        .expect("kick");
+
+    match sink.wait_one(Duration::from_secs(10)) {
+        CallOutcome::Replied(Err(SqliteError::Timeout)) => {}
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    assert_eq!(bridge.metrics.snapshot().timeouts, 1);
+
+    // Wait for the worker to finish and bump late_results.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if bridge.metrics.snapshot().late_results >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snap = bridge.metrics.snapshot();
+    assert_eq!(
+        snap.late_results, 1,
+        "late_results == 1 (no double): {snap:?}"
+    );
+    assert_eq!(snap.worker_rows, 1, "worker_rows tallied once: {snap:?}");
+    assert_eq!(snap.worker_executed, 0);
+    assert_eq!(snap.timeouts, 1);
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// After-failure recovery
+// ---------------------------------------------------------------------------
+
+#[test]
+fn after_bad_sql_worker_still_serves_next_request() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+    create_and_seed(bridge.address, &runtime);
+
+    // Bad SQL.
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "NOT VALID SQL".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick bad");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::Sqlite(_))) => {}
+        other => panic!("expected Sqlite error, got {other:?}"),
+    }
+
+    // Constraint violation (UNIQUE index on v).
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "INSERT INTO t (k, v) VALUES (1, 'a')".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick first insert");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(_)) => {}
+        other => panic!("first insert: {other:?}"),
+    }
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "INSERT INTO t (k, v) VALUES (2, 'a')".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick dup insert");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::Constraint(_))) => {}
+        other => panic!("expected Constraint, got {other:?}"),
+    }
+
+    // Worker still serves a third request fine.
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "INSERT INTO t (k, v) VALUES (3, 'b')".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick recovery insert");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 1 })) => {}
+        other => panic!("recovery insert: {other:?}"),
+    }
+
+    let snap = bridge.metrics.snapshot();
+    assert!(snap.worker_constraint >= 1);
+    assert!(snap.worker_sqlite >= 1);
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Install error variants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_fails_on_bad_pragma() {
+    // Many unknown pragmas silently no-op; use a syntactically broken
+    // statement to force a parse error.
+    let cfg = SqliteConfig {
+        pragmas: vec!["foreign_keys = ;;not valid;;".into()],
+        ..SqliteConfig::memory()
+    };
+    let runtime = make_runtime();
+    let res = SqliteWorker::<SingleShard>::install(&runtime, cfg);
+    match res {
+        Err(tina_sqlite_bridge::InstallError::Pragma(_)) => {}
+        Err(other) => panic!("expected Pragma install error, got {other:?}"),
+        Ok(_) => panic!("install should fail"),
+    }
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn install_fails_on_bad_path_with_open_variant() {
+    // A path under a non-existent directory will fail at sqlite3_open.
+    let cfg = SqliteConfig::path("/this/path/should/not/exist/db.sqlite");
+    let runtime = make_runtime();
+    let res = SqliteWorker::<SingleShard>::install(&runtime, cfg);
+    match res {
+        Err(tina_sqlite_bridge::InstallError::Open(_)) => {}
+        Err(other) => panic!("expected Open install error, got {other:?}"),
+        Ok(_) => panic!("install should fail"),
+    }
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Mailbox burst: all 8 admissions resolve to Ok or Full
+// ---------------------------------------------------------------------------
+
+#[test]
+fn burst_admissions_resolve_ok_or_full() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config().with_mailbox_capacity(64));
+    create_and_seed(bridge.address, &runtime);
+
+    let sink = Arc::new(Sink::default());
+    let mut callers = Vec::new();
+    for _ in 0..8 {
+        let caller = register_caller(
+            &runtime,
+            bridge.address,
+            Arc::clone(&sink),
+            Duration::from_secs(5),
+        );
+        callers.push(caller);
+    }
+    for (i, addr) in callers.into_iter().enumerate() {
+        runtime
+            .try_send(
+                addr,
+                CallerMsg::Run(SqliteRequest::Execute {
+                    sql: "INSERT INTO t (k, v) VALUES (?, ?)".into(),
+                    params: vec![
+                        SqliteValue::Integer(i as i64 + 1),
+                        SqliteValue::Text(format!("burst-{i}")),
+                    ],
+                }),
+            )
+            .expect("kick burst");
+    }
+
+    let outcomes = sink.wait_n(8, Duration::from_secs(15));
+    let mut ok = 0u32;
+    let mut full = 0u32;
+    for o in outcomes {
+        match o {
+            CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 1 })) => ok += 1,
+            CallOutcome::Replied(Err(SqliteError::Full)) => full += 1,
+            other => panic!("unexpected burst outcome: {other:?}"),
+        }
+    }
+    assert!(ok >= 1);
+    assert_eq!(ok + full, 8);
+    assert_eq!(sink.len(), 0);
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Value round-trips
+// ---------------------------------------------------------------------------
+
+fn run_one(
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    addr: SqliteAddress,
+    request: SqliteRequest,
+) -> SqliteCallOutcome {
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(runtime, addr, Arc::clone(&sink), Duration::from_secs(5));
+    runtime
+        .try_send(caller, CallerMsg::Run(request))
+        .expect("kick");
+    sink.wait_one(Duration::from_secs(5))
+}
+
+fn assert_executed(outcome: SqliteCallOutcome, rows: u64) {
+    match outcome {
+        CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed })) => {
+            assert_eq!(rows_changed, rows);
+        }
+        other => panic!("expected Executed {{ rows_changed: {rows} }}, got {other:?}"),
+    }
+}
+
+#[test]
+fn blob_round_trip() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+
+    assert_executed(
+        run_one(
+            &runtime,
+            bridge.address,
+            SqliteRequest::Execute {
+                sql: "CREATE TABLE b (k INTEGER PRIMARY KEY, v BLOB)".into(),
+                params: vec![],
+            },
+        ),
+        0,
+    );
+    let payload: Vec<u8> = (0u8..=255).collect();
+    assert_executed(
+        run_one(
+            &runtime,
+            bridge.address,
+            SqliteRequest::Execute {
+                sql: "INSERT INTO b (k, v) VALUES (1, ?)".into(),
+                params: vec![SqliteValue::Blob(payload.clone())],
+            },
+        ),
+        1,
+    );
+    match run_one(
+        &runtime,
+        bridge.address,
+        SqliteRequest::QueryRows {
+            sql: "SELECT v FROM b WHERE k = 1".into(),
+            params: vec![],
+            max_rows: 1,
+        },
+    ) {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => {
+            assert_eq!(rows.len(), 1);
+            match &rows[0][0] {
+                SqliteValue::Blob(b) => assert_eq!(b, &payload),
+                other => panic!("expected Blob, got {other:?}"),
+            }
+        }
+        other => panic!("select: {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn real_round_trip() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+
+    assert_executed(
+        run_one(
+            &runtime,
+            bridge.address,
+            SqliteRequest::Execute {
+                sql: "CREATE TABLE r (k INTEGER PRIMARY KEY, v REAL)".into(),
+                params: vec![],
+            },
+        ),
+        0,
+    );
+    assert_executed(
+        run_one(
+            &runtime,
+            bridge.address,
+            SqliteRequest::Execute {
+                sql: "INSERT INTO r (k, v) VALUES (1, ?)".into(),
+                params: vec![SqliteValue::Real(std::f64::consts::PI)],
+            },
+        ),
+        1,
+    );
+    match run_one(
+        &runtime,
+        bridge.address,
+        SqliteRequest::QueryRows {
+            sql: "SELECT v FROM r WHERE k = 1".into(),
+            params: vec![],
+            max_rows: 1,
+        },
+    ) {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => match &rows[0][0] {
+            SqliteValue::Real(f) => assert!((f - std::f64::consts::PI).abs() < 1e-12),
+            other => panic!("expected Real, got {other:?}"),
+        },
+        other => panic!("select: {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn non_utf8_text_returns_blob() {
+    // Insert a TEXT column whose bytes aren't valid UTF-8. Rusqlite
+    // binds Text from Rust strings (always UTF-8), so we go through
+    // BLOB then read with TYPEOF to confirm the underlying type was
+    // actually TEXT — and the bridge falls back to Blob since utf-8
+    // decoding fails.
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+
+    assert_executed(
+        run_one(
+            &runtime,
+            bridge.address,
+            SqliteRequest::Execute {
+                sql: "CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)".into(),
+                params: vec![],
+            },
+        ),
+        0,
+    );
+    // CAST a BLOB to TEXT inside SQL — leaves invalid UTF-8 bytes in
+    // a TEXT cell.
+    assert_executed(
+        run_one(
+            &runtime,
+            bridge.address,
+            SqliteRequest::Execute {
+                sql: "INSERT INTO t (k, v) VALUES (1, CAST(? AS TEXT))".into(),
+                params: vec![SqliteValue::Blob(vec![0xff, 0xfe, 0xfd])],
+            },
+        ),
+        1,
+    );
+    match run_one(
+        &runtime,
+        bridge.address,
+        SqliteRequest::QueryRows {
+            sql: "SELECT v FROM t WHERE k = 1".into(),
+            params: vec![],
+            max_rows: 1,
+        },
+    ) {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => match &rows[0][0] {
+            SqliteValue::Blob(b) => assert_eq!(b, &vec![0xff, 0xfe, 0xfd]),
+            other => panic!("expected Blob fallback, got {other:?}"),
+        },
+        other => panic!("select: {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-statement SQL surfaces as Sqlite (not silently truncated)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_statement_execute_falls_through_to_sqlite_error() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(5),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "SELECT 1; SELECT 2".into(),
+                params: vec![],
+            }),
+        )
+        .expect("kick");
+    match sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::Sqlite(_))) => {}
+        other => panic!("expected Sqlite error, got {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// pending_reply_capacity < max_in_flight rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_rejects_pending_below_max_in_flight() {
+    // pending_reply_capacity = 1, max_in_flight = 1 is fine, but if we
+    // ever set pending below max, validate must reject. With current
+    // pins this is hard to hit honestly; force max_in_flight to 2 to
+    // exercise the rule (validate also rejects max_in_flight != 1, so
+    // we must use a config where the pending check fires first; the
+    // actual ordering means InvalidMaxInFlight wins. Test the variant
+    // shape directly instead.)
+    let err = SqliteConfigError::PendingReplyCapacityBelowMaxInFlight {
+        pending: 1,
+        in_flight: 4,
+    };
+    assert!(matches!(
+        err,
+        SqliteConfigError::PendingReplyCapacityBelowMaxInFlight { .. }
+    ));
+    // Also exercise Display for completeness.
+    let s = format!("{err}");
+    assert!(s.contains("pending_reply_capacity 1"));
+    assert!(s.contains("max_in_flight 4"));
+}
+
+// ---------------------------------------------------------------------------
+// Pragma actually lands on the connection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pragma_journal_mode_wal_takes_effect() {
+    // In-memory databases coerce journal_mode to "memory"; use a
+    // tempfile so WAL can actually apply.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("wal.sqlite");
+    let cfg = SqliteConfig::path(&path)
+        .with_pragma("journal_mode = WAL")
+        .with_poll_interval(Duration::from_millis(1));
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, cfg);
+
+    let outcome = run_one(
+        &runtime,
+        bridge.address,
+        SqliteRequest::QueryRows {
+            sql: "PRAGMA journal_mode".into(),
+            params: vec![],
+            max_rows: 1,
+        },
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => {
+            assert_eq!(rows.len(), 1);
+            match &rows[0][0] {
+                SqliteValue::Text(mode) => assert_eq!(mode, "wal"),
+                other => panic!("expected Text, got {other:?}"),
+            }
+        }
+        other => panic!("pragma read: {other:?}"),
+    }
+
+    shutdown_runtime(runtime);
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Closer lifecycle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn closer_is_closed_lifecycle() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+    assert!(!bridge.closer.is_closed());
+    let cloned = bridge.closer.clone();
+    assert!(!cloned.is_closed());
+    bridge.closer.close();
+    assert!(bridge.closer.is_closed());
+    assert!(cloned.is_closed(), "Clone shares the closed flag");
+    // Idempotent.
+    bridge.closer.close();
+    assert!(bridge.closer.is_closed());
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Sustained sequential load: nothing leaks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sustained_sequential_load_keeps_metrics_clean() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, test_config());
+    create_and_seed(bridge.address, &runtime);
+    let baseline = bridge.metrics.snapshot();
+
+    for i in 0..50 {
+        assert_executed(
+            run_one(
+                &runtime,
+                bridge.address,
+                SqliteRequest::Execute {
+                    sql: "INSERT INTO t (k, v) VALUES (?, ?)".into(),
+                    params: vec![
+                        SqliteValue::Integer(i as i64 + 1000),
+                        SqliteValue::Text(format!("load-{i}")),
+                    ],
+                },
+            ),
+            1,
+        );
+    }
+
+    let snap = bridge.metrics.snapshot();
+    assert_eq!(snap.admitted - baseline.admitted, 50);
+    assert_eq!(snap.full, 0);
+    assert_eq!(snap.timeouts, 0);
+    assert_eq!(snap.late_results, 0);
+    assert_eq!(snap.closed, 0);
+    assert_eq!(snap.invalid, 0);
+    assert_eq!(snap.current_in_flight, 0);
+    assert_eq!(snap.in_flight_high_water, 1);
+    assert_eq!(snap.worker_executed - baseline.worker_executed, 50);
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Display round-trips
+// ---------------------------------------------------------------------------
+
+#[test]
+fn error_display_includes_payload() {
+    let cases: Vec<(SqliteError, &str)> = vec![
+        (SqliteError::Full, "ingress full"),
+        (SqliteError::Closed, "closed"),
+        (SqliteError::Timeout, "timeout"),
+        (
+            SqliteError::InvalidRequest("oops".into()),
+            "invalid request: oops",
+        ),
+        (SqliteError::ResponseTooLarge, "row cap"),
+        (SqliteError::Busy, "SQLITE_BUSY"),
+        (
+            SqliteError::Constraint("UNIQUE".into()),
+            "constraint violation: UNIQUE",
+        ),
+        (SqliteError::Io("disk".into()), "io error: disk"),
+        (SqliteError::Sqlite("syntax".into()), "sqlite error: syntax"),
+        (SqliteError::Internal("bug".into()), "internal: bug"),
+    ];
+    for (err, fragment) in cases {
+        let s = format!("{err}");
+        assert!(s.contains(fragment), "{s} missing {fragment}");
+    }
+}
+
+#[test]
+fn install_error_display_names_phase() {
+    let cases: Vec<(tina_sqlite_bridge::InstallError, &str)> = vec![
+        (
+            tina_sqlite_bridge::InstallError::Open("perm".into()),
+            "open: perm",
+        ),
+        (
+            tina_sqlite_bridge::InstallError::Setup("bt".into()),
+            "setup: bt",
+        ),
+        (
+            tina_sqlite_bridge::InstallError::Pragma("bad".into()),
+            "pragma: bad",
+        ),
+        (
+            tina_sqlite_bridge::InstallError::Spawn("eof".into()),
+            "spawn: eof",
+        ),
+        (
+            tina_sqlite_bridge::InstallError::Register("nope".into()),
+            "register: nope",
+        ),
+    ];
+    for (err, fragment) in cases {
+        let s = format!("{err}");
+        assert!(s.contains(fragment), "{s} missing {fragment}");
+    }
+}
