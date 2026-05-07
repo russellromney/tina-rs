@@ -74,6 +74,16 @@
 //!   ready, then admit one slot" reservation idiom must remember that
 //!   admission still races on the `call` future.
 //!
+//! # Request id and trace context
+//!
+//! The Service is generic over the request type `M`. Trace ids,
+//! correlator headers, and `tracing` span context are caller metadata
+//! and travel inside `M`. The bridge does not introduce a global
+//! current-span or a thread-local — there is no hidden context across
+//! the boundary. If the caller wants spans to follow the request,
+//! attach them to `M` (e.g. as a typed field) and read them inside
+//! the Tina handler.
+//!
 //! # Tower middleware safety
 //!
 //! Most Tower layers compose cleanly. A few introduce queues that
@@ -96,7 +106,6 @@
 //! See [`tina_tokio_bridge`] for the underlying bridge contract.
 
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -116,7 +125,6 @@ where
 {
     handle: BridgeHandle<M, R, S, F, AR, TM>,
     per_call_timeout: Option<Duration>,
-    _marker: PhantomData<fn(M, R, AR, TM)>,
 }
 
 impl<M, R, S, F, AR, TM> Clone for TinaTowerService<M, R, S, F, AR, TM>
@@ -128,7 +136,6 @@ where
         Self {
             handle: self.handle.clone(),
             per_call_timeout: self.per_call_timeout,
-            _marker: PhantomData,
         }
     }
 }
@@ -148,7 +155,6 @@ where
         Self {
             handle,
             per_call_timeout: None,
-            _marker: PhantomData,
         }
     }
 

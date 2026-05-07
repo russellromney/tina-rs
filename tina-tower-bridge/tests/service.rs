@@ -148,6 +148,16 @@ async fn poll_ready_returns_ready_ok_when_accepting() {
     }
 }
 
+#[test]
+fn bridge_error_implements_display_and_error() {
+    let err = BridgeError::Full;
+    let display = format!("{err}");
+    assert!(display.contains("full"), "Display: {display}");
+    let _: &dyn std::error::Error = &err;
+    let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+    let _ = boxed;
+}
+
 #[tokio::test]
 async fn is_closed_reflects_close_state() {
     let host = make_host();

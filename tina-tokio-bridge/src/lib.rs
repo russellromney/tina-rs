@@ -47,6 +47,18 @@ pub enum BridgeError {
     Timeout,
 }
 
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => f.write_str("tina bridge: bounded ingress full"),
+            Self::Closed => f.write_str("tina bridge: worker or responder closed"),
+            Self::Timeout => f.write_str("tina bridge: call timed out"),
+        }
+    }
+}
+
+impl std::error::Error for BridgeError {}
+
 /// Capability status for the Tokio bridge compared with Tina core semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityStatus {
