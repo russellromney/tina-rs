@@ -63,13 +63,17 @@ impl Done {
         self.cv.notify_all();
     }
 
-    fn wait(&self, timeout: Duration) {
+    /// Returns `true` when the driver signalled completion within
+    /// the deadline, `false` on timeout. Callers should fail loudly
+    /// on `false` rather than swallow it — a silent timeout would
+    /// produce a misleading "wrong body" assertion later.
+    fn wait(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut guard = self.flag.lock().expect("done lock");
         while !*guard {
             let now = Instant::now();
             if now >= deadline {
-                return;
+                return false;
             }
             let (g, _) = self
                 .cv
@@ -77,6 +81,7 @@ impl Done {
                 .expect("done wait");
             guard = g;
         }
+        true
     }
 }
 
@@ -233,7 +238,12 @@ pub fn run() -> Report {
         .try_send(driver_addr, DriverMsg::Run(url))
         .expect("kick driver");
 
-    done.wait(Duration::from_secs(10));
+    assert!(
+        done.wait(Duration::from_secs(10)),
+        "tina driver timed out before completing all increments — \
+         the bridge or the webhook never finished. The webhook bodies \
+         assertion would otherwise blame the wrong layer."
+    );
 
     // Let the webhook server's writer task land before snapshotting.
     std::thread::sleep(Duration::from_millis(20));
