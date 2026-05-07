@@ -141,7 +141,11 @@ impl Isolate for Connection {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionEvent::Begin => read_call(self.stream, self.max_chunk),
             ConnectionEvent::Read(bytes) => {
@@ -218,7 +222,11 @@ impl Isolate for OutboundClient {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             OutboundClientEvent::Start(addr) => {
                 tcp_connect(addr).reply(OutboundClientEvent::Connected)
@@ -286,7 +294,11 @@ impl Isolate for FileClient {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FileClientEvent::Start { dir, path } => {
                 mkdir(dir, 0o755).reply(move |result| FileClientEvent::DirectoryMade(result, path))
@@ -371,7 +383,11 @@ impl Isolate for Listener {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerEvent::Start => {
                 let addr = self.bind_addr;
@@ -1296,7 +1312,11 @@ impl Isolate for BlockingIsolate {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             BlockingMsg::Park => {
                 if let Some(parked_tx) = self.parked_tx.take() {

@@ -32,7 +32,7 @@ struct SlowClient;
 
 #[tina::isolate(message = DeliverMsg)]
 impl SlowClient {
-    fn handle(&mut self, _msg: DeliverMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, _msg: DeliverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         noop()
     }
 }
@@ -80,7 +80,7 @@ struct Connection {
     send = Outbound<DeliverMsg>,
 )]
 impl Connection {
-    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 32).reply(ConnectionMsg::Read),
             ConnectionMsg::Read(Ok(bytes)) => {
@@ -148,7 +148,7 @@ struct Listener {
     spawn = ChildDefinition<Connection>,
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {

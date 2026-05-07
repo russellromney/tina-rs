@@ -188,7 +188,11 @@ impl Isolate for TimerWorker {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimerEvent::Begin => sleep(Duration::from_millis(5)).reply(TimerEvent::DelayFinished),
             TimerEvent::DelayFinished(Ok(())) => {
@@ -240,7 +244,11 @@ impl Isolate for ObservedTarget {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ObservedTargetEvent::Work => noop(),
             ObservedTargetEvent::Stop => stop(),
@@ -269,7 +277,11 @@ impl Isolate for ObservedSender {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ObservedSenderEvent::Start(target) => send_observed(target, ObservedTargetEvent::Work)
                 .reply(ObservedSenderEvent::SendFinished),
@@ -341,7 +353,11 @@ impl Isolate for ReplyWorker {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerRequest::ReplyNow => reply(WorkerReply("pong")),
             WorkerRequest::DoNotReply => noop(),
@@ -373,7 +389,11 @@ impl Isolate for CallerWorker {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallerEvent::Start(target, request, timeout) => {
                 call(target, request, timeout).reply(CallerEvent::Returned)
@@ -410,7 +430,11 @@ impl Isolate for FillerWorker {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FillerEvent::Fill(caller) => send(caller, CallerEvent::Filler),
         }
@@ -616,7 +640,11 @@ impl Isolate for LowLevelWorker {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             LowLevelEvent::Start => Effect::Call(RuntimeCall::map_result(
                 CallInput::Sleep {
@@ -674,7 +702,11 @@ impl Isolate for ChildWorker {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ChildEvent::Begin => {
                 self.starts.set(self.starts.get() + 1);
@@ -704,7 +736,11 @@ impl Isolate for ParentWorker {
         shard: ConsumerShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentEvent::Begin => spawn(
                 RestartableChildDefinition::new(

@@ -41,7 +41,7 @@ impl Room {
     fn handle(
         &mut self,
         msg: BridgeRequest<RoomRequest, RoomReply>,
-        _ctx: &mut Context<'_, SingleShard>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         let (request, responder) = msg.into_parts();
         match request {

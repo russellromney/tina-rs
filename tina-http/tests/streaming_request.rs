@@ -55,7 +55,11 @@ impl Isolate for Consumer {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ConsumerMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConsumerMsg::Inbound(req) => match req.body {
                 HttpRequestBody::Buffered(bytes) => {
@@ -344,7 +348,11 @@ impl Isolate for NotifyingConsumer {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: NotifyingMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: NotifyingMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             NotifyingMsg::Inbound(req) => {
                 self.dispatched

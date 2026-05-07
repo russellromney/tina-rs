@@ -42,7 +42,7 @@ impl Counter {
     fn handle(
         &mut self,
         request: HttpRequest,
-        _ctx: &mut Context<'_, SingleShard>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         let router = StatefulRouter::<Counter>::new()
             .get("/counter", get_counter)
@@ -79,7 +79,7 @@ struct Driver;
 
 #[tina_runtime::isolate(message = DriverMsg)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             DriverMsg::Begin {
                 client,

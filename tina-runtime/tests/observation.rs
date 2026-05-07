@@ -93,7 +93,11 @@ struct Binder {
 
 #[tina_runtime::isolate(message = BindMsg, shard = TestShard)]
 impl Binder {
-    fn handle(&mut self, msg: BindMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: BindMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             BindMsg::Start => tcp_bind(self.addr).reply(BindMsg::Bound),
             BindMsg::Bound(Ok((listener, _))) => {
@@ -290,7 +294,11 @@ struct Sleeper {
 
 #[tina_runtime::isolate(message = SleeperMsg, shard = TestShard)]
 impl Sleeper {
-    fn handle(&mut self, msg: SleeperMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SleeperMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SleeperMsg::Start => sleep(self.nap).reply(|_| SleeperMsg::SleepDone),
             SleeperMsg::SleepDone => stop(),
@@ -412,7 +420,11 @@ struct Crashy {
 
 #[tina_runtime::isolate(message = CrashMsg, shard = TestShard)]
 impl Crashy {
-    fn handle(&mut self, msg: CrashMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CrashMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CrashMsg::Boom => {
                 self.crashed.fetch_add(1, Ordering::Relaxed);
@@ -438,7 +450,11 @@ struct Parent {
     shard = TestShard,
 )]
 impl Parent {
-    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ParentMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::Spawn => {
                 let crashed = Arc::clone(&self.crashed);
@@ -519,7 +535,11 @@ struct ResultProducer;
 
 #[tina_runtime::isolate(message = ResultMsg, shard = TestShard)]
 impl ResultProducer {
-    fn handle(&mut self, msg: ResultMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ResultMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ResultMsg::FinishWithResult(payload) => stop_with(payload),
             ResultMsg::FinishWithoutResult => stop(),

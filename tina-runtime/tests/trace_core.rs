@@ -41,7 +41,11 @@ impl Isolate for Worker {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         Effect::Noop
     }
 }
@@ -60,7 +64,11 @@ impl Isolate for Session {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         *self.handled.borrow_mut() += 1;
 
         match msg {

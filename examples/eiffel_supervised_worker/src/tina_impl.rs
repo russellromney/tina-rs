@@ -52,7 +52,7 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             WorkerMsg::Boot => {
                 self.slot.set(ctx.me());
@@ -79,7 +79,7 @@ struct Parent {
     spawn = RestartableChildDefinition<Worker>,
 )]
 impl Parent {
-    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ParentMsg::Spawn => {
                 let slot = Arc::clone(&self.slot);

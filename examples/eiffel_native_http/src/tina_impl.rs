@@ -32,7 +32,7 @@ impl Counter {
     fn handle(
         &mut self,
         request: HttpRequest,
-        _ctx: &mut Context<'_, SingleShard>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         let router = StatefulRouter::<Counter>::new()
             .get("/counter", get_counter)

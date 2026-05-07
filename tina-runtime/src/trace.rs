@@ -72,6 +72,36 @@ pub enum EffectKind {
 
     /// The handler returned [`tina::Effect::Batch`].
     Batch,
+
+    /// The handler returned [`tina::Effect::ReplyTo`] for a deferred reply slot.
+    ReplyTo,
+}
+
+/// Why a deferred-reply attempt could not deliver to the original caller.
+///
+/// Duplicate replies and post-drop replies are prevented by the type
+/// system: `reply_to` consumes the [`tina::DeferredReply`] handle, so a
+/// second use is a compile error. There is therefore no
+/// `AlreadyReplied` or `AlreadyDropped` runtime reason. See the
+/// `compile_fail` doctest on [`tina::reply_to`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeferredReplyRejectedReason {
+    /// The original caller already timed out, closed, or otherwise stopped.
+    CallerClosed,
+
+    /// The bounded reply transport path back to the requester was full.
+    ReplyPathFull,
+
+    /// The requester shard was closed before the reply could be routed.
+    RequesterShardClosed,
+
+    /// The reply payload type did not match the dispatching
+    /// `Address<_, R>`'s `R`. Surfaces when a handler captured a
+    /// slot for the wrong isolate type or rebuilt a slot with the
+    /// wrong reply parameter via `runtime_internal`. The original
+    /// caller's translator would have panicked on downcast; this
+    /// reject defangs the panic and drops the payload.
+    TypeMismatch,
 }
 
 /// Trace-level kind of a runtime-owned call.
@@ -517,6 +547,61 @@ pub enum RuntimeEventKind {
         /// Why recovery failed.
         reason: CallError,
     },
+
+    /// A handler captured the current caller promise as a deferred reply slot.
+    ///
+    /// The `call_id` matches the original caller's pending isolate call so
+    /// trace consumers can correlate capture, send, drop, and rejection
+    /// against the original `CallDispatchAttempted`.
+    DeferredReplyCaptured {
+        /// Runtime-assigned slot identifier.
+        slot_id: DeferredSlotId,
+        /// The original isolate call this slot will eventually answer.
+        call_id: CallId,
+    },
+
+    /// A `reply_to(slot, value)` effect successfully routed a reply through
+    /// the slot to the original caller.
+    DeferredReplySent {
+        /// Runtime-assigned slot identifier.
+        slot_id: DeferredSlotId,
+        /// The original isolate call that was answered.
+        call_id: CallId,
+    },
+
+    /// A `reply_to(slot, value)` effect could not deliver a reply.
+    DeferredReplyRejected {
+        /// Runtime-assigned slot identifier.
+        slot_id: DeferredSlotId,
+        /// The original isolate call this slot referenced.
+        call_id: CallId,
+        /// Why the reply could not be delivered.
+        reason: DeferredReplyRejectedReason,
+    },
+
+    /// A live deferred slot was dropped without ever being replied to.
+    DeferredReplyDropped {
+        /// Runtime-assigned slot identifier.
+        slot_id: DeferredSlotId,
+        /// The original isolate call this slot referenced.
+        call_id: CallId,
+    },
+}
+
+/// Stable identifier for one runtime-issued deferred reply slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeferredSlotId(u64);
+
+impl DeferredSlotId {
+    /// Creates a slot identifier from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw slot identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// One deterministic runtime event with a causal link to an earlier event.
@@ -671,6 +756,16 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::Call => 7,
         EffectKind::Batch => 8,
         EffectKind::StopWith => 9,
+        EffectKind::ReplyTo => 10,
+    }
+}
+
+fn deferred_reply_rejected_tag(reason: DeferredReplyRejectedReason) -> u8 {
+    match reason {
+        DeferredReplyRejectedReason::CallerClosed => 1,
+        DeferredReplyRejectedReason::ReplyPathFull => 2,
+        DeferredReplyRejectedReason::RequesterShardClosed => 3,
+        DeferredReplyRejectedReason::TypeMismatch => 4,
     }
 }
 
@@ -957,6 +1052,31 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::RecoveryFailed { reason } => {
             hasher.write_u8(28);
             hasher.write_u8(call_error_tag(reason));
+        }
+        RuntimeEventKind::DeferredReplyCaptured { slot_id, call_id } => {
+            hasher.write_u8(29);
+            hasher.write_u64(slot_id.get());
+            hasher.write_u64(call_id.get());
+        }
+        RuntimeEventKind::DeferredReplySent { slot_id, call_id } => {
+            hasher.write_u8(30);
+            hasher.write_u64(slot_id.get());
+            hasher.write_u64(call_id.get());
+        }
+        RuntimeEventKind::DeferredReplyRejected {
+            slot_id,
+            call_id,
+            reason,
+        } => {
+            hasher.write_u8(31);
+            hasher.write_u64(slot_id.get());
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(deferred_reply_rejected_tag(reason));
+        }
+        RuntimeEventKind::DeferredReplyDropped { slot_id, call_id } => {
+            hasher.write_u8(32);
+            hasher.write_u64(slot_id.get());
+            hasher.write_u64(call_id.get());
         }
     }
 }

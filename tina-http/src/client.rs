@@ -113,7 +113,11 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
         shard: S,
     }
 
-    fn handle(&mut self, msg: HttpClientMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: HttpClientMsg,
+        _ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             HttpClientMsg::Call(call) => self.handle_call(call),
 

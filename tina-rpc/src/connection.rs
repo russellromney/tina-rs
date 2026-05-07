@@ -815,7 +815,11 @@ where
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = S;
 
-    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ConnectionMsg,
+        _ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => self.on_begin(),
             ConnectionMsg::Read(result) => self.on_read(result),
@@ -908,6 +912,7 @@ mod tests {
                     walk(item, shape);
                 }
             }
+            Effect::ReplyTo(_, _) => shape.reply_to += 1,
         }
     }
 
@@ -921,6 +926,7 @@ mod tests {
         stop_with: usize,
         restart: usize,
         call: usize,
+        reply_to: usize,
     }
 
     fn build_request(request_id: u64, service: &str, method: &str, payload: &[u8]) -> Vec<u8> {

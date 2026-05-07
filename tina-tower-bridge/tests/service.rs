@@ -35,7 +35,11 @@ impl BridgeMessage for EchoMsg {
 
 #[tina_runtime::isolate(message = EchoMsg)]
 impl EchoIsolate {
-    fn handle(&mut self, msg: EchoMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: EchoMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             EchoMsg::Request(req) => {
                 let (value, responder) = req.into_parts();
@@ -82,7 +86,11 @@ impl Isolate for SlowIsolate {
         shard: SingleShard,
     }
 
-    fn handle(&mut self, msg: SlowMsg, _ctx: &mut tina::Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SlowMsg,
+        _ctx: &mut tina::Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SlowMsg::Request(req) => {
                 let (value, responder) = req.into_parts();

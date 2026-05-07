@@ -118,7 +118,7 @@ impl Connection {
     fn handle(
         &mut self,
         msg: ConnectionEvent,
-        _ctx: &mut Context<'_, ExampleShard>,
+        _ctx: &mut Context<'_, ExampleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ConnectionEvent::Begin => read_call(self.stream, self.max_chunk),
@@ -198,7 +198,11 @@ struct Listener {
     shard = ExampleShard
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerEvent, ctx: &mut Context<'_, ExampleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ListenerEvent,
+        ctx: &mut Context<'_, ExampleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerEvent::Start => {
                 let addr = self.bind_addr;

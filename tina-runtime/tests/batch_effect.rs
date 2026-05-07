@@ -121,7 +121,11 @@ impl Isolate for Audit {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         let AuditEvent::Record(value) = msg;
         self.seen.borrow_mut().push(value);
         noop()
@@ -141,7 +145,11 @@ impl Isolate for Worker {
         shard: TestShard,
     }
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }
@@ -161,7 +169,11 @@ impl Isolate for Driver {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverEvent::SendTwice => batch([
                 send(self.audit, AuditEvent::Record(1)),

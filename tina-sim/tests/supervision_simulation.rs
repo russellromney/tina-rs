@@ -53,7 +53,11 @@ impl Isolate for Worker {
     type Call = RuntimeCall<WorkerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Boot => {
                 self.observations
@@ -105,7 +109,11 @@ impl Isolate for RestartableParent {
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::SpawnOne => Effect::Spawn(self.spec()),
             ParentMsg::SpawnTwo => {
@@ -130,7 +138,11 @@ impl Isolate for DynamicBootstrapParent {
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::SpawnOne => {
                 let observations = Rc::clone(&self.observations);
@@ -168,7 +180,11 @@ impl Isolate for OneShotParent {
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::SpawnOne => Effect::Spawn(
                 ChildDefinition::new(
@@ -203,7 +219,11 @@ impl Isolate for StaleSender {
     type Call = RuntimeCall<SenderMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SenderMsg::SendToStale => Effect::Send(Outbound::new(self.target, WorkerMsg::Work(99))),
         }
@@ -233,7 +253,11 @@ impl Isolate for Grandchild {
     type Call = RuntimeCall<GrandchildMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             GrandchildMsg::Boot => {
                 self.boots.borrow_mut().push(ctx.isolate_id());
@@ -256,7 +280,11 @@ impl Isolate for ChildSpawner {
     type Call = RuntimeCall<ChildMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ChildMsg::Boot => {
                 let boots = Rc::clone(&self.grandchild_boots);
@@ -287,7 +315,11 @@ impl Isolate for NestedParent {
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::SpawnOne => {
                 let grandchild_boots = Rc::clone(&self.grandchild_boots);

@@ -41,7 +41,7 @@ impl Counter {
     fn handle(
         &mut self,
         msg: BridgeRequest<CounterRequest, CounterReply>,
-        _ctx: &mut Context<'_, SingleShard>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         let (request, responder) = msg.into_parts();
         match request {

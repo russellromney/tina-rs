@@ -189,7 +189,7 @@ fn build_isolate(
             fn handle(
                 &mut self,
                 #msg_name: Self::Message,
-                #ctx_name: &mut ::tina::Context<'_, Self::Shard>,
+                #ctx_name: &mut ::tina::Context<'_, Self::Shard, Self::Reply>,
             ) -> ::tina::Effect<Self> {
                 #body
             }

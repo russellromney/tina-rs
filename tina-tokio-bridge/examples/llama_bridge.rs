@@ -91,7 +91,7 @@ impl Tina {
     fn handle(
         &mut self,
         msg: BridgeRequest<LlamaQuestion, LlamaAnswer>,
-        _ctx: &mut Context<'_, BarnShard>,
+        _ctx: &mut Context<'_, BarnShard, Self::Reply>,
     ) -> Effect<Self> {
         let (question, responder) = msg.into_parts();
         self.snacks_eaten += 1;

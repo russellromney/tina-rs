@@ -90,7 +90,11 @@ struct Target {
 
 #[tina_runtime::isolate(message = TargetMsg, shard = DstShard)]
 impl Target {
-    fn handle(&mut self, msg: TargetMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TargetMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TargetMsg::Value(value) => {
                 self.values.borrow_mut().push(value);
@@ -108,7 +112,11 @@ struct LiveTarget {
 
 #[tina_runtime::isolate(message = TargetMsg, shard = DstShard)]
 impl LiveTarget {
-    fn handle(&mut self, msg: TargetMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TargetMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TargetMsg::Value(value) => {
                 self.values.lock().expect("live values lock").push(value);
@@ -132,7 +140,11 @@ struct Source {
 
 #[tina_runtime::isolate(message = SourceMsg, send = Outbound<TargetMsg>, shard = DstShard)]
 impl Source {
-    fn handle(&mut self, msg: SourceMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SourceMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SourceMsg::Send(value) => send(self.target, TargetMsg::Value(value)),
             SourceMsg::Burst(value) => batch([
@@ -150,7 +162,11 @@ struct LiveSource {
 
 #[tina_runtime::isolate(message = SourceMsg, send = Outbound<TargetMsg>, shard = DstShard)]
 impl LiveSource {
-    fn handle(&mut self, msg: SourceMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SourceMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SourceMsg::Send(value) => send(self.target, TargetMsg::Value(value)),
             SourceMsg::Burst(value) => batch([

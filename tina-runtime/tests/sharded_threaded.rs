@@ -115,7 +115,11 @@ impl Isolate for ShardedCounter {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CounterMsg::Inc { key, reply_to } => {
                 let owner = self.placement.owner_for_str(&key);
@@ -167,7 +171,11 @@ impl Isolate for Tracker {
         shard: AppShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TrackerMsg::IncResult { shard, outcome } => match outcome {
                 Ok(()) => self.inc_oks.lock().expect("inc_oks").push(shard),

@@ -52,7 +52,11 @@ impl Isolate for Counter {
         shard: TestShard,
     }
 
-    fn handle(&mut self, request: HttpRequest, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         let response = match (request.method.clone(), request.path.as_str()) {
             (Method::GET, "/counter") => HttpResponse::text(self.value.to_string()),
             (Method::POST, "/counter") => {

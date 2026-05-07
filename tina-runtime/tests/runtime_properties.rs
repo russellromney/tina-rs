@@ -114,7 +114,7 @@ impl Isolate for Target {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             TargetMsg::Data(_) => Effect::Noop,
@@ -146,7 +146,7 @@ impl Isolate for Driver {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             DriverMsg::Send(value) => {
@@ -167,7 +167,7 @@ impl Isolate for RestartParent {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             ParentMsg::Spawn => {
@@ -189,7 +189,7 @@ impl Isolate for RestartChild {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             TargetMsg::Data(_) => Effect::Noop,
@@ -519,7 +519,7 @@ impl Isolate for DispatcherWorker {
     fn handle(
         &mut self,
         message: Self::Message,
-        ctx: &mut Context<'_, Self::Shard>,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             DispatcherWorkerMsg::Run(DispatcherTask::Normal) => {
@@ -542,7 +542,7 @@ impl Isolate for DispatcherParent {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             DispatcherMsg::SpawnWorker => {
@@ -573,7 +573,7 @@ impl Isolate for DispatcherRegistry {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             RegistryMsg::Register { slot, address } => {

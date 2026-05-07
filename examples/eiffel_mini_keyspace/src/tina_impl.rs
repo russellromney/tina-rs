@@ -49,7 +49,7 @@ struct Store {
 
 #[tina_runtime::isolate(message = StoreMsg, reply = StoreReply)]
 impl Store {
-    fn handle(&mut self, msg: StoreMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: StoreMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             StoreMsg::Set { key, value } => {
                 self.values.insert(key, value);
@@ -101,7 +101,7 @@ struct Connection {
 
 #[tina_runtime::isolate(message = ConnectionMsg)]
 impl Connection {
-    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 4096).reply(ConnectionMsg::Read),
             ConnectionMsg::Read(Ok(bytes)) => {
@@ -203,7 +203,7 @@ struct Listener {
     spawn = ChildDefinition<Connection>,
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {

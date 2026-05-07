@@ -105,7 +105,7 @@ where
     H: 'static,
 {
     let mut shard = TestShard;
-    let mut ctx = Context::new(&mut shard, IsolateId::new(99));
+    let mut ctx = Context::<_, ServiceReply>::new_typed(&mut shard, IsolateId::new(99));
     match svc.handle(call, &mut ctx) {
         Effect::Reply(reply) => reply,
         other => panic!("expected Effect::Reply, got {other:?}"),

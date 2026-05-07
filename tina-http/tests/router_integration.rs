@@ -42,7 +42,11 @@ impl Isolate for Service {
         shard: TestShard,
     }
 
-    fn handle(&mut self, request: HttpRequest, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         reply(self.router.dispatch(&request))
     }
 }

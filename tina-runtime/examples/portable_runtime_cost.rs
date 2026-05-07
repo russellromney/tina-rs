@@ -160,7 +160,11 @@ struct Counter {
 
 #[tina_runtime::isolate(message = CountMsg, shard = CostShard)]
 impl Counter {
-    fn handle(&mut self, msg: CountMsg, _ctx: &mut Context<'_, CostShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CountMsg,
+        _ctx: &mut Context<'_, CostShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CountMsg::Hit => {
                 self.count.fetch_add(1, Ordering::Relaxed);
@@ -182,7 +186,11 @@ struct Relay {
 
 #[tina_runtime::isolate(message = RelayMsg, send = Outbound<CountMsg>, shard = CostShard)]
 impl Relay {
-    fn handle(&mut self, msg: RelayMsg, _ctx: &mut Context<'_, CostShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: RelayMsg,
+        _ctx: &mut Context<'_, CostShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RelayMsg::Forward => send(self.target, CountMsg::Hit),
         }
@@ -204,7 +212,11 @@ struct PingWorker;
 
 #[tina_runtime::isolate(message = PingMsg, reply = PingReply, shard = CostShard)]
 impl PingWorker {
-    fn handle(&mut self, msg: PingMsg, _ctx: &mut Context<'_, CostShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: PingMsg,
+        _ctx: &mut Context<'_, CostShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PingMsg::Ping => reply(PingReply::Pong),
         }
@@ -229,7 +241,11 @@ struct PingClient {
     shard = CostShard
 )]
 impl PingClient {
-    fn handle(&mut self, msg: ClientMsg, _ctx: &mut Context<'_, CostShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ClientMsg,
+        _ctx: &mut Context<'_, CostShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ClientMsg::Start => {
                 call(self.worker, PingMsg::Ping, Duration::from_secs(1)).reply(ClientMsg::Done)
@@ -269,7 +285,11 @@ struct TcpCostService {
     shard = CostShard
 )]
 impl TcpCostService {
-    fn handle(&mut self, msg: TcpCostMsg, _ctx: &mut Context<'_, CostShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TcpCostMsg,
+        _ctx: &mut Context<'_, CostShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TcpCostMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("tcp cost bind addr"))
                 .reply(TcpCostMsg::Bound),

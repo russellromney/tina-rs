@@ -65,7 +65,11 @@ impl Isolate for SlowIsolate {
         shard: SingleShard,
     }
 
-    fn handle(&mut self, msg: SlowMsg, _ctx: &mut tina::Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SlowMsg,
+        _ctx: &mut tina::Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SlowMsg::Request(req) => {
                 let (value, responder) = req.into_parts();

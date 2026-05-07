@@ -158,7 +158,11 @@ struct Sink {
 
 #[tina_runtime::isolate(message = SinkMsg, shard = ComparisonShard)]
 impl Sink {
-    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, ComparisonShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SinkMsg,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SinkMsg::Hit => {
                 push(&self.events, "hit");
@@ -184,7 +188,11 @@ struct Driver {
 
 #[tina_runtime::isolate(message = DriverMsg, send = Outbound<SinkMsg>, shard = ComparisonShard)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, ComparisonShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::Fire(sink) => send(sink, SinkMsg::Hit),
             DriverMsg::Observe(sink) => {
@@ -225,7 +233,11 @@ struct Worker;
 
 #[tina_runtime::isolate(message = WorkReq, reply = WorkReply, shard = ComparisonShard)]
 impl Worker {
-    fn handle(&mut self, msg: WorkReq, _ctx: &mut Context<'_, ComparisonShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkReq,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkReq::Reply => reply(WorkReply("pong")),
             WorkReq::NoReply => noop(),
@@ -249,7 +261,11 @@ struct Client {
 
 #[tina_runtime::isolate(message = ClientMsg, shard = ComparisonShard)]
 impl Client {
-    fn handle(&mut self, msg: ClientMsg, _ctx: &mut Context<'_, ComparisonShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ClientMsg,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ClientMsg::Ask(worker, request, timeout) => {
                 call(worker, request, timeout).reply(ClientMsg::Returned)
@@ -309,7 +325,11 @@ struct RetryClient {
 
 #[tina_runtime::isolate(message = RetryMsg, send = Outbound<RetryMsg>, shard = ComparisonShard)]
 impl RetryClient {
-    fn handle(&mut self, msg: RetryMsg, ctx: &mut Context<'_, ComparisonShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: RetryMsg,
+        ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RetryMsg::Attempt => {
                 self.attempts += 1;
@@ -345,7 +365,7 @@ impl SupervisedChild {
     fn handle(
         &mut self,
         msg: SupervisedChildMsg,
-        _ctx: &mut Context<'_, ComparisonShard>,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             SupervisedChildMsg::Boot => {
@@ -376,7 +396,7 @@ impl SupervisorParent {
     fn handle(
         &mut self,
         msg: SupervisorMsg,
-        _ctx: &mut Context<'_, ComparisonShard>,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             SupervisorMsg::SpawnChild => {
@@ -414,7 +434,11 @@ struct CrossSink;
 
 #[tina_runtime::isolate(message = CrossSinkMsg, shard = CrossShard)]
 impl CrossSink {
-    fn handle(&mut self, _msg: CrossSinkMsg, _ctx: &mut Context<'_, CrossShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: CrossSinkMsg,
+        _ctx: &mut Context<'_, CrossShard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }
@@ -429,7 +453,11 @@ struct CrossDriver;
 
 #[tina_runtime::isolate(message = CrossDriverMsg, send = Outbound<CrossSinkMsg>, shard = CrossShard)]
 impl CrossDriver {
-    fn handle(&mut self, msg: CrossDriverMsg, _ctx: &mut Context<'_, CrossShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CrossDriverMsg,
+        _ctx: &mut Context<'_, CrossShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CrossDriverMsg::FireTwice(target) => batch(vec![
                 send(target, CrossSinkMsg::Hit),
@@ -454,7 +482,7 @@ impl ChatClient {
     fn handle(
         &mut self,
         msg: ChatClientMsg,
-        _ctx: &mut Context<'_, ComparisonShard>,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ChatClientMsg::Deliver(message) => {
@@ -485,7 +513,7 @@ impl ChatRoom {
     fn handle(
         &mut self,
         msg: ChatRoomMsg,
-        _ctx: &mut Context<'_, ComparisonShard>,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ChatRoomMsg::Burst(client) => batch(vec![

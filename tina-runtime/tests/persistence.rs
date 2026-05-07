@@ -96,7 +96,11 @@ struct PersistService {
 
 #[tina_runtime::isolate(message = PersistMsg, shard = PersistShard)]
 impl PersistService {
-    fn handle(&mut self, msg: PersistMsg, _ctx: &mut Context<'_, PersistShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: PersistMsg,
+        _ctx: &mut Context<'_, PersistShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PersistMsg::Recover => {
                 snapshot_load(self.snapshot_path.clone()).reply(PersistMsg::SnapshotLoaded)

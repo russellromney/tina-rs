@@ -37,7 +37,7 @@ struct Producer {
 
 #[tina_runtime::isolate(message = ProducerMsg, send = Outbound<SinkMsg>)]
 impl Producer {
-    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ProducerMsg::Tick(count) => {
                 let next = count + 1;
@@ -65,7 +65,7 @@ struct Sink {
 
 #[tina_runtime::isolate(message = SinkMsg)]
 impl Sink {
-    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             SinkMsg::Got(value) => {
                 self.received.borrow_mut().push(value);
