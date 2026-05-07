@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::{RestartBudget, RestartPolicy, prelude::*};
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedTrySendError};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 use tina_supervisor::SupervisorConfig;
 
 use crate::{Job, Report, job_script};
@@ -52,7 +52,7 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             WorkerMsg::Boot => {
                 self.slot.set(ctx.me());
@@ -79,7 +79,7 @@ struct Parent {
     spawn = RestartableChildDefinition<Worker>,
 )]
 impl Parent {
-    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ParentMsg::Spawn => {
                 let slot = Arc::clone(&self.slot);
@@ -144,12 +144,12 @@ pub fn run() -> anyhow::Result<Report> {
         match job {
             Job::Poison => {
                 let restart_waiter = runtime.observe_child_restarted(parent);
-                send_until_accepted(
-                    &runtime,
-                    addr,
-                    WorkerMsg::Process(*job),
-                    Duration::from_secs(2),
-                )?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                runtime
+                    .send_observed_until(addr, deadline, Duration::from_millis(1), || {
+                        WorkerMsg::Process(*job)
+                    })
+                    .map_err(|e| anyhow::anyhow!("send poison job: {e:?}"))?;
                 restart_waiter
                     .wait(Duration::from_secs(2))
                     .map_err(|e| anyhow::anyhow!("supervisor restart: {e:?}"))?;
@@ -160,12 +160,12 @@ pub fn run() -> anyhow::Result<Report> {
                 })?;
             }
             Job::Work(_) => {
-                send_until_accepted(
-                    &runtime,
-                    addr,
-                    WorkerMsg::Process(*job),
-                    Duration::from_secs(2),
-                )?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                runtime
+                    .send_observed_until(addr, deadline, Duration::from_millis(1), || {
+                        WorkerMsg::Process(*job)
+                    })
+                    .map_err(|e| anyhow::anyhow!("send work job: {e:?}"))?;
             }
         }
     }
@@ -178,29 +178,6 @@ pub fn run() -> anyhow::Result<Report> {
         restarts,
         exit_clean: true,
     })
-}
-
-fn send_until_accepted(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    addr: WorkerAddr,
-    msg: WorkerMsg,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match runtime.try_send(addr, msg) {
-            Ok(()) => return Ok(()),
-            Err(ThreadedTrySendError::IngressFull) => {
-                if Instant::now() > deadline {
-                    anyhow::bail!("send_until_accepted: ingress full timeout");
-                }
-                thread::yield_now();
-            }
-            Err(ThreadedTrySendError::WorkerStopped) => {
-                anyhow::bail!("send_until_accepted: runtime worker stopped");
-            }
-        }
-    }
 }
 
 fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F) -> anyhow::Result<()>

@@ -1,31 +1,18 @@
-# Eiffel Findings — Round 2
+# Eiffel Findings — Current Product Work
 
 This file is the current action list. Eiffel examples are specimens: they
 show how Tokio and Tina code feel for the same kind of job. When the same
 Tina pain appears across specimens, it becomes runtime/API work here.
 
-Round 1 closed in Phase 059 + Phase 053. Those nine items are archived
-verbatim in [`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md); they should not be
-re-opened in this file. Round 2 starts from what the post-053 specimens
-surface.
+The active list below is what Tina still needs. Earlier rounds that
+have closed are summarized further down so external references stay
+valid; the long-form history lives in
+[`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md).
 
-## Round 2 product improvements
+## Active
 
-### 1. `observe_result` on `ThreadedMultiShardRuntime`
-
-**Surfaced by:** `eiffel_sharded_fanout_read`, `eiffel_sharded_keyspace`.
-
-`ThreadedRuntime::observe_result::<T, _, _>(addr)?` is the blessed Phase 059
-Rock 1 way to read an isolate's typed final value. It is shipped on the
-single-shard threaded runtime but not on `ThreadedMultiShardRuntime`, so
-multi-shard examples still fall back to `Arc<Mutex<Option<Report>>>`
-polling for the final value. Both 053 examples now do this dance.
-
-**Build:** lift `observe_result` to `ThreadedMultiShardRuntime`. The
-underlying `Runtime::observe_result` already exists; the multi-shard
-threaded shell just needs to route the registration call to the address's
-owning shard the same way `register_with_capacity_on` does today. Same
-contract as the single-shard form.
+Finding numbers are stable across phases — when a finding closes it
+moves to the [Closed](#closed) section below with the same number.
 
 ### 2. ScatterCoord setup is heavy for the happy path
 
@@ -54,99 +41,24 @@ typed partial-outcome surface — convenience may not collapse `Full` /
 
 ### 3. Self-address at registration time
 
-**Surfaced by:** `eiffel_sharded_fanout_read`.
+**Surfaced by:** `eiffel_sharded_fanout_read`,
+`eiffel_dynamic_worker_pool`.
 
 The `ReplyAdapter` pattern needs the coord's own address to wire the
 adapter, and the coord needs the adapter's address before it can fan out.
-Today the answer is a `Bind { bridge }` message before `Start`. That works
-but adds a variant whose only job is to land "you, isolate, look here for
-your replies" into the isolate's state.
+Today the answer is a `Bind { bridge }` (or `Begin { self_addr }`) message
+before `Start`. That works but adds a variant whose only job is to land
+"you, isolate, look here for your replies" into the isolate's state.
+
+Phase 062 Rock 2 was designed for this (`register_with_capacity_using<I, E>`
+with a `|self_addr| ...` constructor closure) but did not ship in the
+five-Rock landing.
 
 **Build:** a way for an isolate to learn its own typed address at register
 time — for example, a constructor closure parameter `|self_addr| {
 ScatterCoord { ..., self_addr } }`. Avoids the bind-before-start handshake
 and removes the `Option<Address<...>>` field that's only `None` for one
 turn.
-
-### 4. Synchronous `try_send_outcome`
-
-**Surfaced by:** `eiffel_rate_limited_worker`.
-
-The threaded runtime offers three send shapes today:
-
-- `try_send` — fire-and-forget; only surfaces `IngressFull` (command queue
-  full), never `MailboxFull`;
-- `send_and_observe` — synchronous; distinguishes `MailboxFull` from
-  `IngressFull` / `Closed`, but each call is a worker-thread roundtrip, so
-  a tight burst from the host is gated by worker step rate. The mailbox
-  never fills, so overload is never visible at the producer;
-- `try_send_and_observe_with` — non-blocking; takes an observer closure
-  that fires on the worker thread later. Visible overload, but the
-  call-site shape is heavy (one closure per send, atomics for accounting,
-  manual barrier wait until every observer has fired).
-
-For the "host bursts N messages, wants to know per-send whether the
-mailbox accepted" pattern, today the answer is `try_send_and_observe_with`
-plus a hand-rolled accounting loop. The natural shape would be a
-synchronous-but-precise `try_send_outcome(addr, msg) -> Result<(),
-SendOutcomeError>` that returns the same `MailboxFull` / `IngressFull` /
-`Closed` typed error as `send_and_observe` *without* the per-call worker
-roundtrip — by checking the mailbox synchronously in the host before
-queueing the command.
-
-**Build:** a synchronous outcome-typed try_send. May reuse the same
-`ThreadedSendObservedError` enum.
-
-The Phase 059 Rock 5 `send_blocking` / `send_retrying` plan also covers
-this surface but is plan-only as of 2026-05-07; closing this finding
-likely closes Rock 5 too.
-
-### 5. Single-in-flight gate for timer-driven workers
-
-**Surfaced by:** `eiffel_rate_limited_worker`.
-
-A worker isolate that uses `sleep(window).reply(Tick)` to rate-limit its
-processing must never have more than one timer in flight, or the rate
-limit collapses (every Submit kicks off its own sleep). The current shape
-is a `pending: u32` counter and a `was_idle = pending == 0` check inside
-the handler. That's correct but it's the same five lines wherever this
-shape appears.
-
-**Build:** a small "single-call gate" helper for isolate state. Could be a
-`SingleCallGate<R>` field that returns either an effect (when idle) or
-records a deferred entry (when busy). On the runtime side, this might be a
-trait `IsolateCallGate` that picks the next deferred entry on completion.
-Should not hide trace truth: every `sleep` is still one trace event.
-
-### 6. Bridge call retry classifier
-
-**Surfaced by:** `eiffel_retrying_outbound_http`.
-
-A caller-owned retry loop against the reqwest bridge has to write a six-arm
-match against `ReqwestCallOutcome` to classify "is this transient?":
-`Replied(Ok(resp))` (check `resp.status.is_server_error()`),
-`Replied(Err(ReqwestError::Timeout | Reqwest(_)))` (transient),
-`Replied(Err(_other))` (fatal), `Timeout` (transient), `Full | Closed`
-(fatal). Most apps want the same three buckets: succeeded / transient /
-fatal.
-
-**Build:** a small classifier helper on `ReqwestCallOutcome`:
-
-```rust
-match outcome.classify() {
-    OutcomeClass::Succeeded(resp)         => ...,
-    OutcomeClass::Transient(reason)       => retry,
-    OutcomeClass::Fatal(reason)           => fail,
-}
-```
-
-Where the per-bucket `reason` names which sub-cause hit (`UpstreamServer
-{ status }`, `BridgeTimeout`, `WorkerTimeout`, `Reqwest`, etc.). The
-typed multi-arm match still works — this is opt-in sugar.
-
-This is a smaller version of "Tina-shaped retry sugar" — not a hidden
-retry helper, just a classifier so caller-owned retry loops are five
-lines instead of fifteen.
 
 ### 7. Reqwest-bridge flatten edge: useful but per-call-site
 
@@ -183,7 +95,99 @@ why some are layered is confusing.
   punt until a non-pedagogical user actually mixes the two and
   flinches.
 
-### 8. Tina-owned database client (`tina-sqlx-bridge`)
+### 8. External cancellation API
+
+**Surfaced by:** `eiffel_cancellation_chain`.
+
+There is no public `runtime.cancel(addr)` and no public
+`IsolateCall::abort()`. The only way to "externally cancel" mid-
+flight work today is to send a domain `Stop` message to the
+requester isolate, which causes it to stop itself. Stopping the
+requester closes its pending IsolateCalls and any worker reply
+that arrives later is rejected as `CallReplyRejected
+{ RequesterClosed }`. That works, but every isolate that wants to
+be externally cancellable has to add its own `Stop` (or
+equivalent) variant.
+
+**Build:** a runtime-level `runtime.cancel(addr) -> CancelOutcome`
+that closes pending IsolateCalls owned by `addr` without
+requiring user-defined cancellation messages. Or a typed
+`IsolateCall::abort(handle)` that the requester can stash and use
+to drop a single in-flight call without stopping itself.
+
+### 9. Drain helper for `PendingReplies` at service stop
+
+**Surfaced by:** `eiffel_graceful_pool_shutdown`,
+`eiffel_graceful_drain_server`.
+
+`PendingReplies::drain()` returns `Vec<(K, DeferredReply<R>)>`,
+which the user has to map into `Effect::Batch(reply_to(slot,
+value))` calls plus a final `stop()`. The service-stop pattern
+is identical at every call site:
+
+```rust
+let mut effects: Vec<_> =
+    self.pending.drain().into_iter().map(|(_, slot)| reply_to(slot, R::Closed)).collect();
+effects.push(stop());
+Effect::Batch(effects)
+```
+
+The same area also wants a *deadline* — a drain that says "finish
+in-flight work, but give up after T". Today that's a hand-rolled
+`DrainDeadlineFired` continuation message scheduled via `sleep`
+plus a check in the isolate's "is it done" predicate that returns
+true on deadline-fired even when `pending > 0`. The
+`tina-tokio-bridge::BridgeShutdownReport::drained_within_timeout`
+flag is the bridge-side version of the same idea.
+
+**Build:**
+
+- `pending.drain_into_effect(R::Closed) -> Effect<I>` (or
+  similarly named) that returns the matching `Effect::Batch` in
+  one call, with the trailing `stop()` opt-in via a sibling
+  `drain_into_stop_effect(R::Closed)`.
+- An isolate-state `DrainGate` helper that holds the deadline +
+  the pending-count predicate, with an `is_done` /
+  `drained_within_timeout` accessor that the handler reuses.
+
+### 11. Multi-stage pipeline ergonomics
+
+**Surfaced by:** `eiffel_two_stage_pipeline`.
+
+A 3-stage pipeline reads as 4 enum variants in `PipelineMsg`
+(Submit + Parsed + Validated + Executed), each with its own match
+arm. The Tokio side reads as `parse(i).await?; validate(p).await?;
+execute(v).await?` — three lines. The Tina version is correct and
+trace-visible at every stage, but the variant count grows
+linearly with stage count.
+
+**Build:** a pipeline-shaped helper that takes a `[StageAddr; N]`
+and the captured deferred reply slot, walking through stages with
+a single continuation message. Must preserve per-stage timeout
+truth and the typed bail-out arms; this is sugar, not a hidden
+state machine. (`SingleCallGate` does not apply here — it solves
+single-in-flight timer gating, not stage chaining.)
+
+### 12. Rust footgun replication: shared receiver in worker pool
+
+**Surfaced by:** `eiffel_graceful_pool_shutdown` (Tokio side).
+
+Not a Tina finding per se — but worth recording as the *kind of
+footgun* Tina structurally avoids. The Tokio shutdown path needs
+both `JoinSet::abort_all` AND `drop(rx_arc)`. Forgetting the
+second leaves buffered jobs (and their reply oneshots) alive,
+blocking queued callers forever. The test passes under low burst
+because all jobs were in flight.
+
+Tina's `pending.drain()` + `Effect::Batch(reply_to)` makes this
+class of bug structurally impossible: every captured slot has one
+container, and shutdown is one effect away.
+
+This is a positive observation about Tina's model. The build is
+documentation, not new product work — call it out in the user
+guide's lifecycle chapter as a contrast with the Tokio shape.
+
+### 13. Tina-owned database client (`tina-sqlx-bridge`)
 
 **Surfaced by:** `eiffel_sqlite_counter`.
 
@@ -208,29 +212,10 @@ for the sync path) shaped like `tina-reqwest-bridge`:
 - visible `Full` / `Closed` / `Timeout`;
 - metrics handle comparable to `ReqwestMetricsHandle`.
 
-ROADMAP phase 055 names this work; this finding is the per-specimen
+ROADMAP phase 063 names this work; this finding is the per-specimen
 witness.
 
-### 9. Self-address-aware spawn / fanout helper
-
-**Surfaced by:** `eiffel_dynamic_worker_pool`,
-`eiffel_sharded_fanout_read`.
-
-A coordinator that wants to spawn N children that send back to it
-must first be told its own `Address`. Today the pattern is a
-bootstrap `Begin { self_addr: Address<CoordMsg> }` message that the
-host sends after `register`. Same shape shows up in
-`eiffel_sharded_fanout_read` as the `Bind { bridge }` handshake.
-The variant exists only to plug the "isolate doesn't know its own
-address until after registration" gap.
-
-**Build:** a `register_with_capacity_using<F>(capacity, f)` form
-where `f: FnOnce(Address<I::Message>) -> I` lets the constructor
-see its own typed address, removing the `Begin/Bind` bootstrap
-variant. Round 2 finding 3 named this for the scatter/gather coord;
-this specimen reinforces it for plain spawn-and-join.
-
-### 10. Spawn API that surfaces the child's address
+### 14. Spawn API surfaces the child's address
 
 **Surfaced by:** `eiffel_dynamic_worker_pool`.
 
@@ -258,7 +243,7 @@ delivers `Address<ChildMsg>` to the parent as a continuation
 message — analogous to `send_observed` and `runtime calls`. This
 also enables a future `JoinSet`-equivalent isolate primitive.
 
-### 11. Deadline as first-class context
+### 15. Deadline as first-class context
 
 **Surfaced by:** `eiffel_backpressure_chain`.
 
@@ -276,43 +261,66 @@ total: Duration)` with `.remaining() -> Duration`. A future
 matching `IsolateCall` timeout (slightly larger than the budget
 the callee should use) automatically.
 
-### 12. Drain timeout for isolate shutdown
+## Closed
 
-**Surfaced by:** `eiffel_graceful_drain_server`.
+Findings shipped by recent phases. Numbers are kept stable so
+existing README references stay valid.
 
-The bridge crate (`tina-tokio-bridge::BridgeShutdownReport`) has a
-`drained_within_timeout` flag for the bridge case. The same shape
-applies at the isolate level: a `Drain` message that says "finish
-in-flight, then stop" should accept a deadline, with the report
-saying whether drain completed inside it. Today this is a
-hand-rolled `DrainDeadlineFired` continuation message scheduled via
-`sleep` and a check in the isolate's "is it done" predicate that
-returns true on deadline-fired even when `pending > 0`.
+### 1. `observe_result` on `ThreadedMultiShardRuntime` — Phase 062 Rock 1
 
-**Build:** a small `DrainGate` helper for isolate state that holds
-the deadline + the pending-count predicate, with an `is_done` /
-`drained_within_timeout` accessor that the handler reuses.
+Surfaced by `eiffel_sharded_fanout_read`, `eiffel_sharded_keyspace`.
+`runtime.observe_result::<Report, _, _>(addr)` now exists on the
+multi-shard threaded shell with the same single-claim semantics as
+the single-shard form. Both 053 specimens use it directly; the
+`Arc<Mutex<Option<Report>>>` polling is gone.
 
-### 13. Single-in-flight timer gate (reinforced)
+### 4. Synchronous `try_send_outcome` — Phase 062 Rocks 3 & 4
 
-**Surfaced by:** `eiffel_periodic_batcher` (again).
+Surfaced by `eiffel_rate_limited_worker`,
+`eiffel_hot_key_fairness`. `runtime.try_send_outcome(addr, msg,
+&outcomes)` plus a shared `HostBurstOutcomes` accumulator removes
+the per-send observer closure, the Arc-cloned counters, and the
+manual observed barrier. `runtime.send_observed_until(addr,
+deadline, backoff, || msg)` covers the "control message through a
+saturated mailbox" pattern with a typed
+`SendObservedUntilError::{Timeout, Closed, WorkerStopped}`.
 
-Round 2 finding 5 already named this from
-`eiffel_rate_limited_worker`. The periodic batcher needs the same
-pattern: a generation counter on `sleep(...).reply(Tick)` so that a
-size-triggered flush can invalidate a still-pending timer's
-eventual `Tick` without canceling the runtime call. The batcher's
-shape is identical to the rate-limited worker's; the user-side
-boilerplate is the same five lines.
+Per-send precision still rides on the worker-thread observer: true
+synchronous-in-the-host mailbox inspection would violate SPSC and
+expose the worker's address->mailbox registry to the host thread,
+so the helper removes bookkeeping, not the worker roundtrip.
 
-The product work named in finding 5 (`SingleSleepGate` /
-`SingleCallGate<R>`) covers this. Reinforcing here to keep the
-"it's everywhere" signal visible.
+### 5. Single-in-flight gate for timer-driven workers — Phase 062 Rock 5
+
+Surfaced by `eiffel_rate_limited_worker`,
+`eiffel_hot_key_fairness`, and reinforced by
+`eiffel_periodic_batcher` / `eiffel_graceful_drain_server`.
+`tina_runtime::SingleCallGate` names the "at most one timer/call in
+flight, plus N queued" invariant. `submit()` returns `true` when
+the caller should schedule; `complete()` returns `true` when more
+work is queued and the next timer should be scheduled. The gate is
+plain data — it does not own the timer or the trace; the caller
+still writes `sleep(...).reply(...)` so every event is visible.
+
+### 6. Bridge call retry classifier — Phase 062 Rock 6
+
+Surfaced by `eiffel_retrying_outbound_http`,
+`eiffel_webhook_fanout`. `ReqwestOutcomeExt::classify` returns
+`ReqwestOutcomeClass::{Succeeded, Transient(reason),
+Fatal(reason)}` with typed reason payloads. The raw layered
+`ReqwestCallOutcome` and `flatten_outcome` are unchanged; the
+classifier is opt-in sugar. `eiffel_retrying_outbound_http` and
+`eiffel_webhook_fanout` now match three arms instead of six.
+
+### 10. Retry helper at the service edge — Phase 062 Rock 4
+
+Closed by the same Rock as finding 4. `send_observed_until` covers
+both shapes — burst-message ingress and one-shot control-message
+delivery through a saturated mailbox.
 
 ## How To Add A Finding
 
-Only add to this file when the finding implies Tina product work. Round 2
-is for new pain that the post-053 specimens surface.
+Only add to this file when the finding implies Tina product work.
 
 ```md
 ### N. Short product-shaped title
@@ -324,14 +332,18 @@ What repeated pain we saw.
 **Build:** concrete primitive, API, doc, or test work.
 ```
 
-Per-example flavor belongs in the example README. Resolved archaeology
-belongs in `FINDINGS_HISTORY.md`.
+Per-example flavor belongs in the example README. Resolved
+archaeology belongs in `FINDINGS_HISTORY.md`.
 
-## Resolved Or Retired By Recent Phases
+Numbers are stable: when a finding closes, move it down to
+[Closed](#closed) and keep its number so external references
+(README links, commit messages, prior PRs) stay valid.
 
-These used to be current pain and should not be copied into new code.
-Round 1 list, kept short here; the long form is in
-[`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md):
+## Resolved Or Retired Round 1 (Phase 053 + 059)
+
+Round 1 closed in Phase 059 + Phase 053. Those nine items are
+archived verbatim in [`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md).
+Short summary of patterns no new code should copy:
 
 - hand-rolled mailbox factories: use `DefaultMailboxFactory` /
   `DefaultThreadedMailboxFactory`;
@@ -344,16 +356,10 @@ Round 1 list, kept short here; the long form is in
 - `Arc::try_unwrap` bridge shutdown dances: use the bridge host lifecycle;
 - old shared comparison harnesses: examples are specimens, tests are proof;
 - `Arc<Outcome>` / `Arc<Mutex<Vec<_>>>` for an isolate's *final* app
-  value (single-shard): use `stop_with(value)` +
-  `runtime.observe_result::<T>(addr)?`. (Multi-shard is Round 2 finding 1.)
+  value: use `stop_with(value)` +
+  `runtime.observe_result::<T>(addr)?` (works on single-shard and
+  multi-shard threaded runtimes; see active finding 1's closure
+  above);
 - per-comparison shard types: use `SingleShard` for one-shard programs and
   `tina_runtime::sharded::ShardPlacement` / `ShardServiceTable` for
   multi-shard placement.
-- hand-written `impl Isolate for X { tina::isolate_types! { ... } fn handle(...) }`
-  blocks: use `#[tina::isolate(message = M, ...)]` for pure send/reply
-  isolates and `#[tina_runtime::isolate(message = M, ...)]` for
-  isolates whose `handle` calls `sleep(...)` or `call(...)`. The
-  runtime path infers `Call = RuntimeCall<M>`; the `tina` path
-  defaults `Call = Infallible`. Round 3's ergonomics pass converted
-  four such blocks across `eiffel_tower_timeout_counter`,
-  `eiffel_backpressure_chain`, and `eiffel_dynamic_worker_pool`.

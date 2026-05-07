@@ -59,7 +59,7 @@ struct Fetcher {
 
 #[tina_runtime::isolate(message = FetchMsg)]
 impl Fetcher {
-    fn handle(&mut self, msg: FetchMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: FetchMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             FetchMsg::Begin => {
                 if self.remaining == 0 {

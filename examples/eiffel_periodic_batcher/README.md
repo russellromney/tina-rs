@@ -122,11 +122,12 @@ What feels worse:
 
 ## What this suggests
 
-The "single in-flight timer with stale-Tick filter" pattern shows up
-here, in `eiffel_rate_limited_worker`, and in any isolate that uses
-`sleep().reply()` to gate its own work. A small primitive — call it
-`SingleSleepGate` — that owns the generation counter and offers
-`schedule(duration) -> Effect` and `try_take(reply) ->
-Option<TickReply>` would replace this hand-rolled bookkeeping.
-
-(See FINDINGS Round 2 finding 5; this specimen reinforces it.)
+`SingleCallGate` (Phase 062 Rock 5) names "one timer in flight,
+plus N queued" but does **not** cover stale-tick invalidation —
+the case where a size-triggered flush wants to invalidate the
+still-pending timer's eventual `Tick`. So this specimen does not
+adopt the gate; it keeps the generation counter pattern explicit.
+A future "cancellable sleep" primitive (returning a cancel handle
+that produces a typed `Cancelled` reply arm) would replace both
+the gen counter and the manual Tick filter without hiding any
+trace event.

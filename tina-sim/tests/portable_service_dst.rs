@@ -58,7 +58,11 @@ struct Worker {
     shard = DstShard
 )]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Work(request) => send_observed(self.audit, AuditMsg::Record(request.key))
                 .reply(move |outcome| WorkerMsg::Audited(outcome, request)),
@@ -100,7 +104,11 @@ struct AuditSink {
 
 #[tina_runtime::isolate(message = AuditMsg, shard = DstShard)]
 impl AuditSink {
-    fn handle(&mut self, msg: AuditMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: AuditMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             AuditMsg::Record(key) => {
                 self.observed.borrow_mut().push(key);
@@ -131,7 +139,11 @@ struct Router {
     shard = DstShard
 )]
 impl Router {
-    fn handle(&mut self, msg: RouterMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: RouterMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RouterMsg::Submit(request) => {
                 let target = if request.key % 2 == 0 {

@@ -122,5 +122,5 @@ What feels worse:
   primitive `propagate_deadline(target, msg, deadline)` could
   compute `remaining()` and pass it through to the underlying
   `call(...)`.
-- This finding is added to FINDINGS Round 2 as the "deadline
-  propagation as a first-class concept" item.
+- See FINDINGS finding 15 (deadline as first-class context) for
+  the proposed `Deadline` value type.

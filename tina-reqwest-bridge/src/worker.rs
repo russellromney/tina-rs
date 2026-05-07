@@ -600,7 +600,7 @@ impl<S: Shard + 'static> Isolate for ReqwestWorker<S> {
         shard: S,
     }
 
-    fn handle(&mut self, msg: ReqwestMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(&mut self, msg: ReqwestMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
             ReqwestMsg::Send(request) => self.admit_initial(request),
             ReqwestMsg::Poll(id) => self.poll(id),

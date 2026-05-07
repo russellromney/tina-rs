@@ -634,7 +634,7 @@ mod tests {
         );
         let mut svc = svc;
         let mut shard = TestShard;
-        let mut ctx = Context::new(&mut shard, IsolateId::new(99));
+        let mut ctx = Context::<_, ServiceReply>::new_typed(&mut shard, IsolateId::new(99));
         let effect = svc.handle(json_call("read", ()), &mut ctx);
         match effect {
             Effect::Reply(ServiceReply::Ok(bytes)) => {

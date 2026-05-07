@@ -822,7 +822,7 @@ where
     type Call = RuntimeCall<ClientMsg>;
     type Shard = S;
 
-    fn handle(&mut self, msg: ClientMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(&mut self, msg: ClientMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
             ClientMsg::Begin => self.on_begin(),
             ClientMsg::Connected(result) => self.on_connected(result),

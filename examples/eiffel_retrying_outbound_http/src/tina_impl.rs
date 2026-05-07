@@ -21,12 +21,11 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use tina::prelude::*;
 use tina_reqwest_bridge::{
-    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestError, ReqwestRequest, ReqwestWorker,
-    send_request,
+    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestOutcomeClass, ReqwestOutcomeExt,
+    ReqwestRequest, ReqwestWorker, send_request,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, ThreadedRuntimeConfig,
-    sleep,
+    DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
@@ -121,7 +120,7 @@ struct Caller {
 
 #[tina_runtime::isolate(message = CallerMsg)]
 impl Caller {
-    fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             CallerMsg::Begin => self.send_attempt(),
             CallerMsg::HttpReturned(outcome) => self.absorb(outcome),
@@ -146,34 +145,25 @@ impl Caller {
     }
 
     fn absorb(&mut self, outcome: ReqwestCallOutcome) -> Effect<Self> {
-        let transient = match outcome {
-            CallOutcome::Replied(Ok(resp)) => {
-                if resp.status.is_success() {
-                    return self.finish(true);
+        // Phase-062 Rock 6: the classifier collapses the six-arm
+        // pattern over the layered ReqwestCallOutcome into three
+        // typed buckets without losing the layered shape — the raw
+        // `outcome` is consumed only after classify() decides which
+        // bucket the call belongs in. Bridge-vs-worker timeout, 5xx
+        // upstream, and worker transport errors all stay distinct
+        // through their typed reason payloads.
+        match outcome.classify() {
+            ReqwestOutcomeClass::Succeeded(_) => self.finish(true),
+            ReqwestOutcomeClass::Transient(_) => {
+                self.report.transient_failures += 1;
+                if self.report.attempts_made >= MAX_ATTEMPTS {
+                    self.finish(false)
+                } else {
+                    sleep(RETRY_BACKOFF).reply(CallerMsg::BackoffElapsed)
                 }
-                resp.status.is_server_error()
             }
-            // Bridge-layer failures: full / closed / timeout. Treat
-            // timeout as transient, the rest as fatal — matches the
-            // Tokio side's classification.
-            CallOutcome::Timeout => true,
-            CallOutcome::Full | CallOutcome::Closed => false,
-            // Worker-layer failures: classify reqwest transport /
-            // timeout as transient, everything else as fatal.
-            CallOutcome::Replied(Err(ReqwestError::Timeout))
-            | CallOutcome::Replied(Err(ReqwestError::Reqwest(_))) => true,
-            CallOutcome::Replied(Err(_)) => false,
-        };
-
-        if transient {
-            self.report.transient_failures += 1;
-            if self.report.attempts_made >= MAX_ATTEMPTS {
-                return self.finish(false);
-            }
-            return sleep(RETRY_BACKOFF).reply(CallerMsg::BackoffElapsed);
+            ReqwestOutcomeClass::Fatal(_) => self.finish(false),
         }
-
-        self.finish(false)
     }
 
     fn finish(&mut self, ok: bool) -> Effect<Self> {

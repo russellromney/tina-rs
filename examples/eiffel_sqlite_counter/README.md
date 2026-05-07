@@ -81,8 +81,8 @@ What feels better:
   contention, no question of "who else holds this lock." A single
   isolate mailbox serializes every database touch.
 - **Final value through `stop_with`.** Same Phase 059 Rock 1 path
-  as the rest of Round 2. No mpsc, no atomic counter for the final
-  read.
+  the other specimens use. No mpsc, no atomic counter for the
+  final read.
 
 What feels worse — and where the missing bridge bites:
 
@@ -130,7 +130,8 @@ the actual rusqlite calls; bounded ingress; typed `SqliteError`;
 visible `Full` / `Closed` / `Timeout`; metrics shape comparable to
 the reqwest bridge.
 
-(See FINDINGS Round 2 finding 8.)
+(See FINDINGS finding 13 — `tina-sqlx-bridge` — for the proposed
+shape and ROADMAP phase 063 for the planned phase.)
 
 ## What this is not
 

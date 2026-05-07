@@ -63,7 +63,11 @@ impl Isolate for Proxy {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: ProxyMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ProxyMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ProxyMsg::Inbound(req) => {
                 // Forward the inbound path/method/body to upstream.

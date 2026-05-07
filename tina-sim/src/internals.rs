@@ -18,8 +18,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    AddressGeneration, Context, Effect, Isolate, IsolateId, Outbound as TinaOutbound,
-    RestartBudgetState, Shard, ShardId, TrySendError,
+    AddressGeneration, Context, DeferredReplyHandle, Effect, Isolate, IsolateId, MessageCaller,
+    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, TrySendError,
 };
 use tina_runtime::{
     CallId, CallInput, CallKind, CallOutcome, CallOutput, EffectKind, ListenerId,
@@ -132,6 +132,7 @@ pub(crate) struct PendingIsolateCall {
     pub(crate) insertion_order: u64,
     pub(crate) continuation_context: Option<MessageCallContext>,
     pub(crate) translator: Option<ErasedIsolateCallTranslator>,
+    pub(crate) expected_reply_type_id: std::any::TypeId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -375,6 +376,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        caller: Option<MessageCaller>,
     ) -> ErasedEffect<S>;
 }
 
@@ -422,13 +424,17 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        caller: Option<MessageCaller>,
     ) -> ErasedEffect<S> {
         let message = message.downcast::<Msg>().unwrap_or_else(|_| {
             panic!("simulator attempted to deliver a handler message with the wrong type")
         });
 
         let effect = {
-            let mut ctx = Context::new(shard, isolate_id);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id);
+            if let Some(caller) = caller {
+                ctx = ctx.with_caller(caller);
+            }
             self.isolate.handle(*message, &mut ctx)
         };
 
@@ -503,6 +509,7 @@ where
                     message,
                     timeout,
                     translator,
+                    expected_reply_type_id,
                 } => ErasedCall {
                     kind: ErasedCallKind::IsolateCall {
                         send: ErasedSend {
@@ -515,6 +522,7 @@ where
                         translator: Box::new(move |outcome| {
                             Box::new(translator(outcome)) as Box<dyn Any>
                         }),
+                        expected_reply_type_id,
                     },
                 },
             };
@@ -526,6 +534,10 @@ where
                 .map(erase_effect::<I, S, Msg, Outbound>)
                 .collect(),
         ),
+        Effect::ReplyTo(slot, reply) => ErasedEffect::ReplyTo {
+            handle: tina::runtime_internal::deferred_into_handle(slot),
+            message: Box::new(reply),
+        },
     }
 }
 
@@ -571,6 +583,10 @@ where
     RestartChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S>>),
+    ReplyTo {
+        handle: DeferredReplyHandle,
+        message: Box<dyn Any>,
+    },
 }
 
 impl<S> ErasedEffect<S>
@@ -588,6 +604,7 @@ where
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
+            Self::ReplyTo { .. } => EffectKind::ReplyTo,
         }
     }
 }
@@ -669,6 +686,7 @@ pub(crate) enum ErasedCallKind {
         send: ErasedSend,
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 

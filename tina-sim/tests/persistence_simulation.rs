@@ -64,7 +64,11 @@ struct PersistParent {
     shard = SimShard
 )]
 impl PersistParent {
-    fn handle(&mut self, msg: PersistParentMsg, _ctx: &mut Context<'_, SimShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: PersistParentMsg,
+        _ctx: &mut Context<'_, SimShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PersistParentMsg::SpawnChild => {
                 let snapshot_path = self.snapshot_path.clone();
@@ -94,7 +98,11 @@ impl PersistParent {
     shard = SimShard
 )]
 impl PersistService {
-    fn handle(&mut self, msg: PersistMsg, ctx: &mut Context<'_, SimShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: PersistMsg,
+        ctx: &mut Context<'_, SimShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PersistMsg::Recover => {
                 snapshot_load(self.snapshot_path.clone()).reply(PersistMsg::SnapshotLoaded)

@@ -203,7 +203,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         shard: S,
     }
 
-    fn handle(&mut self, msg: HttpConnectionMsg, ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: HttpConnectionMsg,
+        ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
         // Capture self-identity once. Used by the streaming-request
         // dispatch path to hand the service a typed self-address.
         if self.self_isolate_id.is_none() {

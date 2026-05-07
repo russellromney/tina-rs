@@ -280,7 +280,7 @@ fn service_call_timeout_returns_504_on_the_wire() {
         fn handle(
             &mut self,
             _request: HttpRequest,
-            _ctx: &mut Context<'_, TimeoutShard>,
+            _ctx: &mut Context<'_, TimeoutShard, Self::Reply>,
         ) -> Effect<Self> {
             // Never reply. The caller's call timeout fires.
             noop()

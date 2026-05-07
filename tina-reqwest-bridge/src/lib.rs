@@ -41,7 +41,7 @@
 //!         shard: SingleShard,
 //!     }
 //!
-//!     fn handle(&mut self, msg: AppMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+//!     fn handle(&mut self, msg: AppMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
 //!         match msg {
 //!             AppMsg::Start => send_request(
 //!                 self.http,
@@ -153,7 +153,8 @@ mod types;
 mod worker;
 
 pub use helpers::{
-    BridgeFailure, ReqwestAddress, ReqwestCallError, ReqwestCallOutcome, ReqwestResult,
+    BridgeFailure, ReqwestAddress, ReqwestCallError, ReqwestCallOutcome, ReqwestFatalReason,
+    ReqwestOutcomeClass, ReqwestOutcomeExt, ReqwestResult, ReqwestTransientReason,
     flatten_outcome, send_request,
 };
 pub use metrics::{ReqwestMetrics, ReqwestMetricsHandle};

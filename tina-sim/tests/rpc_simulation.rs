@@ -54,7 +54,11 @@ impl Isolate for Observer {
     type Call = RuntimeCall<ClientResultMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: ClientResultMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ClientResultMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         self.received.borrow_mut().push(msg);
         Effect::Noop
     }

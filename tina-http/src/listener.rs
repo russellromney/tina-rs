@@ -117,7 +117,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         shard: S,
     }
 
-    fn handle(&mut self, msg: HttpListenerMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: HttpListenerMsg,
+        _ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             HttpListenerMsg::Start => tcp_bind(self.bind_addr).reply(HttpListenerMsg::Bound),
 

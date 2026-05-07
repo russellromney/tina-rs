@@ -58,7 +58,11 @@ impl Isolate for Parent {
         shard: HarnessShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::Start => spawn(
                 RestartableChildDefinition::new(|| Child { parent: None }, 4)
@@ -107,7 +111,11 @@ impl Isolate for Child {
         shard: HarnessShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ChildMsg::Boot => {
                 let parent = self
@@ -315,7 +323,7 @@ fn dst_harness_keeps_remote_full_pressure_visible_on_oracle() {
         fn handle(
             &mut self,
             msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SenderMsg::Burst => {
@@ -341,7 +349,7 @@ fn dst_harness_keeps_remote_full_pressure_visible_on_oracle() {
         fn handle(
             &mut self,
             _msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             noop()
         }

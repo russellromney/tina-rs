@@ -34,7 +34,11 @@ struct Target {
 
 #[tina_runtime::isolate(message = TargetMsg, shard = DstShard)]
 impl Target {
-    fn handle(&mut self, msg: TargetMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TargetMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TargetMsg::Data(value) => {
                 self.observed.borrow_mut().push(value);
@@ -65,7 +69,11 @@ struct Driver {
     shard = DstShard
 )]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::Send(value) => send(self.target, TargetMsg::Data(value)),
             DriverMsg::Burst(value) => batch([
@@ -96,7 +104,11 @@ struct TimerDriver {
     shard = DstShard
 )]
 impl TimerDriver {
-    fn handle(&mut self, msg: TimerMsg, _ctx: &mut Context<'_, DstShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: TimerMsg,
+        _ctx: &mut Context<'_, DstShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimerMsg::After(value) => sleep(Duration::from_millis(1 + u64::from(value % 5)))
                 .reply(move |_| TimerMsg::Elapsed(value)),
@@ -239,7 +251,7 @@ impl RemoteCoordinator {
     fn handle(
         &mut self,
         msg: RemoteCoordinatorMsg,
-        ctx: &mut Context<'_, RandomShard>,
+        ctx: &mut Context<'_, RandomShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             RemoteCoordinatorMsg::Send(value) => send(
@@ -319,7 +331,7 @@ impl CrossCallWorker {
     fn handle(
         &mut self,
         msg: CrossCallWorkerMsg,
-        _ctx: &mut Context<'_, RandomShard>,
+        _ctx: &mut Context<'_, RandomShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             CrossCallWorkerMsg::Reply(value) => reply(CrossCallReply(value.wrapping_add(1))),
@@ -353,7 +365,7 @@ impl CrossCallClient {
     fn handle(
         &mut self,
         msg: CrossCallClientMsg,
-        _ctx: &mut Context<'_, RandomShard>,
+        _ctx: &mut Context<'_, RandomShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             CrossCallClientMsg::Ask(value) => call(
@@ -403,7 +415,7 @@ impl RemoteWorker {
     fn handle(
         &mut self,
         msg: RemoteWorkerMsg,
-        _ctx: &mut Context<'_, RandomShard>,
+        _ctx: &mut Context<'_, RandomShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             RemoteWorkerMsg::Run { value, reply_to } => {

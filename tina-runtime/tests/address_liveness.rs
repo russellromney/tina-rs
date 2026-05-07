@@ -98,7 +98,7 @@ impl Isolate for Target {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             TargetMsg::Stop => Effect::Stop,
@@ -123,7 +123,7 @@ impl Isolate for Driver {
     fn handle(
         &mut self,
         message: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             DriverMsg::Kick(value) => {

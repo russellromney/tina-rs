@@ -48,7 +48,11 @@ impl Isolate for Driver {
         shard: TestShard,
     }
 
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin {
                 pool,

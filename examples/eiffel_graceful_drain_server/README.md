@@ -92,10 +92,14 @@ waiter.
 The host delivers `Drain` through the same bounded mailbox the
 submits went through. The mailbox may still hold queued admissions
 when shutdown is requested (the worker drains at one per
-`JOB_WORK_MS`); the host retries `send_and_observe` until a slot
-opens. That retry-loop pattern is the same one in
-`eiffel_rate_limited_worker`'s `BurstClosed` delivery — see Round 2
-finding 4 (`try_send_outcome` ergonomics).
+`JOB_WORK_MS`); the host calls
+`runtime.send_observed_until(...)` (Phase 062 Rock 4) which
+retries `MailboxFull` / `IngressFull` up to a deadline. The
+producer side uses `try_send_outcome` + `HostBurstOutcomes`
+(Phase 062 Rocks 3 & 4) so the per-shard admit / mailbox-full /
+ingress-full counts come back as a typed snapshot, no observer
+closure. The Worker's "one Tick in flight, plus N queued"
+invariant is `SingleCallGate` (Phase 062 Rock 5).
 
 ## Discussion
 

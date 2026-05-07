@@ -65,7 +65,11 @@ impl Isolate for Connection {
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Start => read_call(self.stream, self.max_chunk),
             ConnectionMsg::ReadCompleted(bytes) => {
@@ -115,7 +119,11 @@ impl Isolate for Client {
     type Call = RuntimeCall<ClientMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ClientMsg::Start(addr) => Effect::Call(RuntimeCall::new(
                 CallInput::TcpConnect { addr },
@@ -220,7 +228,11 @@ impl Isolate for FileClient {
     type Call = RuntimeCall<FileClientMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FileClientMsg::Start { dir, path } => Effect::Call(RuntimeCall::new(
                 CallInput::Mkdir {
@@ -354,7 +366,11 @@ impl Isolate for UdpClient {
     type Call = RuntimeCall<UdpClientMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             UdpClientMsg::Start => udp_bind(self.receiver_addr).reply(UdpClientMsg::BoundReceiver),
             UdpClientMsg::BoundReceiver(Ok((socket, _addr))) => {
@@ -432,7 +448,11 @@ impl Isolate for DnsProbe {
     type Call = RuntimeCall<DnsProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DnsProbeMsg::Lookup {
                 host,
@@ -487,7 +507,11 @@ impl Isolate for TlsProbe {
     type Call = RuntimeCall<TlsProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TlsProbeMsg::Connect {
                 addr,
@@ -568,7 +592,11 @@ impl Isolate for TlsServerProbe {
     type Call = RuntimeCall<TlsServerProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TlsServerProbeMsg::Bind => {
                 tls_bind(local_addr(0), Vec::new(), Vec::new()).reply(TlsServerProbeMsg::Bound)
@@ -636,7 +664,11 @@ impl Isolate for PathProbe {
     type Call = RuntimeCall<PathProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PathProbeMsg::Start { dir, path, renamed } => mkdir(dir, 0o755)
                 .reply(move |result| PathProbeMsg::DirectoryMade(result, path, renamed)),
@@ -720,7 +752,11 @@ impl Isolate for SignalProbe {
     type Call = RuntimeCall<SignalProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SignalProbeMsg::Wait { name, timeout } => {
                 signal_wait(name, timeout).reply(SignalProbeMsg::Done)
@@ -765,7 +801,11 @@ impl Isolate for ProcessProbe {
     type Call = RuntimeCall<ProcessProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ProcessProbeMsg::Run {
                 command,
@@ -809,7 +849,11 @@ impl Isolate for UdpProbe {
     type Call = RuntimeCall<UdpProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             UdpProbeMsg::Bind => udp_bind(self.bind_addr).reply(UdpProbeMsg::Bound),
             UdpProbeMsg::Bound(Ok((socket, _))) => {
@@ -926,7 +970,11 @@ impl Isolate for Listener {
     type Call = RuntimeCall<ListenerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerMsg::Bootstrap => {
                 self.self_addr = Some(ctx.me());
@@ -1035,7 +1083,11 @@ impl Isolate for Binder {
     type Call = RuntimeCall<BinderMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             BinderMsg::StartBind => {
                 let addr = self.bind_addr;
@@ -1084,7 +1136,11 @@ impl Isolate for Probe {
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ProbeMsg::StartInvalidAccept => Effect::Call(RuntimeCall::new(
                 CallInput::TcpAccept {
@@ -1161,7 +1217,11 @@ impl Isolate for Waiter {
     type Call = RuntimeCall<WaiterMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WaiterMsg::StartAccept => Effect::Call(RuntimeCall::new(
                 CallInput::TcpAccept {
@@ -1212,7 +1272,11 @@ impl Isolate for PeerAwareAcceptor {
     type Call = RuntimeCall<PeerAwareAcceptMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             PeerAwareAcceptMsg::StartAccept => Effect::Call(RuntimeCall::new(
                 CallInput::TcpAccept {
@@ -1259,7 +1323,11 @@ impl Isolate for ReadProbe {
     type Call = RuntimeCall<ReadProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ReadProbeMsg::StartRead => Effect::Call(RuntimeCall::new(
                 CallInput::TcpRead {
@@ -1310,7 +1378,11 @@ impl Isolate for WriteProbe {
     type Call = RuntimeCall<WriteProbeMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WriteProbeMsg::StartWrite => Effect::Call(RuntimeCall::new(
                 CallInput::TcpWrite {
@@ -1358,7 +1430,11 @@ impl Isolate for ListenerCloser {
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CloserMsg::CloseListener => Effect::Call(RuntimeCall::new(
                 CallInput::TcpListenerClose {
@@ -1391,7 +1467,11 @@ impl Isolate for StreamCloser {
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CloserMsg::CloseStream => Effect::Call(RuntimeCall::new(
                 CallInput::TcpStreamClose {

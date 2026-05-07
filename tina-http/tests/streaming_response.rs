@@ -45,7 +45,7 @@ impl Isolate for ChunkProducer {
     fn handle(
         &mut self,
         _msg: ResponseChunkMsg,
-        _ctx: &mut Context<'_, TestShard>,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         if self.yielded >= self.total_chunks {
             return reply(ResponseChunkReply::Eof);
@@ -75,7 +75,11 @@ impl Isolate for StreamingService {
         shard: TestShard,
     }
 
-    fn handle(&mut self, request: HttpRequest, _ctx: &mut Context<'_, TestShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
         let response = if request.path == "/big" {
             HttpResponse::with_stream(
                 StatusCode::OK,

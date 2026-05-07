@@ -35,7 +35,11 @@ struct ChildWorker;
 
 #[tina::isolate(message = ChildEvent, shard = InlineShard)]
 impl ChildWorker {
-    fn handle(&mut self, msg: ChildEvent, _ctx: &mut Context<'_, InlineShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ChildEvent,
+        _ctx: &mut Context<'_, InlineShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ChildEvent::Begin => stop(),
         }
@@ -56,7 +60,11 @@ struct Session {
     shard = InlineShard
 )]
 impl Session {
-    fn handle(&mut self, msg: Message, _ctx: &mut Context<'_, InlineShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Message,
+        _ctx: &mut Context<'_, InlineShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             Message::Note(note) => {
                 self.notes.push(note.clone());
@@ -117,7 +125,8 @@ impl<T> Mailbox<T> for LocalMailbox<T> {
 fn preferred_surface_helpers_build_expected_effects() {
     let audit = Address::new(ShardId::new(3), IsolateId::new(41)).with_reply::<usize>();
     let mut shard = InlineShard;
-    let mut ctx = Context::new(&mut shard, IsolateId::new(7));
+    let mut ctx =
+        Context::<_, <Session as Isolate>::Reply>::new_typed(&mut shard, IsolateId::new(7));
     let mut session = Session {
         notes: Vec::new(),
         audit,

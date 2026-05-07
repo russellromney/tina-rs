@@ -108,7 +108,7 @@ impl LlamaCounter {
     fn handle(
         &mut self,
         msg: BridgeRequest<BrushRequest, BrushReply>,
-        _ctx: &mut Context<'_, BridgeShard>,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
     ) -> Effect<Self> {
         let (request, responder) = msg.into_parts();
         self.brushes += 1;
@@ -457,7 +457,7 @@ impl HoldingWorker {
     fn handle(
         &mut self,
         msg: BridgeRequest<GateRequest, GateReply>,
-        _ctx: &mut Context<'_, BridgeShard>,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
     ) -> Effect<Self> {
         let (_request, responder) = msg.into_parts();
         self.held.push(responder);
@@ -492,7 +492,11 @@ struct ScheduledWorker {
 
 #[tina_runtime::isolate(message = ScheduledMsg, shard = BridgeShard)]
 impl ScheduledWorker {
-    fn handle(&mut self, msg: ScheduledMsg, _ctx: &mut Context<'_, BridgeShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ScheduledMsg,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ScheduledMsg::Request(request) => {
                 sleep(Duration::from_millis(1)).reply(move |_| ScheduledMsg::Ready(request))
@@ -576,7 +580,11 @@ struct FileBridgeWorker;
 
 #[tina_runtime::isolate(message = FileBridgeMsg, shard = BridgeShard)]
 impl FileBridgeWorker {
-    fn handle(&mut self, msg: FileBridgeMsg, _ctx: &mut Context<'_, BridgeShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: FileBridgeMsg,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FileBridgeMsg::Request(request) => {
                 let path = std::env::temp_dir().join(format!(
@@ -756,7 +764,7 @@ impl BlockingWorker {
     fn handle(
         &mut self,
         msg: BridgeRequest<GateRequest, GateReply>,
-        _ctx: &mut Context<'_, BridgeShard>,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
     ) -> Effect<Self> {
         let (request, responder) = msg.into_parts();
         self.entered.send(()).expect("entered signal");
@@ -940,7 +948,7 @@ impl CapturingWorker {
     fn handle(
         &mut self,
         msg: BridgeRequest<GateRequest, GateReply>,
-        _ctx: &mut Context<'_, BridgeShard>,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
     ) -> Effect<Self> {
         let (_request, responder) = msg.into_parts();
         *self.captured.lock().expect("captured responder lock") = Some(responder);
@@ -1015,7 +1023,7 @@ impl GateWorker {
     fn handle(
         &mut self,
         msg: BridgeRequest<GateRequest, GateReply>,
-        _ctx: &mut Context<'_, BridgeShard>,
+        _ctx: &mut Context<'_, BridgeShard, Self::Reply>,
     ) -> Effect<Self> {
         let (request, responder) = msg.into_parts();
         self.entered.send(()).expect("entered signal");

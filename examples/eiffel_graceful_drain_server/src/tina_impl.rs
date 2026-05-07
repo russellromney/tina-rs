@@ -2,29 +2,28 @@
 //! jobs and the shutdown signal — `Drain` is just another message in
 //! `WorkerMsg`. After `Drain` arrives, the worker captures the
 //! observed admitted count as the "expected" total and continues to
-//! drain. When `pending == 0 && processed >= expected`, the worker
-//! `stop_with(report)` and the host's `observe_result::<Report>`
-//! waiter resolves.
+//! drain. When the gate is idle and `processed >= expected`, the
+//! worker `stop_with(report)` and the host's
+//! `observe_result::<Report>` waiter resolves.
 //!
 //! What this teaches:
 //!
 //! - Shutdown is a message. No `select!`, no `oneshot`, no second
 //!   channel; the same mailbox carries jobs and shutdown.
-//! - "In flight" and "pending in queue" are one number: `pending`,
-//!   bounded by the mailbox cap. Drain truth is local: `pending`
-//!   reaches 0.
+//! - "In flight" and "pending in queue" are one number, named by
+//!   `SingleCallGate` (Phase 062 Rock 5). Drain truth is local: the
+//!   gate becomes idle.
 //! - Final `Report` reaches the host via `observe_result`. No
 //!   `Arc<Mutex>`, no mpsc.
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, ThreadedSendObservedError,
-    ThreadedTrySendError, sleep,
+    DefaultThreadedMailboxFactory, HostBurstOutcomes, SingleCallGate, SleepReply, ThreadedRuntime,
+    sleep,
 };
 
 use crate::{BURST_JOBS, JOB_WORK_MS, QUEUE_CAPACITY, Report};
@@ -42,7 +41,9 @@ enum WorkerMsg {
 
 struct Worker {
     work: Duration,
-    pending: u32,
+    /// Phase 062 Rock 5: names the "one Tick in flight, plus N
+    /// queued" invariant.
+    gate: SingleCallGate,
     processed: u32,
     /// `Some(n)` after `Drain` — the admitted count to drain to.
     expected: Option<u32>,
@@ -59,9 +60,7 @@ impl Worker {
             WorkerMsg::Submit(index) => {
                 self.last_index = Some(index);
                 self.report.items_admitted += 1;
-                let was_idle = self.pending == 0;
-                self.pending += 1;
-                if was_idle {
+                if self.gate.submit() {
                     sleep(self.work).reply(WorkerMsg::Tick)
                 } else {
                     noop()
@@ -69,16 +68,17 @@ impl Worker {
             }
             WorkerMsg::Tick(reply) => {
                 if reply.is_err() {
+                    self.gate.cancel_in_flight();
                     self.report.exit_clean = false;
                     return stop_with(self.report);
                 }
                 self.processed += 1;
-                self.pending -= 1;
+                let more = self.gate.complete();
                 self.report.items_processed = self.processed;
                 if self.drained_and_done() {
                     self.report.exit_clean = true;
                     stop_with(self.report)
-                } else if self.pending > 0 {
+                } else if more {
                     sleep(self.work).reply(WorkerMsg::Tick)
                 } else {
                     noop()
@@ -101,7 +101,7 @@ impl Worker {
 impl Worker {
     fn drained_and_done(&self) -> bool {
         match self.expected {
-            Some(expected) => self.pending == 0 && self.processed >= expected,
+            Some(expected) => self.gate.is_idle() && self.processed >= expected,
             None => false,
         }
     }
@@ -117,7 +117,7 @@ pub fn run() -> anyhow::Result<Report> {
         .register_with_capacity::<_, Infallible>(
             Worker {
                 work: Duration::from_millis(JOB_WORK_MS),
-                pending: 0,
+                gate: SingleCallGate::new(),
                 processed: 0,
                 expected: None,
                 last_index: None,
@@ -131,72 +131,36 @@ pub fn run() -> anyhow::Result<Report> {
         .observe_result::<Report, _, _>(worker_addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    // Producer: same shape as eiffel_rate_limited_worker. Non-blocking
-    // burst with per-send observer to count admit / full.
-    let admitted = Arc::new(AtomicU32::new(0));
-    let full = Arc::new(AtomicU32::new(0));
-    let observed = Arc::new(AtomicU32::new(0));
-    let mut ingress_full = 0u32;
-
+    // Producer: non-blocking burst with `try_send_outcome` /
+    // `HostBurstOutcomes` (Phase 062 Rocks 3 & 4).
+    let outcomes = HostBurstOutcomes::new();
     for n in 0..BURST_JOBS {
-        let admitted_obs = Arc::clone(&admitted);
-        let full_obs = Arc::clone(&full);
-        let observed_obs = Arc::clone(&observed);
-        let observer = move |outcome: Result<(), ThreadedSendObservedError>| {
-            match outcome {
-                Ok(()) => {
-                    admitted_obs.fetch_add(1, Ordering::Release);
-                }
-                Err(_) => {
-                    full_obs.fetch_add(1, Ordering::Release);
-                }
-            }
-            observed_obs.fetch_add(1, Ordering::Release);
-        };
-        match runtime.try_send_and_observe_with(worker_addr, WorkerMsg::Submit(n), observer) {
-            Ok(()) => {}
-            Err(ThreadedTrySendError::IngressFull) => {
-                ingress_full += 1;
-                observed.fetch_add(1, Ordering::Release);
-            }
-            Err(e) => return Err(anyhow::anyhow!("try_send_and_observe_with: {e}")),
-        }
+        let _ = runtime.try_send_outcome(worker_addr, WorkerMsg::Submit(n), &outcomes);
     }
+    outcomes
+        .wait_complete(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("burst observers: {e}"))?;
+    let snap = outcomes.snapshot();
 
-    // Wait for observers.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while observed.load(Ordering::Acquire) < BURST_JOBS && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    if observed.load(Ordering::Acquire) < BURST_JOBS {
-        return Err(anyhow::anyhow!("observers did not all fire within 2s"));
-    }
-
-    // Drain message goes through the same mailbox. The mailbox may
-    // still have admitted Submits queued (worker drains them at one
-    // per JOB_WORK_MS), so retry until accepted.
+    // Drain rides the same bounded mailbox; `send_observed_until`
+    // retries on `MailboxFull` / `IngressFull` up to the deadline.
     let close_deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match runtime.send_and_observe(worker_addr, WorkerMsg::Drain) {
-            Ok(()) => break,
-            Err(ThreadedSendObservedError::MailboxFull)
-            | Err(ThreadedSendObservedError::IngressFull) => {
-                if Instant::now() >= close_deadline {
-                    return Err(anyhow::anyhow!("could not deliver Drain within 2s"));
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(e) => return Err(anyhow::anyhow!("Drain send: {e}")),
-        }
-    }
+    runtime
+        .send_observed_until(
+            worker_addr,
+            close_deadline,
+            Duration::from_millis(2),
+            || WorkerMsg::Drain,
+        )
+        .map_err(|e| anyhow::anyhow!("Drain send: {e:?}"))?;
 
     let report = waiter
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("worker did not finish: {e:?}"))?;
 
     let final_report = Report {
-        items_admitted: admitted.load(Ordering::Acquire),
-        items_full: full.load(Ordering::Acquire) + ingress_full,
+        items_admitted: snap.admitted,
+        items_full: snap.mailbox_full + snap.ingress_full,
         items_processed: report.items_processed,
         shutdown_observed: report.shutdown_observed,
         exit_clean: report.exit_clean,

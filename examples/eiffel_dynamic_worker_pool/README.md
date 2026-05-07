@@ -102,8 +102,8 @@ What feels worse:
 - **Chicken-and-egg `Begin { self_addr }` handshake.** A coordinator
   that wants to spawn children that send back has to be told its
   own address as a bootstrap message. The pattern is small but
-  shows up at every fanout-and-join site. (Same finding as Round 2
-  #3 — self-address at registration time.)
+  shows up at every fanout-and-join site. (See FINDINGS finding 3
+  — self-address at registration time.)
 - **No "wait for child to boot before next step" primitive.** The
   Tokio side has `JoinSet::join_next` which both confirms a task
   *finished* and gives the result. The Tina side has
@@ -124,9 +124,9 @@ What feels worse:
 ## Partial-failure flavor
 
 This specimen exercises the happy path: every worker finishes and
-sends. The roadmap's Round 2 cancellation-chain specimen (and the
-sharded scatter/gather report from Phase 053) cover the typed
-partial-aggregate shape. A future variant of this specimen could:
+sends. `eiffel_cancellation_chain` and the sharded scatter/gather
+report from Phase 053 cover the typed partial-aggregate shape. A
+future variant of this specimen could:
 
 - give one worker a slice that triggers a panic;
 - have the coord observe the missing partial via
@@ -135,5 +135,6 @@ partial-aggregate shape. A future variant of this specimen could:
   partials are missing;
 - emit a `Report` with `results_collected < expected`.
 
-That requires either a self-address-aware spawn API or one of the
-Round 2 finding 3 / 1 helpers.
+That requires either FINDINGS finding 3 (self-address at
+registration time) or finding 14 (spawn API surfaces child's
+address) to ship.

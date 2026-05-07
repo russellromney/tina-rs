@@ -90,7 +90,7 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
         shard: S,
     }
 
-    fn handle(&mut self, msg: HttpPoolMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(&mut self, msg: HttpPoolMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
             HttpPoolMsg::Submit(outbound) => {
                 if self.in_flight {

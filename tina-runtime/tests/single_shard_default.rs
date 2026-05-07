@@ -36,7 +36,11 @@ struct Hello {
 // No `shard = ...` argument: macro defaults to `tina::SingleShard`.
 #[tina::isolate(message = HelloMsg)]
 impl Hello {
-    fn handle(&mut self, msg: HelloMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: HelloMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             HelloMsg::Hello => {
                 self.seen = true;
@@ -58,7 +62,11 @@ struct Sleeper;
 // `#[tina_runtime::isolate]` form, also no shard argument.
 #[tina_runtime::isolate(message = SleeperMsg)]
 impl Sleeper {
-    fn handle(&mut self, msg: SleeperMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SleeperMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SleeperMsg::Start => {
                 tina_runtime::sleep(Duration::from_millis(1)).reply(|_| SleeperMsg::Done)

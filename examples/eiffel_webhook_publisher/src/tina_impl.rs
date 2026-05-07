@@ -17,18 +17,15 @@
 //! `["1", "2", "3"]` regardless of which shape produced them.
 
 use std::convert::Infallible;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use tina::prelude::*;
 use tina_reqwest_bridge::{
     ReqwestAddress, ReqwestCallError, ReqwestCallOutcome, ReqwestConfig, ReqwestMsg,
     ReqwestRequest, ReqwestResponse, ReqwestWorker, flatten_outcome, send_request,
 };
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, call};
 
 use crate::{Report, WebhookServer};
 
@@ -51,46 +48,11 @@ enum DriverMsg {
     PostedFlattened(Result<ReqwestResponse, ReqwestCallError>),
 }
 
-#[derive(Default)]
-struct Done {
-    flag: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl Done {
-    fn signal(&self) {
-        *self.flag.lock().expect("done lock") = true;
-        self.cv.notify_all();
-    }
-
-    /// Returns `true` when the driver signalled completion within
-    /// the deadline, `false` on timeout. Callers should fail loudly
-    /// on `false` rather than swallow it — a silent timeout would
-    /// produce a misleading "wrong body" assertion later.
-    fn wait(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.flag.lock().expect("done lock");
-        while !*guard {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (g, _) = self
-                .cv
-                .wait_timeout(guard, deadline - now)
-                .expect("done wait");
-            guard = g;
-        }
-        true
-    }
-}
-
 struct Driver {
     http: ReqwestAddress,
     url: String,
     counter: u64,
     timeout: Duration,
-    done: Arc<Done>,
 }
 
 impl Driver {
@@ -142,7 +104,7 @@ impl Isolate for Driver {
         shard: SingleShard,
     }
 
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             DriverMsg::Run(url) => {
                 self.url = url;
@@ -159,7 +121,6 @@ impl Isolate for Driver {
             DriverMsg::PostedFlattened(result) => {
                 check_flat(&result);
                 if self.counter >= REQUESTS as u64 {
-                    self.done.signal();
                     stop()
                 } else {
                     self.next_post()
@@ -206,14 +167,9 @@ fn check_flat(result: &Result<ReqwestResponse, ReqwestCallError>) {
 }
 
 pub fn run() -> Report {
-    let runtime = Arc::new(ThreadedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
     ));
 
     let webhook = WebhookServer::spawn();
@@ -222,28 +178,29 @@ pub fn run() -> Report {
     let bridge =
         ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default()).expect("install");
 
-    let done = Arc::new(Done::default());
     let driver = Driver {
         http: bridge.address,
         url: String::new(),
         counter: 0,
         timeout: Duration::from_secs(2),
-        done: Arc::clone(&done),
     };
     let driver_addr = runtime
         .register_with_capacity::<_, Infallible>(driver, 8)
         .expect("register driver");
 
+    let complete = runtime.observe_isolate_complete(driver_addr);
+
     runtime
         .try_send(driver_addr, DriverMsg::Run(url))
         .expect("kick driver");
 
-    assert!(
-        done.wait(Duration::from_secs(10)),
-        "tina driver timed out before completing all increments — \
-         the bridge or the webhook never finished. The webhook bodies \
-         assertion would otherwise blame the wrong layer."
-    );
+    complete
+        .wait(Duration::from_secs(10))
+        .expect(
+            "tina driver did not stop before timeout — the bridge or \
+             the webhook never finished. The webhook bodies assertion \
+             would otherwise blame the wrong layer.",
+        );
 
     // Let the webhook server's writer task land before snapshotting.
     std::thread::sleep(Duration::from_millis(20));

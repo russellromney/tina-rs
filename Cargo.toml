@@ -27,6 +27,7 @@ exclude = [
     "examples/eiffel_persistent_counter",
     "examples/eiffel_replay_dst",
     "examples/eiffel_outbound_fetch",
+    "examples/eiffel_scatter_gather",
     "examples/eiffel_outbound_http",
     "examples/eiffel_graceful_shutdown",
     "examples/eiffel_native_http",
@@ -41,6 +42,14 @@ exclude = [
     "examples/eiffel_graceful_drain_server",
     "examples/eiffel_sqlite_counter",
     "examples/eiffel_dynamic_worker_pool",
+    "examples/eiffel_cancellation_chain",
+    "examples/eiffel_owned_state_leak",
+    "examples/eiffel_worker_pool",
+    "examples/eiffel_bounded_batcher",
+    "examples/eiffel_webhook_fanout",
+    "examples/eiffel_hot_key_fairness",
+    "examples/eiffel_two_stage_pipeline",
+    "examples/eiffel_graceful_pool_shutdown",
 ]
 resolver = "2"
 

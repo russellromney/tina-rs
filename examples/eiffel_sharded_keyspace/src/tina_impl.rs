@@ -25,15 +25,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use tina::prelude::*;
 use tina_runtime::sharded::{ShardPlacement, ShardServiceTable, WrongShard};
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime, call,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime, call};
 
 use crate::{Command, Report, SCRIPT, SHARD_RAW_IDS, parse_commands};
 
@@ -80,7 +77,7 @@ struct Store {
 
 #[tina_runtime::isolate(message = StoreMsg, reply = StoreReply, shard = AppShard)]
 impl Store {
-    fn handle(&mut self, msg: StoreMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: StoreMsg, ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
         match msg {
             StoreMsg::Set { key, value } => {
                 if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
@@ -131,12 +128,11 @@ struct Driver {
     /// SUM state: shards still owing a count, and the running total.
     sum_pending: VecDeque<ShardId>,
     sum_total: u64,
-    done: Arc<Mutex<Option<Report>>>,
 }
 
 #[tina_runtime::isolate(message = DriverMsg, shard = AppShard)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => self.next_step(),
             DriverMsg::StoreReturned(outcome) => {
@@ -187,13 +183,9 @@ impl Driver {
                 self.sum_pending = self.placement.shards().iter().copied().collect();
                 self.next_step()
             }
-            Some(Command::Quit) | None => {
-                *self
-                    .done
-                    .lock()
-                    .expect("driver done mutex (set on script completion)") = Some(self.report);
-                stop()
-            }
+            // The host reads `self.report` via
+            // `runtime.observe_result::<Report>` — no shared mutex.
+            Some(Command::Quit) | None => stop_with(self.report),
         }
     }
 
@@ -252,7 +244,6 @@ pub fn run() -> anyhow::Result<Report> {
 
     // Driver lives on the first shard; it walks the script one
     // command at a time via `call(...).reply(...)`.
-    let done = Arc::new(Mutex::new(None));
     let driver = runtime
         .register_with_capacity_on::<Driver, Infallible>(
             ShardId::new(SHARD_RAW_IDS[0]),
@@ -263,29 +254,24 @@ pub fn run() -> anyhow::Result<Report> {
                 report: Report::default(),
                 sum_pending: VecDeque::new(),
                 sum_total: 0,
-                done: Arc::clone(&done),
             },
             64,
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
+    // Phase-062 Rock 1: typed result waiter on the multi-shard runtime.
+    // No `Arc<Mutex<Option<Report>>>` polling.
+    let waiter = runtime
+        .observe_result::<Report, _, _>(driver)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+
     runtime
         .try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
-    // Wait for the Driver to publish a finished `Report` and stop.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if done.lock().expect("done mutex").is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let report = done
-        .lock()
-        .expect("done mutex")
-        .take()
-        .context("driver did not produce a report within the deadline")?;
+    let report = waiter
+        .wait(Duration::from_secs(5))
+        .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
     let _ = runtime.shutdown();
     Ok(report)
 }

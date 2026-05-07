@@ -171,7 +171,11 @@ impl Isolate for RootIsolate {
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             LineageMsg::SpawnChild => Effect::Spawn(tina::ChildDefinition::new(
                 ChildIsolate {
@@ -195,7 +199,11 @@ impl Isolate for RestartableRootIsolate {
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             LineageMsg::SpawnChild => {
                 let child_capacity = self.child_capacity;
@@ -226,7 +234,11 @@ impl Isolate for ChildIsolate {
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             LineageMsg::SpawnGrandchild => {
                 Effect::Spawn(tina::ChildDefinition::new(LeafIsolate, self.leaf_capacity))
@@ -247,7 +259,11 @@ impl Isolate for LeafIsolate {
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         Effect::Noop
     }
 }
@@ -874,6 +890,7 @@ fn restart_children_can_restart_child_before_its_first_turn() {
     assert_ne!(runtime.child_record_snapshot()[0].child_isolate, old_child);
 }
 
+mod deferred;
 mod supervision;
 
 #[test]
@@ -934,7 +951,11 @@ impl Isolate for OverlapAcceptor {
     type Call = RuntimeCall<OverlapAcceptorMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             OverlapAcceptorMsg::Bootstrap => {
                 let addr = self.bind_addr;
@@ -1011,7 +1032,11 @@ impl Isolate for Reader {
     type Call = RuntimeCall<ReaderMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ReaderMsg::Start => Effect::Call(RuntimeCall::new(
                 CallInput::TcpRead {
@@ -1133,7 +1158,11 @@ impl Isolate for CooperativeFairness {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, _msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         self.seen.borrow_mut().push(self.label);
         if self.remaining_self_ticks == 0 {
             noop()
@@ -1157,7 +1186,11 @@ impl Isolate for Sleeper {
     type Call = RuntimeCall<TimerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimerMsg::StartSleep => Effect::Call(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
@@ -1335,7 +1368,11 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             StepEvent::Tick => Effect::Noop,
         }
@@ -1353,7 +1390,11 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RemoteEvent::Kick => send(self.target, RemoteEvent::Arrived),
             RemoteEvent::KickTwice => batch([
@@ -1382,7 +1423,11 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RemoteEvent::Arrived
             | RemoteEvent::Kick
@@ -1404,7 +1449,11 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ShardLocalSupervisionEvent::SpawnChild => spawn(tina::RestartableChildDefinition::new(
                 || ShardLocalChild {
@@ -1429,7 +1478,11 @@ where
     type Call = Infallible;
     type Shard = S;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ShardLocalSupervisionEvent::Panic => panic!("child panicked for restart test"),
             ShardLocalSupervisionEvent::SpawnChild | ShardLocalSupervisionEvent::Noop => noop(),
@@ -1448,7 +1501,11 @@ where
     type Call = RuntimeCall<TimerMsg>;
     type Shard = S;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimerMsg::StartSleep => Effect::Call(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
@@ -2629,7 +2686,11 @@ impl Isolate for ManualCallTarget {
     type Call = Infallible;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ManualCallRequest::NoReply => noop(),
         }
@@ -2655,7 +2716,11 @@ impl Isolate for ManualCallCaller {
     type Call = RuntimeCall<ManualCallCallerMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ManualCallCallerMsg::Start(target) => Effect::Call(RuntimeCall::isolate_call(
                 target,
@@ -2757,7 +2822,11 @@ impl Isolate for RetryWorker {
     type Call = RuntimeCall<RetryMsg>;
     type Shard = TestShard;
 
-    fn handle(&mut self, msg: Self::Message, ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RetryMsg::Attempt => {
                 self.attempts += 1;

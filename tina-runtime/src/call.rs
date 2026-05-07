@@ -1159,6 +1159,7 @@ enum RuntimeCallKind<M> {
         message: Box<dyn Any + Send>,
         timeout: Duration,
         translator: IsolateCallTranslator<M>,
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 
@@ -1249,6 +1250,7 @@ impl<M> RuntimeCall<M> {
                     CallOutcome::Closed => translator(CallOutcome::Closed),
                     CallOutcome::Timeout => translator(CallOutcome::Timeout),
                 }),
+                expected_reply_type_id: std::any::TypeId::of::<R>(),
             },
         }
     }
@@ -1328,6 +1330,7 @@ impl<M> RuntimeCall<M> {
                 message,
                 timeout,
                 translator,
+                expected_reply_type_id,
             } => RuntimeCallParts::IsolateCall {
                 target_shard,
                 target_isolate,
@@ -1335,6 +1338,7 @@ impl<M> RuntimeCall<M> {
                 message,
                 timeout,
                 translator,
+                expected_reply_type_id,
             },
         }
     }
@@ -1377,6 +1381,8 @@ pub enum RuntimeCallParts<M> {
         timeout: Duration,
         /// Outcome translator.
         translator: IsolateCallTranslator<M>,
+        /// `TypeId::of::<R>()` for the dispatching `Address<_, R>`.
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 
@@ -1430,6 +1436,10 @@ pub(crate) enum ErasedCallKind {
         timeout: Duration,
         /// Outcome translator erased to `Any`.
         translator: ErasedIsolateCallTranslator,
+        /// `TypeId::of::<R>()` for the dispatching `Address<_, R>`.
+        /// Used to typecheck deferred-reply payloads before they
+        /// reach the translator's downcast.
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 
@@ -1511,6 +1521,7 @@ where
                 message,
                 timeout,
                 translator,
+                expected_reply_type_id,
             } => ErasedCall {
                 kind: ErasedCallKind::IsolateCall {
                     send: crate::ErasedSend {
@@ -1523,6 +1534,7 @@ where
                     translator: Box::new(move |outcome| {
                         Box::new(translator(outcome)) as Box<dyn Any>
                     }),
+                    expected_reply_type_id,
                 },
             },
         }

@@ -79,7 +79,11 @@ impl Isolate for CallerIsolate {
         shard: SingleShard,
     }
 
-    fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CallerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallerMsg::Run(request) => {
                 send_request(self.worker, request, self.timeout).reply(CallerMsg::Done)
@@ -1083,7 +1087,11 @@ impl Isolate for RawCallerIsolate {
         shard: SingleShard,
     }
 
-    fn handle(&mut self, msg: RawCallerMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: RawCallerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             RawCallerMsg::Run(request) => {
                 // Deliberately the literal raw form, not `send_request`.

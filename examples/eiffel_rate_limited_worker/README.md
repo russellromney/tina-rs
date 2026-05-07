@@ -55,31 +55,51 @@ holds it together.
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
 limit lives in the worker's own state machine: each `Submit` returns
-`sleep(RATE_WINDOW).reply(Tick)`, and the matching `Tick` increments
-`processed`.
+`sleep(RATE_WINDOW).reply(Tick)`. A `SingleCallGate` (Phase-062 Rock 5)
+keeps at most one `sleep` in flight; the matching `Tick` increments
+`processed`. The host closes the burst with a normal Tina message:
+`BurstClosed(admitted)`.
 
 ```rust
 WorkerMsg::Submit(_) => {
     self.report.jobs_admitted += 1;
-    sleep(self.rate_window).reply(WorkerMsg::Tick)
+    if self.gate.submit() { sleep(self.rate_window).reply(WorkerMsg::Tick) }
+    else { noop() }
 }
 WorkerMsg::Tick(_) => {
     self.processed += 1;
-    if self.processed >= expected_total.load(Acquire) { stop_with(self.report) }
+    let more_work = self.gate.complete();
+    if self.is_done() { stop_with(self.report) }
+    else if more_work { sleep(self.rate_window).reply(WorkerMsg::Tick) }
     else { noop() }
 }
-```
-
-The host calls `runtime.send_and_observe(...)` to get the actual
-mailbox outcome:
-
-```rust
-match runtime.send_and_observe(worker_addr, Submit(n)) {
-    Ok(())                                            => admitted += 1,
-    Err(MailboxFull) | Err(IngressFull)               => full     += 1,
-    Err(other)                                        => bail,
+WorkerMsg::BurstClosed(admitted) => {
+    self.expected = Some(admitted);
+    if self.is_done() { stop_with(self.report) } else { noop() }
 }
 ```
+
+The host uses Phase-062 Rock 3's `try_send_outcome` plus a shared
+`HostBurstOutcomes` accumulator. That keeps the burst non-blocking and
+preserves every typed outcome (admitted / mailbox_full / mailbox_closed
+/ ingress_full / worker_stopped) without per-send observer ceremony:
+
+```rust
+let outcomes = HostBurstOutcomes::new();
+for n in 0..BURST_JOBS {
+    let _ = runtime.try_send_outcome(worker_addr, Submit(n), &outcomes);
+}
+outcomes.wait_complete(deadline)?;
+let snap = outcomes.snapshot();
+```
+
+After every observer fires, the host sends `BurstClosed(admitted)`
+through Phase-062 Rock 4's `send_observed_until` retry helper. If the
+mailbox is full of admitted `Submit`s, the helper retries until a slot
+opens or the deadline elapses; the typed `Closed` / `Timeout` /
+`WorkerStopped` outcomes stay distinct. That is deliberate: "done
+sending" is app control state, so it travels as a message rather than
+an `Arc<AtomicU32>` side channel.
 
 The final `Report` comes back via `runtime.observe_result::<Report>` —
 no mpsc, no atomics for the value, no host-side accumulator.
@@ -108,31 +128,3 @@ What feels worse:
   one `Tick`; reading `WorkerMsg`'s enum, the rate-limit shape isn't
   obvious until you see the `sleep(...).reply(Tick)` line. With
   Tokio, `recv().await; sleep().await` is the rate limit textually.
-- **`expected_total` still needs an `Arc<AtomicU32>`.** The worker
-  needs to know "host stopped sending" to know when to stop. The
-  host can't easily push a `Stop` message through the bounded
-  mailbox after a saturating burst (the mailbox is full of `Submit`s).
-  The atomic is small but it's still a side channel — Tina-shaped
-  control plane next to the data plane.
-- **`send_and_observe` is sync per-call.** Each producer step is a
-  worker-thread roundtrip. For this specimen it's the right shape;
-  for high-rate ingress benchmarks it would be the bottleneck.
-  `try_send` is the lighter path but loses the typed `Full` / `Closed`
-  split.
-
-What this suggests:
-
-- A bounded "control" mailbox separate from the data mailbox would
-  let the host send `Stop` / `Drain` after a saturating burst
-  without racing for a slot. Today the canonical answer is "use a
-  separate isolate as the control plane" — but for one shutdown
-  signal that feels heavy. (Related: FINDINGS notes on
-  reply-vs-incoming capacity in Rock 4.)
-- A `runtime.try_send_with_outcome(...)` that returns
-  `Sent`/`MailboxFull`/`IngressFull`/`Closed` *without* a
-  worker-thread roundtrip would let high-rate ingress code stay
-  precise without blocking. Today the choice is fast-but-coarse
-  (`try_send`) vs precise-but-blocking (`send_and_observe`). The
-  bounded host-send helpers from FINDINGS Rock 5 (`send_blocking` /
-  `send_retrying`) are planned but not yet shipped — the closest
-  current shape is `send_and_observe`, used here.

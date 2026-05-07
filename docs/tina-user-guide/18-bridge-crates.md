@@ -163,6 +163,14 @@ let app = App { http: bridge.address };
 `flatten_outcome(outcome)` is available when the call site does not
 need to distinguish bridge-layer from worker-layer failures.
 
+`outcome.classify()` (via the `ReqwestOutcomeExt` trait) is available
+for caller-owned retry loops: it returns
+`ReqwestOutcomeClass::{Succeeded, Transient(reason), Fatal(reason)}`
+where the typed reason still names which layer failed
+(`BridgeTimeout` vs `WorkerTimeout`, `BridgeFull` vs `WorkerFull`,
+etc.). The classifier does not retry — caller still owns idempotency,
+budget, and backoff.
+
 ## What bridges preserve and weaken
 
 **Preserved by every bridge crate:**

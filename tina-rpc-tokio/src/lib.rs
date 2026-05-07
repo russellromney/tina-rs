@@ -177,7 +177,11 @@ where
     type Call = RuntimeCall<ClientResultMsg>;
     type Shard = S;
 
-    fn handle(&mut self, msg: ClientResultMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ClientResultMsg,
+        _ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
         let entry = {
             let mut pending = self
                 .pending

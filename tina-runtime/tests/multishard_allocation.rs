@@ -255,7 +255,11 @@ impl Isolate for AllocationSender {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             AllocationEvent::Kick => send(self.target, AllocationEvent::Arrived),
             AllocationEvent::Arrived => noop(),
@@ -273,7 +277,11 @@ impl Isolate for AllocationSink {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }
@@ -288,7 +296,11 @@ impl Isolate for BatchSender {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             AllocationEvent::Kick => batch(vec![
                 send(self.target, AllocationEvent::Arrived),
@@ -309,7 +321,11 @@ impl Isolate for SpawnCostParent {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SpawnCostMsg::Spawn => spawn(RestartableChildDefinition::new(|| SpawnCostChild, 8)),
             SpawnCostMsg::Restart => restart_children(),
@@ -327,7 +343,11 @@ impl Isolate for SpawnCostChild {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SpawnCostMsg::Spawn | SpawnCostMsg::Restart => noop(),
         }
@@ -405,7 +425,11 @@ impl Isolate for CallTarget {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, _msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         reply(CallReply)
     }
 }
@@ -420,7 +444,11 @@ impl Isolate for CallClient {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallClientMsg::Start(target) => call(
                 target,
@@ -443,7 +471,11 @@ impl Isolate for TimerClient {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TimerMsg::Start => Effect::Call(RuntimeCall::new(
                 CallInput::Sleep {
@@ -469,7 +501,11 @@ impl Isolate for TcpCostClient {
         shard: AllocationShard,
     }
 
-    fn handle(&mut self, msg: Self::Message, _ctx: &mut Context<'_, Self::Shard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             TcpCostMsg::Bind => Effect::Call(RuntimeCall::new(
                 CallInput::TcpBind {

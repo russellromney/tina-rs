@@ -352,7 +352,7 @@ where
     type Call = RuntimeCall<RegistryMsg>;
     type Shard = S;
 
-    fn handle(&mut self, msg: RegistryMsg, _ctx: &mut Context<'_, S>) -> Effect<Self> {
+    fn handle(&mut self, msg: RegistryMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
             RegistryMsg::Route(request) => self.route(request),
             RegistryMsg::ServiceResult(outcome) => self.finish(outcome),
@@ -385,7 +385,7 @@ mod tests {
         msg: RegistryMsg,
     ) -> Effect<Registry<TestShard>> {
         let mut shard = TestShard;
-        let mut ctx = Context::new(&mut shard, IsolateId::new(99));
+        let mut ctx = Context::<_, RouterReply>::new_typed(&mut shard, IsolateId::new(99));
         registry.handle(msg, &mut ctx)
     }
 
