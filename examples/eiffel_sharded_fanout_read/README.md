@@ -110,12 +110,6 @@ What feels worse:
   adapter alongside the coord. A "use this address as the reply
   channel and translate replies through `From`" sugar at registration
   time would shrink the setup.
-- **No `observe_result` on `ThreadedMultiShardRuntime`.** Today the
-  multi-shard runtime exposes `try_send`, `trace`, `topology`,
-  `shutdown`, but not `observe_result`. So the host falls back on
-  `Arc<Mutex<Option<Report>>>` polling. The single-shard
-  `ThreadedRuntime` already has `observe_result`; lifting it to the
-  multi-shard runtime is the obvious next step. (See FINDINGS.)
 - **`Bind` then `Start` is two messages.** The coord needs the
   reply-adapter address, and the adapter needs the coord's address
   — chicken-and-egg. The current shape sends `Bind { bridge }`

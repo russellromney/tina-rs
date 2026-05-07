@@ -22,8 +22,7 @@
 //!   ScatterCoordMsg` and the adapter does the routing.
 
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::sharded::{
@@ -109,7 +108,6 @@ struct ScatterCoord {
     targets_in_order: Vec<ShardId>,
     pending_targets: Vec<ShardId>,
     outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<u64>)>,
-    report_into: Arc<Mutex<Option<ScatterGatherReport<u64>>>>,
 }
 
 impl Isolate for ScatterCoord {
@@ -165,11 +163,11 @@ impl Isolate for ScatterCoord {
                         config: self.config,
                         outcomes,
                     };
-                    *self
-                        .report_into
-                        .lock()
-                        .expect("report mutex (set on fanout completion)") = Some(report);
-                    return stop();
+                    // Phase-062 Rock 1: the host reads the typed
+                    // `ScatterGatherReport<u64>` via
+                    // `runtime.observe_result::<...>` instead of polling
+                    // an `Arc<Mutex<Option<_>>>` slot.
+                    return stop_with(report);
                 }
                 noop()
             }
@@ -227,7 +225,6 @@ pub fn run() -> anyhow::Result<Report> {
         .validate()
         .map_err(|e| anyhow::anyhow!("scatter/gather config: {e}"))?;
 
-    let report_slot: Arc<Mutex<Option<ScatterGatherReport<u64>>>> = Arc::new(Mutex::new(None));
     let coord = runtime
         .register_with_capacity_on::<ScatterCoord, ShardCounterMsg>(
             coord_shard,
@@ -238,7 +235,6 @@ pub fn run() -> anyhow::Result<Report> {
                 targets_in_order: Vec::new(),
                 pending_targets: Vec::new(),
                 outcomes: Vec::with_capacity(config.max_targets),
-                report_into: Arc::clone(&report_slot),
             },
             config.collector_capacity,
         )
@@ -252,6 +248,13 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register reply adapter: {e:?}"))?;
 
+    // Phase-062 Rock 1: typed result waiter on the multi-shard runtime.
+    // The coord publishes its `ScatterGatherReport<u64>` via
+    // `stop_with(report)`; no shared mutex.
+    let waiter = runtime
+        .observe_result::<ScatterGatherReport<u64>, _, _>(coord)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+
     runtime
         .try_send(coord, ScatterCoordMsg::Bind { bridge })
         .map_err(|e| anyhow::anyhow!("send Bind: {e:?}"))?;
@@ -259,18 +262,9 @@ pub fn run() -> anyhow::Result<Report> {
         .try_send(coord, ScatterCoordMsg::Start)
         .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if report_slot.lock().expect("report mutex").is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let report = report_slot
-        .lock()
-        .expect("report mutex")
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("scatter coord did not produce a report within 2s"))?;
+    let report = waiter
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("scatter coord did not produce a report: {e:?}"))?;
 
     let total_sum: u64 = report.replied().map(|(_, v)| *v).sum();
     let shards_replied = report.replied_count() as u32;

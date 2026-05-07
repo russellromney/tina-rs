@@ -167,6 +167,21 @@ If something can fail, Tina makes it traceable.
 
 If something can race, Tina makes it replayable.
 
+## Explicit by design
+
+Tina keeps the important parts visible.
+
+A handler matches a message and returns one effect. Runtime calls come back as
+named continuation messages. Timeouts, `Full`, `Closed`, and mailbox capacity
+are in the code you read.
+
+This is not accidental verbosity. Tina accepts helpers that remove boring
+bookkeeping. Tina rejects helpers that hide who owns state, what can overload,
+where timeout lives, or what message comes next.
+
+That matters for humans, and it matters for LLMs. Copyable local patterns are
+safer than clever APIs whose important rules live somewhere else.
+
 ## Deterministic simulation testing
 
 `tina-sim` runs the same isolate code as `tina-runtime` under a deterministic
@@ -242,6 +257,13 @@ deterministic replay, outbound fetch, graceful shutdown, and more). They are
 specimens for feel and behavior, not a shared harness prison. Cross-cutting
 findings live in
 [`examples/FINDINGS.md`](examples/FINDINGS.md).
+
+Recent Eiffel specimens are also the best place to see the newer app shapes:
+rate-limited workers use a `BurstClosed` control message instead of a host
+atomic, outbound HTTP retry keeps retry policy in the caller while the
+reqwest bridge only classifies outcomes, and sharded fanout uses
+`ShardPlacement` / `ShardServiceTable` / `ReplyAdapter` while honestly showing
+where the setup is still too heavy.
 
 ## Documentation
 

@@ -4,6 +4,107 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 055 Codebase Module Split
+
+- Split the giant runtime, driver, simulator, and support files into smaller
+  modules without changing public behavior, trace vocabulary, or API shape.
+- Preserved the existing test/verify surface while making future feature work
+  easier to review file-by-file instead of re-reading one massive module.
+- Kept the split intentionally boring: module extraction only, no semantic
+  cleanup mixed into the move.
+
+### Phase 051 Ecosystem Bridge Adapters
+
+- Completed the first bridge tranche around Tina's bounded core:
+  `tina-rpc-tokio`, `tina-tower-bridge`, and `tina-reqwest-bridge`, with
+  `tina-tokio-bridge` kept as the generic host/lifecycle foundation.
+- Added bridge docs and Eiffel specimens that name the two-runtime shape,
+  preserve `Full`/`Closed`/`Timeout` outcomes, keep deadlines and ingress caps
+  explicit, and document weakened DST/replay guarantees at the Tokio boundary.
+- Added bridge ergonomics polish: friendlier Tower service aliases, Tower
+  `Service` re-export, reqwest `install`, `send_request`, layered
+  `ReqwestCallOutcome`, opt-in `flatten_outcome`, and
+  `ReqwestOutcomeExt::classify` for caller-owned retry loops.
+- Left SQLx/Postgres, AWS SDK, smol, common bridge setup extraction, and bridge
+  crate folder layout as future bridge/database work.
+
+### Phase 061 Bounded Deferred Replies and Service Fanout
+
+- Added typed deferred reply capture so a service can accept a call, hold the
+  caller reply slot across later messages, and answer after fanout or worker
+  completion without hiding the pending capacity.
+- Added bounded pending-reply accounting, explicit full/closed/rejected trace
+  outcomes, and runtime/simulator proofs for slot capture, reply, drop,
+  caller-close, requester-shard close, stop cleanup, and panic cleanup.
+- Tightened the public API so deferred reply capture derives its reply type
+  from the running isolate context, with a runtime type guard retained at the
+  erased boundary.
+- Added Eiffel scatter/fanout examples that use deferred replies as ordinary
+  Tina state instead of side-channel host polling.
+
+### Phase 059 Eiffel Ergonomics Harvest
+
+- Added typed isolate result waiters through `stop_with(...)` and
+  `observe_result(...)`, retiring several `Arc<Mutex<_>>`/atomic host
+  side-channel patterns in Eiffel specimens.
+- Added per-call reply aliases and first-form TCP loop helpers so common TCP
+  continuation enums read closer to the runtime call that produced them.
+- Added capacity diagnostics and pressure-report conventions for examples and
+  tests, including reusable mailbox budget naming.
+- Added small HTTP router ergonomics, stateful-router support, and bridge
+  specimen structure cleanup so examples show the Tina-shaped code first.
+
+### Phase 058 Tina RPC Usability Layer
+
+- Added a typed Tina RPC service layer on top of the framed-call seed:
+  service-handler topology notes, generated service dispatch, typed client
+  stubs, and a `#[tina_rpc::service]` authoring surface.
+- Added `tina-rpc-tokio` so Tokio callers can await Tina RPC calls through a
+  bounded bridge without pretending cancellation, full, or timeout disappear.
+- Added RPC usability tests and Eiffel typed-RPC notes that keep capacity,
+  serialization limits, local-vs-wire outcomes, and retry policy explicit.
+
+### Phase 053 Sharded Service Primitives
+
+- Added sharded placement primitives with stable key ownership over an
+  explicit ordered shard list, visible placement reports, and owner-side
+  wrong-shard validation.
+- Added first-form sharded table/counter patterns, service-table helpers,
+  reply adapters, bounded scatter/gather vocabulary, partial aggregate
+  outcomes, and hot-key pressure reporting.
+- Added live and simulator/DST proofs for placement determinism, wrong-shard
+  rejection, closed targets, aggregate timeout, and bounded collector pressure.
+
+### Phase 052 Tina Framed Calls First Form
+
+- Added a Tina-native framed request/reply probe with length-prefixed TCP
+  frames, service/method names, request ids, bounded in-flight calls, typed
+  full/closed/timeout/error outcomes, client state machine, and registry.
+- Added simulator and live proofs for framed-call behavior, including visible
+  overload and close/cancel semantics.
+- Added Eiffel RPC comparison coverage so the first-form RPC surface is tested
+  as code people actually read, not only as crate internals.
+
+### Phase 048 Native HTTP Service Stack
+
+- Added Tina-owned HTTP/1.1 first-form support: parser/framing, request and
+  response types, connection/listener isolates, bounded limits, visible
+  overload, graceful close paths, and small routing helpers.
+- Added native HTTP client and bounded pool first forms, plus examples showing
+  when Tina can own HTTP directly instead of using Tokio/Axum as the edge.
+- Added parser-level DST and documented the remaining larger slices:
+  production streaming bodies and full listener/connection simulator replay.
+
+### Phase 047 Eiffel Ergonomics Harvest
+
+- Added the first Eiffel comparison suite discipline and harvested its obvious
+  Tina papercuts into primitives instead of leaving them as example folklore.
+- Added bounded observation handles, stable trace/fingerprint support, easier
+  single-shard defaults, mailbox/reply-slot sizing guidance, sequenced-call/TCP
+  helper docs, bridge lifecycle cleanup, and runtime surface alignment.
+- Updated Eiffel findings/READMEs so resolved pain moved out of the active
+  complaint list and remaining pain became future work.
+
 ### Runtime: TCP/UDP close cancels pending lanes instead of failing with `ResourceBusy`
 
 - `tcp_close_stream`, `tcp_close_listener`, and `udp_close_socket` no

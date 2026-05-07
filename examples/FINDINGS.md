@@ -11,21 +11,20 @@ surface.
 
 ## Round 2 product improvements
 
-### 1. `observe_result` on `ThreadedMultiShardRuntime`
+### 1. `observe_result` on `ThreadedMultiShardRuntime` — closed by Phase 062 Rock 1
 
 **Surfaced by:** `eiffel_sharded_fanout_read`, `eiffel_sharded_keyspace`.
 
-`ThreadedRuntime::observe_result::<T, _, _>(addr)?` is the blessed Phase 059
-Rock 1 way to read an isolate's typed final value. It is shipped on the
-single-shard threaded runtime but not on `ThreadedMultiShardRuntime`, so
-multi-shard examples still fall back to `Arc<Mutex<Option<Report>>>`
-polling for the final value. Both 053 examples now do this dance.
+Phase 062 Rock 1 lifted `observe_result` to `ThreadedMultiShardRuntime`.
+The registration is routed to the address's owning shard the same way
+`try_send` is routed today; the surface, error vocabulary
+(`ResultWaitError`), and single-claim semantics match
+`ThreadedRuntime::observe_result`.
 
-**Build:** lift `observe_result` to `ThreadedMultiShardRuntime`. The
-underlying `Runtime::observe_result` already exists; the multi-shard
-threaded shell just needs to route the registration call to the address's
-owning shard the same way `register_with_capacity_on` does today. Same
-contract as the single-shard form.
+Both 053 specimens now use it directly:
+`stop_with(report)` inside the coord/driver, `runtime
+.observe_result::<Report, _, _>(addr)?.wait(deadline)` on the host —
+no `Arc<Mutex<Option<Report>>>` polling.
 
 ### 2. ScatterCoord setup is heavy for the happy path
 
@@ -68,85 +67,65 @@ ScatterCoord { ..., self_addr } }`. Avoids the bind-before-start handshake
 and removes the `Option<Address<...>>` field that's only `None` for one
 turn.
 
-### 4. Synchronous `try_send_outcome`
+### 4. Synchronous `try_send_outcome` — closed by Phase 062 Rocks 3 & 4
 
 **Surfaced by:** `eiffel_rate_limited_worker`.
 
-The threaded runtime offers three send shapes today:
+Phase 062 Rock 3 ships `runtime.try_send_outcome(addr, msg, &outcomes)`
+plus a shared `HostBurstOutcomes` accumulator. The accumulator wraps
+the existing `try_send_and_observe_with` shape; what it removes is the
+per-send closure, the Arc-cloned counters, and the manual observed
+barrier the caller used to spell out by hand. Every truth-typed outcome
+stays distinct in the snapshot (`admitted`, `mailbox_full`,
+`mailbox_closed`, `ingress_full`, `worker_stopped`).
 
-- `try_send` — fire-and-forget; only surfaces `IngressFull` (command queue
-  full), never `MailboxFull`;
-- `send_and_observe` — synchronous; distinguishes `MailboxFull` from
-  `IngressFull` / `Closed`, but each call is a worker-thread roundtrip, so
-  a tight burst from the host is gated by worker step rate. The mailbox
-  never fills, so overload is never visible at the producer;
-- `try_send_and_observe_with` — non-blocking; takes an observer closure
-  that fires on the worker thread later. Visible overload, but the
-  call-site shape is heavy (one closure per send, atomics for accounting,
-  manual barrier wait until every observer has fired).
+The Round 2 design note recorded in `.intent/phases/062.../plan.md`:
+true synchronous-in-the-host mailbox inspection would violate SPSC and
+expose the worker's address->mailbox registry to the host thread, so
+per-send precision still rides on the worker-thread observer. The
+helper removes bookkeeping, not the worker roundtrip.
 
-For the "host bursts N messages, wants to know per-send whether the
-mailbox accepted" pattern, today the answer is `try_send_and_observe_with`
-plus a hand-rolled accounting loop. The natural shape would be a
-synchronous-but-precise `try_send_outcome(addr, msg) -> Result<(),
-SendOutcomeError>` that returns the same `MailboxFull` / `IngressFull` /
-`Closed` typed error as `send_and_observe` *without* the per-call worker
-roundtrip — by checking the mailbox synchronously in the host before
-queueing the command.
+Phase 062 Rock 4 ships `runtime.send_observed_until(addr, deadline,
+backoff, || msg)` for "control" messages like `BurstClosed(n)` that
+travel through the same bounded data mailbox as work items. It retries
+on `MailboxFull` / `IngressFull` until the deadline and returns typed
+`SendObservedUntilError::{Timeout, Closed, WorkerStopped}` — no hidden
+queue, no second mailbox. `eiffel_rate_limited_worker` now uses both
+helpers; the hand-rolled observer-closure burst loop and the
+`std::thread::sleep` retry loop are both gone.
 
-**Build:** a synchronous outcome-typed try_send. May reuse the same
-`ThreadedSendObservedError` enum.
-
-The Phase 059 Rock 5 `send_blocking` / `send_retrying` plan also covers
-this surface but is plan-only as of 2026-05-07; closing this finding
-likely closes Rock 5 too.
-
-### 5. Single-in-flight gate for timer-driven workers
+### 5. Single-in-flight gate for timer-driven workers — closed by Phase 062 Rock 5
 
 **Surfaced by:** `eiffel_rate_limited_worker`.
 
-A worker isolate that uses `sleep(window).reply(Tick)` to rate-limit its
-processing must never have more than one timer in flight, or the rate
-limit collapses (every Submit kicks off its own sleep). The current shape
-is a `pending: u32` counter and a `was_idle = pending == 0` check inside
-the handler. That's correct but it's the same five lines wherever this
-shape appears.
+Phase 062 Rock 5 ships `tina_runtime::SingleCallGate` — a tiny stateful
+helper that names the "at most one timer/call in flight, plus N
+queued" invariant. `submit()` returns `true` when the caller should
+schedule the timer/call (gate was idle); `false` while a previous one
+is still racing. `complete()` returns `true` when more work is queued
+and the next timer should be scheduled. The gate is plain data — it
+does not own the timer, the trace, or the message; the caller still
+writes `sleep(...).reply(...)` itself, so every `Sleep` event still
+appears in the trace.
 
-**Build:** a small "single-call gate" helper for isolate state. Could be a
-`SingleCallGate<R>` field that returns either an effect (when idle) or
-records a deferred entry (when busy). On the runtime side, this might be a
-trait `IsolateCallGate` that picks the next deferred entry on completion.
-Should not hide trace truth: every `sleep` is still one trace event.
+`eiffel_rate_limited_worker` now uses the gate; the hand-rolled
+`pending: u32` / `was_idle = pending == 0` lines are gone.
 
-### 6. Bridge call retry classifier
+### 6. Bridge call retry classifier — closed by Phase 062 Rock 6
 
 **Surfaced by:** `eiffel_retrying_outbound_http`.
 
-A caller-owned retry loop against the reqwest bridge has to write a six-arm
-match against `ReqwestCallOutcome` to classify "is this transient?":
-`Replied(Ok(resp))` (check `resp.status.is_server_error()`),
-`Replied(Err(ReqwestError::Timeout | Reqwest(_)))` (transient),
-`Replied(Err(_other))` (fatal), `Timeout` (transient), `Full | Closed`
-(fatal). Most apps want the same three buckets: succeeded / transient /
-fatal.
+Phase 062 Rock 6 ships `ReqwestOutcomeExt::classify` returning
+`ReqwestOutcomeClass::{Succeeded, Transient(reason), Fatal(reason)}`
+with typed reason payloads
+(`UpstreamServer { status }`, `UpstreamClient { status }`,
+`BridgeTimeout`, `WorkerTimeout`, `WorkerTransport`, `BridgeFull`,
+`BridgeClosed`, `WorkerFull`, `WorkerClosed`, `RequestTooLarge`,
+`ResponseTooLarge`, `InvalidRequest`). The raw layered
+`ReqwestCallOutcome` and the `flatten_outcome` helper are unchanged —
+the classifier is opt-in sugar.
 
-**Build:** a small classifier helper on `ReqwestCallOutcome`:
-
-```rust
-match outcome.classify() {
-    OutcomeClass::Succeeded(resp)         => ...,
-    OutcomeClass::Transient(reason)       => retry,
-    OutcomeClass::Fatal(reason)           => fail,
-}
-```
-
-Where the per-bucket `reason` names which sub-cause hit (`UpstreamServer
-{ status }`, `BridgeTimeout`, `WorkerTimeout`, `Reqwest`, etc.). The
-typed multi-arm match still works — this is opt-in sugar.
-
-This is a smaller version of "Tina-shaped retry sugar" — not a hidden
-retry helper, just a classifier so caller-owned retry loops are five
-lines instead of fifteen.
+`eiffel_retrying_outbound_http` now matches three arms instead of six.
 
 ### 7. Reqwest-bridge flatten edge: useful but per-call-site
 
