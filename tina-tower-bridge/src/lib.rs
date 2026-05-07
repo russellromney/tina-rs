@@ -109,30 +109,43 @@
 //!
 //! # Cloning and `&mut self`
 //!
-//! Tower's [`Service::call`] takes `&mut self`. Cloning a
+//! Tower's `Service::call` takes `&mut self`. Cloning a
 //! [`TinaTowerService`] clones the bridge handle (cheap `Arc` clone)
 //! — it does **not** clone the Tina service state behind the bridge.
 //! Two clones share one isolate.
 //!
 //! In Axum / WebSocket handlers, clone per async task or per split
-//! half when you need independent callers:
+//! half when you need independent callers. Axum's `State<S>` extracts
+//! the value, not `&mut S`, so handlers that call the service
+//! directly need a one-line rebind:
 //!
-//! ```ignore
-//! let mut sub_svc = svc.clone();
-//! sub_svc.call(RoomRequest::Subscribe(tx)).await?;
-//!
-//! let mut publish_svc = svc.clone();
-//! publish_svc.call(RoomRequest::Publish(text)).await?;
+//! ```no_run
+//! # use axum::extract::State;
+//! # use axum::http::StatusCode;
+//! # use tina_tokio_bridge::BridgeError;
+//! # use tina_tower_bridge::{Service, TinaService};
+//! async fn handler(State(svc): State<TinaService<u32, u32>>) -> Result<String, StatusCode> {
+//!     let mut svc = svc;
+//!     match svc.call(7).await {
+//!         Ok(v) => Ok(v.to_string()),
+//!         Err(BridgeError::Full | BridgeError::Closed) => Err(StatusCode::SERVICE_UNAVAILABLE),
+//!         Err(BridgeError::Timeout) => Err(StatusCode::GATEWAY_TIMEOUT),
+//!     }
+//! }
 //! ```
 //!
-//! Axum's `State<S>` extracts the value, not `&mut S`, so handlers
-//! that call the service directly need a one-line rebind:
+//! For per-connection fan-out (e.g. WebSocket reader/writer split),
+//! clone the service so each task owns an independent `&mut Service`:
 //!
-//! ```ignore
-//! async fn handler(State(svc): State<MyService>) -> ... {
-//!     let mut svc = svc;
-//!     svc.call(req).await
-//! }
+//! ```no_run
+//! # use tina_tower_bridge::{Service, TinaService};
+//! # async fn fan_out(svc: TinaService<u8, u8>) -> Result<(), tina_tokio_bridge::BridgeError> {
+//! let mut sub_svc = svc.clone();
+//! sub_svc.call(0).await?;
+//!
+//! let mut publish_svc = svc.clone();
+//! publish_svc.call(1).await?;
+//! # Ok(()) }
 //! ```
 //!
 //! See [`tina_tokio_bridge`] for the underlying bridge contract.

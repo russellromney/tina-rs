@@ -21,6 +21,90 @@
 //! let (_message, responder) = request.into_parts();
 //! responder.respond("wrong response type");
 //! ```
+//!
+//! # Direct `BridgeRequest` vs wrapper enum
+//!
+//! The simplest bridge-hosted isolate takes [`BridgeRequest<M, R>`]
+//! directly as its message type. One Tina message = one bridge call;
+//! the handler unpacks `(request, responder)` and replies. Use this
+//! shape when the isolate has nothing to do but respond:
+//!
+//! ```ignore
+//! #[tina::isolate(message = BridgeRequest<CounterRequest, CounterReply>)]
+//! impl Counter {
+//!     fn handle(
+//!         &mut self,
+//!         msg: BridgeRequest<CounterRequest, CounterReply>,
+//!         _ctx: &mut Context<'_, SingleShard>,
+//!     ) -> Effect<Self> {
+//!         let (request, responder) = msg.into_parts();
+//!         self.value += 1;
+//!         let _ = responder.respond(CounterReply { value: self.value });
+//!         noop()
+//!     }
+//! }
+//! ```
+//!
+//! As soon as the isolate needs to do anything *between* "request
+//! arrived" and "respond" — sleep on a timer, do an outbound runtime
+//! call, talk to a peer isolate, schedule retries — the direct
+//! `BridgeRequest` shape stops being enough. The handler must return
+//! a runtime call ([`tina_runtime::sleep`], `tcp_*`, etc.) and resume
+//! later when the runtime delivers a continuation message. That
+//! continuation has to be the same isolate's message type, which
+//! means wrapping `BridgeRequest` in a custom enum:
+//!
+//! ```ignore
+//! #[derive(Debug)]
+//! enum CounterMsg {
+//!     /// Inbound bridge call. Carries the request + the responder
+//!     /// the handler must answer.
+//!     Request(BridgeRequest<CounterRequest, CounterReply>),
+//!     /// Per-tick continuation: timer fired, return to work.
+//!     Tick(Result<(), tina_runtime::CallError>),
+//!     /// Outbound runtime-call completion. Carries the responder
+//!     /// captured from the original Request so the handler can
+//!     /// answer once the work finishes.
+//!     Done(Result<Vec<u8>, tina_runtime::CallError>, BridgeResponder<CounterReply>),
+//! }
+//!
+//! impl From<BridgeRequest<CounterRequest, CounterReply>> for CounterMsg {
+//!     fn from(value: BridgeRequest<CounterRequest, CounterReply>) -> Self {
+//!         Self::Request(value)
+//!     }
+//! }
+//!
+//! impl BridgeMessage for CounterMsg {
+//!     fn bridge_cancelled(&self) -> bool {
+//!         match self {
+//!             Self::Request(req) => req.bridge_cancelled(),
+//!             // Continuations are not subject to caller cancellation
+//!             // — they were scheduled by the bridge's own runtime
+//!             // calls.
+//!             Self::Tick(_) | Self::Done(_, _) => false,
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! Two rules for the wrapper:
+//!
+//! 1. The wrapper enum must implement `From<BridgeRequest<M, R>>` so
+//!    [`BridgeHost::register_bridge`] and the [`BridgeHandle`]
+//!    machinery can lift inbound calls into your message type.
+//! 2. The wrapper must impl [`BridgeMessage`] and forward
+//!    `bridge_cancelled()` to the underlying [`BridgeRequest`] when
+//!    the variant carries one. Internal continuations should return
+//!    `false`.
+//!
+//! Carry the [`BridgeResponder<R>`] across continuation messages
+//! (e.g. inside a `Done(...)` variant) when the response cannot be
+//! answered until the runtime call returns. The responder is
+//! `Send`-bounded and survives across handler turns.
+//!
+//! When in doubt, start with the direct `BridgeRequest` shape and
+//! convert to the wrapper enum only when an internal continuation
+//! actually appears.
 
 use std::convert::Infallible;
 use std::marker::PhantomData;
