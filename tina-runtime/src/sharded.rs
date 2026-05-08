@@ -821,6 +821,13 @@ impl HotKeyAttemptReport {
 /// Same-shard use is the common case (a coord registers its adapter
 /// on its own shard so reply translation is local). Cross-shard use is
 /// supported as long as both `M` and `T` are `Send`.
+///
+/// Multi-shard runtimes ship a one-call helper:
+/// `MultiShardRuntime::register_reply_adapter_on`,
+/// `ThreadedMultiShardRuntime::register_reply_adapter_on`, and the
+/// simulator equivalent. Single-shard runtimes (`Runtime`,
+/// `ThreadedRuntime`) have no such helper; register manually with
+/// `runtime.register_with_capacity::<ReplyAdapter<M, T, S>, T>(ReplyAdapter::new(target), capacity)`.
 pub struct ReplyAdapter<M, T, S>
 where
     M: 'static,

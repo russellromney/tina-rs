@@ -97,7 +97,9 @@ copyable rails. Clever helpers that hide the rails are not wins.
 - No scatter/gather framework before the narrow happy path is proven.
 - No external cancellation API that pretends work already accepted by a worker
   vanished.
-- No public API that lets an address escape from failed registration.
+- No hidden usable address after failed registration. If a user explicitly
+  smuggles a constructor-time address through shared state and construction
+  fails, later sends must fail loudly; do not pretend the address was live.
 
 ## Rock 0: Clean The Findings First
 
@@ -241,7 +243,8 @@ Questions to settle:
 
 Rules:
 
-- no dangling address after failed registration;
+- no hidden usable address after failed registration; explicit
+  user-shared escape fails loudly;
 - no hidden first message;
 - no delivery until registration is complete;
 - address generation semantics match normal registration;

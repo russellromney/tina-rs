@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
 use tina_runtime::sharded::{
-    MissingShard, ReplyAdapter, ScatterGatherConfig, ScatterGatherConfigError, ScatterGatherReport,
+    MissingShard, ScatterGatherConfig, ScatterGatherConfigError, ScatterGatherReport,
     ScatterGatherTargetOutcome, ShardPlacement, ShardServiceTable, WrongShard,
 };
 use tina_runtime::{MailboxFactory, MultiShardRuntime, RuntimeCall, SendOutcome, send_observed};
@@ -887,12 +887,11 @@ fn scatter_gather_aggregate_collects_one_reply_per_target() {
         },
         config.collector_capacity,
     );
-    let bridge = runtime
-        .register_with_capacity_on::<ReplyAdapter<CounterCoordMsg, ScatterCoordMsg, AppShard>, ScatterCoordMsg>(
-            ShardId::new(3),
-            ReplyAdapter::new(coord),
-            config.collector_capacity,
-        );
+    let bridge = runtime.register_reply_adapter_on::<CounterCoordMsg, ScatterCoordMsg>(
+        ShardId::new(3),
+        coord,
+        config.collector_capacity,
+    );
     runtime
         .try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();
@@ -1322,12 +1321,11 @@ fn run_scatter_obs(
         },
         config.collector_capacity,
     );
-    let bridge = runtime
-        .register_with_capacity_on::<ReplyAdapter<CounterCoordMsg, ScatterCoordObsMsg, AppShard>, ScatterCoordObsMsg>(
-            coord_shard,
-            ReplyAdapter::new(coord),
-            config.collector_capacity,
-        );
+    let bridge = runtime.register_reply_adapter_on::<CounterCoordMsg, ScatterCoordObsMsg>(
+        coord_shard,
+        coord,
+        config.collector_capacity,
+    );
     runtime
         .try_send(coord, ScatterCoordObsMsg::Bind { bridge })
         .unwrap();
@@ -1614,4 +1612,64 @@ fn scatter_gather_records_closed_when_target_isolate_has_stopped() {
         "expected Closed for shard 3, got {:?}",
         report.outcomes
     );
+}
+
+// Focused: register_reply_adapter_on returns Address<M> on the
+// chosen shard and translates M -> T via the From impl.
+
+#[derive(Debug)]
+enum SinkMsg {
+    Add(u32),
+}
+
+impl From<u32> for SinkMsg {
+    fn from(v: u32) -> Self {
+        SinkMsg::Add(v)
+    }
+}
+
+#[derive(Debug, Default)]
+struct AddSink {
+    seen: Rc<RefCell<u32>>,
+}
+
+impl Isolate for AddSink {
+    tina::isolate_types! {
+        message: SinkMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<SinkMsg>,
+        shard: AppShard,
+    }
+    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        let SinkMsg::Add(v) = msg;
+        *self.seen.borrow_mut() += v;
+        noop()
+    }
+}
+
+#[test]
+fn register_reply_adapter_on_returns_address_on_chosen_shard_and_translates() {
+    let mut runtime = MultiShardRuntime::new([AppShard(7), AppShard(31)], TestMailboxFactory);
+
+    let seen = Rc::new(RefCell::new(0u32));
+    let sink = runtime.register_with_capacity_on::<AddSink, Infallible>(
+        ShardId::new(7),
+        AddSink {
+            seen: Rc::clone(&seen),
+        },
+        16,
+    );
+
+    let bridge =
+        runtime.register_reply_adapter_on::<u32, SinkMsg>(ShardId::new(31), sink, 8);
+
+    assert_eq!(bridge.shard(), ShardId::new(31));
+
+    runtime.try_send(bridge, 5u32).unwrap();
+    runtime.try_send(bridge, 7u32).unwrap();
+    run_until_idle(&mut runtime);
+
+    assert_eq!(*seen.borrow(), 12);
 }

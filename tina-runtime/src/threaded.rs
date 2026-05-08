@@ -281,6 +281,33 @@ where
         })
     }
 
+    /// Threaded mirror of [`Runtime::register_with_capacity_using`].
+    ///
+    /// Constructor runs on the worker thread; caller blocks on the
+    /// worker's reply. Heavy work in `construct` blocks every other
+    /// isolate on the shard for the duration — build the value before
+    /// calling. `Ctor: Send + 'static` so the closure ships across the
+    /// worker command channel.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_using<I, Outbound, Ctor>(
+        &self,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+        Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
+    {
+        self.call(move |runtime| {
+            runtime.register_with_capacity_using::<I, Outbound, _>(mailbox_capacity, construct)
+        })
+    }
+
     /// Configures a registered isolate as supervisor on the worker shard.
     ///
     /// This method panics on unknown parent (consistent

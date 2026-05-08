@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::sharded::{
-    ReplyAdapter, ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome,
-    ShardPlacement, ShardServiceTable,
+    ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement,
+    ShardServiceTable,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, RuntimeCall, ThreadedMultiShardRuntime};
 
@@ -241,9 +241,9 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("register coord: {e:?}"))?;
 
     let bridge = runtime
-        .register_with_capacity_on::<ReplyAdapter<ShardCounterReply, ScatterCoordMsg, AppShard>, ScatterCoordMsg>(
+        .register_reply_adapter_on::<ShardCounterReply, ScatterCoordMsg>(
             coord_shard,
-            ReplyAdapter::new(coord),
+            coord,
             config.collector_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register reply adapter: {e:?}"))?;

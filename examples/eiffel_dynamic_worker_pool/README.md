@@ -99,11 +99,6 @@ What feels better:
 
 What feels worse:
 
-- **Chicken-and-egg `Begin { self_addr }` handshake.** A coordinator
-  that wants to spawn children that send back has to be told its
-  own address as a bootstrap message. The pattern is small but
-  shows up at every fanout-and-join site. (See FINDINGS finding 3
-  — self-address at registration time.)
 - **No "wait for child to boot before next step" primitive.** The
   Tokio side has `JoinSet::join_next` which both confirms a task
   *finished* and gives the result. The Tina side has
@@ -118,8 +113,18 @@ What feels worse:
 - **Mailbox sizing for the coord must account for every child's
   `WorkerDone` reply.** The `incoming + replies` rule (Phase 059
   Rock 4) bites here: with 4 workers, the coord's mailbox holds
-  `Begin + 4 × WorkerDone = 5` outstanding, plus headroom. Easy to
+  `Start + 4 × WorkerDone = 5` outstanding, plus headroom. Easy to
   miscount under pressure (more workers, more reply slots).
+
+What got better:
+
+- **Self-address at registration time.** The old chicken-and-egg
+  `Begin { self_addr }` bootstrap is gone; the coord now learns
+  its own address through the
+  `register_with_capacity_using::<Coordinator, _, _>(cap, |self_addr| ...)`
+  constructor closure. The host kicks the work with a typed
+  `CoordMsg::Start` that carries no address. (FINDINGS finding 3,
+  self-address at registration.)
 
 ## Partial-failure flavor
 
@@ -135,6 +140,6 @@ future variant of this specimen could:
   partials are missing;
 - emit a `Report` with `results_collected < expected`.
 
-That requires either FINDINGS finding 3 (self-address at
-registration time) or finding 14 (spawn API surfaces child's
-address) to ship.
+That requires FINDINGS finding 14 (spawn API surfaces child's
+address); the self-address half of finding 3 already shipped in
+Phase 064 Rock 3 and is used here.
