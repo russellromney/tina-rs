@@ -2,8 +2,13 @@
 
 ## Status
 
-**Shipped.** All original rocks plus the live observer hook and bridge
-emission across every bridge crate are on `main`.
+**Shipped.** All original rocks plus the live observer hook are on
+`main`. Bridge emission landed for `tina-sqlite-bridge`,
+`tina-tokio-bridge`, `tina-tower-bridge`, and `tina-reqwest-bridge`;
+`tina-rpc-tokio`'s pre-existing spans (`tina_rpc.bridge.call` with
+`service` / `method` / `correlator` / `result_kind`) were
+intentionally left untouched and remain on the previous shape.
+Vocabulary harmonisation across all five bridges is deferred.
 
 - `tina-tracing` crate: events, live snapshot, trace-snapshot partial
   marker, stable-name re-exports, `TracingObserver`, doc page,

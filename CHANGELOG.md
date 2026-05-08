@@ -20,15 +20,19 @@ This file records completed work.
   proving a noop observer leaves the deterministic event record
   unchanged. `TraceRetention::Off` plus an observer is the new
   stream-only mode.
-- Added bridge tracing emission across all five Tina bridges behind an
-  optional `tracing` Cargo feature: `tina-sqlite-bridge`,
-  `tina-tokio-bridge`, `tina-tower-bridge`, `tina-reqwest-bridge`, plus
-  the existing `tina-rpc-tokio` spans. Targets follow the
-  `tina_<bridge>.bridge[.call]` shape; shared `reason` strings (`Full`,
-  `Closed`, `Timeout`) reuse runtime vocabulary where the concept
-  matches; bridge-specific fields stay bridge-shaped (`request_kind`,
-  `method`, `status`, `outcome`, `rows_changed`, `row_count`,
-  `elapsed_ms`, `scope`, `detail`).
+- Added new bridge tracing emission for `tina-sqlite-bridge`,
+  `tina-tokio-bridge`, `tina-tower-bridge`, and `tina-reqwest-bridge`
+  behind each crate's optional `tracing` Cargo feature. Targets follow
+  the `tina_<bridge>.bridge[.call]` shape; shared `reason` strings
+  (`Full`, `Closed`, `Timeout`) reuse runtime vocabulary where the
+  concept matches; bridge-specific fields stay bridge-shaped
+  (`request_kind`, `method`, `status`, `outcome`, `rows_changed`,
+  `row_count`, `elapsed_ms`, `scope`, `detail`).
+- `tina-rpc-tokio`'s pre-existing spans (`tina_rpc.bridge.call` with
+  `service`, `method`, `correlator`, `result_kind`) were left
+  untouched in this phase and remain on the previous shape.
+  Documented in `19-tracing.md` as the one bridge whose vocabulary
+  has not been harmonised yet.
 - Added `docs/tina-user-guide/19-tracing.md` with the field/level/reason
   vocabulary table for runtime and bridge events; one runnable example
   (`eiffel_tracing_demo`) wires the live observer end-to-end.
