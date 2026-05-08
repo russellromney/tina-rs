@@ -1662,8 +1662,7 @@ fn register_reply_adapter_on_returns_address_on_chosen_shard_and_translates() {
         16,
     );
 
-    let bridge =
-        runtime.register_reply_adapter_on::<u32, SinkMsg>(ShardId::new(31), sink, 8);
+    let bridge = runtime.register_reply_adapter_on::<u32, SinkMsg>(ShardId::new(31), sink, 8);
 
     assert_eq!(bridge.shard(), ShardId::new(31));
 

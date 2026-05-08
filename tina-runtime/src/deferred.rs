@@ -919,8 +919,7 @@ mod pending_replies_tests {
         box_.try_insert(3, fake_slot_closed(30)).unwrap();
 
         let effects: Vec<tina::Effect<TestIso>> = box_.drain_replies(0);
-        let mut slot_ids: Vec<u64> =
-            effects.iter().map(|e| slot_id_of(e).unwrap()).collect();
+        let mut slot_ids: Vec<u64> = effects.iter().map(|e| slot_id_of(e).unwrap()).collect();
         slot_ids.sort();
         assert_eq!(
             slot_ids,

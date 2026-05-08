@@ -9,10 +9,10 @@
 //!
 //! # Use
 //!
-//! Typed-helper path is the obvious one: `execute_call` projects away
-//! the response enum and surfaces `Result<u64, SqliteError>` at the
-//! call site. The full-truth `send_request` path stays available — see
-//! [`mod@helpers`] for when to reach for which.
+//! Typed-helper path is the obvious one: [`execute_call`] projects
+//! away the response enum and surfaces `Result<u64, SqliteError>` at
+//! the call site. The full-truth [`send_request`] path stays
+//! available — use it when you want the response enum visible.
 //!
 //! ```no_run
 //! use std::convert::Infallible;

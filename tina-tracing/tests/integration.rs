@@ -14,9 +14,9 @@ use tina_runtime::{
     EventId, LiveShardState, RestartSkippedReason, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason, SupervisionRejectedReason, TraceRetention,
 };
+use tina_tracing::RUNTIME_TRACE_TARGET;
 use tina_tracing::events::{call_kind_name, emit_event, emit_events};
 use tina_tracing::live::{affinity_status_name, shard_state_name};
-use tina_tracing::RUNTIME_TRACE_TARGET;
 use tracing::{
     Event, Level, Metadata, Subscriber,
     field::{Field, Visit},
@@ -660,10 +660,7 @@ fn iteration_order_is_preserved() {
         .iter()
         .map(|e| e.field("event_id").unwrap())
         .collect();
-    assert_eq!(
-        ids,
-        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
-    );
+    assert_eq!(ids, vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
 }
 
 #[test]
@@ -695,9 +692,7 @@ fn shard_state_name_round_trips_each_state() {
 fn live_emit_snapshot_walks_a_real_running_topology() {
     use std::time::Duration;
     use tina::prelude::*;
-    use tina_runtime::{
-        DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
-    };
+    use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
     let runtime = ThreadedRuntime::with_config(
         SingleShard,
@@ -718,7 +713,11 @@ fn live_emit_snapshot_walks_a_real_running_topology() {
         .iter()
         .filter(|e| e.kind() == Some("live_shard"))
         .collect();
-    assert_eq!(shard_events.len(), 1, "single-shard runtime emits one shard event");
+    assert_eq!(
+        shard_events.len(),
+        1,
+        "single-shard runtime emits one shard event"
+    );
     let e = shard_events[0];
     assert_eq!(e.target, tina_tracing::LIVE_TOPOLOGY_TARGET);
     assert_eq!(e.level, Level::INFO);

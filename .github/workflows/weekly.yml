@@ -1,0 +1,40 @@
+name: weekly
+
+on:
+  schedule:
+    # Monday 09:00 UTC. Cheap to miss a run; restart by clicking
+    # "Run workflow" in the Actions tab.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-audit
+        run: cargo +stable install cargo-audit --locked
+      - name: Run audit
+        run: cargo +stable audit
+
+  # No `cargo +stable check` job: `tina-runtime` and the vendored
+  # `betelgeuse` crate use `#![feature(allocator_api)]` and other
+  # nightly-only features, so the workspace is nightly-required by
+  # design. A stable check would be permanently red. If a future
+  # phase moves a subset of crates to stable-compatible status,
+  # add a scoped check (a positive list, not `--workspace`).
+
+  miri:
+    name: miri (tina-mailbox-spsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Install Rust nightly with miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+      - name: Run miri
+        run: make miri
