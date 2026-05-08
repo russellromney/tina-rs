@@ -210,10 +210,10 @@ fn threaded_runtime_actually_handles_messages_through_the_helper() {
 fn threaded_runtime_constructor_panic_surfaces_as_error() {
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
 
-    let result = runtime.register_with_capacity_using::<Echo, Infallible, _>(
-        4,
-        |_self_addr| -> Echo { panic!("ctor panic on worker") },
-    );
+    let result = runtime
+        .register_with_capacity_using::<Echo, Infallible, _>(4, |_self_addr| -> Echo {
+            panic!("ctor panic on worker")
+        });
 
     assert!(result.is_err(), "expected worker-stopped error, got Ok");
     let _ = runtime.shutdown();

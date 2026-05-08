@@ -17,7 +17,6 @@ use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::{IntoErasedCall, RuntimeCall};
-use crate::sharded::ReplyAdapter;
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
@@ -32,6 +31,7 @@ use crate::local_system::{
 use crate::mailbox::MailboxFactory;
 use crate::observation;
 use crate::observer::TraceObserver;
+use crate::sharded::ReplyAdapter;
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{

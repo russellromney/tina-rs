@@ -11,9 +11,9 @@ use tina::{Address, Isolate, Mailbox, Outbound as TinaOutbound, Shard, ShardId, 
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::{IntoErasedCall, RuntimeCall};
-use crate::sharded::ReplyAdapter;
 use crate::clock::MonotonicClock;
 use crate::mailbox::MailboxFactory;
+use crate::sharded::ReplyAdapter;
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{IdSource, IntoErasedSpawn, QueuedRemoteEnvelope, Runtime};
 

@@ -587,11 +587,8 @@ fn scatter_gather_records_aggregate_timeout_when_target_does_not_reply() {
         },
         16,
     );
-    let bridge = sim.register_reply_adapter_on::<TrackerMsg, ScatterCoordMsg>(
-        ShardId::new(11),
-        coord,
-        16,
-    );
+    let bridge =
+        sim.register_reply_adapter_on::<TrackerMsg, ScatterCoordMsg>(ShardId::new(11), coord, 16);
 
     sim.try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();
@@ -676,11 +673,8 @@ fn scatter_gather_report_in_sim_preserves_caller_supplied_target_order() {
         },
         16,
     );
-    let bridge = sim.register_reply_adapter_on::<TrackerMsg, ScatterCoordMsg>(
-        ShardId::new(11),
-        coord,
-        16,
-    );
+    let bridge =
+        sim.register_reply_adapter_on::<TrackerMsg, ScatterCoordMsg>(ShardId::new(11), coord, 16);
     sim.try_send(coord, ScatterCoordMsg::Bind { bridge })
         .unwrap();
     sim.try_send(coord, ScatterCoordMsg::Start).unwrap();
