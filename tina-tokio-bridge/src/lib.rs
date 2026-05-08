@@ -113,14 +113,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
-#[cfg(feature = "tracing")]
-use tracing::{Level, event};
 use tina_runtime::{
     CallError, IntoErasedCall, LocalSystem, MailboxFactory, RuntimeEvent, SendRejectedReason,
     ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedSendObservedError,
     ThreadedTrySendError,
 };
 use tokio::sync::oneshot;
+#[cfg(feature = "tracing")]
+use tracing::{Level, event};
 
 /// `tracing` target for per-call events on the bridge.
 #[cfg(feature = "tracing")]

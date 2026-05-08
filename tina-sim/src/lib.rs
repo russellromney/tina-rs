@@ -202,10 +202,7 @@ where
     /// Sets the live trace observer. `None` detaches. Set before the
     /// first `step()`. Same contract as the runtime's; see
     /// [`tina_runtime::TraceObserver`].
-    pub fn set_trace_observer(
-        &mut self,
-        observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
-    ) {
+    pub fn set_trace_observer(&mut self, observer: Option<Arc<dyn tina_runtime::TraceObserver>>) {
         self.trace_observer = observer;
     }
 

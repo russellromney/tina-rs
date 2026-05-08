@@ -45,42 +45,56 @@ impl Capture {
 }
 
 impl Subscriber for Capture {
-    fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
-    fn new_span(&self, _attrs: &Attributes<'_>) -> Id { Id::from_u64(1) }
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _attrs: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
     fn record(&self, _span: &Id, _values: &Record<'_>) {}
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
     fn event(&self, event: &Event<'_>) {
         let metadata = event.metadata();
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
-        self.events.lock().expect("capture lock").push(CapturedEvent {
-            target: metadata.target().to_string(),
-            level: *metadata.level(),
-            fields: visitor.fields,
-        });
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                target: metadata.target().to_string(),
+                level: *metadata.level(),
+                fields: visitor.fields,
+            });
     }
     fn enter(&self, _span: &Id) {}
     fn exit(&self, _span: &Id) {}
 }
 
 #[derive(Default)]
-struct FieldVisitor { fields: BTreeMap<String, String> }
+struct FieldVisitor {
+    fields: BTreeMap<String, String>,
+}
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.fields.insert(field.name().to_string(), format!("{value:?}"));
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 }
 
@@ -103,7 +117,9 @@ enum EchoMsg {
 }
 
 impl From<BridgeRequest<u32, u32>> for EchoMsg {
-    fn from(value: BridgeRequest<u32, u32>) -> Self { Self::Request(value) }
+    fn from(value: BridgeRequest<u32, u32>) -> Self {
+        Self::Request(value)
+    }
 }
 
 impl BridgeMessage for EchoMsg {
@@ -206,8 +222,8 @@ async fn happy_path_emits_admitted_then_replied() {
         new.iter().filter_map(|e| e.kind()).collect::<Vec<_>>(),
     );
     assert!(
-        new.iter().any(|e| e.kind() == Some("replied")
-            && e.field("outcome") == Some("response")),
+        new.iter()
+            .any(|e| e.kind() == Some("replied") && e.field("outcome") == Some("response")),
         "expected replied event, got {:?}",
         new.iter().filter_map(|e| e.kind()).collect::<Vec<_>>(),
     );
@@ -227,12 +243,16 @@ enum StuckMsg {
 }
 
 impl From<BridgeRequest<u32, u32>> for StuckMsg {
-    fn from(value: BridgeRequest<u32, u32>) -> Self { Self::Request(value) }
+    fn from(value: BridgeRequest<u32, u32>) -> Self {
+        Self::Request(value)
+    }
 }
 
 impl BridgeMessage for StuckMsg {
     fn bridge_cancelled(&self) -> bool {
-        match self { Self::Request(request) => request.bridge_cancelled() }
+        match self {
+            Self::Request(request) => request.bridge_cancelled(),
+        }
     }
 }
 
@@ -303,11 +323,8 @@ async fn retry_within_total_timeout_emits_event_with_scope() {
             Duration::from_millis(500),
         )
         .expect("register bridge");
-    let policy = BridgeBackpressure::retry_within(
-        99,
-        Duration::from_millis(1),
-        Duration::from_millis(20),
-    );
+    let policy =
+        BridgeBackpressure::retry_within(99, Duration::from_millis(1), Duration::from_millis(20));
     let result = handle
         .call_with_policy(7, policy, Duration::from_millis(500))
         .await;

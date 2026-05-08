@@ -29,12 +29,18 @@ struct CapturedEvent {
 }
 
 impl CapturedEvent {
-    fn field(&self, name: &str) -> Option<&str> { self.fields.get(name).map(String::as_str) }
-    fn kind(&self) -> Option<&str> { self.field("kind") }
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+    fn kind(&self) -> Option<&str> {
+        self.field("kind")
+    }
 }
 
 #[derive(Debug, Clone, Default)]
-struct Capture { events: Arc<Mutex<Vec<CapturedEvent>>> }
+struct Capture {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
 
 impl Capture {
     fn events(&self) -> Vec<CapturedEvent> {
@@ -43,42 +49,56 @@ impl Capture {
 }
 
 impl Subscriber for Capture {
-    fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
-    fn new_span(&self, _attrs: &Attributes<'_>) -> Id { Id::from_u64(1) }
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _attrs: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
     fn record(&self, _span: &Id, _values: &Record<'_>) {}
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
     fn event(&self, event: &Event<'_>) {
         let metadata = event.metadata();
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
-        self.events.lock().expect("capture lock").push(CapturedEvent {
-            target: metadata.target().to_string(),
-            level: *metadata.level(),
-            fields: visitor.fields,
-        });
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                target: metadata.target().to_string(),
+                level: *metadata.level(),
+                fields: visitor.fields,
+            });
     }
     fn enter(&self, _span: &Id) {}
     fn exit(&self, _span: &Id) {}
 }
 
 #[derive(Default)]
-struct FieldVisitor { fields: BTreeMap<String, String> }
+struct FieldVisitor {
+    fields: BTreeMap<String, String>,
+}
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.fields.insert(field.name().to_string(), format!("{value:?}"));
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 }
 
@@ -96,15 +116,21 @@ fn install_global_capture() -> &'static Capture {
 struct EchoIsolate;
 
 #[derive(Debug)]
-enum EchoMsg { Request(BridgeRequest<u32, u32>) }
+enum EchoMsg {
+    Request(BridgeRequest<u32, u32>),
+}
 
 impl From<BridgeRequest<u32, u32>> for EchoMsg {
-    fn from(value: BridgeRequest<u32, u32>) -> Self { Self::Request(value) }
+    fn from(value: BridgeRequest<u32, u32>) -> Self {
+        Self::Request(value)
+    }
 }
 
 impl BridgeMessage for EchoMsg {
     fn bridge_cancelled(&self) -> bool {
-        match self { Self::Request(request) => request.bridge_cancelled() }
+        match self {
+            Self::Request(request) => request.bridge_cancelled(),
+        }
     }
 }
 

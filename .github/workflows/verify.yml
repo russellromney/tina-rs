@@ -37,3 +37,10 @@ jobs:
 
       - name: Verify workspace
         run: make verify
+
+  # `make verify-examples` lives in the Makefile for local sweeps but
+  # is intentionally not a per-PR gate: 35 example crates × (test +
+  # clippy) with no shared cargo target = 20-40 minutes of runner
+  # time, and most PRs don't touch examples. Run it locally before a
+  # bridge change with downstream consumers, or revisit promoting it
+  # to a scheduled job once we see how often examples actually break.
