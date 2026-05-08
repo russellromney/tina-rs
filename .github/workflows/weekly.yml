@@ -20,18 +20,12 @@ jobs:
       - name: Run audit
         run: cargo +stable audit
 
-  # rust-version.workspace = "1.85" is what the manifest claims; the
-  # primary CI runs nightly only, so a nightly-only feature could
-  # sneak past. This job catches that.
-  stable-check:
-    name: cargo +stable check (workspace)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        run: rustup toolchain install stable --profile minimal
-      - name: Stable workspace check
-        run: cargo +stable check --workspace
+  # No `cargo +stable check` job: `tina-runtime` and the vendored
+  # `betelgeuse` crate use `#![feature(allocator_api)]` and other
+  # nightly-only features, so the workspace is nightly-required by
+  # design. A stable check would be permanently red. If a future
+  # phase moves a subset of crates to stable-compatible status,
+  # add a scoped check (a positive list, not `--workspace`).
 
   miri:
     name: miri (tina-mailbox-spsc)
