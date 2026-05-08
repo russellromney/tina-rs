@@ -10,8 +10,8 @@
 //!   byte-identical (sim/live parity safeguard).
 
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -48,7 +48,11 @@ struct Tiny;
 
 #[tina_runtime::isolate(message = Msg)]
 impl Tiny {
-    fn handle(&mut self, msg: Msg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: Msg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             Msg::Begin => sleep(Duration::ZERO).reply(|_| Msg::Done),
             Msg::Done => stop(),
