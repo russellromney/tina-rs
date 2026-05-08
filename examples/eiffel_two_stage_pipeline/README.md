@@ -59,3 +59,11 @@ What feels worse:
   timeouts. If the *original* caller times out at `STAGE_TIMEOUT`,
   every downstream call also has its own. There is no single
   deadline that propagates.
+
+A pipeline DSL that compresses the four variants into one was
+considered and rejected. Every shape short enough to pay for the
+helper hides one of: the named stage in the variant; the
+trace-visible suspension at each `call(...).reply(...)`; the
+per-stage `Full` / `Closed` / `Timeout` outcome; or partial
+progress data when a middle stage fails. The raw match-state-
+machine form is the semantic truth on purpose.

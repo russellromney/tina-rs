@@ -10,6 +10,16 @@ explicit, every `Full`/`Closed`/error outcome is visible. But it can
 read as ceremony. This page is the blessed shape so a new isolate
 does not invent a worse one.
 
+Grug rule:
+
+```text
+long explicit state machine okay.
+short fake-async machine bad.
+```
+
+Helpers may remove repeated spelling. Helpers should not hide stages,
+capacity, timeout, partial progress, or suspension points.
+
 ## Reply aliases
 
 Each runtime call publishes one reply type. `tcp_connect` resolves to
@@ -92,6 +102,9 @@ Do not:
   resource — the second one will see `CallError::ResourceBusy`;
 - hide the state machine behind `async fn` — Tina handlers are not
   futures.
+- add a pipeline DSL just to make Tina look like Tokio. If each stage
+  has its own failure and pressure story, each stage should stay named
+  in the message enum.
 
 ## List-processing pattern
 

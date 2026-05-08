@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId, TrySendError};
+use tina_runtime::sharded::ReplyAdapter;
 use tina_runtime::{RuntimeCall, RuntimeCallable, RuntimeEvent, SendRejectedReason};
 use tina_supervisor::SupervisorConfig;
 
@@ -204,6 +205,38 @@ where
     {
         self.simulator_mut(shard)
             .register_with_mailbox_capacity::<I, Msg, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Register a [`ReplyAdapter<M, T, S>`] on a chosen shard.
+    /// Simulator parity for the multi-shard runtime forms.
+    ///
+    /// Translates inbound `M` to outbound `T` via the user-provided
+    /// `From<M> for T` and forwards to `target`. Returns the bridge
+    /// `Address<M>` callers send to.
+    ///
+    /// Mirrors `MultiShardRuntime::register_reply_adapter_on` and
+    /// `ThreadedMultiShardRuntime::register_reply_adapter_on` (in
+    /// `tina-runtime`). Bound lists are matched to each runtime's
+    /// lower-level `register_with_capacity_on`. Mirror changes
+    /// across all three.
+    #[allow(private_bounds)]
+    pub fn register_reply_adapter_on<M, T>(
+        &mut self,
+        shard: ShardId,
+        target: Address<T>,
+        mailbox_capacity: usize,
+    ) -> Address<M>
+    where
+        M: 'static,
+        T: 'static + From<M>,
+        std::convert::Infallible: IntoErasedSpawn<S>,
+        RuntimeCall<M>: RuntimeCallable,
+    {
+        self.register_with_capacity_on::<ReplyAdapter<M, T, S>, M, T>(
+            shard,
+            ReplyAdapter::new(target),
+            mailbox_capacity,
+        )
     }
 
     /// Configures a registered isolate as supervisor on its owning shard.

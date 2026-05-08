@@ -60,6 +60,23 @@ Pending work can live in several places:
 
 Shutdown should account for these separately. One number is not enough.
 
+## App Done
+
+There is no blessed `runtime.wait_idle()`.
+
+An app is "done" when the app says it is done. Put that truth in one
+driver or coordinator isolate, let it own the terminal condition, and
+finish with `stop_with(report)`.
+
+```rust
+let waiter = runtime.observe_result::<Report, _, _>(driver)?;
+runtime.try_send(driver, DriverMsg::Begin)?;
+let report = waiter.wait(timeout)?;
+```
+
+This is boring on purpose. The driver knows which mailboxes, calls,
+timers, children, and bridges count. The runtime does not guess.
+
 ## Drain vs Stop
 
 Stop means the isolate stops taking turns.
