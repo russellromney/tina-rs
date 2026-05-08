@@ -155,35 +155,60 @@ emit_snapshot(&topology);
 
 ## Bridges
 
-`tina-rpc-tokio`, `tina-tokio-bridge`, `tina-tower-bridge`,
-`tina-reqwest-bridge`, and `tina-sqlite-bridge` each ship an
-optional `tracing` Cargo feature with the same shape:
+Every Tina bridge ships an optional `tracing` Cargo feature with the
+same shape:
 
 ```toml
 [dependencies]
 tina-sqlite-bridge = { version = "...", features = ["tracing"] }
 ```
 
-What emits today:
+All five bridges emit today. Targets, kinds, and shared field
+vocabulary:
 
-- `tina-rpc-tokio`: bridge spans on `tina_rpc.bridge.call` with
-  `service`, `method`, `correlator`, `result_kind`.
-- `tina-sqlite-bridge`: per-call events on `tina_sqlite.bridge.call`
-  with `kind`, `request_kind`, `reason`, `outcome`, `rows_changed`,
-  `row_count`, `elapsed_ms`; plus one `kind="close"` lifecycle event
-  on `tina_sqlite.bridge`. `reason` reuses the runtime vocabulary
-  (`Full`, `Closed`, `Timeout`) where the concept matches and adds
-  bridge-specific names (`Busy`, `Constraint`, `Io`, `Sqlite`,
-  `ResponseTooLarge`, `InvalidRequest`, `Internal`).
-- `tina-tokio-bridge`, `tina-tower-bridge`, `tina-reqwest-bridge`:
-  feature scaffolded, no spans yet.
+| Bridge | Target | Kinds |
+|---|---|---|
+| `tina-tokio-bridge` | `tina_tokio.bridge.call` / `.bridge` | `admission_rejected`, `admitted`, `replied`, `timeout`, `dropped_response`, `close` |
+| `tina-tower-bridge` | `tina_tower.bridge.call` / `.bridge` | `tower_call`, `tower_response`, `tower_error`, `close` |
+| `tina-reqwest-bridge` | `tina_reqwest.bridge.call` / `.bridge` | `admission_rejected`, `admitted`, `replied`, `timeout`, `retry`, `close` |
+| `tina-sqlite-bridge` | `tina_sqlite.bridge.call` / `.bridge` | `admission_rejected`, `admitted`, `replied`, `timeout`, `close` |
+| `tina-rpc-tokio` | `tina_rpc.bridge.call` (span) | bridge span with `service`, `method`, `correlator`, `result_kind` |
 
-A follow-up pass extends emission to the remaining three bridges
-and reconciles any drift across the five. Targets stay
-`tina_<bridge>.…`; runtime events stay on `tina_runtime::trace`.
+Shared `reason` vocabulary (across all bridges where the concept
+applies): `Full`, `Closed`, `Timeout`. Each bridge adds its own:
+
+- `tina-sqlite-bridge`: `Busy`, `Constraint`, `Io`, `Sqlite`,
+  `ResponseTooLarge`, `InvalidRequest`, `Internal`.
+- `tina-reqwest-bridge`: `Reqwest`, `RequestTooLarge`,
+  `ResponseTooLarge`, `InvalidRequest`.
+- `tina-tokio-bridge`: only the three shared reasons; `dropped_response`
+  uses `reason="CallerClosed"` on the runtime side.
+- `tina-tower-bridge`: only the three shared reasons (re-exposed from
+  the underlying `tina-tokio-bridge`).
+
+Tower events sit *above* the underlying tokio bridge events. Filter
+on the tokio target for transport truth, the tower target for the
+service-layer view. Both fire for the same call; that's the cost of
+two layers of honesty.
+
+Bridge-specific fields stay bridge-shaped:
+
+- `request_kind` (sqlite: `execute` / `query`) — rides on every
+  per-call sqlite event (admission / replied / timeout).
+- `method` (reqwest: HTTP method) — rides on every per-call
+  reqwest event.
+- `status` (reqwest: HTTP status code on successful replies).
+- `outcome` (sqlite/reqwest/tokio replies: `executed` / `rows` /
+  `response`).
+- `rows_changed`, `row_count` (sqlite responses).
+- `elapsed_ms` (timeouts).
+- `scope` (tokio bridge timeouts: `per_attempt` for the inner call
+  deadline, `retry_within_total` for `BridgeBackpressure::RetryWithin`'s
+  total budget).
+- `detail` (typed error message — never replaces `reason`).
 
 Correlate runtime `call_id` ↔ bridge correlator by hand for now.
-Bridge fields stay bridge-shaped, not runtime-shaped.
+The bridges do not invent a shared correlator field.
 
 ## Not in scope
 

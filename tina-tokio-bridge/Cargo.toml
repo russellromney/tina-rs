@@ -10,9 +10,11 @@ repository = "https://github.com/russellromney/tina-rs"
 tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
 tokio = { version = "1.48.0", default-features = false, features = ["rt", "sync", "time"] }
-# Optional tracing scaffolding. No spans/events are emitted yet; the
-# feature surface is here so we can align vocabulary across bridges
-# in one pass instead of inventing per-crate field names.
+# Optional tracing emission. Enables per-call events under
+# `tina_tokio.bridge.call` (`admission_rejected`, `admitted`, `replied`,
+# `timeout`, `dropped_response`) and lifecycle events under
+# `tina_tokio.bridge` (`close`). See `docs/tina-user-guide/19-tracing.md`
+# for the field/level/reason vocabulary.
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 
 [features]
