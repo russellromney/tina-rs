@@ -38,7 +38,9 @@ enum FetchMsg {
     Connected(TcpConnectReply),
     Wrote(TcpWriteReply),
     Read(TcpReadReply),
-    Closed(TcpStreamCloseReply),
+    /// Payload is kept for trace shape but not inspected at the
+    /// handler — close is fire-and-forget here.
+    Closed(#[allow(dead_code)] TcpStreamCloseReply),
 }
 
 /// Per-fetch working state. The two loop helpers are `Option`s so a
@@ -69,7 +71,7 @@ impl Fetcher {
             }
             FetchMsg::Connected(Ok((stream, _local, _peer))) => {
                 self.state.stream = Some(stream);
-                let mut writer = TcpWriteAll::new(stream, b"GET\n".to_vec());
+                let writer = TcpWriteAll::new(stream, b"GET\n".to_vec());
                 let effect = writer
                     .next_effect(FetchMsg::Wrote)
                     .expect("write helper has bytes to ship");

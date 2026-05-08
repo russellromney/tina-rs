@@ -8,8 +8,8 @@
 //! - the observer sees what the in-memory trace contains.
 
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId, stop};
 use tina_runtime::{RuntimeCall, RuntimeEvent, TraceObserver, stable_trace_hash};
@@ -118,4 +118,3 @@ fn sim_closure_observer_works_via_blanket_impl() {
     let _ = run(Some(observer));
     assert!(count.load(Ordering::Relaxed) > 0);
 }
-

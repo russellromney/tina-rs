@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, VecDeque};
 use tina::{Address, Isolate, Mailbox, Outbound as TinaOutbound, Shard, ShardId, TrySendError};
 use tina_supervisor::SupervisorConfig;
 
-use crate::call::IntoErasedCall;
+use crate::call::{IntoErasedCall, RuntimeCall};
 use crate::clock::MonotonicClock;
 use crate::mailbox::MailboxFactory;
+use crate::sharded::ReplyAdapter;
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{IdSource, IntoErasedSpawn, QueuedRemoteEnvelope, Runtime};
 
@@ -185,6 +186,49 @@ where
     {
         self.runtime_mut(shard)
             .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Register a [`ReplyAdapter<M, T, S>`] on a chosen shard.
+    ///
+    /// Translates inbound `M` to outbound `T` via the user-provided
+    /// `From<M> for T` and forwards to `target`. Returns the bridge
+    /// `Address<M>` callers send to.
+    ///
+    /// Equivalent to
+    /// `register_with_capacity_on::<ReplyAdapter<M, T, S>, T>(shard, ReplyAdapter::new(target), capacity)`
+    /// but does not require restating the adapter's full type. The
+    /// adapter has the same per-isolate state any registered isolate
+    /// has (one entry, one bounded mailbox, one handler); no extra
+    /// queue, no target clone, no scatter/gather policy.
+    ///
+    /// Caller picks `shard`. Co-locating with the coordinator keeps
+    /// reply translation local; pinning on the target's shard moves
+    /// it off the caller's hot path. The helper does not pick.
+    ///
+    /// Mirrors
+    /// [`crate::ThreadedMultiShardRuntime::register_reply_adapter_on`]
+    /// (threaded) and `MultiShardSimulator::register_reply_adapter_on`
+    /// (in `tina-sim`). Bound lists are matched to each runtime's
+    /// lower-level `register_with_capacity_on`; mirror changes across
+    /// all three.
+    #[allow(private_bounds)]
+    pub fn register_reply_adapter_on<M, T>(
+        &mut self,
+        shard: ShardId,
+        target: Address<T>,
+        mailbox_capacity: usize,
+    ) -> Address<M>
+    where
+        M: 'static,
+        T: 'static + From<M>,
+        std::convert::Infallible: IntoErasedSpawn<S, F>,
+        RuntimeCall<M>: IntoErasedCall<M>,
+    {
+        self.register_with_capacity_on::<ReplyAdapter<M, T, S>, T>(
+            shard,
+            ReplyAdapter::new(target),
+            mailbox_capacity,
+        )
     }
 
     /// Configures a registered isolate as supervisor on its owning shard.
