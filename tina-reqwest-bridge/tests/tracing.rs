@@ -270,3 +270,59 @@ fn oversized_request_body_emits_request_too_large() {
     assert_eq!(rejected.level, Level::WARN);
     assert_eq!(rejected.field("method"), Some("POST"));
 }
+
+#[test]
+fn terminal_replied_carries_method() {
+    // Drives a request at a connection-refused port so the bridge
+    // walks the spawn -> admitted -> reqwest_error path. Asserts
+    // both the `admitted` and the terminal `replied` event carry
+    // the HTTP method, which is the contract the user guide promises.
+    let capture = install_global_capture();
+    let baseline = capture.events().len();
+
+    let runtime = make_runtime();
+    let cfg = ReqwestConfig::default()
+        .with_default_timeout(Duration::from_millis(500))
+        .with_poll_interval(Duration::from_millis(2));
+    let bridge = ReqwestWorker::install(&runtime, cfg).expect("install bridge");
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink));
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(ReqwestRequest::get("http://127.0.0.1:1/")),
+        )
+        .expect("kick caller");
+    let outcome = sink.wait(Duration::from_secs(5));
+    assert!(
+        matches!(outcome, CallOutcome::Replied(Err(_))),
+        "expected error reply, got {outcome:?}",
+    );
+    let _ = runtime.shutdown();
+
+    let new = capture.events()[baseline..].to_vec();
+
+    let admitted = new
+        .iter()
+        .find(|e| {
+            e.target == "tina_reqwest.bridge.call"
+                && e.kind() == Some("admitted")
+                && e.field("method") == Some("GET")
+        })
+        .expect("admitted event carries method=GET");
+    assert_eq!(admitted.level, Level::DEBUG);
+
+    // Terminal event is either `replied` (reqwest connection refused)
+    // or `timeout` (if reqwest hangs and the bridge default_timeout
+    // fires first). Both must carry `method`.
+    let terminal = new
+        .iter()
+        .find(|e| {
+            e.target == "tina_reqwest.bridge.call"
+                && (e.kind() == Some("replied") || e.kind() == Some("timeout"))
+                && e.field("method") == Some("GET")
+        })
+        .expect("terminal event (replied or timeout) carries method=GET");
+    assert_eq!(terminal.level, Level::WARN);
+}

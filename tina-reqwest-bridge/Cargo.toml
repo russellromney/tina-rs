@@ -16,9 +16,12 @@ tina-runtime = { path = "../tina-runtime" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
 http = { version = "1", default-features = false }
-# Optional tracing scaffolding. No spans/events are emitted yet; the
-# feature surface is here so we can align vocabulary across bridges
-# in one pass instead of inventing per-crate field names.
+# Optional tracing emission. Enables per-call events under
+# `tina_reqwest.bridge.call` (`admission_rejected`, `admitted`,
+# `replied`, `timeout`, `retry`) and lifecycle events under
+# `tina_reqwest.bridge` (`close`). HTTP method rides on every
+# per-call event. See `docs/tina-user-guide/19-tracing.md` for the
+# field/level/reason vocabulary.
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 
 [features]

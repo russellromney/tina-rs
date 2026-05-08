@@ -212,3 +212,119 @@ async fn happy_path_emits_admitted_then_replied() {
         new.iter().filter_map(|e| e.kind()).collect::<Vec<_>>(),
     );
 }
+
+/// Black-hole isolate: keeps every request alive without responding
+/// so the bridge per-attempt timeout fires. The isolate's own Drop
+/// later releases the responders.
+#[derive(Debug, Default)]
+struct StuckIsolate {
+    stuck: Vec<BridgeRequest<u32, u32>>,
+}
+
+#[derive(Debug)]
+enum StuckMsg {
+    Request(BridgeRequest<u32, u32>),
+}
+
+impl From<BridgeRequest<u32, u32>> for StuckMsg {
+    fn from(value: BridgeRequest<u32, u32>) -> Self { Self::Request(value) }
+}
+
+impl BridgeMessage for StuckMsg {
+    fn bridge_cancelled(&self) -> bool {
+        match self { Self::Request(request) => request.bridge_cancelled() }
+    }
+}
+
+#[tina_runtime::isolate(message = StuckMsg)]
+impl StuckIsolate {
+    fn handle(
+        &mut self,
+        msg: StuckMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            StuckMsg::Request(request) => {
+                self.stuck.push(request);
+                noop()
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn per_attempt_timeout_event_carries_scope_and_elapsed_ms() {
+    let capture = install_global_capture();
+    let baseline = capture.events().len();
+
+    let mut host = make_host();
+    let handle = host
+        .register_bridge::<StuckIsolate, u32, u32, Infallible>(
+            StuckIsolate { stuck: Vec::new() },
+            8,
+            Duration::from_millis(50),
+        )
+        .expect("register bridge");
+    let result = handle.call(7).await;
+    assert!(matches!(result, Err(BridgeError::Timeout)));
+    drop(handle);
+    let _ = host.drain_and_shutdown(Duration::from_millis(200));
+
+    let new = capture.events()[baseline..].to_vec();
+    let timeout = new
+        .iter()
+        .find(|e| {
+            e.target == "tina_tokio.bridge.call"
+                && e.kind() == Some("timeout")
+                && e.field("scope") == Some("per_attempt")
+        })
+        .expect("per-attempt timeout event with scope=per_attempt");
+    assert_eq!(timeout.level, Level::WARN);
+    assert_eq!(timeout.field("reason"), Some("Timeout"));
+    assert!(timeout.field("elapsed_ms").is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retry_within_total_timeout_emits_event_with_scope() {
+    use tina_tokio_bridge::BridgeBackpressure;
+
+    let capture = install_global_capture();
+    let baseline = capture.events().len();
+
+    let mut host = make_host();
+    // StuckIsolate never replies. We use call_with_policy(RetryWithin)
+    // with a per-attempt timeout longer than the total timeout, so
+    // the per-attempt path cannot fire first — the only timeout
+    // signal must come from the RetryWithin total-budget site.
+    let handle = host
+        .register_bridge::<StuckIsolate, u32, u32, Infallible>(
+            StuckIsolate { stuck: Vec::new() },
+            8,
+            Duration::from_millis(500),
+        )
+        .expect("register bridge");
+    let policy = BridgeBackpressure::retry_within(
+        99,
+        Duration::from_millis(1),
+        Duration::from_millis(20),
+    );
+    let result = handle
+        .call_with_policy(7, policy, Duration::from_millis(500))
+        .await;
+    assert!(matches!(result, Err(BridgeError::Timeout)));
+    drop(handle);
+    let _ = host.drain_and_shutdown(Duration::from_millis(200));
+
+    let new = capture.events()[baseline..].to_vec();
+    let total = new
+        .iter()
+        .find(|e| {
+            e.target == "tina_tokio.bridge.call"
+                && e.kind() == Some("timeout")
+                && e.field("scope") == Some("retry_within_total")
+        })
+        .expect("retry_within total-budget timeout event");
+    assert_eq!(total.level, Level::WARN);
+    assert_eq!(total.field("reason"), Some("Timeout"));
+    assert!(total.field("elapsed_ms").is_some());
+}

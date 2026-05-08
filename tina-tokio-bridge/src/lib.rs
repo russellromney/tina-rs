@@ -919,6 +919,21 @@ where
                     Ok(outcome) => outcome,
                     Err(_) => {
                         self.record_error(BridgeError::Timeout);
+                        // record_error_on skips Timeout because the
+                        // per-attempt site emits it with elapsed_ms
+                        // (see call_once). The RetryWithin total
+                        // budget has its own timeout site, so emit
+                        // here too with the policy's total budget
+                        // as elapsed_ms.
+                        #[cfg(feature = "tracing")]
+                        event!(
+                            target: TRACE_TARGET_CALL,
+                            Level::WARN,
+                            kind = "timeout",
+                            reason = "Timeout",
+                            scope = "retry_within_total",
+                            elapsed_ms = total_timeout.as_millis() as u64,
+                        );
                         Err(BridgeError::Timeout)
                     }
                 }
@@ -1027,6 +1042,7 @@ where
                     Level::WARN,
                     kind = "timeout",
                     reason = "Timeout",
+                    scope = "per_attempt",
                     elapsed_ms = timeout.as_millis() as u64,
                 );
                 return Err(BridgeError::Timeout);

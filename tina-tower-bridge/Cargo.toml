@@ -16,9 +16,12 @@ tina-runtime = { path = "../tina-runtime" }
 tina-tokio-bridge = { path = "../tina-tokio-bridge" }
 tower-service = "0.3"
 tokio = { version = "1.48.0", default-features = false, features = ["rt", "sync", "time"] }
-# Optional tracing scaffolding. No spans/events are emitted yet; the
-# feature surface is here so we can align vocabulary across bridges
-# in one pass instead of inventing per-crate field names.
+# Optional tracing emission. Enables tower-layer events under
+# `tina_tower.bridge.call` (`tower_call`, `tower_response`,
+# `tower_error`) plus a `close` lifecycle event under
+# `tina_tower.bridge`. These sit *above* the underlying tokio
+# bridge events; both fire for the same call. See
+# `docs/tina-user-guide/19-tracing.md` for the field vocabulary.
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 
 [features]

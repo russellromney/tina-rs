@@ -80,6 +80,12 @@ struct Slot {
     /// Saved request used to build retry attempts. None when retry is
     /// off or the retry budget has been exhausted.
     saved_request: Option<ReqwestRequest>,
+    /// HTTP method as a stable lowercase-friendly string, captured at
+    /// admission so every per-call tracing event (`admitted`, `retry`,
+    /// `timeout`, `replied`) can carry the same `method` field.
+    /// Always populated, regardless of whether the `tracing` feature
+    /// is on, so the type does not branch on cfg.
+    method: String,
 }
 
 /// Bounded outbound HTTP worker around reqwest.
@@ -324,6 +330,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         per_attempt_timeout: Duration,
         saved_request: Option<ReqwestRequest>,
     ) -> Effect<Self> {
+        let method = request.method.as_str().to_string();
         let request_for_reqwest = match build_reqwest_request(&self.client, &request) {
             Ok(req) => req,
             Err(err) => {
@@ -333,7 +340,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     Level::WARN,
                     kind = "admission_rejected",
                     reason = reqwest_error_reason(&err),
-                    method = request.method.as_str(),
+                    method = method.as_str(),
                     detail = %err,
                 );
                 self.tally_error(&err);
@@ -371,6 +378,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 attempts_remaining,
                 retry_delay,
                 saved_request,
+                method: method.clone(),
             },
         );
         let in_flight = self.in_flight.len() as u64;
@@ -381,8 +389,11 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             target: TRACE_TARGET_CALL,
             Level::DEBUG,
             kind = "admitted",
+            method = method.as_str(),
             in_flight,
         );
+        #[cfg(not(feature = "tracing"))]
+        let _ = method;
         self.metrics.note_in_flight(in_flight);
 
         sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
@@ -412,6 +423,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let attempt_due_at = Instant::now() + retry_delay;
+        let method = request.method.as_str().to_string();
         self.in_flight.insert(
             id,
             Slot {
@@ -423,6 +435,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 attempts_remaining,
                 retry_delay,
                 saved_request: None,
+                method,
             },
         );
         let in_flight = self.in_flight.len() as u64;
@@ -443,6 +456,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             attempts_remaining,
             retry_delay,
             saved_request,
+            method,
         } = slot;
 
         match kind {
@@ -456,6 +470,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     attempts_remaining,
                     retry_delay,
                     saved_request,
+                    method,
                     result,
                 ),
                 Err(oneshot::error::TryRecvError::Empty) => {
@@ -472,6 +487,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                                 Level::DEBUG,
                                 kind = "retry",
                                 reason = "Timeout",
+                                method = method.as_str(),
                             );
                             return self.schedule_retry(
                                 saved,
@@ -488,6 +504,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             Level::WARN,
                             kind = "timeout",
                             reason = "Timeout",
+                            method = method.as_str(),
                             elapsed_ms = attempt_started_at.elapsed().as_millis() as u64,
                         );
                         return reply::<Self>(Err(ReqwestError::Timeout));
@@ -504,6 +521,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             attempts_remaining,
                             retry_delay,
                             saved_request,
+                            method,
                         },
                     );
                     sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
@@ -521,6 +539,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             Level::DEBUG,
                             kind = "retry",
                             reason = "Reqwest",
+                            method = method.as_str(),
                         );
                         return self.schedule_retry(
                             saved,
@@ -537,6 +556,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         Level::WARN,
                         kind = "replied",
                         reason = "Reqwest",
+                        method = method.as_str(),
                         detail = %err,
                     );
                     reply::<Self>(Err(err))
@@ -571,6 +591,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             attempts_remaining,
                             retry_delay,
                             saved_request,
+                            method,
                         },
                     );
                     sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
@@ -585,6 +606,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         attempts_remaining: u8,
         retry_delay: Duration,
         saved_request: Option<ReqwestRequest>,
+        method: String,
         result: Result<ReqwestResponse, ReqwestError>,
     ) -> Effect<Self> {
         if let Err(err) = &result {
@@ -600,6 +622,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         Level::DEBUG,
                         kind = "retry",
                         reason = reqwest_error_reason(err),
+                        method = method.as_str(),
                     );
                     let request = saved.clone();
                     return self.schedule_retry(
@@ -621,6 +644,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     Level::DEBUG,
                     kind = "replied",
                     outcome = "response",
+                    method = method.as_str(),
                     status = response.status.as_u16(),
                 );
                 #[cfg(not(feature = "tracing"))]
@@ -634,10 +658,13 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     Level::WARN,
                     kind = "replied",
                     reason = reqwest_error_reason(err),
+                    method = method.as_str(),
                     detail = %err,
                 );
             }
         }
+        #[cfg(not(feature = "tracing"))]
+        let _ = method;
         self.note_terminal();
         reply::<Self>(result)
     }

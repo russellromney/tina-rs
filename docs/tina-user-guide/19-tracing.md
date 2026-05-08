@@ -193,12 +193,18 @@ two layers of honesty.
 
 Bridge-specific fields stay bridge-shaped:
 
-- `request_kind` (sqlite: `execute` / `query`).
-- `method` (reqwest: HTTP method).
-- `status` (reqwest: HTTP status code).
-- `outcome` (sqlite/reqwest/tokio replies: `executed` / `rows` / `response`).
+- `request_kind` (sqlite: `execute` / `query`) — rides on every
+  per-call sqlite event (admission / replied / timeout).
+- `method` (reqwest: HTTP method) — rides on every per-call
+  reqwest event.
+- `status` (reqwest: HTTP status code on successful replies).
+- `outcome` (sqlite/reqwest/tokio replies: `executed` / `rows` /
+  `response`).
 - `rows_changed`, `row_count` (sqlite responses).
-- `elapsed_ms` (per-attempt timeouts).
+- `elapsed_ms` (timeouts).
+- `scope` (tokio bridge timeouts: `per_attempt` for the inner call
+  deadline, `retry_within_total` for `BridgeBackpressure::RetryWithin`'s
+  total budget).
 - `detail` (typed error message — never replaces `reason`).
 
 Correlate runtime `call_id` ↔ bridge correlator by hand for now.
