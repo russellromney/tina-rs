@@ -31,6 +31,7 @@ use crate::local_system::{
 };
 use crate::mailbox::MailboxFactory;
 use crate::observation::{self, BoundAddressWaiter};
+use crate::observer::TraceObserver;
 use crate::trace::{CallKind, RuntimeEvent};
 use crate::{IdSource, IntoErasedSpawn, PreallocationConfig, Runtime, TraceRetention};
 
@@ -152,6 +153,24 @@ where
         })
     }
 
+    /// Starts one worker with a live trace observer wired before the
+    /// first event. Observer stays out of [`ThreadedRuntimeConfig`] —
+    /// config is pure data.
+    pub fn with_config_and_trace_observer(
+        shard: S,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Arc<dyn TraceObserver>,
+    ) -> Self {
+        Self::with_config_observer_and_io_loop_factory(
+            shard,
+            mailbox_factory,
+            config,
+            Some(observer),
+            || io_loop(Global).expect("failed to initialise Betelgeuse IO loop for tina-runtime"),
+        )
+    }
+
     /// Starts one worker thread with an explicit Betelgeuse I/O loop factory.
     ///
     /// The factory runs on the worker thread so loop implementations that own
@@ -161,6 +180,27 @@ where
         shard: S,
         mailbox_factory: F,
         config: ThreadedRuntimeConfig,
+        io_loop_factory: G,
+    ) -> Self
+    where
+        G: FnOnce() -> IOLoopHandle<Global> + Send + 'static,
+    {
+        Self::with_config_observer_and_io_loop_factory(
+            shard,
+            mailbox_factory,
+            config,
+            None,
+            io_loop_factory,
+        )
+    }
+
+    /// [`Self::with_config_and_io_loop_factory`] plus a trace observer.
+    /// Reach for this when both seams matter.
+    pub fn with_config_observer_and_io_loop_factory<G>(
+        shard: S,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Option<Arc<dyn TraceObserver>>,
         io_loop_factory: G,
     ) -> Self
     where
@@ -198,6 +238,7 @@ where
         ));
         let io_loop_factory: ThreadedIoLoopFactory = Box::new(io_loop_factory);
         let worker_metrics = Arc::clone(&metrics);
+        let worker_observer = observer;
         let handle = thread::Builder::new()
             .name(worker_name)
             .spawn(move || {
@@ -208,6 +249,7 @@ where
                     config,
                     io_loop_factory,
                     worker_metrics,
+                    worker_observer,
                 )
             })
             .expect("failed to spawn Tina threaded worker");
@@ -865,6 +907,7 @@ pub(crate) fn threaded_worker_loop<S, F>(
     config: ThreadedRuntimeConfig,
     io_loop_factory: ThreadedIoLoopFactory,
     metrics: Arc<LiveShardMetrics>,
+    observer: Option<Arc<dyn TraceObserver>>,
 ) -> ThreadedWorkerExit
 where
     S: Shard,
@@ -887,6 +930,8 @@ where
         config.preallocation,
     );
     runtime.set_trace_retention(config.trace_retention);
+    // Wire the observer before any event records.
+    runtime.set_trace_observer(observer);
 
     loop {
         metrics.set_resource_counts(runtime.resource_report());

@@ -42,6 +42,7 @@ Read in order if new:
 16. [Continuation And Pipeline Patterns](16-continuation-and-pipeline-patterns.md)
 17. [Pressure Report Convention](17-pressure-report-convention.md)
 18. [Bridge Crates](18-bridge-crates.md)
+19. [Tracing](19-tracing.md)
 
 For runnable specimens, see repo-root `examples/`.
 

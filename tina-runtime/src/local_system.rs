@@ -6,6 +6,7 @@
 //! `ThreadedRuntime`.
 
 use std::alloc::Global;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use crate::driver;
 use crate::errors::{ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError};
 use crate::live_report::{LiveShardReport, LiveShardState, LiveTopologyReport};
 use crate::mailbox::MailboxFactory;
+use crate::observer::TraceObserver;
 use crate::trace::{RuntimeEvent, RuntimeEventKind};
 use crate::{
     DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, IntoErasedSpawn, PreallocationConfig, Runtime,
@@ -649,6 +651,7 @@ where
             shard,
             mailbox_factory,
             config: LocalSystemConfig::default(),
+            trace_observer: None,
         }
     }
 
@@ -661,6 +664,7 @@ where
             shards: Vec::new(),
             mailbox_factory,
             config: LocalSystemConfig::default(),
+            trace_observer: None,
         }
     }
 
@@ -776,6 +780,7 @@ where
     shard: S,
     mailbox_factory: F,
     config: LocalSystemConfig,
+    trace_observer: Option<Arc<dyn TraceObserver>>,
 }
 
 impl<S, F> LocalSystemSingleShardBuilder<S, F>
@@ -866,17 +871,33 @@ where
         self
     }
 
+    /// Wires a live trace observer before the worker records anything.
+    /// One observer. See [`crate::TraceObserver`] for hook rules.
+    pub fn trace_observer(mut self, observer: Arc<dyn TraceObserver>) -> Self {
+        self.trace_observer = Some(observer);
+        self
+    }
+
     /// Builds the local app and starts its worker.
     pub fn build(self) -> LocalSystem<S, F> {
         self.config
             .validate()
             .expect("invalid LocalSystemConfig for single-shard system");
-        LocalSystem {
-            runtime: Some(ThreadedRuntime::with_config(
+        let runtime = match self.trace_observer {
+            Some(observer) => ThreadedRuntime::with_config_and_trace_observer(
                 self.shard,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
-            )),
+                observer,
+            ),
+            None => ThreadedRuntime::with_config(
+                self.shard,
+                self.mailbox_factory,
+                self.config.threaded_runtime_config(),
+            ),
+        };
+        LocalSystem {
+            runtime: Some(runtime),
         }
     }
 }
@@ -943,6 +964,7 @@ where
     shards: Vec<S>,
     mailbox_factory: F,
     config: LocalSystemConfig,
+    trace_observer: Option<Arc<dyn TraceObserver>>,
 }
 
 impl<S, F> LocalSystemMultiShardBuilder<S, F>
@@ -1047,17 +1069,34 @@ where
         self
     }
 
+    /// Wires one live trace observer for every shard before any
+    /// records. Per-shard order preserved; cross-shard order is
+    /// whatever the threads produce.
+    pub fn trace_observer(mut self, observer: Arc<dyn TraceObserver>) -> Self {
+        self.trace_observer = Some(observer);
+        self
+    }
+
     /// Builds the multi-shard local app and starts one worker per shard.
     pub fn build(self) -> LocalMultiShardSystem<S, F> {
         self.config
             .validate()
             .expect("invalid LocalSystemConfig for multi-shard system");
-        LocalMultiShardSystem {
-            runtime: Some(ThreadedMultiShardRuntime::with_config(
+        let runtime = match self.trace_observer {
+            Some(observer) => ThreadedMultiShardRuntime::with_config_and_trace_observer(
                 self.shards,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
-            )),
+                observer,
+            ),
+            None => ThreadedMultiShardRuntime::with_config(
+                self.shards,
+                self.mailbox_factory,
+                self.config.threaded_runtime_config(),
+            ),
+        };
+        LocalMultiShardSystem {
+            runtime: Some(runtime),
         }
     }
 }

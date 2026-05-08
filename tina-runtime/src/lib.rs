@@ -61,6 +61,7 @@ mod local_system;
 mod mailbox;
 mod multi_shard;
 mod observation;
+mod observer;
 pub mod persistence;
 pub mod pressure;
 pub mod sharded;
@@ -134,6 +135,7 @@ pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
     IsolateResultWaiter, OperationDoneWaiter, ResultWaitError, WaitError,
 };
+pub use observer::TraceObserver;
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
@@ -222,6 +224,8 @@ where
     driver_completions: Vec<DriverCompletion>,
     next_isolate_call_ordinal: u64,
     observation: observation::ObservationRegistry,
+    /// Live trace observer. Fires before retention. See [`crate::TraceObserver`].
+    trace_observer: observer::StoredObserver,
     /// Tina-owned slot-id source and pending-capture queue. Cloned
     /// (refcount bump, no allocation) into each per-message
     /// [`MessageCaller`].
@@ -457,6 +461,7 @@ where
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,
             observation: observation::ObservationRegistry::new(),
+            trace_observer: None,
             deferred_registry: Rc::new(DeferredSlotRegistry::new()),
             promoted_slots: deferred::PromotedSlots::default(),
         }
@@ -605,6 +610,14 @@ where
     pub fn set_trace_retention(&mut self, retention: TraceRetention) {
         self.trace_retention = retention;
         self.enforce_trace_retention();
+    }
+
+    /// Sets the live trace observer. `None` detaches. See
+    /// [`crate::TraceObserver`] for hook rules. On `ThreadedRuntime` /
+    /// `LocalSystem`, prefer the build-time wiring so no events fire
+    /// before the hook is in place.
+    pub fn set_trace_observer(&mut self, observer: Option<Arc<dyn TraceObserver>>) {
+        self.trace_observer = observer;
     }
 
     /// Cancels every in-flight runtime-owned call ahead of shutdown.
@@ -2539,18 +2552,22 @@ where
         kind: RuntimeEventKind,
     ) -> EventId {
         let id = self.ids.next_event_id();
+        let event = RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind);
+        // Observer first. Retention::Off does not silence it.
+        // A panic here kills the recording thread by design.
+        if let Some(obs) = &self.trace_observer {
+            obs.on_event(&event);
+        }
         match self.trace_retention {
             TraceRetention::Full => {
-                self.trace
-                    .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
+                self.trace.push(event);
             }
             TraceRetention::Bounded(capacity) if capacity > 0 => {
                 if self.trace.len() == capacity {
                     self.trace.remove(0);
                     self.trace_dropped += 1;
                 }
-                self.trace
-                    .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
+                self.trace.push(event);
             }
             TraceRetention::Bounded(_) | TraceRetention::Off => {
                 self.trace_dropped += 1;
