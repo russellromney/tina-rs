@@ -118,13 +118,13 @@ pub use call::{
     TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
     TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
     TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
-    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
-    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
-    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
-    udp_recv_from, udp_send_to,
+    UdpSocketId, call, call_with_handle, cancel_call, dns_lookup, file_close, file_create,
+    file_fsync, file_open, file_read, file_read_at, file_size, file_write, file_write_at,
+    journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file,
+    rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load,
+    sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read,
+    tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read,
+    tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 pub use deferred::{
     InsertError as PendingRepliesInsertError, PendingReplies,
@@ -346,6 +346,10 @@ struct PendingIsolateCall {
     /// to typecheck deferred-reply payloads before they reach the
     /// translator's downcast.
     expected_reply_type_id: std::any::TypeId,
+    /// Optional caller-owned cancellation cell. The runtime updates
+    /// `state` to `Settled` on completion/timeout/closed, or
+    /// `Cancelled` on explicit `cancel_call`.
+    handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
 }
 
 impl std::fmt::Debug for PendingIsolateCall {
@@ -1557,6 +1561,7 @@ where
             call::ErasedCallKind::Backend { request, .. } => request.kind(),
             call::ErasedCallKind::ObservedSend { .. } => CallKind::ObservedSend,
             call::ErasedCallKind::IsolateCall { .. } => CallKind::IsolateCall,
+            call::ErasedCallKind::CancelCall { .. } => CallKind::CancelCall,
         };
 
         let attempted = self.push_event(
@@ -1586,6 +1591,7 @@ where
                 timeout,
                 translator,
                 expected_reply_type_id,
+                handle_shared,
             } => {
                 self.dispatch_isolate_call(
                     dispatch_context,
@@ -1593,8 +1599,15 @@ where
                     timeout,
                     translator,
                     expected_reply_type_id,
+                    handle_shared,
                     route_remote,
                 );
+            }
+            call::ErasedCallKind::CancelCall {
+                handle_shared,
+                translator,
+            } => {
+                self.dispatch_cancel_call(dispatch_context, handle_shared, translator);
             }
         }
     }
@@ -1822,6 +1835,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_isolate_call(
         &mut self,
         context: CallDispatchContext,
@@ -1829,6 +1843,7 @@ where
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
         expected_reply_type_id: std::any::TypeId,
+        handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         let target_shard = send.target_shard;
@@ -1882,6 +1897,9 @@ where
                 );
                 let insertion_order = self.next_isolate_call_ordinal;
                 self.next_isolate_call_ordinal += 1;
+                if let Some(shared) = &handle_shared {
+                    shared.set_call_id(context.call_id.get());
+                }
                 self.pending_isolate_calls.push(PendingIsolateCall {
                     call_id: context.call_id,
                     requester: context.requester,
@@ -1891,6 +1909,7 @@ where
                     continuation_context: context.continuation_context,
                     translator: Some(translator),
                     expected_reply_type_id,
+                    handle_shared,
                 });
             }
             Err(reason) => {
@@ -1908,6 +1927,10 @@ where
                     SendRejectedReason::Full => CallOutcome::Full,
                     SendRejectedReason::Closed => CallOutcome::Closed,
                 };
+                if let Some(shared) = &handle_shared {
+                    shared.set_call_id(context.call_id.get());
+                    shared.set_state(tina::CallHandleState::Settled);
+                }
                 self.deliver_isolate_call_outcome(
                     context.call_id,
                     context.requester,
@@ -1915,6 +1938,121 @@ where
                     outcome,
                     translator,
                     context.continuation_context,
+                );
+            }
+        }
+    }
+
+    fn dispatch_cancel_call(
+        &mut self,
+        context: CallDispatchContext,
+        handle_shared: std::sync::Arc<tina::CallHandleShared>,
+        translator: Box<dyn FnOnce(tina::CancelOutcome) -> Box<dyn Any>>,
+    ) {
+        // Single-writer (this shard thread): the pending-table state
+        // and `handle_shared.state` agree by construction. No CAS, no
+        // identity check — `CallHandle` is `!Clone` and move-only, so
+        // it can only be in one isolate at once.
+        let outcome = match handle_shared.state() {
+            tina::CallHandleState::Settled => tina::CancelOutcome::AlreadyCompleted,
+            tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
+            tina::CallHandleState::Pending => match handle_shared.call_id() {
+                None => tina::CancelOutcome::NotDispatched,
+                Some(raw_call_id) => {
+                    let call_id = CallId::new(raw_call_id);
+                    match self
+                        .pending_isolate_calls
+                        .iter()
+                        .position(|entry| entry.call_id == call_id)
+                    {
+                        Some(index) => {
+                            let mut entry = self.pending_isolate_calls.remove(index);
+                            // CallCancelled's trace cause chains back
+                            // to the original CallDispatchAttempted so
+                            // every CallDispatchAttempted has exactly
+                            // one settlement event downstream of it.
+                            let original_cause = entry.cause;
+                            let _ = entry.translator.take();
+                            handle_shared.set_state(tina::CallHandleState::Cancelled);
+                            self.close_deferred_slot_for_call_with_reason(
+                                call_id,
+                                trace::DeferredReplyRejectedReason::CallerCancelled,
+                            );
+                            self.push_event(
+                                context.requester.isolate,
+                                Some(original_cause),
+                                RuntimeEventKind::CallCancelled {
+                                    call_id,
+                                    cause: tina::CancelCause::CallerCancelled,
+                                },
+                            );
+                            tina::CancelOutcome::Cancelled
+                        }
+                        None => tina::CancelOutcome::AlreadyCompleted,
+                    }
+                }
+            },
+        };
+
+        let message_any = translator(outcome);
+        let Some(entry_index) = self.entries.iter().position(|entry| {
+            entry.id == context.requester.isolate
+                && entry.generation == context.requester.generation
+        }) else {
+            self.push_event(
+                context.requester.isolate,
+                Some(context.cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id: context.call_id,
+                    call_kind: trace::CallKind::CancelCall,
+                    reason: trace::CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        };
+        if self.entries[entry_index].stopped.get() {
+            self.push_event(
+                context.requester.isolate,
+                Some(context.cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id: context.call_id,
+                    call_kind: trace::CallKind::CancelCall,
+                    reason: trace::CallCompletionRejectedReason::RequesterClosed,
+                },
+            );
+            return;
+        }
+        match self.enqueue_entry_message(entry_index, message_any, context.continuation_context) {
+            Ok(()) => {
+                self.push_event(
+                    context.requester.isolate,
+                    Some(context.cause),
+                    RuntimeEventKind::CallCompleted {
+                        call_id: context.call_id,
+                        call_kind: trace::CallKind::CancelCall,
+                    },
+                );
+            }
+            Err(TrySendError::Full(_)) => {
+                self.push_event(
+                    context.requester.isolate,
+                    Some(context.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id: context.call_id,
+                        call_kind: trace::CallKind::CancelCall,
+                        reason: trace::CallCompletionRejectedReason::MailboxFull,
+                    },
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.push_event(
+                    context.requester.isolate,
+                    Some(context.cause),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_id: context.call_id,
+                        call_kind: trace::CallKind::CancelCall,
+                        reason: trace::CallCompletionRejectedReason::RequesterClosed,
+                    },
                 );
             }
         }
@@ -1937,6 +2075,12 @@ where
             let translator = entry.translator.take().unwrap_or_else(|| {
                 panic!("translator for call {:?} already consumed", entry.call_id)
             });
+            // Timeout shares cancel's cleanup path; cause stays
+            // distinct in the trace via `CallFailed { Timeout }` vs
+            // `CallCancelled { CallerCancelled }`.
+            if let Some(shared) = &entry.handle_shared {
+                shared.set_state(tina::CallHandleState::Settled);
+            }
             self.close_deferred_slot_for_call(entry.call_id);
             self.deliver_isolate_call_outcome(
                 entry.call_id,
@@ -1949,7 +2093,60 @@ where
         }
     }
 
+    /// Cancels every pending isolate call whose caller is the stopping
+    /// isolate. Emits `CallCancelled { OwnerStopped }`, marks each
+    /// shared cell `Cancelled`, and closes any captured deferred slot
+    /// with `CallerCancelled`. The callee may still finish; its later
+    /// reply hits the same rejection path as explicit cancel.
+    fn cancel_pending_isolate_calls_for_owner(
+        &mut self,
+        owner_isolate: IsolateId,
+        owner_generation: AddressGeneration,
+        _stopped_cause: CauseId,
+    ) {
+        let mut i = 0;
+        while i < self.pending_isolate_calls.len() {
+            if self.pending_isolate_calls[i].requester.isolate == owner_isolate
+                && self.pending_isolate_calls[i].requester.generation == owner_generation
+            {
+                let mut entry = self.pending_isolate_calls.remove(i);
+                // Trace cause chains to the original CallDispatchAttempted
+                // (matches CallCompleted/CallFailed convention).
+                let original_cause = entry.cause;
+                let _ = entry.translator.take();
+                if let Some(shared) = &entry.handle_shared {
+                    shared.set_state(tina::CallHandleState::Cancelled);
+                }
+                self.close_deferred_slot_for_call_with_reason(
+                    entry.call_id,
+                    trace::DeferredReplyRejectedReason::CallerCancelled,
+                );
+                self.push_event(
+                    owner_isolate,
+                    Some(original_cause),
+                    RuntimeEventKind::CallCancelled {
+                        call_id: entry.call_id,
+                        cause: tina::CancelCause::OwnerStopped,
+                    },
+                );
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     fn close_deferred_slot_for_call(&mut self, call_id: CallId) {
+        self.close_deferred_slot_for_call_with_reason(
+            call_id,
+            DeferredReplyRejectedReason::CallerClosed,
+        );
+    }
+
+    fn close_deferred_slot_for_call_with_reason(
+        &mut self,
+        call_id: CallId,
+        reason: DeferredReplyRejectedReason,
+    ) {
         // Local-only: caller-liveness sweep here is driven by this
         // shard's pending isolate calls. First form refuses cross-shard
         // captures so every promoted slot is local — see
@@ -1962,7 +2159,7 @@ where
                 RuntimeEventKind::DeferredReplyRejected {
                     slot_id: record.slot_id,
                     call_id: record.call_id,
-                    reason: DeferredReplyRejectedReason::CallerClosed,
+                    reason,
                 },
             );
         }
@@ -1986,6 +2183,9 @@ where
             .translator
             .take()
             .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
+        if let Some(shared) = &pending.handle_shared {
+            shared.set_state(tina::CallHandleState::Settled);
+        }
         self.deliver_isolate_call_outcome(
             call_id,
             pending.requester,
@@ -2401,6 +2601,11 @@ where
             isolate: isolate_id,
             generation: self.entries[index].generation,
         });
+        self.cancel_pending_isolate_calls_for_owner(
+            isolate_id,
+            self.entries[index].generation,
+            stopped.into(),
+        );
         if precollected.is_some() {
             self.push_event(
                 isolate_id,

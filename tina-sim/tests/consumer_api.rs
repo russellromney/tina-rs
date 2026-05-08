@@ -670,20 +670,34 @@ fn downstream_consumer_can_replay_isolate_call_reply_full_closed_timeout() {
 }
 
 #[test]
-fn downstream_consumer_replays_isolate_call_completion_rejected_when_requester_stops() {
+fn downstream_consumer_replays_isolate_call_owner_stopped_when_requester_stops() {
+    // Rock 5: when the requester isolate stops with a pending call,
+    // the runtime proactively cancels the call with cause
+    // `OwnerStopped`. The worker's later reply hits the same
+    // `CallReplyRejected { NoPendingCall }` rejection path as a late
+    // reply against an already-cancelled call.
     let (outcomes, first) = run_stopped_requester_isolate_call_scenario();
     let (replayed_outcomes, replayed) = run_stopped_requester_isolate_call_scenario();
 
     assert!(outcomes.is_empty());
     assert_eq!(replayed_outcomes, outcomes);
     assert_eq!(first.event_record(), replayed.event_record());
+    let owner_stopped_cancels = first
+        .event_record()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCancelled {
+                    cause: tina::CancelCause::OwnerStopped,
+                    ..
+                }
+            )
+        })
+        .count();
     assert_eq!(
-        count_call_completion_rejected(
-            first.event_record(),
-            CallKind::IsolateCall,
-            CallCompletionRejectedReason::RequesterClosed,
-        ),
-        1
+        owner_stopped_cancels, 1,
+        "expected exactly one OwnerStopped cancel event"
     );
 }
 

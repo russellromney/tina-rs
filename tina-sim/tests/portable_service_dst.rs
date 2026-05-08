@@ -428,7 +428,11 @@ fn baobab_dst_replays_observed_send_persistence_and_requester_stop() {
     assert!(run.output().accepted.is_empty());
     assert_eq!(run.output().audit_stored, vec![8]);
     assert_eq!(run.output().journal_appended, 1);
-    assert_eq!(run.output().reply_rejected, 0);
+    // Stopping the router mid-call now cancels its pending isolate
+    // calls (Rock 5: `CallCancelled { OwnerStopped }`). The worker
+    // still finishes and its reply hits `CallReplyRejected
+    // { NoPendingCall }` — that's the late-reply visibility we want.
+    assert_eq!(run.output().reply_rejected, 1);
     assert_eq!(run.output().panicked, 0);
 }
 

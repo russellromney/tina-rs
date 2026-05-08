@@ -4,6 +4,41 @@ This file records completed work.
 
 ## Unreleased
 
+### Cancellation: first-form `CallHandle` and `cancel_call`
+
+- `tina::CallHandle<R>` (move-only, `!Clone`, `#[must_use]`) plus
+  `tina_runtime::call_with_handle(addr, msg, t).reply(...)` returning
+  `(Effect, CallHandle<R>)`.
+- `tina_runtime::cancel_call(handle).reply(...)` closes the wait,
+  reclaims caller-side capacity, and emits
+  `RuntimeEventKind::CallCancelled { call_id, cause }`. Late callee
+  replies surface as `CallReplyRejected { NoPendingCall }` or
+  `DeferredReplyRejected { CallerCancelled }` — visible truth, not
+  silent loss.
+- `CancelOutcome` (`Cancelled` / `AlreadyCompleted` / `AlreadyCancelled`
+  / `NotDispatched`) is `#[must_use]`. `CancelCause` distinguishes
+  `CallerCancelled` / `CallerTimedOut` / `OwnerStopped` /
+  `RuntimeStopped`.
+- Stopping an isolate with pending calls now proactively cancels them
+  with `CallCancelled { OwnerStopped }` instead of waiting for late
+  replies to bounce as `CallCompletionRejected { RequesterClosed }`.
+- New trace shapes: `CallKind::CancelCall`,
+  `CallReplyRejectedReason::CallerCancelled`,
+  `DeferredReplyRejectedReason::CallerCancelled`. Stable hashing,
+  `tina-tracing` event names, and `PressureSummary`
+  (`reply_rejected_caller_cancelled`) all extended.
+- `PressureSummary::Display` format gained a `cancelled=N` field —
+  log scrapers that match the old shape need updating.
+- `examples/eiffel_cancellation_chain` rewritten to use the new
+  shape; the host now counts rejected late replies from the trace
+  and the `Report` reflects that truth instead of hardcoding zero.
+- Simulator parity: `tina-sim` mirrors the dispatch and owner-stop
+  paths; `tina-sim/tests/cancel_call.rs` pins the public behavior
+  deterministically.
+- Bounded `PendingCallSet` (Rock 4) and `Deadline` value (Rock 1)
+  deferred to follow-up phases; design notes recorded in
+  `.intent/phases/066-cancellation-and-deadline-model/`.
+
 ### Phase 055 Codebase Module Split
 
 - Split the giant runtime, driver, simulator, and support files into smaller

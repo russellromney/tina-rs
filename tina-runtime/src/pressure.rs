@@ -35,6 +35,9 @@ pub struct PressureSummary {
     /// An isolate-call reply could not be matched against an
     /// outstanding pending call (typically caller already timed out).
     pub reply_rejected_no_pending_call: u64,
+    /// An isolate-call reply arrived after the caller explicitly
+    /// cancelled the wait via `cancel_call(handle)`.
+    pub reply_rejected_caller_cancelled: u64,
     /// The bounded reply transport between callee and caller was
     /// full. This is the cross-shard reply mailbox; it has its own
     /// budget separate from the caller's inbox.
@@ -80,6 +83,9 @@ impl PressureSummary {
                     CallReplyRejectedReason::RequesterShardClosed => {
                         summary.reply_rejected_requester_shard_closed += 1;
                     }
+                    CallReplyRejectedReason::CallerCancelled => {
+                        summary.reply_rejected_caller_cancelled += 1;
+                    }
                 },
                 RuntimeEventKind::SendRejected { reason, .. } => match reason {
                     SendRejectedReason::Full => summary.send_rejected_full += 1,
@@ -97,6 +103,7 @@ impl PressureSummary {
             || self.completion_rejected_requester_closed > 0
             || self.completion_rejected_resource_closed > 0
             || self.reply_rejected_no_pending_call > 0
+            || self.reply_rejected_caller_cancelled > 0
             || self.reply_rejected_reply_path_full > 0
             || self.reply_rejected_requester_shard_closed > 0
             || self.send_rejected_full > 0
@@ -117,12 +124,13 @@ impl fmt::Display for PressureSummary {
         write!(
             formatter,
             "completion[mbox_full={} requester_closed={} resource_closed={}] \
-             reply[no_pending={} path_full={} shard_closed={}] \
+             reply[no_pending={} cancelled={} path_full={} shard_closed={}] \
              send[full={} closed={}]",
             self.completion_rejected_mailbox_full,
             self.completion_rejected_requester_closed,
             self.completion_rejected_resource_closed,
             self.reply_rejected_no_pending_call,
+            self.reply_rejected_caller_cancelled,
             self.reply_rejected_reply_path_full,
             self.reply_rejected_requester_shard_closed,
             self.send_rejected_full,

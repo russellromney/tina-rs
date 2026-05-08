@@ -592,7 +592,11 @@ fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_mail
 }
 
 #[test]
-fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_stops() {
+fn downstream_consumer_sees_call_cancelled_owner_stopped_when_requester_stops() {
+    // Rock 5: stopping a requester with a pending call now emits
+    // `CallCancelled { OwnerStopped }`. The worker's later reply is
+    // rejected as `CallReplyRejected { NoPendingCall }` because the
+    // pending entry was already cleaned up.
     let outcomes = Rc::new(RefCell::new(Vec::new()));
     let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
     let target = runtime.register_with_capacity(ReplyWorker, 8);
@@ -609,14 +613,20 @@ fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_stop
     drive(&mut runtime);
 
     assert!(outcomes.borrow().is_empty());
-    assert_eq!(
-        count_call_completion_rejected(
-            runtime.trace(),
-            CallKind::IsolateCall,
-            CallCompletionRejectedReason::RequesterClosed,
-        ),
-        1
-    );
+    let owner_stopped_cancels = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCancelled {
+                    cause: tina::CancelCause::OwnerStopped,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(owner_stopped_cancels, 1);
 }
 
 #[derive(Debug, Clone)]

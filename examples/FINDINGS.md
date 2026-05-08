@@ -104,25 +104,24 @@ why some are layered is confusing.
   punt until a non-pedagogical user actually mixes the two and
   flinches.
 
-### 8. External cancellation API
+### 8. External cancellation API — first form shipped
 
 **Surfaced by:** `eiffel_cancellation_chain`.
 
-There is no public `runtime.cancel(addr)` and no public
-`IsolateCall::abort()`. The only way to "externally cancel" mid-
-flight work today is to send a domain `Stop` message to the
-requester isolate, which causes it to stop itself. Stopping the
-requester closes its pending IsolateCalls and any worker reply
-that arrives later is rejected as `CallReplyRejected
-{ RequesterClosed }`. That works, but every isolate that wants to
-be externally cancellable has to add its own `Stop` (or
-equivalent) variant.
+**Resolved (Tina cancellation phase):** Tina now ships
+`call_with_handle(addr, msg, t).reply(...)` returning a caller-owned
+`CallHandle`, plus `cancel_call(handle).reply(...)` that closes one
+pending isolate call's wait. The handle is move-only and not `Clone`.
+Cancellation is visible truth: `CancelOutcome` (`Cancelled` /
+`AlreadyCompleted` / `AlreadyCancelled` / `NotDispatched` /
+`WrongRequester` / `CrossShardUnsupported`) is `#[must_use]`, and
+late callee replies surface as `CallReplyRejected { CallerCancelled }`
+or `DeferredReplyRejected { CallerCancelled }` events.
 
-**Build:** a runtime-level `runtime.cancel(addr) -> CancelOutcome`
-that closes pending IsolateCalls owned by `addr` without
-requiring user-defined cancellation messages. Or a typed
-`IsolateCall::abort(handle)` that the requester can stash and use
-to drop a single in-flight call without stopping itself.
+**Still open:** runtime-level `runtime.cancel_isolate(addr)` (third
+form — closes every call an isolate owns) is a small wrapper around
+`cancel_call`; deferred until the bounded `PendingCallSet` lands in
+phase 067.
 
 ### 9. Drain helper for `PendingReplies` at service stop
 
