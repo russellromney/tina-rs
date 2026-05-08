@@ -770,11 +770,19 @@ where
     /// Generation matches plain
     /// [`register_with_capacity`](Self::register_with_capacity) (initial 0).
     ///
-    /// Honesty: no message delivers before `construct` returns; the closure
-    /// has no runtime handle, so an address can only escape through user-
-    /// captured shared state. Constructor panic leaks the allocated id (never
-    /// reused) and pushes no entry; a try_send to a leaked address then
-    /// panics like any send to an unknown id.
+    /// Honesty:
+    /// - No message delivers before `construct` returns. The entry lands in
+    ///   the registry only after the closure produces the isolate value.
+    /// - The closure has no runtime handle, so an address can only escape
+    ///   through user-captured shared state.
+    /// - Constructor panic *or* mailbox-create panic leaves the allocated id
+    ///   with no entry. The id is never reused (allocator is monotonic). A
+    ///   `try_send` to a leaked address panics like any send to an unknown
+    ///   id.
+    /// - Constructor runs synchronously in the registration call. Heavy work
+    ///   in `construct` blocks the caller (and on `ThreadedRuntime` blocks
+    ///   the worker thread, starving every other isolate on that shard).
+    ///   Build the isolate value before calling.
     #[allow(private_bounds)]
     pub fn register_with_capacity_using<I, Outbound, Ctor>(
         &mut self,

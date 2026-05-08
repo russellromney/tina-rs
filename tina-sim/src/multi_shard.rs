@@ -213,6 +213,12 @@ where
     /// Translates inbound `M` to outbound `T` via the user-provided
     /// `From<M> for T` and forwards to `target`. Returns the bridge
     /// `Address<M>` callers send to.
+    ///
+    /// Mirrors `MultiShardRuntime::register_reply_adapter_on` and
+    /// `ThreadedMultiShardRuntime::register_reply_adapter_on` (in
+    /// `tina-runtime`). Bound lists are matched to each runtime's
+    /// lower-level `register_with_capacity_on`. Mirror changes
+    /// across all three.
     #[allow(private_bounds)]
     pub fn register_reply_adapter_on<M, T>(
         &mut self,

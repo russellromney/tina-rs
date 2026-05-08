@@ -196,13 +196,21 @@ where
     ///
     /// Equivalent to
     /// `register_with_capacity_on::<ReplyAdapter<M, T, S>, T>(shard, ReplyAdapter::new(target), capacity)`
-    /// but does not require restating the adapter's full type. No
-    /// hidden state beyond the adapter's bounded mailbox; no target
-    /// clone or refresh; no scatter/gather policy folded in.
+    /// but does not require restating the adapter's full type. The
+    /// adapter has the same per-isolate state any registered isolate
+    /// has (one entry, one bounded mailbox, one handler); no extra
+    /// queue, no target clone, no scatter/gather policy.
     ///
     /// Caller picks `shard`. Co-locating with the coordinator keeps
     /// reply translation local; pinning on the target's shard moves
     /// it off the caller's hot path. The helper does not pick.
+    ///
+    /// Mirrors
+    /// [`crate::ThreadedMultiShardRuntime::register_reply_adapter_on`]
+    /// (threaded) and `MultiShardSimulator::register_reply_adapter_on`
+    /// (in `tina-sim`). Bound lists are matched to each runtime's
+    /// lower-level `register_with_capacity_on`; mirror changes across
+    /// all three.
     #[allow(private_bounds)]
     pub fn register_reply_adapter_on<M, T>(
         &mut self,

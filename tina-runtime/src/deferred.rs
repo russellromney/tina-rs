@@ -405,25 +405,71 @@ where
     /// slot, each carrying the same `value`.
     ///
     /// Use when the same terminal marker (e.g. `R::Closed`) goes to
-    /// every pending caller. The slot ordering follows the internal
-    /// table, first-allocated first.
+    /// every pending caller. Slots are visited in internal-table
+    /// order, which matches admission order only when the table has
+    /// not been swept and reused; after a sweep, freed positions are
+    /// reused before later still-open positions.
+    ///
+    /// Closed slots (caller went away before reply) are drained too;
+    /// `reply_to` against a Closed slot lands as
+    /// `CallReplyRejected { RequesterClosed }` in the trace. The
+    /// helper does not pre-sweep — it preserves
+    /// [`drain`](Self::drain)'s semantics.
     ///
     /// Compile-time typed: a `PendingReplies<K, R>` only produces
     /// `Effect<I>` when `I::Reply = R`. The caller picks `I` via
     /// turbofish (`pending.drain_replies::<Self>(R::Closed)`).
     ///
     /// No hidden `stop`. Pair with `stop()` or use
-    /// [`drain_into_stop`](Self::drain_into_stop).
+    /// [`drain_replies_into_stop`](Self::drain_replies_into_stop).
+    ///
+    /// Allocates one fresh `Vec<Effect<I>>` of length live-count and
+    /// performs `live - 1` clones of `value` (the last slot consumes
+    /// `value` directly).
+    ///
+    /// ```compile_fail
+    /// # use tina_runtime::PendingReplies;
+    /// # use tina::{Effect, Isolate, Outbound, SingleShard, Context, noop};
+    /// # struct A; struct B;
+    /// # impl Isolate for A {
+    /// #     type Message=(); type Reply=u32;
+    /// #     type Send=Outbound<std::convert::Infallible>;
+    /// #     type Spawn=std::convert::Infallible;
+    /// #     type Call=std::convert::Infallible;
+    /// #     type Shard=SingleShard;
+    /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
+    /// # }
+    /// # impl Isolate for B {
+    /// #     type Message=(); type Reply=u64;  // !! u64 not u32
+    /// #     type Send=Outbound<std::convert::Infallible>;
+    /// #     type Spawn=std::convert::Infallible;
+    /// #     type Call=std::convert::Infallible;
+    /// #     type Shard=SingleShard;
+    /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
+    /// # }
+    /// // Mismatch: PendingReplies<_, u32> cannot produce Effect<B> (B::Reply = u64).
+    /// fn _no(b: &mut PendingReplies<u32, u32>) -> Vec<Effect<B>> {
+    ///     b.drain_replies(0)
+    /// }
+    /// ```
     pub fn drain_replies<I>(&mut self, value: R) -> Vec<Effect<I>>
     where
         I: Isolate<Reply = R>,
         R: Clone,
     {
-        let mut out = Vec::new();
+        let live = self.len();
+        let mut out = Vec::with_capacity(live);
+        let mut taken: Option<DeferredReply<R>> = None;
         for slot in self.slots.iter_mut() {
             if let Some(entry) = slot.take() {
-                out.push(reply_to::<I>(entry.reply, value.clone()));
+                if let Some(prev) = taken.take() {
+                    out.push(reply_to::<I>(prev, value.clone()));
+                }
+                taken = Some(entry.reply);
             }
+        }
+        if let Some(last) = taken {
+            out.push(reply_to::<I>(last, value));
         }
         out
     }
@@ -431,13 +477,15 @@ where
     /// Drain every live slot, computing the reply value per key.
     ///
     /// Use when the per-caller reply depends on the key, or when `R`
-    /// is not `Clone`.
+    /// is not `Clone`. Allocates one fresh `Vec<Effect<I>>` of length
+    /// live-count.
     pub fn drain_replies_with<I, F>(&mut self, mut f: F) -> Vec<Effect<I>>
     where
         I: Isolate<Reply = R>,
         F: FnMut(K) -> R,
     {
-        let mut out = Vec::new();
+        let live = self.len();
+        let mut out = Vec::with_capacity(live);
         for slot in self.slots.iter_mut() {
             if let Some(entry) = slot.take() {
                 out.push(reply_to::<I>(entry.reply, f(entry.key)));
@@ -446,12 +494,10 @@ where
         out
     }
 
-    /// Same as [`drain_replies`](Self::drain_replies), wrapped in
-    /// [`Effect::Batch`].
-    ///
-    /// Returns [`Effect::Noop`] when the box was empty so the caller
-    /// can return the effect unconditionally.
-    pub fn drain_into_effect<I>(&mut self, value: R) -> Effect<I>
+    /// [`drain_replies`](Self::drain_replies) wrapped in
+    /// [`Effect::Batch`]. Returns [`Effect::Noop`] when the box is
+    /// empty.
+    pub fn drain_replies_into_effect<I>(&mut self, value: R) -> Effect<I>
     where
         I: Isolate<Reply = R>,
         R: Clone,
@@ -464,26 +510,28 @@ where
         }
     }
 
-    /// Drain into [`Effect::Batch`] with a trailing [`stop()`].
+    /// [`drain_replies`](Self::drain_replies) plus a trailing
+    /// [`stop()`]. The method name says `stop` on purpose — nothing
+    /// else in this module appends `stop()` for you.
     ///
-    /// The method name says `stop` on purpose: nothing else in this
-    /// module appends `stop()` for you.
-    ///
-    /// Empty box still produces a batch with a single `stop()` so the
-    /// service stops as advertised.
-    pub fn drain_into_stop<I>(&mut self, value: R) -> Effect<I>
+    /// Empty box returns plain [`Effect::Stop`] (not a one-element
+    /// batch). The caller still stops as advertised.
+    pub fn drain_replies_into_stop<I>(&mut self, value: R) -> Effect<I>
     where
         I: Isolate<Reply = R>,
         R: Clone,
     {
         let mut effects = self.drain_replies::<I>(value);
+        if effects.is_empty() {
+            return stop::<I>();
+        }
         effects.push(stop::<I>());
         Effect::Batch(effects)
     }
 
     /// [`drain_replies_with`](Self::drain_replies_with) wrapped in
-    /// [`Effect::Batch`]. Empty box produces [`Effect::Noop`].
-    pub fn drain_with_into_effect<I, F>(&mut self, f: F) -> Effect<I>
+    /// [`Effect::Batch`]. Empty box returns [`Effect::Noop`].
+    pub fn drain_replies_with_into_effect<I, F>(&mut self, f: F) -> Effect<I>
     where
         I: Isolate<Reply = R>,
         F: FnMut(K) -> R,
@@ -496,15 +544,17 @@ where
         }
     }
 
-    /// [`drain_replies_with`](Self::drain_replies_with) wrapped in
-    /// [`Effect::Batch`] with a trailing [`stop()`]. Empty box still
-    /// stops.
-    pub fn drain_with_into_stop<I, F>(&mut self, f: F) -> Effect<I>
+    /// [`drain_replies_with`](Self::drain_replies_with) plus a
+    /// trailing [`stop()`]. Empty box returns plain [`Effect::Stop`].
+    pub fn drain_replies_with_into_stop<I, F>(&mut self, f: F) -> Effect<I>
     where
         I: Isolate<Reply = R>,
         F: FnMut(K) -> R,
     {
         let mut effects = self.drain_replies_with::<I, F>(f);
+        if effects.is_empty() {
+            return stop::<I>();
+        }
         effects.push(stop::<I>());
         Effect::Batch(effects)
     }
@@ -672,18 +722,18 @@ mod pending_replies_tests {
     }
 
     #[test]
-    fn drain_into_effect_empty_is_noop() {
+    fn drain_replies_into_effect_empty_is_noop() {
         let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
-        let effect: tina::Effect<TestIso> = box_.drain_into_effect(7);
+        let effect: tina::Effect<TestIso> = box_.drain_replies_into_effect(7);
         assert!(matches!(effect, tina::Effect::Noop));
     }
 
     #[test]
-    fn drain_into_effect_nonempty_is_batch_of_replies() {
+    fn drain_replies_into_effect_nonempty_is_batch_of_replies() {
         let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
         box_.try_insert(1, fake_slot(10)).unwrap();
         box_.try_insert(2, fake_slot(11)).unwrap();
-        let effect: tina::Effect<TestIso> = box_.drain_into_effect(0);
+        let effect: tina::Effect<TestIso> = box_.drain_replies_into_effect(0);
         match effect {
             tina::Effect::Batch(items) => {
                 assert_eq!(items.len(), 2);
@@ -696,11 +746,11 @@ mod pending_replies_tests {
     }
 
     #[test]
-    fn drain_into_stop_appends_stop_after_replies() {
+    fn drain_replies_into_stop_appends_stop_after_replies() {
         let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
         box_.try_insert(1, fake_slot(10)).unwrap();
         box_.try_insert(2, fake_slot(11)).unwrap();
-        let effect: tina::Effect<TestIso> = box_.drain_into_stop(0);
+        let effect: tina::Effect<TestIso> = box_.drain_replies_into_stop(0);
         match effect {
             tina::Effect::Batch(items) => {
                 assert_eq!(items.len(), 3);
@@ -713,24 +763,52 @@ mod pending_replies_tests {
     }
 
     #[test]
-    fn drain_into_stop_empty_box_still_stops() {
+    fn drain_replies_into_stop_empty_box_returns_plain_stop() {
         let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
-        let effect: tina::Effect<TestIso> = box_.drain_into_stop(0);
+        let effect: tina::Effect<TestIso> = box_.drain_replies_into_stop(0);
+        // No callers => no Batch wrapper. Plain Stop.
+        assert!(
+            matches!(effect, tina::Effect::Stop),
+            "expected plain Stop, got {effect:?}"
+        );
+    }
+
+    #[test]
+    fn drain_replies_with_into_effect_empty_is_noop() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let effect: tina::Effect<TestIso> = box_.drain_replies_with_into_effect(|k| k);
+        assert!(matches!(effect, tina::Effect::Noop));
+    }
+
+    #[test]
+    fn drain_replies_with_into_effect_nonempty_is_batch_of_per_key_replies() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        box_.try_insert(2, fake_slot(20)).unwrap();
+        box_.try_insert(3, fake_slot(30)).unwrap();
+        let effect: tina::Effect<TestIso> = box_.drain_replies_with_into_effect(|k| k * 10);
         match effect {
             tina::Effect::Batch(items) => {
-                assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], tina::Effect::Stop));
+                assert_eq!(items.len(), 2);
+                let values: std::collections::HashSet<u32> = items
+                    .iter()
+                    .filter_map(|e| match e {
+                        tina::Effect::ReplyTo(_, v) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(values.contains(&20));
+                assert!(values.contains(&30));
             }
-            other => panic!("expected Batch with stop, got {other:?}"),
+            other => panic!("expected Batch, got {other:?}"),
         }
     }
 
     #[test]
-    fn drain_with_into_stop_uses_per_key_value_then_stops() {
+    fn drain_replies_with_into_stop_uses_per_key_value_then_stops() {
         let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
         box_.try_insert(5, fake_slot(50)).unwrap();
         box_.try_insert(6, fake_slot(60)).unwrap();
-        let effect: tina::Effect<TestIso> = box_.drain_with_into_stop(|k| k + 1);
+        let effect: tina::Effect<TestIso> = box_.drain_replies_with_into_stop(|k| k + 1);
         match effect {
             tina::Effect::Batch(items) => {
                 assert_eq!(items.len(), 3);
@@ -746,5 +824,39 @@ mod pending_replies_tests {
             }
             other => panic!("expected Batch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn drain_replies_with_into_stop_empty_box_returns_plain_stop() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let effect: tina::Effect<TestIso> = box_.drain_replies_with_into_stop(|k| k);
+        assert!(
+            matches!(effect, tina::Effect::Stop),
+            "expected plain Stop, got {effect:?}"
+        );
+    }
+
+    #[test]
+    fn drain_replies_drains_closed_slots_too() {
+        // drain_replies preserves drain()'s contract: Closed slots
+        // present at drain time get a ReplyTo too. The runtime
+        // records the resulting CallReplyRejected { RequesterClosed }
+        // when reply_to runs.
+        //
+        // Insert order matters: try_insert sweeps Closed slots before
+        // admitting. Inserting the Closed slot last means no later
+        // admission triggers a sweep against it.
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(4);
+        box_.try_insert(1, fake_slot(10)).unwrap();
+        box_.try_insert(2, fake_slot(20)).unwrap();
+        box_.try_insert(3, fake_slot_closed(30)).unwrap();
+
+        let effects: Vec<tina::Effect<TestIso>> = box_.drain_replies(0);
+        assert_eq!(
+            effects.len(),
+            3,
+            "closed slot present at drain time must still produce a ReplyTo"
+        );
+        assert!(box_.is_empty());
     }
 }

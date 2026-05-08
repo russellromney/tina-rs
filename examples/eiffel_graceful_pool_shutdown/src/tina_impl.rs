@@ -97,10 +97,10 @@ impl Frontend {
             }
             FrontendMsg::Shutdown => {
                 // Drain every pending caller as Closed, then stop.
-                // `drain_into_stop` is the typed helper for this exact
-                // shape; the method name says stop on purpose so the
-                // shutdown is not hidden by the helper.
-                self.pending.drain_into_stop::<Self>(FrontendReply::Closed)
+                // The method name says stop on purpose; nothing else
+                // in the helper appends stop() for you.
+                self.pending
+                    .drain_replies_into_stop::<Self>(FrontendReply::Closed)
             }
         }
     }

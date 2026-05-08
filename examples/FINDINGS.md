@@ -156,13 +156,14 @@ flag is the bridge-side version of the same idea.
   one call, with the trailing `stop()` opt-in via a sibling
   `drain_into_stop_effect(R::Closed)`.~~ Shipped:
   `PendingReplies::drain_replies` / `drain_replies_with` /
-  `drain_into_effect` / `drain_into_stop` /
-  `drain_with_into_effect` / `drain_with_into_stop`, all typed
-  so a `PendingReplies<K, R>` only produces `Effect<I>` when
+  `drain_replies_into_effect` / `drain_replies_into_stop` /
+  `drain_replies_with_into_effect` /
+  `drain_replies_with_into_stop`, all typed so a
+  `PendingReplies<K, R>` only produces `Effect<I>` when
   `I::Reply = R`. `eiffel_graceful_pool_shutdown` uses
-  `pending.drain_into_stop::<Self>(R::Closed)`. The deadline
-  half of this finding (DrainGate) folds into finding 15
-  (Deadline as first-class context).
+  `pending.drain_replies_into_stop::<Self>(R::Closed)`. The
+  deadline half of this finding (DrainGate) folds into
+  finding 15 (Deadline as first-class context).
 - An isolate-state `DrainGate` helper that holds the deadline +
   the pending-count predicate, with an `is_done` /
   `drained_within_timeout` accessor that the handler reuses.

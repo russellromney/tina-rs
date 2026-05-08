@@ -15,11 +15,11 @@ cargo test --manifest-path examples/eiffel_graceful_pool_shutdown/Cargo.toml
 `Frontend` holds `PendingReplies::with_capacity(MAX_PENDING)`. On
 `Shutdown` it drains the box and replies `Closed` to every
 pending caller in one `Effect::Batch` plus a trailing `stop()`,
-expressed with the typed `drain_into_stop` helper:
+expressed with the typed `drain_replies_into_stop` helper:
 
 ```rust
 FrontendMsg::Shutdown => {
-    self.pending.drain_into_stop::<Self>(FrontendReply::Closed)
+    self.pending.drain_replies_into_stop::<Self>(FrontendReply::Closed)
 }
 ```
 
@@ -27,13 +27,15 @@ The helper is compile-time typed so a `PendingReplies<K, R>`
 only produces `Effect<I>` when `I::Reply = R`. The method name
 says `stop` on purpose — nothing else in the helper appends
 `stop()` for you, and the underlying `pending.drain()` /
-`reply_to(slot, ...)` semantics are unchanged.
+`reply_to(slot, ...)` semantics are unchanged. Empty box returns
+plain `Effect::Stop` (no Batch wrapper).
 
 ## What feels good
 
-- `drain_into_stop::<Self>(R::Closed)` is the one-liner for the
-  common service-stop pattern. The slot ordering follows the
-  internal slot table (first-allocated first).
+- `drain_replies_into_stop::<Self>(R::Closed)` is the one-liner
+  for the common service-stop pattern. Slots are visited in
+  internal-table order, which matches admission order only when
+  the table has not been swept and reused.
 - The terminal reply is still a regular `reply_to(slot, ...)`
   under the hood — no special path. Use the longer-form
   `pending.drain()` + manual loop when the per-caller reply
