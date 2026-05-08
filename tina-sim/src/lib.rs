@@ -47,6 +47,7 @@ use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tina::{
@@ -132,6 +133,9 @@ where
     last_checker_failure: Option<CheckerFailure>,
     deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
     promoted_slots: deferred::PromotedSlots,
+    /// Live trace observer. Fires before in-memory push so DST replay
+    /// sees the same stream a live operator does.
+    trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
 }
 
 impl<S> Simulator<S>
@@ -186,12 +190,23 @@ where
             last_checker_failure: None,
             deferred_registry: std::rc::Rc::new(DeferredSlotRegistry::new()),
             promoted_slots: deferred::PromotedSlots::default(),
+            trace_observer: None,
         }
     }
 
     /// Returns the immutable simulator config for this run.
     pub fn config(&self) -> &SimulatorConfig {
         &self.config
+    }
+
+    /// Sets the live trace observer. `None` detaches. Set before the
+    /// first `step()`. Same contract as the runtime's; see
+    /// [`tina_runtime::TraceObserver`].
+    pub fn set_trace_observer(
+        &mut self,
+        observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
+    ) {
+        self.trace_observer = observer;
     }
 
     /// Returns the current virtual monotonic time.
@@ -4582,8 +4597,12 @@ where
         kind: RuntimeEventKind,
     ) -> tina_runtime::EventId {
         let id = self.ids.next_event_id();
-        self.trace
-            .push(RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind));
+        let event = RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind);
+        // Observer first. Panic kills the sim thread by design.
+        if let Some(obs) = &self.trace_observer {
+            obs.on_event(&event);
+        }
+        self.trace.push(event);
         id
     }
 

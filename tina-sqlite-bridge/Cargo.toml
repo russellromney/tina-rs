@@ -14,6 +14,14 @@ path = "src/lib.rs"
 tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Optional tracing scaffolding. No spans/events are emitted yet; the
+# feature surface is here so we can align vocabulary across bridges
+# in one pass instead of inventing per-crate field names.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
+
+[features]
+default = []
+tracing = ["dep:tracing"]
 
 [dev-dependencies]
 tempfile = "3"
