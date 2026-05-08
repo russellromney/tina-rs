@@ -13,9 +13,10 @@
   cross-version on-the-wire trace formats, span hierarchy beyond
   shard+isolate scoping. **Bridge tracing alignment** is scaffolded
   (every bridge — `tina-tokio-bridge`, `tina-tower-bridge`,
-  `tina-reqwest-bridge`, `tina-rpc-tokio` — now ships an optional
-  `tracing` feature with the same shape) but no new spans/events are
-  emitted yet; the next pass picks the shared field vocabulary.
+  `tina-reqwest-bridge`, `tina-rpc-tokio`, `tina-sqlite-bridge` —
+  now ships an optional `tracing` feature with the same shape) but
+  no new spans/events are emitted yet; the next pass picks the shared
+  field vocabulary.
 
 ## Goal
 

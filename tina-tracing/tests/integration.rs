@@ -140,7 +140,7 @@ fn evt(id: u64, cause: Option<u64>, kind: RuntimeEventKind) -> RuntimeEvent {
 
 #[test]
 fn handler_lifecycle_emits_expected_levels_and_kinds() {
-    let events = vec![
+    let events = [
         evt(1, None, RuntimeEventKind::MailboxAccepted),
         evt(2, Some(1), RuntimeEventKind::HandlerStarted),
         evt(
@@ -225,7 +225,7 @@ fn supervisor_restart_triggered_records_policy_and_child() {
 
 #[test]
 fn supervisor_restart_rejected_distinguishes_budget_and_stopped() {
-    let events = vec![
+    let events = [
         evt(
             1,
             None,
@@ -263,7 +263,7 @@ fn supervisor_restart_rejected_distinguishes_budget_and_stopped() {
 
 #[test]
 fn restart_child_lifecycle_carries_ordinal_and_generations() {
-    let events = vec![
+    let events = [
         evt(
             1,
             None,
@@ -315,7 +315,7 @@ fn restart_child_lifecycle_carries_ordinal_and_generations() {
 
 #[test]
 fn send_rejected_full_and_closed_keep_distinct_reasons() {
-    let events = vec![
+    let events = [
         evt(
             1,
             None,
@@ -442,7 +442,7 @@ fn deferred_reply_rejected_preserves_each_reason() {
 
 #[test]
 fn deferred_reply_capture_send_drop_keep_correlation() {
-    let events = vec![
+    let events = [
         evt(
             1,
             None,

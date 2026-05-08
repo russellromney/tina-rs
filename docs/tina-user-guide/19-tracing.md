@@ -155,9 +155,9 @@ emit_snapshot(&topology);
 
 ## Bridges
 
-`tina-rpc-tokio`, `tina-tokio-bridge`, `tina-tower-bridge`, and
-`tina-reqwest-bridge` each ship an optional `tracing` Cargo feature
-with the same shape:
+`tina-rpc-tokio`, `tina-tokio-bridge`, `tina-tower-bridge`,
+`tina-reqwest-bridge`, and `tina-sqlite-bridge` each ship an
+optional `tracing` Cargo feature with the same shape:
 
 ```toml
 [dependencies]
@@ -165,9 +165,9 @@ tina-rpc-tokio = { version = "...", features = ["tracing"] }
 ```
 
 `tina-rpc-tokio` emits bridge spans (`tina_rpc.bridge.call` with
-`service`, `method`, `correlator`, `result_kind`). The other three
+`service`, `method`, `correlator`, `result_kind`). The other four
 scaffold the feature without emitting yet. A follow-up pass aligns
-the vocabulary across all four — runtime events under
+the vocabulary across all five — runtime events under
 `target = "tina_runtime::trace"`, bridge spans under
 `target = "tina_<bridge>.…"`, sharing `reason` strings where the
 concept matches.
