@@ -47,6 +47,7 @@ use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tina::{
@@ -132,10 +133,9 @@ where
     last_checker_failure: Option<CheckerFailure>,
     deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
     promoted_slots: deferred::PromotedSlots,
-    /// Live trace observer. Same contract as the runtime's; fires
-    /// before the in-memory trace push so DST replay sees the same
-    /// stream a live operator would see.
-    trace_observer: Option<std::sync::Arc<dyn tina_runtime::TraceObserver>>,
+    /// Live trace observer. Fires before in-memory push so DST replay
+    /// sees the same stream a live operator does.
+    trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
 }
 
 impl<S> Simulator<S>
@@ -199,14 +199,12 @@ where
         &self.config
     }
 
-    /// Installs or removes a live trace observer.
-    ///
-    /// Same contract as the runtime: fires once per event in
-    /// recording order, panics kill the simulator thread. Useful for
-    /// DST adapters that want to compare live and replay event streams.
+    /// Sets the live trace observer. `None` detaches. Set before the
+    /// first `step()`. Same contract as the runtime's; see
+    /// [`tina_runtime::TraceObserver`].
     pub fn set_trace_observer(
         &mut self,
-        observer: Option<std::sync::Arc<dyn tina_runtime::TraceObserver>>,
+        observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
     ) {
         self.trace_observer = observer;
     }
@@ -4600,9 +4598,7 @@ where
     ) -> tina_runtime::EventId {
         let id = self.ids.next_event_id();
         let event = RuntimeEvent::new(id, cause, self.shard.id(), isolate, kind);
-        // Observer first; sim has no retention knob today, so the
-        // in-memory trace push always follows. Panicking observer
-        // kills the sim thread by design.
+        // Observer first. Panic kills the sim thread by design.
         if let Some(obs) = &self.trace_observer {
             obs.on_event(&event);
         }

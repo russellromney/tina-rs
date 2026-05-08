@@ -154,8 +154,8 @@ where
     }
 
     /// Starts one worker with a live trace observer wired before the
-    /// first event. The observer is kept out of [`ThreadedRuntimeConfig`]
-    /// on purpose: that config stays pure data.
+    /// first event. Observer stays out of [`ThreadedRuntimeConfig`] —
+    /// config is pure data.
     pub fn with_config_and_trace_observer(
         shard: S,
         mailbox_factory: F,
@@ -194,11 +194,9 @@ where
         )
     }
 
-    /// Internal entry: same as [`Self::with_config_and_io_loop_factory`]
-    /// plus an optional trace observer. The public API exposes the
-    /// observer through the dedicated `with_config_and_trace_observer`
-    /// constructor.
-    fn with_config_observer_and_io_loop_factory<G>(
+    /// [`Self::with_config_and_io_loop_factory`] plus a trace observer.
+    /// Reach for this when both seams matter.
+    pub fn with_config_observer_and_io_loop_factory<G>(
         shard: S,
         mailbox_factory: F,
         config: ThreadedRuntimeConfig,

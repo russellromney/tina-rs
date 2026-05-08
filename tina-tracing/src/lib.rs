@@ -2,17 +2,8 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-//! Adapter from `tina-runtime` trace events and live reports to
-//! [`tracing`] events.
-//!
-//! Tina already records the right facts: every [`RuntimeEvent`] carries
-//! shard, isolate, generation, call id, kind, and a *typed* reason.
-//! `LiveTopologyReport` carries per-shard state and per-queue
-//! accepted/full/closed counts. This crate is the boring shim that turns
-//! those typed values into structured `tracing` events without flattening
-//! them.
-//!
-//! [`RuntimeEvent`]: tina_runtime::RuntimeEvent
+//! Adapter from [`tina_runtime`] trace events and live reports to
+//! [`tracing`] events. Boring shim. No flattening.
 //!
 //! # Rule
 //!
@@ -21,50 +12,68 @@
 //! ergonomics may not flatten truth.
 //! ```
 //!
-//! - Every typed reason — `Full`, `Closed`, `Timeout`, `CallerClosed`,
+//! - Every typed reason (`Full`, `Closed`, `Timeout`, `CallerClosed`,
 //!   `ResourceClosed`, `ReplyPathFull`, `RequesterShardClosed`,
 //!   `MailboxFull`, `RequesterClosed`, `NoPendingCall`, `TypeMismatch`,
-//!   `BudgetExceeded`, `SupervisorStopped`, `NotRestartable` — is emitted
-//!   as a stable string in the `reason` field. They are never collapsed
-//!   into a generic `error`.
+//!   `BudgetExceeded`, `SupervisorStopped`, `NotRestartable`) is a
+//!   stable string in `reason`. Never collapsed into a generic `error`.
 //! - `event_id`, `cause_id`, `call_id`, `slot_id`, `isolate`,
-//!   `generation`, `child_isolate`, `record_index` are **correlation**
-//!   fields. They are unbounded cardinality. **Do not** turn them into
-//!   metric labels in your subscriber.
+//!   `generation`, `child_isolate`, `record_index` are correlation
+//!   fields. Unbounded cardinality. **Do not** use them as metric
+//!   labels.
 //!
 //! # Levels
 //!
-//! - `TRACE` for normal lifecycle and dispatch (mailbox accept, handler
-//!   start/finish, send accept, call dispatch, call complete, deferred
-//!   reply capture/send/drop, journal append).
-//! - `DEBUG` for benign lifecycle (`IsolateStopped`,
+//! - `TRACE`: lifecycle and dispatch (mailbox accept, handler
+//!   start/finish, sends, call dispatch/complete, deferred slots,
+//!   journal append).
+//! - `DEBUG`: benign lifecycle (`IsolateStopped`,
 //!   `RestartChildSkipped`, `SupervisorRestartTriggered`).
-//! - `WARN` for visible rejections (`SendRejected`,
-//!   `CallCompletionRejected`, `CallReplyRejected`,
-//!   `DeferredReplyRejected`, `SupervisorRestartRejected`,
-//!   `JournalAppendFailed`, `SnapshotCommitFailed`). `Closed` is benign
-//!   lifecycle truth, not an error; it stays at `WARN` so the *operator*
-//!   decides what to alert on.
-//! - `ERROR` for `HandlerPanicked`, `RecoveryFailed`, `CallFailed`.
+//! - `WARN`: visible rejections. `Closed` is lifecycle truth, not an
+//!   error; the operator decides what to alert on.
+//! - `ERROR`: `HandlerPanicked`, `RecoveryFailed`, `CallFailed`.
 //!
 //! # Side effects
 //!
-//! No function in this crate installs a global subscriber unless its
-//! name explicitly says `install_global_*`. The only such function is
-//! [`install_global_default_subscriber`], gated behind the `subscriber`
-//! Cargo feature.
+//! No function installs a global subscriber unless the name says
+//! `install_global_*`. Only [`install_global_default_subscriber`]
+//! does, behind the `subscriber` feature.
 //!
 //! # Layout
 //!
-//! - [`events`] — per-`RuntimeEvent` emission.
-//! - [`live`] — per-`LiveTopologyReport` snapshot emission.
+//! - [`events`] — per-event emission.
+//! - [`live`] — per-snapshot emission.
 //!
-//! # Example
+//! # Live wiring (preferred)
+//!
+//! `TracingObserver` is a [`tina_runtime::TraceObserver`]. Wire it at
+//! build time and every event flows into the subscriber as it happens.
+//! See `eiffel_tracing_demo` for a runnable version.
+//!
+//! ```ignore
+//! use std::sync::Arc;
+//! use tina_runtime::{ThreadedRuntime, ThreadedRuntimeConfig};
+//! use tina_tracing::TracingObserver;
+//!
+//! let runtime = ThreadedRuntime::with_config_and_trace_observer(
+//!     shard,
+//!     factory,
+//!     ThreadedRuntimeConfig::default(),
+//!     Arc::new(TracingObserver::new()),
+//! );
+//! ```
+//!
+//! # End-of-run dump
+//!
+//! For tests and tools. Sample fmt-subscriber output for the event below:
+//!
+//! ```text
+//! WARN tina_runtime::trace: kind="send_rejected" event_id=1 cause_id=- shard=0 isolate=7
+//!     target_shard=0 target_isolate=8 target_generation=0 reason="Full"
+//! ```
 //!
 //! ```
-//! use tina_runtime::{
-//!     CauseId, EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-//! };
+//! use tina_runtime::{EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
 //! use tina::{AddressGeneration, IsolateId, ShardId};
 //!
 //! let events = vec![
@@ -81,7 +90,7 @@
 //!         },
 //!     ),
 //! ];
-//! tina_tracing::events::emit_events(events.iter());
+//! tina_tracing::emit_events(events.iter());
 //! ```
 
 pub mod events;
@@ -96,10 +105,8 @@ mod install;
 #[cfg(feature = "subscriber")]
 pub use install::install_global_default_subscriber;
 
-// Re-exports of the stable-name helpers and per-event entry points so
-// callers wiring fields outside the adapter (e.g. correlating bridge
-// spans against runtime trace events) can pick up the same vocabulary
-// without reaching into a submodule path.
+// Stable-name helpers and entry points re-exported at the root so
+// callers don't need to reach through submodule paths.
 pub use events::{
     call_completion_rejected_reason_name, call_error_name, call_kind_name,
     call_reply_rejected_reason_name, deferred_reply_rejected_reason_name, effect_kind_name,
@@ -108,13 +115,8 @@ pub use events::{
 };
 pub use live::{affinity_status_name, emit_snapshot, shard_state_name};
 
-/// Target string used for every Tina-runtime trace event emitted by
-/// this crate.
-///
-/// Subscribers can filter on this target to pick up runtime events
-/// without entangling them with bridge-internal spans.
+/// Target for every runtime trace event this crate emits.
 pub const RUNTIME_TRACE_TARGET: &str = "tina_runtime::trace";
 
-/// Target string used for every Tina live-topology snapshot event
-/// emitted by this crate.
+/// Target for every live-topology snapshot event this crate emits.
 pub const LIVE_TOPOLOGY_TARGET: &str = "tina_runtime::live";

@@ -1,16 +1,9 @@
-//! Tina runtime trace -> tracing fmt subscriber, live.
+//! Live Tina runtime trace -> tracing fmt subscriber.
 //!
-//! Single-shard explicit-step runtime with a [`TracingObserver`]
-//! attached. Every recorded event becomes a structured
-//! `tracing::Event` as it happens — no end-of-run dump needed.
-//!
-//! The caller fans out six zero-duration `sleep` calls into a
-//! one-slot mailbox. The first reply fits; the rest hit
-//! `MailboxFull` until the handler drains. The fmt subscriber
-//! prints lifecycle events at TRACE and capacity rejections at
-//! WARN, in the order the runtime produced them.
-//!
-//! Run with:
+//! Single-shard runtime with a [`TracingObserver`] wired before the
+//! first event. Caller fans six zero-duration `sleep` calls into a
+//! one-slot mailbox. First reply fits; rest hit `MailboxFull` until
+//! the handler drains.
 //!
 //! ```text
 //! cargo run --manifest-path examples/eiffel_tracing_demo/Cargo.toml
@@ -73,8 +66,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
-    // Wire the observer before any event records. From here on every
-    // recorded event becomes a structured tracing::Event.
+    // Observer wired before any event records.
     runtime.set_trace_observer(Some(Arc::new(TracingObserver::new())));
 
     let caller = runtime.register_with_capacity::<Caller, Infallible>(
@@ -82,8 +74,7 @@ fn main() -> anyhow::Result<()> {
             fanout: 6,
             delivered: 0,
         },
-        // One inbound slot. The first sleep reply fits; the next ones
-        // hit `MailboxFull` until the handler drains.
+        // One slot — forces MailboxFull on the late replies.
         1,
     );
     runtime

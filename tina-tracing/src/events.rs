@@ -18,32 +18,24 @@ use tracing::{Level, event};
 
 use crate::RUNTIME_TRACE_TARGET;
 
-/// Field wrapper for the optional cause id.
-///
-/// Renders as the bare number when a cause exists, and as `-` when it
-/// does not. Keeps `cause_id` honest (no zero-as-absent sentinel) while
-/// avoiding the noisier `Some(N)` / `None` Debug shape that `Option`
-/// would produce by default.
-struct CauseField(Option<u64>);
+/// Renders an `Option<T>` as bare `T` (Display) when present, `-` when absent.
+/// No zero-as-absent sentinel, no `Some(...)`/`None` Debug noise.
+pub(crate) struct OptValue<T>(pub Option<T>);
 
-impl fmt::Debug for CauseField {
+impl<T: fmt::Display> fmt::Debug for OptValue<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(id) => write!(formatter, "{id}"),
+        match &self.0 {
+            Some(value) => write!(formatter, "{value}"),
             None => formatter.write_str("-"),
         }
     }
 }
 
-/// Emits one [`tracing::Event`] for `event`.
-///
-/// Field set is described on the crate root. `cause_id` is rendered as
-/// the bare number when present and `-` when absent — never `0`.
-/// Numeric IDs (event/cause/call/slot/isolate) are correlation fields,
-/// not metric labels.
+/// Emits one [`tracing::Event`] for `event`. Field set on the crate root.
+/// IDs (event/cause/call/slot/isolate) are correlation fields, not metric labels.
 pub fn emit_event(event: &RuntimeEvent) {
     let event_id = event.id().get();
-    let cause_id = CauseField(event.cause().map(|c| c.event().get()));
+    let cause_id = OptValue(event.cause().map(|c| c.event().get()));
     let shard = event.shard().get();
     let isolate = event.isolate().get();
 
@@ -480,19 +472,10 @@ where
 
 /// Emits a [`TraceSnapshot`].
 ///
-/// When the snapshot is partial (one or more shards could not report
-/// their tail), one synthetic `WARN`-level event is emitted *before*
-/// the per-event walk:
-///
-/// ```text
-/// kind="trace_snapshot_partial" missing_shards=[0,2]
-/// ```
-///
-/// `trace_snapshot_partial` is a snapshot-level meta-fact, not a
-/// `RuntimeEventKind` — it surfaces the truth that
-/// [`TraceSnapshot::missing_shards`] would otherwise drop on the
-/// floor. Consumers that filter by `kind` should treat it as a signal
-/// that the following events are not the full story.
+/// Partial snapshots emit one warn-level
+/// `kind="trace_snapshot_partial" missing_shards=[…]` marker first,
+/// then the events. The marker is a meta-fact; consumers filtering
+/// by `kind` should treat it as "what follows is incomplete."
 pub fn emit_trace_snapshot(snapshot: &TraceSnapshot) {
     if snapshot.is_partial() {
         emit_partial_marker(snapshot.missing_shards());
@@ -500,13 +483,10 @@ pub fn emit_trace_snapshot(snapshot: &TraceSnapshot) {
     emit_events(snapshot.events().iter());
 }
 
-/// Emits the partial-snapshot marker for `missing_shards` without
-/// walking any events.
+/// Emits the partial-snapshot marker only — no events walked.
 ///
-/// Public so a host that builds its own composite snapshot (e.g. a
-/// local + remote merge) can emit the same warning shape without
-/// going through [`TraceSnapshot`]. Named honestly: this is the
-/// marker only.
+/// For hosts that build composite snapshots and want the same warning
+/// shape without going through [`TraceSnapshot`].
 pub fn emit_partial_marker(missing_shards: &[tina::ShardId]) {
     let ids: Vec<u32> = missing_shards.iter().map(|s| s.get()).collect();
     event!(
@@ -517,8 +497,8 @@ pub fn emit_partial_marker(missing_shards: &[tina::ShardId]) {
     );
 }
 
-/// Stable string name for an [`EffectKind`]. Exposed so external
-/// observers can construct the same field values when correlating.
+/// Stable name for an [`EffectKind`]. External observers use this to
+/// build matching field values.
 pub fn effect_kind_name(kind: EffectKind) -> &'static str {
     match kind {
         EffectKind::Noop => "noop",

@@ -133,8 +133,7 @@ fn threaded_runtime_observer_fires_on_worker_thread() {
         .register_with_capacity::<Tiny, Infallible>(Tiny, 4)
         .expect("register tiny");
     runtime.try_send(addr, Msg::Begin).expect("kick tiny");
-    let result = runtime.shutdown();
-    let _ = result;
+    let _ = runtime.shutdown();
     let observed = collector.0.lock().unwrap().clone();
     assert!(
         observed

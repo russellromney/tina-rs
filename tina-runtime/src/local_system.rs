@@ -872,10 +872,7 @@ where
     }
 
     /// Wires a live trace observer before the worker records anything.
-    ///
-    /// Single observer. Hook fires synchronously on the shard worker
-    /// thread. Panicking observer kills the worker. See
-    /// [`crate::TraceObserver`].
+    /// One observer. See [`crate::TraceObserver`] for hook rules.
     pub fn trace_observer(mut self, observer: Arc<dyn TraceObserver>) -> Self {
         self.trace_observer = Some(observer);
         self
@@ -1072,11 +1069,9 @@ where
         self
     }
 
-    /// Wires a live trace observer before any shard records anything.
-    ///
-    /// One observer for the whole multi-shard system. The same `Arc`
-    /// is cloned into each shard worker; per-shard order is preserved
-    /// but cross-shard order is whatever the threads produce.
+    /// Wires one live trace observer for every shard before any
+    /// records. Per-shard order preserved; cross-shard order is
+    /// whatever the threads produce.
     pub fn trace_observer(mut self, observer: Arc<dyn TraceObserver>) -> Self {
         self.trace_observer = Some(observer);
         self

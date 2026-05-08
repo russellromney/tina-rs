@@ -612,12 +612,10 @@ where
         self.enforce_trace_retention();
     }
 
-    /// Installs or removes the live trace observer.
-    ///
-    /// `None` detaches. Hook fires synchronously before retention.
-    /// Panicking observer kills the recording thread.
-    /// On `ThreadedRuntime` / `LocalSystem`, set this at build time
-    /// so no events fire before the hook is wired.
+    /// Sets the live trace observer. `None` detaches. See
+    /// [`crate::TraceObserver`] for hook rules. On `ThreadedRuntime` /
+    /// `LocalSystem`, prefer the build-time wiring so no events fire
+    /// before the hook is in place.
     pub fn set_trace_observer(&mut self, observer: Option<Arc<dyn TraceObserver>>) {
         self.trace_observer = observer;
     }

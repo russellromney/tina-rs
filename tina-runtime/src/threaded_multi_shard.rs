@@ -76,14 +76,10 @@ where
         Self::with_config_and_optional_trace_observer(shards, mailbox_factory, config, None)
     }
 
-    /// Same as [`Self::with_config`] but wires a live trace observer
-    /// on every shard before the first event records.
-    ///
-    /// Observer is held outside [`ThreadedRuntimeConfig`] so the
-    /// config stays pure data. The same observer (clone of the same
-    /// `Arc`) runs on each shard worker thread; per-shard event order
-    /// is preserved, but events from different shards interleave
-    /// freely.
+    /// Like [`Self::with_config`] but wires one trace observer on
+    /// every shard before the first event records. Observer stays out
+    /// of [`ThreadedRuntimeConfig`] — config is pure data. Per-shard
+    /// order preserved; events across shards interleave freely.
     pub fn with_config_and_trace_observer<I>(
         shards: I,
         mailbox_factory: F,

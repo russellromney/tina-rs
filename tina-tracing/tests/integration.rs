@@ -679,16 +679,71 @@ fn trace_retention_variants_are_referenced_for_doc_compile() {
 // Live snapshot helper-name mapping (Rock 5, lightweight)
 // ---------------------------------------------------------------------------
 //
-// `LiveTopologyReport` is built only by the runtime; we don't reach
-// for crate-private constructors here. Instead the live emitter is
-// exercised end-to-end from the example, and these unit-level tests
-// pin the stable name mappings.
+// `LiveTopologyReport` constructors are crate-private in tina-runtime,
+// so we build a real one via a running ThreadedRuntime and walk the
+// emitter against it. The stable-name helpers also get unit-level
+// coverage so renaming the runtime enums fails here loudly.
 
 #[test]
 fn shard_state_name_round_trips_each_state() {
     assert_eq!(shard_state_name(LiveShardState::Running), "Running");
     assert_eq!(shard_state_name(LiveShardState::Stopped), "Stopped");
     assert_eq!(shard_state_name(LiveShardState::Failed), "Failed");
+}
+
+#[test]
+fn live_emit_snapshot_walks_a_real_running_topology() {
+    use std::time::Duration;
+    use tina::prelude::*;
+    use tina_runtime::{
+        DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+    };
+
+    let runtime = ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig::default(),
+    );
+    // Give the worker a moment to register its thread id.
+    std::thread::sleep(Duration::from_millis(20));
+    let topology = runtime.topology();
+
+    let captured = with_capture(|cap| {
+        tina_tracing::live::emit_snapshot(&topology);
+        cap.events()
+    });
+    let _ = runtime.shutdown();
+
+    let shard_events: Vec<&CapturedEvent> = captured
+        .iter()
+        .filter(|e| e.kind() == Some("live_shard"))
+        .collect();
+    assert_eq!(shard_events.len(), 1, "single-shard runtime emits one shard event");
+    let e = shard_events[0];
+    assert_eq!(e.target, tina_tracing::LIVE_TOPOLOGY_TARGET);
+    assert_eq!(e.level, Level::INFO);
+    assert_eq!(e.field("state"), Some("Running"));
+    assert_eq!(e.field("shard"), Some("0"));
+    assert!(e.field("ingress_capacity").is_some());
+    // Optional fields render via OptValue: bare value when present, "-" when absent.
+    // configured_core was not set, so it must render as "-", not "None".
+    assert_eq!(e.field("configured_core"), Some("-"));
+    assert_eq!(e.field("observed_core"), Some("-"));
+    // worker_name is set by ThreadedRuntime; render bare without quotes.
+    assert!(
+        e.field("worker_name")
+            .map(|s| !s.starts_with("Some(") && s != "None")
+            .unwrap_or(false),
+        "worker_name renders bare, not as Some(...)/None — got {:?}",
+        e.field("worker_name"),
+    );
+    // Single-shard runtime has no remote queues.
+    assert!(
+        captured
+            .iter()
+            .all(|e| e.kind() != Some("live_remote_queue")),
+        "single-shard runtime has no remote queues",
+    );
 }
 
 // ---------------------------------------------------------------------------

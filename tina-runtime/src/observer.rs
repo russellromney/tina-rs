@@ -1,31 +1,28 @@
 //! Live trace observer hook.
 //!
-//! One callback. Fires once per [`RuntimeEvent`] before retention
-//! trims. Synchronous, on the recording thread. No internal queue.
+//! One callback per [`RuntimeEvent`], synchronous, on the recording
+//! thread, before retention trims. No queue.
 //!
 //! Rules:
-//!
-//! - No handle to the runtime. Reentry is impossible by construction.
-//! - Hot path. Bound your work; clone the event and forward to a
-//!   bounded queue if you need a different thread.
-//! - Panics are not caught. A panicking observer kills the recording
-//!   thread.
+//! - No runtime handle. Reentry impossible by construction.
+//! - Hot path. Bound your work. Clone and forward if you need
+//!   another thread.
+//! - Panics are not caught — they kill the recording thread.
 //! - `TraceRetention::Off` does not silence the observer. Stream-only
-//!   mode is `retention = Off` + observer set.
-//!
-//! Per-shard order only. Global order across shards is not promised;
-//! sort by [`crate::EventId`] if you need it.
+//!   = `Off` + observer.
+//! - Per-shard order only. No global cross-shard order; sort by
+//!   [`crate::EventId`] if you need one.
 
 use std::sync::Arc;
 
 use crate::trace::RuntimeEvent;
 
-/// One synchronous callback per recorded event.
+/// Sync callback fired once per recorded event.
 ///
-/// `Send + Sync + 'static` because shards run on their own threads
-/// and share the observer via `Arc`.
+/// `Send + Sync + 'static` so shards on their own threads can share
+/// it via `Arc`.
 pub trait TraceObserver: Send + Sync + 'static {
-    /// Called once per event, before retention.
+    /// Fires once per event, before retention.
     fn on_event(&self, event: &RuntimeEvent);
 }
 
