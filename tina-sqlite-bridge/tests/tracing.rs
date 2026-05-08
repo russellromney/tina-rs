@@ -66,11 +66,14 @@ impl Subscriber for Capture {
         let metadata = event.metadata();
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
-        self.events.lock().expect("capture lock").push(CapturedEvent {
-            target: metadata.target().to_string(),
-            level: *metadata.level(),
-            fields: visitor.fields,
-        });
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                target: metadata.target().to_string(),
+                level: *metadata.level(),
+                fields: visitor.fields,
+            });
     }
     fn enter(&self, _span: &Id) {}
     fn exit(&self, _span: &Id) {}
@@ -83,19 +86,24 @@ struct FieldVisitor {
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.fields.insert(field.name().to_string(), format!("{value:?}"));
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 }
 
@@ -234,7 +242,12 @@ fn admission_and_replied_emit_with_aligned_vocabulary() {
     let runtime = make_runtime();
     let bridge = install_bridge(&runtime, fresh_db_config());
     let sink = Arc::new(Sink::default());
-    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink), Duration::from_secs(5));
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(5),
+    );
     runtime
         .try_send(
             caller,
@@ -253,9 +266,7 @@ fn admission_and_replied_emit_with_aligned_vocabulary() {
     let new = &capture.events()[baseline..];
     let admitted = new
         .iter()
-        .find(|e| {
-            e.kind() == Some("admitted") && e.field("request_kind") == Some("execute")
-        })
+        .find(|e| e.kind() == Some("admitted") && e.field("request_kind") == Some("execute"))
         .expect("admitted event for execute");
     assert_eq!(admitted.target, "tina_sqlite.bridge.call");
     assert_eq!(admitted.level, Level::DEBUG);
@@ -300,7 +311,12 @@ fn replied_event_carries_request_kind_for_query() {
 
     // Now run a query and assert request_kind=query rides on the replied event.
     let sink = Arc::new(Sink::default());
-    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink), Duration::from_secs(5));
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(5),
+    );
     runtime
         .try_send(
             caller,
@@ -337,12 +353,20 @@ fn admission_rejected_after_close_uses_aligned_reason() {
     bridge.closer.close();
 
     let sink = Arc::new(Sink::default());
-    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink), Duration::from_secs(2));
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
     runtime
         .try_send(caller, CallerMsg::Run(SqliteRequest::execute("SELECT 1")))
         .expect("kick caller");
     let outcome = sink.wait_one(Duration::from_secs(5));
-    assert!(matches!(outcome, CallOutcome::Replied(Err(SqliteError::Closed))));
+    assert!(matches!(
+        outcome,
+        CallOutcome::Replied(Err(SqliteError::Closed))
+    ));
     let _ = runtime.shutdown();
 
     let new = &capture.events()[baseline..];
@@ -371,7 +395,12 @@ fn invalid_request_emits_admission_rejected_with_detail() {
     let runtime = make_runtime();
     let bridge = install_bridge(&runtime, fresh_db_config());
     let sink = Arc::new(Sink::default());
-    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink), Duration::from_secs(2));
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
     runtime
         .try_send(caller, CallerMsg::Run(SqliteRequest::execute("")))
         .expect("kick caller");
@@ -413,7 +442,12 @@ fn timeout_event_carries_request_kind() {
     let bridge = install_bridge(&runtime, cfg);
 
     let sink = Arc::new(Sink::default());
-    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink), Duration::from_secs(5));
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(5),
+    );
     runtime
         .try_send(
             caller,
@@ -430,10 +464,7 @@ fn timeout_event_carries_request_kind() {
     let new = capture.events()[baseline..].to_vec();
     let timeout = new
         .iter()
-        .find(|e| {
-            e.kind() == Some("timeout")
-                && e.field("request_kind") == Some("query")
-        })
+        .find(|e| e.kind() == Some("timeout") && e.field("request_kind") == Some("query"))
         .expect("timeout event carries request_kind=query");
     assert_eq!(timeout.target, "tina_sqlite.bridge.call");
     assert_eq!(timeout.level, Level::WARN);
