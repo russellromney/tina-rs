@@ -2,21 +2,43 @@
 
 ## Status
 
-- Done: `tina-tracing` crate (events + live snapshot + trace-snapshot
-  partial marker + stable-name re-exports + `TracingObserver`),
-  doc page, runnable example. `cause_id` renders as bare number /
-  `-`. `TraceObserver` trait on `tina-runtime` with sync inline hook,
-  builder-time wiring on `ThreadedRuntime` / `ThreadedMultiShardRuntime`
-  / `LocalSystem*Builder`, sim parity, and a noop-observer trace
-  byte-equality test on both runtime and sim.
-- Deferred: OpenTelemetry, Prometheus, exporter policy, metric policy,
-  cross-version on-the-wire trace formats, span hierarchy beyond
-  shard+isolate scoping. **Bridge tracing alignment** is scaffolded
-  (every bridge — `tina-tokio-bridge`, `tina-tower-bridge`,
-  `tina-reqwest-bridge`, `tina-rpc-tokio`, `tina-sqlite-bridge` —
-  now ships an optional `tracing` feature with the same shape) but
-  no new spans/events are emitted yet; the next pass picks the shared
-  field vocabulary.
+**Shipped.** All original rocks plus the live observer hook are on
+`main`. Bridge emission landed for `tina-sqlite-bridge`,
+`tina-tokio-bridge`, `tina-tower-bridge`, and `tina-reqwest-bridge`;
+`tina-rpc-tokio`'s pre-existing spans (`tina_rpc.bridge.call` with
+`service` / `method` / `correlator` / `result_kind`) were
+intentionally left untouched and remain on the previous shape.
+Vocabulary harmonisation across all five bridges is deferred.
+
+- `tina-tracing` crate: events, live snapshot, trace-snapshot partial
+  marker, stable-name re-exports, `TracingObserver`, doc page,
+  runnable example. `cause_id` renders as bare number or `-`. Shipped
+  in #27.
+- `TraceObserver` trait on `tina-runtime` with synchronous inline hook,
+  builder-time wiring on `ThreadedRuntime` /
+  `ThreadedMultiShardRuntime` / `LocalSystem*Builder`, simulator
+  parity, and noop-observer byte-identical-trace property tests on
+  both runtime and sim. Shipped in #27.
+- Bridge emission across `tina-sqlite-bridge` (#30) and
+  `tina-tokio-bridge` / `tina-tower-bridge` / `tina-reqwest-bridge`
+  (#31), behind each crate's optional `tracing` Cargo feature. Targets
+  follow `tina_<bridge>.bridge[.call]`; `reason` reuses runtime
+  vocabulary where concepts match; `request_kind` (sqlite) and
+  `method` (reqwest) ride on every per-call event; `scope`
+  (`per_attempt` / `retry_within_total`) tags tokio-bridge timeouts.
+  `tina-rpc-tokio`'s pre-existing spans were left untouched.
+
+Deferred to later observability work:
+
+- OpenTelemetry / Prometheus mappers, exporter policy, metric policy.
+- Cross-version on-the-wire trace formats.
+- Span timing for runtime calls (Tina's call lifecycle is already a
+  causal chain).
+- `tina-rpc-tokio` vocabulary harmonisation with the new bridge shape
+  (additive `kind`/`reason` fields alongside its existing
+  `service`/`method`/`correlator`/`result_kind` spans).
+- A shared bridge correlator surfaced as a runtime-side `call_id`
+  link.
 
 ## Goal
 

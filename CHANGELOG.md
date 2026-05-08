@@ -53,6 +53,41 @@ API additions:
 - Bounded `PendingCallSet` (Rock 4) and `Deadline` value (Rock 1)
   deferred to follow-up phases; design notes recorded in
   `.intent/phases/066-cancellation-and-deadline-model/`.
+### Phase 065 Observability First Form
+
+- Added `tina-tracing`: an adapter crate that turns `RuntimeEvent`s and
+  `LiveTopologyReport`s into structured `tracing::Event`s under stable
+  targets (`tina_runtime::trace`, `tina_runtime::live`) without flattening
+  typed reasons (`Full`, `Closed`, `CallerClosed`, `ReplyPathFull`,
+  `MailboxFull`, `BudgetExceeded`, …).
+- Added a live `TraceObserver` hook on `tina-runtime` and `tina-sim`: one
+  synchronous in-line callback fired before retention, wired through
+  `ThreadedRuntime`, `ThreadedMultiShardRuntime`, `LocalSystem*Builder`,
+  and the `Simulator` setter. `ThreadedRuntimeConfig` stays pure data
+  (`Copy + Eq`); the observer is a separate constructor parameter.
+- Added byte-identical-trace property tests on both runtime and simulator
+  proving a noop observer leaves the deterministic event record
+  unchanged. `TraceRetention::Off` plus an observer is the new
+  stream-only mode.
+- Added new bridge tracing emission for `tina-sqlite-bridge`,
+  `tina-tokio-bridge`, `tina-tower-bridge`, and `tina-reqwest-bridge`
+  behind each crate's optional `tracing` Cargo feature. Targets follow
+  the `tina_<bridge>.bridge[.call]` shape; shared `reason` strings
+  (`Full`, `Closed`, `Timeout`) reuse runtime vocabulary where the
+  concept matches; bridge-specific fields stay bridge-shaped
+  (`request_kind`, `method`, `status`, `outcome`, `rows_changed`,
+  `row_count`, `elapsed_ms`, `scope`, `detail`).
+- `tina-rpc-tokio`'s pre-existing spans (`tina_rpc.bridge.call` with
+  `service`, `method`, `correlator`, `result_kind`) were left
+  untouched in this phase and remain on the previous shape.
+  Documented in `19-tracing.md` as the one bridge whose vocabulary
+  has not been harmonised yet.
+- Added `docs/tina-user-guide/19-tracing.md` with the field/level/reason
+  vocabulary table for runtime and bridge events; one runnable example
+  (`eiffel_tracing_demo`) wires the live observer end-to-end.
+- Left OpenTelemetry / Prometheus mappers, span timing for runtime
+  calls, cross-bridge correlator alignment, and `tina-rpc-tokio`
+  vocabulary harmonisation as future observability work.
 
 ### Phase 055 Codebase Module Split
 
