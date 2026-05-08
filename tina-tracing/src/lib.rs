@@ -36,7 +36,7 @@
 //! # Side effects
 //!
 //! No function installs a global subscriber unless the name says
-//! `install_global_*`. Only [`install_global_default_subscriber`]
+//! `install_global_*`. Only `install_global_default_subscriber`
 //! does, behind the `subscriber` feature.
 //!
 //! # Layout
