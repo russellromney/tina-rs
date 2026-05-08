@@ -7,12 +7,14 @@ members = [
     "tina-rpc",
     "tina-rpc-macros",
     "tina-reqwest-bridge",
+    "tina-sqlite-bridge",
     "tina-rpc-tokio",
     "tina-runtime",
     "tina-sim",
     "tina-supervisor",
     "tina-tokio-bridge",
     "tina-tower-bridge",
+    "tina-tracing",
 ]
 exclude = [
     "examples/eiffel_real_io_chat",

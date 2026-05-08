@@ -342,12 +342,17 @@ fn threaded_multishard_observe_result_resolves_typed_value_on_owning_shard() {
         .observe_result::<FanoutReport, _, _>(worker)
         .expect("register result waiter");
 
-    let report = FanoutReport { sum: 600, shards: 3 };
+    let report = FanoutReport {
+        sum: 600,
+        shards: 3,
+    };
     runtime
         .try_send(worker, WorkerMsg::Finish(report.clone()))
         .expect("kick worker");
 
-    let got = waiter.wait(Duration::from_secs(3)).expect("waiter resolves");
+    let got = waiter
+        .wait(Duration::from_secs(3))
+        .expect("waiter resolves");
     assert_eq!(got, report);
 
     let _ = runtime.shutdown();

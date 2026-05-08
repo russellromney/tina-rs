@@ -1,0 +1,31 @@
+[package]
+name = "tina-tracing"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Adapter from tina-runtime trace events and live reports to tracing events"
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina = { path = "../tina" }
+tina-runtime = { path = "../tina-runtime" }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# Optional dep that backs `install_global_default_subscriber` behind
+# the `subscriber` feature. Tests and examples pull tracing-subscriber
+# in unconditionally via `[dev-dependencies]` below — the duplication
+# is intentional: the public surface stays opt-in while tests get the
+# extras (env-filter) they need without flipping the feature.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"], optional = true }
+
+[features]
+default = []
+subscriber = ["dep:tracing-subscriber"]
+
+[dev-dependencies]
+# Keep the version pinned to the same major.minor as the optional dep
+# above so security/CVE bumps move both at once.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }

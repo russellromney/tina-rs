@@ -1,4 +1,4 @@
-use eiffel_sqlite_counter::{Report, tina_impl, tokio_impl};
+use eiffel_sqlite_counter::{Report, tina_demo, tina_impl, tokio_impl};
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args()
@@ -12,10 +12,22 @@ fn main() -> anyhow::Result<()> {
             print_side("tokio", tokio_impl::run()?);
             print_side("tina", tina_impl::run()?);
         }
+        "demo" => {
+            tina_demo::demo_constraint()?;
+            tina_demo::demo_timeout()?;
+            tina_demo::demo_closed()?;
+            tina_demo::demo_invalid()?;
+            tina_demo::demo_retry()?;
+        }
+        "demo-constraint" => tina_demo::demo_constraint()?,
+        "demo-timeout" => tina_demo::demo_timeout()?,
+        "demo-closed" => tina_demo::demo_closed()?,
+        "demo-invalid" => tina_demo::demo_invalid()?,
+        "demo-retry" => tina_demo::demo_retry()?,
         other => {
             anyhow::bail!(
-                "unknown mode {other:?}; expected tokio, tina, or both. \
-                 usage: eiffel-sqlite-counter [tokio|tina|both]"
+                "unknown mode {other:?}; expected tokio | tina | both | demo \
+                 | demo-constraint | demo-timeout | demo-closed | demo-invalid | demo-retry"
             );
         }
     }

@@ -14,4 +14,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 tina = { path = "../../tina" }
 tina-runtime = { path = "../../tina-runtime" }
+tina-sqlite-bridge = { path = "../../tina-sqlite-bridge" }
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
