@@ -37,3 +37,25 @@ jobs:
 
       - name: Verify workspace
         run: make verify
+
+  # Eiffel examples are excluded from the main workspace (each is its
+  # own cargo workspace). `cargo test --workspace` skips them, so a
+  # bridge change can break a downstream specimen and not fail CI.
+  # This job walks every examples/*/Cargo.toml and runs cargo test +
+  # clippy. Linux-only to save runner minutes; if any specimen needs
+  # macOS-specific behavior, add a matrix later.
+  verify-examples:
+    name: make verify-examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
+
+      - name: Verify examples
+        run: make verify-examples

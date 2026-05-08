@@ -1,0 +1,46 @@
+name: weekly
+
+on:
+  schedule:
+    # Monday 09:00 UTC. Cheap to miss a run; restart by clicking
+    # "Run workflow" in the Actions tab.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-audit
+        run: cargo +stable install cargo-audit --locked
+      - name: Run audit
+        run: cargo +stable audit
+
+  # rust-version.workspace = "1.85" is what the manifest claims; the
+  # primary CI runs nightly only, so a nightly-only feature could
+  # sneak past. This job catches that.
+  stable-check:
+    name: cargo +stable check (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - name: Stable workspace check
+        run: cargo +stable check --workspace
+
+  miri:
+    name: miri (tina-mailbox-spsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Install Rust nightly with miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+      - name: Run miri
+        run: make miri
