@@ -161,20 +161,29 @@ optional `tracing` Cargo feature with the same shape:
 
 ```toml
 [dependencies]
-tina-rpc-tokio = { version = "...", features = ["tracing"] }
+tina-sqlite-bridge = { version = "...", features = ["tracing"] }
 ```
 
-`tina-rpc-tokio` emits bridge spans (`tina_rpc.bridge.call` with
-`service`, `method`, `correlator`, `result_kind`). The other four
-scaffold the feature without emitting yet. A follow-up pass aligns
-the vocabulary across all five — runtime events under
-`target = "tina_runtime::trace"`, bridge spans under
-`target = "tina_<bridge>.…"`, sharing `reason` strings where the
-concept matches.
+What emits today:
 
-Until that lands: filter on the targets you have. Correlate runtime
-`call_id` ↔ bridge correlator by hand. Bridge fields stay
-bridge-shaped, not runtime-shaped.
+- `tina-rpc-tokio`: bridge spans on `tina_rpc.bridge.call` with
+  `service`, `method`, `correlator`, `result_kind`.
+- `tina-sqlite-bridge`: per-call events on `tina_sqlite.bridge.call`
+  with `kind`, `request_kind`, `reason`, `outcome`, `rows_changed`,
+  `row_count`, `elapsed_ms`; plus one `kind="close"` lifecycle event
+  on `tina_sqlite.bridge`. `reason` reuses the runtime vocabulary
+  (`Full`, `Closed`, `Timeout`) where the concept matches and adds
+  bridge-specific names (`Busy`, `Constraint`, `Io`, `Sqlite`,
+  `ResponseTooLarge`, `InvalidRequest`, `Internal`).
+- `tina-tokio-bridge`, `tina-tower-bridge`, `tina-reqwest-bridge`:
+  feature scaffolded, no spans yet.
+
+A follow-up pass extends emission to the remaining three bridges
+and reconciles any drift across the five. Targets stay
+`tina_<bridge>.…`; runtime events stay on `tina_runtime::trace`.
+
+Correlate runtime `call_id` ↔ bridge correlator by hand for now.
+Bridge fields stay bridge-shaped, not runtime-shaped.
 
 ## Not in scope
 

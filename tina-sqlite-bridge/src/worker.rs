@@ -17,6 +17,8 @@ use std::time::Instant;
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use tina::prelude::*;
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+#[cfg(feature = "tracing")]
+use tracing::{Level, event};
 
 use crate::SqliteError;
 use crate::helpers::SqliteResult;
@@ -24,6 +26,101 @@ use crate::metrics::{MetricsInner, SqliteMetricsHandle};
 use crate::types::{
     InstallError, SqliteConfig, SqlitePath, SqliteRequest, SqliteResponse, SqliteValue,
 };
+
+/// `tracing` target for per-call events on the bridge isolate.
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_CALL: &str = "tina_sqlite.bridge.call";
+
+/// `tracing` target for bridge lifecycle events (close, etc.).
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_BRIDGE: &str = "tina_sqlite.bridge";
+
+#[cfg(feature = "tracing")]
+fn request_kind_name(request: &SqliteRequest) -> &'static str {
+    match request {
+        SqliteRequest::Execute { .. } => "execute",
+        SqliteRequest::QueryRows { .. } => "query",
+    }
+}
+
+#[cfg(feature = "tracing")]
+fn admission_reason_name(err: &SqliteError) -> &'static str {
+    match err {
+        SqliteError::Full => "Full",
+        SqliteError::Closed => "Closed",
+        SqliteError::InvalidRequest(_) => "InvalidRequest",
+        SqliteError::Internal(_) => "Internal",
+        // Worker-class errors never fire from admission. Fall through
+        // to a stable string so a future variant doesn't silently log
+        // an empty reason.
+        _ => "Other",
+    }
+}
+
+#[cfg(feature = "tracing")]
+fn worker_reason_name(err: &SqliteError) -> &'static str {
+    match err {
+        SqliteError::Busy => "Busy",
+        SqliteError::Constraint(_) => "Constraint",
+        SqliteError::Io(_) => "Io",
+        SqliteError::Sqlite(_) => "Sqlite",
+        SqliteError::ResponseTooLarge => "ResponseTooLarge",
+        SqliteError::Timeout => "Timeout",
+        SqliteError::Internal(_) => "Internal",
+        // Admission-class errors never come from the worker thread.
+        _ => "Other",
+    }
+}
+
+/// Emits one tracing event for a worker-terminal `SqliteResult` the
+/// bridge isolate is about to forward to the caller. Success replies
+/// log at DEBUG with `outcome=executed|rows`; typed errors log at
+/// WARN, internal errors at ERROR. Bridge-side timeouts are emitted
+/// at the timeout site, not here.
+#[cfg(feature = "tracing")]
+fn emit_replied(result: &SqliteResult) {
+    match result {
+        Ok(SqliteResponse::Executed { rows_changed }) => event!(
+            target: TRACE_TARGET_CALL,
+            Level::DEBUG,
+            kind = "replied",
+            outcome = "executed",
+            rows_changed = *rows_changed,
+        ),
+        Ok(SqliteResponse::Rows { rows, .. }) => event!(
+            target: TRACE_TARGET_CALL,
+            Level::DEBUG,
+            kind = "replied",
+            outcome = "rows",
+            row_count = rows.len() as u64,
+        ),
+        Err(err) => {
+            let reason = worker_reason_name(err);
+            let level = match err {
+                SqliteError::Internal(_) => Level::ERROR,
+                _ => Level::WARN,
+            };
+            // tracing::event! bakes the level into static callsite
+            // metadata, so each level needs its own invocation.
+            match level {
+                Level::ERROR => event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::ERROR,
+                    kind = "replied",
+                    reason,
+                    detail = %err,
+                ),
+                _ => event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::WARN,
+                    kind = "replied",
+                    reason,
+                    detail = %err,
+                ),
+            }
+        }
+    }
+}
 
 /// Messages handled by [`SqliteWorker`]. `Request` is the user-facing
 /// variant; `Poll` is the internal sleep continuation.
@@ -111,6 +208,15 @@ impl SqliteCloser {
     /// not wait for in-flight to drain. The in-flight SQLite call,
     /// if any, runs to completion.
     pub fn close(&self) {
+        #[cfg(feature = "tracing")]
+        {
+            // swap so we can suppress the trace event on idempotent re-close.
+            let was_closed = self.closed.swap(true, Ordering::AcqRel);
+            if !was_closed {
+                event!(target: TRACE_TARGET_BRIDGE, Level::DEBUG, kind = "close");
+            }
+        }
+        #[cfg(not(feature = "tracing"))]
         self.closed.store(true, Ordering::Release);
     }
 
@@ -177,18 +283,46 @@ impl<S: Shard + 'static> SqliteWorker<S> {
     }
 
     fn admit(&mut self, request: SqliteRequest) -> Effect<Self> {
+        #[cfg(feature = "tracing")]
+        let request_kind = request_kind_name(&request);
+
         if self.closed.load(Ordering::Acquire) {
             self.metrics.closed.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Closed",
+                request_kind,
+            );
             return reply::<Self>(Err(SqliteError::Closed));
         }
 
         if let Err(err) = validate_request(&request, &self.config) {
             self.metrics.invalid.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = admission_reason_name(&err),
+                request_kind,
+                detail = %err,
+            );
             return reply::<Self>(Err(err));
         }
 
         if self.in_flight.is_some() {
             self.metrics.full.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Full",
+                request_kind,
+            );
             return reply::<Self>(Err(SqliteError::Full));
         }
 
@@ -210,6 +344,15 @@ impl<S: Shard + 'static> SqliteWorker<S> {
         // Worker dead, or admission bug let a second Run past the
         // in_flight check. Either way, surface visibly.
         if self.cmd_tx.try_send(cmd).is_err() {
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::ERROR,
+                kind = "admission_rejected",
+                reason = "Internal",
+                request_kind,
+                detail = "worker thread unavailable",
+            );
             return reply::<Self>(Err(SqliteError::Internal(
                 "worker thread unavailable".into(),
             )));
@@ -224,6 +367,14 @@ impl<S: Shard + 'static> SqliteWorker<S> {
         self.metrics.set_in_flight(1);
         self.metrics.note_in_flight(1);
 
+        #[cfg(feature = "tracing")]
+        event!(
+            target: TRACE_TARGET_CALL,
+            Level::DEBUG,
+            kind = "admitted",
+            request_kind,
+        );
+
         sleep(self.config.poll_interval).reply(|_| SqliteMsg::Poll)
     }
 
@@ -236,6 +387,8 @@ impl<S: Shard + 'static> SqliteWorker<S> {
         match in_flight.response_rx.try_recv() {
             Ok(result) => {
                 self.metrics.set_in_flight(0);
+                #[cfg(feature = "tracing")]
+                emit_replied(&result);
                 reply::<Self>(result)
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -246,6 +399,14 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                     in_flight.abandoned.store(true, Ordering::Release);
                     self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
                     self.metrics.set_in_flight(0);
+                    #[cfg(feature = "tracing")]
+                    event!(
+                        target: TRACE_TARGET_CALL,
+                        Level::WARN,
+                        kind = "timeout",
+                        reason = "Timeout",
+                        elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
+                    );
                     return reply::<Self>(Err(SqliteError::Timeout));
                 }
                 self.in_flight = Some(in_flight);
@@ -253,6 +414,14 @@ impl<S: Shard + 'static> SqliteWorker<S> {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.metrics.set_in_flight(0);
+                #[cfg(feature = "tracing")]
+                event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::ERROR,
+                    kind = "replied",
+                    reason = "Internal",
+                    detail = "worker thread terminated mid-request",
+                );
                 reply::<Self>(Err(SqliteError::Internal(
                     "worker thread terminated mid-request".into(),
                 )))
