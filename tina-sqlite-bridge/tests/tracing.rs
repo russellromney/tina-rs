@@ -253,19 +253,78 @@ fn admission_and_replied_emit_with_aligned_vocabulary() {
     let new = &capture.events()[baseline..];
     let admitted = new
         .iter()
-        .find(|e| e.kind() == Some("admitted"))
-        .expect("admitted event");
+        .find(|e| {
+            e.kind() == Some("admitted") && e.field("request_kind") == Some("execute")
+        })
+        .expect("admitted event for execute");
     assert_eq!(admitted.target, "tina_sqlite.bridge.call");
     assert_eq!(admitted.level, Level::DEBUG);
-    assert_eq!(admitted.field("request_kind"), Some("execute"));
 
     let replied = new
         .iter()
-        .find(|e| e.kind() == Some("replied"))
-        .expect("replied event");
+        .find(|e| {
+            e.kind() == Some("replied")
+                && e.field("outcome") == Some("executed")
+                && e.field("request_kind") == Some("execute")
+        })
+        .expect("replied event for execute");
     assert_eq!(replied.level, Level::DEBUG);
-    assert_eq!(replied.field("outcome"), Some("executed"));
     assert!(replied.field("rows_changed").is_some());
+}
+
+#[test]
+fn replied_event_carries_request_kind_for_query() {
+    let capture = install_global_capture();
+    let baseline = capture.events().len();
+
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, fresh_db_config());
+
+    // Seed an empty table so the query is structurally valid.
+    let setup = Arc::new(Sink::default());
+    let setup_caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&setup),
+        Duration::from_secs(5),
+    );
+    runtime
+        .try_send(
+            setup_caller,
+            CallerMsg::Run(SqliteRequest::execute(
+                "CREATE TABLE q (k INTEGER PRIMARY KEY)",
+            )),
+        )
+        .expect("kick setup");
+    let _ = setup.wait_one(Duration::from_secs(5));
+
+    // Now run a query and assert request_kind=query rides on the replied event.
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink), Duration::from_secs(5));
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::query_rows("SELECT * FROM q", 16)),
+        )
+        .expect("kick caller");
+    let outcome = sink.wait_one(Duration::from_secs(5));
+    assert!(matches!(
+        outcome,
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { .. }))
+    ));
+    let _ = runtime.shutdown();
+
+    let new = capture.events()[baseline..].to_vec();
+    let replied = new
+        .iter()
+        .find(|e| {
+            e.kind() == Some("replied")
+                && e.field("outcome") == Some("rows")
+                && e.field("request_kind") == Some("query")
+        })
+        .expect("replied event for query carries request_kind");
+    assert_eq!(replied.level, Level::DEBUG);
+    assert!(replied.field("row_count").is_some());
 }
 
 #[test]
@@ -332,4 +391,52 @@ fn invalid_request_emits_admission_rejected_with_detail() {
         .expect("admission_rejected InvalidRequest event");
     assert_eq!(rejected.level, Level::WARN);
     assert!(rejected.field("detail").is_some());
+}
+
+#[test]
+fn timeout_event_carries_request_kind() {
+    // Tight bridge default_timeout + a recursive CTE that runs longer
+    // than the deadline forces a per-attempt timeout. Asserts the
+    // emitted timeout event carries `request_kind=query` so operators
+    // can filter timeouts by request shape.
+    const HEAVY_QUERY: &str = "WITH RECURSIVE seq(x) AS (\
+        SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000000\
+        ) SELECT SUM(x) FROM seq";
+
+    let capture = install_global_capture();
+    let baseline = capture.events().len();
+
+    let runtime = make_runtime();
+    let cfg = SqliteConfig::memory()
+        .with_default_timeout(Duration::from_millis(20))
+        .with_poll_interval(Duration::from_millis(1));
+    let bridge = install_bridge(&runtime, cfg);
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(&runtime, bridge.address, Arc::clone(&sink), Duration::from_secs(5));
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(SqliteRequest::query_rows(HEAVY_QUERY, 1)),
+        )
+        .expect("kick caller");
+    let outcome = sink.wait_one(Duration::from_secs(5));
+    assert!(matches!(
+        outcome,
+        CallOutcome::Replied(Err(SqliteError::Timeout))
+    ));
+    let _ = runtime.shutdown();
+
+    let new = capture.events()[baseline..].to_vec();
+    let timeout = new
+        .iter()
+        .find(|e| {
+            e.kind() == Some("timeout")
+                && e.field("request_kind") == Some("query")
+        })
+        .expect("timeout event carries request_kind=query");
+    assert_eq!(timeout.target, "tina_sqlite.bridge.call");
+    assert_eq!(timeout.level, Level::WARN);
+    assert_eq!(timeout.field("reason"), Some("Timeout"));
+    assert!(timeout.field("elapsed_ms").is_some());
 }

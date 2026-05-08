@@ -35,7 +35,6 @@ const TRACE_TARGET_CALL: &str = "tina_sqlite.bridge.call";
 #[cfg(feature = "tracing")]
 const TRACE_TARGET_BRIDGE: &str = "tina_sqlite.bridge";
 
-#[cfg(feature = "tracing")]
 fn request_kind_name(request: &SqliteRequest) -> &'static str {
     match request {
         SqliteRequest::Execute { .. } => "execute",
@@ -78,13 +77,14 @@ fn worker_reason_name(err: &SqliteError) -> &'static str {
 /// WARN, internal errors at ERROR. Bridge-side timeouts are emitted
 /// at the timeout site, not here.
 #[cfg(feature = "tracing")]
-fn emit_replied(result: &SqliteResult) {
+fn emit_replied(result: &SqliteResult, request_kind: &'static str) {
     match result {
         Ok(SqliteResponse::Executed { rows_changed }) => event!(
             target: TRACE_TARGET_CALL,
             Level::DEBUG,
             kind = "replied",
             outcome = "executed",
+            request_kind,
             rows_changed = *rows_changed,
         ),
         Ok(SqliteResponse::Rows { rows, .. }) => event!(
@@ -92,6 +92,7 @@ fn emit_replied(result: &SqliteResult) {
             Level::DEBUG,
             kind = "replied",
             outcome = "rows",
+            request_kind,
             row_count = rows.len() as u64,
         ),
         Err(err) => {
@@ -108,6 +109,7 @@ fn emit_replied(result: &SqliteResult) {
                     Level::ERROR,
                     kind = "replied",
                     reason,
+                    request_kind,
                     detail = %err,
                 ),
                 _ => event!(
@@ -115,6 +117,7 @@ fn emit_replied(result: &SqliteResult) {
                     Level::WARN,
                     kind = "replied",
                     reason,
+                    request_kind,
                     detail = %err,
                 ),
             }
@@ -138,6 +141,11 @@ struct InFlight {
     response_rx: Receiver<SqliteResult>,
     started_at: Instant,
     abandoned: Arc<AtomicBool>,
+    /// Stable name of the original request for tracing field reuse.
+    /// `"execute"` or `"query"`. Carried even when the `tracing`
+    /// feature is off so the field stays cheap and the type does
+    /// not branch on cfg.
+    request_kind: &'static str,
 }
 
 enum WorkerCmd {
@@ -283,7 +291,6 @@ impl<S: Shard + 'static> SqliteWorker<S> {
     }
 
     fn admit(&mut self, request: SqliteRequest) -> Effect<Self> {
-        #[cfg(feature = "tracing")]
         let request_kind = request_kind_name(&request);
 
         if self.closed.load(Ordering::Acquire) {
@@ -362,6 +369,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
             response_rx,
             started_at: Instant::now(),
             abandoned,
+            request_kind,
         });
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
         self.metrics.set_in_flight(1);
@@ -384,11 +392,15 @@ impl<S: Shard + 'static> SqliteWorker<S> {
             return noop();
         };
 
+        let request_kind = in_flight.request_kind;
+
         match in_flight.response_rx.try_recv() {
             Ok(result) => {
                 self.metrics.set_in_flight(0);
                 #[cfg(feature = "tracing")]
-                emit_replied(&result);
+                emit_replied(&result, request_kind);
+                #[cfg(not(feature = "tracing"))]
+                let _ = request_kind;
                 reply::<Self>(result)
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -405,6 +417,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                         Level::WARN,
                         kind = "timeout",
                         reason = "Timeout",
+                        request_kind,
                         elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
                     );
                     return reply::<Self>(Err(SqliteError::Timeout));
@@ -420,6 +433,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                     Level::ERROR,
                     kind = "replied",
                     reason = "Internal",
+                    request_kind,
                     detail = "worker thread terminated mid-request",
                 );
                 reply::<Self>(Err(SqliteError::Internal(
