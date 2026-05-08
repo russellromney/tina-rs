@@ -1,0 +1,445 @@
+//! Caller-side helpers: type aliases, raw and typed call shorthands,
+//! row accessors, and outcome classification.
+//!
+//! The bridge has two error layers:
+//!
+//! - **Bridge delivery**: `CallOutcome::Full | Closed | Timeout` is what
+//!   the runtime says about the IsolateCall — could it reach the worker,
+//!   did the IsolateCall deadline elapse.
+//! - **Worker outcome**: [`crate::SqliteError`] is what the worker says
+//!   about the request it accepted.
+//!
+//! Both layers stay distinct in the default reply shape:
+//!
+//! ```ignore
+//! AppMsg::DbDone(SqliteCallOutcome)
+//! // CallOutcome::Replied(Ok(SqliteResponse::Executed { .. }))
+//! // CallOutcome::Replied(Err(SqliteError::Constraint(_)))
+//! // CallOutcome::Full | Closed | Timeout
+//! ```
+//!
+//! # Two paths
+//!
+//! - [`send_request`] is the **raw, full-truth** path: takes a
+//!   [`SqliteRequest`], reply is
+//!   `CallOutcome<Result<SqliteResponse, SqliteError>>`. Use it when
+//!   you want the response enum visible at the call site, or when one
+//!   helper must accept either request shape.
+//! - [`execute_call`] / [`query_call`] are **typed shorthands** that
+//!   take their args directly (sql + params, plus `max_rows` for
+//!   queries). The reply projects the response enum away:
+//!   `execute_call` is `CallOutcome<Result<u64, SqliteError>>`;
+//!   `query_call` is `CallOutcome<Result<SqliteRows, SqliteError>>`.
+//!   Mismatched request shape is impossible at the type level.
+
+use std::time::Duration;
+
+use tina::Address;
+use tina::Effect;
+use tina::Isolate;
+use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call};
+
+use crate::SqliteError;
+use crate::types::{SqliteRequest, SqliteResponse, SqliteValue};
+use crate::worker::SqliteMsg;
+
+/// Worker reply type. Same as the inner `Result` carried inside a
+/// [`CallOutcome`].
+pub type SqliteResult = Result<SqliteResponse, SqliteError>;
+
+/// Tina address shape for a registered SQLite worker. Use this in
+/// isolate fields:
+///
+/// ```ignore
+/// struct App { db: SqliteAddress, ... }
+/// ```
+pub type SqliteAddress = Address<SqliteMsg, SqliteResult>;
+
+/// Full reply shape: `CallOutcome<Result<SqliteResponse, SqliteError>>`.
+pub type SqliteCallOutcome = CallOutcome<SqliteResult>;
+
+/// Reply shape from [`execute_call`].
+pub type SqliteExecutedOutcome = CallOutcome<Result<u64, SqliteError>>;
+
+/// Reply shape from [`query_call`].
+pub type SqliteRowsOutcome = CallOutcome<Result<SqliteRows, SqliteError>>;
+
+/// Buffered query result. Carried inside [`SqliteRowsOutcome`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqliteRows {
+    /// Column names in result order.
+    pub columns: Vec<String>,
+    /// Buffered rows. Cells match column order.
+    pub rows: Vec<Vec<SqliteValue>>,
+}
+
+impl SqliteRows {
+    /// Number of buffered rows.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// `true` iff no rows were returned.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Borrow row `i`. None if out of range.
+    pub fn row(&self, i: usize) -> Option<Row<'_>> {
+        let cells = self.rows.get(i)?;
+        Some(Row {
+            cells,
+            columns: &self.columns,
+        })
+    }
+
+    /// Iterate rows.
+    pub fn iter(&self) -> impl Iterator<Item = Row<'_>> {
+        self.rows.iter().map(move |cells| Row {
+            cells,
+            columns: &self.columns,
+        })
+    }
+}
+
+/// Borrowed view of one row plus its column names.
+#[derive(Debug, Clone, Copy)]
+pub struct Row<'a> {
+    cells: &'a [SqliteValue],
+    columns: &'a [String],
+}
+
+impl<'a> Row<'a> {
+    /// Number of columns.
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// `true` iff no columns.
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Borrow cell `idx`. None if out of range.
+    pub fn col(&self, idx: usize) -> Option<&'a SqliteValue> {
+        self.cells.get(idx)
+    }
+
+    /// Borrow the cell whose column has this name. None if no such
+    /// column. Linear scan; fine for small result rows.
+    pub fn by_name(&self, name: &str) -> Option<&'a SqliteValue> {
+        self.columns
+            .iter()
+            .position(|c| c == name)
+            .and_then(|i| self.cells.get(i))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw path: full-truth IsolateCall.
+// ---------------------------------------------------------------------------
+
+/// Submit one SQLite request through a registered worker.
+///
+/// Thin wrapper over `tina_runtime::call(addr, SqliteMsg::Request(req),
+/// timeout)`. The reply preserves the response enum and both error
+/// layers.
+pub fn send_request(
+    addr: SqliteAddress,
+    request: SqliteRequest,
+    timeout: Duration,
+) -> IsolateCall<SqliteMsg, SqliteResult> {
+    call(addr, SqliteMsg::Request(request), timeout)
+}
+
+// ---------------------------------------------------------------------------
+// Typed shorthands: request shape known at the call site.
+// ---------------------------------------------------------------------------
+
+/// Prepared `Execute` call. Use [`Self::reply`] to fold it into a
+/// continuation message of your isolate's message type.
+pub struct ExecuteCall {
+    inner: IsolateCall<SqliteMsg, SqliteResult>,
+}
+
+impl std::fmt::Debug for ExecuteCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecuteCall").finish_non_exhaustive()
+    }
+}
+
+impl ExecuteCall {
+    /// Turn this prepared call into one continuation message.
+    pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(SqliteExecutedOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.inner
+            .reply(move |raw| translator(project_executed(raw)))
+    }
+}
+
+/// Prepared `QueryRows` call.
+pub struct QueryCall {
+    inner: IsolateCall<SqliteMsg, SqliteResult>,
+}
+
+impl std::fmt::Debug for QueryCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryCall").finish_non_exhaustive()
+    }
+}
+
+impl QueryCall {
+    /// Turn this prepared call into one continuation message.
+    pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(SqliteRowsOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.inner.reply(move |raw| translator(project_rows(raw)))
+    }
+}
+
+/// Build an `Execute` call with the typed reply shape
+/// `CallOutcome<Result<u64, SqliteError>>`. Same admission, same
+/// failure surface; only the response enum is projected away.
+///
+/// ```ignore
+/// AppMsg::Start => execute_call(
+///     self.db,
+///     "UPDATE counter SET value = value + 1 WHERE id = ?",
+///     vec![self.id.into()],
+///     Duration::from_secs(2),
+/// )
+/// .reply(AppMsg::Updated),
+///
+/// AppMsg::Updated(outcome) => match outcome {
+///     CallOutcome::Replied(Ok(rows_changed)) => { ... }
+///     CallOutcome::Replied(Err(e)) => { ... }
+///     CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => { ... }
+/// }
+/// ```
+pub fn execute_call(
+    addr: SqliteAddress,
+    sql: impl Into<String>,
+    params: Vec<SqliteValue>,
+    timeout: Duration,
+) -> ExecuteCall {
+    ExecuteCall {
+        inner: send_request(
+            addr,
+            SqliteRequest::Execute {
+                sql: sql.into(),
+                params,
+            },
+            timeout,
+        ),
+    }
+}
+
+/// Build a `QueryRows` call with the typed reply shape
+/// `CallOutcome<Result<SqliteRows, SqliteError>>`.
+pub fn query_call(
+    addr: SqliteAddress,
+    sql: impl Into<String>,
+    params: Vec<SqliteValue>,
+    max_rows: usize,
+    timeout: Duration,
+) -> QueryCall {
+    QueryCall {
+        inner: send_request(
+            addr,
+            SqliteRequest::QueryRows {
+                sql: sql.into(),
+                params,
+                max_rows,
+            },
+            timeout,
+        ),
+    }
+}
+
+fn project_executed(outcome: SqliteCallOutcome) -> SqliteExecutedOutcome {
+    match outcome {
+        CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed })) => {
+            CallOutcome::Replied(Ok(rows_changed))
+        }
+        // Unreachable in practice: `execute_call` only ever sends
+        // `SqliteRequest::Execute`, and the worker's `run_request`
+        // matches request shape to response shape. Surface
+        // `Internal` rather than panic if a future code change
+        // breaks that invariant.
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { .. })) => CallOutcome::Replied(Err(
+            SqliteError::Internal("execute_call: worker returned Rows response".into()),
+        )),
+        CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
+        CallOutcome::Full => CallOutcome::Full,
+        CallOutcome::Closed => CallOutcome::Closed,
+        CallOutcome::Timeout => CallOutcome::Timeout,
+    }
+}
+
+fn project_rows(outcome: SqliteCallOutcome) -> SqliteRowsOutcome {
+    match outcome {
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { columns, rows })) => {
+            CallOutcome::Replied(Ok(SqliteRows { columns, rows }))
+        }
+        // See `project_executed` for the same invariant note.
+        CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => CallOutcome::Replied(Err(
+            SqliteError::Internal("query_call: worker returned Executed response".into()),
+        )),
+        CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
+        CallOutcome::Full => CallOutcome::Full,
+        CallOutcome::Closed => CallOutcome::Closed,
+        CallOutcome::Timeout => CallOutcome::Timeout,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outcome classification: Succeeded / Transient / Fatal.
+// ---------------------------------------------------------------------------
+
+/// Three-way classification of a SQLite call outcome.
+///
+/// Generic over the success carrier `T`:
+///
+/// - On the raw path, `T = SqliteResponse`.
+/// - On `execute_call`, `T = u64` (rows_changed).
+/// - On `query_call`, `T = SqliteRows`.
+///
+/// Caller-side retry loops typically only care about three buckets:
+/// did the call succeed, was the failure transient (worth retrying),
+/// or fatal? Match against this.
+///
+/// **The classifier does not retry.** It does not know your
+/// idempotency rules, your retry budget, or your backoff. It just
+/// labels each outcome.
+///
+/// # Default policy
+///
+/// - **Worker `Busy`**: `Transient(Busy)`. SQLite asked us to back off.
+/// - **Worker `Timeout`**: `Transient(WorkerTimeout)`.
+/// - **Bridge `Timeout`**: `Transient(BridgeTimeout)`.
+/// - Everything else is `Fatal(...)`. Retrying without changing the
+///   request, the database state, or the bridge config will reproduce.
+#[derive(Debug, Clone)]
+pub enum SqliteOutcomeClass<T> {
+    /// Worker accepted and produced a successful response.
+    Succeeded(T),
+    /// Failure that retrying the same request might fix.
+    Transient(SqliteTransientReason),
+    /// Failure that retrying the same request will not fix.
+    Fatal(SqliteFatalReason),
+}
+
+/// Why the classifier judged the outcome retryable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteTransientReason {
+    /// `SQLITE_BUSY` / `SQLITE_LOCKED`. SQLite asked us to back off.
+    Busy,
+    /// Worker per-attempt deadline elapsed.
+    WorkerTimeout,
+    /// IsolateCall deadline elapsed before the worker replied.
+    BridgeTimeout,
+}
+
+/// Why the classifier judged the outcome non-retryable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteFatalReason {
+    /// Worker rejected admission: `max_in_flight` saturated.
+    Full,
+    /// Worker has been closed.
+    Closed,
+    /// Request rejected by validation.
+    InvalidRequest(String),
+    /// Buffered query response exceeded the configured row cap.
+    ResponseTooLarge,
+    /// SQLite constraint violation.
+    Constraint(String),
+    /// I/O-class SQLite error.
+    Io(String),
+    /// Catch-all SQLite error.
+    Sqlite(String),
+    /// Bridge invariant failed.
+    Internal(String),
+    /// Bridge ingress mailbox full (runtime layer).
+    BridgeFull,
+    /// Bridge target closed or stale (runtime layer).
+    BridgeClosed,
+}
+
+/// Extension trait that adds [`Self::classify`] to the various
+/// SQLite call outcome shapes.
+pub trait SqliteOutcomeExt {
+    /// Successful payload type carried by [`SqliteOutcomeClass::Succeeded`].
+    type Success;
+    /// Classify the outcome into Succeeded / Transient / Fatal.
+    fn classify(self) -> SqliteOutcomeClass<Self::Success>;
+}
+
+impl SqliteOutcomeExt for SqliteCallOutcome {
+    type Success = SqliteResponse;
+    fn classify(self) -> SqliteOutcomeClass<SqliteResponse> {
+        classify_inner(self, |resp| resp)
+    }
+}
+
+impl SqliteOutcomeExt for SqliteExecutedOutcome {
+    type Success = u64;
+    fn classify(self) -> SqliteOutcomeClass<u64> {
+        classify_inner(self, |rows_changed| rows_changed)
+    }
+}
+
+impl SqliteOutcomeExt for SqliteRowsOutcome {
+    type Success = SqliteRows;
+    fn classify(self) -> SqliteOutcomeClass<SqliteRows> {
+        classify_inner(self, |rows| rows)
+    }
+}
+
+fn classify_inner<R, T>(
+    outcome: CallOutcome<Result<R, SqliteError>>,
+    project: impl FnOnce(R) -> T,
+) -> SqliteOutcomeClass<T> {
+    match outcome {
+        CallOutcome::Replied(Ok(payload)) => SqliteOutcomeClass::Succeeded(project(payload)),
+        CallOutcome::Replied(Err(SqliteError::Busy)) => {
+            SqliteOutcomeClass::Transient(SqliteTransientReason::Busy)
+        }
+        CallOutcome::Replied(Err(SqliteError::Timeout)) => {
+            SqliteOutcomeClass::Transient(SqliteTransientReason::WorkerTimeout)
+        }
+        CallOutcome::Replied(Err(SqliteError::Full)) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Full)
+        }
+        CallOutcome::Replied(Err(SqliteError::Closed)) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Closed)
+        }
+        CallOutcome::Replied(Err(SqliteError::InvalidRequest(msg))) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::InvalidRequest(msg))
+        }
+        CallOutcome::Replied(Err(SqliteError::ResponseTooLarge)) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::ResponseTooLarge)
+        }
+        CallOutcome::Replied(Err(SqliteError::Constraint(msg))) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Constraint(msg))
+        }
+        CallOutcome::Replied(Err(SqliteError::Io(msg))) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Io(msg))
+        }
+        CallOutcome::Replied(Err(SqliteError::Sqlite(msg))) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Sqlite(msg))
+        }
+        CallOutcome::Replied(Err(SqliteError::Internal(msg))) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Internal(msg))
+        }
+        CallOutcome::Timeout => SqliteOutcomeClass::Transient(SqliteTransientReason::BridgeTimeout),
+        CallOutcome::Full => SqliteOutcomeClass::Fatal(SqliteFatalReason::BridgeFull),
+        CallOutcome::Closed => SqliteOutcomeClass::Fatal(SqliteFatalReason::BridgeClosed),
+    }
+}

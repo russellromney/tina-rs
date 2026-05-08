@@ -75,7 +75,6 @@ pub use errors::{
     ThreadedTrySendError,
 };
 pub use host_burst::{HostBurstOutcomes, HostBurstSnapshot, HostBurstWaitError};
-pub use single_call_gate::SingleCallGate;
 pub use local_system::{
     LocalMultiShardSystem, LocalMultiShardSystemShutdown, LocalSystem, LocalSystemConfig,
     LocalSystemConfigError, LocalSystemMultiShardBuilder, LocalSystemShutdown,
@@ -83,6 +82,7 @@ pub use local_system::{
     LocalSystemTerminalReport, LocalSystemTerminalSummary, ShutdownUncleanReason, TraceSnapshot,
 };
 pub use multi_shard::{MultiShardRuntime, MultiShardRuntimeConfig};
+pub use single_call_gate::SingleCallGate;
 pub use threaded::{DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, ThreadedRuntime, ThreadedRuntimeConfig};
 pub use threaded_multi_shard::ThreadedMultiShardRuntime;
 

@@ -4,9 +4,11 @@ Tokio-vs-Tina counter persisted in SQLite. Each side initialises a
 fresh `tempfile`-managed database, increments a single-row counter
 50 times, reads it back, and ends with `final_value = 50`.
 
-This specimen is **not** a proof that Tina's database story is
-production-ready. It documents the shape of the gap and motivates a
-real `tina-sqlx-bridge` (ROADMAP phase 055).
+The Tina side now drives a real
+[`tina-sqlite-bridge`](../../tina-sqlite-bridge) worker instead of
+running rusqlite inline in a handler. The shard thread is no longer
+blocked while SQLite runs; admission, in-flight, and timeouts are
+named caps with typed failure modes.
 
 ## Run
 
@@ -20,15 +22,38 @@ side=tokio final_value=50 exit_clean=true
 side=tina  final_value=50 exit_clean=true
 ```
 
+The Tina side also prints a one-line bridge metrics summary:
+
+```
+eiffel_sqlite_counter (tina) bridge metrics: \
+  admitted=51 executed=50 rows=1 timeouts=0 late=0 full=0 closed=0 high_water=1
+```
+
+### Failure-shape demos
+
+`demo` runs four short scripts that surface each typed error a user
+will hit at the call site:
+
+```sh
+cargo run --manifest-path examples/eiffel_sqlite_counter/Cargo.toml -- demo
+# or one at a time:
+#   demo-constraint  — UNIQUE violation (SqliteError::Constraint)
+#   demo-timeout     — bridge default_timeout fires; worker finishes;
+#                      late_results bumps (SqliteError::Timeout)
+#   demo-closed      — bridge closed before send (SqliteError::Closed)
+#   demo-invalid     — over-cap params (SqliteError::InvalidRequest)
+```
+
 ## Read
 
 - [`src/tokio_impl.rs`](src/tokio_impl.rs)
 - [`src/tina_impl.rs`](src/tina_impl.rs)
 
-## Tokio shape
+## Tokio shape: `spawn_blocking` + `Arc<Mutex<Connection>>`
 
-`rusqlite` is sync. The textbook pattern is
-`tokio::task::spawn_blocking` per query:
+`rusqlite` is sync. The textbook Tokio pattern is one
+`tokio::task::spawn_blocking` per query, with the connection wrapped
+in `Arc<Mutex<_>>` so it can move into successive blocking tasks:
 
 ```rust
 let conn = Arc::new(Mutex::new(open()?));
@@ -41,103 +66,99 @@ for _ in 0..N {
 }
 ```
 
-Each blocking call moves an `Arc<Mutex<Connection>>` clone into the
-blocking pool. The async runtime is never blocked. This is the
-generally-accepted pattern for any sync C library under Tokio.
+The async runtime is never blocked; the blocking pool absorbs the
+sync calls. Pressure (how many blocking tasks are queued, how long
+each one waits) lives entirely inside Tokio's blocking pool defaults
+and is not nameable from the call site.
 
-## Tina shape
-
-There is no `tina-sqlx-bridge` (yet — see ROADMAP phase 055). The
-honest first-form shape is one `SqliteWorker` isolate that owns the
-connection and runs each query inline in `handle`:
+## Tina shape: `tina-sqlite-bridge` install + typed `execute_call`
 
 ```rust
-fn handle(&mut self, msg: SqliteMsg, ...) -> Effect<Self> {
-    match msg {
-        SqliteMsg::Increment => {
-            self.conn.execute("UPDATE counter SET value = value + 1 WHERE id = 0", [])
-                .expect("update");
-            self.local_count += 1;
-            noop()
-        }
-        SqliteMsg::Finalize => {
-            let value: i64 = self.conn.query_row(...)?;
-            self.report.final_value = value as u64;
-            stop_with(self.report)
-        }
-    }
-}
+use tina_sqlite_bridge::{execute_call, query_call, SqliteConfig, SqliteWorker};
+
+let cfg = SqliteConfig::path(&path)
+    .with_default_timeout(Duration::from_secs(5))
+    .with_busy_timeout(Duration::from_secs(2))
+    .with_pragma("journal_mode = WAL")
+    .with_poll_interval(Duration::from_millis(1));
+let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg)?;
+
+// In the driver isolate — typed helper. The reply is
+// CallOutcome<Result<u64, SqliteError>>; no SqliteResponse enum to
+// peel.
+execute_call(
+    bridge.address,
+    "UPDATE counter SET value = value + 1 WHERE id = 0",
+    vec![],
+    Duration::from_secs(5),
+)
+.reply(DriverMsg::Stepped)
 ```
 
-The host fires N `Increment` messages then `Finalize` and reads the
-final `Report` via `observe_result::<Report>`.
+The raw `send_request(addr, SqliteRequest::Execute { ... }, timeout)`
+path is still available as the full-truth escape hatch — use it when
+you want to see the response enum at the call site or when one helper
+must accept either request shape.
 
-## Discussion
+Under the hood the bridge owns one std-thread blocking worker that
+holds the `rusqlite::Connection`. The Tina shard thread submits
+requests to a `mpsc::sync_channel` and folds the eventual reply
+into a continuation message. Failure modes are visible at the
+boundary:
 
-What feels better:
-
-- **Owned state through one isolate.** The connection lives in one
-  place. There is no `Arc<Mutex<Connection>>`, no inter-thread
-  contention, no question of "who else holds this lock." A single
-  isolate mailbox serializes every database touch.
-- **Final value through `stop_with`.** Same Phase 059 Rock 1 path
-  the other specimens use. No mpsc, no atomic counter for the
-  final read.
-
-What feels worse — and where the missing bridge bites:
-
-- **The shard thread blocks for the duration of every query.**
-  Tina handlers are synchronous. There is no `await`, no
-  `runtime.run_blocking(closure)` adapter. While
-  `conn.execute(...)` runs, *every other isolate on this shard*
-  is paused. SQLite operations are fast (microseconds for a
-  single-row `UPDATE`), so for a single-shard adoption-grade
-  specimen this is acceptable. For a multi-shard production server
-  it is not. Postgres queries against a remote server can take
-  *milliseconds* — blocking a shard thread for that long is a
-  Tina-contract violation in spirit.
-- **No bounded "in-flight queries" notion.** With a real DB bridge,
-  `max_in_flight` would let a worker accept submissions but bound
-  how many queries can be running concurrently against the server.
-  Today, a hand-written worker is single-in-flight by virtue of
-  being a single isolate; there is no way to fan queries out
-  without losing the bounded-pressure contract that
-  `tina-reqwest-bridge` ships.
-- **Errors collapse to `expect("update")`.** A real bridge would
-  surface a typed `SqliteError::*` (Closed, Busy, IoError,
-  Constraint, Decode, etc.) at the call site. This specimen panics
-  on any database error because there is no good place to put a
-  reply translator: the handler returns `Effect<Self>`, not
-  `Result<Effect<Self>, _>`.
-
-## What this suggests
-
-A `tina-sqlx-bridge` (or `tina-rusqlite-bridge` for the sync-only
-path) shaped like `tina-reqwest-bridge` would shrink this specimen
-to roughly:
-
-```rust
-let bridge = SqliteWorker::install(&runtime, SqliteConfig {
-    path, max_in_flight: 4, query_timeout: Duration::from_secs(5),
-})?;
-
-call(bridge.address, SqliteMsg::Update("UPDATE counter SET ..."), timeout)
-    .reply(MyMsg::Updated)
+```
+mailbox full      -> CallError::TargetFull (Tina ingress)
+max_in_flight     -> SqliteError::Full
+per-attempt clock -> SqliteError::Timeout
+row buffer cap    -> SqliteError::ResponseTooLarge
+SQLITE_BUSY/LOCK  -> SqliteError::Busy
+constraint viol.  -> SqliteError::Constraint(detail)
+worker closed     -> SqliteError::Closed
 ```
 
-with the bridge handling: a Tokio-owned blocking-pool runtime for
-the actual rusqlite calls; bounded ingress; typed `SqliteError`;
-visible `Full` / `Closed` / `Timeout`; metrics shape comparable to
-the reqwest bridge.
+## Why inline `rusqlite` in `handle()` was only a specimen, not production
 
-(See FINDINGS finding 13 — `tina-sqlx-bridge` — for the proposed
-shape and ROADMAP phase 063 for the planned phase.)
+The earlier version of this specimen ran `self.conn.execute(...)`
+directly inside the handler. That works for a 50-row counter, but
+hides three problems:
+
+1. **The shard thread blocks while SQLite runs.** Every other
+   isolate on the shard is paused for the duration of the query.
+   Microsecond `UPDATE` calls hide it; a 50ms `Postgres` query
+   against a remote server would not.
+2. **No named caps.** There is no `mailbox_capacity`, no
+   `max_in_flight`, no `default_timeout`. Pressure is invisible. A
+   slow query becomes a slow shard becomes a slow service.
+3. **Errors collapse to `expect(...)`.** A real bridge surfaces a
+   typed `SqliteError::*`. The inline version had no place to put
+   a reply translator because handlers return `Effect<Self>`, not
+   `Result<Effect<Self>, _>`.
+
+The bridge fixes all three. The shard thread does no SQLite work;
+each cap is named in `SqliteConfig`; every failure has a typed
+variant.
+
+## Serial one-connection mode vs named pool mode
+
+The bridge today ships only the **serial one-connection** mode:
+
+- `external_pool_size = 1`
+- `max_in_flight = 1`
+
+Both are pinned to `1` and rejected at config validation otherwise.
+The doctrine "external bridge work may be parallel; all parallelism
+must have names and caps" is honest once the serial shape is
+settled. A pooled form would lift these pins, inherit the same
+config knobs and typed errors, document a per-connection isolation
+rule (no shared `Arc<Mutex<Connection>>`), and add tests that prove
+the pool's `Full` boundary.
 
 ## What this is not
 
 - Not a benchmark. `INCREMENTS = 50` is small enough to run in
   milliseconds; the lesson is shape, not throughput.
-- Not a transaction story. The single-row update is implicit-
-  autocommit. WAL, BEGIN/COMMIT, and concurrent readers are out of
-  scope.
-- Not a multi-shard or pooled story. Both sides use one connection.
+- Not a transaction story. The single-row update is
+  implicit-autocommit. `BEGIN`/`COMMIT`, savepoints, and explicit
+  transaction handles are out of scope.
+- Not typed row mapping. Rows come back as `Vec<Vec<SqliteValue>>`.
+- Not multi-shard or pooled. Both sides use one connection.

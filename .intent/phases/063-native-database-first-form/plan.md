@@ -2,14 +2,32 @@
 
 ## Status
 
-- Done: Eiffel `eiffel_sqlite_counter` proved the gap.
-- In progress: 061 deferred replies landed; bridge crates have first forms.
-- Open: build the first bounded DB bridge and write down bridge parallelism truth.
-- Deferred: `tina-sqlx-bridge`, native Postgres wire, pooling, migrations, ORM, schema tools.
-- Parallel: this phase may start while 064 runs. Do not wait for the 064 bridge
-  audit. Follow the current `tina-reqwest-bridge` style for install/config/
-  metrics/shutdown, keep the surface small, and expect a later 064 polish pass
-  if the bridge convention tightens names.
+- Done: `tina-sqlite-bridge` first form landed. One connection, one
+  blocking std thread, autocommit only. `external_pool_size`,
+  `max_in_flight`, and `pending_reply_capacity` pinned to `1` at
+  config validation. Typed `SqliteError` covers admission (`Full`,
+  `Closed`, `InvalidRequest`), per-attempt timeout, response cap,
+  `Busy`, `Constraint`, `Io`, generic `Sqlite`, and `Internal`. Late
+  worker results after a bridge timeout are observed via an
+  abandoned-flag the worker thread checks before sending; they bump
+  `late_results` and the per-outcome counter once each (no double
+  tally). Eiffel `eiffel_sqlite_counter` rewired to use the bridge;
+  both Tokio and Tina sides land on `final_value = 50`.
+- Done: typed-helper ergonomics polish — `execute_call`/`query_call`,
+  `Row`/`SqliteRows` accessors, `From` impls for common Rust types
+  (no silent `From<u64>`; use `TryFrom<u64>` instead), generic
+  classifier `SqliteOutcomeClass<T>` over the success carrier.
+  Demo modes (constraint, timeout, closed, invalid, retry) live on
+  the example.
+- Open: write the next-slice plan (Postgres / SQLx / pooled SQLite)
+  once 063 lessons are written down.
+- Deferred: `tina-sqlx-bridge`, native Postgres wire, pooling,
+  migrations, ORM, schema tools, transactions, typed row mapping.
+- Parallel: this phase may start while 064 runs. Do not wait for the
+  064 bridge audit. Follow the current `tina-reqwest-bridge` style
+  for install/config/metrics/shutdown, keep the surface small, and
+  expect a later 064 polish pass if the bridge convention tightens
+  names.
 
 ## Goal
 
