@@ -158,6 +158,29 @@ use std::time::Duration;
 use tina::Shard;
 use tina_runtime::MailboxFactory;
 use tina_tokio_bridge::{BridgeError, BridgeHandle, BridgeMessage, BridgeRequest};
+#[cfg(feature = "tracing")]
+use tracing::{Level, event};
+
+/// `tracing` target for per-call events at the tower layer.
+///
+/// Tower events sit *above* the underlying tina-tokio bridge events
+/// (`tina_tokio.bridge.call`). Filter on this target for the
+/// service-layer view; filter on the inner target for transport truth.
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_CALL: &str = "tina_tower.bridge.call";
+
+/// `tracing` target for tower-layer lifecycle events.
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_BRIDGE: &str = "tina_tower.bridge";
+
+#[cfg(feature = "tracing")]
+fn bridge_error_reason(error: BridgeError) -> &'static str {
+    match error {
+        BridgeError::Full => "Full",
+        BridgeError::Closed => "Closed",
+        BridgeError::Timeout => "Timeout",
+    }
+}
 
 /// `tower::Service` wrapper around a [`BridgeHandle`].
 ///
@@ -217,6 +240,11 @@ where
     /// Marks the underlying bridge handle (and every clone) as closed.
     /// After close, `poll_ready` returns `Ready(Err(Closed))`.
     pub fn close(&self) {
+        // Underlying bridge emits its own close event on
+        // `tina_tokio.bridge`. We add a tower-layer marker so
+        // operators filtering by tower target see the lifecycle too.
+        #[cfg(feature = "tracing")]
+        event!(target: TRACE_TARGET_BRIDGE, Level::DEBUG, kind = "close");
         self.handle.close();
     }
 
@@ -254,11 +282,31 @@ where
     fn call(&mut self, request: M) -> Self::Future {
         let handle = self.handle.clone();
         let per_call = self.per_call_timeout;
+        #[cfg(feature = "tracing")]
+        event!(target: TRACE_TARGET_CALL, Level::DEBUG, kind = "tower_call");
         Box::pin(async move {
-            match per_call {
+            let result = match per_call {
                 Some(timeout) => handle.call_with_timeout(request, timeout).await,
                 None => handle.call(request).await,
+            };
+            #[cfg(feature = "tracing")]
+            match &result {
+                Ok(_) => event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::DEBUG,
+                    kind = "tower_response",
+                ),
+                Err(error) => {
+                    let reason = bridge_error_reason(*error);
+                    event!(
+                        target: TRACE_TARGET_CALL,
+                        Level::WARN,
+                        kind = "tower_error",
+                        reason,
+                    );
+                }
             }
+            result
         })
     }
 }

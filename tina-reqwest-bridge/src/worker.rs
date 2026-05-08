@@ -14,12 +14,35 @@ use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntime
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
+#[cfg(feature = "tracing")]
+use tracing::{Level, event};
 
 use crate::metrics::{MetricsInner, ReqwestMetricsHandle};
 use crate::types::{
     RedirectPolicy, ReqwestConfig, ReqwestConfigError, ReqwestError, ReqwestRequest,
     ReqwestResponse, RetryPolicy,
 };
+
+/// `tracing` target for per-call events.
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_CALL: &str = "tina_reqwest.bridge.call";
+
+/// `tracing` target for bridge lifecycle.
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_BRIDGE: &str = "tina_reqwest.bridge";
+
+#[cfg(feature = "tracing")]
+fn reqwest_error_reason(err: &ReqwestError) -> &'static str {
+    match err {
+        ReqwestError::Full => "Full",
+        ReqwestError::Closed => "Closed",
+        ReqwestError::Timeout => "Timeout",
+        ReqwestError::RequestTooLarge => "RequestTooLarge",
+        ReqwestError::ResponseTooLarge => "ResponseTooLarge",
+        ReqwestError::InvalidRequest(_) => "InvalidRequest",
+        ReqwestError::Reqwest(_) => "Reqwest",
+    }
+}
 
 /// Messages handled by [`ReqwestWorker`].
 ///
@@ -228,18 +251,45 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
     }
 
     fn admit_initial(&mut self, request: ReqwestRequest) -> Effect<Self> {
+        #[cfg(feature = "tracing")]
+        let method = request.method.as_str();
+
         if self.closed.load(Ordering::Acquire) {
             self.metrics.closed.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Closed",
+                method,
+            );
             return reply::<Self>(Err(ReqwestError::Closed));
         }
         if request.body.len() > self.config.request_body_limit {
             self.metrics
                 .request_too_large
                 .fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "RequestTooLarge",
+                method,
+            );
             return reply::<Self>(Err(ReqwestError::RequestTooLarge));
         }
         if self.in_flight.len() >= self.config.max_in_flight {
             self.metrics.full.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Full",
+                method,
+            );
             return reply::<Self>(Err(ReqwestError::Full));
         }
 
@@ -277,6 +327,15 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         let request_for_reqwest = match build_reqwest_request(&self.client, &request) {
             Ok(req) => req,
             Err(err) => {
+                #[cfg(feature = "tracing")]
+                event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::WARN,
+                    kind = "admission_rejected",
+                    reason = reqwest_error_reason(&err),
+                    method = request.method.as_str(),
+                    detail = %err,
+                );
                 self.tally_error(&err);
                 return reply::<Self>(Err(err));
             }
@@ -317,6 +376,13 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         let in_flight = self.in_flight.len() as u64;
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
         self.metrics.set_in_flight(in_flight);
+        #[cfg(feature = "tracing")]
+        event!(
+            target: TRACE_TARGET_CALL,
+            Level::DEBUG,
+            kind = "admitted",
+            in_flight,
+        );
         self.metrics.note_in_flight(in_flight);
 
         sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
@@ -400,6 +466,13 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             attempts_remaining > 0 && retry_on_timeout(&self.config.retry),
                         ) {
                             self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "tracing")]
+                            event!(
+                                target: TRACE_TARGET_CALL,
+                                Level::DEBUG,
+                                kind = "retry",
+                                reason = "Timeout",
+                            );
                             return self.schedule_retry(
                                 saved,
                                 attempts_remaining - 1,
@@ -409,6 +482,14 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         }
                         self.metrics.timeout.fetch_add(1, Ordering::Relaxed);
                         self.note_terminal();
+                        #[cfg(feature = "tracing")]
+                        event!(
+                            target: TRACE_TARGET_CALL,
+                            Level::WARN,
+                            kind = "timeout",
+                            reason = "Timeout",
+                            elapsed_ms = attempt_started_at.elapsed().as_millis() as u64,
+                        );
                         return reply::<Self>(Err(ReqwestError::Timeout));
                     }
                     self.in_flight.insert(
@@ -434,6 +515,13 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         attempts_remaining > 0 && retry_on_reqwest_io(&self.config.retry),
                     ) {
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "tracing")]
+                        event!(
+                            target: TRACE_TARGET_CALL,
+                            Level::DEBUG,
+                            kind = "retry",
+                            reason = "Reqwest",
+                        );
                         return self.schedule_retry(
                             saved,
                             attempts_remaining - 1,
@@ -443,6 +531,14 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     }
                     self.tally_error(&err);
                     self.note_terminal();
+                    #[cfg(feature = "tracing")]
+                    event!(
+                        target: TRACE_TARGET_CALL,
+                        Level::WARN,
+                        kind = "replied",
+                        reason = "Reqwest",
+                        detail = %err,
+                    );
                     reply::<Self>(Err(err))
                 }
             },
@@ -498,6 +594,13 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     is_retryable(err, &self.config.retry),
                 ) {
                     self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "tracing")]
+                    event!(
+                        target: TRACE_TARGET_CALL,
+                        Level::DEBUG,
+                        kind = "retry",
+                        reason = reqwest_error_reason(err),
+                    );
                     let request = saved.clone();
                     return self.schedule_retry(
                         request,
@@ -510,10 +613,30 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         }
 
         match &result {
-            Ok(_) => {
+            Ok(response) => {
                 self.metrics.responses.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "tracing")]
+                event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::DEBUG,
+                    kind = "replied",
+                    outcome = "response",
+                    status = response.status.as_u16(),
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = response;
             }
-            Err(err) => self.tally_error(err),
+            Err(err) => {
+                self.tally_error(err);
+                #[cfg(feature = "tracing")]
+                event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::WARN,
+                    kind = "replied",
+                    reason = reqwest_error_reason(err),
+                    detail = %err,
+                );
+            }
         }
         self.note_terminal();
         reply::<Self>(result)
@@ -622,6 +745,15 @@ pub struct ReqwestCloser {
 impl ReqwestCloser {
     /// Mark the worker closed. Idempotent.
     pub fn close(&self) {
+        #[cfg(feature = "tracing")]
+        {
+            // swap so we can suppress the trace event on idempotent re-close.
+            let was_closed = self.closed.swap(true, Ordering::AcqRel);
+            if !was_closed {
+                event!(target: TRACE_TARGET_BRIDGE, Level::DEBUG, kind = "close");
+            }
+        }
+        #[cfg(not(feature = "tracing"))]
         self.closed.store(true, Ordering::Release);
     }
 

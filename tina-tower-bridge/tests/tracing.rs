@@ -1,0 +1,216 @@
+//! Tracing emission for `tina-tower-bridge`. The tower wrapper sits
+//! above `tina-tokio-bridge`; events here carry the
+//! `tina_tower.bridge.*` target so subscribers filtering on the
+//! tower target see the service-layer view.
+
+#![cfg(feature = "tracing")]
+
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use tina::prelude::*;
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
+use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeMessage, BridgeRequest};
+use tina_tower_bridge::{Service, TinaTowerService};
+use tracing::{
+    Event, Level, Metadata, Subscriber,
+    field::{Field, Visit},
+    span::{Attributes, Id, Record},
+};
+
+#[derive(Debug, Clone)]
+struct CapturedEvent {
+    target: String,
+    level: Level,
+    fields: BTreeMap<String, String>,
+}
+
+impl CapturedEvent {
+    fn field(&self, name: &str) -> Option<&str> { self.fields.get(name).map(String::as_str) }
+    fn kind(&self) -> Option<&str> { self.field("kind") }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Capture { events: Arc<Mutex<Vec<CapturedEvent>>> }
+
+impl Capture {
+    fn events(&self) -> Vec<CapturedEvent> {
+        self.events.lock().expect("capture lock").clone()
+    }
+}
+
+impl Subscriber for Capture {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
+    fn new_span(&self, _attrs: &Attributes<'_>) -> Id { Id::from_u64(1) }
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+    fn event(&self, event: &Event<'_>) {
+        let metadata = event.metadata();
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().expect("capture lock").push(CapturedEvent {
+            target: metadata.target().to_string(),
+            level: *metadata.level(),
+            fields: visitor.fields,
+        });
+    }
+    fn enter(&self, _span: &Id) {}
+    fn exit(&self, _span: &Id) {}
+}
+
+#[derive(Default)]
+struct FieldVisitor { fields: BTreeMap<String, String> }
+
+impl Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.fields.insert(field.name().to_string(), format!("{value:?}"));
+    }
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.fields.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+static GLOBAL_CAPTURE: OnceLock<Capture> = OnceLock::new();
+
+fn install_global_capture() -> &'static Capture {
+    GLOBAL_CAPTURE.get_or_init(|| {
+        let capture = Capture::default();
+        let _ = tracing::subscriber::set_global_default(capture.clone());
+        capture
+    })
+}
+
+#[derive(Debug, Default)]
+struct EchoIsolate;
+
+#[derive(Debug)]
+enum EchoMsg { Request(BridgeRequest<u32, u32>) }
+
+impl From<BridgeRequest<u32, u32>> for EchoMsg {
+    fn from(value: BridgeRequest<u32, u32>) -> Self { Self::Request(value) }
+}
+
+impl BridgeMessage for EchoMsg {
+    fn bridge_cancelled(&self) -> bool {
+        match self { Self::Request(request) => request.bridge_cancelled() }
+    }
+}
+
+#[tina_runtime::isolate(message = EchoMsg)]
+impl EchoIsolate {
+    fn handle(
+        &mut self,
+        msg: EchoMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            EchoMsg::Request(request) => {
+                let (value, responder) = request.into_parts();
+                let _ = responder.respond(value);
+                noop()
+            }
+        }
+    }
+}
+
+fn make_host() -> BridgeHost<SingleShard, DefaultThreadedMailboxFactory> {
+    BridgeHost::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tower_call_then_response_emit_at_tower_target() {
+    let capture = install_global_capture();
+    let baseline = capture.events().len();
+
+    let mut host = make_host();
+    let handle = host
+        .register_bridge::<EchoIsolate, u32, u32, Infallible>(
+            EchoIsolate,
+            8,
+            Duration::from_millis(500),
+        )
+        .expect("register bridge");
+    let mut svc = TinaTowerService::new(handle.clone());
+    let response = svc.call(99).await.expect("call ok");
+    assert_eq!(response, 99);
+    drop(handle);
+    drop(svc);
+    let _ = host.drain_and_shutdown(Duration::from_millis(200));
+
+    let new = capture.events()[baseline..].to_vec();
+    let entries: Vec<&CapturedEvent> = new
+        .iter()
+        .filter(|e| e.target == "tina_tower.bridge.call")
+        .collect();
+    assert!(
+        entries.iter().any(|e| e.kind() == Some("tower_call")),
+        "expected tower_call, got {:?}",
+        entries.iter().filter_map(|e| e.kind()).collect::<Vec<_>>(),
+    );
+    assert!(
+        entries.iter().any(|e| e.kind() == Some("tower_response")),
+        "expected tower_response, got {:?}",
+        entries.iter().filter_map(|e| e.kind()).collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tower_close_emits_lifecycle_and_call_after_close_errors() {
+    let capture = install_global_capture();
+    let baseline = capture.events().len();
+
+    let mut host = make_host();
+    let handle = host
+        .register_bridge::<EchoIsolate, u32, u32, Infallible>(
+            EchoIsolate,
+            8,
+            Duration::from_millis(100),
+        )
+        .expect("register bridge");
+    let mut svc = TinaTowerService::new(handle.clone());
+    svc.close();
+    let result = svc.call(0).await;
+    assert!(matches!(result, Err(BridgeError::Closed)));
+    drop(handle);
+    drop(svc);
+    let _ = host.drain_and_shutdown(Duration::from_millis(200));
+
+    let new = capture.events()[baseline..].to_vec();
+    assert!(
+        new.iter().any(|e| e.target == "tina_tower.bridge"
+            && e.kind() == Some("close")
+            && e.level == Level::DEBUG),
+        "expected tower close lifecycle event at DEBUG",
+    );
+    assert!(
+        new.iter().any(|e| e.target == "tina_tower.bridge.call"
+            && e.kind() == Some("tower_error")
+            && e.level == Level::WARN
+            && e.field("reason") == Some("Closed")),
+        "expected tower_error reason=Closed at WARN, got {:?}",
+        new.iter()
+            .filter(|e| e.target == "tina_tower.bridge.call")
+            .filter_map(|e| e.kind())
+            .collect::<Vec<_>>(),
+    );
+}

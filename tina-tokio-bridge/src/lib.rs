@@ -113,12 +113,31 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
+#[cfg(feature = "tracing")]
+use tracing::{Level, event};
 use tina_runtime::{
     CallError, IntoErasedCall, LocalSystem, MailboxFactory, RuntimeEvent, SendRejectedReason,
     ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedSendObservedError,
     ThreadedTrySendError,
 };
 use tokio::sync::oneshot;
+
+/// `tracing` target for per-call events on the bridge.
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_CALL: &str = "tina_tokio.bridge.call";
+
+/// `tracing` target for bridge lifecycle events (close).
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_BRIDGE: &str = "tina_tokio.bridge";
+
+#[cfg(feature = "tracing")]
+fn bridge_error_reason(error: BridgeError) -> &'static str {
+    match error {
+        BridgeError::Full => "Full",
+        BridgeError::Closed => "Closed",
+        BridgeError::Timeout => "Timeout",
+    }
+}
 
 /// Error returned by a Tokio-to-Tina bridge call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +313,15 @@ struct BridgeState {
 
 impl BridgeState {
     fn close(&self) {
+        #[cfg(feature = "tracing")]
+        {
+            // swap so we can suppress the trace event on idempotent re-close.
+            let was_closed = self.closed.swap(true, Ordering::AcqRel);
+            if !was_closed {
+                event!(target: TRACE_TARGET_BRIDGE, Level::DEBUG, kind = "close");
+            }
+        }
+        #[cfg(not(feature = "tracing"))]
         self.closed.store(true, Ordering::Release);
     }
 
@@ -550,6 +578,13 @@ impl<R> BridgeResponder<R> {
                     .dropped_responses
                     .fetch_add(1, Ordering::Relaxed);
             }
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "dropped_response",
+                reason = "CallerClosed",
+            );
         }
         result
     }
@@ -916,6 +951,13 @@ where
         self.state.metrics.attempts.fetch_add(1, Ordering::Relaxed);
         if self.state.is_closed() {
             self.state.metrics.closed.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Closed",
+            );
             return Err(BridgeError::Closed);
         }
 
@@ -941,6 +983,12 @@ where
                     match result {
                         Ok(()) => {
                             state.metrics.accepted.fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "tracing")]
+                            event!(
+                                target: TRACE_TARGET_CALL,
+                                Level::DEBUG,
+                                kind = "admitted",
+                            );
                             let _ = observed_tx.send(Ok(()));
                         }
                         Err(error) => {
@@ -973,6 +1021,14 @@ where
             Ok(outcome) => outcome,
             Err(_) => {
                 self.record_error(BridgeError::Timeout);
+                #[cfg(feature = "tracing")]
+                event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::WARN,
+                    kind = "timeout",
+                    reason = "Timeout",
+                    elapsed_ms = timeout.as_millis() as u64,
+                );
                 return Err(BridgeError::Timeout);
             }
         };
@@ -981,6 +1037,13 @@ where
             BridgeWaitOutcome::Response(response) => {
                 cancellation.disarm();
                 self.state.metrics.responses.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "tracing")]
+                event!(
+                    target: TRACE_TARGET_CALL,
+                    Level::DEBUG,
+                    kind = "replied",
+                    outcome = "response",
+                );
                 Ok(response)
             }
             BridgeWaitOutcome::ObservedError(error) => {
@@ -1010,6 +1073,18 @@ where
             BridgeError::Timeout => {
                 state.metrics.timeout.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        // Bridge timeouts emit at the timeout site so they carry
+        // elapsed_ms; here we cover Full and Closed admission paths
+        // (record_error_on is the single record-side mutator).
+        #[cfg(feature = "tracing")]
+        if !matches!(error, BridgeError::Timeout) {
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = bridge_error_reason(error),
+            );
         }
     }
 }
