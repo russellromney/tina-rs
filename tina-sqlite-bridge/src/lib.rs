@@ -131,6 +131,6 @@ pub use helpers::{
 pub use metrics::{SqliteMetrics, SqliteMetricsHandle};
 pub use types::{
     InstallError, SqliteConfig, SqliteConfigError, SqliteError, SqlitePath, SqliteRequest,
-    SqliteResponse, SqliteValue,
+    SqliteResponse, SqliteValue, U64TooLarge,
 };
 pub use worker::{InstalledSqliteBridge, SqliteCloser, SqliteMsg, SqliteWorker};

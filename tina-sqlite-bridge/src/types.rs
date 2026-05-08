@@ -127,14 +127,34 @@ impl From<u8> for SqliteValue {
     }
 }
 
-/// SQLite has no unsigned integer type. Values that don't fit in
-/// `i64` are stored bit-for-bit (so `u64::MAX` round-trips as `-1`).
-/// If you need full-range `u64`, store as `Blob`.
-impl From<u64> for SqliteValue {
-    fn from(v: u64) -> Self {
-        Self::Integer(v as i64)
+/// SQLite has no unsigned integer type. `u64` values up to `i64::MAX`
+/// fit; larger values would silently change. We expose this as
+/// `TryFrom` rather than `From` so the failure is visible at the call
+/// site. For full-range `u64`, store as `Blob`.
+impl TryFrom<u64> for SqliteValue {
+    type Error = U64TooLarge;
+
+    fn try_from(v: u64) -> Result<Self, Self::Error> {
+        if v <= i64::MAX as u64 {
+            Ok(Self::Integer(v as i64))
+        } else {
+            Err(U64TooLarge(v))
+        }
     }
 }
+
+/// `u64` exceeded `i64::MAX`; cannot be stored as a SQLite `Integer`
+/// without loss. Store as `Blob` if you need the full range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct U64TooLarge(pub u64);
+
+impl std::fmt::Display for U64TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "u64 value {} exceeds i64::MAX", self.0)
+    }
+}
+
+impl std::error::Error for U64TooLarge {}
 
 impl From<f64> for SqliteValue {
     fn from(v: f64) -> Self {
@@ -376,15 +396,12 @@ pub enum SqliteConfigError {
         /// Hard cap.
         cap: usize,
     },
-    /// `pending_reply_capacity == 0`. Need at least one slot.
-    ZeroPendingReplyCapacity,
-    /// `pending_reply_capacity < max_in_flight`. Every accepted request
-    /// needs a reply slot.
-    PendingReplyCapacityBelowMaxInFlight {
-        /// Requested `pending_reply_capacity`.
-        pending: usize,
-        /// Requested `max_in_flight`.
-        in_flight: usize,
+    /// `pending_reply_capacity` not pinned to `1`. The serial first
+    /// form has only one in-flight slot, so the budget must be `1`.
+    /// A pooled form will lift this pin and grow the cap.
+    InvalidPendingReplyCapacity {
+        /// Requested value.
+        requested: usize,
     },
     /// `max_in_flight` not pinned to `1`.
     InvalidMaxInFlight {
@@ -414,10 +431,9 @@ impl std::fmt::Display for SqliteConfigError {
             Self::MailboxCapacityTooLarge { requested, cap } => {
                 write!(f, "mailbox_capacity {requested} exceeds cap {cap}")
             }
-            Self::ZeroPendingReplyCapacity => f.write_str("pending_reply_capacity must be >= 1"),
-            Self::PendingReplyCapacityBelowMaxInFlight { pending, in_flight } => write!(
+            Self::InvalidPendingReplyCapacity { requested } => write!(
                 f,
-                "pending_reply_capacity {pending} < max_in_flight {in_flight}"
+                "pending_reply_capacity must be exactly 1 (got {requested})"
             ),
             Self::InvalidMaxInFlight { requested } => {
                 write!(f, "max_in_flight must be exactly 1 (got {requested})")
@@ -440,13 +456,14 @@ impl std::error::Error for SqliteConfigError {}
 /// Every knob is named. No silent clamps; out-of-range values reject
 /// through [`SqliteConfig::validate`].
 ///
-/// Pins:
+/// Pins (serial first form):
 ///
 /// - `external_pool_size = 1` (one connection, one blocking worker)
 /// - `max_in_flight = 1` (sequential admission)
+/// - `pending_reply_capacity = 1` (one accepted caller waiting at a time)
 ///
-/// Both reject any other value at validate time. A pooled form would
-/// lift these pins and inherit the same named caps.
+/// All three reject any other value at validate time. A pooled form
+/// would lift these pins and inherit the same named caps.
 #[derive(Debug, Clone)]
 pub struct SqliteConfig {
     /// Where to open the SQLite database.
@@ -456,9 +473,9 @@ pub struct SqliteConfig {
     /// Max simultaneously-in-flight ops. Must be `1`. Past this, the
     /// worker replies [`SqliteError::Full`].
     pub max_in_flight: usize,
-    /// Max admitted callers waiting on a deferred reply. Must be `>= 1`.
-    /// With `max_in_flight = 1` this is effectively the same; it is
-    /// kept named so a pooled form can grow it independently.
+    /// Max admitted callers waiting on a deferred reply. Must be `1`
+    /// in the serial first form (mirrors `max_in_flight`); a pooled
+    /// form will lift this pin and let the budget grow.
     pub pending_reply_capacity: usize,
     /// Worker mailbox capacity (Tina ingress). Past this, callers see
     /// `CallError::TargetFull` at the runtime layer. Hard-capped at
@@ -599,13 +616,9 @@ impl SqliteConfig {
                 requested: self.external_pool_size,
             });
         }
-        if self.pending_reply_capacity == 0 {
-            return Err(SqliteConfigError::ZeroPendingReplyCapacity);
-        }
-        if self.pending_reply_capacity < self.max_in_flight {
-            return Err(SqliteConfigError::PendingReplyCapacityBelowMaxInFlight {
-                pending: self.pending_reply_capacity,
-                in_flight: self.max_in_flight,
+        if self.pending_reply_capacity != 1 {
+            return Err(SqliteConfigError::InvalidPendingReplyCapacity {
+                requested: self.pending_reply_capacity,
             });
         }
         if self.default_timeout.is_zero() {

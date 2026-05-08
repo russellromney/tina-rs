@@ -223,11 +223,20 @@ fn config_rejects_external_pool_above_one() {
 }
 
 #[test]
-fn config_rejects_zero_pending_reply_capacity() {
+fn config_rejects_pending_reply_capacity_zero() {
     let cfg = SqliteConfig::memory().with_pending_reply_capacity(0);
     assert_eq!(
         cfg.validate(),
-        Err(SqliteConfigError::ZeroPendingReplyCapacity)
+        Err(SqliteConfigError::InvalidPendingReplyCapacity { requested: 0 })
+    );
+}
+
+#[test]
+fn config_rejects_pending_reply_capacity_above_one() {
+    let cfg = SqliteConfig::memory().with_pending_reply_capacity(4);
+    assert_eq!(
+        cfg.validate(),
+        Err(SqliteConfigError::InvalidPendingReplyCapacity { requested: 4 })
     );
 }
 
@@ -1162,33 +1171,6 @@ fn multi_statement_execute_falls_through_to_sqlite_error() {
 }
 
 // ---------------------------------------------------------------------------
-// pending_reply_capacity < max_in_flight rejected
-// ---------------------------------------------------------------------------
-
-#[test]
-fn config_rejects_pending_below_max_in_flight() {
-    // pending_reply_capacity = 1, max_in_flight = 1 is fine, but if we
-    // ever set pending below max, validate must reject. With current
-    // pins this is hard to hit honestly; force max_in_flight to 2 to
-    // exercise the rule (validate also rejects max_in_flight != 1, so
-    // we must use a config where the pending check fires first; the
-    // actual ordering means InvalidMaxInFlight wins. Test the variant
-    // shape directly instead.)
-    let err = SqliteConfigError::PendingReplyCapacityBelowMaxInFlight {
-        pending: 1,
-        in_flight: 4,
-    };
-    assert!(matches!(
-        err,
-        SqliteConfigError::PendingReplyCapacityBelowMaxInFlight { .. }
-    ));
-    // Also exercise Display for completeness.
-    let s = format!("{err}");
-    assert!(s.contains("pending_reply_capacity 1"));
-    assert!(s.contains("max_in_flight 4"));
-}
-
-// ---------------------------------------------------------------------------
 // Pragma actually lands on the connection
 // ---------------------------------------------------------------------------
 
@@ -1807,8 +1789,16 @@ fn value_from_extra_types() {
     assert_eq!(SqliteValue::from(7_u16), SqliteValue::Integer(7));
     assert_eq!(SqliteValue::from(7_u8), SqliteValue::Integer(7));
 
-    // u64 documented saturation: u64::MAX → -1 (bit pattern preserved).
-    assert_eq!(SqliteValue::from(u64::MAX), SqliteValue::Integer(-1));
+    // u64 goes through TryFrom: fits → Ok(Integer), overflows → Err.
+    assert_eq!(SqliteValue::try_from(7_u64), Ok(SqliteValue::Integer(7)));
+    assert_eq!(
+        SqliteValue::try_from(i64::MAX as u64),
+        Ok(SqliteValue::Integer(i64::MAX))
+    );
+    assert_eq!(
+        SqliteValue::try_from(u64::MAX),
+        Err(tina_sqlite_bridge::U64TooLarge(u64::MAX))
+    );
 
     // f32 widens.
     assert_eq!(SqliteValue::from(0.5_f32), SqliteValue::Real(0.5));

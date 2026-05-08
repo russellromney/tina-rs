@@ -3,20 +3,31 @@
 ## Status
 
 - Done: `tina-sqlite-bridge` first form landed. One connection, one
-  blocking std thread, autocommit only. `external_pool_size` and
-  `max_in_flight` pinned to `1` at config validation. Typed
-  `SqliteError` covers admission (`Full`, `Closed`, `InvalidRequest`),
-  per-attempt timeout, response cap, `Busy`, `Constraint`, `Io`,
-  generic `Sqlite`, and `Internal`. Late worker results after a
-  bridge timeout are observed by a watcher thread and counted as
-  `late_results`. Eiffel `eiffel_sqlite_counter` rewired to use the
-  bridge; both Tokio and Tina sides land on `final_value = 50`.
-- Done: Eiffel `eiffel_sqlite_counter` proved the gap, and the rewrite
-  removes inline `rusqlite::Connection::execute` from the handler.
+  blocking std thread, autocommit only. `external_pool_size`,
+  `max_in_flight`, and `pending_reply_capacity` pinned to `1` at
+  config validation. Typed `SqliteError` covers admission (`Full`,
+  `Closed`, `InvalidRequest`), per-attempt timeout, response cap,
+  `Busy`, `Constraint`, `Io`, generic `Sqlite`, and `Internal`. Late
+  worker results after a bridge timeout are observed via an
+  abandoned-flag the worker thread checks before sending; they bump
+  `late_results` and the per-outcome counter once each (no double
+  tally). Eiffel `eiffel_sqlite_counter` rewired to use the bridge;
+  both Tokio and Tina sides land on `final_value = 50`.
+- Done: typed-helper ergonomics polish — `execute_call`/`query_call`,
+  `Row`/`SqliteRows` accessors, `From` impls for common Rust types
+  (no silent `From<u64>`; use `TryFrom<u64>` instead), generic
+  classifier `SqliteOutcomeClass<T>` over the success carrier.
+  Demo modes (constraint, timeout, closed, invalid, retry) live on
+  the example.
 - Open: write the next-slice plan (Postgres / SQLx / pooled SQLite)
   once 063 lessons are written down.
 - Deferred: `tina-sqlx-bridge`, native Postgres wire, pooling,
   migrations, ORM, schema tools, transactions, typed row mapping.
+- Parallel: this phase may start while 064 runs. Do not wait for the
+  064 bridge audit. Follow the current `tina-reqwest-bridge` style
+  for install/config/metrics/shutdown, keep the surface small, and
+  expect a later 064 polish pass if the bridge convention tightens
+  names.
 
 ## Goal
 
@@ -31,6 +42,11 @@ Tina isolate state is serial.
 external bridge work may be parallel.
 all parallelism must have names and caps.
 ```
+
+This is a concrete bridge, not the shared bridge framework. Do not invent a
+`tina-bridge-common` crate here. 064 owns the bridge convention audit. 063
+should build one honest database bridge whose shape is easy to compare against
+the existing bridge crates.
 
 ## Non-Goals
 
@@ -60,6 +76,21 @@ If any cap fills, caller sees typed `Full`, not buffering fog.
 
 If caller times out first, accepted work may finish late; late reply is dropped
 visibly through Tina trace/metrics.
+
+Use the current bridge vocabulary unless a local reason says otherwise:
+
+- `install` wires runtime registration and returns the address/closer/metrics
+  handles;
+- config validation returns typed errors, never silent clamping;
+- metrics count worker-terminal outcomes, not caller-observed outcomes after a
+  Tina call timeout;
+- shutdown stops admission, drains or visibly closes accepted work, and returns
+  terminal truth;
+- supplied external resources, if supported, must say which policy knobs are
+  caller-owned.
+
+If 064 later standardizes any of these names, adapt in a small follow-up. Do
+not block first-form SQLite on that audit.
 
 ## Rock 1: `tina-sqlite-bridge` Crate
 
@@ -138,6 +169,7 @@ Proof:
 - worker close;
 - sequential calls;
 - after-failure recovery.
+- `install()` smoke path, so examples do not copy manual registration ceremony.
 
 ## Rock 2: Blocking Worker / Connection Model
 
@@ -263,7 +295,8 @@ Write the next plan slice after SQLite teaches the shape:
 
 ## Order
 
-1. Bridge doctrine doc in plan/docs.
+1. Bridge doctrine doc in plan/docs, explicitly saying this phase can run in
+   parallel with 064 and may receive a later naming polish.
 2. Crate skeleton and config validation.
 3. One-connection SQLite worker.
 4. Deferred reply + pending cap.

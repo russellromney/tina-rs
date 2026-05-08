@@ -93,18 +93,23 @@ pub struct InstalledSqliteBridge<S: Shard + 'static> {
     _shard: PhantomData<S>,
 }
 
-/// Cloneable closer. Non-blocking. Flips the closed flag; new requests
-/// reply [`SqliteError::Closed`]. The in-flight request runs to
-/// completion; the blocking thread and connection live until the
-/// bridge isolate drops.
+/// Cloneable closer. Non-blocking. Flips the closed flag; new
+/// admissions reply [`SqliteError::Closed`]. The in-flight request
+/// runs to completion. There is no force-cancel: `rusqlite` is sync C
+/// code with no cancellation handle, and the worker thread always
+/// finishes its current SQLite call. Dropping the bridge isolate
+/// closes the command channel, after which the worker thread exits at
+/// its next `recv` — but only after it finishes whatever call is
+/// already in progress.
 #[derive(Debug, Clone)]
 pub struct SqliteCloser {
     closed: Arc<AtomicBool>,
 }
 
 impl SqliteCloser {
-    /// Mark the worker closed. Idempotent. Does not wait for in-flight
-    /// to drain; drop the runtime to force-cancel the thread.
+    /// Mark the worker closed. Idempotent. Returns immediately; does
+    /// not wait for in-flight to drain. The in-flight SQLite call,
+    /// if any, runs to completion.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }

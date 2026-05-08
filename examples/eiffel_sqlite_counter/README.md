@@ -71,9 +71,11 @@ sync calls. Pressure (how many blocking tasks are queued, how long
 each one waits) lives entirely inside Tokio's blocking pool defaults
 and is not nameable from the call site.
 
-## Tina shape: `tina-sqlite-bridge` install + bounded `call`
+## Tina shape: `tina-sqlite-bridge` install + typed `execute_call`
 
 ```rust
+use tina_sqlite_bridge::{execute_call, query_call, SqliteConfig, SqliteWorker};
+
 let cfg = SqliteConfig::path(&path)
     .with_default_timeout(Duration::from_secs(5))
     .with_busy_timeout(Duration::from_secs(2))
@@ -81,17 +83,22 @@ let cfg = SqliteConfig::path(&path)
     .with_poll_interval(Duration::from_millis(1));
 let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg)?;
 
-// In the driver isolate:
-tina_sqlite_bridge::send_request(
+// In the driver isolate — typed helper. The reply is
+// CallOutcome<Result<u64, SqliteError>>; no SqliteResponse enum to
+// peel.
+execute_call(
     bridge.address,
-    SqliteRequest::Execute {
-        sql: "UPDATE counter SET value = value + 1 WHERE id = 0".into(),
-        params: vec![],
-    },
+    "UPDATE counter SET value = value + 1 WHERE id = 0",
+    vec![],
     Duration::from_secs(5),
 )
 .reply(DriverMsg::Stepped)
 ```
+
+The raw `send_request(addr, SqliteRequest::Execute { ... }, timeout)`
+path is still available as the full-truth escape hatch — use it when
+you want to see the response enum at the call site or when one helper
+must accept either request shape.
 
 Under the hood the bridge owns one std-thread blocking worker that
 holds the `rusqlite::Connection`. The Tina shard thread submits
