@@ -54,12 +54,32 @@ impl SqliteValue {
     }
 
     /// Returns the inner bytes if this is `Blob`. None otherwise.
-    /// (Text whose bytes are not valid UTF-8 is also surfaced as
-    /// `Blob` by the bridge — see the value-decoding rule in
-    /// `worker.rs`.)
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
             Self::Blob(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Consumes the value, returning the owned `String` if this is
+    /// `Text`. None otherwise. Avoids the clone in `as_text`.
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            Self::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Consumes the value, returning the owned `Vec<u8>` if this is
+    /// `Blob`. None otherwise. Avoids the clone in `as_blob`.
+    ///
+    /// SQLite text whose bytes are not valid UTF-8 is surfaced as
+    /// `Blob` by the bridge (see the value decoder in `worker.rs`),
+    /// so reading "text" data through `into_blob` is sometimes the
+    /// only safe option.
+    pub fn into_blob(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Blob(b) => Some(b),
             _ => None,
         }
     }
@@ -71,9 +91,67 @@ impl From<i64> for SqliteValue {
     }
 }
 
+impl From<i32> for SqliteValue {
+    fn from(v: i32) -> Self {
+        Self::Integer(i64::from(v))
+    }
+}
+
+impl From<i16> for SqliteValue {
+    fn from(v: i16) -> Self {
+        Self::Integer(i64::from(v))
+    }
+}
+
+impl From<i8> for SqliteValue {
+    fn from(v: i8) -> Self {
+        Self::Integer(i64::from(v))
+    }
+}
+
+impl From<u32> for SqliteValue {
+    fn from(v: u32) -> Self {
+        Self::Integer(i64::from(v))
+    }
+}
+
+impl From<u16> for SqliteValue {
+    fn from(v: u16) -> Self {
+        Self::Integer(i64::from(v))
+    }
+}
+
+impl From<u8> for SqliteValue {
+    fn from(v: u8) -> Self {
+        Self::Integer(i64::from(v))
+    }
+}
+
+/// SQLite has no unsigned integer type. Values that don't fit in
+/// `i64` are stored bit-for-bit (so `u64::MAX` round-trips as `-1`).
+/// If you need full-range `u64`, store as `Blob`.
+impl From<u64> for SqliteValue {
+    fn from(v: u64) -> Self {
+        Self::Integer(v as i64)
+    }
+}
+
 impl From<f64> for SqliteValue {
     fn from(v: f64) -> Self {
         Self::Real(v)
+    }
+}
+
+impl From<f32> for SqliteValue {
+    fn from(v: f32) -> Self {
+        Self::Real(f64::from(v))
+    }
+}
+
+/// SQLite stores booleans as integers (0/1).
+impl From<bool> for SqliteValue {
+    fn from(v: bool) -> Self {
+        Self::Integer(if v { 1 } else { 0 })
     }
 }
 
@@ -92,6 +170,30 @@ impl From<&str> for SqliteValue {
 impl From<Vec<u8>> for SqliteValue {
     fn from(v: Vec<u8>) -> Self {
         Self::Blob(v)
+    }
+}
+
+impl From<&[u8]> for SqliteValue {
+    fn from(v: &[u8]) -> Self {
+        Self::Blob(v.to_vec())
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for SqliteValue {
+    fn from(v: &[u8; N]) -> Self {
+        Self::Blob(v.to_vec())
+    }
+}
+
+impl<T> From<Option<T>> for SqliteValue
+where
+    T: Into<SqliteValue>,
+{
+    fn from(v: Option<T>) -> Self {
+        match v {
+            Some(t) => t.into(),
+            None => SqliteValue::Null,
+        }
     }
 }
 
@@ -165,7 +267,9 @@ impl SqliteRequest {
         self
     }
 
-    /// Replace the parameter list.
+    /// **Replace** the parameter list. Anything previously added by
+    /// [`Self::param`] is discarded. Use this to set the whole vector
+    /// in one shot; for chaining, prefer [`Self::param`].
     pub fn params(mut self, values: Vec<SqliteValue>) -> Self {
         match &mut self {
             Self::Execute { params, .. } | Self::QueryRows { params, .. } => {

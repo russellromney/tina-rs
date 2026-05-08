@@ -1437,8 +1437,15 @@ fn request_builder_chains() {
 
 #[derive(Debug)]
 enum TypedCallerMsg {
-    RunExecute(SqliteRequest),
-    RunQuery(SqliteRequest),
+    RunExecute {
+        sql: String,
+        params: Vec<SqliteValue>,
+    },
+    RunQuery {
+        sql: String,
+        params: Vec<SqliteValue>,
+        max_rows: usize,
+    },
     DoneExecute(tina_sqlite_bridge::SqliteExecutedOutcome),
     DoneQuery(tina_sqlite_bridge::SqliteRowsOutcome),
 }
@@ -1452,38 +1459,44 @@ struct TypedSink {
 
 impl TypedSink {
     fn put_executed(&self, o: tina_sqlite_bridge::SqliteExecutedOutcome) {
-        *self.executed.lock().unwrap() = Some(o);
+        *self.executed.lock().expect("typed sink") = Some(o);
         self.cv.notify_all();
     }
     fn put_rows(&self, o: tina_sqlite_bridge::SqliteRowsOutcome) {
-        *self.rows.lock().unwrap() = Some(o);
+        *self.rows.lock().expect("typed sink") = Some(o);
         self.cv.notify_all();
     }
     fn wait_executed(&self, t: Duration) -> tina_sqlite_bridge::SqliteExecutedOutcome {
         let deadline = Instant::now() + t;
-        let mut g = self.executed.lock().unwrap();
+        let mut g = self.executed.lock().expect("typed sink");
         while g.is_none() {
             let now = Instant::now();
             if now >= deadline {
                 panic!("typed wait_executed timed out");
             }
-            let (gg, _) = self.cv.wait_timeout(g, deadline - now).unwrap();
+            let (gg, _) = self
+                .cv
+                .wait_timeout(g, deadline - now)
+                .expect("typed cv wait");
             g = gg;
         }
-        g.take().unwrap()
+        g.take().expect("typed sink populated")
     }
     fn wait_rows(&self, t: Duration) -> tina_sqlite_bridge::SqliteRowsOutcome {
         let deadline = Instant::now() + t;
-        let mut g = self.rows.lock().unwrap();
+        let mut g = self.rows.lock().expect("typed sink");
         while g.is_none() {
             let now = Instant::now();
             if now >= deadline {
                 panic!("typed wait_rows timed out");
             }
-            let (gg, _) = self.cv.wait_timeout(g, deadline - now).unwrap();
+            let (gg, _) = self
+                .cv
+                .wait_timeout(g, deadline - now)
+                .expect("typed cv wait");
             g = gg;
         }
-        g.take().unwrap()
+        g.take().expect("typed sink populated")
     }
 }
 
@@ -1508,14 +1521,16 @@ impl Isolate for TypedCaller {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TypedCallerMsg::RunExecute(req) => {
-                tina_sqlite_bridge::execute_call(self.db, req, self.timeout)
+            TypedCallerMsg::RunExecute { sql, params } => {
+                tina_sqlite_bridge::execute_call(self.db, sql, params, self.timeout)
                     .reply(TypedCallerMsg::DoneExecute)
             }
-            TypedCallerMsg::RunQuery(req) => {
-                tina_sqlite_bridge::query_call(self.db, req, self.timeout)
-                    .reply(TypedCallerMsg::DoneQuery)
-            }
+            TypedCallerMsg::RunQuery {
+                sql,
+                params,
+                max_rows,
+            } => tina_sqlite_bridge::query_call(self.db, sql, params, max_rows, self.timeout)
+                .reply(TypedCallerMsg::DoneQuery),
             TypedCallerMsg::DoneExecute(o) => {
                 self.sink.put_executed(o);
                 stop()
@@ -1533,7 +1548,6 @@ fn execute_call_returns_typed_rows_changed() {
     let runtime = make_runtime();
     let bridge = install_bridge(&runtime, test_config());
 
-    // Schema setup via the raw path.
     let _ = run_one(
         &runtime,
         bridge.address,
@@ -1554,11 +1568,12 @@ fn execute_call_returns_typed_rows_changed() {
     runtime
         .try_send(
             caller,
-            TypedCallerMsg::RunExecute(
-                SqliteRequest::execute("INSERT INTO t (k, v) VALUES (?, ?)")
-                    .param(1_i64)
-                    .param(99_i64),
-            ),
+            TypedCallerMsg::RunExecute {
+                sql: "INSERT INTO t (k, v) VALUES (?, ?)".into(),
+                // i32 + i32 — proves From<i32> works without explicit
+                // type annotation.
+                params: vec![1.into(), 99.into()],
+            },
         )
         .expect("kick");
     match sink.wait_executed(Duration::from_secs(5)) {
@@ -1600,72 +1615,24 @@ fn query_call_returns_typed_rows() {
     runtime
         .try_send(
             caller,
-            TypedCallerMsg::RunQuery(
-                SqliteRequest::query_rows("SELECT k, v FROM t WHERE k = ?", 16).param(1_i64),
-            ),
+            TypedCallerMsg::RunQuery {
+                sql: "SELECT k, v FROM t WHERE k = ?".into(),
+                params: vec![1.into()],
+                max_rows: 16,
+            },
         )
         .expect("kick");
     match sink.wait_rows(Duration::from_secs(5)) {
         CallOutcome::Replied(Ok(rows)) => {
             assert_eq!(rows.columns, vec!["k".to_string(), "v".to_string()]);
-            assert_eq!(rows.rows.len(), 1);
-            assert_eq!(rows.rows[0][0].as_i64(), Some(1));
-            assert_eq!(rows.rows[0][1].as_text(), Some("hello"));
+            assert_eq!(rows.len(), 1);
+            // Row newtype accessors.
+            let row = rows.row(0).expect("row 0");
+            assert_eq!(row.col(0).and_then(|c| c.as_i64()), Some(1));
+            assert_eq!(row.by_name("v").and_then(|c| c.as_text()), Some("hello"));
+            assert!(row.by_name("nope").is_none());
         }
         other => panic!("expected typed Ok(SqliteRows), got {other:?}"),
-    }
-    shutdown_runtime(runtime);
-}
-
-#[test]
-fn execute_call_on_query_sql_surfaces_internal() {
-    // execute_call against a row-producing statement: worker returns
-    // Rows; the projection reports Internal rather than lying.
-    let runtime = make_runtime();
-    let bridge = install_bridge(&runtime, test_config());
-    let _ = run_one(
-        &runtime,
-        bridge.address,
-        SqliteRequest::execute("CREATE TABLE t (k INTEGER PRIMARY KEY)"),
-    );
-    let _ = run_one(
-        &runtime,
-        bridge.address,
-        SqliteRequest::execute("INSERT INTO t (k) VALUES (1)"),
-    );
-
-    let sink = Arc::new(TypedSink::default());
-    let caller = runtime
-        .register_with_capacity::<_, Infallible>(
-            TypedCaller {
-                db: bridge.address,
-                timeout: Duration::from_secs(2),
-                sink: Arc::clone(&sink),
-            },
-            8,
-        )
-        .expect("register typed caller");
-    // Send an Execute that's actually a SELECT. rusqlite::Connection::
-    // execute returns SQLITE_OK with rows_affected, but the SELECT
-    // produces rows through a different path. Actually rusqlite's
-    // execute on a SELECT returns Ok(0) with no rows. That's still
-    // Executed, not Rows. Force the projection mismatch instead by
-    // sending a QueryRows shape via raw and expecting execute helper
-    // path... too contrived. Instead, exercise the projection on a
-    // crafted SqliteCallOutcome via the public API: project_executed
-    // is private, but the typed helper's reply path is exercised by
-    // the test above. We rely on review for this case.
-    runtime
-        .try_send(
-            caller,
-            TypedCallerMsg::RunExecute(
-                SqliteRequest::execute("INSERT INTO t (k) VALUES (?)").param(2_i64),
-            ),
-        )
-        .expect("kick");
-    match sink.wait_executed(Duration::from_secs(5)) {
-        CallOutcome::Replied(Ok(rows_changed)) => assert_eq!(rows_changed, 1),
-        other => panic!("typed insert: {other:?}"),
     }
     shutdown_runtime(runtime);
 }
@@ -1690,51 +1657,177 @@ fn classify_succeeded_transient_fatal() {
     }
 
     let busy: SqliteCallOutcome = CallOutcome::Replied(Err(SqliteError::Busy));
-    matches!(
+    assert!(matches!(
         busy.classify(),
         SqliteOutcomeClass::Transient(SqliteTransientReason::Busy)
-    )
-    .then_some(())
-    .expect("Busy → Transient(Busy)");
+    ));
 
     let worker_timeout: SqliteCallOutcome = CallOutcome::Replied(Err(SqliteError::Timeout));
-    matches!(
+    assert!(matches!(
         worker_timeout.classify(),
         SqliteOutcomeClass::Transient(SqliteTransientReason::WorkerTimeout)
-    )
-    .then_some(())
-    .expect("worker Timeout → Transient(WorkerTimeout)");
+    ));
 
     let bridge_timeout: SqliteCallOutcome = CallOutcome::Timeout;
-    matches!(
+    assert!(matches!(
         bridge_timeout.classify(),
         SqliteOutcomeClass::Transient(SqliteTransientReason::BridgeTimeout)
-    )
-    .then_some(())
-    .expect("bridge Timeout → Transient(BridgeTimeout)");
+    ));
 
     let constraint: SqliteCallOutcome =
         CallOutcome::Replied(Err(SqliteError::Constraint("UNIQUE".into())));
-    matches!(
+    assert!(matches!(
         constraint.classify(),
         SqliteOutcomeClass::Fatal(SqliteFatalReason::Constraint(_))
-    )
-    .then_some(())
-    .expect("Constraint → Fatal(Constraint)");
+    ));
 
     let bridge_full: SqliteCallOutcome = CallOutcome::Full;
-    matches!(
+    assert!(matches!(
         bridge_full.classify(),
         SqliteOutcomeClass::Fatal(SqliteFatalReason::BridgeFull)
-    )
-    .then_some(())
-    .expect("bridge Full → Fatal(BridgeFull)");
+    ));
 
     let worker_full: SqliteCallOutcome = CallOutcome::Replied(Err(SqliteError::Full));
-    matches!(
+    assert!(matches!(
         worker_full.classify(),
         SqliteOutcomeClass::Fatal(SqliteFatalReason::Full)
-    )
-    .then_some(())
-    .expect("worker Full → Fatal(Full)");
+    ));
+}
+
+// Classifier on typed outcomes (execute_call / query_call).
+
+#[test]
+fn classify_on_typed_outcomes() {
+    use tina_sqlite_bridge::{
+        SqliteExecutedOutcome, SqliteFatalReason, SqliteOutcomeClass, SqliteOutcomeExt, SqliteRows,
+        SqliteRowsOutcome, SqliteTransientReason,
+    };
+
+    // Executed outcome: success carries u64.
+    let exec_ok: SqliteExecutedOutcome = CallOutcome::Replied(Ok(7));
+    match exec_ok.classify() {
+        SqliteOutcomeClass::Succeeded(rows_changed) => assert_eq!(rows_changed, 7),
+        other => panic!("Succeeded(7) expected, got {other:?}"),
+    }
+
+    let exec_busy: SqliteExecutedOutcome = CallOutcome::Replied(Err(SqliteError::Busy));
+    assert!(matches!(
+        exec_busy.classify(),
+        SqliteOutcomeClass::Transient(SqliteTransientReason::Busy)
+    ));
+
+    let exec_constraint: SqliteExecutedOutcome =
+        CallOutcome::Replied(Err(SqliteError::Constraint("UNIQUE".into())));
+    assert!(matches!(
+        exec_constraint.classify(),
+        SqliteOutcomeClass::Fatal(SqliteFatalReason::Constraint(_))
+    ));
+
+    // Rows outcome: success carries SqliteRows.
+    let q_ok: SqliteRowsOutcome = CallOutcome::Replied(Ok(SqliteRows {
+        columns: vec!["x".into()],
+        rows: vec![vec![SqliteValue::Integer(1)]],
+    }));
+    match q_ok.classify() {
+        SqliteOutcomeClass::Succeeded(rows) => {
+            assert_eq!(rows.columns, vec!["x".to_string()]);
+            assert_eq!(rows.len(), 1);
+        }
+        other => panic!("Succeeded(rows) expected, got {other:?}"),
+    }
+
+    let q_bridge_timeout: SqliteRowsOutcome = CallOutcome::Timeout;
+    assert!(matches!(
+        q_bridge_timeout.classify(),
+        SqliteOutcomeClass::Transient(SqliteTransientReason::BridgeTimeout)
+    ));
+}
+
+// SqliteRows::row / Row::col / Row::by_name accessors.
+
+#[test]
+fn row_accessors_borrow_cells_and_resolve_by_name() {
+    use tina_sqlite_bridge::SqliteRows;
+
+    let rows = SqliteRows {
+        columns: vec!["a".into(), "b".into(), "c".into()],
+        rows: vec![
+            vec![
+                SqliteValue::Integer(10),
+                SqliteValue::Text("hi".into()),
+                SqliteValue::Null,
+            ],
+            vec![
+                SqliteValue::Integer(20),
+                SqliteValue::Text("bye".into()),
+                SqliteValue::Real(0.5),
+            ],
+        ],
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(!rows.is_empty());
+    assert!(rows.row(2).is_none());
+
+    let r0 = rows.row(0).expect("row 0");
+    assert_eq!(r0.len(), 3);
+    assert_eq!(r0.col(0).and_then(|c| c.as_i64()), Some(10));
+    assert_eq!(r0.by_name("b").and_then(|c| c.as_text()), Some("hi"));
+    assert!(r0.by_name("c").map(|c| c.is_null()).unwrap_or(false));
+    assert!(r0.by_name("missing").is_none());
+
+    let collected: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.by_name("a").and_then(|c| c.as_i64()))
+        .collect();
+    assert_eq!(collected, vec![10, 20]);
+}
+
+// SqliteValue: more From conversions and consuming accessors.
+
+#[test]
+fn value_into_text_and_into_blob_take_ownership() {
+    let t = SqliteValue::Text("owned".into());
+    assert_eq!(t.into_text(), Some("owned".to_string()));
+
+    let b = SqliteValue::Blob(vec![1, 2, 3]);
+    assert_eq!(b.into_blob(), Some(vec![1, 2, 3]));
+
+    // Wrong variants return None.
+    assert!(SqliteValue::Integer(1).into_text().is_none());
+    assert!(SqliteValue::Real(0.5).into_blob().is_none());
+}
+
+#[test]
+fn value_from_extra_types() {
+    // Integer widths.
+    assert_eq!(SqliteValue::from(7_i32), SqliteValue::Integer(7));
+    assert_eq!(SqliteValue::from(7_i16), SqliteValue::Integer(7));
+    assert_eq!(SqliteValue::from(7_i8), SqliteValue::Integer(7));
+    assert_eq!(SqliteValue::from(7_u32), SqliteValue::Integer(7));
+    assert_eq!(SqliteValue::from(7_u16), SqliteValue::Integer(7));
+    assert_eq!(SqliteValue::from(7_u8), SqliteValue::Integer(7));
+
+    // u64 documented saturation: u64::MAX → -1 (bit pattern preserved).
+    assert_eq!(SqliteValue::from(u64::MAX), SqliteValue::Integer(-1));
+
+    // f32 widens.
+    assert_eq!(SqliteValue::from(0.5_f32), SqliteValue::Real(0.5));
+
+    // bool → 0/1.
+    assert_eq!(SqliteValue::from(false), SqliteValue::Integer(0));
+    assert_eq!(SqliteValue::from(true), SqliteValue::Integer(1));
+
+    // &[u8] and array-ref blobs.
+    let slice: &[u8] = &[1, 2, 3];
+    assert_eq!(SqliteValue::from(slice), SqliteValue::Blob(vec![1, 2, 3]));
+    assert_eq!(
+        SqliteValue::from(b"\x00\xff"),
+        SqliteValue::Blob(vec![0, 0xff])
+    );
+
+    // Option<T> → Null on None, value on Some.
+    let none_i: Option<i64> = None;
+    assert_eq!(SqliteValue::from(none_i), SqliteValue::Null);
+    let some_i: Option<i64> = Some(42);
+    assert_eq!(SqliteValue::from(some_i), SqliteValue::Integer(42));
 }

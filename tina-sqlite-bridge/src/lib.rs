@@ -20,9 +20,7 @@
 //!
 //! use tina::prelude::*;
 //! use tina_runtime::{CallOutcome, RuntimeCall};
-//! use tina_sqlite_bridge::{
-//!     SqliteAddress, SqliteExecutedOutcome, SqliteRequest, execute_call,
-//! };
+//! use tina_sqlite_bridge::{SqliteAddress, SqliteExecutedOutcome, execute_call};
 //!
 //! enum AppMsg {
 //!     Start,
@@ -47,7 +45,8 @@
 //!         match msg {
 //!             AppMsg::Start => execute_call(
 //!                 self.db,
-//!                 SqliteRequest::execute("INSERT INTO t (x) VALUES (?)").param(7_i64),
+//!                 "INSERT INTO t (x) VALUES (?)",
+//!                 vec![7.into()],
 //!                 Duration::from_secs(2),
 //!             )
 //!             .reply(AppMsg::DbDone),
@@ -125,7 +124,7 @@ mod types;
 mod worker;
 
 pub use helpers::{
-    ExecuteCall, QueryCall, SqliteAddress, SqliteCallOutcome, SqliteExecutedOutcome,
+    ExecuteCall, QueryCall, Row, SqliteAddress, SqliteCallOutcome, SqliteExecutedOutcome,
     SqliteFatalReason, SqliteOutcomeClass, SqliteOutcomeExt, SqliteResult, SqliteRows,
     SqliteRowsOutcome, SqliteTransientReason, execute_call, query_call, send_request,
 };

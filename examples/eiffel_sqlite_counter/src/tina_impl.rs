@@ -14,8 +14,8 @@ use rusqlite::{Connection, params};
 use tina::prelude::*;
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
 use tina_sqlite_bridge::{
-    SqliteAddress, SqliteCloser, SqliteConfig, SqliteExecutedOutcome, SqliteRequest,
-    SqliteRowsOutcome, SqliteWorker, execute_call, query_call,
+    SqliteAddress, SqliteCloser, SqliteConfig, SqliteExecutedOutcome, SqliteRowsOutcome,
+    SqliteWorker, execute_call, query_call,
 };
 
 use crate::{INCREMENTS, Report};
@@ -54,7 +54,8 @@ impl Isolate for Driver {
         match msg {
             DriverMsg::Step => execute_call(
                 self.db,
-                SqliteRequest::execute("UPDATE counter SET value = value + 1 WHERE id = 0"),
+                "UPDATE counter SET value = value + 1 WHERE id = 0",
+                vec![],
                 self.timeout,
             )
             .reply(DriverMsg::Stepped),
@@ -77,18 +78,19 @@ impl Isolate for Driver {
             },
             DriverMsg::Finalize => query_call(
                 self.db,
-                SqliteRequest::query_rows("SELECT value FROM counter WHERE id = 0", 1),
+                "SELECT value FROM counter WHERE id = 0",
+                vec![],
+                1,
                 self.timeout,
             )
             .reply(DriverMsg::Finalized),
             DriverMsg::Finalized(outcome) => {
                 match outcome {
                     CallOutcome::Replied(Ok(rows)) => {
-                        if let Some(row) = rows.rows.into_iter().next() {
-                            if let Some(v) = row.first().and_then(|c| c.as_i64()) {
-                                self.report.final_value = v as u64;
-                                self.report.exit_clean = true;
-                            }
+                        if let Some(v) = rows.row(0).and_then(|r| r.col(0)).and_then(|c| c.as_i64())
+                        {
+                            self.report.final_value = u64::try_from(v).unwrap_or(0);
+                            self.report.exit_clean = true;
                         }
                     }
                     other => {
