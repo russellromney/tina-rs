@@ -304,7 +304,7 @@ where
     /// returned address through `try_send` requires `M: Send` (the
     /// runtime's send surface enforces it independently).
     ///
-    /// Mirrors [`MultiShardRuntime::register_reply_adapter_on`]
+    /// Mirrors [`crate::MultiShardRuntime::register_reply_adapter_on`]
     /// (explicit-step) and `MultiShardSimulator::register_reply_adapter_on`
     /// (in `tina-sim`). Bound lists are matched to each runtime's
     /// lower-level `register_with_capacity_on`; mirror changes across
