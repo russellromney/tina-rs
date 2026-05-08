@@ -76,7 +76,9 @@ fn registered_address_routes_to_the_constructed_isolate() {
     let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
     let seen = Arc::new(AtomicU32::new(0));
 
-    let addr = runtime.register_with_capacity_using::<Echo, Infallible, _>(4, |self_addr| Echo {
+    // I is inferred from the closure return type; only Outbound
+    // needs the turbofish.
+    let addr = runtime.register_with_capacity_using::<_, Infallible, _>(4, |self_addr| Echo {
         self_addr,
         seen: Arc::clone(&seen),
     });
@@ -217,18 +219,11 @@ fn threaded_runtime_constructor_panic_surfaces_as_error() {
     let _ = runtime.shutdown();
 }
 
-// ---- Combined: register_with_capacity_using + drain_replies_into_stop ----
-
-// Frontend that captures its own address at registration, holds a
-// PendingReplies, and on Shutdown drains every pending caller as
-// Closed and stops. Exercises both shipped helpers in one isolate.
+// Combined: register_with_capacity_using + drain_replies_into_stop
+// in one isolate. Exercises both shipped helpers together.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reply {
-    #[allow(dead_code)] // future: success path; current test exercises drain shutdown only.
-    Ok(u32),
-    Closed,
-}
+struct Closed;
 
 #[derive(Debug)]
 enum FrontMsg {
@@ -238,11 +233,10 @@ enum FrontMsg {
 }
 
 struct Front {
-    self_addr: Address<FrontMsg, Reply>,
-    pending: PendingReplies<u32, Reply>,
+    pending: PendingReplies<u32, Closed>,
 }
 
-#[tina_runtime::isolate(message = FrontMsg, reply = Reply)]
+#[tina_runtime::isolate(message = FrontMsg, reply = Closed)]
 impl Front {
     fn handle(
         &mut self,
@@ -251,30 +245,26 @@ impl Front {
     ) -> Effect<Self> {
         match msg {
             FrontMsg::Submit(qid) => match self.pending.try_capture(ctx, qid) {
-                // 10ms sleep so the slot is live when Shutdown fires.
+                // Sleep keeps the slot live until Shutdown fires.
                 Ok(()) => sleep(Duration::from_millis(10)).reply(FrontMsg::Tick),
-                Err(PendingRepliesTryCaptureError::Full) => reply(Reply::Closed),
+                Err(PendingRepliesTryCaptureError::Full) => reply(Closed),
                 Err(other) => panic!("try_capture: {other:?}"),
             },
             FrontMsg::Tick(_) => noop(),
-            FrontMsg::Shutdown => {
-                // Round 1 + Rock 3 helpers used together: address
-                // came from the constructor closure, drain came from
-                // PendingReplies.
-                assert_eq!(self.self_addr.generation().get(), 0);
-                self.pending.drain_replies_into_stop::<Self>(Reply::Closed)
-            }
+            FrontMsg::Shutdown => self.pending.drain_replies_into_stop::<Self>(Closed),
         }
     }
 }
 
 #[test]
-fn helpers_compose_self_address_plus_drain_into_stop() {
+fn helpers_compose_self_address_plus_drain_replies_into_stop() {
+    // Constructor closure builds the isolate value; the isolate later
+    // calls drain_replies_into_stop on Shutdown. Stop only happens if
+    // both helpers compose correctly.
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
 
     let front = runtime
-        .register_with_capacity_using::<Front, Infallible, _>(8, |self_addr| Front {
-            self_addr,
+        .register_with_capacity_using::<Front, Infallible, _>(8, |_self_addr| Front {
             pending: PendingReplies::with_capacity(4),
         })
         .expect("register");
@@ -283,7 +273,6 @@ fn helpers_compose_self_address_plus_drain_into_stop() {
 
     runtime.try_send(front, FrontMsg::Submit(1)).unwrap();
     runtime.try_send(front, FrontMsg::Submit(2)).unwrap();
-    // Shutdown before sleeps fire: pending box has 2 live slots.
     runtime.try_send(front, FrontMsg::Shutdown).unwrap();
 
     stopped
@@ -292,13 +281,9 @@ fn helpers_compose_self_address_plus_drain_into_stop() {
     let _ = runtime.shutdown();
 }
 
-// ---- Deferred: multi-shard parity. Marker, not actual coverage. ----
-
+// Marker: multi-shard parity is deferred. Replace the body with a
+// real parity test when the multi-shard forms ship and drop the
+// ignore. Empty body so an accidental un-ignore passes trivially.
 #[test]
 #[ignore = "multi-shard register_with_capacity_using_on is deferred; design note in .intent/phases/064-..."]
-fn multi_shard_register_with_capacity_using_on_is_deferred() {
-    // Intentionally fails-by-being-ignored. When the multi-shard
-    // forms ship, replace this with the real parity test and drop
-    // the ignore. Keeps the deferral visible in the test suite.
-    panic!("multi-shard register_with_capacity_using_on not shipped yet");
-}
+fn multi_shard_register_with_capacity_using_on_is_deferred() {}

@@ -401,31 +401,14 @@ where
         out
     }
 
-    /// Drain every live slot and produce one [`Effect::ReplyTo`] per
-    /// slot, each carrying the same `value`.
+    /// One [`Effect::ReplyTo`] per live slot, all with the same
+    /// `value`. Slot order follows the internal table; after
+    /// sweep+reuse this diverges from admission order. Closed slots
+    /// present at drain time are drained too — the runtime records
+    /// the resulting rejection. The helper does not pre-sweep.
     ///
-    /// Use when the same terminal marker (e.g. `R::Closed`) goes to
-    /// every pending caller. Slots are visited in internal-table
-    /// order, which matches admission order only when the table has
-    /// not been swept and reused; after a sweep, freed positions are
-    /// reused before later still-open positions.
-    ///
-    /// Closed slots (caller went away before reply) are drained too;
-    /// `reply_to` against a Closed slot lands as
-    /// `CallReplyRejected { RequesterClosed }` in the trace. The
-    /// helper does not pre-sweep — it preserves
-    /// [`drain`](Self::drain)'s semantics.
-    ///
-    /// Compile-time typed: a `PendingReplies<K, R>` only produces
-    /// `Effect<I>` when `I::Reply = R`. The caller picks `I` via
-    /// turbofish (`pending.drain_replies::<Self>(R::Closed)`).
-    ///
-    /// No hidden `stop`. Pair with `stop()` or use
-    /// [`drain_replies_into_stop`](Self::drain_replies_into_stop).
-    ///
-    /// Allocates one fresh `Vec<Effect<I>>` of length live-count and
-    /// performs `live - 1` clones of `value` (the last slot consumes
-    /// `value` directly).
+    /// `PendingReplies<K, R>` only produces `Effect<I>` when
+    /// `I::Reply = R`; pick `I` via turbofish. No hidden `stop`.
     ///
     /// ```compile_fail
     /// # use tina_runtime::PendingReplies;
@@ -457,8 +440,9 @@ where
         I: Isolate<Reply = R>,
         R: Clone,
     {
-        let live = self.len();
-        let mut out = Vec::with_capacity(live);
+        let mut out = Vec::with_capacity(self.slots.len());
+        // R rides in `taken` so the last slot consumes `value` without
+        // cloning. K drops per iteration with `entry`.
         let mut taken: Option<DeferredReply<R>> = None;
         for slot in self.slots.iter_mut() {
             if let Some(entry) = slot.take() {
@@ -474,18 +458,31 @@ where
         out
     }
 
-    /// Drain every live slot, computing the reply value per key.
+    /// Per-key reply form of [`drain_replies`](Self::drain_replies).
+    /// Use when the value depends on `K` or `R: !Clone`.
     ///
-    /// Use when the per-caller reply depends on the key, or when `R`
-    /// is not `Clone`. Allocates one fresh `Vec<Effect<I>>` of length
-    /// live-count.
+    /// ```compile_fail
+    /// # use tina_runtime::PendingReplies;
+    /// # use tina::{Effect, Isolate, Outbound, SingleShard, Context, noop};
+    /// # struct B;
+    /// # impl Isolate for B {
+    /// #     type Message=(); type Reply=u64;
+    /// #     type Send=Outbound<std::convert::Infallible>;
+    /// #     type Spawn=std::convert::Infallible;
+    /// #     type Call=std::convert::Infallible;
+    /// #     type Shard=SingleShard;
+    /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
+    /// # }
+    /// fn _no(b: &mut PendingReplies<u32, u32>) -> Vec<Effect<B>> {
+    ///     b.drain_replies_with(|_k| 0u32)
+    /// }
+    /// ```
     pub fn drain_replies_with<I, F>(&mut self, mut f: F) -> Vec<Effect<I>>
     where
         I: Isolate<Reply = R>,
         F: FnMut(K) -> R,
     {
-        let live = self.len();
-        let mut out = Vec::with_capacity(live);
+        let mut out = Vec::with_capacity(self.slots.len());
         for slot in self.slots.iter_mut() {
             if let Some(entry) = slot.take() {
                 out.push(reply_to::<I>(entry.reply, f(entry.key)));
@@ -495,8 +492,24 @@ where
     }
 
     /// [`drain_replies`](Self::drain_replies) wrapped in
-    /// [`Effect::Batch`]. Returns [`Effect::Noop`] when the box is
-    /// empty.
+    /// [`Effect::Batch`]; [`Effect::Noop`] on empty box.
+    ///
+    /// ```compile_fail
+    /// # use tina_runtime::PendingReplies;
+    /// # use tina::{Effect, Isolate, Outbound, SingleShard, Context, noop};
+    /// # struct B;
+    /// # impl Isolate for B {
+    /// #     type Message=(); type Reply=u64;
+    /// #     type Send=Outbound<std::convert::Infallible>;
+    /// #     type Spawn=std::convert::Infallible;
+    /// #     type Call=std::convert::Infallible;
+    /// #     type Shard=SingleShard;
+    /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
+    /// # }
+    /// fn _no(b: &mut PendingReplies<u32, u32>) -> Effect<B> {
+    ///     b.drain_replies_into_effect(0u32)
+    /// }
+    /// ```
     pub fn drain_replies_into_effect<I>(&mut self, value: R) -> Effect<I>
     where
         I: Isolate<Reply = R>,
@@ -511,11 +524,30 @@ where
     }
 
     /// [`drain_replies`](Self::drain_replies) plus a trailing
-    /// [`stop()`]. The method name says `stop` on purpose — nothing
-    /// else in this module appends `stop()` for you.
+    /// [`stop()`]. Method name says `stop` on purpose — nothing
+    /// else in this module appends one for you.
     ///
-    /// Empty box returns plain [`Effect::Stop`] (not a one-element
-    /// batch). The caller still stops as advertised.
+    /// Bimodal: empty box → plain [`Effect::Stop`]; non-empty →
+    /// [`Effect::Batch`] of `N` replies + [`Effect::Stop`]. A handler
+    /// that just returns the effect sees no difference; a caller
+    /// that pattern-matches must handle both.
+    ///
+    /// ```compile_fail
+    /// # use tina_runtime::PendingReplies;
+    /// # use tina::{Effect, Isolate, Outbound, SingleShard, Context, noop};
+    /// # struct B;
+    /// # impl Isolate for B {
+    /// #     type Message=(); type Reply=u64;
+    /// #     type Send=Outbound<std::convert::Infallible>;
+    /// #     type Spawn=std::convert::Infallible;
+    /// #     type Call=std::convert::Infallible;
+    /// #     type Shard=SingleShard;
+    /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
+    /// # }
+    /// fn _no(b: &mut PendingReplies<u32, u32>) -> Effect<B> {
+    ///     b.drain_replies_into_stop(0u32)
+    /// }
+    /// ```
     pub fn drain_replies_into_stop<I>(&mut self, value: R) -> Effect<I>
     where
         I: Isolate<Reply = R>,
@@ -530,7 +562,24 @@ where
     }
 
     /// [`drain_replies_with`](Self::drain_replies_with) wrapped in
-    /// [`Effect::Batch`]. Empty box returns [`Effect::Noop`].
+    /// [`Effect::Batch`]; [`Effect::Noop`] on empty box.
+    ///
+    /// ```compile_fail
+    /// # use tina_runtime::PendingReplies;
+    /// # use tina::{Effect, Isolate, Outbound, SingleShard, Context, noop};
+    /// # struct B;
+    /// # impl Isolate for B {
+    /// #     type Message=(); type Reply=u64;
+    /// #     type Send=Outbound<std::convert::Infallible>;
+    /// #     type Spawn=std::convert::Infallible;
+    /// #     type Call=std::convert::Infallible;
+    /// #     type Shard=SingleShard;
+    /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
+    /// # }
+    /// fn _no(b: &mut PendingReplies<u32, u32>) -> Effect<B> {
+    ///     b.drain_replies_with_into_effect(|_k| 0u32)
+    /// }
+    /// ```
     pub fn drain_replies_with_into_effect<I, F>(&mut self, f: F) -> Effect<I>
     where
         I: Isolate<Reply = R>,
@@ -545,7 +594,25 @@ where
     }
 
     /// [`drain_replies_with`](Self::drain_replies_with) plus a
-    /// trailing [`stop()`]. Empty box returns plain [`Effect::Stop`].
+    /// trailing [`stop()`]. Same bimodal contract as
+    /// [`drain_replies_into_stop`](Self::drain_replies_into_stop).
+    ///
+    /// ```compile_fail
+    /// # use tina_runtime::PendingReplies;
+    /// # use tina::{Effect, Isolate, Outbound, SingleShard, Context, noop};
+    /// # struct B;
+    /// # impl Isolate for B {
+    /// #     type Message=(); type Reply=u64;
+    /// #     type Send=Outbound<std::convert::Infallible>;
+    /// #     type Spawn=std::convert::Infallible;
+    /// #     type Call=std::convert::Infallible;
+    /// #     type Shard=SingleShard;
+    /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
+    /// # }
+    /// fn _no(b: &mut PendingReplies<u32, u32>) -> Effect<B> {
+    ///     b.drain_replies_with_into_stop(|_k| 0u32)
+    /// }
+    /// ```
     pub fn drain_replies_with_into_stop<I, F>(&mut self, f: F) -> Effect<I>
     where
         I: Isolate<Reply = R>,
@@ -852,10 +919,13 @@ mod pending_replies_tests {
         box_.try_insert(3, fake_slot_closed(30)).unwrap();
 
         let effects: Vec<tina::Effect<TestIso>> = box_.drain_replies(0);
+        let mut slot_ids: Vec<u64> =
+            effects.iter().map(|e| slot_id_of(e).unwrap()).collect();
+        slot_ids.sort();
         assert_eq!(
-            effects.len(),
-            3,
-            "closed slot present at drain time must still produce a ReplyTo"
+            slot_ids,
+            vec![10, 20, 30],
+            "closed slot 30 must appear in the drained effects"
         );
         assert!(box_.is_empty());
     }

@@ -109,7 +109,7 @@ pub fn run() -> anyhow::Result<Report> {
         .collect();
 
     let coord_addr = runtime
-        .register_with_capacity_using::<Coordinator, Infallible, _>(
+        .register_with_capacity_using::<_, Infallible, _>(
             // Mailbox sized for `Start` + every worker's `WorkerDone`.
             (WORKER_COUNT + 4) as usize,
             move |self_addr| Coordinator {

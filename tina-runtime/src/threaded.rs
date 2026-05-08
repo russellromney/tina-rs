@@ -241,11 +241,11 @@ where
 
     /// Threaded mirror of [`Runtime::register_with_capacity_using`].
     ///
-    /// Constructor runs on the worker thread, not the caller; caller blocks
-    /// on the worker's reply. Heavy `construct` work blocks every other
-    /// isolate on the shard for the duration. Same honesty rules as the
-    /// explicit-step form. `Ctor: Send + 'static` so the closure ships
-    /// across the worker command channel.
+    /// Constructor runs on the worker thread; caller blocks on the
+    /// worker's reply. Heavy work in `construct` blocks every other
+    /// isolate on the shard for the duration — build the value before
+    /// calling. `Ctor: Send + 'static` so the closure ships across the
+    /// worker command channel.
     #[allow(private_bounds)]
     pub fn register_with_capacity_using<I, Outbound, Ctor>(
         &self,

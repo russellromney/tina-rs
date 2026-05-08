@@ -1614,29 +1614,37 @@ fn scatter_gather_records_closed_when_target_isolate_has_stopped() {
     );
 }
 
-// Focused: register_reply_adapter_on returns a usable Address<M> on
-// the requested shard and the adapter actually translates M -> T.
-//
-// Setup: a Sink<CounterMsg> on shard 7. An adapter on shard 31 that
-// takes u32 and converts to CounterMsg via a local From impl. Send
-// a u32 to the adapter; expect the sink to see a CounterMsg.
+// Focused: register_reply_adapter_on returns Address<M> on the
+// chosen shard and translates M -> T via the From impl.
+
+#[derive(Debug)]
+enum SinkMsg {
+    Add(u32),
+}
+
+impl From<u32> for SinkMsg {
+    fn from(v: u32) -> Self {
+        SinkMsg::Add(v)
+    }
+}
 
 #[derive(Debug, Default)]
-struct CounterCountSink {
+struct AddSink {
     seen: Rc<RefCell<u32>>,
 }
 
-impl Isolate for CounterCountSink {
+impl Isolate for AddSink {
     tina::isolate_types! {
-        message: u64,
+        message: SinkMsg,
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<u64>,
+        call: RuntimeCall<SinkMsg>,
         shard: AppShard,
     }
-    fn handle(&mut self, msg: u64, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
-        *self.seen.borrow_mut() += msg as u32;
+    fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        let SinkMsg::Add(v) = msg;
+        *self.seen.borrow_mut() += v;
         noop()
     }
 }
@@ -1646,17 +1654,16 @@ fn register_reply_adapter_on_returns_address_on_chosen_shard_and_translates() {
     let mut runtime = MultiShardRuntime::new([AppShard(7), AppShard(31)], TestMailboxFactory);
 
     let seen = Rc::new(RefCell::new(0u32));
-    let sink = runtime.register_with_capacity_on::<CounterCountSink, Infallible>(
+    let sink = runtime.register_with_capacity_on::<AddSink, Infallible>(
         ShardId::new(7),
-        CounterCountSink {
+        AddSink {
             seen: Rc::clone(&seen),
         },
         16,
     );
 
-    // Register the adapter on a different shard than the target.
     let bridge =
-        runtime.register_reply_adapter_on::<u32, u64>(ShardId::new(31), sink, 8);
+        runtime.register_reply_adapter_on::<u32, SinkMsg>(ShardId::new(31), sink, 8);
 
     assert_eq!(bridge.shard(), ShardId::new(31));
 
