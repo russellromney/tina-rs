@@ -4,6 +4,38 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 065 Observability First Form
+
+- Added `tina-tracing`: an adapter crate that turns `RuntimeEvent`s and
+  `LiveTopologyReport`s into structured `tracing::Event`s under stable
+  targets (`tina_runtime::trace`, `tina_runtime::live`) without flattening
+  typed reasons (`Full`, `Closed`, `CallerClosed`, `ReplyPathFull`,
+  `MailboxFull`, `BudgetExceeded`, …).
+- Added a live `TraceObserver` hook on `tina-runtime` and `tina-sim`: one
+  synchronous in-line callback fired before retention, wired through
+  `ThreadedRuntime`, `ThreadedMultiShardRuntime`, `LocalSystem*Builder`,
+  and the `Simulator` setter. `ThreadedRuntimeConfig` stays pure data
+  (`Copy + Eq`); the observer is a separate constructor parameter.
+- Added byte-identical-trace property tests on both runtime and simulator
+  proving a noop observer leaves the deterministic event record
+  unchanged. `TraceRetention::Off` plus an observer is the new
+  stream-only mode.
+- Added bridge tracing emission across all five Tina bridges behind an
+  optional `tracing` Cargo feature: `tina-sqlite-bridge`,
+  `tina-tokio-bridge`, `tina-tower-bridge`, `tina-reqwest-bridge`, plus
+  the existing `tina-rpc-tokio` spans. Targets follow the
+  `tina_<bridge>.bridge[.call]` shape; shared `reason` strings (`Full`,
+  `Closed`, `Timeout`) reuse runtime vocabulary where the concept
+  matches; bridge-specific fields stay bridge-shaped (`request_kind`,
+  `method`, `status`, `outcome`, `rows_changed`, `row_count`,
+  `elapsed_ms`, `scope`, `detail`).
+- Added `docs/tina-user-guide/19-tracing.md` with the field/level/reason
+  vocabulary table for runtime and bridge events; one runnable example
+  (`eiffel_tracing_demo`) wires the live observer end-to-end.
+- Left OpenTelemetry / Prometheus mappers, span timing for runtime
+  calls, cross-bridge correlator alignment, and `tina-rpc-tokio`
+  vocabulary harmonisation as future observability work.
+
 ### Phase 055 Codebase Module Split
 
 - Split the giant runtime, driver, simulator, and support files into smaller
