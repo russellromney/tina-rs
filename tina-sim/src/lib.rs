@@ -133,6 +133,10 @@ where
     last_checker_failure: Option<CheckerFailure>,
     deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
     promoted_slots: deferred::PromotedSlots,
+    /// Bounded ring of recently-cancelled `CallId`s. Mirrors the
+    /// runtime so late deferred replies surface as `CallerCancelled`
+    /// even when the slot is captured *after* cancel runs.
+    cancelled_calls: std::collections::VecDeque<CallId>,
     /// Live trace observer. Fires before in-memory push so DST replay
     /// sees the same stream a live operator does.
     trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
@@ -190,6 +194,7 @@ where
             last_checker_failure: None,
             deferred_registry: std::rc::Rc::new(DeferredSlotRegistry::new()),
             promoted_slots: deferred::PromotedSlots::default(),
+            cancelled_calls: std::collections::VecDeque::with_capacity(64),
             trace_observer: None,
         }
     }
@@ -739,12 +744,17 @@ where
                                 cause,
                                 CallOutcome::Replied(reply),
                             ) {
+                                let reason = if self.was_recently_cancelled(call_id) {
+                                    CallReplyRejectedReason::CallerCancelled
+                                } else {
+                                    CallReplyRejectedReason::NoPendingCall
+                                };
                                 self.push_event(
                                     isolate_id,
                                     Some(cause),
                                     RuntimeEventKind::CallReplyRejected {
                                         call_id,
-                                        reason: CallReplyRejectedReason::NoPendingCall,
+                                        reason,
                                     },
                                 );
                             }
@@ -861,6 +871,11 @@ where
                         },
                     );
                 } else {
+                    let reason = if self.was_recently_cancelled(record.call_id) {
+                        tina_runtime::DeferredReplyRejectedReason::CallerCancelled
+                    } else {
+                        tina_runtime::DeferredReplyRejectedReason::CallerClosed
+                    };
                     record.shared.set_state(tina::DeferredSlotState::Closed);
                     self.push_event(
                         isolate_id,
@@ -868,7 +883,7 @@ where
                         RuntimeEventKind::DeferredReplyRejected {
                             slot_id: record.slot_id,
                             call_id: record.call_id,
-                            reason: tina_runtime::DeferredReplyRejectedReason::CallerClosed,
+                            reason,
                         },
                     );
                 }
@@ -3746,6 +3761,17 @@ where
         );
     }
 
+    fn record_cancelled_call(&mut self, call_id: CallId) {
+        if self.cancelled_calls.len() == 64 {
+            self.cancelled_calls.pop_front();
+        }
+        self.cancelled_calls.push_back(call_id);
+    }
+
+    fn was_recently_cancelled(&self, call_id: CallId) -> bool {
+        self.cancelled_calls.iter().any(|c| *c == call_id)
+    }
+
     /// Cancels every pending isolate call whose caller is the stopping
     /// isolate. Same shape as the runtime helper.
     fn cancel_pending_isolate_calls_for_owner(
@@ -3754,32 +3780,35 @@ where
         owner_generation: AddressGeneration,
         _stopped_cause: tina_runtime::CauseId,
     ) {
-        let mut i = 0;
-        while i < self.pending_isolate_calls.len() {
-            if self.pending_isolate_calls[i].requester.isolate == owner_isolate
-                && self.pending_isolate_calls[i].requester.generation == owner_generation
-            {
-                let mut entry = self.pending_isolate_calls.remove(i);
-                let original_cause = entry.cause;
-                let _ = entry.translator.take();
-                if let Some(shared) = &entry.handle_shared {
-                    shared.set_state(tina::CallHandleState::Cancelled);
-                }
-                self.close_deferred_slot_for_call_with_reason(
-                    entry.call_id,
-                    tina_runtime::DeferredReplyRejectedReason::CallerCancelled,
-                );
-                self.push_event(
-                    owner_isolate,
-                    Some(original_cause),
-                    RuntimeEventKind::CallCancelled {
-                        call_id: entry.call_id,
-                        cause: tina::CancelCause::OwnerStopped,
-                    },
-                );
-            } else {
-                i += 1;
+        // Single-pass partition: O(n) over pending calls.
+        let original = std::mem::take(&mut self.pending_isolate_calls);
+        let (mut owned, kept): (Vec<_>, Vec<_>) =
+            original.into_iter().partition(|entry| {
+                entry.requester.isolate == owner_isolate
+                    && entry.requester.generation == owner_generation
+            });
+        self.pending_isolate_calls = kept;
+        for entry in owned.iter_mut() {
+            self.record_cancelled_call(entry.call_id);
+        }
+        for mut entry in owned {
+            let original_cause = entry.cause;
+            let _ = entry.translator.take();
+            if let Some(shared) = &entry.handle_shared {
+                shared.set_state(tina::CallHandleState::Cancelled);
             }
+            self.close_deferred_slot_for_call_with_reason(
+                entry.call_id,
+                tina_runtime::DeferredReplyRejectedReason::CallerCancelled,
+            );
+            self.push_event(
+                owner_isolate,
+                Some(original_cause),
+                RuntimeEventKind::CallCancelled {
+                    call_id: entry.call_id,
+                    cause: tina::CancelCause::OwnerStopped,
+                },
+            );
         }
     }
 
@@ -3825,6 +3854,7 @@ where
                             let original_cause = entry.cause;
                             let _ = entry.translator.take();
                             handle_shared.set_state(tina::CallHandleState::Cancelled);
+                            self.record_cancelled_call(call_id);
                             self.close_deferred_slot_for_call_with_reason(
                                 call_id,
                                 tina_runtime::DeferredReplyRejectedReason::CallerCancelled,
@@ -4564,12 +4594,17 @@ where
             RemoteCallOutcome::Closed => CallOutcome::Closed,
         };
         if !self.complete_isolate_call(reply.call_id, reply.cause, outcome) {
+            let reason = if self.was_recently_cancelled(reply.call_id) {
+                CallReplyRejectedReason::CallerCancelled
+            } else {
+                CallReplyRejectedReason::NoPendingCall
+            };
             self.push_event(
                 reply.requester.isolate,
                 Some(reply.cause),
                 RuntimeEventKind::CallReplyRejected {
                     call_id: reply.call_id,
-                    reason: CallReplyRejectedReason::NoPendingCall,
+                    reason,
                 },
             );
         }

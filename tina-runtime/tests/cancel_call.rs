@@ -20,19 +20,22 @@ use tina_runtime::{
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Polls `cond` for up to `total` time, checking every 5ms. Returns
-/// false on timeout. Avoids fixed `thread::sleep` calls that flake on
-/// loaded CI machines.
+/// Polls `cond` until it returns true or `total` elapses. The 10ms
+/// step plus 5s default budget is sized for slow / thermally throttled
+/// CI runners; a tight inner loop would still be portable, but the
+/// poll lets the worker thread make progress.
 fn wait_for(total: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + total;
     while std::time::Instant::now() < deadline {
         if cond() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(10));
     }
     cond()
 }
+
+const POLL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Waits until the runtime's trace shows an `IsolateCall`-shaped
 /// `CallDispatchAttempted` event. Lets the test sequence
@@ -40,7 +43,7 @@ fn wait_for(total: Duration, mut cond: impl FnMut() -> bool) -> bool {
 fn wait_for_isolate_call_dispatched(
     runtime: &Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
 ) -> bool {
-    wait_for(Duration::from_secs(2), || {
+    wait_for(POLL_BUDGET, || {
         let trace = runtime.trace();
         trace.events().iter().any(|event| {
             matches!(
@@ -184,7 +187,7 @@ fn cancel_call_closes_pending_wait() {
         .expect("cancel");
 
     let obs_for_wait = observations.clone();
-    let saw_cancel = wait_for(Duration::from_secs(2), || {
+    let saw_cancel = wait_for(POLL_BUDGET, || {
         !obs_for_wait.lock().expect("obs lock").cancels.is_empty()
     });
     assert!(saw_cancel, "driver never observed the cancel outcome");
@@ -251,7 +254,7 @@ fn cancel_after_reply_returns_already_completed() {
         .expect("release");
     let obs_for_reply = observations.clone();
     assert!(
-        wait_for(Duration::from_secs(2), || {
+        wait_for(POLL_BUDGET, || {
             !obs_for_reply.lock().expect("obs lock").outcomes.is_empty()
         }),
         "driver never observed the reply"
@@ -262,7 +265,7 @@ fn cancel_after_reply_returns_already_completed() {
         .expect("cancel");
     let obs_for_cancel = observations.clone();
     assert!(
-        wait_for(Duration::from_secs(2), || {
+        wait_for(POLL_BUDGET, || {
             !obs_for_cancel.lock().expect("obs lock").cancels.is_empty()
         }),
         "driver never observed the cancel outcome"

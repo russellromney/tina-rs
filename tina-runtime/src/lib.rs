@@ -118,7 +118,8 @@ pub use call::{
     TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
     TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
     TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, call_with_handle, cancel_call, dns_lookup, file_close, file_create,
+    UdpSocketId, call, call_handle_call_id, call_with_handle, cancel_call, dns_lookup, file_close,
+    file_create,
     file_fsync, file_open, file_read, file_read_at, file_size, file_write, file_write_at,
     journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file,
     rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load,
@@ -232,7 +233,15 @@ where
     deferred_registry: Rc<DeferredSlotRegistry>,
     /// Promoted-slot table. Owned solely by the runtime.
     promoted_slots: deferred::PromotedSlots,
+    /// Bounded ring of recently-cancelled `CallId`s. Late callee
+    /// replies for these settle as `CallerCancelled` instead of the
+    /// less-specific `CallerClosed` / `NoPendingCall`. Bounded at
+    /// [`CANCELLED_CALL_RING_CAPACITY`] — older entries are evicted,
+    /// at which point fall-through to the generic reason is honest.
+    cancelled_calls: std::collections::VecDeque<CallId>,
 }
+
+const CANCELLED_CALL_RING_CAPACITY: usize = 64;
 
 #[derive(Debug)]
 struct InFlightCall {
@@ -468,6 +477,9 @@ where
             trace_observer: None,
             deferred_registry: Rc::new(DeferredSlotRegistry::new()),
             promoted_slots: deferred::PromotedSlots::default(),
+            cancelled_calls: std::collections::VecDeque::with_capacity(
+                CANCELLED_CALL_RING_CAPACITY,
+            ),
         }
     }
 
@@ -1360,12 +1372,17 @@ where
                                 cause,
                                 CallOutcome::Replied(reply.into_any()),
                             ) {
+                                let reason = if self.was_recently_cancelled(call_id) {
+                                    CallReplyRejectedReason::CallerCancelled
+                                } else {
+                                    CallReplyRejectedReason::NoPendingCall
+                                };
                                 self.push_event(
                                     isolate_id,
                                     Some(cause),
                                     RuntimeEventKind::CallReplyRejected {
                                         call_id,
-                                        reason: CallReplyRejectedReason::NoPendingCall,
+                                        reason,
                                     },
                                 );
                             }
@@ -1489,8 +1506,14 @@ where
                         },
                     );
                 } else {
-                    // pending isolate call gone (e.g. requester
-                    // already closed). Surface as CallerClosed.
+                    // Pending call gone — distinguish "caller
+                    // cancelled the wait" from "caller stopped /
+                    // timed out" using the recently-cancelled ring.
+                    let reason = if self.was_recently_cancelled(record.call_id) {
+                        DeferredReplyRejectedReason::CallerCancelled
+                    } else {
+                        DeferredReplyRejectedReason::CallerClosed
+                    };
                     record.shared.set_state(DeferredSlotState::Closed);
                     self.push_event(
                         isolate_id,
@@ -1498,7 +1521,7 @@ where
                         RuntimeEventKind::DeferredReplyRejected {
                             slot_id: record.slot_id,
                             call_id: record.call_id,
-                            reason: DeferredReplyRejectedReason::CallerClosed,
+                            reason,
                         },
                     );
                 }
@@ -1974,6 +1997,7 @@ where
                             let original_cause = entry.cause;
                             let _ = entry.translator.take();
                             handle_shared.set_state(tina::CallHandleState::Cancelled);
+                            self.record_cancelled_call(call_id);
                             self.close_deferred_slot_for_call_with_reason(
                                 call_id,
                                 trace::DeferredReplyRejectedReason::CallerCancelled,
@@ -2104,34 +2128,37 @@ where
         owner_generation: AddressGeneration,
         _stopped_cause: CauseId,
     ) {
-        let mut i = 0;
-        while i < self.pending_isolate_calls.len() {
-            if self.pending_isolate_calls[i].requester.isolate == owner_isolate
-                && self.pending_isolate_calls[i].requester.generation == owner_generation
-            {
-                let mut entry = self.pending_isolate_calls.remove(i);
-                // Trace cause chains to the original CallDispatchAttempted
-                // (matches CallCompleted/CallFailed convention).
-                let original_cause = entry.cause;
-                let _ = entry.translator.take();
-                if let Some(shared) = &entry.handle_shared {
-                    shared.set_state(tina::CallHandleState::Cancelled);
-                }
-                self.close_deferred_slot_for_call_with_reason(
-                    entry.call_id,
-                    trace::DeferredReplyRejectedReason::CallerCancelled,
-                );
-                self.push_event(
-                    owner_isolate,
-                    Some(original_cause),
-                    RuntimeEventKind::CallCancelled {
-                        call_id: entry.call_id,
-                        cause: tina::CancelCause::OwnerStopped,
-                    },
-                );
-            } else {
-                i += 1;
+        // Single-pass partition: O(n) over pending calls instead of
+        // O(n²) from repeated `Vec::remove`. Important for routers
+        // with many in-flight calls.
+        let original = std::mem::take(&mut self.pending_isolate_calls);
+        let (mut owned, kept): (Vec<_>, Vec<_>) =
+            original.into_iter().partition(|entry| {
+                entry.requester.isolate == owner_isolate
+                    && entry.requester.generation == owner_generation
+            });
+        self.pending_isolate_calls = kept;
+        for entry in owned.iter_mut() {
+            self.record_cancelled_call(entry.call_id);
+        }
+        for mut entry in owned {
+            let original_cause = entry.cause;
+            let _ = entry.translator.take();
+            if let Some(shared) = &entry.handle_shared {
+                shared.set_state(tina::CallHandleState::Cancelled);
             }
+            self.close_deferred_slot_for_call_with_reason(
+                entry.call_id,
+                trace::DeferredReplyRejectedReason::CallerCancelled,
+            );
+            self.push_event(
+                owner_isolate,
+                Some(original_cause),
+                RuntimeEventKind::CallCancelled {
+                    call_id: entry.call_id,
+                    cause: tina::CancelCause::OwnerStopped,
+                },
+            );
         }
     }
 
@@ -2140,6 +2167,20 @@ where
             call_id,
             DeferredReplyRejectedReason::CallerClosed,
         );
+    }
+
+    /// Records `call_id` in the bounded recently-cancelled ring.
+    /// Late replies for these surface as `CallerCancelled` instead of
+    /// the generic `NoPendingCall` / `CallerClosed`.
+    fn record_cancelled_call(&mut self, call_id: CallId) {
+        if self.cancelled_calls.len() == CANCELLED_CALL_RING_CAPACITY {
+            self.cancelled_calls.pop_front();
+        }
+        self.cancelled_calls.push_back(call_id);
+    }
+
+    fn was_recently_cancelled(&self, call_id: CallId) -> bool {
+        self.cancelled_calls.iter().any(|c| *c == call_id)
     }
 
     fn close_deferred_slot_for_call_with_reason(

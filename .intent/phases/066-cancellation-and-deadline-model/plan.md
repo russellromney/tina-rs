@@ -2,11 +2,29 @@
 
 ## Status
 
-- Done: design drafted from Eiffel cancellation/backpressure/pool findings.
+- Done (066A — caller-owned call cancellation):
+  - Rock 2 caller-owned `CallHandle<R>` (`!Clone`, `#[must_use]`, move-only).
+  - Rock 3 `cancel_call(handle).reply(...)`; closes wait, reclaims caller-side
+    capacity, emits `CallCancelled { cause }`. Late callee replies surface as
+    `CallReplyRejected { CallerCancelled }` / `DeferredReplyRejected
+    { CallerCancelled }` via a bounded recently-cancelled ring (capacity 64),
+    not the generic `NoPendingCall` / `CallerClosed`.
+  - Rock 5 owner-stop proactively cancels caller-owned pending calls with
+    `OwnerStopped`. Single-pass `partition`, O(n) over pending calls.
+  - Rock 6 `examples/eiffel_cancellation_chain` rewritten on the new shape;
+    Tina vs Tokio invariants split honestly (Tina lets workers finish + counts
+    rejected late replies; Tokio aborts via `JoinSet::abort_all`).
+  - Simulator parity in `tina-sim`; deterministic tests in
+    `tina-sim/tests/cancel_call.rs` and `tina-runtime/tests/cancel_call.rs`.
+  - Trace/pressure/tracing vocabulary extended (`CallKind::CancelCall`,
+    `PressureSummary::cancelled`, etc.).
 - In progress: none.
-- Open: implement the first cancellation primitive and deadline value.
-- Deferred: external `cancel_isolate`, resource-driver cancellation expansion,
-  fake cancellation of already-accepted foreign work, broad workflow macros.
+- Deferred to follow-up phases:
+  - Rock 1 `Deadline` value.
+  - Rock 4 bounded `PendingCallSet`.
+- Deferred by design: external `cancel_isolate`, resource-driver cancellation
+  expansion, fake cancellation of already-accepted foreign work, broad
+  workflow macros.
 
 ## Goal
 

@@ -189,11 +189,12 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
 
-    // Count worker replies rejected after cancellation — i.e. the
-    // visible truth that workers finished late. Both reply paths
-    // surface the truth: `CallReplyRejected { NoPendingCall }` for
-    // direct `reply(...)` and `DeferredReplyRejected { CallerCancelled }`
-    // for any captured deferred slot.
+    // Count worker replies rejected after cancellation. The runtime
+    // distinguishes "caller cancelled" from "caller closed for other
+    // reasons" via the recently-cancelled ring: a late reply from a
+    // worker whose call was explicitly cancelled lands as
+    // `CallReplyRejected { CallerCancelled }` (direct `reply`) or
+    // `DeferredReplyRejected { CallerCancelled }` (captured slot).
     let trace = runtime.trace();
     let replies_after_cancel = trace
         .events()
@@ -202,12 +203,10 @@ pub fn run() -> anyhow::Result<Report> {
             matches!(
                 event.kind(),
                 RuntimeEventKind::CallReplyRejected {
-                    reason: CallReplyRejectedReason::NoPendingCall
-                        | CallReplyRejectedReason::CallerCancelled,
+                    reason: CallReplyRejectedReason::CallerCancelled,
                     ..
                 } | RuntimeEventKind::DeferredReplyRejected {
-                    reason: DeferredReplyRejectedReason::CallerCancelled
-                        | DeferredReplyRejectedReason::CallerClosed,
+                    reason: DeferredReplyRejectedReason::CallerCancelled,
                     ..
                 }
             )

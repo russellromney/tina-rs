@@ -49,10 +49,10 @@ pub struct Report {
     pub exit_clean: bool,
 }
 
-/// Structural invariants both sides should satisfy. Exact
-/// `replies_before_cancel` is timing-sensitive (depends on scheduler),
-/// so we only check shape.
-pub fn assert_report_invariants(side: &str, report: &Report) {
+/// Shape both sides share: cancel fired, exit was clean, and
+/// `replies_before_cancel < FANOUT` (cancellation actually preempted
+/// some work).
+fn assert_shared_invariants(side: &str, report: &Report) {
     assert!(
         report.replies_before_cancel < FANOUT,
         "{side}: cancel must fire before all workers finish, got {report:?}",
@@ -65,14 +65,47 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
         report.exit_clean,
         "{side}: expected exit_clean, got {report:?}"
     );
-    // The driver never absorbs a post-cancel reply: in Tokio the
-    // task is aborted; in Tina the runtime rejects late replies as
-    // typed trace events instead of delivering them.
-    assert!(
-        report
-            .replies_before_cancel
-            .saturating_add(report.replies_after_cancel)
-            <= FANOUT,
-        "{side}: replies_before + replies_after must not exceed FANOUT, got {report:?}",
+}
+
+/// Tina-side invariants. The runtime does not preempt the workers'
+/// sleeps, so every worker eventually finishes; post-cancel replies
+/// bounce as typed `CallReplyRejected { CallerCancelled }` events and
+/// the host counts them in `replies_after_cancel`. The total must
+/// equal `FANOUT`.
+pub fn assert_tina_report_invariants(report: &Report) {
+    assert_shared_invariants("tina", report);
+    let total = report
+        .replies_before_cancel
+        .checked_add(report.replies_after_cancel)
+        .expect("u32 overflow");
+    assert_eq!(
+        total, FANOUT,
+        "tina: every worker should finish (delivered or rejected), got {report:?}",
     );
+}
+
+/// Tokio-side invariants. `JoinSet::abort_all` preempts at the next
+/// await point, so aborted tasks never run their reply path —
+/// `replies_after_cancel` is always zero, and the absorbed total is
+/// strictly less than `FANOUT`.
+pub fn assert_tokio_report_invariants(report: &Report) {
+    assert_shared_invariants("tokio", report);
+    assert_eq!(
+        report.replies_after_cancel, 0,
+        "tokio: aborted tasks never deliver replies, got {report:?}",
+    );
+    assert!(
+        report.replies_before_cancel < FANOUT,
+        "tokio: cancel preempts before all workers finish, got {report:?}",
+    );
+}
+
+/// Backwards-compatible aggregate invariant. Calls the appropriate
+/// per-side check based on `side`.
+pub fn assert_report_invariants(side: &str, report: &Report) {
+    match side {
+        "tina" => assert_tina_report_invariants(report),
+        "tokio" => assert_tokio_report_invariants(report),
+        other => panic!("unknown side {other:?}; expected \"tina\" or \"tokio\""),
+    }
 }

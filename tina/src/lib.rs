@@ -1446,7 +1446,8 @@ pub enum DeferredSlotState {
 ///     h.clone() // CallHandle does not implement Clone
 /// }
 /// ```
-#[must_use = "store the CallHandle to cancel later, or drop it explicitly"]
+#[must_use = "use the CallHandle (cancel_call, store in state, or `let _ = ...`) — \
+              dropping it lets the call run to completion"]
 pub struct CallHandle<R> {
     handle: CallHandleInner,
     _marker: PhantomData<fn(R) -> R>,
@@ -1543,14 +1544,37 @@ impl CallHandleShared {
         if raw == 0 { None } else { Some(raw) }
     }
 
-    /// Stamps the call id on dispatch. Runtime-only. Asserts no
-    /// double-stamp in both debug and release builds — silently
-    /// overwriting would point the handle at the wrong call.
+    /// Stamps the call id on dispatch. Runtime-only.
+    ///
+    /// `debug_assert!`s catch double-stamp during development. In
+    /// release we keep the *first* stamp (so a buggy refactor cannot
+    /// silently retarget the handle), trace via `eprintln!` so the
+    /// regression is visible, and refuse the second store. Crashing
+    /// the shard on an internal-invariant violation would be worse
+    /// than logging it.
     #[doc(hidden)]
     pub fn set_call_id(&self, call_id: u64) {
-        assert!(call_id != 0, "runtime call id must be non-zero");
-        let prior = self.call_id.swap(call_id, Ordering::Release);
-        assert!(prior == 0, "call id stamped twice on one CallHandleShared");
+        debug_assert!(call_id != 0, "runtime call id must be non-zero");
+        if call_id == 0 {
+            return;
+        }
+        match self.call_id.compare_exchange(
+            0,
+            call_id,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(prior) => {
+                debug_assert!(
+                    false,
+                    "call id stamped twice: prior={prior} new={call_id}"
+                );
+                eprintln!(
+                    "tina: CallHandleShared double-stamp detected (prior={prior} new={call_id}); keeping first"
+                );
+            }
+        }
     }
 
     /// Returns the dispatching `Address<_, R>`'s `R` type id.

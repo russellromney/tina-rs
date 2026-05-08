@@ -2228,6 +2228,18 @@ where
     CancelCallBuilder::new(inner)
 }
 
+/// Returns the runtime-assigned [`CallId`] for `handle`, or `None` if
+/// its effect has not yet been dispatched.
+///
+/// `tina::CallHandle::call_id` returns a raw `u64` because `tina` is
+/// the trait crate and must not depend on this crate's `CallId`. Use
+/// this helper from runtime-aware code to keep the typed identity.
+pub fn call_handle_call_id<R>(handle: &CallHandle<R>) -> Option<CallId> {
+    tina::runtime_internal::call_handle_shared(handle)
+        .call_id()
+        .map(CallId::new)
+}
+
 /// Returns a helper that calls another isolate and requires a timeout.
 ///
 /// Same-shard calls complete inside one shard runtime. Live local multi-shard

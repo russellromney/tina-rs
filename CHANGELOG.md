@@ -6,6 +6,21 @@ This file records completed work.
 
 ### Cancellation: first-form `CallHandle` and `cancel_call`
 
+**Breaking trace surface changes** (downstream consumers — lint
+your matches):
+- `PressureSummary::Display` format adds a `cancelled=N` field. Log
+  scrapers matching the old `reply[no_pending=N path_full=N
+  shard_closed=N]` shape need updating.
+- Stopping an isolate with pending calls used to settle as
+  `CallCompletionRejected { RequesterClosed }` when the worker's late
+  reply arrived. It now emits `CallCancelled { OwnerStopped }` at the
+  moment of stop, and the worker's late reply hits
+  `CallReplyRejected { NoPendingCall }` (or
+  `DeferredReplyRejected { CallerCancelled }` for captured slots).
+  Trace assertions on the old shape fail loudly.
+
+API additions:
+
 - `tina::CallHandle<R>` (move-only, `!Clone`, `#[must_use]`) plus
   `tina_runtime::call_with_handle(addr, msg, t).reply(...)` returning
   `(Effect, CallHandle<R>)`.
