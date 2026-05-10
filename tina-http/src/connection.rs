@@ -24,14 +24,13 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
-use tina_runtime::{
-    CallError, CallOutcome, StreamId, call, sleep, tcp_close_stream, tcp_read, tcp_write,
-};
+use tina_runtime::{CallError, CallOutcome, call, sleep};
 
 use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_request_head};
 use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
+use crate::transport::HttpTransport;
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError};
 
 /// Bytes the connection isolate asks for per `tcp_read`. Bounded so a
@@ -89,7 +88,11 @@ impl HttpConnectionMsg {
 /// multi-turn services declare an enum that wraps `HttpRequest` and
 /// supply `From<HttpRequest>`.
 pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = HttpRequest> {
-    stream: StreamId,
+    transport: HttpTransport,
+    /// Per-call deadline passed to TLS lane reads/writes/closes. Ignored
+    /// on the TCP transport (TCP reads/writes have no per-call deadline
+    /// today).
+    tls_io_timeout: Duration,
     service: Address<M, HttpResponse>,
     limits: HttpLimits,
     service_call_timeout: Duration,
@@ -157,15 +160,37 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
 }
 
 impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
-    /// Builds a new connection isolate state for one accepted TCP stream.
+    /// Builds a new connection isolate over a TCP transport. Convenience
+    /// for the plain-HTTP path.
     pub fn new(
-        stream: StreamId,
+        stream: tina_runtime::StreamId,
         service: Address<M, HttpResponse>,
         limits: HttpLimits,
         service_call_timeout: Duration,
     ) -> Self {
+        Self::with_transport(
+            HttpTransport::Tcp(stream),
+            service,
+            limits,
+            service_call_timeout,
+            // Unused on the TCP transport.
+            Duration::ZERO,
+        )
+    }
+
+    /// Builds a new connection isolate over an explicit transport. Used
+    /// by `HttpsListener` to wire a TLS stream; the plain HTTP listener
+    /// goes through [`HttpConnection::new`].
+    pub fn with_transport(
+        transport: HttpTransport,
+        service: Address<M, HttpResponse>,
+        limits: HttpLimits,
+        service_call_timeout: Duration,
+        tls_io_timeout: Duration,
+    ) -> Self {
         Self {
-            stream,
+            transport,
+            tls_io_timeout,
             service,
             limits,
             service_call_timeout,
@@ -250,7 +275,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn read_more(&mut self) -> Effect<Self> {
-        tcp_read(self.stream, READ_CHUNK).reply(HttpConnectionMsg::Read)
+        self.transport
+            .read_call(READ_CHUNK, self.tls_io_timeout)
+            .reply(HttpConnectionMsg::Read)
     }
 
     fn handle_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
@@ -443,7 +470,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             // via received bytes < expected.
             return reply(RequestChunkReply::Eof);
         }
-        tcp_read(self.stream, want).reply(HttpConnectionMsg::BodyChunkRead)
+        self.transport
+            .read_call(want, self.tls_io_timeout)
+            .reply(HttpConnectionMsg::BodyChunkRead)
     }
 
     fn handle_body_chunk_read(&mut self, result: Result<Vec<u8>, CallError>) -> Effect<Self> {
@@ -526,7 +555,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     /// we know how many bytes the runtime accepted; we do not pre-copy
     /// the buffer with an offset.
     fn write_pending(&mut self) -> Effect<Self> {
-        tcp_write(self.stream, self.pending_response.clone()).reply(HttpConnectionMsg::Wrote)
+        self.transport
+            .write_call(self.pending_response.clone(), self.tls_io_timeout)
+            .reply(HttpConnectionMsg::Wrote)
     }
 
     fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
@@ -598,7 +629,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn begin_close(&mut self) -> Effect<Self> {
-        tcp_close_stream(self.stream).reply(HttpConnectionMsg::Closed)
+        self.transport
+            .close_call(self.tls_io_timeout)
+            .reply(HttpConnectionMsg::Closed)
     }
 }
 

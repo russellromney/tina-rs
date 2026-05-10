@@ -15,25 +15,32 @@
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
+use http::header::HOST;
+use http::HeaderValue;
 use tina::prelude::*;
-use tina_runtime::{
-    CallError, StreamId, sleep, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
-};
+use tina_runtime::{CallError, StreamId, TlsStreamId, sleep, tcp_connect, tls_connect};
 
 use crate::parse::{HttpResponseHead, ResponseParseProgress, encode_request, parse_response_head};
-use crate::types::{HttpClientConfig, HttpClientError, HttpRequest, HttpResponse};
+use crate::target::{HttpHostPolicy, HttpTarget};
+use crate::transport::HttpTransport;
+use crate::types::{
+    HttpClientConfig, HttpClientError, HttpRequest, HttpResponse, HttpTransportPhase,
+};
 
 /// Bytes the client asks for per `tcp_read`. Matches the server side.
 const READ_CHUNK: usize = 4096;
 
-/// One outbound HTTP/1.1 call: which `target` to connect to and what
-/// `request` to send.
+/// One outbound HTTP/1.1 call: which target to connect to and what
+/// request to send.
 #[derive(Debug, Clone)]
 pub struct OutboundCall {
-    /// TCP address of the upstream server.
-    pub target: SocketAddr,
+    /// Where (and how) to send the request. Plain TCP or native HTTPS.
+    pub target: HttpTarget,
     /// Request to write on the wire. The encoder fills in
-    /// `Content-Length` and `Connection: close` automatically.
+    /// `Content-Length` and `Connection: close` automatically. For
+    /// HTTPS, the `Host:` header is auto-populated from the target's
+    /// [`HttpHostPolicy`] unless one was supplied explicitly (in
+    /// which case [`HttpClientError::DuplicateHostHeader`] surfaces).
     pub request: HttpRequest,
 }
 
@@ -48,20 +55,28 @@ pub enum HttpClientMsg {
     Call(OutboundCall),
     /// `tcp_connect` reply.
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    /// `tcp_write` reply.
+    /// `tls_connect` reply.
+    TlsConnected(Result<TlsStreamId, CallError>),
+    /// `tcp_write` / `tls_write` reply.
     Wrote(Result<usize, CallError>),
-    /// `tcp_read` reply.
+    /// `tcp_read` / `tls_read` reply.
     Read(Result<Vec<u8>, CallError>),
-    /// `tcp_close_stream` reply.
+    /// `tcp_close_stream` / `tls_close` reply.
     Closed(Result<(), CallError>),
     /// Per-call deadline timer fired.
     Deadline(Result<(), CallError>),
 }
 
 impl HttpClientMsg {
-    /// Builds a `Call` variant from the constituent parts.
-    pub fn call(target: SocketAddr, request: HttpRequest) -> Self {
-        Self::Call(OutboundCall { target, request })
+    /// Builds a `Call` variant from the constituent parts. Accepts
+    /// any value that converts into [`HttpTarget`] — a bare
+    /// `SocketAddr` is interpreted as plain HTTP for backward
+    /// compatibility.
+    pub fn call(target: impl Into<HttpTarget>, request: HttpRequest) -> Self {
+        Self::Call(OutboundCall {
+            target: target.into(),
+            request,
+        })
     }
 }
 
@@ -78,7 +93,7 @@ pub struct HttpClient<S: Shard + 'static> {
 /// State for one in-flight call. Cleared at terminal.
 struct ActiveCall {
     request_bytes: Vec<u8>,
-    stream: Option<StreamId>,
+    transport: Option<HttpTransport>,
     pending_write: Vec<u8>,
     read_buf: Vec<u8>,
     parsed_head: Option<HttpResponseHead>,
@@ -122,22 +137,49 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
             HttpClientMsg::Call(call) => self.handle_call(call),
 
             HttpClientMsg::Connected(Ok((stream, _local, _peer))) => {
+                let transport = HttpTransport::Tcp(stream);
                 let Some(state) = self.state.as_mut() else {
                     // Stale: previous call already ended. Close the
                     // dangling stream so the kernel does not leak.
-                    return tcp_close_stream(stream).reply(HttpClientMsg::Closed);
+                    return transport
+                        .close_call(self.config.request_timeout)
+                        .reply(HttpClientMsg::Closed);
                 };
-                state.stream = Some(stream);
+                state.transport = Some(transport);
                 state.pending_write = state.request_bytes.clone();
                 self.write_more()
             }
             HttpClientMsg::Connected(Err(_)) => self.fail(HttpClientError::Connect),
 
+            HttpClientMsg::TlsConnected(Ok(stream)) => {
+                let transport = HttpTransport::Tls(stream);
+                let Some(state) = self.state.as_mut() else {
+                    return transport
+                        .close_call(self.config.request_timeout)
+                        .reply(HttpClientMsg::Closed);
+                };
+                state.transport = Some(transport);
+                state.pending_write = state.request_bytes.clone();
+                self.write_more()
+            }
+            HttpClientMsg::TlsConnected(Err(source)) => self.fail(HttpClientError::Transport {
+                phase: HttpTransportPhase::Connect,
+                source,
+            }),
+
             HttpClientMsg::Wrote(Ok(count)) => self.handle_wrote(count),
-            HttpClientMsg::Wrote(Err(_)) => self.fail(HttpClientError::Write),
+            HttpClientMsg::Wrote(Err(source)) => self.fail(self.transport_or_flat_error(
+                HttpTransportPhase::Write,
+                source,
+                HttpClientError::Write,
+            )),
 
             HttpClientMsg::Read(Ok(bytes)) => self.handle_bytes_read(bytes),
-            HttpClientMsg::Read(Err(_)) => self.fail(HttpClientError::Read),
+            HttpClientMsg::Read(Err(source)) => self.fail(self.transport_or_flat_error(
+                HttpTransportPhase::Read,
+                source,
+                HttpClientError::Read,
+            )),
 
             HttpClientMsg::Deadline(_) => {
                 if self.state.is_some() {
@@ -157,25 +199,64 @@ impl<S: Shard + 'static> HttpClient<S> {
         if self.state.is_some() {
             return reply(Err(HttpClientError::Busy));
         }
-        let request_bytes = encode_request(&call.request);
+        let OutboundCall { target, request } = call;
+        // Apply the Host policy *before* encoding so the wire bytes
+        // already carry the right `Host:` value.
+        let request = match apply_host_policy(request, &target) {
+            Ok(request) => request,
+            Err(error) => return reply(Err(error)),
+        };
+        let request_bytes = encode_request(&request);
         self.state = Some(ActiveCall {
             request_bytes,
-            stream: None,
+            transport: None,
             pending_write: Vec::new(),
             read_buf: Vec::new(),
             parsed_head: None,
             head_len: 0,
         });
-        let connect_effect: Effect<Self> = tcp_connect(call.target).reply(HttpClientMsg::Connected);
+        let connect_effect: Effect<Self> = match target {
+            HttpTarget::Http(addr) => tcp_connect(addr).reply(HttpClientMsg::Connected),
+            HttpTarget::Https {
+                addr,
+                server_name,
+                trust_roots,
+                host: _,
+            } => tls_connect(
+                addr,
+                server_name,
+                trust_roots.root_certificates_der,
+                self.config.request_timeout,
+            )
+            .reply(HttpClientMsg::TlsConnected),
+        };
         let deadline_effect: Effect<Self> =
             sleep(self.config.request_timeout).reply(HttpClientMsg::Deadline);
         batch(vec![connect_effect, deadline_effect])
     }
 
+    /// If the active call is on a TLS transport, surface the typed
+    /// `Transport` variant carrying the runtime error and phase. If
+    /// the active call is on TCP (or there is no active state), keep
+    /// the older flat variant for source compat.
+    fn transport_or_flat_error(
+        &self,
+        phase: HttpTransportPhase,
+        source: CallError,
+        flat: HttpClientError,
+    ) -> HttpClientError {
+        match self.state.as_ref().and_then(|state| state.transport) {
+            Some(HttpTransport::Tls(_)) => HttpClientError::Transport { phase, source },
+            _ => flat,
+        }
+    }
+
     fn write_more(&mut self) -> Effect<Self> {
         let state = self.state.as_ref().expect("state present during write");
-        let stream = state.stream.expect("stream set before write");
-        tcp_write(stream, state.pending_write.clone()).reply(HttpClientMsg::Wrote)
+        let transport = state.transport.expect("transport set before write");
+        transport
+            .write_call(state.pending_write.clone(), self.config.request_timeout)
+            .reply(HttpClientMsg::Wrote)
     }
 
     fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
@@ -196,8 +277,10 @@ impl<S: Shard + 'static> HttpClient<S> {
 
     fn read_more(&mut self) -> Effect<Self> {
         let state = self.state.as_ref().expect("state present during read");
-        let stream = state.stream.expect("stream set before read");
-        tcp_read(stream, READ_CHUNK).reply(HttpClientMsg::Read)
+        let transport = state.transport.expect("transport set before read");
+        transport
+            .read_call(READ_CHUNK, self.config.request_timeout)
+            .reply(HttpClientMsg::Read)
     }
 
     fn handle_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
@@ -245,23 +328,25 @@ impl<S: Shard + 'static> HttpClient<S> {
             headers: head.headers,
             body: crate::HttpResponseBody::Buffered(body),
         };
-        self.finish(Ok(response), state.stream)
+        self.finish(Ok(response), state.transport)
     }
 
     fn fail(&mut self, error: HttpClientError) -> Effect<Self> {
-        let stream = self.state.take().and_then(|s| s.stream);
-        self.finish(Err(error), stream)
+        let transport = self.state.take().and_then(|s| s.transport);
+        self.finish(Err(error), transport)
     }
 
-    /// Replies the result and closes the underlying stream, if any.
+    /// Replies the result and closes the underlying transport, if any.
     fn finish(
         &mut self,
         result: Result<HttpResponse, HttpClientError>,
-        stream: Option<StreamId>,
+        transport: Option<HttpTransport>,
     ) -> Effect<Self> {
         let reply_effect: Effect<Self> = reply(result);
-        if let Some(stream) = stream {
-            let close_effect: Effect<Self> = tcp_close_stream(stream).reply(HttpClientMsg::Closed);
+        if let Some(transport) = transport {
+            let close_effect: Effect<Self> = transport
+                .close_call(self.config.request_timeout)
+                .reply(HttpClientMsg::Closed);
             batch(vec![reply_effect, close_effect])
         } else {
             reply_effect
@@ -275,4 +360,34 @@ fn body_complete(state: &ActiveCall) -> bool {
     };
     let needed = state.head_len + head.content_length;
     state.read_buf.len() >= needed
+}
+
+/// Resolves the `Host:` header on an outbound request from the
+/// target's [`HttpHostPolicy`]. Plain HTTP keeps whatever the caller
+/// supplied (HTTP/1.1 requires the caller to set Host explicitly for
+/// TCP targets; the encoder does not synthesize one). HTTPS targets
+/// auto-populate Host from the policy unless the caller already set
+/// one — in which case [`HttpClientError::DuplicateHostHeader`]
+/// surfaces so the conflict is visible.
+fn apply_host_policy(
+    mut request: HttpRequest,
+    target: &HttpTarget,
+) -> Result<HttpRequest, HttpClientError> {
+    let HttpTarget::Https {
+        server_name, host, ..
+    } = target
+    else {
+        return Ok(request);
+    };
+    let policy_value = match host {
+        HttpHostPolicy::UseServerName => server_name.as_str(),
+        HttpHostPolicy::Explicit(name) => name.as_str(),
+    };
+    if request.headers.contains_key(HOST) {
+        return Err(HttpClientError::DuplicateHostHeader);
+    }
+    let value = HeaderValue::from_str(policy_value)
+        .map_err(|_| HttpClientError::DuplicateHostHeader)?;
+    request.headers.insert(HOST, value);
+    Ok(request)
 }

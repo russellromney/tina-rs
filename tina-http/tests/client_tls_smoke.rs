@@ -1,0 +1,322 @@
+//! End-to-end native HTTPS client tests.
+//!
+//! The Tina HTTPS server and HTTPS client cannot share a runtime in
+//! first form: the runtime has one TLS worker thread per shard, and
+//! the client and server sides of a single TLS handshake both need
+//! to drive that worker concurrently — they deadlock.
+//!
+//! These tests therefore put the *server* on a raw OS thread (using
+//! `rustls::ServerConnection` directly) and run the Tina `HttpClient`
+//! on a `ThreadedRuntime`, then drive an HTTPS round-trip across the
+//! two. The negative-path tests (bad name, untrusted root, duplicate
+//! Host) follow the same shape.
+
+use std::convert::Infallible;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use http::header::HOST;
+use http::{HeaderValue, Method, StatusCode};
+use tina::prelude::*;
+use tina_http::{
+    HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpHostPolicy, HttpRequest,
+    HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, HttpTransportPhase,
+    TlsTrustRoots,
+};
+use tina_runtime::{
+    CallError, CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+    ThreadedRuntimeConfig, call,
+};
+
+#[derive(Debug, Default)]
+struct TestShard;
+
+impl Shard for TestShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(202)
+    }
+}
+
+struct CertBundle {
+    cert_der: Vec<u8>,
+    server_config: rustls::ServerConfig,
+}
+
+fn build_cert_bundle() -> CertBundle {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("rcgen self-sign");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+    let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
+    let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_cert], server_key)
+        .expect("server config");
+    CertBundle {
+        cert_der,
+        server_config,
+    }
+}
+
+/// Spawns a rustls HTTPS server on a thread that handles exactly one
+/// connection: it reads the request, fishes the `Host:` header, and
+/// replies `HTTP/1.1 200 OK` with the Host value as the body. Returns
+/// the bound addr.
+fn spawn_one_shot_https_server(server_config: rustls::ServerConfig) -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind one-shot https");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let (tcp, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        tcp.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        tcp.set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        let connection = match rustls::ServerConnection::new(Arc::new(server_config)) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        let mut buf = [0u8; 4096];
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+        let host = request
+            .lines()
+            .find_map(|line| line.strip_prefix("Host: ").or_else(|| line.strip_prefix("host: ")))
+            .unwrap_or("")
+            .trim_end_matches('\r');
+        let body = host.as_bytes();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+        let _ = stream.conn.send_close_notify();
+        let _ = stream.flush();
+    });
+    addr
+}
+
+#[derive(Debug, Clone)]
+enum DriverMsg {
+    Fetch {
+        client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
+        target: HttpTarget,
+        request: HttpRequest,
+        timeout: Duration,
+    },
+    Returned(CallOutcome<Result<HttpResponse, HttpClientError>>),
+}
+
+struct Driver {
+    sender: mpsc::Sender<Result<HttpResponse, HttpClientError>>,
+}
+
+impl Isolate for Driver {
+    tina::isolate_types! {
+        message: DriverMsg,
+        reply: (),
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<DriverMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            DriverMsg::Fetch {
+                client,
+                target,
+                request,
+                timeout,
+            } => call(client, HttpClientMsg::call(target, request), timeout)
+                .reply(DriverMsg::Returned),
+            DriverMsg::Returned(outcome) => {
+                let result = match outcome {
+                    CallOutcome::Replied(inner) => inner,
+                    CallOutcome::Full => Err(HttpClientError::Busy),
+                    CallOutcome::Closed => Err(HttpClientError::Closed),
+                    CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                };
+                let _ = self.sender.send(result);
+                stop()
+            }
+        }
+    }
+}
+
+fn run_one_fetch(
+    target: HttpTarget,
+    request: HttpRequest,
+) -> Result<HttpResponse, HttpClientError> {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<HttpClient<TestShard>, Infallible>(
+            HttpClient::<TestShard>::new(HttpClientConfig::dev()),
+            16,
+        )
+        .expect("register client");
+    let (tx, rx) = mpsc::channel();
+    let driver = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 8)
+        .expect("register driver");
+    runtime
+        .try_send(
+            driver,
+            DriverMsg::Fetch {
+                client,
+                target,
+                request,
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .expect("send Fetch");
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("driver delivers result");
+    let _ = runtime.shutdown();
+    result
+}
+
+fn body_str(response: &HttpResponse) -> String {
+    let bytes = match &response.body {
+        HttpResponseBody::Buffered(b) => b.clone(),
+        HttpResponseBody::Stream(_) => Vec::new(),
+    };
+    String::from_utf8(bytes).expect("utf8 body")
+}
+
+fn empty_request(path: &str) -> HttpRequest {
+    HttpRequest {
+        method: Method::GET,
+        path: path.to_string(),
+        version: http::Version::HTTP_11,
+        headers: http::HeaderMap::new(),
+        body: HttpRequestBody::default(),
+    }
+}
+
+#[test]
+fn https_client_round_trips_against_rustls_server() {
+    let bundle = build_cert_bundle();
+    let addr = spawn_one_shot_https_server(bundle.server_config);
+    let trust = TlsTrustRoots::from_der(vec![bundle.cert_der]);
+    let target = HttpTarget::https(addr, "localhost", trust);
+    let response = run_one_fetch(target, empty_request("/host")).expect("https fetch ok");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(body_str(&response), "localhost");
+}
+
+#[test]
+fn explicit_host_policy_overrides_default() {
+    let bundle = build_cert_bundle();
+    let addr = spawn_one_shot_https_server(bundle.server_config);
+    let trust = TlsTrustRoots::from_der(vec![bundle.cert_der]);
+    let target = HttpTarget::Https {
+        addr,
+        server_name: "localhost".to_string(),
+        trust_roots: trust,
+        host: HttpHostPolicy::Explicit("api.example.com".to_string()),
+    };
+    let response = run_one_fetch(target, empty_request("/host")).expect("https fetch ok");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(body_str(&response), "api.example.com");
+}
+
+#[test]
+fn duplicate_host_header_is_typed_error() {
+    let bundle = build_cert_bundle();
+    let addr = spawn_one_shot_https_server(bundle.server_config);
+    let trust = TlsTrustRoots::from_der(vec![bundle.cert_der]);
+    let target = HttpTarget::https(addr, "localhost", trust);
+    let mut request = empty_request("/host");
+    request
+        .headers
+        .insert(HOST, HeaderValue::from_static("conflict.example.com"));
+    let result = run_one_fetch(target, request);
+    assert!(
+        matches!(result, Err(HttpClientError::DuplicateHostHeader)),
+        "expected DuplicateHostHeader, got {result:?}"
+    );
+}
+
+#[test]
+fn bad_server_name_yields_typed_tls_name_error() {
+    // Server is irrelevant — no TLS connect should land on it.
+    let bundle = build_cert_bundle();
+    let addr = spawn_one_shot_https_server(bundle.server_config);
+    let trust = TlsTrustRoots::from_der(vec![bundle.cert_der]);
+    let target = HttpTarget::Https {
+        addr,
+        server_name: "not a valid dns name!".to_string(),
+        trust_roots: trust,
+        host: HttpHostPolicy::UseServerName,
+    };
+    let result = run_one_fetch(target, empty_request("/host"));
+    match result {
+        Err(HttpClientError::Transport {
+            phase: HttpTransportPhase::Connect,
+            source: CallError::TlsName,
+        }) => {}
+        other => panic!("expected TlsName transport error, got {other:?}"),
+    }
+}
+
+#[test]
+fn untrusted_root_yields_typed_transport_error() {
+    let bundle = build_cert_bundle();
+    let addr = spawn_one_shot_https_server(bundle.server_config);
+    // Use a different cert as the "root" — server's leaf isn't anchored.
+    let other = rcgen::generate_simple_self_signed(vec!["other.example".to_string()])
+        .expect("rcgen self-sign 2");
+    let untrusted = TlsTrustRoots::from_der(vec![other.cert.der().to_vec()]);
+    let target = HttpTarget::Https {
+        addr,
+        server_name: "localhost".to_string(),
+        trust_roots: untrusted,
+        host: HttpHostPolicy::UseServerName,
+    };
+    let result = run_one_fetch(target, empty_request("/host"));
+    match result {
+        // Either TlsHandshake (peer rejected) or Io (peer aborted)
+        // is acceptable; the contract is that callers see a typed
+        // Transport variant in the Connect phase, not the flat
+        // `Connect` from the TCP path.
+        Err(HttpClientError::Transport {
+            phase: HttpTransportPhase::Connect,
+            source: CallError::TlsHandshake,
+        }) => {}
+        Err(HttpClientError::Transport {
+            phase: HttpTransportPhase::Connect,
+            source: CallError::Io,
+        }) => {}
+        other => panic!("expected typed Transport(Connect, TlsHandshake|Io), got {other:?}"),
+    }
+}

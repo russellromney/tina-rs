@@ -570,8 +570,39 @@ impl Default for PoolConfig {
     }
 }
 
-/// Reasons an outbound HTTP call failed before producing a parsed
-/// [`HttpResponse`].
+/// Phase of an outbound TLS-aware transport operation. Used inside
+/// [`HttpClientError::Transport`] so callers can match on what was
+/// happening when the underlying [`tina_runtime::CallError`] surfaced.
+///
+/// The plain-HTTP path keeps the older flat variants
+/// (`Connect`/`Write`/`Read`/`Closed`/`Timeout`) for source compat;
+/// only the HTTPS path produces `Transport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpTransportPhase {
+    /// `tls_connect` (client-side handshake).
+    Connect,
+    /// `tls_bind` (server-side, listed for symmetry; not emitted by
+    /// the client).
+    Bind,
+    /// `tls_accept` (server-side, listed for symmetry; not emitted by
+    /// the client).
+    Accept,
+    /// `tls_read`.
+    Read,
+    /// `tls_write`.
+    Write,
+    /// `tls_close`.
+    Close,
+}
+
+/// Reasons an outbound HTTP/HTTPS call failed before producing a
+/// parsed [`HttpResponse`].
+///
+/// Plain-HTTP calls produce the flat `Connect`/`Write`/`Read`/`Closed`
+/// variants; HTTPS calls produce [`HttpClientError::Transport`] so
+/// callers can match the precise TLS reason
+/// (`TlsName`, `TlsCertificate`, `TlsHandshake`, `TlsFull`,
+/// `TlsClosed`, `Timeout`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpClientError {
     /// `tcp_connect` failed before the request could be written.
@@ -592,4 +623,18 @@ pub enum HttpClientError {
     /// The pool's slot was busy when this Submit arrived. Direct (non-
     /// pooled) calls never produce this variant.
     PoolFull,
+    /// A TLS-aware transport call failed. `phase` says which lane op
+    /// (`tls_connect`/`tls_read`/`tls_write`/`tls_close`); `source`
+    /// is the typed runtime error
+    /// (`TlsName`, `TlsCertificate`, `TlsHandshake`, `TlsFull`,
+    /// `TlsClosed`, `Timeout`, `Io`, ...). Plain-HTTP failures keep
+    /// the older flat variants above.
+    Transport {
+        phase: HttpTransportPhase,
+        source: tina_runtime::CallError,
+    },
+    /// The request already carried a `Host:` header that conflicts
+    /// with the [`crate::HttpHostPolicy`] for this target. Reject so
+    /// callers see the duplicate explicitly.
+    DuplicateHostHeader,
 }
