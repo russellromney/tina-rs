@@ -6,7 +6,7 @@ use tina_runtime::CallOutcome;
 use tina_sqlx_bridge::{
     PgCancelConfig, PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt,
     PgPoolConfig, PgRequest, PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome,
-    PgTransientReason, PgValue, U64TooLarge,
+    PgTransientReason, PgType, PgValue, U64TooLarge,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,67 @@ fn pg_value_option_some_and_none() {
     let none: PgValue = Option::<i64>::None.into();
     assert_eq!(some, PgValue::I64(7));
     assert_eq!(none, PgValue::Null);
+}
+
+#[test]
+fn typed_null_builders_match_pg_type() {
+    assert_eq!(PgValue::null_bool(), PgValue::TypedNull(PgType::Bool));
+    assert_eq!(PgValue::null_i64(), PgValue::TypedNull(PgType::I64));
+    assert_eq!(PgValue::null_f64(), PgValue::TypedNull(PgType::F64));
+    assert_eq!(PgValue::null_text(), PgValue::TypedNull(PgType::Text));
+    assert_eq!(PgValue::null_bytes(), PgValue::TypedNull(PgType::Bytes));
+    let v: PgValue = PgType::Bool.into();
+    assert_eq!(v, PgValue::TypedNull(PgType::Bool));
+}
+
+#[test]
+fn typed_null_is_null() {
+    assert!(PgValue::Null.is_null());
+    assert!(PgValue::null_bool().is_null());
+    assert!(PgValue::null_text().is_null());
+    assert!(!PgValue::I64(0).is_null());
+    assert!(!PgValue::Bool(false).is_null());
+}
+
+#[test]
+fn typed_null_accessors_return_none() {
+    // TypedNull is a NULL, not a value — typed accessors return None.
+    assert_eq!(PgValue::null_bool().as_bool(), None);
+    assert_eq!(PgValue::null_i64().as_i64(), None);
+    assert_eq!(PgValue::null_text().as_str(), None);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+fn typed_null_uuid_builder_and_accessor() {
+    let v = PgValue::null_uuid();
+    assert_eq!(v, PgValue::TypedNull(PgType::Uuid));
+    assert!(v.is_null());
+    assert_eq!(v.as_uuid(), None);
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn typed_null_json_builder_and_accessor() {
+    let v = PgValue::null_json();
+    assert_eq!(v, PgValue::TypedNull(PgType::Json));
+    assert!(v.is_null());
+}
+
+#[cfg(feature = "numeric")]
+#[test]
+fn typed_null_numeric_builder_and_accessor() {
+    let v = PgValue::null_numeric();
+    assert_eq!(v, PgValue::TypedNull(PgType::Numeric));
+    assert!(v.is_null());
+}
+
+#[cfg(feature = "time")]
+#[test]
+fn typed_null_temporal_builders() {
+    assert!(PgValue::null_timestamp().is_null());
+    assert!(PgValue::null_timestamptz().is_null());
+    assert!(PgValue::null_date().is_null());
 }
 
 #[test]

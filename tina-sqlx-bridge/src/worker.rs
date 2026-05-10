@@ -30,7 +30,7 @@ use tracing::{Level, event};
 use crate::metrics::{MetricsInner, PgMetricsHandle};
 use crate::types::{
     InstallError, PgConfig, PgError, PgRequest, PgResponse, PgRow, PgStep, PgStepOk,
-    PgTransactionOutcome, PgValue,
+    PgTransactionOutcome, PgType, PgValue,
 };
 
 /// `tracing` target for per-call events on the bridge isolate.
@@ -1025,12 +1025,13 @@ fn bind_param<'q>(
     value: PgValue,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match value {
-        // Bind NULL with a typed `Option::<i64>::None`; Postgres infers
-        // the parameter type from the query, but SQLx's `Encode` needs
-        // a concrete carrier. `INT8` is the safest default for first
-        // form. Callers who need a typed null at a non-INT8 column
-        // should bind a sentinel and `IS NULL`-check in SQL.
+        // Untyped NULL: SQLx's `Encode` needs a concrete carrier, so
+        // we send `INT8 NULL`. Postgres infers the parameter type
+        // from query context where possible (table columns, casts).
+        // If you're hitting "could not determine data type of
+        // parameter $N" on NULL, switch to `PgValue::TypedNull(...)`.
         PgValue::Null => q.bind(Option::<i64>::None),
+        PgValue::TypedNull(pg_type) => bind_typed_null(q, pg_type),
         PgValue::Bool(b) => q.bind(b),
         PgValue::I64(i) => q.bind(i),
         PgValue::F64(f) => q.bind(f),
@@ -1048,6 +1049,31 @@ fn bind_param<'q>(
         PgValue::TimestampTz(t) => q.bind(t),
         #[cfg(feature = "time")]
         PgValue::Date(d) => q.bind(d),
+    }
+}
+
+fn bind_typed_null<'q>(
+    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    pg_type: PgType,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match pg_type {
+        PgType::Bool => q.bind(Option::<bool>::None),
+        PgType::I64 => q.bind(Option::<i64>::None),
+        PgType::F64 => q.bind(Option::<f64>::None),
+        PgType::Text => q.bind(Option::<String>::None),
+        PgType::Bytes => q.bind(Option::<Vec<u8>>::None),
+        #[cfg(feature = "uuid")]
+        PgType::Uuid => q.bind(Option::<uuid::Uuid>::None),
+        #[cfg(feature = "json")]
+        PgType::Json => q.bind(Option::<serde_json::Value>::None),
+        #[cfg(feature = "numeric")]
+        PgType::Numeric => q.bind(Option::<rust_decimal::Decimal>::None),
+        #[cfg(feature = "time")]
+        PgType::Timestamp => q.bind(Option::<time::PrimitiveDateTime>::None),
+        #[cfg(feature = "time")]
+        PgType::TimestampTz => q.bind(Option::<time::OffsetDateTime>::None),
+        #[cfg(feature = "time")]
+        PgType::Date => q.bind(Option::<time::Date>::None),
     }
 }
 

@@ -296,6 +296,13 @@ Each feature pulls the matching SQLx feature. A column whose type
 isn't enabled returns `PgError::Decode` with a hint at the cargo
 feature that fixes it. Nothing is silently coerced.
 
+**NULLs.** `PgValue::Null` sends `INT8 NULL`. Postgres infers the
+actual type from context most of the time. When it can't (a
+positional NULL into a non-INT8 column without a SQL cast),
+`PgValue::TypedNull(PgType::X)` — or shorthand `PgValue::null_*()`
+— sends a NULL with the right wire type oid. Decode always lands
+in `PgValue::Null` regardless of how the NULL was bound.
+
 Non-goals: generic `sqlx::Database`, ORM, migrations, struct
 mapping, a transaction *handle* (vs. atomic script). See the
 phase plan for the why.

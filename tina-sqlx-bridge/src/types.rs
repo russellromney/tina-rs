@@ -7,6 +7,54 @@ use std::time::Duration;
 /// quietly turn the bridge mailbox into an unbounded queue.
 pub(crate) const MAX_MAILBOX_CAPACITY: usize = 1 << 20;
 
+/// Postgres type descriptor used as a hint when binding NULL values.
+///
+/// `PgValue::Null` binds as an untyped null (encoded as `INT8 NULL`),
+/// which Postgres usually infers from the surrounding query — but
+/// not always. When you bind NULL into a positional parameter of a
+/// non-INT8 column without a SQL cast, Postgres returns a
+/// type-mismatch error. [`PgValue::TypedNull`] uses this enum to
+/// pick the right SQLx encoder so the wire-level type oid matches
+/// the column.
+///
+/// One variant per supported [`PgValue`] type. Feature-gated entries
+/// mirror the feature-gated `PgValue` variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgType {
+    /// Postgres `BOOL`.
+    Bool,
+    /// Postgres `INT2` / `INT4` / `INT8`. Bound as `INT8 NULL`.
+    I64,
+    /// Postgres `FLOAT4` / `FLOAT8`. Bound as `FLOAT8 NULL`.
+    F64,
+    /// Postgres `TEXT` / `VARCHAR` / `CHAR` / `BPCHAR` / `NAME` /
+    /// `CITEXT`.
+    Text,
+    /// Postgres `BYTEA`.
+    Bytes,
+    /// Postgres `UUID`. Available with the `uuid` feature.
+    #[cfg(feature = "uuid")]
+    Uuid,
+    /// Postgres `JSON` / `JSONB`. Bound as `JSONB NULL` (compatible
+    /// with both Postgres column types in practice). Available with
+    /// the `json` feature.
+    #[cfg(feature = "json")]
+    Json,
+    /// Postgres `NUMERIC`. Available with the `numeric` feature.
+    #[cfg(feature = "numeric")]
+    Numeric,
+    /// Postgres `TIMESTAMP` (without time zone). Available with the
+    /// `time` feature.
+    #[cfg(feature = "time")]
+    Timestamp,
+    /// Postgres `TIMESTAMPTZ`. Available with the `time` feature.
+    #[cfg(feature = "time")]
+    TimestampTz,
+    /// Postgres `DATE`. Available with the `time` feature.
+    #[cfg(feature = "time")]
+    Date,
+}
+
 /// Postgres value at the bridge boundary.
 ///
 /// The base variants cover the boring core of Postgres types: bool,
@@ -19,10 +67,21 @@ pub(crate) const MAX_MAILBOX_CAPACITY: usize = 1 << 20;
 /// coerced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PgValue {
-    /// SQL `NULL`. On bind, the null is sent untyped and Postgres
-    /// infers the column type from the query. On decode, any column's
-    /// missing value lands here.
+    /// Untyped SQL `NULL`. On bind, sent as `INT8 NULL` and
+    /// Postgres infers the column type from the query (e.g. an
+    /// `INSERT INTO t (col) VALUES ($1)` resolves through the table
+    /// schema). On decode, any column's missing value lands here.
+    ///
+    /// **When Postgres can't infer** (a positional NULL bind into a
+    /// non-INT8 column without a SQL cast or surrounding type
+    /// information), use [`Self::TypedNull`] to pick the right
+    /// type-tagged encoder.
     Null,
+    /// Type-tagged SQL `NULL`. Sent on the wire as a `NULL` of the
+    /// matching Postgres type, so positional binds into non-INT8
+    /// columns work without a SQL cast. On decode, all NULLs land
+    /// in [`Self::Null`] regardless of how they were bound.
+    TypedNull(PgType),
     /// Postgres `BOOL`.
     Bool(bool),
     /// Any signed Postgres integer (`INT2` / `INT4` / `INT8`) widened
@@ -62,9 +121,80 @@ pub enum PgValue {
 }
 
 impl PgValue {
-    /// `true` iff the value is `Null`.
+    /// `true` iff the value is `Null` or `TypedNull(_)`. Both are
+    /// SQL NULL on the wire; the difference is only the encoder
+    /// hint at bind time.
     pub fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
+        matches!(self, Self::Null | Self::TypedNull(_))
+    }
+
+    /// Build a typed NULL for `pg_type`. Same as
+    /// `PgValue::TypedNull(pg_type)`, kept for builder-style use.
+    pub fn typed_null(pg_type: PgType) -> Self {
+        Self::TypedNull(pg_type)
+    }
+
+    /// Convenience: typed NULL for `BOOL`.
+    pub fn null_bool() -> Self {
+        Self::TypedNull(PgType::Bool)
+    }
+
+    /// Convenience: typed NULL for `INT8`.
+    pub fn null_i64() -> Self {
+        Self::TypedNull(PgType::I64)
+    }
+
+    /// Convenience: typed NULL for `FLOAT8`.
+    pub fn null_f64() -> Self {
+        Self::TypedNull(PgType::F64)
+    }
+
+    /// Convenience: typed NULL for `TEXT` (also matches
+    /// `VARCHAR` / `BPCHAR` / `CITEXT`).
+    pub fn null_text() -> Self {
+        Self::TypedNull(PgType::Text)
+    }
+
+    /// Convenience: typed NULL for `BYTEA`.
+    pub fn null_bytes() -> Self {
+        Self::TypedNull(PgType::Bytes)
+    }
+
+    /// Convenience: typed NULL for `UUID`.
+    #[cfg(feature = "uuid")]
+    pub fn null_uuid() -> Self {
+        Self::TypedNull(PgType::Uuid)
+    }
+
+    /// Convenience: typed NULL for `JSONB` (also accepted by
+    /// `JSON` columns).
+    #[cfg(feature = "json")]
+    pub fn null_json() -> Self {
+        Self::TypedNull(PgType::Json)
+    }
+
+    /// Convenience: typed NULL for `NUMERIC`.
+    #[cfg(feature = "numeric")]
+    pub fn null_numeric() -> Self {
+        Self::TypedNull(PgType::Numeric)
+    }
+
+    /// Convenience: typed NULL for `TIMESTAMP`.
+    #[cfg(feature = "time")]
+    pub fn null_timestamp() -> Self {
+        Self::TypedNull(PgType::Timestamp)
+    }
+
+    /// Convenience: typed NULL for `TIMESTAMPTZ`.
+    #[cfg(feature = "time")]
+    pub fn null_timestamptz() -> Self {
+        Self::TypedNull(PgType::TimestampTz)
+    }
+
+    /// Convenience: typed NULL for `DATE`.
+    #[cfg(feature = "time")]
+    pub fn null_date() -> Self {
+        Self::TypedNull(PgType::Date)
     }
 
     /// Returns the inner bool if this is a `Bool`. None otherwise.
@@ -356,6 +486,14 @@ where
             Some(t) => t.into(),
             None => PgValue::Null,
         }
+    }
+}
+
+impl From<PgType> for PgValue {
+    /// Construct a typed NULL: `PgType::Uuid.into()` returns
+    /// `PgValue::TypedNull(PgType::Uuid)`.
+    fn from(pg_type: PgType) -> Self {
+        Self::TypedNull(pg_type)
     }
 }
 

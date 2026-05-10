@@ -21,16 +21,9 @@ use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
 };
-#[cfg(any(
-    feature = "uuid",
-    feature = "json",
-    feature = "numeric",
-    feature = "time"
-))]
-use tina_sqlx_bridge::PgValue;
 use tina_sqlx_bridge::{
     InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgPoolConfig, PgRequest,
-    PgResponse, PgRows, PgStep, PgStepOk, PgTransactionOutcome, PgWorker, send_request,
+    PgResponse, PgRows, PgStep, PgStepOk, PgTransactionOutcome, PgValue, PgWorker, send_request,
 };
 
 fn database_url() -> Option<String> {
@@ -1164,6 +1157,195 @@ fn cancel_on_timeout_disabled_by_default_no_cancels_sent() {
     assert_eq!(
         snap.db_cancels_sent, 0,
         "cancel must stay off by default: {snap:?}",
+    );
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn typed_null_text_round_trips_via_positional_bind() {
+    // A positional NULL bind into a TEXT column would need a SQL
+    // cast under PgValue::Null (which sends INT8 NULL). With
+    // PgValue::null_text() the wire-level NULL is typed as TEXT
+    // and Postgres accepts it without a cast.
+    use tina_sqlx_bridge::PgType;
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let table = unique_table();
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!(
+            "CREATE TABLE {table} (id INT8 PRIMARY KEY, name TEXT)"
+        )),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    let insert = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("INSERT INTO {table} (id, name) VALUES ($1, $2)"))
+            .param(1_i64)
+            .param(PgValue::null_text()),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    assert!(
+        matches!(
+            insert,
+            CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected: 1 }))
+        ),
+        "typed null insert: {insert:?}",
+    );
+
+    let fetch = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one(format!("SELECT name FROM {table} WHERE id = $1")).param(1_i64),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match fetch {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert!(row.col(0).map(PgValue::is_null).unwrap_or(false));
+        }
+        other => panic!("fetch: {other:?}"),
+    }
+
+    // Sanity: PgType::into() builds the same TypedNull.
+    let pre_built: PgValue = PgType::Text.into();
+    assert_eq!(pre_built, PgValue::TypedNull(PgType::Text));
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("DROP TABLE {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    shutdown(runtime);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn typed_null_uuid_works_where_untyped_null_would_fail() {
+    // The whole point of typed nulls: a positional NULL into a UUID
+    // column without a SQL cast. Untyped Null sends INT8 NULL,
+    // which Postgres rejects with a type-mismatch. This test
+    // exercises the success path; the failure path (untyped Null)
+    // is covered by the `untyped_null_into_uuid_column_errors` test
+    // below as a contrast.
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let table = unique_table();
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!(
+            "CREATE TABLE {table} (id INT8 PRIMARY KEY, ref UUID)"
+        )),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    let insert = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("INSERT INTO {table} (id, ref) VALUES ($1, $2)"))
+            .param(1_i64)
+            .param(PgValue::null_uuid()),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    assert!(
+        matches!(
+            insert,
+            CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected: 1 }))
+        ),
+        "typed null uuid insert: {insert:?}",
+    );
+
+    let fetch = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one(format!("SELECT ref FROM {table} WHERE id = $1")).param(1_i64),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match fetch {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert!(row.col(0).map(PgValue::is_null).unwrap_or(false));
+        }
+        other => panic!("fetch: {other:?}"),
+    }
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("DROP TABLE {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    shutdown(runtime);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn untyped_null_into_uuid_column_errors() {
+    // Contrast for the typed-null test above: PgValue::Null is sent
+    // as INT8 NULL, so a positional bind into a UUID column trips
+    // a Postgres type-mismatch error. This test locks the failure
+    // shape so a regression in the bind code is loud.
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let table = unique_table();
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!(
+            "CREATE TABLE {table} (id INT8 PRIMARY KEY, ref UUID)"
+        )),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("INSERT INTO {table} (id, ref) VALUES ($1, $2)"))
+            .param(1_i64)
+            .param(PgValue::Null),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    assert!(
+        matches!(outcome, CallOutcome::Replied(Err(PgError::Sqlx(_)))),
+        "expected Sqlx type-mismatch error, got {outcome:?}",
+    );
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("DROP TABLE {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
     shutdown(runtime);
 }

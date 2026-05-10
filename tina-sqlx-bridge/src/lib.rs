@@ -55,6 +55,33 @@
 //! all) decode to [`PgError::Decode`] with the type name. Nothing is
 //! silently coerced.
 //!
+//! # NULL bind hints
+//!
+//! [`PgValue::Null`] sends `INT8 NULL`. Postgres infers the actual
+//! parameter type from query context — table columns in
+//! `INSERT INTO t (col) VALUES ($1)`, an explicit cast in
+//! `SELECT $1::TEXT`, etc. This is fine most of the time.
+//!
+//! When Postgres can't infer (a positional NULL bind into a
+//! non-INT8 column without surrounding type hints), use
+//! [`PgValue::TypedNull`] — or one of the `null_*()` shorthands
+//! ([`PgValue::null_text`], [`PgValue::null_uuid`], …) — to send a
+//! NULL with the right wire-level type oid:
+//!
+//! ```ignore
+//! // Postgres rejects: INT8 NULL bound to UUID column.
+//! .param(PgValue::Null)
+//!
+//! // Works: typed UUID NULL.
+//! .param(PgValue::null_uuid())
+//!
+//! // Equivalent: PgType::Uuid.into() builds a TypedNull.
+//! .param(PgValue::from(PgType::Uuid))
+//! ```
+//!
+//! On decode, NULLs land in [`PgValue::Null`] regardless of how they
+//! were bound. Only the bind side cares about the type tag.
+//!
 //! Generic `sqlx::Database` support, user-struct row mapping, an
 //! ORM, migrations, and a transaction *handle* (vs. atomic script)
 //! are explicit non-goals. See the phase plan for the declined set
@@ -252,6 +279,6 @@ pub use helpers::{
 pub use metrics::{PgMetrics, PgMetricsHandle};
 pub use types::{
     InstallError, PgCancelConfig, PgConfig, PgConfigError, PgError, PgPoolConfig, PgRequest,
-    PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome, PgValue, U64TooLarge,
+    PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome, PgType, PgValue, U64TooLarge,
 };
 pub use worker::{InstalledPgBridge, PgCloser, PgMsg, PgWorker};
