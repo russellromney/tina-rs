@@ -9,9 +9,12 @@ The rule:
 > Tokio may speak ecosystem. Tina owns state. Bridge shows pressure.
 > Bridge may adapt. Bridge may not lie.
 
-If you can use a native Tina crate, do. If you need HTTPS, HTTP/2, an
-existing Axum app, or a third-party SDK that only ships a Tokio
-client, reach for a bridge crate.
+If you can use a native Tina crate, do. Native HTTPS/1.1 lives in
+`tina-http`'s `HttpsListener` and `HttpClient` — explicit DER cert
+config, typed startup, matchable TLS errors. Reach for a bridge
+when you need HTTP/2, ALPN, system trust roots, redirects/cookies,
+an existing Axum app, or a third-party SDK that only ships a Tokio
+client.
 
 ## What ships today
 
@@ -19,7 +22,7 @@ client, reach for a bridge crate.
 | --- | --- | --- |
 | `tina-tokio-bridge` | Tokio caller → Tina isolate | A Tokio handler needs a bounded request/reply path into a Tina service. |
 | `tina-tower-bridge` | `tower::Service` over a Tina bridge | An Axum/Hyper/Tower stack wants to call a Tina service through normal Tower middleware. |
-| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTPS/HTTP-2 with mature redirect, retry, and connection-reuse. |
+| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; reqwest covers everything else. |
 
 Each crate is small, opt-in, and bounded. Native Tina crates
 (`tina-http`, etc.) do not depend on any bridge; bridges do not leak

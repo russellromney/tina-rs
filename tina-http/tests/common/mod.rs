@@ -186,6 +186,13 @@ impl TestHarness {
             .as_ref()
             .expect("runtime present until shutdown")
     }
+
+    /// Returns the listener isolate address for tests that need to
+    /// send extra `HttpListenerMsg`s to it (e.g. idempotency
+    /// regression tests).
+    pub fn listener_address(&self) -> Address<HttpListenerMsg> {
+        self.listener
+    }
 }
 
 /// Counts runtime events whose kind is `CallCompleted` for a TCP-read

@@ -6,11 +6,6 @@ benchmarks. They are ergonomics and functionality probes that should help us
 discover where Tina is safer, awkward, incomplete, broken, or pointing at a
 better model.
 
-The directory prefix is `specimen_` on purpose. A specimen is something you
-put under glass and inspect: small enough to understand, real enough to make
-the shape honest. These crates are not product templates and not scorekeeping
-harnesses.
-
 Cross-cutting ergonomic findings — patterns that show up in more than one
 comparison and the API/runtime suggestions they imply — live in
 [`FINDINGS.md`](FINDINGS.md). The longer field journal and resolved
@@ -146,6 +141,7 @@ than that.
 | `specimen_outbound_fetch` | Specimen | "Go fetch these endpoints and aggregate" — Tina as a TCP/DNS *client*, compared to `reqwest`/`hyper`. |
 | `specimen_outbound_http` | Specimen | Same scripted HTTP endpoint sequence, two clients: `tina_http::HttpClient` (with a `Driver` isolate bridging the host thread) vs `reqwest::Client`. |
 | `specimen_native_http` | Specimen | Native HTTP/1.1 counter server: `tina_http::HttpListener` + Counter isolate vs `axum`. **First example where the Tina side is shorter than the Tokio side.** |
+| `specimen_native_https` | Specimen | Native HTTPS/1.1 counter server: `tina_http::HttpsListener` (call-shaped typed startup, DER cert/key, single-worker TLS lane) vs hand-rolled `tokio + tokio-rustls`. The shared scripted client is stdlib `rustls`. The Tina HTTPS *client* lives in `tina-http/tests/client_tls_smoke.rs` because client and server cannot share a runtime in first form (single TLS worker thread deadlocks the handshake). |
 | `specimen_graceful_shutdown` | Specimen | Long-lived service with in-flight work receives SIGINT; compares `tokio::signal` + manual drain against Tina's signal capture and bounded shutdown story. |
 | `specimen_axum_counter` | Bridge (deferred) | Stateful HTTP counter over axum; tests `tina-tokio-bridge` ergonomics and HTTP-shaped pushback. *Awaiting bridge ergonomics work; not rewritten under the specimens rule yet.* |
 | `specimen_ws_room` | Bridge (deferred) | WebSocket broadcast room with two clients; tests bridge-hosted bidirectional sessions and subscriber pruning. *Awaiting bridge ergonomics work.* |

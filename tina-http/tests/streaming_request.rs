@@ -103,6 +103,10 @@ impl Isolate for Consumer {
                     self.accumulated.clear();
                     reply(HttpResponse::with_text(StatusCode::OK, body))
                 }
+                CallOutcome::Replied(RequestChunkReply::Error(_)) => {
+                    self.pending_source = None;
+                    reply(HttpResponse::internal_error())
+                }
                 CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => {
                     self.pending_source = None;
                     reply(HttpResponse::internal_error())
@@ -396,6 +400,10 @@ impl Isolate for NotifyingConsumer {
                     self.pending_source = None;
                     self.accumulated.clear();
                     reply(HttpResponse::with_text(StatusCode::OK, body))
+                }
+                CallOutcome::Replied(RequestChunkReply::Error(_)) => {
+                    self.pending_source = None;
+                    reply(HttpResponse::internal_error())
                 }
                 CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => {
                     self.pending_source = None;

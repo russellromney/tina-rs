@@ -86,8 +86,31 @@ pub enum EffectKind {
 /// `compile_fail` doctest on [`tina::reply_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredReplyRejectedReason {
-    /// The original caller already timed out, closed, or otherwise stopped.
+    /// The original caller already closed for a reason not classified
+    /// below: e.g. requester shard failure, transport issue, or a
+    /// pre-066 lifecycle path we have not yet split out.
     CallerClosed,
+
+    /// Caller invoked `cancel_call(handle)`. Distinct from
+    /// `CallerClosed` (lifecycle), `CallerTimedOut` (deadline),
+    /// `OwnerStopped` (owner isolate stopped), and `RuntimeStopped`
+    /// (runtime shutting down) so observers can attribute the cause.
+    CallerCancelled,
+
+    /// The mandatory call timeout fired before the reply arrived.
+    /// Distinct from `CallerCancelled`: the user did not explicitly
+    /// `cancel_call` — the deadline elapsed.
+    CallerTimedOut,
+
+    /// The owning isolate stopped while this call was pending.
+    /// Distinct from `CallerCancelled` so traces can tell explicit
+    /// cancel from owner lifecycle.
+    OwnerStopped,
+
+    /// The runtime began shutting down before the reply arrived.
+    /// Distinct from `OwnerStopped` so traces can tell isolate-scoped
+    /// teardown from process-scoped teardown.
+    RuntimeStopped,
 
     /// The bounded reply transport path back to the requester was full.
     ReplyPathFull,
@@ -232,6 +255,11 @@ pub enum CallKind {
     /// An isolate-to-isolate call whose reply is delivered back to the
     /// requester as an ordinary later message.
     IsolateCall,
+
+    /// A caller-issued request to cancel one pending isolate call's wait.
+    /// The runtime delivers a [`tina::CancelOutcome`] back to the
+    /// requester as an ordinary later message.
+    CancelCall,
 }
 
 /// Why a runtime-owned call's completion could not be delivered to the
@@ -257,9 +285,27 @@ pub enum CallCompletionRejectedReason {
 pub enum CallReplyRejectedReason {
     /// The call was no longer pending by the time the callee replied.
     ///
-    /// This usually means the caller's timeout already fired, or the call was
-    /// otherwise settled before the reply arrived.
+    /// Used as the fall-through when no more specific cause is on
+    /// record — for example, after the bounded recently-cancelled
+    /// ring evicts the call_id. The more specific
+    /// `CallerCancelled` / `CallerTimedOut` / `OwnerStopped` /
+    /// `RuntimeStopped` reasons take precedence when known.
     NoPendingCall,
+
+    /// The original caller explicitly cancelled the wait via
+    /// `cancel_call(handle)` before the reply arrived.
+    CallerCancelled,
+
+    /// The mandatory call timeout fired before the reply arrived.
+    /// Distinct from `CallerCancelled` (explicit) and
+    /// `NoPendingCall` (no record).
+    CallerTimedOut,
+
+    /// The owning isolate stopped while this call was pending.
+    OwnerStopped,
+
+    /// The runtime began shutting down before the reply arrived.
+    RuntimeStopped,
 
     /// The bounded reply transport path back to the requester was full.
     ReplyPathFull,
@@ -513,6 +559,23 @@ pub enum RuntimeEventKind {
         reason: CallReplyRejectedReason,
     },
 
+    /// The runtime closed the caller-side wait of an in-flight isolate
+    /// call because of an explicit cancel, owner stop, or other
+    /// lifecycle event named by `cause`.
+    ///
+    /// The callee may still finish work it already accepted; any reply
+    /// that arrives later is rejected as a separate
+    /// `CallReplyRejected` (or `DeferredReplyRejected`) event with
+    /// reason `CallerCancelled` / `CallerClosed`. This event records
+    /// the cancel itself.
+    CallCancelled {
+        /// The runtime-assigned identifier for the cancelled call.
+        call_id: CallId,
+
+        /// Why the caller-side wait closed.
+        cause: tina::CancelCause,
+    },
+
     /// A local snapshot was committed.
     SnapshotCommitted,
 
@@ -694,6 +757,122 @@ impl RuntimeEvent {
     }
 }
 
+/// Convenience queries over runtime traces.
+///
+/// These helpers summarize facts that are already present in the trace. They
+/// do not hide call outcomes or infer missing causality; they just replace the
+/// repeated `matches!(event.kind(), ...)` scans that show up in tests and
+/// specimen harnesses.
+pub trait RuntimeTraceExt {
+    /// Counts runtime-owned calls of `call_kind` that completed successfully.
+    fn count_completed(&self, call_kind: CallKind) -> usize;
+
+    /// Returns true when any runtime-owned call of `call_kind` completed
+    /// successfully.
+    fn any_completed(&self, call_kind: CallKind) -> bool {
+        self.count_completed(call_kind) > 0
+    }
+
+    /// Counts runtime-owned calls of `call_kind` that failed before their
+    /// translated continuation was delivered.
+    fn count_failed(&self, call_kind: CallKind) -> usize;
+
+    /// Returns true when any runtime-owned call of `call_kind` failed before
+    /// its translated continuation was delivered.
+    fn any_failed(&self, call_kind: CallKind) -> bool {
+        self.count_failed(call_kind) > 0
+    }
+
+    /// Counts failed runtime-owned calls of `call_kind` whose reason matches
+    /// `predicate`.
+    fn count_failed_with(
+        &self,
+        call_kind: CallKind,
+        predicate: impl FnMut(CallError) -> bool,
+    ) -> usize;
+
+    /// Returns true when any failed runtime-owned call of `call_kind` has a
+    /// reason matching `predicate`.
+    fn any_failed_with(
+        &self,
+        call_kind: CallKind,
+        predicate: impl FnMut(CallError) -> bool,
+    ) -> bool {
+        self.count_failed_with(call_kind, predicate) > 0
+    }
+
+    /// Counts runtime-owned call completions of `call_kind` that could not be
+    /// delivered back to their requester.
+    fn count_completion_rejected(&self, call_kind: CallKind) -> usize;
+
+    /// Returns true when any runtime-owned call completion of `call_kind`
+    /// could not be delivered back to its requester.
+    fn any_completion_rejected(&self, call_kind: CallKind) -> bool {
+        self.count_completion_rejected(call_kind) > 0
+    }
+}
+
+impl RuntimeTraceExt for [RuntimeEvent] {
+    fn count_completed(&self, call_kind: CallKind) -> usize {
+        self.iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted {
+                        call_kind: actual,
+                        ..
+                    } if actual == call_kind
+                )
+            })
+            .count()
+    }
+
+    fn count_failed(&self, call_kind: CallKind) -> usize {
+        self.iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallFailed {
+                        call_kind: actual,
+                        ..
+                    } if actual == call_kind
+                )
+            })
+            .count()
+    }
+
+    fn count_failed_with(
+        &self,
+        call_kind: CallKind,
+        mut predicate: impl FnMut(CallError) -> bool,
+    ) -> usize {
+        self.iter()
+            .filter(|event| match event.kind() {
+                RuntimeEventKind::CallFailed {
+                    call_kind: actual,
+                    reason,
+                    ..
+                } => actual == call_kind && predicate(reason),
+                _ => false,
+            })
+            .count()
+    }
+
+    fn count_completion_rejected(&self, call_kind: CallKind) -> usize {
+        self.iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_kind: actual,
+                        ..
+                    } if actual == call_kind
+                )
+            })
+            .count()
+    }
+}
+
 /// Stable, allocation-free FNV-1a hasher used for trace fingerprints.
 ///
 /// FNV-1a is chosen over `std::hash::DefaultHasher` because its bytewise
@@ -766,6 +945,10 @@ fn deferred_reply_rejected_tag(reason: DeferredReplyRejectedReason) -> u8 {
         DeferredReplyRejectedReason::ReplyPathFull => 2,
         DeferredReplyRejectedReason::RequesterShardClosed => 3,
         DeferredReplyRejectedReason::TypeMismatch => 4,
+        DeferredReplyRejectedReason::CallerCancelled => 5,
+        DeferredReplyRejectedReason::CallerTimedOut => 6,
+        DeferredReplyRejectedReason::OwnerStopped => 7,
+        DeferredReplyRejectedReason::RuntimeStopped => 8,
     }
 }
 
@@ -812,6 +995,7 @@ fn call_kind_tag(kind: CallKind) -> u8 {
         CallKind::Sleep => 38,
         CallKind::ObservedSend => 39,
         CallKind::IsolateCall => 40,
+        CallKind::CancelCall => 41,
     }
 }
 
@@ -885,6 +1069,19 @@ fn call_reply_rejected_tag(reason: CallReplyRejectedReason) -> u8 {
         CallReplyRejectedReason::NoPendingCall => 1,
         CallReplyRejectedReason::ReplyPathFull => 2,
         CallReplyRejectedReason::RequesterShardClosed => 3,
+        CallReplyRejectedReason::CallerCancelled => 4,
+        CallReplyRejectedReason::CallerTimedOut => 5,
+        CallReplyRejectedReason::OwnerStopped => 6,
+        CallReplyRejectedReason::RuntimeStopped => 7,
+    }
+}
+
+fn cancel_cause_tag(cause: tina::CancelCause) -> u8 {
+    match cause {
+        tina::CancelCause::CallerCancelled => 1,
+        tina::CancelCause::CallerTimedOut => 2,
+        tina::CancelCause::OwnerStopped => 3,
+        tina::CancelCause::RuntimeStopped => 4,
     }
 }
 
@@ -1078,6 +1275,11 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u64(slot_id.get());
             hasher.write_u64(call_id.get());
         }
+        RuntimeEventKind::CallCancelled { call_id, cause } => {
+            hasher.write_u8(33);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(cancel_cause_tag(cause));
+        }
     }
 }
 
@@ -1196,5 +1398,52 @@ mod stable_hash_tests {
         let forward = stable_trace_hash([&a, &b]);
         let reversed = stable_trace_hash([&b, &a]);
         assert_ne!(forward, reversed);
+    }
+
+    #[test]
+    fn trace_query_helpers_count_call_facts() {
+        let trace = [
+            RuntimeEvent::new(
+                EventId::new(1),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::CallCompleted {
+                    call_id: CallId::new(1),
+                    call_kind: CallKind::TlsBind,
+                },
+            ),
+            RuntimeEvent::new(
+                EventId::new(2),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::CallFailed {
+                    call_id: CallId::new(2),
+                    call_kind: CallKind::TlsBind,
+                    reason: CallError::TlsCertificate,
+                },
+            ),
+            RuntimeEvent::new(
+                EventId::new(3),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id: CallId::new(3),
+                    call_kind: CallKind::TlsRead,
+                    reason: CallCompletionRejectedReason::MailboxFull,
+                },
+            ),
+        ];
+
+        assert_eq!(trace.count_completed(CallKind::TlsBind), 1);
+        assert!(trace.any_completed(CallKind::TlsBind));
+        assert_eq!(trace.count_failed(CallKind::TlsBind), 1);
+        assert!(trace.any_failed_with(CallKind::TlsBind, |reason| {
+            reason == CallError::TlsCertificate
+        }));
+        assert_eq!(trace.count_completion_rejected(CallKind::TlsRead), 1);
+        assert!(!trace.any_failed(CallKind::TlsRead));
     }
 }

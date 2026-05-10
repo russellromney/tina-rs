@@ -99,7 +99,7 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
                 self.in_flight = true;
                 call(
                     self.client,
-                    HttpClientMsg::Call(outbound),
+                    HttpClientMsg::Call(Box::new(outbound)),
                     self.config.client_call_timeout,
                 )
                 .reply(HttpPoolMsg::Returned)

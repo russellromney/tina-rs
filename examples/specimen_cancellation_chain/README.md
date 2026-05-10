@@ -6,23 +6,20 @@ the host asks for cancellation before any worker has finished.
 
 ## What this teaches
 
-Tina has no public *external* cancellation primitive. There is no
-`runtime.cancel(addr)` and no public `IsolateCall::abort()`. The
-closest thing is "send a `Stop` message to the requester isolate,
-which causes it to stop itself." Stopping the requester closes its
-pending IsolateCalls; later worker replies are rejected by the
-runtime as `CallReplyRejected { RequesterClosed }` and never reach
-the handler.
+Tina's first-form external cancellation primitive is
+`call_with_handle(addr, msg, t).reply(...)` which returns a
+caller-owned `CallHandle`, plus `cancel_call(handle).reply(...)`
+which closes the wait. The handle is move-only and not `Clone`: one
+handle, one cancel.
 
-Tokio: `JoinSet::abort_all()`. Preempts at the next await boundary;
-aborted tasks never deliver.
+Cancellation closes the *wait*, not the *work*. Workers that already
+accepted their request may still finish; their replies become typed
+`CallReplyRejected { CallerCancelled }` events in the trace and never
+reach the driver's handler. The driver stays alive and can keep
+serving other messages.
 
-Tina: the `Stop` envelope on `DriverMsg`, plus
-`runtime.try_send(driver, DriverMsg::Stop)` from the host. The
-driver's `Stop` arm ends with `stop_with(report)` and the host
-reads the typed `Report` through
-`runtime.observe_result::<Report>(driver)` — no
-`Arc<Mutex<Option<Report>>>` side channel.
+Tokio side: `JoinSet::abort_all()`. Preempts at the next await
+boundary; aborted tasks never deliver.
 
 ## Run
 
@@ -31,26 +28,27 @@ cargo run --manifest-path examples/specimen_cancellation_chain/Cargo.toml -- bot
 cargo test --manifest-path examples/specimen_cancellation_chain/Cargo.toml
 ```
 
-## What feels worse
+## What feels worse than Tokio
 
-- **Cancellation is a domain message, not a runtime verb.** Every
-  isolate that wants to be externally cancellable must add its own
-  `Stop` (or equivalent) variant. That's fine for an isolate that
-  already has a domain shutdown. It is verbose for libraries that
-  want generic mid-flight cancellation.
-- **No handle for "abort just these N calls."** The driver has to
-  stop *itself* — there is no way to keep the driver alive but
-  abandon its currently in-flight IsolateCalls.
+- Cancellation is bookkeeping: each pending call needs its own
+  `CallHandle` stored in isolate state. The driver fans the cancels
+  back out as a `Batch`, one cancel per stored handle. There is no
+  one-shot `JoinSet::abort_all()` analogue — see Rock 4 of
+  `.intent/phases/066-cancellation-and-deadline-model/plan.md` for
+  the bounded-set helper that closes that gap.
 
 ## What feels better
 
-- **Late replies are visibly accounted for.** Every worker reply
-  that arrives after the driver stops produces a typed
-  `CallReplyRejected { RequesterClosed }` event in the trace. There
-  is no silent task-leak.
-- **Resource cleanup is the same path as graceful exit.** Whatever
-  cleanup runs when the driver stops naturally also runs here.
+- Late replies are visibly accounted for. Every worker reply that
+  arrives after cancellation produces a typed
+  `CallReplyRejected { CallerCancelled }` event. No silent task-leak.
+- The driver does not have to stop itself to cancel its calls.
+  `cancel_call(handle)` closes one wait without killing the isolate.
+- `CancelOutcome` is `#[must_use]`: ignoring the truth ("did the
+  cancel reclaim a wait, or was the call already done?") is a
+  compile-time lint.
 
 ## Findings touched
 
-- See FINDINGS finding 8 (external cancellation API).
+- See FINDINGS finding 8 (external cancellation API) — Tina now ships
+  the first-form primitive (`call_with_handle` + `cancel_call`).

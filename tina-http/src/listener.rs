@@ -51,6 +51,8 @@ pub struct HttpListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stati
     service_call_timeout: Duration,
     connection_mailbox_capacity: usize,
     listener: Option<ListenerId>,
+    /// Set on the first `Start`. Second Start is a no-op.
+    started: bool,
     stopping: bool,
     _shard: PhantomData<S>,
 }
@@ -80,6 +82,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, 
             service_call_timeout,
             connection_mailbox_capacity,
             listener: None,
+            started: false,
             stopping: false,
             _shard: PhantomData,
         }
@@ -123,11 +126,29 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HttpListenerMsg::Start => tcp_bind(self.bind_addr).reply(HttpListenerMsg::Bound),
+            HttpListenerMsg::Start => {
+                if self.started {
+                    // Idempotent: a second Start would overwrite
+                    // self.listener and leak the first. Reply type
+                    // is `()` so the contract is "trace shows one
+                    // TcpBind".
+                    return noop();
+                }
+                self.started = true;
+                tcp_bind(self.bind_addr).reply(HttpListenerMsg::Bound)
+            }
 
             HttpListenerMsg::Bound(Ok((listener, local_addr))) => {
                 self.listener = Some(listener);
                 let _ = local_addr;
+                if self.stopping {
+                    // Stop arrived while bind was in flight. Close
+                    // the just-bound listener immediately rather
+                    // than starting the accept loop, otherwise the
+                    // listener would leak until full shutdown.
+                    let listener = self.listener.take().expect("set just above");
+                    return tcp_close_listener(listener).reply(HttpListenerMsg::ListenerClosed);
+                }
                 tcp_accept(listener).reply(HttpListenerMsg::Accepted)
             }
             HttpListenerMsg::Bound(Err(_)) => stop(),
@@ -142,7 +163,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // touch the listener again.
                     return tcp_close_stream(stream).reply(HttpListenerMsg::StreamClosed);
                 }
-                let listener = self.listener.expect("listener set after bind");
+                let Some(listener) = self.listener else {
+                    // Defensive: invariant says listener=Some when
+                    // !stopping. If violated, orphan-close.
+                    return tcp_close_stream(stream).reply(HttpListenerMsg::StreamClosed);
+                };
                 let child = self.build_connection_child(stream);
                 batch(vec![
                     spawn(child),

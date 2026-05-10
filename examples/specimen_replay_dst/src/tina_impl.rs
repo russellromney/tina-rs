@@ -19,10 +19,10 @@ use std::rc::Rc;
 
 use tina::prelude::*;
 use tina_sim::dst::{
-    History, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrinkReport, SweepFailure,
+    ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrinkReport, SweepFailure,
     SweepSuccess, assert_replay_case, shrink_replay_case, sweep_seeds,
 };
-use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator, SimulatorConfig};
+use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
 /// The history alphabet. Each op causes an observable simulator
 /// action — deleting one changes the trace hash.
@@ -109,9 +109,14 @@ fn faults() -> FaultConfig {
 /// The bug in a box: a saved `ReplayCase` with pinned event count and
 /// trace hash. Copy this shape into your bug report.
 pub fn case() -> ReplayCase<Op> {
-    let history = History::new(
+    let config = ReplayConfig::with_faults(faults())
+        .with_mailbox(PRODUCER_ROLE, 16)
+        .with_mailbox(SINK_ROLE, 16);
+    ReplayCase::new(
         "specimen_replay_dst saved seed",
         42,
+        config,
+        "history-driven ticks fan out into a sink under seeded delivery delays",
         vec![
             Op::Tick(0),
             Op::Tick(1),
@@ -122,26 +127,9 @@ pub fn case() -> ReplayCase<Op> {
             Op::Tick(5),
             Op::Drain,
         ],
-    );
-    let config = ReplayConfig {
-        simulator: SimulatorConfig {
-            faults: faults(),
-            ..SimulatorConfig::default()
-        },
-        mailboxes: [(PRODUCER_ROLE, 16), (SINK_ROLE, 16)]
-            .into_iter()
-            .collect(),
-    };
-    ReplayCase {
-        name: "specimen_replay_dst saved seed",
-        seed: 42,
-        config,
-        scenario: "history-driven ticks fan out into a sink under seeded delivery delays",
-        history,
-        expected_event_count: SAVED_EVENT_COUNT,
-        expected_trace_hash: SAVED_TRACE_HASH,
-        invariant: "every Tick op produces one SinkMsg::Got(value) in trace order",
-    }
+        "every Tick op produces one SinkMsg::Got(value) in trace order",
+    )
+    .expecting(SAVED_EVENT_COUNT, SAVED_TRACE_HASH)
 }
 
 // Saved constants. Refresh these only after a conscious trace-shape
@@ -157,9 +145,7 @@ const SAVED_TRACE_HASH: u64 = 0xc878_d2a4_3912_9480;
 /// case's `ReplayConfig` supplies the simulator config (with `seed`
 /// taken from the case) and both mailbox capacities.
 pub fn run_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
-    let mut config = case.config.simulator.clone();
-    config.seed = case.seed;
-    let mut sim = Simulator::new(SingleShard, config);
+    let mut sim = Simulator::new(SingleShard, case.simulator_config());
 
     let received = Rc::new(RefCell::new(Vec::new()));
     let sink = sim.register_with_mailbox_capacity(
@@ -211,16 +197,19 @@ pub fn run() -> anyhow::Result<Demo> {
         "specimen_replay_dst seed sweep",
         [42_u64, 99, 123, 256, 1024],
         |seed| {
-            let mut c = case();
-            c.seed = seed;
-            // Keep history.name/seed in sync with case.name/seed so
-            // the debug_asserts in check_replay_case stay happy.
-            c.history = History::new(c.name, seed, c.history.operations().to_vec());
-            // Sweep is searching: clear the saved constants on the
-            // generated case so a discovered failure refreshes them.
-            c.expected_event_count = 0;
-            c.expected_trace_hash = 0;
-            c
+            // Build a fresh case at this seed via ReplayCase::new so
+            // case.name/seed and history.name/seed stay aligned.
+            // No `.expecting(...)` — sweep is searching, so a found
+            // failure refreshes the expected constants on its own.
+            let template = case();
+            ReplayCase::new(
+                template.name,
+                seed,
+                template.config.clone(),
+                template.scenario,
+                template.history.operations().to_vec(),
+                template.invariant,
+            )
         },
         run_case,
         |report| {

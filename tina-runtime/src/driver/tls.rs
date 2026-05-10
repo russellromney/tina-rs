@@ -67,6 +67,10 @@ pub(super) struct TlsWorkerLane {
     pub(super) streams: Vec<TlsStreamEntry>,
     pub(super) next_listener_id: u64,
     pub(super) next_stream_id: u64,
+    /// Call ids cancelled by close-wins. `advance()` drains into
+    /// synthetic `Failed(TargetClosed)` completions; the worker's
+    /// real completion is dropped because the pending entry is gone.
+    pub(super) cancelled_by_close: Vec<CallId>,
 }
 
 pub(super) struct TlsListenerEntry {
@@ -300,6 +304,7 @@ impl TlsWorkerLane {
             streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             next_listener_id: 1,
             next_stream_id: 1,
+            cancelled_by_close: Vec::new(),
         }
     }
 
@@ -368,18 +373,23 @@ impl TlsWorkerLane {
         call_id: CallId,
         listener: TlsListenerId,
     ) -> Option<DriverCompletion> {
-        if self.lane_has_pending(TlsPendingLane::ListenerAccept(listener)) {
-            return Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::ResourceBusy),
-            });
-        }
         let Some(index) = self.listeners.iter().position(|entry| entry.id == listener) else {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::InvalidResource),
             });
         };
+        // Close wins: cancel any pending accept on this listener.
+        // Mirrors `do_listener_close` on the TCP lane.
+        for pending in self.pending.iter_mut() {
+            if matches!(pending.lane, TlsPendingLane::ListenerAccept(l) if l == listener)
+                && !pending.cancelled.load(Ordering::Acquire)
+            {
+                pending.cancelled.store(true, Ordering::Release);
+                pending.timed_out = true;
+                self.cancelled_by_close.push(pending.call_id);
+            }
+        }
         self.listeners.remove(index);
         Some(DriverCompletion {
             call_id,
@@ -416,23 +426,30 @@ impl TlsWorkerLane {
     pub(super) fn submit_close(
         &mut self,
         call_id: CallId,
-        stream: TlsStreamId,
+        stream_id: TlsStreamId,
         timeout: Duration,
         now: Instant,
     ) -> Option<DriverCompletion> {
-        let lane = TlsPendingLane::Stream(stream);
-        if self.lane_has_pending(lane) {
-            return Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::ResourceBusy),
-            });
-        }
-        let Some(stream) = self.stream(stream) else {
+        let lane = TlsPendingLane::Stream(stream_id);
+        let Some(stream_arc) = self.stream(stream_id) else {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::InvalidResource),
             });
         };
+        // Close wins: cancel any pending read/write on this stream.
+        for pending in self.pending.iter_mut() {
+            if pending.lane == lane && !pending.cancelled.load(Ordering::Acquire) {
+                pending.cancelled.store(true, Ordering::Release);
+                pending.timed_out = true;
+                self.cancelled_by_close.push(pending.call_id);
+            }
+        }
+        // Free the lane slot now. The worker still flushes through
+        // its cloned `Arc<Mutex<TlsRuntimeStream>>`; further
+        // read/write/close submissions on this id see
+        // `InvalidResource`.
+        self.streams.retain(|entry| entry.id != stream_id);
         let cancelled = Arc::new(AtomicBool::new(false));
         self.submit_command(
             call_id,
@@ -441,7 +458,7 @@ impl TlsWorkerLane {
             now,
             TlsCommand::Close {
                 call_id,
-                stream,
+                stream: stream_arc,
                 timeout,
                 cancelled,
             },
@@ -573,6 +590,17 @@ impl TlsWorkerLane {
     }
 
     pub(super) fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
+        // Drain close-wins cancellations into synthetic completions.
+        while let Some(call_id) = self.cancelled_by_close.pop() {
+            if let Some(idx) = self.pending.iter().position(|p| p.call_id == call_id) {
+                self.pending.remove(idx);
+            }
+            completed.push(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::TargetClosed),
+            });
+        }
+
         for pending in &mut self.pending {
             if !pending.timed_out
                 && !pending.cancelled.load(Ordering::Acquire)
@@ -664,14 +692,8 @@ impl TlsWorkerLane {
                 }
                 Err(error) => CallOutput::Failed(error),
             },
-            TlsCompletionResult::Output(output) => {
-                if matches!(output, CallOutput::TlsClosed)
-                    && let TlsPendingLane::Stream(stream) = pending.lane
-                {
-                    self.streams.retain(|entry| entry.id != stream);
-                }
-                output
-            }
+            // Streams are removed at `submit_close` time, not here.
+            TlsCompletionResult::Output(output) => output,
         };
         completed.push(DriverCompletion {
             call_id: completion.call_id,
@@ -866,6 +888,7 @@ pub(super) fn connect_tls(
         return Err(CallError::Timeout);
     }
     let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|_| CallError::Io)?;
+    // `set_*_timeout` only fails for `Some(zero)`/`None`; never here.
     let _ = tcp.set_read_timeout(Some(timeout));
     let _ = tcp.set_write_timeout(Some(timeout));
 
@@ -933,6 +956,13 @@ pub(super) fn accept_tls(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(CallError::Timeout)?;
+    // Idle accept poll. `thread::yield_now()` would burn CPU on a
+    // bound-but-quiet listener; sleep a millisecond between polls
+    // so an HTTPS listener that nobody is calling stays cheap.
+    // 1ms is well below the typical accept-deadline grain
+    // (250ms in dev, 100ms in pressure) and short enough that
+    // accept latency stays imperceptible.
+    let poll_interval = Duration::from_millis(1);
     let (tcp, peer_addr) = loop {
         if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err(CallError::Timeout);
@@ -940,7 +970,7 @@ pub(super) fn accept_tls(
         match listener.accept() {
             Ok(accepted) => break accepted,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::yield_now();
+                thread::sleep(poll_interval);
             }
             Err(_) => return Err(CallError::Io),
         }
@@ -950,6 +980,7 @@ pub(super) fn accept_tls(
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or(CallError::Timeout)?;
+    // Infallible; see `connect_tls`.
     let _ = tcp.set_read_timeout(Some(remaining));
     let _ = tcp.set_write_timeout(Some(remaining));
     let connection = rustls::ServerConnection::new(config).map_err(|_| CallError::TlsHandshake)?;

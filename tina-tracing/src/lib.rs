@@ -109,9 +109,9 @@ pub use install::install_global_default_subscriber;
 // callers don't need to reach through submodule paths.
 pub use events::{
     call_completion_rejected_reason_name, call_error_name, call_kind_name,
-    call_reply_rejected_reason_name, deferred_reply_rejected_reason_name, effect_kind_name,
-    emit_event, emit_events, emit_partial_marker, emit_trace_snapshot, restart_skipped_reason_name,
-    send_rejected_reason_name,
+    call_reply_rejected_reason_name, cancel_cause_name, deferred_reply_rejected_reason_name,
+    effect_kind_name, emit_event, emit_events, emit_partial_marker, emit_trace_snapshot,
+    restart_skipped_reason_name, send_rejected_reason_name,
 };
 pub use live::{affinity_status_name, emit_snapshot, shard_state_name};
 

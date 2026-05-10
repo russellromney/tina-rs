@@ -68,6 +68,7 @@ pub(crate) struct IsolateCallDeliveryContext {
 pub(crate) type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
 pub(crate) type ErasedIsolateCallTranslator =
     Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
+pub(crate) type ErasedCancelCallTranslator = Box<dyn FnOnce(tina::CancelOutcome) -> Box<dyn Any>>;
 
 pub(crate) const INITIAL_ENTRY_CAPACITY: usize = 8;
 pub(crate) const INITIAL_CHILD_RECORD_CAPACITY: usize = 8;
@@ -133,6 +134,7 @@ pub(crate) struct PendingIsolateCall {
     pub(crate) continuation_context: Option<MessageCallContext>,
     pub(crate) translator: Option<ErasedIsolateCallTranslator>,
     pub(crate) expected_reply_type_id: std::any::TypeId,
+    pub(crate) handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -510,6 +512,7 @@ where
                     timeout,
                     translator,
                     expected_reply_type_id,
+                    handle_shared,
                 } => ErasedCall {
                     kind: ErasedCallKind::IsolateCall {
                         send: ErasedSend {
@@ -523,6 +526,18 @@ where
                             Box::new(translator(outcome)) as Box<dyn Any>
                         }),
                         expected_reply_type_id,
+                        handle_shared,
+                    },
+                },
+                RuntimeCallParts::CancelCall {
+                    handle_shared,
+                    translator,
+                } => ErasedCall {
+                    kind: ErasedCallKind::CancelCall {
+                        handle_shared,
+                        translator: Box::new(move |outcome| {
+                            Box::new(translator(outcome)) as Box<dyn Any>
+                        }),
                     },
                 },
             };
@@ -687,6 +702,11 @@ pub(crate) enum ErasedCallKind {
         timeout: Duration,
         translator: ErasedIsolateCallTranslator,
         expected_reply_type_id: std::any::TypeId,
+        handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
+    },
+    CancelCall {
+        handle_shared: std::sync::Arc<tina::CallHandleShared>,
+        translator: ErasedCancelCallTranslator,
     },
 }
 

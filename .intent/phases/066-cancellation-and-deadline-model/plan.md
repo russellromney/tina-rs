@@ -2,11 +2,52 @@
 
 ## Status
 
-- Done: design drafted from Specimen cancellation/backpressure/pool findings.
+- Done (066A — caller-owned call cancellation):
+  - Rock 2 caller-owned `CallHandle<R>` (`!Clone`, `#[must_use]`, move-only).
+    Stamped with `(call_id, shard_id)` on dispatch; cross-shard cancel is
+    rejected with `CancelOutcome::WrongShard` instead of falling through to
+    a silent wrong-result.
+  - Rock 3 `cancel_call(handle).reply(...)`; closes wait, reclaims caller-side
+    capacity, emits `CallCancelled { cause }`. Late callee replies surface as
+    cause-specific `CallReplyRejected` / `DeferredReplyRejected` reasons:
+    `CallerCancelled` for explicit cancel, `CallerTimedOut` for timeout,
+    `OwnerStopped` for owner lifecycle, `RuntimeStopped` for runtime
+    shutdown — via a bounded `(CallId, CancelCause)` ring (capacity 64),
+    falling through to the generic `NoPendingCall` / `CallerClosed` only on
+    eviction.
+  - Rock 5 owner-stop proactively cancels caller-owned pending calls with
+    `CallCancelled { OwnerStopped }`. Single-pass `partition`, O(n) over
+    pending calls. Late replies for stopped owners classify as
+    `OwnerStopped`, distinct from explicit cancel in both the settlement
+    event and the rejection event.
+  - Rock 6 `examples/specimen_cancellation_chain` rewritten on the new shape;
+    Tina-side polls the trace until rejection count converges before
+    snapshotting (no slow-CI flake), Tokio-side asserts the loose
+    `before + after <= FANOUT` so refactors that add an await between
+    sleep and reply do not tripwire.
+  - Runtime shutdown emits `CallCancelled { RuntimeStopped }` for pending
+    isolate calls and transitions caller-held `CallHandle`s to `Cancelled`
+    state. Caller-side `handle.state()` after shutdown is the truth.
+  - Simulator parity in `tina-sim`; deterministic tests in
+    `tina-sim/tests/cancel_call.rs` (8 tests) and
+    `tina-runtime/tests/cancel_call.rs` (3 tests). Coverage map:
+    cancel-before-delivery, cancel-after-deferred-capture, late-reply
+    classification (specific reason, not generic), `AlreadyCancelled`
+    via `runtime_internal` dual-handle, timeout-vs-cancel distinct trace
+    facts, owner-stop with stored handles, cross-shard `WrongShard`,
+    capacity reclamation across 32 cycles.
+  - Trace/pressure/tracing vocabulary extended: `CallKind::CancelCall`,
+    `CancelOutcome::WrongShard`, six new rejection-reason variants
+    (`CallerTimedOut` / `OwnerStopped` / `RuntimeStopped` on each of
+    `CallReplyRejectedReason` and `DeferredReplyRejectedReason`),
+    `PressureSummary` counters appended additively.
 - In progress: none.
-- Open: implement the first cancellation primitive and deadline value.
-- Deferred: external `cancel_isolate`, resource-driver cancellation expansion,
-  fake cancellation of already-accepted foreign work, broad workflow macros.
+- Deferred to follow-up phases:
+  - Rock 1 `Deadline` value.
+  - Rock 4 bounded `PendingCallSet`.
+- Deferred by design: external `cancel_isolate`, resource-driver cancellation
+  expansion, fake cancellation of already-accepted foreign work, broad
+  workflow macros.
 
 ## Goal
 
@@ -356,7 +397,7 @@ Proof:
 
 ## Rock 6: Specimen Cancellation Chain
 
-Update existing specimens first. Do not create a new specimen unless the
+Update existing Specimen specimens first. Do not create a new specimen unless the
 existing ones cannot honestly show the new model.
 
 Primary target:

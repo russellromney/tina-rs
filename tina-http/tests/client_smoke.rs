@@ -2,8 +2,9 @@
 //!
 //! Spins up a stdlib `TcpListener` reference server that speaks a tiny
 //! canned response, registers an [`HttpClient`] as a long-lived
-//! service isolate, and drives it via `call(client, ...).reply(...)`
-//! from a Driver isolate. Asserts the parsed [`HttpResponse`] matches
+//! service isolate, and drives it via
+//! [`ThreadedRuntime::call_blocking`](tina_runtime::ThreadedRuntime::call_blocking).
+//! Asserts the parsed [`HttpResponse`] matches
 //! the wire bytes the reference server wrote.
 //!
 //! Bad-input cases live in `client_bad_input.rs`.
@@ -43,7 +44,7 @@ fn start_canned_server(canned_response: Vec<u8>) -> SocketAddr {
 }
 
 #[derive(Debug, Clone)]
-enum DriverMsg {
+enum BackgroundDriverMsg {
     Begin {
         client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
         target: SocketAddr,
@@ -53,34 +54,34 @@ enum DriverMsg {
     Returned(CallOutcome<Result<HttpResponse, HttpClientError>>),
 }
 
-struct Driver {
+struct BackgroundDriver {
     sender: mpsc::Sender<Result<HttpResponse, HttpClientError>>,
 }
 
-impl Isolate for Driver {
+impl Isolate for BackgroundDriver {
     tina::isolate_types! {
-        message: DriverMsg,
+        message: BackgroundDriverMsg,
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
+        call: RuntimeCall<BackgroundDriverMsg>,
         shard: SingleShard,
     }
 
     fn handle(
         &mut self,
-        msg: DriverMsg,
+        msg: BackgroundDriverMsg,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DriverMsg::Begin {
+            BackgroundDriverMsg::Begin {
                 client,
                 target,
                 request,
                 timeout,
             } => call(client, HttpClientMsg::call(target, request), timeout)
-                .reply(DriverMsg::Returned),
-            DriverMsg::Returned(outcome) => {
+                .reply(BackgroundDriverMsg::Returned),
+            BackgroundDriverMsg::Returned(outcome) => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,
                     CallOutcome::Full => Err(HttpClientError::Busy),
@@ -114,27 +115,20 @@ fn run_one_request(canned_response: Vec<u8>) -> Result<HttpResponse, HttpClientE
         )
         .expect("register client");
 
-    let (tx, rx) = mpsc::channel();
-    let driver = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 16)
-        .expect("register driver");
-
     let request = HttpRequest::get("/").header("Host", "x").build();
-    runtime
-        .try_send(
-            driver,
-            DriverMsg::Begin {
-                client,
-                target,
-                request,
-                timeout: Duration::from_secs(2),
-            },
+    let result = match runtime
+        .call_blocking(
+            client,
+            HttpClientMsg::call(target, request),
+            Duration::from_secs(2),
         )
-        .expect("send Begin");
-
-    let result = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("driver delivers result");
+        .expect("client call runs")
+    {
+        CallOutcome::Replied(inner) => inner,
+        CallOutcome::Full => Err(HttpClientError::Busy),
+        CallOutcome::Closed => Err(HttpClientError::Closed),
+        CallOutcome::Timeout => Err(HttpClientError::Timeout),
+    };
 
     let _ = runtime.shutdown();
     result
@@ -207,12 +201,15 @@ fn second_call_while_busy_returns_busy() {
 
     let (tx_a, _rx_a) = mpsc::channel();
     let driver_a = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_a }, 8)
+        .register_with_capacity::<BackgroundDriver, Infallible>(
+            BackgroundDriver { sender: tx_a },
+            8,
+        )
         .expect("register driver A");
     runtime
         .try_send(
             driver_a,
-            DriverMsg::Begin {
+            BackgroundDriverMsg::Begin {
                 client,
                 target,
                 request: HttpRequest::get("/").header("Host", "x").build(),
@@ -226,12 +223,15 @@ fn second_call_while_busy_returns_busy() {
 
     let (tx_b, rx_b) = mpsc::channel();
     let driver_b = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_b }, 8)
+        .register_with_capacity::<BackgroundDriver, Infallible>(
+            BackgroundDriver { sender: tx_b },
+            8,
+        )
         .expect("register driver B");
     runtime
         .try_send(
             driver_b,
-            DriverMsg::Begin {
+            BackgroundDriverMsg::Begin {
                 client,
                 target,
                 request: HttpRequest::get("/").header("Host", "x").build(),

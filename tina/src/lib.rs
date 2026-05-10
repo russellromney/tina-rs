@@ -108,7 +108,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Type-erased payload for [`Effect::StopWith`].
 ///
@@ -1400,6 +1400,272 @@ pub enum DeferredSlotState {
     Closed,
 }
 
+/// Caller-owned handle for one in-flight isolate call.
+///
+/// Built by `tina_runtime::call_with_handle(addr, msg, t).reply(...)`.
+/// Pass to `cancel_call(handle)` to close the wait. Move-only and
+/// `!Clone`: one handle, one cancel.
+///
+/// Rules:
+/// - cancels the wait, not work the callee already accepted; late
+///   replies become `CallReplyRejected { CallerCancelled }` trace facts;
+/// - double cancel returns `AlreadyCancelled`; cancel after settle
+///   returns `AlreadyCompleted`;
+/// - does not release pool leases — that is its own primitive;
+/// - dropping the handle does not cancel; the call runs to completion;
+/// - the runtime stamps the handle with the originating shard id on
+///   dispatch. A `cancel_call` issued from a different shard returns
+///   `CancelOutcome::WrongShard` instead of falling through to a
+///   silent wrong-result.
+///
+/// Type-system guarantees (compile-fail proofs):
+///
+/// `CallHandle` is not a reply token. `reply_to` requires a
+/// `DeferredReply<R>`, not a `CallHandle<R>`:
+///
+/// ```compile_fail
+/// # use tina::{CallHandle, Effect, Isolate, Outbound, reply_to};
+/// # struct S;
+/// # impl Isolate for S {
+/// #     type Message = (); type Reply = u32;
+/// #     type Send = Outbound<std::convert::Infallible>;
+/// #     type Spawn = std::convert::Infallible;
+/// #     type Call = std::convert::Infallible;
+/// #     type Shard = tina::SingleShard;
+/// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
+/// #         tina::noop()
+/// #     }
+/// # }
+/// fn _bad(handle: CallHandle<u32>) -> Effect<S> {
+///     reply_to(handle, 1) // expected DeferredReply, found CallHandle
+/// }
+/// ```
+///
+/// `CallHandle` is not `Clone` — the type system enforces "one cancel
+/// per handle":
+///
+/// ```compile_fail
+/// # use tina::CallHandle;
+/// fn _bad(h: CallHandle<u32>) -> CallHandle<u32> {
+///     h.clone() // CallHandle does not implement Clone
+/// }
+/// ```
+#[must_use = "use the CallHandle (cancel_call, store in state, or `let _ = ...`) — \
+              dropping it lets the call run to completion"]
+pub struct CallHandle<R> {
+    handle: CallHandleInner,
+    _marker: PhantomData<fn(R) -> R>,
+}
+
+impl<R> std::fmt::Debug for CallHandle<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CallHandle")
+            .field("call_id", &self.handle.shared.call_id())
+            .field("state", &self.state())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> CallHandle<R> {
+    /// Returns the runtime-assigned call id, or `None` if the effect
+    /// has not yet been dispatched.
+    pub fn call_id(&self) -> Option<u64> {
+        self.handle.shared.call_id()
+    }
+
+    /// Returns the current state of the underlying call.
+    pub fn state(&self) -> CallHandleState {
+        self.handle.shared.state()
+    }
+}
+
+/// Type-erased inner handle. Runtime-only; mint via [`runtime_internal`].
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CallHandleInner {
+    shared: Arc<CallHandleShared>,
+}
+
+const HANDLE_STATE_PENDING: u8 = 0;
+const HANDLE_STATE_SETTLED: u8 = 1;
+const HANDLE_STATE_CANCELLED: u8 = 2;
+
+/// Shared state between a [`CallHandle`] and the runtime's pending-call
+/// registry. Runtime-only; user code cannot construct one.
+///
+/// **Concurrency invariant.** All writes (`set_state`, `set_call_id`,
+/// `set_shard_id`) happen on one shard thread — the runtime that owns
+/// the pending entry. Reads can come from another thread (a host
+/// polling `handle.state()`, or another shard's runtime checking the
+/// shard fingerprint before honoring a cross-shard cancel). Writers
+/// use `Release`, readers use `Acquire`, so observers see a consistent
+/// transition without seeing torn payloads.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CallHandleShared {
+    state: AtomicU8,
+    /// `0` until dispatched, then `CallId::get()`.
+    call_id: AtomicU64,
+    /// `u32::MAX` until dispatched, then `ShardId::get()`. Stamped at
+    /// the same site as `call_id` so a non-`MAX` shard id implies
+    /// a non-zero call id (single-writer + Release/Acquire).
+    ///
+    /// Used by the runtime to reject a cross-shard `cancel_call` —
+    /// the pending-call registry lives on the originating shard, so
+    /// a different shard's runtime would silently fall through to
+    /// `AlreadyCompleted` if it attempted the lookup.
+    shard_id: AtomicU32,
+    expected_reply_type_id: TypeId,
+}
+
+/// Sentinel for `shard_id` "not yet stamped." `u32::MAX` is reserved
+/// so any user-defined `ShardId` is distinguishable from "unstamped."
+const SHARD_ID_UNSTAMPED: u32 = u32::MAX;
+
+impl CallHandleShared {
+    /// Builds a fresh `Pending` shared cell. Runtime-only.
+    #[doc(hidden)]
+    pub fn new(expected_reply_type_id: TypeId) -> Self {
+        Self {
+            state: AtomicU8::new(HANDLE_STATE_PENDING),
+            call_id: AtomicU64::new(0),
+            shard_id: AtomicU32::new(SHARD_ID_UNSTAMPED),
+            expected_reply_type_id,
+        }
+    }
+
+    /// Reads the current handle state.
+    pub fn state(&self) -> CallHandleState {
+        match self.state.load(Ordering::Acquire) {
+            HANDLE_STATE_PENDING => CallHandleState::Pending,
+            HANDLE_STATE_SETTLED => CallHandleState::Settled,
+            HANDLE_STATE_CANCELLED => CallHandleState::Cancelled,
+            other => unreachable!("invalid call handle state byte: {other}"),
+        }
+    }
+
+    /// Updates handle state. Runtime-only; called on the shard thread
+    /// that owns the pending entry.
+    #[doc(hidden)]
+    pub fn set_state(&self, state: CallHandleState) {
+        let byte = match state {
+            CallHandleState::Pending => HANDLE_STATE_PENDING,
+            CallHandleState::Settled => HANDLE_STATE_SETTLED,
+            CallHandleState::Cancelled => HANDLE_STATE_CANCELLED,
+        };
+        self.state.store(byte, Ordering::Release);
+    }
+
+    /// Returns the runtime-assigned call id, or `None` while not yet
+    /// dispatched.
+    pub fn call_id(&self) -> Option<u64> {
+        let raw = self.call_id.load(Ordering::Acquire);
+        if raw == 0 { None } else { Some(raw) }
+    }
+
+    /// Returns the originating shard id, or `None` while not yet
+    /// dispatched. Stamped together with `call_id`.
+    pub fn shard_id(&self) -> Option<u32> {
+        let raw = self.shard_id.load(Ordering::Acquire);
+        if raw == SHARD_ID_UNSTAMPED {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+
+    /// Stamps the call id on dispatch. Runtime-only.
+    ///
+    /// The two `set_call_id` sites in `tina-runtime`'s
+    /// `dispatch_isolate_call` are mutually exclusive (success vs.
+    /// send-rejected branches); a second stamp on the same handle
+    /// would be a runtime invariant violation, so we panic loudly
+    /// on it rather than silently first-stamp-wins.
+    #[doc(hidden)]
+    pub fn set_call_id(&self, call_id: u64) {
+        assert!(call_id != 0, "runtime call id must be non-zero");
+        let prior = self.call_id.swap(call_id, Ordering::Release);
+        assert!(
+            prior == 0,
+            "tina: CallHandleShared::set_call_id stamped twice (prior={prior} new={call_id}); \
+             this is a tina-runtime invariant violation",
+        );
+    }
+
+    /// Stamps the originating shard id on dispatch. Runtime-only.
+    /// Same single-stamp invariant as `set_call_id`.
+    #[doc(hidden)]
+    pub fn set_shard_id(&self, shard_id: u32) {
+        assert!(
+            shard_id != SHARD_ID_UNSTAMPED,
+            "ShardId == u32::MAX is reserved as the unstamped sentinel",
+        );
+        let prior = self.shard_id.swap(shard_id, Ordering::Release);
+        assert!(
+            prior == SHARD_ID_UNSTAMPED,
+            "tina: CallHandleShared::set_shard_id stamped twice (prior={prior} new={shard_id}); \
+             this is a tina-runtime invariant violation",
+        );
+    }
+
+    /// Returns the dispatching `Address<_, R>`'s `R` type id.
+    pub fn expected_reply_type_id(&self) -> TypeId {
+        self.expected_reply_type_id
+    }
+}
+
+/// Lifecycle states a [`CallHandle`] may pass through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallHandleState {
+    /// The call is still in the runtime's pending table.
+    Pending,
+    /// The call already replied, timed out, was rejected, or its caller
+    /// closed. Cancelling now returns `AlreadyCompleted`.
+    Settled,
+    /// The call was explicitly cancelled. Cancelling again returns
+    /// `AlreadyCancelled`.
+    Cancelled,
+}
+
+/// Why a wait was cancelled. Distinct names keep timeout, explicit
+/// cancel, and lifecycle close separate in the trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CancelCause {
+    /// `cancel_call(handle)` from the caller.
+    CallerCancelled,
+    /// Mandatory call timeout elapsed.
+    CallerTimedOut,
+    /// Owning isolate stopped.
+    OwnerStopped,
+    /// Runtime stopped.
+    RuntimeStopped,
+}
+
+/// Outcome of a `cancel_call(handle)` request.
+#[must_use = "CancelOutcome reports whether the wait was actually reclaimed"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CancelOutcome {
+    /// Wait closed; capacity reclaimed; late replies become rejected facts.
+    Cancelled,
+    /// Already replied, timed out, or otherwise settled.
+    AlreadyCompleted,
+    /// Already cancelled.
+    AlreadyCancelled,
+    /// The handle was minted on a different shard. The cancel did
+    /// not run; the originating shard's pending-call entry is
+    /// untouched. Send the cancel to the right shard, or store the
+    /// handle on the originating isolate and cancel from there.
+    WrongShard,
+}
+
+impl CancelOutcome {
+    /// Returns whether this outcome successfully cancelled a pending wait.
+    pub const fn is_cancelled(self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
 /// Reasons [`Context::take_reply_slot`] may refuse a capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TakeReplySlotError {
@@ -1589,7 +1855,10 @@ impl DeferredSlotRegistry {
 pub mod runtime_internal {
     use std::sync::Arc;
 
-    use crate::{DeferredReply, DeferredReplyHandle, DeferredSlotShared};
+    use crate::{
+        CallHandle, CallHandleInner, CallHandleShared, DeferredReply, DeferredReplyHandle,
+        DeferredSlotShared,
+    };
 
     /// Build a handle from a runtime-allocated shared slot.
     pub fn handle_from_shared(shared: Arc<DeferredSlotShared>) -> DeferredReplyHandle {
@@ -1615,13 +1884,43 @@ pub mod runtime_internal {
             _marker: std::marker::PhantomData,
         }
     }
+
+    /// Build a typed [`CallHandle`] from a runtime-allocated shared cell.
+    pub fn call_handle_from_shared<R>(shared: Arc<CallHandleShared>) -> CallHandle<R> {
+        CallHandle {
+            handle: CallHandleInner { shared },
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Borrow the shared cell for runtime-side dispatch and lookup.
+    pub fn call_handle_shared<R>(handle: &CallHandle<R>) -> &Arc<CallHandleShared> {
+        &handle.handle.shared
+    }
+
+    /// Move the typed handle into its erased inner form. Used by
+    /// `cancel_call`'s erase path to drop the reply-type marker.
+    pub fn call_handle_into_inner<R>(handle: CallHandle<R>) -> CallHandleInner {
+        handle.handle
+    }
+
+    /// Borrow the shared cell from an erased inner handle.
+    pub fn call_handle_inner_shared(inner: &CallHandleInner) -> &Arc<CallHandleShared> {
+        &inner.shared
+    }
+
+    /// Consume the erased inner handle, returning its shared cell.
+    pub fn call_handle_inner_into_shared(inner: CallHandleInner) -> Arc<CallHandleShared> {
+        inner.shared
+    }
 }
 
 /// Common imports for ordinary Tina application code.
 pub mod prelude {
     pub use crate::{
-        Address, ChildDefinition, Context, DeferredReply, Effect, Isolate, IsolateId, Outbound,
-        RestartableChildDefinition, Shard, ShardId, SingleShard, batch, isolate, isolate_types,
-        noop, reply, reply_to, restart_children, send, sequence, spawn, stop, stop_with,
+        Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition, Context,
+        DeferredReply, Effect, Isolate, IsolateId, Outbound, RestartableChildDefinition, Shard,
+        ShardId, SingleShard, batch, isolate, isolate_types, noop, reply, reply_to,
+        restart_children, send, sequence, spawn, stop, stop_with,
     };
 }

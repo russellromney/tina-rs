@@ -104,25 +104,24 @@ why some are layered is confusing.
   punt until a non-pedagogical user actually mixes the two and
   flinches.
 
-### 8. External cancellation API
+### 8. External cancellation API — first form shipped
 
 **Surfaced by:** `specimen_cancellation_chain`.
 
-There is no public `runtime.cancel(addr)` and no public
-`IsolateCall::abort()`. The only way to "externally cancel" mid-
-flight work today is to send a domain `Stop` message to the
-requester isolate, which causes it to stop itself. Stopping the
-requester closes its pending IsolateCalls and any worker reply
-that arrives later is rejected as `CallReplyRejected
-{ RequesterClosed }`. That works, but every isolate that wants to
-be externally cancellable has to add its own `Stop` (or
-equivalent) variant.
+**Resolved (Tina cancellation phase):** Tina now ships
+`call_with_handle(addr, msg, t).reply(...)` returning a caller-owned
+`CallHandle`, plus `cancel_call(handle).reply(...)` that closes one
+pending isolate call's wait. The handle is move-only and not `Clone`.
+Cancellation is visible truth: `CancelOutcome` (`Cancelled` /
+`AlreadyCompleted` / `AlreadyCancelled` / `NotDispatched` /
+`WrongRequester` / `CrossShardUnsupported`) is `#[must_use]`, and
+late callee replies surface as `CallReplyRejected { CallerCancelled }`
+or `DeferredReplyRejected { CallerCancelled }` events.
 
-**Build:** a runtime-level `runtime.cancel(addr) -> CancelOutcome`
-that closes pending IsolateCalls owned by `addr` without
-requiring user-defined cancellation messages. Or a typed
-`IsolateCall::abort(handle)` that the requester can stash and use
-to drop a single in-flight call without stopping itself.
+**Still open:** runtime-level `runtime.cancel_isolate(addr)` (third
+form — closes every call an isolate owns) is a small wrapper around
+`cancel_call`; deferred until the bounded `PendingCallSet` lands in
+phase 067.
 
 ### 9. Drain helper for `PendingReplies` at service stop
 
@@ -275,6 +274,42 @@ or a caller-asserted `M` (not honest under the LLM rule). Pick
 the typed-event vs. continuation form when the supervisor/spawn
 API gets revisited.
 
+### 16. Multi-worker TLS lane (or split accept/stream lanes)
+
+**Surfaced by:** `specimen_native_https`, `tina-http/tests/client_tls_smoke.rs`.
+
+The runtime's TLS lane is one worker thread per shard. The worker
+processes one TLS op at a time: a `tls_accept` poll (busy-waiting
+on the listening socket plus driving the TLS handshake) blocks
+every other TLS op on that lane — `tls_read`, `tls_write`,
+`tls_close`, and any concurrent `tls_connect`. Two consequences
+visible from the example:
+
+- `HttpsListener` must use a *short* `tls_accept_timeout` (default
+  250ms) so the worker yields between accept polls and live
+  connections can drain. Each connection's per-op latency
+  effectively includes one accept-slice.
+- A Tina HTTPS server and a Tina HTTPS client cannot share a
+  runtime: both sides of one TLS handshake need the worker
+  concurrently and they deadlock. The example puts the
+  counterparty on a raw OS thread; the integration tests do the
+  same. Outbound HTTPS calls work, inbound HTTPS works, but they
+  must live in separate processes (or separate shards once shards
+  carry independent TLS lanes).
+
+**Build:** either a worker pool inside the existing TLS lane, or
+split accept/handshake from per-stream read/write/close so each
+lane has one worker (accept worker keeps poll-looping; stream
+workers move data). The choice determines how throughput scales
+and whether `tls_accept_timeout` can grow back to "wait
+indefinitely". Keep DER-only inputs, no system roots, no HTTP/2
+in scope.
+
+**Revisit when:** real users hit the same-process server+client
+constraint, or the example acquires a third role (proxy / mTLS).
+Until then, first-form HTTPS is honest about its single-lane
+bottleneck.
+
 ### 15. Deadline as first-class context
 
 **Surfaced by:** `specimen_backpressure_chain`.
@@ -301,6 +336,24 @@ existing call APIs without adding hidden cancellation or retry.
 
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
+
+### 17. Host-thread `call_blocking` — Phase 068 follow-up
+
+Surfaced by `specimen_native_https` and native HTTP/TLS tests.
+`ThreadedRuntime::call_blocking(addr, msg, timeout)` now performs
+the ordinary typed Tina call through a temporary driver isolate and
+returns `CallOutcome<R>` to the host thread. The HTTPS specimen and
+the direct TLS client/server tests use it; tests that intentionally
+need a concurrent in-flight call still keep an explicit driver.
+
+### 18. Trace query helpers — Phase 068 follow-up
+
+Surfaced by TLS regression tests that repeatedly scanned for
+`RuntimeEventKind::CallCompleted` / `CallFailed` by hand.
+`RuntimeTraceExt` now adds `count_completed`, `any_completed`,
+`count_failed`, `any_failed`, `count_failed_with`, and
+`count_completion_rejected` on trace slices. The helpers summarize
+existing trace facts only; they do not infer hidden causality.
 
 ### 1. `observe_result` on `ThreadedMultiShardRuntime` — Phase 062 Rock 1
 
