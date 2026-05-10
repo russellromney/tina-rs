@@ -527,6 +527,14 @@ where
         self.observation.register_bound()
     }
 
+    /// Registers a typed waiter for the next `tls_bind` completion.
+    /// Mirrors [`Self::observe_next_bound`] for the TLS rail. The
+    /// waiter resolves with the bound `SocketAddr` carried by
+    /// [`CallOutput::TlsBound`], or with the typed runtime error.
+    pub fn observe_next_tls_bound(&mut self) -> BoundAddressWaiter {
+        self.observation.register_tls_bound()
+    }
+
     /// Registers a typed waiter for the targeted isolate's `IsolateStopped`.
     ///
     /// The waiter resolves the next time the isolate identified by `address`
@@ -2156,6 +2164,19 @@ where
                 (_, Some(reason)) => {
                     self.observation
                         .notify_bound(observation::BoundAddressOutcome::Failed(reason));
+                }
+                _ => {}
+            }
+        }
+        if matches!(in_flight.call_kind, CallKind::TlsBind) {
+            match (&result, failure_reason) {
+                (CallOutput::TlsBound { local_addr, .. }, _) => {
+                    self.observation
+                        .notify_tls_bound(observation::BoundAddressOutcome::Bound(*local_addr));
+                }
+                (_, Some(reason)) => {
+                    self.observation
+                        .notify_tls_bound(observation::BoundAddressOutcome::Failed(reason));
                 }
                 _ => {}
             }

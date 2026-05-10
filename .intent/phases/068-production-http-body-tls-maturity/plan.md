@@ -29,7 +29,24 @@
     `18-bridge-crates.md`, `examples/README.md`, `FINDINGS.md` (new
     finding 16: multi-worker TLS lane).
 - In progress: none.
-- Post-review fixes (PR feedback round):
+- Post-review fixes (PR feedback round 2):
+  - Boxed `HttpClientMsg::Call(Box<OutboundCall>)` to silence
+    `clippy::large_enum_variant` — `OutboundCall` carries an
+    `HttpRequest` whose `HeaderMap` + body dwarfed every other
+    variant.
+  - Added `Runtime::observe_next_tls_bound` (and the `ThreadedRuntime`
+    forward) that mirrors the existing `observe_next_bound` but
+    fires on `CallKind::TlsBind` completion. The runtime now also
+    exposes `pending_tls_bound` in the `ObservationRegistry` debug.
+  - Symmetric Host policy on `HttpTarget::Http`: variant carries an
+    optional `host: Option<String>`. `None` keeps the existing
+    caller-managed-Host behavior; `Some(value)` populates the wire
+    `Host:` header (and rejects caller-set Host via
+    `DuplicateHostHeader` like HTTPS does). New constructor:
+    `HttpTarget::http_with_host`. `From<SocketAddr>` still produces
+    `Http { host: None }` so existing call sites keep working.
+
+- Post-review fixes (PR feedback round 1):
   - `HttpsListener` accept-error classification: re-accept only on
     `Timeout` and `TlsHandshake` (transient); close out on
     `TlsClosed`, `Io`, `InvalidResource`, `TlsFull`, etc. Avoids

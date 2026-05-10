@@ -240,6 +240,47 @@ fn https_listener_serves_get_through_real_rustls_client() {
 }
 
 #[test]
+fn observe_next_tls_bound_resolves_when_listener_binds() {
+    // The runtime's TLS-bound observer is the trace-shaped sibling
+    // of the call-shaped Start. Tests / migration users who'd reach
+    // for `observe_next_bound` get the same affordance for HTTPS
+    // via `observe_next_tls_bound`.
+    let GeneratedIdentity { identity, cert_der } = generate_identity();
+
+    let runtime = build_runtime();
+    let counter = runtime
+        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
+        .expect("register counter");
+    let listener_isolate = HttpsListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        counter,
+        HttpsServerConfig::dev(identity),
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register https listener");
+
+    let bound = runtime.observe_next_tls_bound();
+    runtime
+        .try_send(listener, HttpsListenerMsg::Start)
+        .expect("send Start");
+    let addr = bound
+        .wait(Duration::from_secs(5))
+        .expect("listener publishes bound TLS address");
+
+    let request = b"GET /counter HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = run_https_request(addr, cert_der, request);
+    let text = std::str::from_utf8(&response).expect("utf8 response");
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "expected 200 OK, got: {text:?}"
+    );
+
+    let _ = runtime.try_send(listener, HttpsListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
 fn https_listener_typed_failure_on_invalid_key_does_not_leak_listener() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     // Real cert + garbage private key → rustls `with_single_cert` fails.

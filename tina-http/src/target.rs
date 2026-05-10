@@ -4,9 +4,21 @@
 use std::net::SocketAddr;
 
 /// Where to send an outbound HTTP/1.1 call.
+///
+/// Both variants accept a `host` value that decides the wire `Host:`
+/// header. On HTTP it is `Option<String>` — `None` means the caller
+/// is responsible for setting `Host:` themselves (HTTP/1.0 style).
+/// On HTTPS it is required as an [`HttpHostPolicy`] because SNI and
+/// `Host:` need to agree by default.
 #[derive(Debug, Clone)]
 pub enum HttpTarget {
-    Http(SocketAddr),
+    Http {
+        addr: SocketAddr,
+        /// Wire `Host:` header. `None` leaves the caller's request
+        /// untouched; `Some(value)` is inserted (and conflicts with
+        /// a caller-supplied Host).
+        host: Option<String>,
+    },
     Https {
         addr: SocketAddr,
         /// Validated by rustls during the TLS handshake.
@@ -19,8 +31,18 @@ pub enum HttpTarget {
 }
 
 impl HttpTarget {
+    /// Plain HTTP target, caller-managed `Host:`.
     pub fn http(addr: SocketAddr) -> Self {
-        Self::Http(addr)
+        Self::Http { addr, host: None }
+    }
+
+    /// Plain HTTP target with the wire `Host:` value supplied here.
+    /// A caller-set `Host:` header on the request will conflict.
+    pub fn http_with_host(addr: SocketAddr, host: impl Into<String>) -> Self {
+        Self::Http {
+            addr,
+            host: Some(host.into()),
+        }
     }
 
     /// HTTPS target with `Host:` defaulted to `server_name`.
@@ -39,8 +61,9 @@ impl HttpTarget {
 }
 
 impl From<SocketAddr> for HttpTarget {
+    /// Backward-compatible: bare `SocketAddr` → plain HTTP, caller-managed Host.
     fn from(addr: SocketAddr) -> Self {
-        Self::Http(addr)
+        Self::Http { addr, host: None }
     }
 }
 

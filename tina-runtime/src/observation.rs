@@ -428,6 +428,7 @@ struct ChildRestartedSlot {
 /// register in the order they want to be served.
 pub(crate) struct ObservationRegistry {
     pending_bound: VecDeque<SyncSender<BoundAddressOutcome>>,
+    pending_tls_bound: VecDeque<SyncSender<BoundAddressOutcome>>,
     pending_isolate_complete: Vec<IsolateCompleteSlot>,
     pending_operation_done: Vec<OperationDoneSlot>,
     pending_child_restarted: Vec<ChildRestartedSlot>,
@@ -440,6 +441,7 @@ impl std::fmt::Debug for ObservationRegistry {
         formatter
             .debug_struct("ObservationRegistry")
             .field("pending_bound", &self.pending_bound.len())
+            .field("pending_tls_bound", &self.pending_tls_bound.len())
             .field(
                 "pending_isolate_complete",
                 &self.pending_isolate_complete.len(),
@@ -483,6 +485,7 @@ impl ObservationRegistry {
     pub(crate) const fn with_max_pending(max_pending: usize) -> Self {
         Self {
             pending_bound: VecDeque::new(),
+            pending_tls_bound: VecDeque::new(),
             pending_isolate_complete: Vec::new(),
             pending_operation_done: Vec::new(),
             pending_child_restarted: Vec::new(),
@@ -497,6 +500,15 @@ impl ObservationRegistry {
         }
         let (waiter, sender) = BoundAddressWaiter::from_pair();
         self.pending_bound.push_back(sender);
+        waiter
+    }
+
+    pub(crate) fn register_tls_bound(&mut self) -> BoundAddressWaiter {
+        if self.is_full() {
+            return BoundAddressWaiter::with_error(WaitError::ObservationFull);
+        }
+        let (waiter, sender) = BoundAddressWaiter::from_pair();
+        self.pending_tls_bound.push_back(sender);
         waiter
     }
 
@@ -560,6 +572,7 @@ impl ObservationRegistry {
     fn pending_count(&mut self) -> usize {
         self.prune_abandoned_result_slots();
         self.pending_bound.len()
+            + self.pending_tls_bound.len()
             + self.pending_isolate_complete.len()
             + self.pending_operation_done.len()
             + self.pending_child_restarted.len()
@@ -572,6 +585,16 @@ impl ObservationRegistry {
 
     pub(crate) fn notify_bound(&mut self, outcome: BoundAddressOutcome) {
         while let Some(sender) = self.pending_bound.pop_front() {
+            match sender.try_send(outcome) {
+                Ok(()) => return,
+                Err(mpsc::TrySendError::Full(_)) => continue,
+                Err(mpsc::TrySendError::Disconnected(_)) => continue,
+            }
+        }
+    }
+
+    pub(crate) fn notify_tls_bound(&mut self, outcome: BoundAddressOutcome) {
+        while let Some(sender) = self.pending_tls_bound.pop_front() {
             match sender.try_send(outcome) {
                 Ok(()) => return,
                 Err(mpsc::TrySendError::Full(_)) => continue,

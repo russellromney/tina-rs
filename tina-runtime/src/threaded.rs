@@ -362,6 +362,14 @@ where
         }
     }
 
+    /// Mirrors [`Self::observe_next_bound`] for `tls_bind`.
+    pub fn observe_next_tls_bound(&self) -> BoundAddressWaiter {
+        match self.call(|runtime| runtime.observe_next_tls_bound()) {
+            Ok(waiter) => waiter,
+            Err(_) => observation::stopped_bound_waiter(),
+        }
+    }
+
     /// Registers a typed waiter for the targeted isolate's `IsolateStopped`
     /// event on the worker shard.
     ///

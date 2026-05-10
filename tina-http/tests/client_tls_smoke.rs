@@ -260,6 +260,77 @@ fn invalid_host_policy_value_is_typed_error() {
 }
 
 #[test]
+fn http_target_host_policy_inserts_host_header() {
+    // Verifies the symmetric HTTP-side host policy: HttpTarget::Http
+    // with `Some(host)` populates the wire `Host:` header just like
+    // HTTPS does.
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind plain");
+    let addr = listener.local_addr().expect("addr");
+    let server_thread = thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("accept");
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut buf = [0u8; 4096];
+        let mut have = 0;
+        loop {
+            let n = match tcp.read(&mut buf[have..]) {
+                Ok(0) | Err(_) => return Vec::new(),
+                Ok(n) => n,
+            };
+            have += n;
+            if buf[..have].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = std::str::from_utf8(&buf[..have]).unwrap_or("");
+        // Encoder emits header names in canonical lowercase.
+        let host = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("host: ")
+                    .or_else(|| line.strip_prefix("Host: "))
+            })
+            .unwrap_or("")
+            .trim_end_matches('\r')
+            .as_bytes()
+            .to_vec();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            host.len()
+        );
+        let _ = tcp.write_all(head.as_bytes());
+        let _ = tcp.write_all(&host);
+        host
+    });
+
+    let target = HttpTarget::http_with_host(addr, "internal.svc");
+    let result = run_one_fetch(target, empty_request("/")).expect("plain http fetch ok");
+    let observed = server_thread.join().expect("server thread");
+    assert_eq!(observed, b"internal.svc");
+    assert_eq!(result.status, StatusCode::OK);
+}
+
+#[test]
+fn duplicate_host_header_on_http_target_is_typed_error() {
+    // Symmetric DuplicateHostHeader proof for the HTTP path.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind plain");
+    let addr = listener.local_addr().expect("addr");
+    // Server doesn't matter — failure surfaces at encode.
+    drop(listener);
+    let target = HttpTarget::http_with_host(addr, "internal.svc");
+    let mut request = empty_request("/");
+    request
+        .headers
+        .insert(HOST, HeaderValue::from_static("conflict.example.com"));
+    let result = run_one_fetch(target, request);
+    assert!(
+        matches!(result, Err(HttpClientError::DuplicateHostHeader)),
+        "expected DuplicateHostHeader on HTTP target, got {result:?}"
+    );
+}
+
+#[test]
 fn duplicate_host_header_is_typed_error() {
     let bundle = build_cert_bundle();
     let addr = spawn_one_shot_https_server(bundle.server_config);

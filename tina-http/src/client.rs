@@ -41,10 +41,12 @@ pub struct OutboundCall {
 }
 
 /// `Call` is user-callable; the rest are continuations from the
-/// client's own runtime calls.
+/// client's own runtime calls. `Call` is boxed so the enum stays
+/// small in the mailbox — `OutboundCall` carries an `HttpRequest`
+/// with a `HeaderMap` and body, which dwarfs every other variant.
 #[derive(Debug, Clone)]
 pub enum HttpClientMsg {
-    Call(OutboundCall),
+    Call(Box<OutboundCall>),
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
     TlsConnected(Result<TlsStreamId, CallError>),
     Wrote(Result<usize, CallError>),
@@ -56,10 +58,10 @@ pub enum HttpClientMsg {
 impl HttpClientMsg {
     /// A bare `SocketAddr` is interpreted as plain HTTP.
     pub fn call(target: impl Into<HttpTarget>, request: HttpRequest) -> Self {
-        Self::Call(OutboundCall {
+        Self::Call(Box::new(OutboundCall {
             target: target.into(),
             request,
-        })
+        }))
     }
 }
 
@@ -117,7 +119,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HttpClientMsg::Call(call) => self.handle_call(call),
+            HttpClientMsg::Call(call) => self.handle_call(*call),
 
             HttpClientMsg::Connected(Ok((stream, _local, _peer))) => {
                 let transport = HttpTransport::Tcp(stream);
@@ -196,7 +198,7 @@ impl<S: Shard + 'static> HttpClient<S> {
             head_len: 0,
         });
         let connect_effect: Effect<Self> = match target {
-            HttpTarget::Http(addr) => tcp_connect(addr).reply(HttpClientMsg::Connected),
+            HttpTarget::Http { addr, .. } => tcp_connect(addr).reply(HttpClientMsg::Connected),
             HttpTarget::Https {
                 addr,
                 server_name,
@@ -340,22 +342,31 @@ fn body_complete(state: &ActiveCall) -> bool {
     state.read_buf.len() >= needed
 }
 
-/// HTTPS targets auto-populate `Host:` from the policy. Plain HTTP
-/// keeps caller-supplied Host as-is; the encoder doesn't synthesise
-/// one. Caller-supplied Host on HTTPS conflicts with the policy.
+/// Resolves the wire `Host:` from the target's host policy.
+///
+/// - `Http { host: None }` leaves the request untouched.
+/// - `Http { host: Some(v) }` inserts `v` (or errors on duplicate).
+/// - `Https { host: UseServerName }` inserts `server_name`.
+/// - `Https { host: Explicit(v) }` inserts `v`.
 fn apply_host_policy(
     mut request: HttpRequest,
     target: &HttpTarget,
 ) -> Result<HttpRequest, HttpClientError> {
-    let HttpTarget::Https {
-        server_name, host, ..
-    } = target
-    else {
-        return Ok(request);
+    let policy_value: Option<&str> = match target {
+        HttpTarget::Http { host: None, .. } => None,
+        HttpTarget::Http { host: Some(v), .. } => Some(v.as_str()),
+        HttpTarget::Https {
+            server_name,
+            host: HttpHostPolicy::UseServerName,
+            ..
+        } => Some(server_name.as_str()),
+        HttpTarget::Https {
+            host: HttpHostPolicy::Explicit(v),
+            ..
+        } => Some(v.as_str()),
     };
-    let policy_value = match host {
-        HttpHostPolicy::UseServerName => server_name.as_str(),
-        HttpHostPolicy::Explicit(name) => name.as_str(),
+    let Some(policy_value) = policy_value else {
+        return Ok(request);
     };
     if request.headers.contains_key(HOST) {
         return Err(HttpClientError::DuplicateHostHeader);
