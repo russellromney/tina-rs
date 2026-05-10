@@ -356,26 +356,59 @@ pub enum ReleaseFailure {
 
 /// Internals exposed for runtime crates.
 ///
-/// Application code should not import this module. Constructors here
-/// let only `tina-runtime` (and tests inside this crate's test target)
-/// mint pool ids, resource ids, and leases — application code cannot
-/// forge them.
+/// Cross-crate Rust does not have a clean private-but-visible
+/// boundary, so the lease and id constructors here are
+/// `unsafe fn`. The unsafety is not memory-related; it is the
+/// pool's *contract* invariant:
+///
+/// > Only the pool that owns a resource may mint a lease for it.
+///
+/// Calling [`lease_new`] from outside the pool implementation lets
+/// application code forge a lease whose identity matches an
+/// outstanding one, release the duplicate, and produce resource
+/// aliasing — the pool will hand the same resource to a new waiter
+/// while the original lease is still live. That is a real
+/// correctness bug for resources that don't tolerate it (DB
+/// connections, files, sockets).
+///
+/// `tina-runtime`'s pool implementation is the only legitimate
+/// caller. It wraps each call in `unsafe { }` with a SAFETY comment
+/// pointing at the pool that minted the lease.
+#[allow(unsafe_code)]
 pub mod runtime_internal {
     use super::{PoolId, PoolLease, ResourceId};
     use std::num::NonZeroU64;
 
-    /// Mint a new [`PoolId`]. Runtime-internal.
-    pub fn pool_id_from_raw(raw: NonZeroU64) -> PoolId {
+    /// Mint a new [`PoolId`].
+    ///
+    /// # Safety
+    ///
+    /// Caller must be a runtime-side pool implementation. Forging a
+    /// `PoolId` that collides with a live pool's id lets a forged
+    /// lease pass the release-time identity check.
+    pub unsafe fn pool_id_from_raw(raw: NonZeroU64) -> PoolId {
         PoolId(raw)
     }
 
-    /// Mint a new [`ResourceId`]. Runtime-internal.
-    pub fn resource_id_from_raw(raw: u32) -> ResourceId {
+    /// Mint a new [`ResourceId`].
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`pool_id_from_raw`] — runtime-internal.
+    pub unsafe fn resource_id_from_raw(raw: u32) -> ResourceId {
         ResourceId(raw)
     }
 
-    /// Mint a new [`PoolLease`]. Runtime-internal.
-    pub fn lease_new<H>(
+    /// Mint a new [`PoolLease`].
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the pool implementation that owns
+    /// `resource_id` under `pool_id` at `generation`. Constructing a
+    /// lease that duplicates an outstanding lease — or re-uses a
+    /// retired generation — breaks the move-only invariant and lets
+    /// the same resource be handed to two callers concurrently.
+    pub unsafe fn lease_new<H>(
         pool_id: PoolId,
         resource_id: ResourceId,
         generation: u64,
@@ -389,8 +422,10 @@ pub mod runtime_internal {
         }
     }
 
-    /// Consume a lease into its parts. Runtime-internal — pools use
-    /// this to validate releases.
+    /// Consume a lease into its parts. Pools use this to validate
+    /// releases. Safe: destructuring a legitimately-issued lease
+    /// cannot break the pool invariant on its own — only
+    /// [`lease_new`] can.
     pub fn lease_into_parts<H>(lease: PoolLease<H>) -> (PoolId, ResourceId, u64, H) {
         (
             lease.pool_id,

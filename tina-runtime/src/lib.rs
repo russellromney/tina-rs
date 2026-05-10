@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 // Phase Mariner 012 substrate is Betelgeuse, which exposes its
@@ -63,6 +63,7 @@ mod multi_shard;
 mod observation;
 mod observer;
 pub mod persistence;
+#[allow(unsafe_code)]
 pub mod pool;
 pub mod pressure;
 pub mod sharded;

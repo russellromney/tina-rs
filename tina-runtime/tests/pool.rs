@@ -697,6 +697,81 @@ fn force_close_zeroes_leased_and_returns_pool_closed() {
 }
 
 #[test]
+fn force_close_retires_outstanding_leases_immediately() {
+    // Codex P2: force close must retire leased resources at the
+    // close moment, not "once each caller eventually releases."
+    // Acquire two, send Force, snapshot pressure *before* any
+    // release lands. Both should be Retired.
+    let h = build(PoolConfig::new(2, 0), vec![1, 2]);
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginAcquire { id: 1 })
+        .expect("a1");
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginAcquire { id: 2 })
+        .expect("a2");
+    wait_acquires(&h.obs, 2);
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginClose(CloseMode::Force))
+        .expect("force");
+    wait_closed_ack(&h.obs);
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginPressure)
+        .expect("pressure");
+    let pr = wait_pressure(&h.obs);
+    assert_eq!(
+        pr.leased, 0,
+        "force close must zero leased before any release; got {pr:?}"
+    );
+    assert_eq!(
+        pr.retired_count, 2,
+        "force close must bump retired_count for every outstanding lease; got {pr:?}"
+    );
+    assert!(pr.closed);
+
+    // Late releases still report PoolClosed and don't double-bump
+    // retired_count (the resource is already Retired, so the
+    // Force-close release branch returns PoolClosed without
+    // touching state).
+    h.runtime
+        .try_send(
+            h.driver,
+            DriverMsg::BeginRelease {
+                id: 1,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        )
+        .expect("late r1");
+    h.runtime
+        .try_send(
+            h.driver,
+            DriverMsg::BeginRelease {
+                id: 2,
+                disposition: ReleaseDisposition::Retire,
+            },
+        )
+        .expect("late r2");
+    wait_releases(&h.obs, 2);
+    assert_eq!(
+        h.obs.lock().expect("obs").releases,
+        vec![ReleaseOutcome::PoolClosed, ReleaseOutcome::PoolClosed]
+    );
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginPressure)
+        .expect("pressure 2");
+    let pr2 = wait_pressure(&h.obs);
+    assert_eq!(
+        pr2.retired_count, 2,
+        "late releases on force-closed pool must not double-bump retired; got {pr2:?}"
+    );
+
+    shutdown(h);
+}
+
+#[test]
 fn cancel_via_call_handle_reclaims_waiter_capacity() {
     let h = build(PoolConfig::new(1, 2), vec![1]);
 

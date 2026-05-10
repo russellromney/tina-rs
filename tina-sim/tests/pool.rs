@@ -427,6 +427,33 @@ fn dst_drain_close_settles_waiters_and_keeps_release() {
 }
 
 #[test]
+fn dst_force_close_retires_outstanding_leases_immediately() {
+    let mut s = build(PoolConfig::new(2, 0), vec![1, 2]);
+    s.sim
+        .try_send(s.driver, DriverMsg::BeginAcquire { id: 1 })
+        .expect("a1");
+    s.sim
+        .try_send(s.driver, DriverMsg::BeginAcquire { id: 2 })
+        .expect("a2");
+    drain(&mut s.sim);
+
+    s.sim
+        .try_send(s.driver, DriverMsg::BeginClose(CloseMode::Force))
+        .expect("force");
+    drain(&mut s.sim);
+
+    // Pressure before any release: leased must already be 0.
+    s.sim
+        .try_send(s.driver, DriverMsg::BeginPressure)
+        .expect("p");
+    drain(&mut s.sim);
+    let pr = s.obs.lock().expect("obs").pressure.expect("pressure");
+    assert_eq!(pr.leased, 0, "force close must zero leased: {pr:?}");
+    assert_eq!(pr.retired_count, 2);
+    assert!(pr.closed);
+}
+
+#[test]
 fn dst_force_close_zeroes_leased_on_release() {
     let mut s = build(PoolConfig::new(2, 0), vec![1, 2]);
     s.sim

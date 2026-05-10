@@ -45,7 +45,10 @@ fn mint_pool_id() -> PoolId {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nz = NonZeroU64::new(raw).expect("pool id counter wrapped to zero");
-    pool_internal::pool_id_from_raw(nz)
+    // SAFETY: process-wide monotonic counter, used only here to
+    // identify a pool we're constructing in `WorkerPool::new`. The
+    // returned id is unique per pool instance for the process.
+    unsafe { pool_internal::pool_id_from_raw(nz) }
 }
 
 /// Messages handled by [`WorkerPool`]. `H` is the resource handle.
@@ -352,12 +355,20 @@ where
             .and_then(|r| r.as_ref())
             .expect("resource present for non-retired slot")
             .clone();
-        pool_internal::lease_new(
-            self.pool_id,
-            pool_internal::resource_id_from_raw(resource_id),
-            generation,
-            handle,
-        )
+        // SAFETY: this is the pool implementation that owns
+        // `resource_id` under `self.pool_id`. The state-machine
+        // guarantees `generation` was just minted for this resource
+        // and is not duplicated against any outstanding lease — see
+        // the `Idle { next_generation }` arm above which transitions
+        // to `Leased { generation }` atomically with the lease mint.
+        unsafe {
+            pool_internal::lease_new(
+                self.pool_id,
+                pool_internal::resource_id_from_raw(resource_id),
+                generation,
+                handle,
+            )
+        }
     }
 
     fn track_dispatch(
@@ -512,13 +523,51 @@ where
 
     fn handle_close(&mut self, mode: CloseMode) -> Effect<Self> {
         // Idempotent. Force can upgrade Drain; not the other way.
-        match (self.closed, mode) {
-            (None, m) => self.closed = Some(m),
-            (Some(CloseMode::Drain), CloseMode::Force) => self.closed = Some(CloseMode::Force),
-            _ => {}
-        }
+        let upgraded_to_force = match (self.closed, mode) {
+            (None, CloseMode::Force) => {
+                self.closed = Some(CloseMode::Force);
+                true
+            }
+            (None, CloseMode::Drain) => {
+                self.closed = Some(CloseMode::Drain);
+                false
+            }
+            (Some(CloseMode::Drain), CloseMode::Force) => {
+                self.closed = Some(CloseMode::Force);
+                true
+            }
+            _ => false,
+        };
 
         let mut effects: Vec<Effect<Self>> = Vec::new();
+
+        // Force-close retires every outstanding lease right now. The
+        // public contract says force marks outstanding leases stale —
+        // not "marks them stale once each caller eventually
+        // releases." Late releases land on Retired state and get
+        // PoolClosed without owning resource cleanup. Drops the
+        // resource handle promptly so heavy H types (connections,
+        // files) release.
+        if upgraded_to_force {
+            for idx in 0..self.states.len() {
+                if matches!(self.states[idx], ResourceState::Leased { .. }) {
+                    self.states[idx] = ResourceState::Retired;
+                    self.resources[idx] = None;
+                    self.counters.retired += 1;
+                }
+            }
+            // In-flight dispatches whose resource we just retired
+            // can never complete cleanly — drop their tracker entries
+            // so the next sweep_in_flight doesn't double-recover.
+            self.in_flight.clear();
+            // Idle resources also become unreachable under Force.
+            // They keep ResourceState::Idle so a stray release of an
+            // already-returned generation still reports DoubleRelease
+            // accurately, but they won't be handed out (the
+            // closed.is_some() check at the top of handle_acquire
+            // prevents that).
+        }
+
         for slot in self.waiter_slab.iter_mut() {
             if let Some(waiter) = slot.take() {
                 self.counters.closed += 1;
