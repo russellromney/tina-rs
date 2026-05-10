@@ -379,6 +379,7 @@ where
         shard: &mut S,
         isolate_id: IsolateId,
         caller: Option<MessageCaller>,
+        now: std::time::Instant,
     ) -> ErasedEffect<S>;
 }
 
@@ -427,13 +428,14 @@ where
         shard: &mut S,
         isolate_id: IsolateId,
         caller: Option<MessageCaller>,
+        now: std::time::Instant,
     ) -> ErasedEffect<S> {
         let message = message.downcast::<Msg>().unwrap_or_else(|_| {
             panic!("simulator attempted to deliver a handler message with the wrong type")
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }

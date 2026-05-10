@@ -20,12 +20,17 @@ fn print_side(side: &str, r: Report) {
     println!(
         "comparison=specimen_pool_cancel_reclaim side={} cancelled={} \
          retried_admitted={} retried_full={} retried_resourced={} \
-         exit_clean={}",
+         waiters_high_water={} waiters_max={} exit_clean={}",
         side,
         r.cancelled,
         r.retried_admitted,
         r.retried_full,
         r.retried_resourced,
+        r.waiters_high_water,
+        r.waiters_max,
         r.exit_clean,
     );
+    if !r.discovery_line.is_empty() {
+        println!("capacity {side} {}", r.discovery_line);
+    }
 }

@@ -1231,3 +1231,113 @@ fn pressure_report_counts_full() {
 
     shutdown(h);
 }
+
+#[test]
+fn pressure_report_tracks_high_water_waiters() {
+    // 1 resource, 4 waiter slots. Issue 4 acquires: first gets the
+    // resource, three park as waiters. high_water_waiters hits 3.
+    // Release the lease — pool dispatches one parked waiter, live
+    // waiters drops to 2. High water stays 3.
+    let h = build(PoolConfig::new(1, 4), vec![1]);
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginAcquire { id: 1 })
+        .expect("a1");
+    wait_acquires(&h.obs, 1);
+
+    for id in 2..=4 {
+        h.runtime
+            .try_send(h.driver, DriverMsg::BeginAcquire { id })
+            .expect("park");
+    }
+    // Give the runtime a moment to handle the three Acquires as parks.
+    std::thread::sleep(Duration::from_millis(50));
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginPressure)
+        .expect("pressure-mid");
+    let mid = wait_pressure(&h.obs);
+    assert_eq!(mid.waiters, 3, "three parked waiters");
+    assert_eq!(mid.high_water_waiters, 3);
+    assert_eq!(mid.full_count, 0);
+
+    // Release dispatches one waiter to the resource; live waiters → 2.
+    h.runtime
+        .try_send(
+            h.driver,
+            DriverMsg::BeginRelease {
+                id: 1,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        )
+        .expect("release");
+    wait_acquires(&h.obs, 2);
+    wait_releases(&h.obs, 1);
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginPressure)
+        .expect("pressure-after");
+    let after = wait_pressure(&h.obs);
+    assert_eq!(after.waiters, 2, "one parked waiter dispatched");
+    assert_eq!(after.high_water_waiters, 3, "high water is sticky");
+
+    // Project to the count surface. Pin the name so a CI test
+    // cannot silently retarget if internals get renamed.
+    let report =
+        after.to_waiters_capacity_report("pool.demo.waiters", tina::capacity::CapacityMode::Fixed);
+    assert_eq!(report.name, "pool.demo.waiters");
+    assert_eq!(report.max_messages, Some(4));
+    assert_eq!(report.current_messages, 2);
+    assert_eq!(report.high_water_messages, 3);
+    assert_eq!(report.full_count, 0);
+
+    // Stuff into a CapacitySummary and use the assertion helpers.
+    let mut summary = tina_runtime::CapacitySummary::new();
+    summary.push(report).expect("push");
+    summary
+        .surface("pool.demo.waiters")
+        .high_water_at_most(3)
+        .expect("high water within configured cap");
+    summary
+        .surface("pool.demo.waiters")
+        .no_full()
+        .expect("no Full under nominal load");
+
+    shutdown(h);
+}
+
+#[test]
+fn pressure_report_capacity_surface_records_full_under_overload() {
+    // 1 resource, 0 waiters: every acquire after the first sheds
+    // with Full. The capacity surface records those rejections and
+    // the discovery formatter suggests "raise cap".
+    let h = build(PoolConfig::new(1, 0), vec![1]);
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginAcquire { id: 1 })
+        .expect("a1");
+    wait_acquires(&h.obs, 1);
+    for id in 2..=4 {
+        h.runtime
+            .try_send(h.driver, DriverMsg::BeginAcquire { id })
+            .expect("full");
+    }
+    wait_acquires(&h.obs, 4);
+
+    h.runtime
+        .try_send(h.driver, DriverMsg::BeginPressure)
+        .expect("pressure");
+    let pr = wait_pressure(&h.obs);
+
+    let report =
+        pr.to_waiters_capacity_report("pool.demo.waiters", tina::capacity::CapacityMode::Tuning);
+    assert_eq!(report.full_count, 3);
+    assert_eq!(report.high_water_messages, 0);
+
+    let line = tina_runtime::format_discovery_line(&report);
+    assert!(line.contains("tuning"), "{line}");
+    assert!(line.contains("full=3"), "{line}");
+    assert!(line.contains("raise cap"), "{line}");
+
+    shutdown(h);
+}
