@@ -886,8 +886,18 @@ pub struct PgConfig {
     /// `pg_cancel_backend(pid)` from a small dedicated pool when the
     /// per-attempt timeout elapses on a request whose backend PID
     /// was captured. Default `None` — opt in via
-    /// [`Self::with_cancel_on_timeout`]. Only honored on the
-    /// `install` path; ignored on `install_with_pool`.
+    /// [`Self::with_cancel_on_timeout`].
+    ///
+    /// **Only honored on [`crate::PgWorker::install`].** The
+    /// supplied-pool path ([`crate::PgWorker::install_with_pool`])
+    /// silently ignores this field — the bridge cannot construct a
+    /// sidecar pool without an owned URL, and the caller already
+    /// owns connection lifetimes.
+    ///
+    /// **Sidecar URL** is the same as `pool.url`. There is no knob
+    /// to point the sidecar at a different host. The sidecar exists
+    /// to fire one-shot `pg_cancel_backend` calls; co-locating it
+    /// with the main pool is the boring choice.
     pub cancel: Option<PgCancelConfig>,
 }
 
@@ -962,7 +972,9 @@ impl PgConfig {
         self
     }
 
-    /// Enables DB-side cancellation with a sidecar pool of `pool_size`.
+    /// Enables DB-side cancellation with a sidecar pool of `pool_size`
+    /// and a default `acquire_timeout`. Use [`Self::with_cancel`] to
+    /// set both knobs explicitly.
     ///
     /// When the bridge per-attempt timeout fires, the bridge runs
     /// `pg_cancel_backend($1)` against the captured backend PID via
@@ -970,13 +982,15 @@ impl PgConfig {
     /// capture `pg_backend_pid()` before running the user's query.
     ///
     /// Only honored on [`crate::PgWorker::install`]; the
-    /// supplied-pool path ignores it (caller owns the pool).
+    /// supplied-pool path ignores it.
     pub fn with_cancel_on_timeout(mut self, pool_size: u32) -> Self {
         self.cancel = Some(PgCancelConfig::new().with_pool_size(pool_size));
         self
     }
 
-    /// Sets the full cancel config explicitly.
+    /// Sets the full cancel config explicitly. Use this when you want
+    /// to override the sidecar's `acquire_timeout` from
+    /// [`PgCancelConfig::default`].
     pub fn with_cancel(mut self, cancel: PgCancelConfig) -> Self {
         self.cancel = Some(cancel);
         self

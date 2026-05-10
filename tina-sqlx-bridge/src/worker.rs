@@ -386,11 +386,30 @@ impl<S: Shard + 'static> PgWorker<S> {
                         if pid != 0 {
                             let pool = cancel_pool.pool().clone();
                             self.metrics.db_cancels_sent.fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "tracing")]
+                            event!(
+                                target: TRACE_TARGET_CALL,
+                                Level::DEBUG,
+                                kind = "cancel_fired",
+                                pid,
+                                request_kind,
+                            );
                             self.runtime.spawn(async move {
-                                let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                                #[allow(unused_variables)]
+                                let r = sqlx::query("SELECT pg_cancel_backend($1)")
                                     .bind(pid)
                                     .execute(&pool)
                                     .await;
+                                #[cfg(feature = "tracing")]
+                                if let Err(err) = r {
+                                    event!(
+                                        target: TRACE_TARGET_CALL,
+                                        Level::WARN,
+                                        kind = "cancel_failed",
+                                        pid,
+                                        detail = %err,
+                                    );
+                                }
                             });
                         }
                     }

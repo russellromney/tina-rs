@@ -184,6 +184,22 @@ fn install_without_pool_config_errors_with_missing_pool_config() {
 }
 
 #[test]
+fn install_with_pool_silently_ignores_cancel_config() {
+    // Caller may build a config with cancel set (e.g. from a shared
+    // template) but install with a supplied pool. The bridge does
+    // not error — it just builds without a sidecar. Cancel is a
+    // no-op on this path. Lock that contract: install succeeds, no
+    // panic, no cancel firing later.
+    let runtime = make_runtime();
+    let cfg = config_for_admission_tests().with_cancel_on_timeout(1);
+    let (bridge, _tokio_rt) = install_lazy(&runtime, cfg);
+    // The bridge is alive; closing exercises drop ordering.
+    bridge.closer.close();
+    assert_eq!(bridge.metrics.snapshot().db_cancels_sent, 0);
+    shutdown(runtime);
+}
+
+#[test]
 fn install_with_invalid_config_errors_with_config() {
     let runtime = make_runtime();
     let cfg = PgConfig::bridge_only().with_default_timeout(Duration::ZERO);
