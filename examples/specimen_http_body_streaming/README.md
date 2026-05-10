@@ -24,17 +24,30 @@ Both sides:
 
 ```
 side=tokio bytes_received=262144 status_ok=true wall_clock_ms=~600
-           exit_clean=true tina_response_high_water=n/a
+           exit_clean=true tokio_response_alloc_floor=262144
+           tina_response_high_water=n/a
 side=tina  bytes_received=262144 status_ok=true wall_clock_ms=~600
-           exit_clean=true tina_response_high_water=4096
+           exit_clean=true tokio_response_alloc_floor=n/a
+           tina_response_high_water=4096
 ```
 
-The wall-clock numbers are similar (the slow reader paces both).
-The number that's only visible on the Tina side is
-`tina_response_high_water` — the peak bytes resident in the
-connection's outbound buffer, observed via `BodyMetrics`. On the
-Tokio side that number is "the whole body, plus whatever hyper
-keeps queued for the writer task" and is not surfaced.
+Wall-clock is similar (the slow reader paces both). The body
+footprint numbers tell the real story:
+
+- Tokio reports `tokio_response_alloc_floor=262144`. This is a
+  *lower bound*: we know the `Vec<u8>` we hand to `Body::from(...)`
+  is 256 KiB and lives until the response finishes streaming.
+  Hyper queues more bytes for its writer task — we don't see
+  those.
+- Tina reports `tina_response_high_water=4096`. This is the
+  *exact peak* observed via `BodyMetrics`: at no point did the
+  connection isolate hold more than one chunk's worth of body.
+  64× smaller than the body itself.
+
+Both numbers are honest. Tokio's is "at least this much"
+because that body model has no per-chunk hook to measure
+through. Tina's is "exactly this much" because every chunk goes
+through a charge/release pair.
 
 ## Read
 

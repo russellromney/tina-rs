@@ -23,18 +23,24 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn print_side(side: &str, report: Report) {
+    let alloc_floor = report
+        .tokio_response_alloc_floor
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
     let high_water = report
         .tina_response_high_water
         .map(|n| n.to_string())
         .unwrap_or_else(|| "n/a".to_string());
     println!(
         "comparison=specimen_http_body_streaming side={} bytes_received={} status_ok={} \
-         wall_clock_ms={} exit_clean={} tina_response_high_water={}",
+         wall_clock_ms={} exit_clean={} tokio_response_alloc_floor={} \
+         tina_response_high_water={}",
         side,
         report.bytes_received,
         report.status_ok,
         report.wall_clock_ms,
         report.exit_clean,
+        alloc_floor,
         high_water,
     );
 }

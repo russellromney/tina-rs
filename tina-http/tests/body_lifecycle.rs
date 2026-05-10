@@ -201,16 +201,15 @@ fn shutdown_while_streaming_response_drains_body_metrics() {
         snap.drained(),
         "body charges must release on shutdown even mid-stream; got {snap:?}"
     );
-    // The body high water might be one or two chunks depending on
-    // when shutdown landed; we only assert it's nonzero (we did
-    // start streaming) and bounded.
+    // The connection only pulls the next chunk after the previous
+    // one fully drains, so peak charge equals one chunk exactly.
     assert!(
         snap.response_body_high_water > 0,
         "high water > 0 after some chunks streamed"
     );
-    assert!(
-        snap.response_body_high_water <= chunk_size * 2,
-        "single in-flight chunk caps high water; got {}",
+    assert_eq!(
+        snap.response_body_high_water, chunk_size,
+        "in-flight chunk caps high water at exactly one chunk; got {}",
         snap.response_body_high_water
     );
 }

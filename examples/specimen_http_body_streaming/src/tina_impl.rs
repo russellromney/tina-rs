@@ -134,6 +134,7 @@ pub fn run() -> anyhow::Result<Report> {
         status_ok: ok,
         wall_clock_ms: wall_ms,
         exit_clean: snap.drained(),
+        tokio_response_alloc_floor: None,
         tina_response_high_water: Some(snap.response_body_high_water),
     })
 }

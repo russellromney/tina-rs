@@ -23,6 +23,12 @@ use tokio::sync::oneshot;
 
 use crate::{RESPONSE_BODY_BYTES, Report, slow_reader_client};
 
+// On the Tokio side we know the lower bound on body residency: the
+// `Vec<u8>` we hand to `Body::from(...)` is RESPONSE_BODY_BYTES
+// long and lives until the response finishes streaming. Hyper may
+// queue more bytes internally; we don't see those.
+const TOKIO_RESPONSE_ALLOC_FLOOR: usize = RESPONSE_BODY_BYTES;
+
 async fn big() -> Response {
     let body: Vec<u8> = vec![b'a'; RESPONSE_BODY_BYTES];
     Response::builder()
@@ -69,6 +75,7 @@ pub fn run() -> anyhow::Result<Report> {
         status_ok: ok,
         wall_clock_ms: wall_ms,
         exit_clean: true,
+        tokio_response_alloc_floor: Some(TOKIO_RESPONSE_ALLOC_FLOOR),
         tina_response_high_water: None,
     })
 }

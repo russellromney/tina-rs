@@ -11,6 +11,11 @@ fn tokio_smoke() {
     assert!(r.status_ok);
     assert!(r.exit_clean);
     assert!(r.tina_response_high_water.is_none(), "no metrics on tokio");
+    assert_eq!(
+        r.tokio_response_alloc_floor,
+        Some(RESPONSE_BODY_BYTES),
+        "tokio side allocates the whole body Vec up front"
+    );
 }
 
 #[test]
@@ -22,14 +27,13 @@ fn tina_smoke_caps_in_flight_body_near_one_chunk() {
     let hw = r
         .tina_response_high_water
         .expect("tina side reports response high water");
-    // High water should never be the entire body. Two chunks worth
-    // is generous slack against runtime scheduling — what matters
-    // is "much smaller than RESPONSE_BODY_BYTES".
-    assert!(
-        hw <= CHUNK_BYTES * 2,
-        "tina response_body_high_water = {hw}, expected <= {} (one or two chunks). \
-         A regression here means the connection started buffering whole bodies again.",
-        CHUNK_BYTES * 2
+    // The connection pulls the next chunk only after the previous
+    // one fully drains, so peak charge equals exactly one chunk.
+    // A regression that buffered whole bodies would push this up.
+    assert_eq!(
+        hw, CHUNK_BYTES,
+        "tina response_body_high_water = {hw}, expected exactly {CHUNK_BYTES} (one chunk). \
+         A regression here means the connection started buffering whole bodies again."
     );
     assert!(
         hw < RESPONSE_BODY_BYTES,

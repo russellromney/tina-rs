@@ -42,10 +42,17 @@ pub struct Report {
     pub status_ok: bool,
     pub wall_clock_ms: u128,
     pub exit_clean: bool,
-    /// Tina-only: peak body bytes resident in the connection
-    /// isolate at any point. `None` for the Tokio side, which has
-    /// no equivalent — its body is `Body::from(big_vec)`, fully
-    /// resident.
+    /// Tokio side only. Lower bound on bytes the body holder
+    /// allocates: the `Vec<u8>` we hand to `Body::from(...)` is
+    /// `RESPONSE_BODY_BYTES` long and must live until the response
+    /// finishes streaming. Hyper internally also queues some bytes
+    /// for the writer task; we do not measure those. The number
+    /// reported here is "at least this much body is resident".
+    pub tokio_response_alloc_floor: Option<usize>,
+    /// Tina side only. Peak body bytes resident in the connection
+    /// isolate at any time, observed via `BodyMetrics`. There is
+    /// no equivalent reading on the Tokio side because hyper's
+    /// internal body queue is not exposed.
     pub tina_response_high_water: Option<usize>,
 }
 

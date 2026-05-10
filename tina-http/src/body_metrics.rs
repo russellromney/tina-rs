@@ -34,6 +34,32 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+// CAS loop that monotonically pushes `target` up to `new`. Bounded
+// by contention: each retry observes a fresh value, so under N
+// threads the worst case is N retries.
+fn bump_high_water(target: &AtomicUsize, new: usize) {
+    let mut hw = target.load(Ordering::Relaxed);
+    while new > hw {
+        match target.compare_exchange_weak(hw, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => hw = observed,
+        }
+    }
+}
+
+// Atomic saturating sub. CAS loop because `fetch_sub` would wrap
+// on underflow. Bounded by contention.
+fn saturating_sub(target: &AtomicUsize, n: usize) {
+    let mut cur = target.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(n);
+        match target.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 /// Shard-local body-pressure counters. Cheap to clone (`Arc`-backed).
 ///
 /// One instance is shared between an [`crate::HttpListener`] (or
@@ -62,77 +88,43 @@ impl BodyMetrics {
         Self::default()
     }
 
-    /// Charges `n` bytes of inbound body. Returns the new current
-    /// value so callers can size buffers; the high-water is updated
-    /// monotonically.
-    pub fn charge_request(&self, n: usize) -> usize {
+    /// Charges `n` bytes of inbound body. High-water is bumped if
+    /// the resulting current exceeds it.
+    pub fn charge_request(&self, n: usize) {
         let prev = self
             .inner
             .request_body_current
             .fetch_add(n, Ordering::Relaxed);
-        let new = prev + n;
-        // High-water is monotonic. We accept a benign race here:
-        // two concurrent charges may both attempt to bump the high
-        // water; whichever wins, the larger value sticks.
-        let mut hw = self.inner.request_body_high_water.load(Ordering::Relaxed);
-        while new > hw {
-            match self.inner.request_body_high_water.compare_exchange_weak(
-                hw,
-                new,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => hw = observed,
-            }
-        }
-        new
+        bump_high_water(&self.inner.request_body_high_water, prev + n);
     }
 
-    /// Releases `n` bytes of inbound body.
+    /// Releases `n` bytes of inbound body. Saturates at zero so a
+    /// double-release does not wrap. In practice each [`BodyMetrics`]
+    /// is owned by one shard's isolates, which run single-threaded;
+    /// the CAS loop here is for correctness, not contention.
     pub fn release_request(&self, n: usize) {
-        // Saturating sub via fetch_update guards against double-release
-        // bugs without poisoning the counter.
-        let _ = self.inner.request_body_current.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(n)),
-        );
+        saturating_sub(&self.inner.request_body_current, n);
     }
 
     /// Charges `n` bytes of outbound body.
-    pub fn charge_response(&self, n: usize) -> usize {
+    pub fn charge_response(&self, n: usize) {
         let prev = self
             .inner
             .response_body_current
             .fetch_add(n, Ordering::Relaxed);
-        let new = prev + n;
-        let mut hw = self.inner.response_body_high_water.load(Ordering::Relaxed);
-        while new > hw {
-            match self.inner.response_body_high_water.compare_exchange_weak(
-                hw,
-                new,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => hw = observed,
-            }
-        }
-        new
+        bump_high_water(&self.inner.response_body_high_water, prev + n);
     }
 
-    /// Releases `n` bytes of outbound body.
+    /// Releases `n` bytes of outbound body. Saturates at zero.
     pub fn release_response(&self, n: usize) {
-        let _ = self.inner.response_body_current.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(n)),
-        );
+        saturating_sub(&self.inner.response_body_current, n);
     }
 
     /// Increments the cap-full counter. Use when the parser rejects
-    /// a body for exceeding [`crate::HttpLimits::max_body_bytes`].
+    /// a request for declared `Content-Length` greater than
+    /// [`crate::HttpLimits::max_body_bytes`]. The cap is checked once
+    /// at parse time; this counter does not fire later in the body
+    /// stream.
     pub fn record_body_full(&self) {
         self.inner.body_full_count.fetch_add(1, Ordering::Relaxed);
     }
