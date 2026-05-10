@@ -363,7 +363,8 @@ pub enum ReleaseFailure {
 ///
 /// > Only the pool that owns a resource may mint a lease for it.
 ///
-/// Calling [`lease_new`] from outside the pool implementation lets
+/// Calling [`runtime_internal::lease_new`] from outside the pool
+/// implementation lets
 /// application code forge a lease whose identity matches an
 /// outstanding one, release the duplicate, and produce resource
 /// aliasing — the pool will hand the same resource to a new waiter
