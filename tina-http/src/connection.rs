@@ -29,6 +29,7 @@ use tina_runtime::{
     tls_read, tls_write,
 };
 
+use crate::body_metrics::BodyMetrics;
 use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_request_head};
 use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
@@ -99,6 +100,17 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     service: Address<M, HttpResponse>,
     limits: HttpLimits,
     service_call_timeout: Duration,
+    /// Optional body-pressure counters. When `Some`, the connection
+    /// charges inbound/outbound bytes on admission and releases on
+    /// drain/drop, and increments full/timeout/IO-error counts on
+    /// the appropriate edge transitions. When `None` no metrics are
+    /// recorded — zero-overhead default.
+    metrics: Option<BodyMetrics>,
+    /// Bytes currently charged to `metrics.request_body_*`. Tracks
+    /// what we owe the metrics on drop/close.
+    metrics_request_charge: usize,
+    /// Bytes currently charged to `metrics.response_body_*`.
+    metrics_response_charge: usize,
 
     // Accumulating wire state.
     read_buf: Vec<u8>,
@@ -191,12 +203,37 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
         service_call_timeout: Duration,
         tls_io_timeout: Duration,
     ) -> Self {
+        Self::with_transport_and_metrics(
+            transport,
+            service,
+            limits,
+            service_call_timeout,
+            tls_io_timeout,
+            None,
+        )
+    }
+
+    /// Builds a connection isolate that reports body pressure into
+    /// the supplied [`BodyMetrics`]. Listeners thread one shared
+    /// `BodyMetrics` through every connection they spawn so the
+    /// snapshot reflects the whole shard.
+    pub fn with_transport_and_metrics(
+        transport: HttpTransport,
+        service: Address<M, HttpResponse>,
+        limits: HttpLimits,
+        service_call_timeout: Duration,
+        tls_io_timeout: Duration,
+        metrics: Option<BodyMetrics>,
+    ) -> Self {
         Self {
             transport,
             tls_io_timeout,
             service,
             limits,
             service_call_timeout,
+            metrics,
+            metrics_request_charge: 0,
+            metrics_response_charge: 0,
             read_buf: Vec::new(),
             parsed_head: None,
             head_len: 0,
@@ -293,27 +330,47 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             // Peer closed cleanly. If we already parsed a head and have
             // a partial body, this is a truncated request — close
             // without dispatching. If we haven't parsed yet, also close.
+            if self.parsed_head.is_some() {
+                // Truncation: peer sent FIN before declared length.
+                // Distinct from a clean post-body close.
+                self.record_body_io_error();
+            }
             return self.begin_close();
         }
 
+        let pre_len = self.read_buf.len();
         self.read_buf.extend_from_slice(&bytes);
 
         if self.parsed_head.is_none() {
             match parse_request_head(&self.read_buf, &self.limits) {
                 ParseProgress::NeedMore => return self.read_more(),
                 ParseProgress::Complete { head, head_len } => {
+                    // Charge the body bytes already past head_len so
+                    // far. The post-head `read_more` path charges
+                    // subsequent reads via the else-branch below.
+                    let body_already_in_buf = self.read_buf.len().saturating_sub(head_len);
                     self.parsed_head = Some(head);
                     self.head_len = head_len;
+                    self.charge_request(body_already_in_buf);
                     // Disarm the slow-loris guard. The deadline message
                     // may still arrive but `handle_header_deadline`
                     // checks this flag and no-ops.
                     self.head_deadline_armed = false;
+                }
+                ParseProgress::Failed(RequestParseError::BodyTooLarge) => {
+                    self.head_deadline_armed = false;
+                    self.record_body_full();
+                    return self.send_parse_error(RequestParseError::BodyTooLarge);
                 }
                 ParseProgress::Failed(error) => {
                     self.head_deadline_armed = false;
                     return self.send_parse_error(error);
                 }
             }
+        } else {
+            // Head already parsed. Every new byte read is body.
+            let delta = self.read_buf.len() - pre_len;
+            self.charge_request(delta);
         }
 
         self.maybe_dispatch_or_read_more()
@@ -375,6 +432,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .take()
             .expect("head parsed before dispatch");
         self.will_close = true;
+        // The body bytes are about to leave this isolate — either
+        // handed to the service buffered, or moved into
+        // `inbound_buffer` for streaming. Either way the charge
+        // accounting flips: buffered releases everything now;
+        // streaming keeps the inbound_buffer slice charged but
+        // releases the rest (the body had not arrived yet anyway,
+        // so charge==buffer.len() at this point).
+        self.release_request_all();
 
         // Decide buffered vs streaming dispatch based on the limits.
         let request = match self.limits.inbound_stream_chunk_size {
@@ -398,8 +463,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 self.inbound_total = head.content_length;
                 self.inbound_received = buf.len();
                 self.inbound_delivered = 0;
+                let pre_buf_len = buf.len();
                 self.inbound_buffer = buf;
                 self.inbound_chunk_size = chunk_size.max(1);
+                // Streaming: charge the prefix bytes that just moved
+                // from `read_buf` into `inbound_buffer`. Subsequent
+                // body bytes are charged in `handle_body_chunk_read`.
+                self.charge_request(pre_buf_len);
                 let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
                     tina::Address::new_with_generation(
                         self.shard_id_for_self(),
@@ -492,15 +562,29 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let bytes = match result {
             Ok(bytes) => bytes,
             // Surface the typed error so service can tell short
-            // delivery (Eof) from truncation (Error).
-            Err(error) => return reply(RequestChunkReply::Error(error)),
+            // delivery (Eof) from truncation (Error). Distinguish
+            // timeout from other IO errors in the metrics.
+            Err(error) => {
+                match error {
+                    CallError::Timeout => self.record_body_timeout(),
+                    _ => self.record_body_io_error(),
+                }
+                return reply(RequestChunkReply::Error(error));
+            }
         };
         if bytes.is_empty() {
             // Peer closed mid-body. Service notices via `delivered < expected`.
+            // The wire was short, so this is a truncation event from a
+            // metrics standpoint — the server cannot fulfil the
+            // declared length.
+            if self.inbound_delivered + self.inbound_buffer.len() < self.inbound_total {
+                self.record_body_io_error();
+            }
             return reply(RequestChunkReply::Eof);
         }
         self.inbound_received += bytes.len();
         self.inbound_buffer.extend_from_slice(&bytes);
+        self.charge_request(bytes.len());
         self.serve_chunk_from_buffer()
     }
 
@@ -512,6 +596,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .min(remaining_total);
         let chunk: Vec<u8> = self.inbound_buffer.drain(..take).collect();
         self.inbound_delivered += take;
+        // The chunk has left the connection; release its charge.
+        self.release_request(take);
         reply(RequestChunkReply::Chunk(chunk))
     }
 
@@ -540,10 +626,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         match response.body {
             HttpResponseBody::Buffered(body_bytes) => {
                 // Append the buffered body to the head and write it all
-                // through the existing partial-write loop.
+                // through the existing partial-write loop. Charge the
+                // body portion only — head bytes do not count against
+                // the body cap.
+                let body_len = body_bytes.len();
                 let mut bytes = head_bytes;
                 bytes.extend_from_slice(&body_bytes);
                 self.pending_response = bytes;
+                self.charge_response(body_len);
                 self.write_pending()
             }
             HttpResponseBody::Stream(ResponseStream {
@@ -552,7 +642,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             }) => {
                 // Write the head; once the head has fully drained,
                 // `handle_wrote` will pull the first chunk from the
-                // source and write it.
+                // source and write it. Body bytes are charged
+                // per-chunk in `handle_stream_chunk`.
                 self.pending_response = head_bytes;
                 self.stream_source = Some(source);
                 self.stream_bytes_remaining = content_length;
@@ -577,8 +668,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
         if count == 0 {
+            // Wire stalled with no progress — treat as truncation
+            // for metrics. Source isolate (if any) is not separately
+            // notified; first form keeps the close path simple.
+            if self.metrics_response_charge > 0 {
+                self.record_body_io_error();
+            }
             return self.begin_close();
         }
+        // Release whatever portion of the just-accepted bytes were
+        // body (charge only ever covered body bytes, not the head).
+        let release = count.min(self.metrics_response_charge);
+        self.release_response(release);
         if count >= self.pending_response.len() {
             self.pending_response.clear();
             // Buffer drained. If we are streaming, pull the next chunk;
@@ -612,31 +713,45 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                     self.stream_source = None;
                     return self.begin_close();
                 }
-                if bytes.len() > self.stream_bytes_remaining {
+                let written_bytes = if bytes.len() > self.stream_bytes_remaining {
                     // Source over-produced relative to declared length.
                     // Truncate to keep the wire framing honest.
                     let mut truncated = bytes;
                     truncated.truncate(self.stream_bytes_remaining);
                     self.stream_bytes_remaining = 0;
-                    self.pending_response = truncated;
+                    truncated
                 } else {
                     self.stream_bytes_remaining -= bytes.len();
-                    self.pending_response = bytes;
-                }
+                    bytes
+                };
+                let n = written_bytes.len();
+                self.pending_response = written_bytes;
+                self.charge_response(n);
                 self.write_pending()
             }
             CallOutcome::Replied(ResponseChunkReply::Eof) => {
                 // Source finished. Close — note the wire `Content-Length`
                 // we already emitted is canonical; the source under-
                 // producing is a contract violation but we close cleanly.
+                if self.stream_bytes_remaining > 0 {
+                    // Wire is short relative to declared length.
+                    self.record_body_io_error();
+                }
                 self.stream_source = None;
                 self.begin_close()
             }
-            CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => {
+            CallOutcome::Timeout => {
+                // Source took too long to produce the next chunk.
+                self.record_body_timeout();
+                self.stream_source = None;
+                self.begin_close()
+            }
+            CallOutcome::Full | CallOutcome::Closed => {
                 // Source died mid-stream. Close the wire — the client
                 // sees a truncated body relative to `Content-Length`.
                 // First-form policy: close, do not try to inject an
                 // error response on top of an already-emitted head.
+                self.record_body_io_error();
                 self.stream_source = None;
                 self.begin_close()
             }
@@ -644,12 +759,124 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn begin_close(&mut self) -> Effect<Self> {
+        // Any body bytes still resident in this isolate are about to
+        // be dropped; release them so the metrics' `current` returns
+        // to zero on a clean shutdown sequence.
+        self.release_request_all();
+        self.release_response_all();
         match self.transport {
             HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpConnectionMsg::Closed),
             HttpTransport::Tls(stream) => {
                 tls_close(stream, self.tls_io_timeout).reply(HttpConnectionMsg::Closed)
             }
         }
+    }
+
+    // --- BodyMetrics helpers --------------------------------------
+
+    fn charge_request(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.charge_request(n);
+            self.metrics_request_charge += n;
+        }
+    }
+
+    fn release_request(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let take = n.min(self.metrics_request_charge);
+        if take == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_request(take);
+        }
+        self.metrics_request_charge -= take;
+    }
+
+    fn release_request_all(&mut self) {
+        if self.metrics_request_charge == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_request(self.metrics_request_charge);
+        }
+        self.metrics_request_charge = 0;
+    }
+
+    fn charge_response(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.charge_response(n);
+            self.metrics_response_charge += n;
+        }
+    }
+
+    fn release_response(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let take = n.min(self.metrics_response_charge);
+        if take == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_response(take);
+        }
+        self.metrics_response_charge -= take;
+    }
+
+    fn release_response_all(&mut self) {
+        if self.metrics_response_charge == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_response(self.metrics_response_charge);
+        }
+        self.metrics_response_charge = 0;
+    }
+
+    fn record_body_full(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_body_full();
+        }
+    }
+
+    fn record_body_timeout(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_body_timeout();
+        }
+    }
+
+    fn record_body_io_error(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_body_io_error();
+        }
+    }
+}
+
+// Drop catches isolates abandoned without a clean close path
+// (panic, runtime stop, force-close). Without this, an isolate
+// dropped mid-body would leave its charge resident in the shared
+// metrics forever, breaking the "drained()" terminal assertion.
+impl<S: Shard, M: From<HttpRequest> + Send + 'static> Drop for HttpConnection<S, M> {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            if self.metrics_request_charge > 0 {
+                metrics.release_request(self.metrics_request_charge);
+            }
+            if self.metrics_response_charge > 0 {
+                metrics.release_response(self.metrics_response_charge);
+            }
+        }
+        self.metrics_request_charge = 0;
+        self.metrics_response_charge = 0;
     }
 }
 

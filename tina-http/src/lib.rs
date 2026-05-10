@@ -1,6 +1,41 @@
 //! Native HTTP/1.1 and HTTPS/1.1 for tina-rs. No Tokio edge.
-//! `Content-Length` request bodies only — no chunked, no pipelining,
-//! no `Expect: 100-continue`.
+//! `Content-Length` framing only on both request and response — no
+//! chunked, no pipelining, no `Expect: 100-continue`.
+//!
+//! # Body model
+//!
+//! Bodies are either **buffered** (whole `Vec<u8>` resident in the
+//! connection isolate) or **streamed** (pulled chunk-by-chunk from
+//! a chunk-source isolate).
+//!
+//! - Request: streaming activates when
+//!   [`HttpLimits::inbound_stream_chunk_size`] is `Some(N)` and the
+//!   request declares a non-zero `Content-Length`. Dispatch happens
+//!   as soon as the head parses; the service pulls body chunks via
+//!   `call(stream.source, HttpConnectionMsg::body_next(), timeout)`.
+//!   Clean `Eof` and truncated [`RequestChunkReply::Error`] are
+//!   distinct.
+//! - Response: callers build a streamed response with
+//!   [`HttpResponse::with_stream`], handing in a [`ResponseStream`]
+//!   whose `content_length` is declared up front. The connection
+//!   writes the head with that length and pulls chunks via
+//!   `call(source, ResponseChunkMsg::Next, t)` until `Eof`.
+//!
+//! Unknown-length streaming responses are deliberately not part of
+//! the first form: the type system gives no way to ask for them.
+//! Chunked transfer-encoding is rejected on both directions as
+//! `UnsupportedTransferEncoding` (501 server-side, parse error
+//! client-side).
+//!
+//! # Body pressure
+//!
+//! Attach a [`BodyMetrics`] to either listener via
+//! `with_metrics(metrics.clone())` to record request/response
+//! bytes resident, peak high-water, body-cap full counts, and
+//! body IO/timeout error counts.
+//! [`BodyPressureReport::drained`] is the "no-leak" terminal
+//! assertion. A shared capacity-report shape lives in a separate
+//! slice; this report folds into it when that ships.
 //!
 //! Server: [`HttpListener`] over TCP, [`HttpsListener`] over TLS.
 //! HTTPS startup is call-shaped:
@@ -28,6 +63,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod body_metrics;
 pub mod client;
 pub mod connection;
 pub mod listener;
@@ -41,6 +77,7 @@ pub mod target;
 pub mod transport;
 pub mod types;
 
+pub use body_metrics::{BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use listener::{HttpListener, HttpListenerMsg};
