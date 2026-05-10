@@ -69,12 +69,15 @@ pub struct ResponseStream {
 /// this on the call chain rooted at
 /// `crate::HttpConnectionMsg::RequestBodyNext` (or its `body_next()`
 /// constructor).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestChunkReply {
     /// One chunk of body bytes.
     Chunk(Vec<u8>),
-    /// End of stream.
+    /// End of stream — the declared `Content-Length` was reached.
     Eof,
+    /// Read failed mid-body. Distinct from `Eof` so the service
+    /// can tell clean short delivery from truncation.
+    Error(tina_runtime::CallError),
 }
 
 /// A streaming request body: declared length plus a source isolate.

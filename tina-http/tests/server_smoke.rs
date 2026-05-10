@@ -9,7 +9,11 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{TestHarness, assert_status_and_body, assert_status_starts_with, scripted_request};
+use tina_http::HttpListenerMsg;
+use tina_runtime::{CallKind, RuntimeEventKind};
 
 fn assert_connection_close(response: &[u8]) {
     let text = std::str::from_utf8(response).expect("http response is utf8");
@@ -42,4 +46,40 @@ fn native_http_server_serves_get_and_post() {
     assert_connection_close(&response_d);
 
     harness.shutdown();
+}
+
+#[test]
+fn second_start_does_not_rebind_or_leak_listener() {
+    // HttpListener's reply type is `()` so we can't surface a typed
+    // AlreadyStarted error here; the contract is that the second
+    // Start is a no-op and the trace shows exactly one TcpBind.
+    let harness = TestHarness::start();
+    // TestHarness already sent Start once during start(). Send a
+    // second Start — should be a no-op.
+    let runtime = harness.runtime_handle();
+    runtime
+        .try_send(harness.listener_address(), HttpListenerMsg::Start)
+        .expect("send second Start");
+
+    // Give the second Start a chance to run and any (incorrect)
+    // second tcp_bind to land in the trace.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let trace = harness.shutdown();
+    let tcp_bind_completions = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpBind,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        tcp_bind_completions, 1,
+        "exactly one tcp_bind should have completed (got {tcp_bind_completions})",
+    );
 }

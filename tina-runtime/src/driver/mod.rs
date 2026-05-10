@@ -965,6 +965,7 @@ mod tests {
             streams: Vec::new(),
             next_listener_id: 1,
             next_stream_id: 1,
+            cancelled_by_close: Vec::new(),
         };
 
         let mut completed = Vec::new();

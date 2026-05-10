@@ -83,7 +83,12 @@ For protocols, prefer boring sync codec crates:
 
 - HTTP/1 parse with `httparse`
 - HTTP types with `http`
-- TLS state machine with `rustls`
+- TLS state machine with `rustls` — driven by the runtime's TLS lane
+  (`tls_bind` / `tls_accept` / `tls_connect` / `tls_read` / `tls_write`
+  / `tls_close`). `tina-http`'s `HttpsListener` and `HttpClient` use
+  these directly: HTTP/1.1 over a real `rustls` handshake, no Tokio
+  edge. DER cert/key inputs are explicit; no system trust roots, no
+  HTTP/2, no ALPN.
 - JSON with `serde_json`
 - protobuf with `prost`
 - Postgres wire with `postgres-protocol`

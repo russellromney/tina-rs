@@ -106,7 +106,10 @@ fn submit_via(
             driver,
             DriverMsg::Begin {
                 pool,
-                outbound: OutboundCall { target, request },
+                outbound: OutboundCall {
+                    target: target.into(),
+                    request,
+                },
                 timeout: Duration::from_secs(2),
             },
         )

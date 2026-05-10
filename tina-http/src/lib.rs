@@ -1,38 +1,53 @@
-//! Native HTTP/1.1 service stack for tina-rs.
+//! Native HTTP/1.1 and HTTPS/1.1 for tina-rs. No Tokio edge.
+//! `Content-Length` request bodies only — no chunked, no pipelining,
+//! no `Expect: 100-continue`.
 //!
-//! Tina speaks HTTP without a Tokio edge. HTTP/1.1 only. `Content-Length`
-//! request bodies only — no chunked request bodies, no pipelining, no
-//! `Expect: 100-continue`.
+//! Server: [`HttpListener`] over TCP, [`HttpsListener`] over TLS.
+//! HTTPS startup is call-shaped:
+//! `call(listener, HttpsListenerMsg::Start, t)` returns
+//! `Result<HttpsReady, HttpsStartupError>`.
 //!
-//! User registers an [`HttpListener`] with a service-isolate address.
-//! The listener spawns one [`HttpConnection`] per accepted socket.
-//! Services receive [`HttpRequest`] and reply [`HttpResponse`].
+//! Client: [`HttpClient`] dispatches on [`HttpTarget`]. HTTPS targets
+//! carry explicit DER [`TlsTrustRoots`], a server name validated by
+//! rustls, and an [`HttpHostPolicy`] for the wire `Host:` header.
 //!
-//! Backpressure surfaces as typed `CallOutcome::{Replied, Full, Closed,
-//! Timeout}`, mapped to HTTP status codes by an explicit policy.
+//! Errors: HTTPS-aware paths produce
+//! [`HttpClientError::Transport { phase, source }`] carrying typed
+//! `CallError` reasons (`TlsName`, `TlsCertificate`, `TlsHandshake`,
+//! `TlsFull`, `TlsClosed`, `Timeout`, `Io`). Plain TCP keeps the flat
+//! `Connect`/`Read`/`Write`/`Closed`/`Timeout` variants.
 //!
-//! Tina owns the listener, every connection isolate, every read buffer,
-//! the parser invocation, every write, and the close path. No library
-//! owns the socket, blocks on `Read`/`Write`, spawns threads, or hides
-//! buffers.
+//! TLS state machine is `rustls`, driven by the runtime's
+//! single-worker TLS lane. First form does not target high HTTPS
+//! concurrency — see [`HttpsServerConfig`] for the lane-yield
+//! trade-off.
 //!
-//! Out of scope here: TLS and any production-performance claim.
+//! Out of scope: HTTP/2, ALPN, ACME, mTLS, SNI routing, system roots,
+//! certificate reload, redirects, cookies. For mature outbound
+//! web-client behaviour use the `tina-reqwest-bridge` crate.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod client;
 pub mod connection;
 pub mod listener;
+pub mod listener_tls;
 pub mod parse;
 pub mod pool;
 pub mod request_builder;
 pub mod router;
 pub mod streaming;
+pub mod target;
+pub mod transport;
 pub mod types;
 
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use listener::{HttpListener, HttpListenerMsg};
+pub use listener_tls::{
+    HttpsListener, HttpsListenerMsg, HttpsReady, HttpsServerConfig, HttpsStartupError,
+    TlsServerIdentity,
+};
 pub use parse::{
     HttpResponseHead, ParseProgress, ResponseParseProgress, encode_request, encode_response,
     parse_request_head, parse_response_head,
@@ -43,9 +58,12 @@ pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
 pub use streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
+pub use target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
+pub use transport::HttpTransport;
 pub use types::{
     HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody, HttpResponse,
-    HttpResponseBody, HttpServerConfig, PoolConfig, RequestParseError, ResponseParseError,
+    HttpResponseBody, HttpServerConfig, HttpTransportPhase, PoolConfig, RequestParseError,
+    ResponseParseError,
 };
 
 // Re-exports from the `http` crate for convenient `tina_http::Method`,

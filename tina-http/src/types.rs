@@ -570,8 +570,23 @@ impl Default for PoolConfig {
     }
 }
 
-/// Reasons an outbound HTTP call failed before producing a parsed
-/// [`HttpResponse`].
+/// Phase tag inside [`HttpClientError::Transport`]. `Bind` and
+/// `Accept` exist for symmetry; the client only ever emits
+/// `Connect`, `Read`, `Write`, `Close`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpTransportPhase {
+    Connect,
+    Bind,
+    Accept,
+    Read,
+    Write,
+    Close,
+}
+
+/// Outbound call failed before producing a parsed [`HttpResponse`].
+/// Plain HTTP keeps flat variants for source compat; HTTPS produces
+/// [`HttpClientError::Transport`] carrying the typed
+/// [`tina_runtime::CallError`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpClientError {
     /// `tcp_connect` failed before the request could be written.
@@ -592,4 +607,17 @@ pub enum HttpClientError {
     /// The pool's slot was busy when this Submit arrived. Direct (non-
     /// pooled) calls never produce this variant.
     PoolFull,
+    /// TLS lane call failed. `source` is the typed `CallError`
+    /// (`TlsName`, `TlsCertificate`, `TlsHandshake`, `TlsFull`,
+    /// `TlsClosed`, `Timeout`, `Io`, ...).
+    Transport {
+        phase: HttpTransportPhase,
+        source: tina_runtime::CallError,
+    },
+    /// Caller already set `Host:` on an HTTPS target — conflicts
+    /// with the [`crate::HttpHostPolicy`].
+    DuplicateHostHeader,
+    /// [`crate::HttpHostPolicy`] resolved to a string with bytes
+    /// that are not a valid `HeaderValue`.
+    InvalidHostHeaderValue,
 }

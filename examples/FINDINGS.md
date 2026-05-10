@@ -274,6 +274,42 @@ or a caller-asserted `M` (not honest under the LLM rule). Pick
 the typed-event vs. continuation form when the supervisor/spawn
 API gets revisited.
 
+### 16. Multi-worker TLS lane (or split accept/stream lanes)
+
+**Surfaced by:** `eiffel_native_https`, `tina-http/tests/client_tls_smoke.rs`.
+
+The runtime's TLS lane is one worker thread per shard. The worker
+processes one TLS op at a time: a `tls_accept` poll (busy-waiting
+on the listening socket plus driving the TLS handshake) blocks
+every other TLS op on that lane — `tls_read`, `tls_write`,
+`tls_close`, and any concurrent `tls_connect`. Two consequences
+visible from the example:
+
+- `HttpsListener` must use a *short* `tls_accept_timeout` (default
+  250ms) so the worker yields between accept polls and live
+  connections can drain. Each connection's per-op latency
+  effectively includes one accept-slice.
+- A Tina HTTPS server and a Tina HTTPS client cannot share a
+  runtime: both sides of one TLS handshake need the worker
+  concurrently and they deadlock. The example puts the
+  counterparty on a raw OS thread; the integration tests do the
+  same. Outbound HTTPS calls work, inbound HTTPS works, but they
+  must live in separate processes (or separate shards once shards
+  carry independent TLS lanes).
+
+**Build:** either a worker pool inside the existing TLS lane, or
+split accept/handshake from per-stream read/write/close so each
+lane has one worker (accept worker keeps poll-looping; stream
+workers move data). The choice determines how throughput scales
+and whether `tls_accept_timeout` can grow back to "wait
+indefinitely". Keep DER-only inputs, no system roots, no HTTP/2
+in scope.
+
+**Revisit when:** real users hit the same-process server+client
+constraint, or the example acquires a third role (proxy / mTLS).
+Until then, first-form HTTPS is honest about its single-lane
+bottleneck.
+
 ### 15. Deadline as first-class context
 
 **Surfaced by:** `eiffel_backpressure_chain`.
@@ -300,6 +336,24 @@ existing call APIs without adding hidden cancellation or retry.
 
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
+
+### 17. Host-thread `call_blocking` — Phase 068 follow-up
+
+Surfaced by `eiffel_native_https` and native HTTP/TLS tests.
+`ThreadedRuntime::call_blocking(addr, msg, timeout)` now performs
+the ordinary typed Tina call through a temporary driver isolate and
+returns `CallOutcome<R>` to the host thread. The HTTPS specimen and
+the direct TLS client/server tests use it; tests that intentionally
+need a concurrent in-flight call still keep an explicit driver.
+
+### 18. Trace query helpers — Phase 068 follow-up
+
+Surfaced by TLS regression tests that repeatedly scanned for
+`RuntimeEventKind::CallCompleted` / `CallFailed` by hand.
+`RuntimeTraceExt` now adds `count_completed`, `any_completed`,
+`count_failed`, `any_failed`, `count_failed_with`, and
+`count_completion_rejected` on trace slices. The helpers summarize
+existing trace facts only; they do not infer hidden causality.
 
 ### 1. `observe_result` on `ThreadedMultiShardRuntime` — Phase 062 Rock 1
 

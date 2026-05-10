@@ -18,3 +18,6 @@ http = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tina-sim = { path = "../tina-sim" }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+rcgen = "0.13"
