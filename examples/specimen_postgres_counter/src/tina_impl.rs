@@ -1,146 +1,21 @@
-//! Tina side. Driver isolate calls into a `tina-sqlx-bridge` worker
-//! that owns the `sqlx::PgPool`. Each SQL op goes through
-//! `tina_runtime::call(...)`; the shard thread never blocks on SQLx.
-//! Compare to `tokio_impl.rs` (`pool.execute(...)` directly): same
-//! Postgres pool underneath, but the Tina side names every pressure
-//! cap and surfaces typed failures.
+//! Tina side. The host thread calls into a `tina-sqlx-bridge` worker
+//! that owns the `sqlx::PgPool`. The shard thread never blocks on
+//! SQLx. Compare to `tokio_impl.rs` (`pool.execute(...)` directly):
+//! same Postgres pool underneath, but the Tina side names every
+//! pressure cap and surfaces typed failures.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
 use tina_sqlx_bridge::{
-    PgAddress, PgCloser, PgConfig, PgExecutedOutcome, PgFetchOneOutcome, PgPoolConfig, PgWorker,
-    execute_call, fetch_one_call,
+    PgConfig, PgMsg, PgPoolConfig, PgRequest, PgResponse, PgWorker,
 };
 
 use crate::{INCREMENTS, Report, unique_table};
 
-#[derive(Debug)]
-enum DriverMsg {
-    CreateTable,
-    Created(PgExecutedOutcome),
-    Seed,
-    Seeded(PgExecutedOutcome),
-    Step,
-    Stepped(PgExecutedOutcome),
-    Finalize,
-    Finalized(PgFetchOneOutcome),
-    Drop,
-    Dropped(#[allow(dead_code)] PgExecutedOutcome),
-}
-
-struct Driver {
-    db: PgAddress,
-    table: String,
-    remaining: u32,
-    timeout: Duration,
-    report: Report,
-    closer: PgCloser,
-}
-
-impl Driver {
-    fn create_sql(&self) -> String {
-        format!(
-            "CREATE TABLE {} (id INT8 PRIMARY KEY, value INT8 NOT NULL)",
-            self.table
-        )
-    }
-
-    fn seed_sql(&self) -> String {
-        format!("INSERT INTO {} (id, value) VALUES (0, 0)", self.table)
-    }
-
-    fn step_sql(&self) -> String {
-        format!("UPDATE {} SET value = value + 1 WHERE id = 0", self.table)
-    }
-
-    fn finalize_sql(&self) -> String {
-        format!("SELECT value FROM {} WHERE id = 0", self.table)
-    }
-
-    fn drop_sql(&self) -> String {
-        format!("DROP TABLE {}", self.table)
-    }
-
-    fn give_up(&self, ctx: &str, outcome: impl std::fmt::Debug) -> Effect<Self> {
-        eprintln!("specimen_postgres_counter (tina) {ctx}: unexpected outcome {outcome:?}");
-        self.closer.close();
-        stop_with(self.report)
-    }
-}
-
-impl Isolate for Driver {
-    tina::isolate_types! {
-        message: DriverMsg,
-        reply: Report,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
-        shard: SingleShard,
-    }
-
-    fn handle(
-        &mut self,
-        msg: DriverMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            DriverMsg::CreateTable => {
-                execute_call(self.db, self.create_sql(), vec![], self.timeout)
-                    .reply(DriverMsg::Created)
-            }
-            DriverMsg::Created(outcome) => match outcome {
-                CallOutcome::Replied(Ok(_)) => tina_runtime::sleep(Duration::from_millis(0))
-                    .reply(|_| DriverMsg::Seed),
-                other => self.give_up("create", other),
-            },
-            DriverMsg::Seed => execute_call(self.db, self.seed_sql(), vec![], self.timeout)
-                .reply(DriverMsg::Seeded),
-            DriverMsg::Seeded(outcome) => match outcome {
-                CallOutcome::Replied(Ok(_)) => tina_runtime::sleep(Duration::from_millis(0))
-                    .reply(|_| DriverMsg::Step),
-                other => self.give_up("seed", other),
-            },
-            DriverMsg::Step => execute_call(self.db, self.step_sql(), vec![], self.timeout)
-                .reply(DriverMsg::Stepped),
-            DriverMsg::Stepped(outcome) => match outcome {
-                CallOutcome::Replied(Ok(1)) => {
-                    self.remaining -= 1;
-                    let next = if self.remaining == 0 {
-                        DriverMsg::Finalize
-                    } else {
-                        DriverMsg::Step
-                    };
-                    tina_runtime::sleep(Duration::from_millis(0)).reply(move |_| next)
-                }
-                other => self.give_up("step", other),
-            },
-            DriverMsg::Finalize => {
-                fetch_one_call(self.db, self.finalize_sql(), vec![], self.timeout)
-                    .reply(DriverMsg::Finalized)
-            }
-            DriverMsg::Finalized(outcome) => match outcome {
-                CallOutcome::Replied(Ok(Some(row))) => {
-                    if let Some(v) = row.get_i64(0) {
-                        self.report.final_value = u64::try_from(v).unwrap_or(0);
-                        self.report.exit_clean = true;
-                    }
-                    tina_runtime::sleep(Duration::from_millis(0)).reply(|_| DriverMsg::Drop)
-                }
-                other => self.give_up("finalize", other),
-            },
-            DriverMsg::Drop => execute_call(self.db, self.drop_sql(), vec![], self.timeout)
-                .reply(DriverMsg::Dropped),
-            DriverMsg::Dropped(_) => {
-                self.closer.close();
-                stop_with(self.report)
-            }
-        }
-    }
-}
+const SQL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run(url: &str) -> anyhow::Result<Report> {
     let runtime = Arc::new(ThreadedRuntime::new(
@@ -160,29 +35,20 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
     let bridge = PgWorker::<SingleShard>::install(&runtime, cfg)
         .map_err(|e| anyhow::anyhow!("install pg bridge: {e}"))?;
 
-    let driver = Driver {
-        db: bridge.address,
-        table: unique_table("tina_counter"),
-        remaining: INCREMENTS,
-        timeout: Duration::from_secs(5),
-        report: Report::default(),
-        closer: bridge.closer.clone(),
-    };
-    let driver_addr = runtime
-        .register_with_capacity::<_, Infallible>(driver, 16)
-        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
-
-    let waiter = runtime
-        .observe_result::<Report, _, _>(driver_addr)
-        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
-
-    runtime
-        .try_send(driver_addr, DriverMsg::CreateTable)
-        .map_err(|e| anyhow::anyhow!("try_send CreateTable: {e:?}"))?;
-
-    let report = waiter
-        .wait(Duration::from_secs(60))
-        .map_err(|e| anyhow::anyhow!("driver did not finish: {e:?}"))?;
+    let table = unique_table("tina_counter");
+    let mut report = Report::default();
+    let run_result = run_counter_script(&runtime, bridge.address, &table);
+    match run_result {
+        Ok(final_value) => {
+            report.final_value = final_value;
+            report.exit_clean = true;
+        }
+        Err(error) => {
+            eprintln!("specimen_postgres_counter (tina): {error:#}");
+        }
+    }
+    let _ = execute(&runtime, bridge.address, drop_sql(&table));
+    bridge.closer.close();
 
     let snap = bridge.metrics.snapshot();
     eprintln!(
@@ -204,4 +70,64 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
         let _ = rt.shutdown();
     }
     Ok(report)
+}
+
+fn run_counter_script(
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    db: tina_sqlx_bridge::PgAddress,
+    table: &str,
+) -> anyhow::Result<u64> {
+    execute(runtime, db, create_sql(table))?;
+    execute(runtime, db, seed_sql(table))?;
+    for _ in 0..INCREMENTS {
+        let rows = execute(runtime, db, step_sql(table))?;
+        if rows != 1 {
+            anyhow::bail!("step affected {rows} rows, expected 1");
+        }
+    }
+
+    let outcome = runtime.call_blocking(
+        db,
+        PgMsg::Send(PgRequest::fetch_one(finalize_sql(table))),
+        SQL_TIMEOUT,
+    )?;
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => row
+            .get_i64(0)
+            .and_then(|v| u64::try_from(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("final query did not return one unsigned integer")),
+        other => anyhow::bail!("unexpected finalize outcome {other:?}"),
+    }
+}
+
+fn execute(
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    db: tina_sqlx_bridge::PgAddress,
+    sql: String,
+) -> anyhow::Result<u64> {
+    let outcome = runtime.call_blocking(db, PgMsg::Send(PgRequest::execute(sql)), SQL_TIMEOUT)?;
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected })) => Ok(rows_affected),
+        other => anyhow::bail!("unexpected execute outcome {other:?}"),
+    }
+}
+
+fn create_sql(table: &str) -> String {
+    format!("CREATE TABLE {table} (id INT8 PRIMARY KEY, value INT8 NOT NULL)")
+}
+
+fn seed_sql(table: &str) -> String {
+    format!("INSERT INTO {table} (id, value) VALUES (0, 0)")
+}
+
+fn step_sql(table: &str) -> String {
+    format!("UPDATE {table} SET value = value + 1 WHERE id = 0")
+}
+
+fn finalize_sql(table: &str) -> String {
+    format!("SELECT value FROM {table} WHERE id = 0")
+}
+
+fn drop_sql(table: &str) -> String {
+    format!("DROP TABLE {table}")
 }

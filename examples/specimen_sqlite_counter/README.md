@@ -71,10 +71,11 @@ sync calls. Pressure (how many blocking tasks are queued, how long
 each one waits) lives entirely inside Tokio's blocking pool defaults
 and is not nameable from the call site.
 
-## Tina shape: `tina-sqlite-bridge` install + typed `execute_call`
+## Tina shape: `tina-sqlite-bridge` install + host `call_blocking`
 
 ```rust
-use tina_sqlite_bridge::{execute_call, query_call, SqliteConfig, SqliteWorker};
+use tina_runtime::CallOutcome;
+use tina_sqlite_bridge::{SqliteConfig, SqliteMsg, SqliteRequest, SqliteResponse, SqliteWorker};
 
 let cfg = SqliteConfig::path(&path)
     .with_default_timeout(Duration::from_secs(5))
@@ -83,22 +84,25 @@ let cfg = SqliteConfig::path(&path)
     .with_poll_interval(Duration::from_millis(1));
 let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg)?;
 
-// In the driver isolate — typed helper. The reply is
-// CallOutcome<Result<u64, SqliteError>>; no SqliteResponse enum to
-// peel.
-execute_call(
+// From the host thread. Service isolates should still use
+// execute_call(...).reply(...) when they want a continuation message.
+let outcome = runtime.call_blocking(
     bridge.address,
-    "UPDATE counter SET value = value + 1 WHERE id = 0",
-    vec![],
+    SqliteMsg::Request(SqliteRequest::execute(
+        "UPDATE counter SET value = value + 1 WHERE id = 0",
+    )),
     Duration::from_secs(5),
-)
-.reply(DriverMsg::Stepped)
+)?;
+assert!(matches!(
+    outcome,
+    CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 1 }))
+));
 ```
 
-The raw `send_request(addr, SqliteRequest::Execute { ... }, timeout)`
-path is still available as the full-truth escape hatch — use it when
-you want to see the response enum at the call site or when one helper
-must accept either request shape.
+The service-isolate helpers `execute_call(...)` and `query_call(...)`
+are still the copied path when you are already inside `handle()` and
+want to continue through `.reply(...)`. The host-side specimen uses
+`call_blocking` because it is a script, not a long-lived app isolate.
 
 Under the hood the bridge owns one std-thread blocking worker that
 holds the `rusqlite::Connection`. The Tina shard thread submits
