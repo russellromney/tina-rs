@@ -1,0 +1,38 @@
+[package]
+name = "tina-sqlx-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded Postgres worker around SQLx, for Tina services"
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina = { path = "../tina" }
+tina-runtime = { path = "../tina-runtime" }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+] }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+# Optional tracing emission. Enables per-call events under
+# `tina_sqlx.bridge.call` (`admission_rejected`, `admitted`, `replied`,
+# `timeout`) and lifecycle events under `tina_sqlx.bridge` (`close`).
+# Field/level/reason vocabulary mirrors the reqwest/sqlite bridges.
+tracing = { version = "0.1", default-features = false, features = [
+    "std",
+    "attributes",
+], optional = true }
+
+[features]
+default = []
+tracing = ["dep:tracing"]
