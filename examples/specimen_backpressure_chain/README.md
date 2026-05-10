@@ -47,17 +47,20 @@ you nothing more than "the chain timed out."
 
 Three first-class isolates: `ServiceA`, `ServiceB`, `ServiceC`. Each
 is a service in the chapter-10 sense (request → maybe runtime calls
-→ reply). The deadline is propagated as a typed `Duration` in the
-request message and as the matching `IsolateCall` timeout:
+→ reply). The deadline is a typed `Deadline` value anchored at A's
+`Context::now()`; downstream hops read the remaining budget against
+their own `now`:
 
 ```rust
 // A → B
-call(self.b_addr, BMsg::Forward { iteration, budget: self.deadline },
-     self.deadline + Duration::from_millis(50))   // outer slack
+let deadline = ctx.deadline_after(self.budget);
+call(self.b_addr, BMsg::Forward { iteration, deadline },
+     self.budget + Duration::from_millis(50))     // outer slack
     .reply(AMsg::BDone)
 
-// B → C, with the budget B received from A
-call(self.c_addr, CMsg::Compute { iteration }, budget)
+// B → C, with whatever budget remains at B's now
+let timeout = deadline.remaining_or_zero(ctx.now());
+call(self.c_addr, CMsg::Compute { iteration }, timeout)
     .reply(BMsg::CDone)
 ```
 
@@ -81,11 +84,17 @@ What feels better:
   the hop. A debugger reading the trace sees one
   `CallOutcome::Timeout` event at exactly the call that ran past
   budget, not a chain of dropped futures with no provenance.
-- **Deadline is a real value in the message.** The `budget: Duration`
-  in `BMsg::Forward` is not magic. A future B could observe its own
-  arrival time and shrink the budget further before passing it to C
-  — exactly the deadline-propagation contract that distributed
-  systems books spend chapters on.
+- **Deadline is a real value in the message.** `Deadline` carries
+  the absolute monotonic time the budget runs out. Each hop reads
+  `remaining_or_zero(ctx.now())` against its own runtime/sim-stamped
+  `now`, so the budget shrinks honestly across hops — the
+  deadline-propagation contract that distributed systems books spend
+  chapters on, made concrete in 25 lines of Tina.
+- **Runtime/sim honest.** `Deadline` does not call `Instant::now()`
+  internally. It carries an `Instant` the runtime stamped via
+  `Context::now()`; the simulator stamps the same field from its
+  virtual clock anchor, so DST/replay tests see deterministic
+  deadline math.
 - **The reply translator is tiny.** B's `match outcome { Replied(())
   => reply(Ok), Timeout => reply(CTimedOut), Full | Closed =>
   reply(Error) }` is the entire propagation layer. No second tower
@@ -98,29 +107,33 @@ What feels worse:
   `CallOutcome::Timeout` at the same wall-clock instant as B's call
   to C, and A loses the per-hop attribution. The specimen adds 50 ms
   of slack at A's outer call. In a real chain with N hops, the
-  outermost call ends up with N × slack budget — and there's no
-  helper that names "outer = innermost + slack" pattern. Roll-your-
-  own arithmetic at every hop.
-- **No deadline as ambient context.** Each call passes the
-  `Duration` explicitly. There is no `ctx.deadline()` API; if a hop
-  forgets to forward `budget`, the chain silently uses the default
-  (often `forever`). Compare to `context.Context` in Go or
-  `tower::Service` request extensions in Rust — both ship a
-  conventional spot for the deadline.
+  outermost call ends up with N × slack budget — there is no helper
+  that names the "outer = innermost + slack" pattern, and Tina is
+  not going to ship one: each call's timeout is its own typed
+  truth.
+- **`Deadline` does not retry, does not extend, does not cancel
+  work.** It is a budget value. If the budget is gone, you stop
+  waiting; whatever already-accepted external work was started runs
+  to completion (or its own bridge timeout). Cancellation is its own
+  primitive — see `specimen_cancellation_chain`.
 - **Three isolates feel like overkill for a three-hop demo.** Each
   hop is its own struct with its own `enum`, its own `Reply`, and
   its own `RuntimeCall` continuation. For a real production service
-  this is appropriate — but the ratio of "boilerplate per hop" is
-  high enough that a `tina_rpc` wrapper or a derive-based helper
-  would shrink it significantly.
+  this is appropriate — the ratio of "boilerplate per hop" is high
+  but each suspension point and each `Full` / `Closed` / `Timeout`
+  edge stays named.
 
-## What this suggests
+## What changed in 072
 
-- A small "deadline" type that carries `(start: Instant, total:
-  Duration)` and computes `remaining()` would replace the explicit
-  `Duration` budget and the +50ms slack pattern. A future Tina
-  primitive `propagate_deadline(target, msg, deadline)` could
-  compute `remaining()` and pass it through to the underlying
-  `call(...)`.
-- See FINDINGS finding 15 (deadline as first-class context) for
-  the proposed `Deadline` value type.
+The 067 form of this specimen passed `budget: Duration` through the
+chain. The budget was the *original* budget at every hop: B's call
+to C used the full `TOTAL_DEADLINE` even though A's hop had already
+consumed some of it. This worked because the work happens to be
+short, but it is not honest.
+
+The 072 form propagates a `Deadline` instead. Each hop reads
+`deadline.remaining_or_zero(ctx.now())` against its own
+runtime/sim-stamped `now`, so the budget actually shrinks across
+hops. The same shape works under live and simulator runtimes —
+`Context::now()` returns the simulator's virtual time when run
+under DST.

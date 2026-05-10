@@ -89,6 +89,8 @@ Map:
 | socket read/write | runtime call effect |
 | `sleep().await` | `sleep(...).reply(...)` |
 | request then await answer | `call(..., timeout).reply(...)` |
+| `tokio::time::timeout` budget through a chain | `Deadline` value, `ctx.deadline_after(d)` |
+| `JoinSet::abort_all` | `PendingCallSet` + drain + `cancel_call` per handle |
 
 ## What To Check Before Done
 

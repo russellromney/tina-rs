@@ -109,6 +109,35 @@ remains:
 - not-closed systems
 - runtime errors
 
+The deadline itself is a [`Deadline`] value (see
+[ergonomics-checklist § Deadlines](11-ergonomics-checklist.md#deadlines)).
+Build it from `ctx.deadline_after(budget)` and pass
+`deadline.remaining_or_zero(ctx.now())` to each downstream call so the
+shutdown budget shrinks honestly across hops. Cancellation is its own
+primitive — see "Cancellation" below.
+
+## Cancellation
+
+Cancellation closes a *wait*, not the *work*. `cancel_call(handle)`
+reclaims caller-side capacity and reports `CallCancelled { cause }` in
+the trace; if the callee already accepted the work, it may still finish
+and its late reply becomes a typed `CallReplyRejected` event. There is
+no "kill this worker."
+
+Owners that hold many in-flight calls should store the handles in a
+bounded `PendingCallSet<K, R>` keyed by request id. The set rejects
+duplicate keys loudly (it deliberately does **not** auto-sweep
+settled handles, to avoid an ABA bug when a stale `Returned`
+continuation can still fire); `sweep_terminal()` is the explicit
+opt-in for foreground reclaim at known-safe points. See
+[ergonomics-checklist § Bounded pending call handles](11-ergonomics-checklist.md#bounded-pending-call-handles)
+for the shape.
+
+Owner-stop already cancels every caller-owned pending call with cause
+`OwnerStopped`; an explicit `drain` + `cancel_call` per entry is the
+right shape when the owner needs the cancels acked back through its own
+mailbox before stopping.
+
 ## What To Test
 
 For any service with real I/O, test:
