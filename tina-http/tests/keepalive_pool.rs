@@ -787,7 +787,7 @@ fn different_origin_pools_do_not_share_connections() {
     let (driver_a, _, rx_a) = rig.driver(&pool_a);
     let (driver_b, _, rx_b) = rig.driver(&pool_b);
 
-    for &(driver, ref rx) in &[(driver_a, &rx_a), (driver_b, &rx_b)] {
+    for &(driver, rx) in &[(driver_a, &rx_a), (driver_b, &rx_b)] {
         for id in 0..2 {
             let _ = rig.rt().try_send(
                 driver,
