@@ -2,46 +2,64 @@
 
 ![tina-rs hero](tina.png)
 
-Tina is a Rust framework for writing concurrent services as small synchronous
-state machines. Each isolate owns its state, processes one message at a time,
-and returns an `Effect`. The runtime owns scheduling, time, I/O, supervision,
-and replay.
+Tina is a Rust concurrency framework for services built from isolated state
+machines: each one owns its state, communicates through bounded queues, and
+asks the runtime to perform side effects.
 
-Tina is not an async I/O runtime like Tokio or monoio. It is the concurrency
-model above the runtime substrate. Today `tina-runtime` runs on an explicit-step
-oracle and a threaded runtime backed by
-[Pekka Enberg's Betelgeuse](https://github.com/penberg/betelgeuse); future
-backends (`io_uring`, monoio, glommio) can ride underneath if they preserve
-the contract.
+In Tokio, the main unit of concurrency is a `Future`: a function-shaped state
+machine that yields at `.await` points. That works well for many I/O-heavy
+programs, but it makes several production concerns indirect: where work is
+queued, which state may move between threads, which operations are bounded,
+what happens after timeout, and how to replay an interleaving.
 
-It is an independent Rust implementation inspired by
-[Peter Mbanugo's Tina](https://github.com/pmbanugo/tina) and by thread-per-core
-systems like [Seastar](https://seastar.io/). The motivation comes from
-Mbanugo's article
+Tina makes those concerns part of the program model.
+
+The main unit is an isolate: a shard-local state machine with private state.
+An isolate handles one message synchronously and returns an `Effect`. Effects
+are data: send a message, reply to a caller, sleep, read from a socket, write
+to a journal, spawn a child, stop. The runtime interprets effects, owns I/O
+and time, and resumes isolates by delivering continuation messages.
+
+The project includes its own runtimes: `tina-runtime` for live execution and
+`tina-sim` for deterministic simulation.
+
+This means Tina is a runtime, but not an async/await runtime. It is closer to
+a bounded actor/runtime system with thread-per-core scheduling and
+deterministic simulation as first-class constraints.
+
+`tina-rs` is an independent Rust implementation inspired by
+[Peter Mbanugo's Tina](https://github.com/pmbanugo/tina), a thread-per-core
+concurrency framework in Odin, and by his article
 [The Tokio/Rayon Trap and Why Async/Await Fails Concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency).
+The design also rhymes with Erlang/OTP supervision, Seastar-style shard-local
+execution, and TigerBeetle-style deterministic testing: keep state owned,
+queues bounded, and execution replayable.
 
-> Tina is very experimental and in active development. The model is stable
-> enough to write services against; the public API surface is not.
+> Tina is experimental and in active development. The model is now strong
+> enough to write specimen services against; the public API is still moving.
 
-Tina provides:
+Tina is aimed at services where these properties matter more than linear
+`async fn` syntax:
 
-* **Isolate-per-entity state machines.** Connections, sessions, workers, or
-  protocol roles each get a typed state machine that owns its data. No
-  `Arc<Mutex<_>>`.
-* **Synchronous handlers returning `Effect`.** Handlers don't `await`. They
-  return one of: `send`, `reply`, `stop`, `spawn`, `batch`, or a runtime call
-  like `sleep`, `tcp_read`, `tcp_write`, `snapshot_commit`, or `journal_append`.
-* **Bounded mailboxes.** Every queue has a capacity. `Full`, `Closed`, and
-  `Timeout` are normal outcomes, not exceptions.
+* **Shard-local ownership.** Connections, sessions, workers, or protocol
+  roles each get a typed state machine that owns its data. Shared state is
+  possible, but it is not the default shape.
+* **Synchronous handlers returning `Effect`.** Handlers do not `await`. They
+  return one runtime-interpreted effect: `send`, `reply`, `stop`, `spawn`,
+  `batch`, or a runtime call like `sleep`, `tcp_read`, `tcp_write`,
+  `snapshot_commit`, or `journal_append`.
+* **Bounded mailboxes and visible overload.** Every important queue has a
+  capacity. `Full`, `Closed`, and `Timeout` are normal outcomes, not
+  exceptions.
 * **Runtime-owned I/O.** TCP, UDP, DNS, TLS, file I/O, snapshot/journal
   persistence, signals, and process execution flow through typed runtime
   calls. Continuations come back as ordinary messages.
-* **Supervision with restart budgets.** Parent isolates restart children
-  under `OneForOne`, `OneForAll`, or `RestForOne` policy with a finite
-  budget. Restart events are typed entries in the runtime trace.
+* **Visible cancellation, supervision, and shutdown.** Parent isolates can
+  restart children under bounded policy. Calls time out. Late replies,
+  cancellations, and terminal shutdown facts are recorded in the runtime trace.
 * **Deterministic simulation.** The same isolate code runs under the live
   `ThreadedRuntime` and under `tina-sim` with virtual time, seeded faults,
-  and replay. Same seed, same config, same failure.
+  saved replay cases, and shrinking. Same seed, same config, same failure.
 
 ## A TCP echo connection
 
@@ -102,10 +120,12 @@ tokio::spawn(async move {
 });
 ```
 
-Tokio suspends the function across each `.await`. Tina returns to the
-runtime between effects. Both are correct; the difference is whether
-suspension points are syntactic (`.await`) or structural (one match arm
-per resumption).
+Tokio hides the state machine behind a future. Tina asks you to write the
+state machine directly.
+
+That is more verbose for linear request code. It is easier to inspect when
+the service has fanout, backpressure, retries, shutdown, supervision, or
+state that must stay on one shard.
 
 The full echo server, including the listener that spawns one connection
 isolate per accepted socket, lives in
