@@ -30,48 +30,31 @@ use crate::types::{
 /// Bytes the client asks for per `tcp_read`. Matches the server side.
 const READ_CHUNK: usize = 4096;
 
-/// One outbound HTTP/1.1 call: which target to connect to and what
-/// request to send.
+/// One outbound HTTP/1.1 call. The encoder adds `Content-Length` and
+/// `Connection: close`. For HTTPS, the `Host:` header comes from the
+/// target's [`HttpHostPolicy`]; supplying one yourself returns
+/// [`HttpClientError::DuplicateHostHeader`].
 #[derive(Debug, Clone)]
 pub struct OutboundCall {
-    /// Where (and how) to send the request. Plain TCP or native HTTPS.
     pub target: HttpTarget,
-    /// Request to write on the wire. The encoder fills in
-    /// `Content-Length` and `Connection: close` automatically. For
-    /// HTTPS, the `Host:` header is auto-populated from the target's
-    /// [`HttpHostPolicy`] unless one was supplied explicitly (in
-    /// which case [`HttpClientError::DuplicateHostHeader`] surfaces).
     pub request: HttpRequest,
 }
 
-/// Messages handled by [`HttpClient`].
-///
-/// `Call` is the user-callable variant. The rest are internal
-/// continuations produced by the client's own runtime calls; user code
-/// never constructs them directly.
+/// `Call` is user-callable; the rest are continuations from the
+/// client's own runtime calls.
 #[derive(Debug, Clone)]
 pub enum HttpClientMsg {
-    /// Run this outbound call.
     Call(OutboundCall),
-    /// `tcp_connect` reply.
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    /// `tls_connect` reply.
     TlsConnected(Result<TlsStreamId, CallError>),
-    /// `tcp_write` / `tls_write` reply.
     Wrote(Result<usize, CallError>),
-    /// `tcp_read` / `tls_read` reply.
     Read(Result<Vec<u8>, CallError>),
-    /// `tcp_close_stream` / `tls_close` reply.
     Closed(Result<(), CallError>),
-    /// Per-call deadline timer fired.
     Deadline(Result<(), CallError>),
 }
 
 impl HttpClientMsg {
-    /// Builds a `Call` variant from the constituent parts. Accepts
-    /// any value that converts into [`HttpTarget`] — a bare
-    /// `SocketAddr` is interpreted as plain HTTP for backward
-    /// compatibility.
+    /// A bare `SocketAddr` is interpreted as plain HTTP.
     pub fn call(target: impl Into<HttpTarget>, request: HttpRequest) -> Self {
         Self::Call(OutboundCall {
             target: target.into(),
@@ -139,8 +122,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
             HttpClientMsg::Connected(Ok((stream, _local, _peer))) => {
                 let transport = HttpTransport::Tcp(stream);
                 let Some(state) = self.state.as_mut() else {
-                    // Stale: previous call already ended. Close the
-                    // dangling stream so the kernel does not leak.
+                    // Previous call already ended; close the dangling stream.
                     return transport
                         .close_call(self.config.request_timeout)
                         .reply(HttpClientMsg::Closed);
@@ -200,8 +182,6 @@ impl<S: Shard + 'static> HttpClient<S> {
             return reply(Err(HttpClientError::Busy));
         }
         let OutboundCall { target, request } = call;
-        // Apply the Host policy *before* encoding so the wire bytes
-        // already carry the right `Host:` value.
         let request = match apply_host_policy(request, &target) {
             Ok(request) => request,
             Err(error) => return reply(Err(error)),
@@ -235,10 +215,8 @@ impl<S: Shard + 'static> HttpClient<S> {
         batch(vec![connect_effect, deadline_effect])
     }
 
-    /// If the active call is on a TLS transport, surface the typed
-    /// `Transport` variant carrying the runtime error and phase. If
-    /// the active call is on TCP (or there is no active state), keep
-    /// the older flat variant for source compat.
+    /// TLS transport produces a typed `Transport` error; TCP keeps
+    /// the flat variant for source compat.
     fn transport_or_flat_error(
         &self,
         phase: HttpTransportPhase,
@@ -362,13 +340,9 @@ fn body_complete(state: &ActiveCall) -> bool {
     state.read_buf.len() >= needed
 }
 
-/// Resolves the `Host:` header on an outbound request from the
-/// target's [`HttpHostPolicy`]. Plain HTTP keeps whatever the caller
-/// supplied (HTTP/1.1 requires the caller to set Host explicitly for
-/// TCP targets; the encoder does not synthesize one). HTTPS targets
-/// auto-populate Host from the policy unless the caller already set
-/// one — in which case [`HttpClientError::DuplicateHostHeader`]
-/// surfaces so the conflict is visible.
+/// HTTPS targets auto-populate `Host:` from the policy. Plain HTTP
+/// keeps caller-supplied Host as-is; the encoder doesn't synthesise
+/// one. Caller-supplied Host on HTTPS conflicts with the policy.
 fn apply_host_policy(
     mut request: HttpRequest,
     target: &HttpTarget,
@@ -387,7 +361,7 @@ fn apply_host_policy(
         return Err(HttpClientError::DuplicateHostHeader);
     }
     let value = HeaderValue::from_str(policy_value)
-        .map_err(|_| HttpClientError::DuplicateHostHeader)?;
+        .map_err(|_| HttpClientError::InvalidHostHeaderValue)?;
     request.headers.insert(HOST, value);
     Ok(request)
 }

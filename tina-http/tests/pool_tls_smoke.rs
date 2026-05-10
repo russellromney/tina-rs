@@ -1,12 +1,6 @@
-//! Pool-over-HTTPS proof.
-//!
-//! The HTTPS connection pool is the same `HttpConnectionPool` used by
-//! plain HTTP — it admission-controls a single slot in front of one
-//! `HttpClient`. The pool does not key on target shape; HTTPS targets
-//! flow through unchanged. This test proves one HTTPS Submit succeeds
-//! through the pool. The HTTP-side `pool_smoke.rs` already proves
-//! `PoolFull` when the slot is busy — that semantics is identical for
-//! HTTPS because the pool layer never inspects the target.
+//! Pool over HTTPS. `HttpConnectionPool` is target-agnostic — same
+//! capacity-1 admission gate, just an HTTPS target on the wire.
+//! Covers happy-path admission + `PoolFull` when the slot is busy.
 
 use std::convert::Infallible;
 use std::io::{Read, Write};
@@ -19,7 +13,7 @@ use std::time::Duration;
 use http::{HeaderMap, Method, StatusCode, Version};
 use tina::prelude::*;
 use tina_http::{
-    HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpConnectionPool, HttpPoolMsg,
+    HttpClient, HttpClientConfig, HttpClientError, HttpConnectionPool, HttpPoolMsg,
     HttpRequest, HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, OutboundCall,
     PoolConfig, TlsTrustRoots,
 };
@@ -79,7 +73,7 @@ fn spawn_one_shot_https_server(server_config: rustls::ServerConfig) -> SocketAdd
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.write_all(body);
         let _ = stream.flush();
-        let _ = stream.conn.send_close_notify();
+        stream.conn.send_close_notify();
         let _ = stream.flush();
     });
     addr
@@ -132,6 +126,127 @@ impl Isolate for Driver {
             }
         }
     }
+}
+
+/// HTTPS server that handshakes, then holds the stream silent so the
+/// in-flight Submit ties up the pool slot until its deadline.
+fn spawn_black_hole_https_server(server_config: rustls::ServerConfig) -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        let (tcp, _) = match listener.accept() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let connection = match rustls::ServerConnection::new(Arc::new(server_config)) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        // Drive handshake so client's `tls_connect` returns, then
+        // sleep silent so the in-flight Submit holds the slot.
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        while stream.conn.is_handshaking() {
+            if stream.conn.complete_io(&mut stream.sock).is_err() {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_secs(5));
+        drop(stream);
+    });
+    addr
+}
+
+#[test]
+fn pool_refuses_with_full_when_https_slot_busy() {
+    // Submit_A holds the slot via a black-hole server; Submit_B must
+    // get `PoolFull` while in-flight. Same shape as the TCP test.
+    let (cert_der, server_config) = build_cert_bundle();
+    let slow_addr = spawn_black_hole_https_server(server_config);
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<HttpClient<TestShard>, Infallible>(
+            HttpClient::<TestShard>::new(HttpClientConfig::dev()),
+            16,
+        )
+        .expect("register client");
+    let pool = runtime
+        .register_with_capacity::<HttpConnectionPool<TestShard>, _>(
+            HttpConnectionPool::<TestShard>::new(PoolConfig::dev(), client),
+            16,
+        )
+        .expect("register pool");
+
+    let target = HttpTarget::https(
+        slow_addr,
+        "localhost",
+        TlsTrustRoots::from_der(vec![cert_der]),
+    );
+    let request = HttpRequest {
+        method: Method::GET,
+        path: "/".to_string(),
+        version: Version::HTTP_11,
+        headers: HeaderMap::new(),
+        body: HttpRequestBody::default(),
+    };
+
+    let (tx_a, _rx_a) = mpsc::channel();
+    let driver_a = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_a }, 8)
+        .expect("register driver A");
+    runtime
+        .try_send(
+            driver_a,
+            DriverMsg::Begin {
+                pool,
+                outbound: OutboundCall {
+                    target: target.clone(),
+                    request: request.clone(),
+                },
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .expect("send Begin A");
+
+    // Let Submit_A reach the pool and set in_flight.
+    thread::sleep(Duration::from_millis(150));
+
+    let (tx_b, rx_b) = mpsc::channel();
+    let driver_b = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_b }, 8)
+        .expect("register driver B");
+    runtime
+        .try_send(
+            driver_b,
+            DriverMsg::Begin {
+                pool,
+                outbound: OutboundCall {
+                    target,
+                    request,
+                },
+                timeout: Duration::from_secs(2),
+            },
+        )
+        .expect("send Begin B");
+
+    let result_b = rx_b
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Submit_B reply");
+    assert!(
+        matches!(result_b, Err(HttpClientError::PoolFull)),
+        "expected PoolFull while HTTPS slot is busy, got {result_b:?}"
+    );
+
+    let _ = runtime.shutdown();
 }
 
 #[test]

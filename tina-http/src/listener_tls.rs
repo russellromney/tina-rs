@@ -1,23 +1,9 @@
-//! Listener isolate for the native HTTPS/1.1 server.
-//!
-//! [`HttpsListener`] is the TLS analogue of [`crate::HttpListener`]. It
-//! binds a TLS listener (cert chain + private key, DER-encoded), accepts
-//! TLS streams, and spawns one [`crate::HttpConnection`] per accepted
-//! TLS stream (with [`crate::HttpTransport::Tls`] as the transport).
-//!
-//! Startup is **call-shaped**: the user issues
-//! `call(listener, HttpsListenerMsg::Start, deadline)` and receives
-//! `Ok(HttpsReady { local_addr })` once the bind completes, or
-//! `Err(HttpsStartupError::Bind { source })` if `tls_bind` failed. No
-//! child connection isolate is spawned on bind failure; the runtime
-//! does not park a TLS listener resource.
-//!
-//! After `Ready`, the accept loop is the same shape as the plain TCP
-//! listener: one accept call in flight, spawn a connection on success,
-//! re-accept; orphan-close on accept-after-stop.
-//!
-//! Cert/key inputs are **explicit DER**. There are no PEM defaults and
-//! no system roots. PEM helpers, where added, live in test code only.
+//! HTTPS/1.1 listener over the runtime TLS lane. Startup is
+//! call-shaped: `call(listener, Start, t)` returns
+//! `Result<HttpsReady, HttpsStartupError>`. After `Ready`, the
+//! accept loop spawns one [`crate::HttpConnection`] per accepted TLS
+//! stream. Cert/key inputs are explicit DER — no PEM defaults, no
+//! system roots.
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -32,24 +18,15 @@ use crate::connection::{HttpConnection, HttpConnectionMsg};
 use crate::transport::HttpTransport;
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
 
-/// DER-encoded TLS server identity. The runtime hands these to
-/// `rustls::ServerConfig::with_single_cert`. Inputs are explicit:
-/// the caller supplies a certificate chain (leaf first, then any
-/// intermediates) and a PKCS#8 private key.
+/// DER cert chain (leaf first) + PKCS#8 private key. Fed to
+/// `rustls::ServerConfig::with_single_cert`.
 #[derive(Debug, Clone)]
 pub struct TlsServerIdentity {
-    /// DER-encoded certificate chain. The leaf certificate is first,
-    /// followed by any intermediates the server should present. The
-    /// root is not included.
     pub certificate_chain_der: Vec<Vec<u8>>,
-    /// DER-encoded PKCS#8 private key matching the leaf certificate.
     pub private_key_der: Vec<u8>,
 }
 
 impl TlsServerIdentity {
-    /// Builds a `TlsServerIdentity` from DER bytes. Convenience over
-    /// the public fields so call sites read `from_der(...)` rather
-    /// than spelling the struct out.
     pub fn from_der(certificate_chain: Vec<Vec<u8>>, private_key: Vec<u8>) -> Self {
         Self {
             certificate_chain_der: certificate_chain,
@@ -58,46 +35,24 @@ impl TlsServerIdentity {
     }
 }
 
-/// Server-side knobs for a native HTTPS listener.
+/// HTTPS listener config. Two distinct TLS deadlines because the
+/// runtime's TLS lane has one worker thread per shard: a long
+/// in-flight `tls_accept` blocks live connections' reads/writes.
 ///
-/// Composes [`HttpServerConfig`] with a [`TlsServerIdentity`] and two
-/// distinct TLS lane deadlines:
-///
-/// - `tls_accept_timeout` is the per-call deadline on `tls_accept`. The
-///   runtime's TLS lane is single-threaded, so an in-flight `tls_accept`
-///   (which busy-polls for a new connection plus drives the TLS
-///   handshake) blocks every other TLS op on that lane — including a
-///   live connection's `tls_read`/`tls_write`. A short
-///   `tls_accept_timeout` (e.g. 250ms) makes the listener re-issue
-///   `tls_accept` every quarter-second, freeing the worker between
-///   polls so connection reads/writes can drain. The listener treats
-///   `Timeout` on accept as "no connection in this slice; re-poll".
-/// - `tls_io_timeout` is the per-call deadline on `tls_read`,
-///   `tls_write`, and `tls_close` for an accepted connection. It
-///   bounds how long a single lane operation may stall.
-///
-/// First form is **not** designed for high HTTPS concurrency: the
-/// runtime serialises every TLS op (accept, handshake, read, write,
-/// close) onto one worker thread, so observed throughput is one TLS
-/// op at a time. Each connection's per-op latency includes any
-/// in-flight `tls_accept` slice. Production HTTPS performance is
-/// explicitly out of scope.
+/// `tls_accept_timeout` is short (default 250ms) so the listener
+/// re-polls and the worker yields between accepts. `tls_io_timeout`
+/// bounds individual `tls_read`/`tls_write`/`tls_close` ops. First
+/// form is not designed for high HTTPS concurrency.
 #[derive(Debug, Clone)]
 pub struct HttpsServerConfig {
-    /// Plain-HTTP knobs (limits, service-call timeout, mailbox sizes).
     pub http: HttpServerConfig,
-    /// DER cert chain + private key.
     pub identity: TlsServerIdentity,
-    /// Per-call deadline on `tls_accept`. Short on purpose; see struct
-    /// docs.
     pub tls_accept_timeout: Duration,
-    /// Per-call deadline on `tls_read`, `tls_write`, `tls_close`.
     pub tls_io_timeout: Duration,
 }
 
 impl HttpsServerConfig {
-    /// Builds a config from an identity with development-preset HTTP
-    /// knobs, a 250ms accept timeout, and a 30s I/O timeout.
+    /// Dev preset: 250ms accept, 30s I/O.
     pub fn dev(identity: TlsServerIdentity) -> Self {
         Self {
             http: HttpServerConfig::dev(),
@@ -107,8 +62,7 @@ impl HttpsServerConfig {
         }
     }
 
-    /// Builds a config with pressure-preset HTTP knobs, a 100ms
-    /// accept timeout, and a 1s I/O timeout.
+    /// Pressure preset: 100ms accept, 1s I/O.
     pub fn pressure(identity: TlsServerIdentity) -> Self {
         Self {
             http: HttpServerConfig::pressure(),
@@ -119,46 +73,34 @@ impl HttpsServerConfig {
     }
 }
 
-/// Reply variant: HTTPS listener is bound and accepting TLS streams.
+/// HTTPS listener is bound. `local_addr` carries the kernel-assigned
+/// port when the caller bound `:0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpsReady {
-    /// Actual bound socket address (with the kernel-assigned port if
-    /// the caller bound `:0`).
     pub local_addr: SocketAddr,
 }
 
-/// Reply variant: HTTPS listener could not start. The listener isolate
-/// stops without spawning any child or holding a TLS resource.
+/// HTTPS listener could not start. No child spawned, no TLS resource
+/// held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpsStartupError {
-    /// `tls_bind` failed. `source` carries the typed runtime error
-    /// (`TlsCertificate` for invalid cert/key, `Io` for socket
-    /// problems, `TlsFull` for lane overload, etc.).
+    /// `tls_bind` failed. `source` is the typed runtime error
+    /// (`TlsCertificate`, `Io`, `TlsFull`, ...).
     Bind { source: CallError },
 }
 
-/// Inbound message variants for [`HttpsListener`].
-///
-/// Only `Start` and `Stop` are sent by user code. The rest are runtime
-/// continuations produced by the listener's own `tls_*` calls.
+/// User code sends `Start` and `Stop`; the rest are continuations
+/// from the listener's own `tls_*` calls.
 #[derive(Debug, Clone)]
 pub enum HttpsListenerMsg {
-    /// Kick off the bind. Sent once by the host via
-    /// `call(listener, Start, deadline).reply(...)`. The reply lands
-    /// when bind either succeeds (`Ok(HttpsReady)`) or fails
-    /// (`Err(HttpsStartupError::Bind)`).
     Start,
-    /// `tls_bind` reply.
     Bound(Result<(TlsListenerId, SocketAddr), CallError>),
-    /// `tls_accept` reply.
     Accepted(Result<(TlsStreamId, SocketAddr), CallError>),
-    /// Request to stop accepting and close the listener. Already-spawned
-    /// connection isolates run to completion through normal cleanup.
+    /// Stop accepting and close the listener. Spawned connections
+    /// drain on their own.
     Stop,
-    /// `tls_close_listener` reply.
     ListenerClosed(Result<(), CallError>),
-    /// `tls_close` reply for an orphan stream the listener decided to
-    /// drop (kernel-already-accepted connection arriving after `Stop`).
+    /// `tls_close` reply for an orphan stream accepted after `Stop`.
     StreamClosed(Result<(), CallError>),
 }
 
@@ -235,19 +177,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     .reply(HttpsListenerMsg::Accepted);
                 batch(vec![ready_effect, accept_effect])
             }
-            HttpsListenerMsg::Bound(Err(source)) => {
-                // Reply Err and stop. No child has been spawned, no
-                // TlsListenerId is held — nothing to clean up.
-                batch(vec![
-                    reply(Err(HttpsStartupError::Bind { source })),
-                    stop(),
-                ])
-            }
+            HttpsListenerMsg::Bound(Err(source)) => batch(vec![
+                reply(Err(HttpsStartupError::Bind { source })),
+                stop(),
+            ]),
 
             HttpsListenerMsg::Accepted(Ok((stream, _peer))) => {
                 if self.stopping {
-                    // Stop already ran; close the orphan stream and do
-                    // not re-issue accept.
                     return tls_close(stream, self.tls_io_timeout)
                         .reply(HttpsListenerMsg::StreamClosed);
                 }
@@ -259,13 +195,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                         .reply(HttpsListenerMsg::Accepted),
                 ])
             }
-            HttpsListenerMsg::Accepted(Err(_)) => {
-                // Accept failed (likely listener was closed or handshake
-                // failed). On handshake failure no `TlsStreamId` was
-                // allocated by the runtime — see `accept_tls` in
-                // tina-runtime — so we issue a fresh accept rather than
-                // tearing down. Mirrors the TCP listener's policy of
-                // surviving transient accept failures.
+            HttpsListenerMsg::Accepted(Err(error)) => {
+                // Re-accept on transient errors only. `Timeout` =
+                // empty accept slice; `TlsHandshake` = malformed peer
+                // bytes (no TlsStreamId allocated). Everything else
+                // (`TlsClosed`, `Io`, `InvalidResource`, `TlsFull`)
+                // means re-accepting would busy-loop — close out.
                 if self.stopping {
                     if let Some(listener) = self.listener.take() {
                         return tls_close_listener(listener)
@@ -276,7 +211,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 let Some(listener) = self.listener else {
                     return stop();
                 };
-                tls_accept(listener, self.tls_accept_timeout).reply(HttpsListenerMsg::Accepted)
+                match error {
+                    CallError::Timeout | CallError::TlsHandshake => {
+                        tls_accept(listener, self.tls_accept_timeout)
+                            .reply(HttpsListenerMsg::Accepted)
+                    }
+                    _ => {
+                        self.stopping = true;
+                        let listener = self.listener.take().expect("listener present");
+                        tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed)
+                    }
+                }
             }
 
             HttpsListenerMsg::Stop => {

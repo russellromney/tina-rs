@@ -1,19 +1,11 @@
-//! Tina-vs-Tokio: a native HTTPS/1.1 counter server. The shared
-//! `scripted_client` is a stdlib rustls client that hits both sides
-//! identically.
+//! Tina-vs-Tokio HTTPS/1.1 counter server. Same scripted rustls
+//! client hits both: `GET /counter → POST × 3 → GET /counter →
+//! GET /missing`. Tokio side: hand-rolled `tokio + tokio-rustls`.
+//! Tina side: `tina_http::HttpsListener` + Counter isolate.
 //!
-//! - Tokio: hand-rolled `tokio + tokio-rustls` per-connection HTTPS.
-//! - Tina: `tina_http::HttpsListener` + a `Counter` isolate.
-//!
-//! Both sides serve the same HTTP/1.1 shape:
-//! `GET /counter → POST × 3 → GET /counter → GET /missing`.
-//!
-//! The Tina HTTPS *client* (`HttpClient` over an `HttpTarget::Https`
-//! target) is exercised by the integration tests in
-//! `tina-http/tests/client_tls_smoke.rs`. It is not in this example
-//! because the runtime's TLS lane has one worker thread per shard,
-//! and running both the server and the client against the same
-//! lane deadlocks the handshake.
+//! HTTPS *client* coverage lives in `tina-http/tests/client_tls_smoke.rs`
+//! — Tina's single-worker TLS lane deadlocks if server + client share
+//! a runtime.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -33,9 +25,8 @@ pub struct Report {
     pub exit_clean: bool,
 }
 
-/// Drives both sides through a real rustls client. `cert_der` is the
-/// self-signed leaf the server presents — used as a trust root for
-/// the client. There are no system roots and no PEM defaults.
+/// Real rustls client. `cert_der` is the server leaf, also used as
+/// the client's trust root.
 pub fn scripted_client(addr: SocketAddr, cert_der: Vec<u8>) -> Report {
     let mut report = Report {
         exit_clean: true,

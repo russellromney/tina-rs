@@ -1,10 +1,5 @@
-//! Tokio reference: `tokio + tokio-rustls` HTTPS server, hand-rolled
-//! HTTP/1.1 to match the Tina side line-for-line.
-//!
-//! One `tokio::net::TcpListener` accepts plaintext TCP, hands each
-//! connection to `tokio_rustls::TlsAcceptor`, then a per-task loop
-//! reads exactly one HTTP/1.1 request, mutates a shared counter, and
-//! writes a response. State is `Arc<AtomicU32>`.
+//! Tokio reference: `tokio + tokio-rustls` HTTPS, one task per
+//! connection. State is `Arc<AtomicU32>`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

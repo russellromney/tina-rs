@@ -29,6 +29,23 @@
     `18-bridge-crates.md`, `examples/README.md`, `FINDINGS.md` (new
     finding 16: multi-worker TLS lane).
 - In progress: none.
+- Post-review fixes (PR feedback round):
+  - `HttpsListener` accept-error classification: re-accept only on
+    `Timeout` and `TlsHandshake` (transient); close out on
+    `TlsClosed`, `Io`, `InvalidResource`, `TlsFull`, etc. Avoids
+    busy-loop on terminal errors.
+  - Removed dead `HttpListenerTransport` type from public API.
+  - Added `TLS_DEADLINE_UNUSED` const sentinel; replaced raw
+    `Duration::ZERO` magic at TCP-only call sites.
+  - Split `DuplicateHostHeader` into `DuplicateHostHeader` (caller
+    set Host) + `InvalidHostHeaderValue` (policy bytes invalid).
+  - Tests added: `invalid_host_policy_value_is_typed_error`,
+    `pool_refuses_with_full_when_https_slot_busy` (closes the Rock 4
+    Full/Busy gap), three DST tests for scripted
+    `TlsCertificate`/`TlsName`/`Timeout` connect failures mapping to
+    `Transport(Connect, _)`.
+  - Cleanup pass: semi-grug comments throughout new code.
+  - Eiffel `Counter` handler: dropped redundant match wrapper.
 - Open: make `tina-http` speak HTTPS with existing Tina TLS rails.
 - Deferred: HTTP/2, gRPC, ALPN, ACME, cert reload, mTLS, SNI routing,
   system-root defaults, proxies, redirects, cookies, chunked transfer, broad

@@ -1,16 +1,7 @@
-//! Isolate-level DST for the HTTPS client over scripted TLS.
-//!
-//! The simulator drives a single `tls_connect` outcome that returns
-//! HTTP/1.1 bytes from the scripted TLS read rail. The HttpClient
-//! parses those bytes into an `HttpResponse` exactly as it would over
-//! a real TLS lane. Cert validation is *not* exercised here — the
-//! simulator scripts the connect outcome (`Connected` or one of the
-//! typed failures); HTTP-side parsing is independent of TLS verifier
-//! behaviour.
-//!
-//! The matching saved-hash test pins the call-kind sequence so a future
-//! refactor that, say, accidentally drops `TlsClose` or reorders
-//! `TlsWrite` and `TlsRead` will fail the regression seed.
+//! Isolate-level DST: HttpClient over scripted TLS. Sim scripts the
+//! connect outcome (Connected with HTTP/1.1 bytes, or a typed
+//! failure); HttpClient parses the bytes / classifies the error.
+//! Replay determinism is pinned via `stable_trace_hash`.
 
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -22,9 +13,9 @@ use tina::ShardId;
 use tina::prelude::*;
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpRequest, HttpRequestBody,
-    HttpResponse, HttpResponseBody, HttpTarget, TlsTrustRoots, encode_request,
+    HttpResponse, HttpResponseBody, HttpTarget, HttpTransportPhase, TlsTrustRoots, encode_request,
 };
-use tina_runtime::{CallOutcome, RuntimeCall, call, stable_trace_hash};
+use tina_runtime::{CallError, CallOutcome, RuntimeCall, call, stable_trace_hash};
 use tina_sim::{
     ScriptedTlsConfig, ScriptedTlsConnectConfig, ScriptedTlsConnectResult, ScriptedTlsReadResult,
     ScriptedTlsWriteResult, Simulator, SimulatorConfig,
@@ -41,8 +32,7 @@ impl Shard for SimShard {
     }
 }
 
-/// Tiny one-shot driver: issues `call(client, ...)` and stashes the
-/// outcome into the shared observation slot.
+/// One-shot driver: stashes the call outcome into the observation slot.
 #[derive(Debug, Clone)]
 enum DriverMsg {
     Begin {
@@ -124,10 +114,8 @@ fn build_sim_config(target: &HttpTarget, request: &HttpRequest) -> SimulatorConf
     else {
         unreachable!("DST target is HTTPS by construction")
     };
-    // Compute exactly what the encoder will write on the wire so the
-    // scripted Wrote count matches reality. The Host policy on the
-    // target injects a `Host:` header before encoding; mirror that
-    // here so the scripted byte count is honest.
+    // Mirror the client's Host policy here so the scripted Wrote
+    // count matches the actual encoded request bytes.
     let mut planned = request.clone();
     let policy_value = match host {
         tina_http::HttpHostPolicy::UseServerName => server_name.clone(),
@@ -221,4 +209,93 @@ fn https_client_dst_replay_is_deterministic() {
         "stable_trace_hash must match across DST runs (lens: {len_a} vs {len_b})"
     );
     assert_eq!(len_a, len_b, "trace event count must match across DST runs");
+}
+
+/// Sim scripts the connect outcome; returns the client's classified result.
+fn run_dst_with_connect_failure(
+    failure: ScriptedTlsConnectResult,
+) -> Result<HttpResponse, HttpClientError> {
+    let target = https_target();
+    let HttpTarget::Https {
+        addr, server_name, ..
+    } = target.clone()
+    else {
+        unreachable!()
+    };
+    let config = SimulatorConfig {
+        tls: ScriptedTlsConfig {
+            pending_completion_capacity: 4,
+            connects: vec![ScriptedTlsConnectConfig {
+                addr,
+                server_name,
+                complete_after_step: 1,
+                result: failure,
+            }],
+        },
+        ..Default::default()
+    };
+
+    let mut sim = Simulator::new(SimShard, config);
+    let observed = Rc::new(RefCell::new(None));
+    let client = sim.register_with_mailbox_capacity(
+        HttpClient::<SimShard>::new(HttpClientConfig::dev()),
+        16,
+    );
+    let driver = sim.register_with_mailbox_capacity(
+        Driver {
+            observed: Rc::clone(&observed),
+        },
+        8,
+    );
+    sim.try_send(
+        driver,
+        DriverMsg::Begin {
+            client,
+            target,
+            request: dst_request(),
+            timeout: Duration::from_secs(5),
+        },
+    )
+    .expect("send Begin");
+    sim.run_until_quiescent();
+    observed.borrow_mut().take().expect("driver observed result")
+}
+
+#[test]
+fn scripted_tls_certificate_yields_typed_transport_error() {
+    let result = run_dst_with_connect_failure(ScriptedTlsConnectResult::Certificate);
+    match result {
+        Err(HttpClientError::Transport {
+            phase: HttpTransportPhase::Connect,
+            source: CallError::TlsCertificate,
+        }) => {}
+        other => panic!("expected Transport(Connect, TlsCertificate), got {other:?}"),
+    }
+}
+
+#[test]
+fn scripted_tls_name_yields_typed_transport_error() {
+    let result = run_dst_with_connect_failure(ScriptedTlsConnectResult::Name);
+    match result {
+        Err(HttpClientError::Transport {
+            phase: HttpTransportPhase::Connect,
+            source: CallError::TlsName,
+        }) => {}
+        other => panic!("expected Transport(Connect, TlsName), got {other:?}"),
+    }
+}
+
+#[test]
+fn scripted_tls_timeout_yields_typed_transport_error() {
+    let result = run_dst_with_connect_failure(ScriptedTlsConnectResult::Timeout);
+    match result {
+        // Either the connect timeout or the deadline timer fires
+        // first; both surface as a typed Timeout, not flat Connect.
+        Err(HttpClientError::Transport {
+            phase: HttpTransportPhase::Connect,
+            source: CallError::Timeout,
+        }) => {}
+        Err(HttpClientError::Timeout) => {}
+        other => panic!("expected typed Timeout, got {other:?}"),
+    }
 }

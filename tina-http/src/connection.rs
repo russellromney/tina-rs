@@ -30,7 +30,7 @@ use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_r
 use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
-use crate::transport::HttpTransport;
+use crate::transport::{HttpTransport, TLS_DEADLINE_UNUSED};
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError};
 
 /// Bytes the connection isolate asks for per `tcp_read`. Bounded so a
@@ -173,8 +173,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             service,
             limits,
             service_call_timeout,
-            // Unused on the TCP transport.
-            Duration::ZERO,
+            TLS_DEADLINE_UNUSED,
         )
     }
 

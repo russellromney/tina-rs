@@ -1,15 +1,6 @@
-//! End-to-end native HTTPS client tests.
-//!
-//! The Tina HTTPS server and HTTPS client cannot share a runtime in
-//! first form: the runtime has one TLS worker thread per shard, and
-//! the client and server sides of a single TLS handshake both need
-//! to drive that worker concurrently — they deadlock.
-//!
-//! These tests therefore put the *server* on a raw OS thread (using
-//! `rustls::ServerConnection` directly) and run the Tina `HttpClient`
-//! on a `ThreadedRuntime`, then drive an HTTPS round-trip across the
-//! two. The negative-path tests (bad name, untrusted root, duplicate
-//! Host) follow the same shape.
+//! Native HTTPS client tests against a thread-spawned rustls server
+//! (Tina's TLS lane has one worker — server and client cannot share
+//! a runtime).
 
 use std::convert::Infallible;
 use std::io::{Read, Write};
@@ -66,10 +57,8 @@ fn build_cert_bundle() -> CertBundle {
     }
 }
 
-/// Spawns a rustls HTTPS server on a thread that handles exactly one
-/// connection: it reads the request, fishes the `Host:` header, and
-/// replies `HTTP/1.1 200 OK` with the Host value as the body. Returns
-/// the bound addr.
+/// One-shot rustls HTTPS server: reads one request, replies 200 with
+/// the wire `Host:` value as the body.
 fn spawn_one_shot_https_server(server_config: rustls::ServerConfig) -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind one-shot https");
     let addr = listener.local_addr().expect("local addr");
@@ -106,7 +95,7 @@ fn spawn_one_shot_https_server(server_config: rustls::ServerConfig) -> SocketAdd
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.write_all(body);
         let _ = stream.flush();
-        let _ = stream.conn.send_close_notify();
+        stream.conn.send_close_notify();
         let _ = stream.flush();
     });
     addr
@@ -251,6 +240,26 @@ fn explicit_host_policy_overrides_default() {
 }
 
 #[test]
+fn invalid_host_policy_value_is_typed_error() {
+    // Failure surfaces at encode — no tls_connect runs. `\n` makes
+    // `HeaderValue::from_str` reject the policy value.
+    let bundle = build_cert_bundle();
+    let addr = spawn_one_shot_https_server(bundle.server_config);
+    let trust = TlsTrustRoots::from_der(vec![bundle.cert_der]);
+    let target = HttpTarget::Https {
+        addr,
+        server_name: "localhost".to_string(),
+        trust_roots: trust,
+        host: HttpHostPolicy::Explicit("bad\nhost".to_string()),
+    };
+    let result = run_one_fetch(target, empty_request("/host"));
+    assert!(
+        matches!(result, Err(HttpClientError::InvalidHostHeaderValue)),
+        "expected InvalidHostHeaderValue for non-ASCII Host policy, got {result:?}"
+    );
+}
+
+#[test]
 fn duplicate_host_header_is_typed_error() {
     let bundle = build_cert_bundle();
     let addr = spawn_one_shot_https_server(bundle.server_config);
@@ -269,7 +278,7 @@ fn duplicate_host_header_is_typed_error() {
 
 #[test]
 fn bad_server_name_yields_typed_tls_name_error() {
-    // Server is irrelevant — no TLS connect should land on it.
+    // `ServerName::try_from` fails before any TCP connect.
     let bundle = build_cert_bundle();
     let addr = spawn_one_shot_https_server(bundle.server_config);
     let trust = TlsTrustRoots::from_der(vec![bundle.cert_der]);
@@ -293,7 +302,7 @@ fn bad_server_name_yields_typed_tls_name_error() {
 fn untrusted_root_yields_typed_transport_error() {
     let bundle = build_cert_bundle();
     let addr = spawn_one_shot_https_server(bundle.server_config);
-    // Use a different cert as the "root" — server's leaf isn't anchored.
+    // Different cert as the trust root → server leaf isn't anchored.
     let other = rcgen::generate_simple_self_signed(vec!["other.example".to_string()])
         .expect("rcgen self-sign 2");
     let untrusted = TlsTrustRoots::from_der(vec![other.cert.der().to_vec()]);
@@ -305,10 +314,8 @@ fn untrusted_root_yields_typed_transport_error() {
     };
     let result = run_one_fetch(target, empty_request("/host"));
     match result {
-        // Either TlsHandshake (peer rejected) or Io (peer aborted)
-        // is acceptable; the contract is that callers see a typed
-        // Transport variant in the Connect phase, not the flat
-        // `Connect` from the TCP path.
+        // TlsHandshake (peer rejected) or Io (peer aborted) — both
+        // are typed Transport variants, not the flat TCP `Connect`.
         Err(HttpClientError::Transport {
             phase: HttpTransportPhase::Connect,
             source: CallError::TlsHandshake,

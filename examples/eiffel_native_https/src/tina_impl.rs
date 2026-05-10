@@ -1,16 +1,11 @@
-//! Tina: `tina_http::HttpsListener` + `Counter` isolate.
-//!
-//! Startup is **call-shaped**: a tiny `Driver` isolate calls
-//! `HttpsListener` with `Start` and the typed
-//! `Result<HttpsReady, HttpsStartupError>` reply pops out via an
-//! mpsc channel. Once `Ready` arrives, the example drives the
-//! shared scripted rustls client and shuts down.
+//! Tina HTTPS server. `Driver` isolate gates startup on the typed
+//! call-shaped `Start` reply; main thread drives the scripted client
+//! once `Ready` lands.
 
 use std::convert::Infallible;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use http::{Method, StatusCode};
 use tina::prelude::*;
 use tina_http::{
     HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg, HttpsReady, HttpsServerConfig,
@@ -47,13 +42,7 @@ impl Counter {
             .get("/counter", get_counter)
             .post("/counter", post_counter)
             .method_not_allowed();
-        // Ignore the dispatcher's body for unknown paths so we still
-        // produce a 404 with no body — the example contract.
-        let response = match (request.method.clone(), request.path.as_str()) {
-            (Method::GET | Method::POST, "/counter") => router.dispatch(self, &request),
-            _ => HttpResponse::with_status(StatusCode::NOT_FOUND),
-        };
-        reply(response)
+        reply(router.dispatch(self, &request))
     }
 }
 

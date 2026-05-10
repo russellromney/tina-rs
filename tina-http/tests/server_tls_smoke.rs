@@ -1,12 +1,5 @@
-//! End-to-end happy-path smoke test for the native HTTPS/1.1 server.
-//!
-//! Spins up a `ThreadedRuntime`, registers a `Counter` service, an
-//! `HttpsListener`, and a `Driver` isolate that issues the call-shaped
-//! `Start` and forwards the typed `HttpsReady` / `HttpsStartupError`
-//! reply to the test thread. Once `Ready` is observed, the test
-//! drives a real `rustls`-based HTTPS client against the bound port
-//! and asserts a `200` plus the response body. A second test
-//! exercises the bind-failure path with an invalid private key.
+//! Native HTTPS server smoke. Real rustls client GETs `/counter`;
+//! bad-key path returns typed `HttpsStartupError::Bind`.
 
 use std::convert::Infallible;
 use std::io::{Read, Write};
@@ -75,8 +68,7 @@ impl Isolate for Counter {
     }
 }
 
-/// Tiny startup driver: one shot of `call(listener, Start, t)` whose
-/// typed reply is forwarded out through an mpsc channel.
+/// One-shot `call(listener, Start, t)`; reply lands on an mpsc channel.
 #[derive(Debug, Clone)]
 enum DriverMsg {
     Begin {
@@ -169,10 +161,9 @@ fn run_https_request(addr: SocketAddr, root_cert_der: Vec<u8>, request: &[u8]) -
     stream.write_all(request).expect("write request");
     stream.flush().expect("flush request");
     let mut response = Vec::new();
-    // First-form HTTPS server uses `Connection: close` framing; the
-    // rustls client may surface the close as an unclean read error
-    // even after all bytes arrived. Tolerate that: the assertion is
-    // on the bytes we got, not on a clean close-notify.
+    // `Connection: close` framing — rustls may surface the close as
+    // an unclean read error even after all bytes arrived. Trust the
+    // bytes we got.
     let _ = stream.read_to_end(&mut response);
     response
 }
@@ -251,8 +242,7 @@ fn https_listener_serves_get_through_real_rustls_client() {
 #[test]
 fn https_listener_typed_failure_on_invalid_key_does_not_leak_listener() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    // Generate a real cert chain, then swap in a totally garbage private
-    // key so `tls_bind` fails inside rustls' `with_single_cert`.
+    // Real cert + garbage private key → rustls `with_single_cert` fails.
     let certified =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-sign");
     let cert_der = certified.cert.der().to_vec();
@@ -290,9 +280,7 @@ fn https_listener_typed_failure_on_invalid_key_does_not_leak_listener() {
         .expect("startup reply lands");
     match outcome {
         DriverOutcome::Replied(Err(HttpsStartupError::Bind { source })) => {
-            // Runtime maps a rustls `with_single_cert` failure to
-            // `CallError::TlsCertificate`. The variant is the contract;
-            // the surrounding wrapper is what callers match.
+            // Rustls `with_single_cert` failure → `CallError::TlsCertificate`.
             assert_eq!(
                 source,
                 tina_runtime::CallError::TlsCertificate,
@@ -306,9 +294,7 @@ fn https_listener_typed_failure_on_invalid_key_does_not_leak_listener() {
         DriverOutcome::NonReply(reason) => panic!("startup call did not reply: {reason}"),
     }
 
-    // Trace must show no TLS listener resources held — the listener
-    // isolate stopped without spawning a connection or holding a
-    // TlsListenerId. The runtime shutdown report would catch a held
-    // resource; here we just verify shutdown completes cleanly.
+    // Shutdown must complete cleanly — runtime would surface a held
+    // TlsListenerId in the shutdown report otherwise.
     let _ = runtime.shutdown();
 }

@@ -570,39 +570,23 @@ impl Default for PoolConfig {
     }
 }
 
-/// Phase of an outbound TLS-aware transport operation. Used inside
-/// [`HttpClientError::Transport`] so callers can match on what was
-/// happening when the underlying [`tina_runtime::CallError`] surfaced.
-///
-/// The plain-HTTP path keeps the older flat variants
-/// (`Connect`/`Write`/`Read`/`Closed`/`Timeout`) for source compat;
-/// only the HTTPS path produces `Transport`.
+/// Phase tag inside [`HttpClientError::Transport`]. `Bind` and
+/// `Accept` exist for symmetry; the client only ever emits
+/// `Connect`, `Read`, `Write`, `Close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpTransportPhase {
-    /// `tls_connect` (client-side handshake).
     Connect,
-    /// `tls_bind` (server-side, listed for symmetry; not emitted by
-    /// the client).
     Bind,
-    /// `tls_accept` (server-side, listed for symmetry; not emitted by
-    /// the client).
     Accept,
-    /// `tls_read`.
     Read,
-    /// `tls_write`.
     Write,
-    /// `tls_close`.
     Close,
 }
 
-/// Reasons an outbound HTTP/HTTPS call failed before producing a
-/// parsed [`HttpResponse`].
-///
-/// Plain-HTTP calls produce the flat `Connect`/`Write`/`Read`/`Closed`
-/// variants; HTTPS calls produce [`HttpClientError::Transport`] so
-/// callers can match the precise TLS reason
-/// (`TlsName`, `TlsCertificate`, `TlsHandshake`, `TlsFull`,
-/// `TlsClosed`, `Timeout`).
+/// Outbound call failed before producing a parsed [`HttpResponse`].
+/// Plain HTTP keeps flat variants for source compat; HTTPS produces
+/// [`HttpClientError::Transport`] carrying the typed
+/// [`tina_runtime::CallError`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpClientError {
     /// `tcp_connect` failed before the request could be written.
@@ -623,18 +607,17 @@ pub enum HttpClientError {
     /// The pool's slot was busy when this Submit arrived. Direct (non-
     /// pooled) calls never produce this variant.
     PoolFull,
-    /// A TLS-aware transport call failed. `phase` says which lane op
-    /// (`tls_connect`/`tls_read`/`tls_write`/`tls_close`); `source`
-    /// is the typed runtime error
+    /// TLS lane call failed. `source` is the typed `CallError`
     /// (`TlsName`, `TlsCertificate`, `TlsHandshake`, `TlsFull`,
-    /// `TlsClosed`, `Timeout`, `Io`, ...). Plain-HTTP failures keep
-    /// the older flat variants above.
+    /// `TlsClosed`, `Timeout`, `Io`, ...).
     Transport {
         phase: HttpTransportPhase,
         source: tina_runtime::CallError,
     },
-    /// The request already carried a `Host:` header that conflicts
-    /// with the [`crate::HttpHostPolicy`] for this target. Reject so
-    /// callers see the duplicate explicitly.
+    /// Caller already set `Host:` on an HTTPS target — conflicts
+    /// with the [`crate::HttpHostPolicy`].
     DuplicateHostHeader,
+    /// [`crate::HttpHostPolicy`] resolved to a string with bytes
+    /// that are not a valid `HeaderValue`.
+    InvalidHostHeaderValue,
 }
