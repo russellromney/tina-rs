@@ -348,6 +348,42 @@ DST-claimed code cannot silently depend on `std::time::Instant`,
 with `Context::deadline_after(duration)` as the runtime/sim-aware
 sugar. No live-only `Deadline::after` shortcut ships.
 
+### 19. Pool consumer ergonomics — host-side acquire and scenario runner
+
+**Surfaced by:** `eiffel_pool_cancel_reclaim` (and to a lesser extent
+`eiffel_graceful_pool_shutdown`).
+
+The cancel-reclaim specimen is ~245 lines tina vs ~113 lines tokio.
+Roughly 115 of the gap is a `Driver` isolate that exists *only*
+because `cancel_call(handle)` requires being inside an isolate's
+`handle()`. Roughly 34 lines are a host-side
+`try_send` + `std::thread::sleep` dance to step the driver through
+seven scripted stages. Both costs go away in real services (the
+service's own handler is the isolate, and there are no scripted
+stages), but they hurt readability of test-shaped specimens.
+
+Two helpers would cut the gap further when a real consumer pulls them
+into existence:
+
+- A host-side `runtime.acquire_owned(pool_addr, timeout)` analogous
+  to `observe_result`. Lets test code acquire from outside an isolate
+  context, eliminating the coordination Driver. Real risk: creates a
+  second pool-interaction model from the host side. Defer until a
+  real consumer (HTTP keepalive, DB pool) pulls on it.
+- A host-side scenario runner —
+  `runtime.scenario(addr).send(M).then_wait(D).send(N).run()` — that
+  collapses the `try_send` + `sleep` dance. Real risk: becomes fake
+  async choreography that hides ordering bugs. Test sugar only;
+  defer until a second test specimen wants the same shape.
+
+**Decision:** both are watch-list, not next-up. The
+result-flavored `acquire_result_effect` / `release_result_effect`
+helpers (shipped with 067) gave the same payoff for the no-loss case
+and remain the right place to push first.
+
+**Revisit when:** an HTTP keepalive consumer or a third pool
+specimen wants either shape.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so

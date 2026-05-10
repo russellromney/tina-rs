@@ -1070,6 +1070,143 @@ fn closed_count_includes_late_acquires() {
     shutdown(h);
 }
 
+// --- Result-flavored helpers --------------------------------------------
+//
+// Tiny isolate that uses acquire_result_effect and release_result_effect
+// directly. Proves the helpers compose correctly end-to-end and that
+// pool-layer outcomes (Full / Closed) and transport-layer outcomes
+// (CallTimeout, etc.) survive the fold as distinct AcquireFailure variants.
+
+#[derive(Debug)]
+enum ResultDriverMsg {
+    Acquire,
+    Acquired(Result<PoolLease<Resource>, tina::pool::AcquireFailure>),
+    Release,
+    Released(Result<(), tina::pool::ReleaseFailure>),
+}
+
+#[derive(Debug, Default)]
+struct ResultObs {
+    acquires: Vec<Result<u32, tina::pool::AcquireFailure>>,
+    releases: Vec<Result<(), tina::pool::ReleaseFailure>>,
+}
+
+struct ResultDriver {
+    pool: Address<WorkerPoolMsg<Resource>, WorkerPoolReply<Resource>>,
+    obs: Arc<Mutex<ResultObs>>,
+    held: Option<PoolLease<Resource>>,
+}
+
+#[tina_runtime::isolate(message = ResultDriverMsg)]
+impl ResultDriver {
+    fn handle(
+        &mut self,
+        msg: ResultDriverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ResultDriverMsg::Acquire => tina_runtime::pool::acquire_result_effect(
+                self.pool,
+                CALL_TIMEOUT,
+                ResultDriverMsg::Acquired,
+            ),
+            ResultDriverMsg::Acquired(result) => {
+                let summary = match &result {
+                    Ok(lease) => Ok(*lease.handle()),
+                    Err(e) => Err(*e),
+                };
+                if let Ok(lease) = result {
+                    self.held = Some(lease);
+                }
+                self.obs.lock().expect("obs").acquires.push(summary);
+                noop()
+            }
+            ResultDriverMsg::Release => {
+                if let Some(lease) = self.held.take() {
+                    tina_runtime::pool::release_result_effect(
+                        lease,
+                        self.pool,
+                        ReleaseDisposition::Reuse,
+                        CALL_TIMEOUT,
+                        ResultDriverMsg::Released,
+                    )
+                } else {
+                    noop()
+                }
+            }
+            ResultDriverMsg::Released(result) => {
+                self.obs.lock().expect("obs").releases.push(result);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn result_helpers_collapse_call_outcome_to_typed_result() {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+    let pool: WorkerPool<Resource, SingleShard> = WorkerPool::new(PoolConfig::new(1, 0), vec![42]);
+    let pool_addr = runtime
+        .register_with_capacity::<_, Infallible>(pool, 32)
+        .expect("pool");
+    let obs = Arc::new(Mutex::new(ResultObs::default()));
+    let driver = runtime
+        .register_with_capacity::<_, Infallible>(
+            ResultDriver {
+                pool: pool_addr,
+                obs: obs.clone(),
+                held: None,
+            },
+            32,
+        )
+        .expect("driver");
+
+    // Happy path: acquire -> Ok(lease), release -> Ok(()).
+    runtime
+        .try_send(driver, ResultDriverMsg::Acquire)
+        .expect("a1");
+    let obs_a = obs.clone();
+    assert!(
+        wait_for(POLL_BUDGET, || !obs_a
+            .lock()
+            .expect("obs")
+            .acquires
+            .is_empty()),
+        "no acquire reply observed"
+    );
+
+    // Second acquire while resource is held → pool says Full.
+    runtime
+        .try_send(driver, ResultDriverMsg::Acquire)
+        .expect("a2 full");
+    let obs_a2 = obs.clone();
+    assert!(wait_for(POLL_BUDGET, || {
+        obs_a2.lock().expect("obs").acquires.len() >= 2
+    }));
+
+    // Release the first lease → Ok(()).
+    runtime
+        .try_send(driver, ResultDriverMsg::Release)
+        .expect("rel");
+    let obs_r = obs.clone();
+    assert!(wait_for(POLL_BUDGET, || {
+        !obs_r.lock().expect("obs").releases.is_empty()
+    }));
+
+    let snap = obs.lock().expect("obs");
+    assert_eq!(snap.acquires.len(), 2);
+    assert_eq!(snap.acquires[0], Ok(42));
+    assert_eq!(snap.acquires[1], Err(tina::pool::AcquireFailure::Full));
+    assert_eq!(snap.releases, vec![Ok(())]);
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
 #[test]
 fn pressure_report_counts_full() {
     let h = build(PoolConfig::new(1, 0), vec![1]);
