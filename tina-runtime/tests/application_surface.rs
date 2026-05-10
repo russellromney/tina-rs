@@ -799,6 +799,7 @@ fn assert_dispatch_attempts_have_terminal_outcomes(trace: &[RuntimeEvent]) {
             RuntimeEventKind::CallCompleted { .. }
                 | RuntimeEventKind::CallFailed { .. }
                 | RuntimeEventKind::CallCompletionRejected { .. }
+                | RuntimeEventKind::CallCancelled { .. }
         )
     });
     assert_eq!(
@@ -1478,12 +1479,7 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
 
     let trace = runtime.shutdown().expect("runtime shutdown succeeds");
     assert_dispatch_attempts_have_terminal_outcomes(&trace);
-    for call_kind in [
-        CallKind::TcpAccept,
-        CallKind::TcpRead,
-        CallKind::Sleep,
-        CallKind::IsolateCall,
-    ] {
+    for call_kind in [CallKind::TcpAccept, CallKind::TcpRead, CallKind::Sleep] {
         assert_event_exists(
             &trace,
             &format!("shutdown should reject pending {call_kind:?} completion"),
@@ -1499,6 +1495,23 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
             },
         );
     }
+    // Pending isolate-calls now settle as `CallCancelled { RuntimeStopped }`
+    // at shutdown so observers can attribute the cause and so any caller
+    // still holding a `CallHandle` sees `state() == Cancelled` (not a
+    // forever-`Pending` lie).
+    assert_event_exists(
+        &trace,
+        "shutdown should cancel pending isolate calls with RuntimeStopped",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallCancelled {
+                    cause: tina::CancelCause::RuntimeStopped,
+                    ..
+                }
+            )
+        },
+    );
 }
 
 #[test]

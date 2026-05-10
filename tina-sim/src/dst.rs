@@ -466,6 +466,9 @@ fn call_outcome_matches(kind: RuntimeEventKind, expected: CallId) -> bool {
         } | RuntimeEventKind::CallCompletionRejected {
             call_id,
             ..
+        } | RuntimeEventKind::CallCancelled {
+            call_id,
+            ..
         } if call_id == expected
     )
 }

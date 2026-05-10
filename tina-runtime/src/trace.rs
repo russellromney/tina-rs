@@ -86,8 +86,31 @@ pub enum EffectKind {
 /// `compile_fail` doctest on [`tina::reply_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredReplyRejectedReason {
-    /// The original caller already timed out, closed, or otherwise stopped.
+    /// The original caller already closed for a reason not classified
+    /// below: e.g. requester shard failure, transport issue, or a
+    /// pre-066 lifecycle path we have not yet split out.
     CallerClosed,
+
+    /// Caller invoked `cancel_call(handle)`. Distinct from
+    /// `CallerClosed` (lifecycle), `CallerTimedOut` (deadline),
+    /// `OwnerStopped` (owner isolate stopped), and `RuntimeStopped`
+    /// (runtime shutting down) so observers can attribute the cause.
+    CallerCancelled,
+
+    /// The mandatory call timeout fired before the reply arrived.
+    /// Distinct from `CallerCancelled`: the user did not explicitly
+    /// `cancel_call` — the deadline elapsed.
+    CallerTimedOut,
+
+    /// The owning isolate stopped while this call was pending.
+    /// Distinct from `CallerCancelled` so traces can tell explicit
+    /// cancel from owner lifecycle.
+    OwnerStopped,
+
+    /// The runtime began shutting down before the reply arrived.
+    /// Distinct from `OwnerStopped` so traces can tell isolate-scoped
+    /// teardown from process-scoped teardown.
+    RuntimeStopped,
 
     /// The bounded reply transport path back to the requester was full.
     ReplyPathFull,
@@ -232,6 +255,11 @@ pub enum CallKind {
     /// An isolate-to-isolate call whose reply is delivered back to the
     /// requester as an ordinary later message.
     IsolateCall,
+
+    /// A caller-issued request to cancel one pending isolate call's wait.
+    /// The runtime delivers a [`tina::CancelOutcome`] back to the
+    /// requester as an ordinary later message.
+    CancelCall,
 }
 
 /// Why a runtime-owned call's completion could not be delivered to the
@@ -257,9 +285,27 @@ pub enum CallCompletionRejectedReason {
 pub enum CallReplyRejectedReason {
     /// The call was no longer pending by the time the callee replied.
     ///
-    /// This usually means the caller's timeout already fired, or the call was
-    /// otherwise settled before the reply arrived.
+    /// Used as the fall-through when no more specific cause is on
+    /// record — for example, after the bounded recently-cancelled
+    /// ring evicts the call_id. The more specific
+    /// `CallerCancelled` / `CallerTimedOut` / `OwnerStopped` /
+    /// `RuntimeStopped` reasons take precedence when known.
     NoPendingCall,
+
+    /// The original caller explicitly cancelled the wait via
+    /// `cancel_call(handle)` before the reply arrived.
+    CallerCancelled,
+
+    /// The mandatory call timeout fired before the reply arrived.
+    /// Distinct from `CallerCancelled` (explicit) and
+    /// `NoPendingCall` (no record).
+    CallerTimedOut,
+
+    /// The owning isolate stopped while this call was pending.
+    OwnerStopped,
+
+    /// The runtime began shutting down before the reply arrived.
+    RuntimeStopped,
 
     /// The bounded reply transport path back to the requester was full.
     ReplyPathFull,
@@ -511,6 +557,23 @@ pub enum RuntimeEventKind {
 
         /// Why the reply could not settle the call.
         reason: CallReplyRejectedReason,
+    },
+
+    /// The runtime closed the caller-side wait of an in-flight isolate
+    /// call because of an explicit cancel, owner stop, or other
+    /// lifecycle event named by `cause`.
+    ///
+    /// The callee may still finish work it already accepted; any reply
+    /// that arrives later is rejected as a separate
+    /// `CallReplyRejected` (or `DeferredReplyRejected`) event with
+    /// reason `CallerCancelled` / `CallerClosed`. This event records
+    /// the cancel itself.
+    CallCancelled {
+        /// The runtime-assigned identifier for the cancelled call.
+        call_id: CallId,
+
+        /// Why the caller-side wait closed.
+        cause: tina::CancelCause,
     },
 
     /// A local snapshot was committed.
@@ -766,6 +829,10 @@ fn deferred_reply_rejected_tag(reason: DeferredReplyRejectedReason) -> u8 {
         DeferredReplyRejectedReason::ReplyPathFull => 2,
         DeferredReplyRejectedReason::RequesterShardClosed => 3,
         DeferredReplyRejectedReason::TypeMismatch => 4,
+        DeferredReplyRejectedReason::CallerCancelled => 5,
+        DeferredReplyRejectedReason::CallerTimedOut => 6,
+        DeferredReplyRejectedReason::OwnerStopped => 7,
+        DeferredReplyRejectedReason::RuntimeStopped => 8,
     }
 }
 
@@ -812,6 +879,7 @@ fn call_kind_tag(kind: CallKind) -> u8 {
         CallKind::Sleep => 38,
         CallKind::ObservedSend => 39,
         CallKind::IsolateCall => 40,
+        CallKind::CancelCall => 41,
     }
 }
 
@@ -885,6 +953,19 @@ fn call_reply_rejected_tag(reason: CallReplyRejectedReason) -> u8 {
         CallReplyRejectedReason::NoPendingCall => 1,
         CallReplyRejectedReason::ReplyPathFull => 2,
         CallReplyRejectedReason::RequesterShardClosed => 3,
+        CallReplyRejectedReason::CallerCancelled => 4,
+        CallReplyRejectedReason::CallerTimedOut => 5,
+        CallReplyRejectedReason::OwnerStopped => 6,
+        CallReplyRejectedReason::RuntimeStopped => 7,
+    }
+}
+
+fn cancel_cause_tag(cause: tina::CancelCause) -> u8 {
+    match cause {
+        tina::CancelCause::CallerCancelled => 1,
+        tina::CancelCause::CallerTimedOut => 2,
+        tina::CancelCause::OwnerStopped => 3,
+        tina::CancelCause::RuntimeStopped => 4,
     }
 }
 
@@ -1077,6 +1158,11 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u8(32);
             hasher.write_u64(slot_id.get());
             hasher.write_u64(call_id.get());
+        }
+        RuntimeEventKind::CallCancelled { call_id, cause } => {
+            hasher.write_u8(33);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(cancel_cause_tag(cause));
         }
     }
 }
