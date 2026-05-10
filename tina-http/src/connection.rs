@@ -47,6 +47,7 @@ use tina_runtime::{
     tls_read, tls_write,
 };
 
+use crate::body_metrics::BodyMetrics;
 use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_request_head};
 use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
@@ -126,6 +127,17 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     service: Address<M, HttpResponse>,
     limits: HttpLimits,
     service_call_timeout: Duration,
+    /// Optional body-pressure counters. When `Some`, the connection
+    /// charges inbound/outbound bytes on admission and releases on
+    /// drain/drop, and increments full/timeout/IO-error counts on
+    /// the appropriate edge transitions. When `None` no metrics are
+    /// recorded — zero-overhead default.
+    metrics: Option<BodyMetrics>,
+    /// Bytes currently charged to `metrics.request_body_*`. Tracks
+    /// what we owe the metrics on drop/close.
+    metrics_request_charge: usize,
+    /// Bytes currently charged to `metrics.response_body_*`.
+    metrics_response_charge: usize,
 
     // Accumulating wire state.
     read_buf: Vec<u8>,
@@ -135,15 +147,25 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     // Outbound write state. `pending_response` is the bytes still to
     // write; `tcp_write` may accept fewer than we send, in which case
     // `handle_wrote` drains the accepted prefix and we re-issue the
-    // remainder.
+    // remainder. Buffered responses write the head first (no body
+    // charge), then promote `pending_buffered_body` into
+    // `pending_response` and charge body bytes once the head drains.
+    // This keeps the body-pressure counter honest: `current` only
+    // reflects body bytes actually queued for the wire.
     pending_response: Vec<u8>,
+    pending_buffered_body: Option<Vec<u8>>,
 
     // Streaming-response state. `Some` once we have written the head of
     // a streamed response and need to keep pulling chunks until `Eof`.
-    // `bytes_remaining` is decremented as chunks are written; when it
-    // hits zero (or we receive `Eof`), we close.
+    // For `Content-Length` framing, `stream_bytes_remaining` decrements
+    // as chunks are written and the connection closes when it hits
+    // zero or the source replies `Eof`. For `Transfer-Encoding:
+    // chunked` framing (`stream_chunked = true`), the byte counter is
+    // unused and the loop runs until the source replies `Eof`; the
+    // connection then writes the `0 CRLF CRLF` terminator and closes.
     stream_source: Option<Address<ResponseChunkMsg, ResponseChunkReply>>,
     stream_bytes_remaining: usize,
+    stream_chunked: bool,
     stream_call_timeout: Duration,
 
     // Inbound streaming state.
@@ -192,6 +214,13 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     request_generation: u64,
     head_deadline_armed: bool,
 
+    // Latch flipped the first time we reply `Eof` (or `Error`) on
+    // the streaming-body chunk path. A buggy service that calls
+    // `body_next` after Eof gets the same `Eof` reply without
+    // touching the socket, so a single peer FIN cannot be charged
+    // as multiple IO errors.
+    body_eof_replied: bool,
+
     _shard: std::marker::PhantomData<S>,
 }
 
@@ -224,18 +253,45 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
         service_call_timeout: Duration,
         tls_io_timeout: Duration,
     ) -> Self {
+        Self::with_transport_and_metrics(
+            transport,
+            service,
+            limits,
+            service_call_timeout,
+            tls_io_timeout,
+            None,
+        )
+    }
+
+    /// Builds a connection isolate that reports body pressure into
+    /// the supplied [`BodyMetrics`]. Listeners thread one shared
+    /// `BodyMetrics` through every connection they spawn so the
+    /// snapshot reflects the whole shard.
+    pub fn with_transport_and_metrics(
+        transport: HttpTransport,
+        service: Address<M, HttpResponse>,
+        limits: HttpLimits,
+        service_call_timeout: Duration,
+        tls_io_timeout: Duration,
+        metrics: Option<BodyMetrics>,
+    ) -> Self {
         Self {
             transport,
             tls_io_timeout,
             service,
             limits,
             service_call_timeout,
+            metrics,
+            metrics_request_charge: 0,
+            metrics_response_charge: 0,
             read_buf: Vec::new(),
             parsed_head: None,
             head_len: 0,
             pending_response: Vec::new(),
+            pending_buffered_body: None,
             stream_source: None,
             stream_bytes_remaining: 0,
+            stream_chunked: false,
             stream_call_timeout: service_call_timeout,
             inbound_total: 0,
             inbound_received: 0,
@@ -247,6 +303,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             will_close: false,
             request_generation: 0,
             head_deadline_armed: true,
+            body_eof_replied: false,
             _shard: std::marker::PhantomData,
         }
     }
@@ -280,7 +337,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpConnectionMsg::Begin => self.start(),
 
             HttpConnectionMsg::Read(Ok(bytes)) => self.handle_bytes_read(bytes),
-            HttpConnectionMsg::Read(Err(_)) => self.begin_close(),
+            HttpConnectionMsg::Read(Err(_)) => {
+                // Mid-body buffered read failure (head parsed, body
+                // not yet complete). Distinct from a clean post-body
+                // close; record so the metric reflects the truncation.
+                if self.parsed_head.is_some() {
+                    self.record_body_io_error();
+                }
+                self.begin_close()
+            }
 
             HttpConnectionMsg::HeaderDeadline { generation, .. } => {
                 self.handle_header_deadline(generation)
@@ -289,7 +354,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpConnectionMsg::ServiceReturned(outcome) => self.handle_service_outcome(outcome),
 
             HttpConnectionMsg::Wrote(Ok(count)) => self.handle_wrote(count),
-            HttpConnectionMsg::Wrote(Err(_)) => self.begin_close(),
+            HttpConnectionMsg::Wrote(Err(_)) => {
+                // Wire write failed while a body was still owed —
+                // either still queued in `pending_response`, sitting
+                // in `pending_buffered_body`, or being streamed.
+                // Record the truncation so the metric is honest.
+                if self.has_pending_body() {
+                    self.record_body_io_error();
+                }
+                self.begin_close()
+            }
 
             HttpConnectionMsg::StreamChunk(outcome) => self.handle_stream_chunk(outcome),
 
@@ -337,17 +411,22 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     /// `request_generation` or `head_deadline_armed` — those are
     /// updated by [`Self::begin_request_iteration`].
     fn reset_for_next_request(&mut self) {
+        self.release_request_all();
+        self.release_response_all();
         self.read_buf.clear();
         self.parsed_head = None;
         self.head_len = 0;
         self.pending_response.clear();
+        self.pending_buffered_body = None;
         self.stream_source = None;
         self.stream_bytes_remaining = 0;
+        self.stream_chunked = false;
         self.inbound_total = 0;
         self.inbound_received = 0;
         self.inbound_delivered = 0;
         self.inbound_buffer.clear();
         self.inbound_chunk_size = 0;
+        self.body_eof_replied = false;
         self.will_close = false;
     }
 
@@ -367,27 +446,47 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             // Peer closed cleanly. If we already parsed a head and have
             // a partial body, this is a truncated request — close
             // without dispatching. If we haven't parsed yet, also close.
+            if self.parsed_head.is_some() {
+                // Truncation: peer sent FIN before declared length.
+                // Distinct from a clean post-body close.
+                self.record_body_io_error();
+            }
             return self.begin_close();
         }
 
+        let pre_len = self.read_buf.len();
         self.read_buf.extend_from_slice(&bytes);
 
         if self.parsed_head.is_none() {
             match parse_request_head(&self.read_buf, &self.limits) {
                 ParseProgress::NeedMore => return self.read_more(),
                 ParseProgress::Complete { head, head_len } => {
+                    // Charge the body bytes already past head_len so
+                    // far. The post-head `read_more` path charges
+                    // subsequent reads via the else-branch below.
+                    let body_already_in_buf = self.read_buf.len().saturating_sub(head_len);
                     self.parsed_head = Some(head);
                     self.head_len = head_len;
+                    self.charge_request(body_already_in_buf);
                     // Disarm the slow-loris guard. The deadline message
                     // may still arrive but `handle_header_deadline`
                     // checks this flag and no-ops.
                     self.head_deadline_armed = false;
+                }
+                ParseProgress::Failed(RequestParseError::BodyTooLarge) => {
+                    self.head_deadline_armed = false;
+                    self.record_body_full();
+                    return self.send_parse_error(RequestParseError::BodyTooLarge);
                 }
                 ParseProgress::Failed(error) => {
                     self.head_deadline_armed = false;
                     return self.send_parse_error(error);
                 }
             }
+        } else {
+            // Head already parsed. Every new byte read is body.
+            let delta = self.read_buf.len() - pre_len;
+            self.charge_request(delta);
         }
 
         self.maybe_dispatch_or_read_more()
@@ -465,6 +564,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         // `Connection: close`).
         self.will_close = self.limits.keepalive_idle_timeout.is_none() || head.connection_close;
 
+        // The body bytes are about to leave this isolate — either
+        // handed to the service buffered, or moved into
+        // `inbound_buffer` for streaming. Either way the charge
+        // accounting flips: buffered releases everything now;
+        // streaming keeps the inbound_buffer slice charged after
+        // re-charging the moved prefix below.
+        self.release_request_all();
+
         // Decide buffered vs streaming dispatch based on the limits.
         let request = match self.limits.inbound_stream_chunk_size {
             Some(chunk_size) if head.content_length > 0 => {
@@ -487,8 +594,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 self.inbound_total = head.content_length;
                 self.inbound_received = buf.len();
                 self.inbound_delivered = 0;
+                let pre_buf_len = buf.len();
                 self.inbound_buffer = buf;
                 self.inbound_chunk_size = chunk_size.max(1);
+                // Streaming: charge the prefix bytes that just moved
+                // from `read_buf` into `inbound_buffer`. Subsequent
+                // body bytes are charged in `handle_body_chunk_read`.
+                self.charge_request(pre_buf_len);
                 let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
                     tina::Address::new_with_generation(
                         self.shard_id_for_self(),
@@ -549,22 +661,38 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     /// - If the buffer is empty and the full body has been delivered,
     ///   reply `Eof`.
     fn handle_request_body_next(&mut self) -> Effect<Self> {
+        if self.body_eof_replied {
+            // Service already saw `Eof`/`Error` once. Don't re-issue
+            // socket reads or double-count metrics; just repeat Eof.
+            return reply(RequestChunkReply::Eof);
+        }
         if self.inbound_delivered >= self.inbound_total {
+            self.body_eof_replied = true;
             return reply(RequestChunkReply::Eof);
         }
         if !self.inbound_buffer.is_empty() {
             return self.serve_chunk_from_buffer();
         }
         // Need to pull more bytes from the socket. Cap the request at
-        // what we still need so the kernel does not over-read.
+        // three independent limits and take the smallest:
+        //   1. Bytes still owed by `Content-Length`. We never want
+        //      to read past the body.
+        //   2. Per-syscall ceiling `READ_CHUNK`. Bounds any one
+        //      read regardless of declared length.
+        //   3. The user's configured `inbound_stream_chunk_size`.
+        //      Without this, a small chunk-size config would
+        //      still let `READ_CHUNK` body bytes sit resident,
+        //      defeating the body-pressure story.
         let want = self
             .inbound_total
             .saturating_sub(self.inbound_received)
-            .min(READ_CHUNK);
+            .min(READ_CHUNK)
+            .min(self.inbound_chunk_size.max(1));
         if want == 0 {
             // Defensive: nothing left to read but delivered != total.
             // Treat as truncation — reply Eof so the service notices
             // via received bytes < expected.
+            self.body_eof_replied = true;
             return reply(RequestChunkReply::Eof);
         }
         match self.transport {
@@ -581,15 +709,33 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let bytes = match result {
             Ok(bytes) => bytes,
             // Surface the typed error so service can tell short
-            // delivery (Eof) from truncation (Error).
-            Err(error) => return reply(RequestChunkReply::Error(error)),
+            // delivery (Eof) from truncation (Error). Distinguish
+            // timeout from other IO errors in the metrics, and
+            // latch eof so a follow-up body_next does not re-issue
+            // the failing read.
+            Err(error) => {
+                match error {
+                    CallError::Timeout => self.record_body_timeout(),
+                    _ => self.record_body_io_error(),
+                }
+                self.body_eof_replied = true;
+                return reply(RequestChunkReply::Error(error));
+            }
         };
         if bytes.is_empty() {
             // Peer closed mid-body. Service notices via `delivered < expected`.
+            // The wire was short, so this is a truncation event from a
+            // metrics standpoint — the server cannot fulfil the
+            // declared length.
+            if self.inbound_delivered + self.inbound_buffer.len() < self.inbound_total {
+                self.record_body_io_error();
+            }
+            self.body_eof_replied = true;
             return reply(RequestChunkReply::Eof);
         }
         self.inbound_received += bytes.len();
         self.inbound_buffer.extend_from_slice(&bytes);
+        self.charge_request(bytes.len());
         self.serve_chunk_from_buffer()
     }
 
@@ -601,6 +747,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .min(remaining_total);
         let chunk: Vec<u8> = self.inbound_buffer.drain(..take).collect();
         self.inbound_delivered += take;
+        // The chunk has left the connection; release its charge.
+        self.release_request(take);
         reply(RequestChunkReply::Chunk(chunk))
     }
 
@@ -622,29 +770,36 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn start_writing(&mut self, response: HttpResponse) -> Effect<Self> {
-        // Encode the head with the declared body length. The body bytes
-        // (or chunks for a streamed body) are written separately so
-        // streaming can pace per-chunk.
+        // Write the head first, then the body. Splitting them keeps
+        // the body-pressure counter honest: `pending_response`
+        // contains *only* head bytes until the head drains, then
+        // we promote the body and charge it. Without this split, a
+        // partial head write would release body charge that hadn't
+        // gone on the wire yet, making `current` lie.
         let head_bytes = encode_response_head(&response, self.will_close);
         match response.body {
             HttpResponseBody::Buffered(body_bytes) => {
-                // Append the buffered body to the head and write it all
-                // through the existing partial-write loop.
-                let mut bytes = head_bytes;
-                bytes.extend_from_slice(&body_bytes);
-                self.pending_response = bytes;
+                self.pending_response = head_bytes;
+                if !body_bytes.is_empty() {
+                    self.pending_buffered_body = Some(body_bytes);
+                }
                 self.write_pending()
             }
             HttpResponseBody::Stream(ResponseStream {
                 content_length,
                 source,
             }) => {
-                // Write the head; once the head has fully drained,
-                // `handle_wrote` will pull the first chunk from the
-                // source and write it.
                 self.pending_response = head_bytes;
                 self.stream_source = Some(source);
                 self.stream_bytes_remaining = content_length;
+                self.stream_chunked = false;
+                self.write_pending()
+            }
+            HttpResponseBody::ChunkedStream(crate::streaming::ChunkedResponseStream { source }) => {
+                self.pending_response = head_bytes;
+                self.stream_source = Some(source);
+                self.stream_bytes_remaining = 0;
+                self.stream_chunked = true;
                 self.write_pending()
             }
         }
@@ -666,17 +821,48 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
         if count == 0 {
+            // Wire stalled with no progress — treat as truncation
+            // when a body was still owed.
+            if self.has_pending_body() {
+                self.record_body_io_error();
+            }
             return self.begin_close();
         }
+        // `pending_response` only ever contains head bytes (no
+        // charge) or body bytes (charged). So whatever we just
+        // sent, releasing `count` against the charge is exact:
+        // head writes release zero (charge is zero); body writes
+        // release exactly the body bytes that drained.
+        let release = count.min(self.metrics_response_charge);
+        self.release_response(release);
         if count >= self.pending_response.len() {
             self.pending_response.clear();
-            // Buffer drained. If we are streaming, pull the next chunk;
-            // otherwise the response is complete — either close or
-            // loop back for the next keepalive request.
-            if self.stream_source.is_some() && self.stream_bytes_remaining > 0 {
+            // Buffer drained. Three cases:
+            //  - buffered body was queued behind the head -> promote
+            //    it, charge once, write it.
+            //  - streaming source still owes bytes -> pull next.
+            //  - nothing left -> either close or loop back for the
+            //    next keepalive request.
+            if let Some(body) = self.pending_buffered_body.take() {
+                let n = body.len();
+                self.pending_response = body;
+                self.charge_response(n);
+                return self.write_pending();
+            }
+            // Streaming branch: pull the next chunk if the source
+            // still owes bytes. For known-length streams this means
+            // `stream_bytes_remaining > 0`; for chunked streams we
+            // pull until the source replies `Eof`.
+            let should_pull = match (self.stream_source.is_some(), self.stream_chunked) {
+                (true, true) => true,
+                (true, false) => self.stream_bytes_remaining > 0,
+                (false, _) => false,
+            };
+            if should_pull {
                 self.pull_next_chunk()
             } else {
                 self.stream_source = None;
+                self.stream_chunked = false;
                 self.finish_response()
             }
         } else {
@@ -705,6 +891,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         self.begin_request_iteration(idle)
     }
 
+    /// True when this connection still owes the wire body bytes —
+    /// either currently queued (`metrics_response_charge`), parked
+    /// behind the head (`pending_buffered_body`), or coming from a
+    /// streaming source.
+    fn has_pending_body(&self) -> bool {
+        if self.metrics_response_charge > 0 || self.pending_buffered_body.is_some() {
+            return true;
+        }
+        match (self.stream_source.is_some(), self.stream_chunked) {
+            (true, true) => true,
+            (true, false) => self.stream_bytes_remaining > 0,
+            (false, _) => false,
+        }
+    }
+
     /// Issues a `call(source, Next, t).reply(StreamChunk)` to pull the
     /// next chunk of a streamed response.
     fn pull_next_chunk(&mut self) -> Effect<Self> {
@@ -717,59 +918,233 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         match outcome {
             CallOutcome::Replied(ResponseChunkReply::Chunk(bytes)) => {
                 if bytes.is_empty() {
-                    // Treat empty chunk like Eof — defensive against
-                    // sources that signal end-of-stream this way.
-                    self.stream_source = None;
-                    return self.finish_response();
+                    // Empty chunk = Eof. For known-length streams a
+                    // short wire is a truncation event; for chunked
+                    // streams it just means "no more data" and we
+                    // emit the terminator.
+                    if !self.stream_chunked && self.stream_bytes_remaining > 0 {
+                        self.record_body_io_error();
+                    }
+                    return self.finish_stream_eof();
                 }
-                if bytes.len() > self.stream_bytes_remaining {
-                    // Source over-produced relative to declared length.
-                    // Truncate to keep the wire framing honest.
-                    let mut truncated = bytes;
-                    truncated.truncate(self.stream_bytes_remaining);
-                    self.stream_bytes_remaining = 0;
-                    self.pending_response = truncated;
+                if self.stream_chunked {
+                    self.write_chunked_data(bytes)
                 } else {
-                    self.stream_bytes_remaining -= bytes.len();
-                    self.pending_response = bytes;
+                    self.write_known_length_chunk(bytes)
                 }
-                self.write_pending()
             }
             CallOutcome::Replied(ResponseChunkReply::Eof) => {
-                // Source finished. The wire `Content-Length` we
-                // already emitted is canonical; the source
-                // under-producing is a contract violation but we
-                // settle cleanly. If keepalive is on and the source
-                // produced exactly the declared length, the next
-                // request can still ride this connection.
-                self.stream_source = None;
-                if self.stream_bytes_remaining > 0 {
-                    // Source ended early. The wire framing now lies
-                    // about the body — don't try to keep this
-                    // connection alive for the next caller.
-                    self.will_close = true;
+                // Source finished. For known-length the declared
+                // Content-Length is canonical; under-produce is a
+                // truncation. For chunked we emit the `0 CRLF CRLF`
+                // terminator and close after it drains.
+                if !self.stream_chunked && self.stream_bytes_remaining > 0 {
+                    self.record_body_io_error();
                 }
-                self.finish_response()
+                self.finish_stream_eof()
             }
-            CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => {
-                // Source died mid-stream. Close the wire — the
-                // client sees a truncated body relative to
-                // `Content-Length`. Force close (do not loop into
-                // keepalive) because the framing is now broken.
+            CallOutcome::Timeout => {
+                // Source took too long to produce the next chunk.
+                // The wire is now in an incomplete state — for
+                // known-length streams the Content-Length is short,
+                // for chunked streams there is no terminator. Both
+                // are user-visible truncations. We record the
+                // *cause* (timeout) and the *symptom*
+                // (io_error/truncation) so a snapshot reader can
+                // see both why and what.
+                self.record_body_timeout();
+                self.record_body_io_error();
                 self.stream_source = None;
-                self.will_close = true;
+                self.stream_chunked = false;
+                self.begin_close()
+            }
+            CallOutcome::Full | CallOutcome::Closed => {
+                // Source died mid-stream. Close the wire — the
+                // client sees a truncated body relative to the
+                // framing. We do not try to inject an error
+                // response on top of an already-emitted head.
+                self.record_body_io_error();
+                self.stream_source = None;
+                self.stream_chunked = false;
                 self.begin_close()
             }
         }
     }
 
+    /// Frames `bytes` for a known-length stream and queues the
+    /// write. Truncates if the source over-produced.
+    fn write_known_length_chunk(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+        let written_bytes = if bytes.len() > self.stream_bytes_remaining {
+            // Source over-produced relative to declared length.
+            // Truncate to keep the wire framing honest.
+            let mut truncated = bytes;
+            truncated.truncate(self.stream_bytes_remaining);
+            self.stream_bytes_remaining = 0;
+            truncated
+        } else {
+            self.stream_bytes_remaining -= bytes.len();
+            bytes
+        };
+        let n = written_bytes.len();
+        self.pending_response = written_bytes;
+        self.charge_response(n);
+        self.write_pending()
+    }
+
+    /// Frames `bytes` as one HTTP/1.1 chunked-transfer chunk:
+    /// `<size in hex>\r\n<bytes>\r\n`. Body charge counts only the
+    /// data bytes, not the framing overhead. Hex digits are
+    /// lowercase for parity with curl/hyper/nginx — the spec
+    /// allows either case but the wire convention is lowercase.
+    fn write_chunked_data(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+        let n = bytes.len();
+        let mut framed = format!("{:x}\r\n", n).into_bytes();
+        framed.extend_from_slice(&bytes);
+        framed.extend_from_slice(b"\r\n");
+        self.pending_response = framed;
+        self.charge_response(n);
+        self.write_pending()
+    }
+
+    /// Source replied `Eof` (or empty chunk). For chunked, queue the
+    /// `0 CRLF CRLF` terminator and let the next `handle_wrote`
+    /// finish once it drains. For known-length, the declared
+    /// `Content-Length` is canonical; if the source produced exactly
+    /// that many bytes the connection can still be reused.
+    fn finish_stream_eof(&mut self) -> Effect<Self> {
+        self.stream_source = None;
+        if self.stream_chunked {
+            self.stream_chunked = false;
+            // Terminator is framing, not body — no charge.
+            self.pending_response = b"0\r\n\r\n".to_vec();
+            self.write_pending()
+        } else {
+            if self.stream_bytes_remaining > 0 {
+                self.will_close = true;
+            }
+            self.finish_response()
+        }
+    }
+
     fn begin_close(&mut self) -> Effect<Self> {
+        // Any body bytes still resident in this isolate are about to
+        // be dropped; release them so the metrics' `current` returns
+        // to zero on a clean shutdown sequence.
+        self.release_request_all();
+        self.release_response_all();
         match self.transport {
             HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpConnectionMsg::Closed),
             HttpTransport::Tls(stream) => {
                 tls_close(stream, self.tls_io_timeout).reply(HttpConnectionMsg::Closed)
             }
         }
+    }
+
+    // --- BodyMetrics helpers --------------------------------------
+
+    fn charge_request(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.charge_request(n);
+            self.metrics_request_charge += n;
+        }
+    }
+
+    fn release_request(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let take = n.min(self.metrics_request_charge);
+        if take == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_request(take);
+        }
+        self.metrics_request_charge -= take;
+    }
+
+    fn release_request_all(&mut self) {
+        if self.metrics_request_charge == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_request(self.metrics_request_charge);
+        }
+        self.metrics_request_charge = 0;
+    }
+
+    fn charge_response(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.charge_response(n);
+            self.metrics_response_charge += n;
+        }
+    }
+
+    fn release_response(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let take = n.min(self.metrics_response_charge);
+        if take == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_response(take);
+        }
+        self.metrics_response_charge -= take;
+    }
+
+    fn release_response_all(&mut self) {
+        if self.metrics_response_charge == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.release_response(self.metrics_response_charge);
+        }
+        self.metrics_response_charge = 0;
+    }
+
+    fn record_body_full(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_body_full();
+        }
+    }
+
+    fn record_body_timeout(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_body_timeout();
+        }
+    }
+
+    fn record_body_io_error(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_body_io_error();
+        }
+    }
+}
+
+// Drop catches isolates abandoned without a clean close path
+// (panic, runtime stop, force-close). Without this, an isolate
+// dropped mid-body would leave its charge resident in the shared
+// metrics forever, breaking the "drained()" terminal assertion.
+impl<S: Shard, M: From<HttpRequest> + Send + 'static> Drop for HttpConnection<S, M> {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            if self.metrics_request_charge > 0 {
+                metrics.release_request(self.metrics_request_charge);
+            }
+            if self.metrics_response_charge > 0 {
+                metrics.release_response(self.metrics_response_charge);
+            }
+        }
+        self.metrics_request_charge = 0;
+        self.metrics_response_charge = 0;
     }
 }
 

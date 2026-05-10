@@ -7,43 +7,115 @@ This file records completed work.
 ### Server-side HTTP/1.1 keep-alive
 
 `tina_http::HttpListener` / `HttpConnection` can now serve multiple
-sequential requests on one TCP/TLS stream. Opt-in via
-`HttpLimits::keepalive_idle_timeout = Some(d)`; `None` (the
-default) keeps the legacy one-request-per-connection behaviour, so
-this is non-breaking.
+sequential requests on one TCP/TLS stream. Opt in with
+`HttpLimits::keepalive_idle_timeout = Some(d)`; `None` keeps the
+legacy one-request-per-connection behavior.
 
 What stays explicit:
-- **Per-request close intent.** HTTP/1.0 default close, an
-  explicit `Connection: close` request header, parse errors, and
-  service-call errors (`Full` / `Closed` / `Timeout`) all force
-  close after the response. A streaming response that ends short
-  of its declared `Content-Length` also forces close — the wire
-  framing lies and the connection cannot be safely reused.
-- **Idle timeout.** Between requests the connection waits up to
-  `keepalive_idle_timeout` for the next request's head to start
-  and complete. On expiry the connection isolate stops cleanly
-  (same path as the existing first-request slow-loris guard); no
-  408 is written because the runtime rejects `tcp_close_stream`
-  while a `tcp_read` is pending.
-- **No pipelining.** Per-request reset between iterations drops
-  any read-ahead bytes; well-behaved HTTP/1.1 clients wait for
-  each response.
-- **Generation-tagged head deadline.** Each iteration bumps a
-  per-connection `request_generation`. The `HeaderDeadline`
-  message carries the generation; stale deadlines from prior
-  iterations are dropped silently. Same pattern as the keepalive
-  client's per-request deadline guard.
+- HTTP/1.0 default close, explicit `Connection: close`, parse errors,
+  service-call errors, and short known-length streaming responses all
+  force close after the response.
+- Between requests, the connection waits up to
+  `keepalive_idle_timeout` for the next request head. Stale head
+  deadlines are generation-tagged and ignored.
+- No pipelining: per-request reset drops read-ahead bytes between
+  iterations.
 
-Tests:
-- 8 integration tests in `tina-http/tests/server_keepalive.rs`
-  drive a hand-rolled `std::net::TcpStream` against the
-  keepalive-enabled `HttpListener`: three sequential requests on
-  one socket, HTTP/1.0 → close, `Connection: close` → close, idle
-  timeout fires deterministically, default config still serves
-  one-then-close, slow-loris on the second request fires the
-  deadline, body cap still enforced per request, mixed
-  GET/POST/echo on one socket.
-- Existing tests unchanged.
+Eight integration tests in `tina-http/tests/server_keepalive.rs` cover
+sequential reuse, close intent, idle timeout, default one-shot behavior,
+slow-loris timeout on a later request, per-request body caps, and mixed
+GET/POST traffic on one socket.
+
+### HTTP/1.1 keepalive pool
+
+`tina-http` now ships a real keepalive pool consumer of the
+`WorkerPool` vocabulary. One TCP (or TLS) connection serves many
+sequential requests; the pool exposes acquire / release / retire /
+close and a pressure report.
+
+What got shorter:
+- An integration-test client that issues three requests against the
+  same origin shares one TCP accept on the server side. (The
+  user-facing wins of keepalive — fewer handshakes per workload —
+  apply when there is a keepalive-capable server to talk to. A
+  user-facing specimen is gated on the planned server-side keepalive
+  work.)
+
+What stayed explicit:
+- Origin keying. `OriginKey` carries scheme + `SocketAddr` + (HTTPS:
+  SNI server name + the DER trust roots stored verbatim — no
+  fingerprint hash, no collision risk). A pool's connections are
+  pre-bound to one `HttpTarget` at registration so cross-origin
+  reuse is impossible at the connection-isolate level: the only
+  way to reach a different origin is to register a different pool.
+- Caps. `PoolConfig::new(capacity, max_waiters)` sizes resources
+  and parked callers; the pool isolate's mailbox size is a separate
+  bound (size to `>= max_waiters + burst`). The connection isolate's
+  mailbox sizes only its own continuations.
+- Reuse vs retire. The connection's `KeepaliveOutcome::Request`
+  carries `must_retire`. Set when the server returned `Connection:
+  close`, the peer EOF'd, or any connect/write/read error fired.
+  **Recommended consumer pattern: always release `Reuse`.** The
+  connection isolate self-heals — it has already dropped the bad
+  transport and will reconnect on the next request. Releasing
+  `Retire` permanently removes the slot and drains pool capacity if
+  done on every must_retire; reserve it for the rare "the
+  connection isolate itself is suspect" case (panic, observed
+  protocol violation).
+- Deadlines. `KeepaliveConnectionMsg::Request { request_timeout }`
+  is the wall-clock budget enforced inside the connection via a
+  generation-tagged `sleep`. Pass `Deadline::remaining_or_zero(now)`
+  from a caller-owned deadline to propagate budgets honestly across
+  hops. No hidden retry, no hidden queue.
+- Close modes. `CloseMode::Drain` blocks new acquires and lets
+  outstanding leases return normally; `Force` retires outstanding
+  leases — late releases get `PoolClosed`.
+- Shutdown. `WorkerPool` does not own connection-isolate lifetime.
+  `build_keepalive_pool` returns a `KeepalivePoolHandles` bundle
+  with the pool address *and* the connection addresses; send
+  `KeepaliveConnectionMsg::Stop` to each connection after pool
+  close so the underlying transports are closed and the isolates
+  exit. Without this, transports leak past pool close.
+
+New surface in `tina_http`:
+- `OriginKey`, `KeepaliveConnection`, `KeepaliveConnectionMsg`,
+  `KeepaliveOutcome`, `KeepaliveConnAddr`, `KeepalivePoolHandles`,
+  `build_keepalive_pool`.
+- `encode_keepalive_request` — sibling of the unchanged
+  `encode_request` for the keepalive caller (omits the
+  `Connection: close` header). The original `encode_request`
+  signature is unchanged; this is a pure addition.
+
+Sixteen integration tests live in `tina-http/tests/keepalive_pool.rs`,
+plus an HTTPS-keepalive smoke (`keepalive_tls_smoke.rs`) and an
+isolate-level DST replay (`dst_keepalive.rs`):
+
+- sequential reuse counted via TCP accept count
+- cross-origin isolation (two pools, two accept counts)
+- stale server-close → `must_retire = true`, reconnect on next call
+- acquire `Full`, acquire-call-timeout & acquire-cancel reclaim of
+  waiter capacity
+- request timeout marks must_retire; **always-Reuse** keeps pool
+  capacity stable; an explicit-Retire test shows the pool removes
+  the slot when asked
+- Drain blocks new acquires; Drain-with-parked-waiters settles
+  waiters as Closed; Force marks outstanding leases stale; Stop
+  after Force closes the underlying transport
+- HTTPS keepalive shares one TLS handshake across three sequential
+  requests
+- multi-slot pool (capacity 2) serves two concurrent acquires with
+  two TCP accepts; `available` returns to 2 after release
+- `OriginKey` distinguishes SNI / trust-root identity
+- `request_timeout` correlates with wall-clock duration (proves the
+  variable controls the failure)
+- `PoolPressureReport` shape across capacity / `Full` / closed
+  transitions
+- DST replay: two passes against the same scripted TCP config
+  produce identical trace fingerprints
+
+The legacy capacity-1 `HttpConnectionPool` is kept as the first
+form for one-request-per-connection admission; it remains useful
+for callers that do not need keepalive.
 
 ### 066A hostile-review fixes
 

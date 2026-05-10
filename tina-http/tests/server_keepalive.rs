@@ -12,7 +12,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tina_http::HttpLimits;
 
@@ -170,10 +170,7 @@ fn three_sequential_requests_share_one_tcp_connection_when_keepalive_on() {
             "keepalive response should not include `Connection: close`; got {text:?}"
         );
     }
-    let resp = round_trip(
-        &mut stream,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut stream, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
     assert_body_ends_with(&resp, "3");
 
@@ -187,10 +184,7 @@ fn http_1_0_client_closes_after_one_response_even_when_keepalive_on() {
     let harness = keepalive_harness();
     let mut stream = open_stream(&harness);
 
-    let resp = round_trip(
-        &mut stream,
-        b"GET /counter HTTP/1.0\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut stream, b"GET /counter HTTP/1.0\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
     let text = std::str::from_utf8(&resp).expect("utf8");
     assert!(
@@ -244,10 +238,7 @@ fn idle_timeout_fires_and_listener_remains_healthy() {
     let harness = keepalive_harness();
     let mut stream = open_stream(&harness);
 
-    let resp = round_trip(
-        &mut stream,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut stream, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
 
     // Wait long enough for the idle deadline to expire and the
@@ -279,16 +270,13 @@ fn idle_timeout_fires_and_listener_remains_healthy() {
     drop(stream);
 
     // Listener is uncorrupted: a fresh request still gets served.
-    let follow = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2))
-        .expect("fresh connect");
+    let follow =
+        TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).expect("fresh connect");
     let mut follow = follow;
     follow
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout");
-    let resp = round_trip(
-        &mut follow,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut follow, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
 
     harness.shutdown();
@@ -302,10 +290,7 @@ fn default_limits_serve_one_request_then_close() {
     let harness = TestHarness::start();
     let mut stream = open_stream(&harness);
 
-    let resp = round_trip(
-        &mut stream,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut stream, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
     // Server forces close because keepalive is off.
     let text = std::str::from_utf8(&resp).expect("utf8");
@@ -332,10 +317,7 @@ fn slow_loris_on_second_request_fires_deadline_via_trace() {
     let harness = keepalive_harness();
     let mut stream = open_stream(&harness);
 
-    let resp = round_trip(
-        &mut stream,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut stream, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
 
     // Send a partial second head (no terminating CRLF CRLF).
@@ -366,15 +348,12 @@ fn slow_loris_on_second_request_fires_deadline_via_trace() {
     drop(stream);
 
     // Listener still serves a follow-up on a fresh connection.
-    let mut fresh = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2))
-        .expect("fresh connect");
+    let mut fresh =
+        TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).expect("fresh connect");
     fresh
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout");
-    let resp = round_trip(
-        &mut fresh,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut fresh, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
 
     harness.shutdown();
@@ -426,10 +405,7 @@ fn keepalive_serves_mixed_get_and_post_with_bodies() {
     let harness = keepalive_harness();
     let mut stream = open_stream(&harness);
 
-    let resp = round_trip(
-        &mut stream,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut stream, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
     assert_body_ends_with(&resp, "0");
 
@@ -447,10 +423,7 @@ fn keepalive_serves_mixed_get_and_post_with_bodies() {
     assert_status(&resp, "200");
     assert_body_ends_with(&resp, "1");
 
-    let resp = round_trip(
-        &mut stream,
-        b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
+    let resp = round_trip(&mut stream, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_status(&resp, "200");
     assert_body_ends_with(&resp, "1");
 

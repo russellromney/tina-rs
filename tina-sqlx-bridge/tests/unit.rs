@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use tina_runtime::CallOutcome;
 use tina_sqlx_bridge::{
-    PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt, PgPoolConfig,
-    PgRequest, PgResponse, PgRow, PgTransientReason, PgValue, U64TooLarge,
+    PgCancelConfig, PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt,
+    PgPoolConfig, PgRequest, PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome,
+    PgTransientReason, PgType, PgValue, U64TooLarge,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,67 @@ fn pg_value_option_some_and_none() {
 }
 
 #[test]
+fn typed_null_builders_match_pg_type() {
+    assert_eq!(PgValue::null_bool(), PgValue::TypedNull(PgType::Bool));
+    assert_eq!(PgValue::null_i64(), PgValue::TypedNull(PgType::I64));
+    assert_eq!(PgValue::null_f64(), PgValue::TypedNull(PgType::F64));
+    assert_eq!(PgValue::null_text(), PgValue::TypedNull(PgType::Text));
+    assert_eq!(PgValue::null_bytes(), PgValue::TypedNull(PgType::Bytes));
+    let v: PgValue = PgType::Bool.into();
+    assert_eq!(v, PgValue::TypedNull(PgType::Bool));
+}
+
+#[test]
+fn typed_null_is_null() {
+    assert!(PgValue::Null.is_null());
+    assert!(PgValue::null_bool().is_null());
+    assert!(PgValue::null_text().is_null());
+    assert!(!PgValue::I64(0).is_null());
+    assert!(!PgValue::Bool(false).is_null());
+}
+
+#[test]
+fn typed_null_accessors_return_none() {
+    // TypedNull is a NULL, not a value — typed accessors return None.
+    assert_eq!(PgValue::null_bool().as_bool(), None);
+    assert_eq!(PgValue::null_i64().as_i64(), None);
+    assert_eq!(PgValue::null_text().as_str(), None);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+fn typed_null_uuid_builder_and_accessor() {
+    let v = PgValue::null_uuid();
+    assert_eq!(v, PgValue::TypedNull(PgType::Uuid));
+    assert!(v.is_null());
+    assert_eq!(v.as_uuid(), None);
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn typed_null_json_builder_and_accessor() {
+    let v = PgValue::null_json();
+    assert_eq!(v, PgValue::TypedNull(PgType::Json));
+    assert!(v.is_null());
+}
+
+#[cfg(feature = "numeric")]
+#[test]
+fn typed_null_numeric_builder_and_accessor() {
+    let v = PgValue::null_numeric();
+    assert_eq!(v, PgValue::TypedNull(PgType::Numeric));
+    assert!(v.is_null());
+}
+
+#[cfg(feature = "time")]
+#[test]
+fn typed_null_temporal_builders() {
+    assert!(PgValue::null_timestamp().is_null());
+    assert!(PgValue::null_timestamptz().is_null());
+    assert!(PgValue::null_date().is_null());
+}
+
+#[test]
 fn pg_value_accessors_match_variant() {
     assert_eq!(PgValue::I64(7).as_i64(), Some(7));
     assert_eq!(PgValue::Bool(true).as_bool(), Some(true));
@@ -87,6 +149,52 @@ fn pg_value_into_consumes_without_clone() {
     let b = PgValue::Bytes(vec![9, 9]);
     assert_eq!(b.into_bytes(), Some(vec![9, 9]));
     assert_eq!(PgValue::I64(1).into_string(), None);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+fn pg_value_uuid_round_trip_through_from_and_accessor() {
+    let id = uuid::Uuid::from_u128(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef);
+    let v: PgValue = id.into();
+    assert_eq!(v, PgValue::Uuid(id));
+    assert_eq!(v.as_uuid(), Some(id));
+    assert_eq!(PgValue::I64(1).as_uuid(), None);
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn pg_value_json_round_trip() {
+    let payload = serde_json::json!({ "k": "v", "n": 7 });
+    let v: PgValue = payload.clone().into();
+    match &v {
+        PgValue::Json(inner) => assert_eq!(inner, &payload),
+        _ => panic!("expected Json"),
+    }
+    assert_eq!(v.as_json(), Some(&payload));
+}
+
+#[cfg(feature = "numeric")]
+#[test]
+fn pg_value_numeric_round_trip() {
+    use core::str::FromStr;
+    let d = rust_decimal::Decimal::from_str("3.14159").unwrap();
+    let v: PgValue = d.into();
+    assert_eq!(v, PgValue::Numeric(d));
+    assert_eq!(v.as_numeric(), Some(d));
+}
+
+#[cfg(feature = "time")]
+#[test]
+fn pg_value_temporal_round_trip() {
+    use time::macros::{date, datetime, time as t};
+    let d = date!(2024 - 03 - 14);
+    let dt = time::PrimitiveDateTime::new(d, t!(09:30:00));
+    let dtz = datetime!(2024-03-14 09:30:00 UTC);
+    assert_eq!(PgValue::from(d).as_date(), Some(d));
+    assert_eq!(PgValue::from(dt).as_timestamp(), Some(dt));
+    assert_eq!(PgValue::from(dtz).as_timestamptz(), Some(dtz));
+    // Wrong-shape accessors return None.
+    assert_eq!(PgValue::from(d).as_timestamp(), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +261,90 @@ fn pg_request_builder_params_replaces_vector() {
     assert_eq!(params, vec![PgValue::Bool(true), PgValue::Null]);
 }
 
+#[test]
+fn pg_step_builder_param_and_replace() {
+    let step = PgStep::execute("UPDATE t SET v = $1 WHERE k = $2")
+        .param(7_i64)
+        .param("seven");
+    match step {
+        PgStep::Execute { params, .. } => {
+            assert_eq!(
+                params,
+                vec![PgValue::I64(7), PgValue::String("seven".into())]
+            );
+        }
+        _ => panic!("expected Execute"),
+    }
+    let replaced = PgStep::fetch_one("SELECT 1")
+        .param(1)
+        .params(vec![PgValue::Bool(false)]);
+    match replaced {
+        PgStep::FetchOne { params, .. } => {
+            assert_eq!(params, vec![PgValue::Bool(false)]);
+        }
+        _ => panic!("expected FetchOne"),
+    }
+}
+
+#[test]
+fn pg_request_transaction_carries_steps() {
+    let req = PgRequest::transaction(vec![
+        PgStep::execute("INSERT INTO t VALUES ($1)").param(1_i64),
+        PgStep::fetch_one("SELECT 1::INT8"),
+    ]);
+    match req {
+        PgRequest::Transaction { steps } => {
+            assert_eq!(steps.len(), 2);
+        }
+        _ => panic!("expected Transaction"),
+    }
+}
+
+#[test]
+fn pg_request_param_is_noop_on_transaction() {
+    // `.param(...)` on a Transaction is a no-op, not a panic. Steps
+    // carry their own parameters.
+    let req = PgRequest::transaction(vec![PgStep::execute("SELECT 1")])
+        .param(99_i64)
+        .params(vec![PgValue::Bool(true)]);
+    match req {
+        PgRequest::Transaction { steps } => assert_eq!(steps.len(), 1),
+        _ => panic!("expected Transaction"),
+    }
+}
+
+#[test]
+fn classify_committed_transaction_succeeds() {
+    use tina_sqlx_bridge::PgTransactionCallOutcome;
+    let outcome: PgTransactionCallOutcome =
+        CallOutcome::Replied(Ok(PgTransactionOutcome::Committed {
+            steps: vec![PgStepOk::Executed { rows_affected: 1 }],
+        }));
+    match outcome.classify() {
+        PgOutcomeClass::Succeeded(PgTransactionOutcome::Committed { steps }) => {
+            assert_eq!(steps.len(), 1);
+        }
+        other => panic!("expected Succeeded(Committed), got {other:?}"),
+    }
+}
+
+#[test]
+fn pg_request_fetch_many_carries_max_rows_and_params() {
+    let req = PgRequest::fetch_many("SELECT * FROM t WHERE k > $1", 100).param(7_i64);
+    match req {
+        PgRequest::FetchMany {
+            sql,
+            params,
+            max_rows,
+        } => {
+            assert!(sql.contains("FROM t"));
+            assert_eq!(max_rows, 100);
+            assert_eq!(params, vec![PgValue::I64(7)]);
+        }
+        _ => panic!("expected FetchMany"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
@@ -199,6 +391,12 @@ fn config_rejects_zero_max_request_params() {
 }
 
 #[test]
+fn config_rejects_zero_max_response_rows() {
+    let cfg = good_config().with_max_response_rows(0);
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroMaxResponseRows));
+}
+
+#[test]
 fn config_rejects_zero_pool_max_connections() {
     let cfg =
         good_config().with_pool(PgPoolConfig::new("postgres://invalid/").with_max_connections(0));
@@ -210,6 +408,27 @@ fn config_rejects_zero_pool_acquire_timeout() {
     let cfg = good_config()
         .with_pool(PgPoolConfig::new("postgres://invalid/").with_acquire_timeout(Duration::ZERO));
     assert_eq!(cfg.validate(), Err(PgConfigError::ZeroPoolAcquireTimeout));
+}
+
+#[test]
+fn config_rejects_zero_cancel_pool_size() {
+    let cfg = good_config().with_cancel(PgCancelConfig::new().with_pool_size(0));
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroCancelPoolSize));
+}
+
+#[test]
+fn config_rejects_zero_cancel_acquire_timeout() {
+    let cfg = good_config().with_cancel(PgCancelConfig::new().with_acquire_timeout(Duration::ZERO));
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroCancelAcquireTimeout));
+}
+
+#[test]
+fn with_cancel_on_timeout_sets_default_acquire_timeout() {
+    let cfg = good_config().with_cancel_on_timeout(2);
+    assert!(cfg.cancel.is_some());
+    let cancel = cfg.cancel.as_ref().unwrap();
+    assert_eq!(cancel.pool_size, 2);
+    assert!(cancel.acquire_timeout > Duration::ZERO);
 }
 
 #[test]

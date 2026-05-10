@@ -245,11 +245,21 @@ fn is_origin_form(target: &str) -> bool {
 
 /// Serialises a response head onto a wire buffer using HTTP/1.1 framing.
 ///
-/// Emits status line + headers + `Content-Length` (taken from the
-/// body's declared length) + optional `Connection: close` + the empty
-/// terminator line. Body bytes are *not* appended — the connection
-/// isolate writes them separately so streaming can write chunk by
-/// chunk.
+/// Emits status line + headers + framing line + optional
+/// `Connection: close` + the empty terminator line. The framing
+/// line is picked from the body variant:
+///
+/// - `Buffered(_)` / `Stream(_)` → `Content-Length: N`.
+/// - `ChunkedStream(_)`         → `Transfer-Encoding: chunked`.
+///
+/// **Caller-supplied `Content-Length` and `Transfer-Encoding`
+/// headers are dropped.** Framing is owned by the body type, not
+/// the caller. If the caller wants chunked, they build a
+/// `ChunkedStream` body; setting `Transfer-Encoding: chunked` on a
+/// `Buffered(_)` body has no effect on the wire.
+///
+/// Body bytes are *not* appended — the connection isolate writes
+/// them separately so streaming can write chunk by chunk.
 pub fn encode_response_head(
     response: &crate::types::HttpResponse,
     connection_close: bool,
@@ -272,7 +282,11 @@ pub fn encode_response_head(
 
     let mut wrote_connection = false;
     for (name, value) in response.headers.iter() {
-        if name == http::header::CONTENT_LENGTH {
+        if name == http::header::CONTENT_LENGTH || name == http::header::TRANSFER_ENCODING {
+            // We pick the framing header based on the body variant,
+            // so a caller-supplied `Content-Length` /
+            // `Transfer-Encoding` is dropped. Anything else we emit
+            // verbatim.
             continue;
         } else if name == http::header::CONNECTION {
             if connection_close {
@@ -285,9 +299,19 @@ pub fn encode_response_head(
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b"Content-Length: ");
-    out.extend_from_slice(response.body.declared_length().to_string().as_bytes());
-    out.extend_from_slice(b"\r\n");
+    // Framing: `Content-Length` when known, `Transfer-Encoding:
+    // chunked` when not. The connection writer follows the same
+    // branch when it frames each chunk on the wire.
+    match response.body.declared_length() {
+        Some(length) => {
+            out.extend_from_slice(b"Content-Length: ");
+            out.extend_from_slice(length.to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        None => {
+            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        }
+    }
     if connection_close && !wrote_connection {
         out.extend_from_slice(b"Connection: close\r\n");
     }
@@ -305,7 +329,8 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
     let mut out = encode_response_head(response, connection_close);
     match &response.body {
         crate::types::HttpResponseBody::Buffered(bytes) => out.extend_from_slice(bytes),
-        crate::types::HttpResponseBody::Stream(_) => {
+        crate::types::HttpResponseBody::Stream(_)
+        | crate::types::HttpResponseBody::ChunkedStream(_) => {
             panic!("encode_response cannot serialise a streaming body; use encode_response_head")
         }
     }
@@ -314,9 +339,23 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
 
 /// Serialises a client-side request onto wire bytes.
 ///
-/// Always emits `Content-Length` (zero when no body) and `Connection:
-/// close` — one request per connection, no keep-alive on the client.
+/// Always emits `Content-Length` (zero when no body) and
+/// `Connection: close` — one request per connection, no keep-alive
+/// on the client. For the keepalive caller use
+/// [`encode_keepalive_request`]. Caller-supplied `Connection` and
+/// `Content-Length` headers are dropped — the encoder owns framing.
 pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
+    encode_request_internal(request, true)
+}
+
+/// Like [`encode_request`] but omits `Connection: close` so HTTP/1.1
+/// keep-alive defaults apply and the server holds the socket open
+/// for the next request. Used by [`crate::KeepaliveConnection`].
+pub fn encode_keepalive_request(request: &HttpRequest) -> Vec<u8> {
+    encode_request_internal(request, false)
+}
+
+fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec<u8> {
     let body_bytes: &[u8] = match &request.body {
         crate::types::HttpRequestBody::Buffered(bytes) => bytes,
         crate::types::HttpRequestBody::Stream(_) => {
@@ -337,10 +376,6 @@ pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
     out.extend_from_slice(version_str.as_bytes());
     out.extend_from_slice(b"\r\n");
 
-    // Always force `Connection: close` and our own `Content-Length`.
-    // The client reads to EOF, so a user-supplied `keep-alive` would
-    // hang the read until `request_timeout`. Drop both from user input
-    // and re-emit ours.
     for (name, value) in request.headers.iter() {
         if name == http::header::CONTENT_LENGTH || name == http::header::CONNECTION {
             continue;
@@ -353,7 +388,9 @@ pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
     out.extend_from_slice(b"Content-Length: ");
     out.extend_from_slice(body_bytes.len().to_string().as_bytes());
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(b"Connection: close\r\n");
+    if connection_close {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body_bytes);
     out
@@ -817,9 +854,22 @@ mod tests {
     }
 
     #[test]
+    fn encode_keepalive_request_omits_connection_header() {
+        // The keepalive caller (pool consumer) gets a wire body with
+        // no `Connection: close`; HTTP/1.1 default is keep-alive, so
+        // the server holds the socket open for the next request.
+        let req = HttpRequest::get("/x").build();
+        let bytes = encode_keepalive_request(&req);
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(!text.contains("Connection: close"));
+        assert!(text.contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
     fn encode_request_overrides_user_keep_alive() {
-        // First-form client reads to EOF. A `keep-alive` user header
-        // would hang the read; encoder must drop it and emit `close`.
+        // Caller-supplied `Connection` is always dropped; framing is
+        // owned by the encoder. Caller-supplied `Content-Length` is
+        // also dropped in favour of the actual body length.
         let req = HttpRequest::get("/x")
             .header("Connection", "keep-alive")
             .header("Content-Length", "999")

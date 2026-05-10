@@ -11,10 +11,22 @@ The rule:
 
 If you can use a native Tina crate, do. Native HTTPS/1.1 lives in
 `tina-http`'s `HttpsListener` and `HttpClient` — explicit DER cert
-config, typed startup, matchable TLS errors. Reach for a bridge
-when you need HTTP/2, ALPN, system trust roots, redirects/cookies,
-an existing Axum app, or a third-party SDK that only ships a Tokio
-client.
+config, typed startup, matchable TLS errors. For repeated outbound
+requests against the same origin, `tina_http::build_keepalive_pool`
+hands you a `KeepalivePoolHandles { pool, connections }`: one TCP
+(or TLS) connection per pool slot serves many requests, with
+`acquire` / `release` / `retire` / `close` and a pressure report.
+Each connection isolate is bound to one origin at construction —
+scheme + `SocketAddr` + (HTTPS) SNI + the configured DER trust
+roots themselves — so cross-origin reuse cannot happen at the
+connection-isolate level. The recommended consumer pattern is
+always release `Reuse`; the connection self-heals on
+`must_retire = true` (drops the bad transport, reconnects on the
+next request). Send `KeepaliveConnectionMsg::Stop` to each
+address in `handles.connections` on shutdown so transports close
+promptly. Reach for a bridge when you need HTTP/2, ALPN, system
+trust roots, redirects/cookies, an existing Axum app, or a
+third-party SDK that only ships a Tokio client.
 
 ## What ships today
 
@@ -24,7 +36,7 @@ client.
 | `tina-tower-bridge` | `tower::Service` over a Tina bridge | An Axum/Hyper/Tower stack wants to call a Tina service through normal Tower middleware. |
 | `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; reqwest covers everything else. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
-| `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first, `Execute` and `FetchOne` only in first form. Transactions, streaming rows, generic `sqlx::Database`, and DB-side cancellation are non-goals. |
+| `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
 
 Each crate is small, opt-in, and bounded. Native Tina crates
 (`tina-http`, etc.) do not depend on any bridge; bridges do not leak
@@ -194,16 +206,12 @@ budget, and backoff.
 
 ### `tina-sqlx-bridge` — Tina → Postgres
 
-Adoption bridge for Postgres. Not a native Tina DB client. SQLx owns
-the connection pool, the wire protocol, and TLS; the bridge owns
-bounded ingress, per-attempt deadline, late-result truth, and typed
-failures.
+Adoption bridge. SQLx owns the pool, the wire, and TLS. The bridge
+owns bounded ingress, the per-attempt deadline, late-result truth,
+and typed failures.
 
 ```rust
-use tina_sqlx_bridge::{
-    PgAddress, PgConfig, PgExecutedOutcome, PgPoolConfig, PgWorker,
-    execute_call, fetch_one_call,
-};
+use tina_sqlx_bridge::{PgConfig, PgPoolConfig, PgWorker, execute_call};
 
 let cfg = PgConfig::new()
     .with_pool(PgPoolConfig::new(env::var("DATABASE_URL")?))
@@ -211,39 +219,35 @@ let cfg = PgConfig::new()
     .with_default_timeout(Duration::from_secs(2));
 let bridge = PgWorker::<SingleShard>::install(&runtime, cfg)?;
 
-// Inside a handler:
-execute_call(
-    self.db,
-    "INSERT INTO t (k, v) VALUES ($1, $2)",
-    vec![1.into(), "hello".into()],
-    Duration::from_secs(2),
-)
-.reply(AppMsg::Inserted);
+// In a handler:
+execute_call(self.db, "INSERT INTO t (k, v) VALUES ($1, $2)",
+    vec![1.into(), "hello".into()], Duration::from_secs(2))
+    .reply(AppMsg::Inserted);
 ```
 
-First form is **Postgres-first**: `Execute` and `FetchOne` only. The
-bridge speaks SQLx 0.8's runtime-checked `sqlx::query(...)`; no
-`query!` macros, no offline metadata, no compile-time database
-dependency. Transactions, streaming rows, generic `sqlx::Database`,
-user-struct mapping, ORM/migrations, and DB-side cancellation are
-explicit non-goals.
+Runtime-checked SQLx (`sqlx::query(...)`). No `query!` macros, no
+offline metadata, no DB needed at compile time.
 
-**Two install paths.**
+**Operations.**
 
-- `PgWorker::install(&runtime, cfg)` builds an `sqlx::PgPool` and
-  small Tokio runtime from `PgConfig::pool`. Use when the bridge is
-  the only consumer.
-- `PgWorker::install_with_pool(&runtime, cfg, pool, tokio_handle)`
-  wraps a caller-supplied pool. The supplied pool owns its SQLx
-  settings (`max_connections`, `acquire_timeout`, TLS); the bridge
-  does not re-apply `PgConfig::pool` on this path. SQLx 0.8 spawns
-  pool maintenance tasks at construction, so the supplied pool must
-  be built inside an active Tokio context.
+| Request | Returns | Notes |
+| --- | --- | --- |
+| `Execute` | `rows_affected` | row-less statement |
+| `FetchOne` | `Row` / `NoRows` / `TooManyRows` | streams at most two rows; never buffers a large result set |
+| `FetchMany { max_rows }` | `Rows { rows, truncated }` | reads `max_rows + 1` then stops; effective cap clamped by `max_response_rows` |
+| `Transaction { steps }` | `Committed { steps }` / `RolledBack { failed_at, error, completed }` | atomic script; no nesting |
 
-**Tina caps vs SQLx pool caps.** Both layers report independently:
+Helpers project the response shape away: `execute_call` → `u64`,
+`fetch_one_call` → `Option<PgRow>`, `fetch_many_call` → `PgRows`,
+`transaction_call` → `PgTransactionOutcome`. Each helper has a
+`PgOutcomeExt::classify` impl that sorts outcomes into Succeeded /
+Transient / Fatal for caller-owned retry. Classifier does not
+retry.
+
+**Errors.**
 
 ```text
-mailbox_capacity   -> CallError::TargetFull (Tina ingress)
+mailbox full       -> CallError::TargetFull (Tina ingress)
 max_in_flight      -> PgError::Full
 per-attempt clock  -> PgError::Timeout
 pool acquire clock -> PgError::PoolAcquireTimeout
@@ -254,52 +258,66 @@ too many rows      -> PgError::TooManyRows
 worker closed      -> PgError::Closed
 ```
 
-`Full` is **not** `PoolAcquireTimeout`. Tina's `max_in_flight` cap
-and SQLx's `acquire_timeout` are different bottlenecks; the bridge
-surfaces them separately so retry/backoff decisions can be honest.
+`Full` is not `PoolAcquireTimeout`. Tina admission and SQLx pool
+acquire are different bottlenecks.
 
-**Timeout layers.**
+**Timeouts.** Three different ones:
 
-- `CallOutcome::Timeout` (caller side): the *caller's* IsolateCall
-  deadline elapsed. The bridge does not see this; the runtime drops
-  the eventual reply as `CallReplyRejected` and that truth lives in
-  the trace.
-- `PgError::Timeout` (worker side): the bridge's *per-attempt*
-  deadline (`PgConfig::default_timeout`) elapsed. The bridge
-  detaches the result receiver, surfaces `PgError::Timeout`, and
-  bumps `timeouts`. The spawned SQLx future is **not** aborted; it
-  runs to natural completion. When it finishes, `late_results`
-  bumps and the actual worker-terminal counter (`responses_*`,
-  `sqlx_errors`, `decode_errors`, etc.) increments — that's the
-  honest record of what Postgres actually did, even though the
-  caller already moved on.
-- `PgError::PoolAcquireTimeout`: SQLx's pool deadline
-  (`PgPoolConfig::acquire_timeout`) elapsed before a connection was
-  available.
+- `CallOutcome::Timeout` — the *caller's* IsolateCall deadline.
+  Bridge does not see it; the runtime drops the late reply,
+  visible in the trace.
+- `PgError::Timeout` — the *bridge's* per-attempt deadline. Bridge
+  detaches the receiver and replies. The SQLx future runs to
+  natural completion; when it does, `late_results` bumps and the
+  real outcome lands in the worker-terminal counter.
+- `PgError::PoolAcquireTimeout` — SQLx's pool deadline.
 
-**Cancellation non-claim.** Once a query reaches Postgres, the bridge
-cannot stop it. The per-attempt timeout detaches the spawned task's
-result receiver but does **not** abort the future or issue a
-Postgres `CancelRequest`; the SQLx future runs to natural
-completion and the connection stays held until then. DB-side
-`CancelRequest` is its own design pass and an explicit non-goal in
-first form. Treat `PgError::Timeout` as "Tina stopped waiting,"
-not "the database stopped working."
+**Cancellation.** Default off: Postgres keeps running the query
+past `PgError::Timeout`. The connection stays held until SQLx
+returns. Treat `PgError::Timeout` as "Tina stopped waiting," not
+"the database stopped."
 
-**`outcome.classify()`** (via `PgOutcomeExt`) returns
-`PgOutcomeClass::{Succeeded, Transient(reason), Fatal(reason)}` for
-caller-owned retry loops: `WorkerTimeout`, `PoolAcquireTimeout`, and
-`BridgeTimeout` are transient; `Full`, `Closed`, `TooManyRows`,
-`Decode`, `Sqlx`, `BridgeFull`, `BridgeClosed` are fatal. The
-classifier does not retry — caller owns idempotency, budget, and
-backoff.
+Opt-in via `PgConfig::with_cancel_on_timeout(pool_size)`. The
+bridge builds a sidecar pool from the same URL and fires
+`pg_cancel_backend(pid)` on timeout. Cost: one extra round trip
+per request to capture the backend PID. `db_cancels_sent` counts
+attempts. Best-effort — Postgres may not honor it, and a small
+race exists between cancel firing and the target connection
+returning to the pool. Only the `install` path honors this;
+`install_with_pool` silently ignores it.
 
-**SQLite vs Postgres.** Use `tina-sqlite-bridge` for in-process
-SQLite. SQLite is sync C; one blocking connection, one std thread,
-no async pool, no two-runtime cost. Use `tina-sqlx-bridge` when the
-target is a real Postgres server. The Postgres bridge pays for
-SQLx's Tokio runtime and connection-pool latency; the SQLite bridge
-does not.
+**Two install paths.**
+
+- `install(&runtime, cfg)` — bridge builds the pool and a small
+  Tokio runtime from `cfg`.
+- `install_with_pool(&runtime, cfg, pool, handle)` — caller
+  supplies both. SQLx settings on the supplied pool are caller-
+  owned. The pool must be built inside an active Tokio context
+  (SQLx 0.8 spawns maintenance tasks at construction).
+
+**Value types.** Boring core (`bool`, `i64`, `f64`, `String`,
+`Vec<u8>`) ships always. Wider types are cargo features:
+
+- `uuid` — `UUID`
+- `json` — `JSON` and `JSONB` (both → `serde_json::Value`; bind
+  sends `JSONB`)
+- `numeric` — `NUMERIC` (`rust_decimal::Decimal`, ~28 digits)
+- `time` — `TIMESTAMP`, `TIMESTAMPTZ`, `DATE`
+
+Each feature pulls the matching SQLx feature. A column whose type
+isn't enabled returns `PgError::Decode` with a hint at the cargo
+feature that fixes it. Nothing is silently coerced.
+
+**NULLs.** `PgValue::Null` sends `INT8 NULL`. Postgres infers the
+actual type from context most of the time. When it can't (a
+positional NULL into a non-INT8 column without a SQL cast),
+`PgValue::TypedNull(PgType::X)` — or shorthand `PgValue::null_*()`
+— sends a NULL with the right wire type oid. Decode always lands
+in `PgValue::Null` regardless of how the NULL was bound.
+
+Non-goals: generic `sqlx::Database`, ORM, migrations, struct
+mapping, a transaction *handle* (vs. atomic script). See the
+phase plan for the why.
 
 ## What bridges preserve and weaken
 
