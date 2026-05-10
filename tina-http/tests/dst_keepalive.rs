@@ -183,6 +183,7 @@ fn keepalive_connection_replays_byte_identical() {
             let body = match response.body {
                 HttpResponseBody::Buffered(b) => b,
                 HttpResponseBody::Stream(_) => Vec::new(),
+                HttpResponseBody::ChunkedStream(_) => Vec::new(),
             };
             assert_eq!(body, b"hello");
         }
