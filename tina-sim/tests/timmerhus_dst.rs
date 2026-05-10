@@ -580,16 +580,15 @@ const REMOTE_FULL_TRACE_HASH_PIN: u64 = 0x0300_4e4d_26f6_ddf3;
 
 fn remote_full_pressure_case() -> ReplayCase<PressureOp> {
     let history = remote_full_pressure_history();
-    ReplayCase {
-        name: "timmerhus remote full pressure",
-        seed: history.seed(),
-        config: ReplayConfig::default(),
-        scenario: "one cross-shard burst into a capacity-1 shard pair under default config",
-        history,
-        expected_event_count: REMOTE_FULL_EVENT_COUNT,
-        expected_trace_hash: REMOTE_FULL_TRACE_HASH,
-        invariant: "remote-shard pair `Full` shows up exactly once and target keeps the first value",
-    }
+    ReplayCase::new(
+        "timmerhus remote full pressure",
+        history.seed(),
+        ReplayConfig::default(),
+        "one cross-shard burst into a capacity-1 shard pair under default config",
+        history.operations().to_vec(),
+        "remote-shard pair `Full` shows up exactly once and target keeps the first value",
+    )
+    .expecting(REMOTE_FULL_EVENT_COUNT, REMOTE_FULL_TRACE_HASH)
 }
 
 fn run_remote_full_pressure_case(

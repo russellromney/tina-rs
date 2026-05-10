@@ -49,6 +49,16 @@ This file records completed work.
   bare `History` to `assert_replay_case` + `ReplayCase` so the new
   shape is the way for new DST tests, not just an alternative
   parallel API.
+- Added ergonomic helpers driven by real-use friction:
+  `ReplayCase::new(...).expecting(count, hash)` builds the case and
+  the bundled `History` from one set of name+seed inputs;
+  `ReplayCase::simulator_config()` returns a `SimulatorConfig` with
+  `case.seed` already set so the runner is one line;
+  `ReplayConfig::with_faults(...)` and `with_mailbox(role, cap)`
+  replace nested struct literals; `observe_replay_case` plus
+  `ReplayReport::pinned_constants()` are the blessed discovery path
+  for first constants; the user guide gains a "Pick Your Op
+  Alphabet" section that names the mental move.
 
 ### Phase 065 Observability First Form
 

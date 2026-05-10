@@ -49,43 +49,69 @@ DST is not one huge random test. It is a normal debug loop:
 The user should not feel like they are using a simulator API. They
 should feel like they are putting a bug in a box.
 
+## Pick Your Op Alphabet
+
+Before any of the rest of this matters, you have to map the real
+service onto a small explicit `enum Op { ... }`. This is the mental
+move. Everything else is ceremony.
+
+Rules:
+
+- one variant per externally-visible action: ingress message, kicked
+  burst, drained step, scripted IO arrival, deliberate clock advance.
+  Do not make ops that just "let the simulator run for a while" —
+  that hides timing the seeded faults need.
+- each op must have a visible effect on the trace. Deleting an op
+  must change the event count or trace hash. If a shrink reduces the
+  history to one op without breaking the bug, the other ops were
+  decorative; rebuild the alphabet.
+- keep ops small and copy-friendly. `Op::Burst { size: 4 }` over
+  `Op::BurstFour`. `Op::Tick(u32)` over six numbered variants.
+- match isolate roles, not handler internals. The runner translates
+  `Op::Burst` into "send the burst message to the source isolate";
+  the case never reaches inside an isolate's state.
+
+A good alphabet usually has three or four variants: one or two
+"queue work", one "drain time", maybe one "introduce pressure". The
+`burst overflow` saved case (`tina-sim/tests/saved_replay_cases.rs`)
+is `Burst { size }` and `Step`. The `eiffel_replay_dst` example is
+`Tick(u32)` and `Drain`. Both fit on one screen.
+
+When the alphabet feels right, the case literal reads like a script
+of the bug — and the shrink output reads like the smallest script
+that still proves it.
+
 ## A ReplayCase Is A Bug In A Box
 
 `tina_sim::dst::ReplayCase<Op>` is plain data. Everything needed to
-redo a failure is visible:
+redo a failure is visible. Use `ReplayCase::new(...).expecting(...)`
+plus `ReplayConfig::with_faults(...).with_mailbox(...)` so the name
+and seed are typed once and the config builds in three lines:
 
 ```rust
-use tina_sim::dst::{History, ReplayCase, ReplayConfig};
-use tina_sim::SimulatorConfig;
+use tina_sim::dst::{ReplayCase, ReplayConfig};
+
+const SOURCE: &str = "source";
+const SINK: &str = "sink";
 
 fn case() -> ReplayCase<Op> {
-    let config = ReplayConfig {
-        simulator: SimulatorConfig {
-            faults: my_faults(),
-            // tcp/udp/dns/tls/signal/process/storage scripted configs
-            // also live here when a case needs them.
-            ..SimulatorConfig::default()
-        },
-        // Per-isolate mailbox capacities, keyed by a runner-chosen
-        // role name. Missing entries panic loudly inside the runner.
-        mailboxes: [("source", 8), ("sink", 2)].into_iter().collect(),
-    };
-    ReplayCase {
-        name: "mailbox full under local-send delay",
-        seed: 42,
+    let config = ReplayConfig::with_faults(my_faults())
+        .with_mailbox(SOURCE, 8)
+        .with_mailbox(SINK, 2);
+    ReplayCase::new(
+        "mailbox full under local-send delay",
+        42,
         config,
-        scenario: "burst of sends races a delayed delivery round",
-        history: History::new(
-            "mailbox full under local-send delay",
-            42,
-            vec![Op::Burst, Op::Burst, Op::Drain],
-        ),
-        expected_event_count: 47,
-        expected_trace_hash: 0x9c4f_2d18_aabb_ccdd,
-        invariant: "remote_full rejection appears in the trace",
-    }
+        "burst of sends races a delayed delivery round",
+        vec![Op::Burst, Op::Burst, Op::Drain],
+        "remote_full rejection appears in the trace",
+    )
+    .expecting(47, 0x9c4f_2d18_aabb_ccdd)
 }
 ```
+
+Role names for mailboxes live as `const &'static str` next to the
+case so a typo is one find/replace, not a silent runtime panic.
 
 Rules the case must obey:
 
@@ -93,40 +119,43 @@ Rules the case must obey:
   history are explicit Rust data — nothing the runner needs to
   reproduce the bug lives outside the case
 - `case.name` and `case.seed` must match `case.history.name()` /
-  `case.history.seed()`; `check_replay_case` debug-asserts this
+  `case.history.seed()`; `ReplayCase::new` enforces this and
+  `check_replay_case` debug-asserts it
 - `expected_event_count` and `expected_trace_hash` are pinned with
-  conscious review, not generated
+  conscious review, not generated — see [Discover The Constants](#discover-the-constants)
 - the trace hash uses `tina_runtime::stable_trace_hash`, never debug
   strings
 - live-only knobs do not belong in `ReplayConfig`
 
-A case is pasteable as Rust data — copy the `ReplayCase { ... }`
-literal into another file, rebuild, and the bug travels.
+A case is pasteable as Rust data — copy the `case()` function into
+another file, rebuild, and the bug travels.
 
 The `Display` impls on `SweepFailure`, `ShrinkReport`, and
 `ReplayMismatch` print the case as readable lines (not as Rust source).
 That output is for bug reports and PR descriptions; for code, copy the
 `case()` function itself.
 
+For more nuance — when to keep `ReplayCase { ... }` struct literals,
+when to skip `.expecting(...)`, how `ReplayConfig` composes with
+scripted IO — the public docs on the types are the source of truth.
+
 ## The Runner
 
-The runner is a normal function:
+The runner is a normal function. `case.simulator_config()` returns a
+`SimulatorConfig` with the case's seed already set, so the runner is
+short:
 
 ```rust
 use tina_sim::dst::{ReplayCase, ReplayReport};
 
 fn run_case(case: &ReplayCase<Op>) -> ReplayReport<MyProjection> {
-    // The case carries the full SimulatorConfig; the runner only has
-    // to override seed (so the case's seed wins).
-    let mut config = case.config.simulator.clone();
-    config.seed = case.seed;
-    let mut sim = Simulator::new(MyShard, config);
+    let mut sim = Simulator::new(MyShard, case.simulator_config());
 
     // Mailbox capacities come from the case too. `mailbox(role)`
     // panics loudly if the case forgot to declare a role.
     let sink = sim.register_with_mailbox_capacity(
         Sink::default(),
-        case.config.mailbox("sink"),
+        case.config.mailbox(SINK),
     );
 
     // drive case.history.operations(), etc.
@@ -138,6 +167,32 @@ fn run_case(case: &ReplayCase<Op>) -> ReplayReport<MyProjection> {
 
 `ReplayReport::from_case_and_events` fills in event count and trace
 hash. The runner only owns the projection.
+
+## Discover The Constants
+
+A new case needs an `expected_event_count` and an
+`expected_trace_hash` that nobody can guess in advance. The blessed
+discovery shape is `observe_replay_case` — it runs once, returns the
+report, does not compare against anything:
+
+```rust
+use tina_sim::dst::observe_replay_case;
+
+#[test]
+#[ignore] // run once to discover, then chain `.expecting(...)` on the case
+fn pin_constants() {
+    let report = observe_replay_case(&case(), run_case);
+    println!("{}", report.pinned_constants());
+    // prints two lines, e.g.
+    //   expected_event_count: 34
+    //   expected_trace_hash: 0xe22d12a51cd8cf10
+}
+```
+
+Then chain `.expecting(34, 0xe22d_12a5_1cd8_cf10)` on the
+`ReplayCase::new(...)` call, drop the `#[ignore]` test, and use
+`assert_replay_case` for the regression. The next time the trace
+shape drifts, the panic tells you what to look at.
 
 ## Run Same Case Twice
 
@@ -302,8 +357,11 @@ Good Tina simulation targets:
 ## See Also
 
 - `examples/eiffel_replay_dst` — the copyable specimen.
-- `tina_sim::dst` module — `History`, `ReplayCase`, `ReplayReport`,
-  `ReplayConfig`, `assert_replay_case`, `check_replay_case`,
-  `sweep_seeds`, `shrink_replay_case`, `assert_replays`,
-  `delete_shrink`, `InvariantSuite`.
+- `tina_sim::dst` module — `History`, `ReplayCase` (with `new` /
+  `expecting` / `simulator_config`), `ReplayReport` (with
+  `from_case_and_events` / `pinned_constants`), `ReplayConfig` (with
+  `with_faults` / `with_mailbox` / `mailbox`), `observe_replay_case`,
+  `assert_replay_case`, `check_replay_case`, `sweep_seeds`,
+  `shrink_replay_case`, `assert_replays`, `delete_shrink`,
+  `InvariantSuite`.
 - `tina_runtime::stable_trace_hash` — the canonical fingerprint.
