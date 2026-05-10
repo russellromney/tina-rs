@@ -408,6 +408,53 @@ and remain the right place to push first.
 **Revisit when:** an HTTP keepalive consumer or a third pool
 specimen wants either shape.
 
+### 20. HTTP body-streaming ergonomics — first round shipped
+
+**Surfaced by:** `specimen_http_body_streaming`.
+
+Two ergonomic gaps showed up in the first specimen and got fixed
+in this slice:
+
+- **Hand-rolling an `Isolate` just to yield bytes.** A single-route
+  streamed response needed two custom isolates: a chunk source
+  with `tina::isolate_types!` + `ResponseChunkMsg`/`ResponseChunkReply`
+  arms, plus the request handler. Wrapping any
+  `Iterator<Item = Vec<u8>>` is now `IterBodySource::new(iter)`;
+  no `Isolate` impl. The handler still names the framing
+  (`stream_known_length` / `stream_chunked`), so the choice is
+  visible without macro magic.
+- **Framing was a struct literal, not a typed choice.** Callers
+  built `ResponseStream { content_length: ..., source }` with no
+  hint that an "unknown length" shape existed. Loud constructors
+  (`HttpResponse::stream_known_length` and
+  `HttpResponse::stream_chunked`) make the call site name the
+  framing; a chunked response is `Transfer-Encoding: chunked` on
+  the wire with the connection writing the terminator on `Eof`.
+
+What still needs work but is deferred:
+
+- **Cancel signal from connection back to source.** When the wire
+  fails mid-stream the source isolate is left idle. `body_io_error_count`
+  records the failure visibly, but the source itself has no
+  notification — fine for stateless iterators, awkward for
+  sources that hold resources (file handles, downstream RPCs).
+  Adding `ResponseChunkMsg::Cancel` plus the connection's
+  `Outbound` capability needs more design; recorded as a
+  follow-up.
+- **Live metrics ticks.** `BodyMetrics::snapshot()` is callable
+  from any thread at any time (the counter is `Arc`-backed), but
+  there is no built-in periodic emit. A `runtime.metrics_tick(D)`-
+  shaped helper or a generic capacity-tick channel belongs in the
+  observability slice, not here.
+- **Chunked decoding on the HTTP/1 client.** Server can emit
+  chunked; the client still rejects chunked responses as
+  `UnsupportedTransferEncoding`. Symmetric support is a separate
+  slice with its own decoder + tests.
+
+**Status:** shipped (server-side chunked emit, `IterBodySource`,
+loud-API constructors, `body_io_error_count` proves mid-stream
+client close).
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
