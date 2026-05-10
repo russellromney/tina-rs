@@ -2,7 +2,7 @@
 
 ## Status
 
-- Done: design drafted from Eiffel worker-pool, sharded, reqwest, and DB bridge
+- Done: design drafted from Specimen worker-pool, sharded, reqwest, and DB bridge
   pressure.
 - In progress: blocked on 066 cancellation/deadline vocabulary for final API.
 - Open: implement one bounded pool primitive after 066 first form lands.
@@ -362,17 +362,17 @@ Proof:
 - worker failure path retires lease or produces a typed release rejection;
 - pressure report shows leased/waiter/retired/full counts.
 
-## Rock 7: Eiffel Migration
+## Rock 7: Specimen Migration
 
 Update existing pool-shaped specimens first. Do not create a new specimen unless
 the existing ones cannot honestly show the new pool model.
 
 Primary targets:
 
-- `eiffel_dynamic_worker_pool`;
-- `eiffel_graceful_pool_shutdown`.
+- `specimen_dynamic_worker_pool`;
+- `specimen_graceful_pool_shutdown`.
 
-Only add a new `eiffel_bounded_worker_pool` if both existing examples are too
+Only add a new `specimen_bounded_worker_pool` if both existing examples are too
 pedagogical or too specialized to carry the lesson.
 
 README must compare:
@@ -428,6 +428,6 @@ tests/examples for the parts that do not need cancellation.
 - stale/double release is rejected visibly;
 - close modes and resource-health policy are documented and tested;
 - pressure report exists;
-- one Eiffel example uses the pool;
+- one Specimen example uses the pool;
 - DB/HTTP/AWS pool follow-ups can reuse the vocabulary instead of inventing
   their own.

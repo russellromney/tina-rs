@@ -79,7 +79,7 @@ rejection appears.
 
 ## Worked example: the chat-room miss
 
-`examples/eiffel_real_io_chat`'s first draft sized its connection mailbox
+`examples/specimen_real_io_chat`'s first draft sized its connection mailbox
 at the obvious "one slot per concurrent operation" value. Each connection
 issued a burst of 64 `send_observed(...).reply(...)` calls into a fanout.
 The isolate could not absorb 64 reply messages before it could finish

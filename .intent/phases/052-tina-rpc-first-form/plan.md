@@ -158,7 +158,7 @@ Compromise:
    - out-of-order replies;
    - saved seed for at least one reordered history.
 
-7. **Eiffel RPC Comparison**
+7. **Specimen RPC Comparison**
 
    Add comparison:
 

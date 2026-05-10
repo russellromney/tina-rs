@@ -7,7 +7,7 @@ Design only. No code shipped.
 ## Goal
 
 Replace per-hop "outer = inner + slack" math in
-`eiffel_backpressure_chain` with one absolute deadline value.
+`specimen_backpressure_chain` with one absolute deadline value.
 Each hop converts to its own remaining `Duration` at the call
 site.
 
@@ -71,5 +71,5 @@ clock abstraction and build `Deadline` on that clock.
 - Past deadline saturates to `Duration::ZERO`.
 - zero-duration deadline is expired.
 - remaining time decreases according to the chosen clock.
-- Migrated `eiffel_backpressure_chain` no longer threads a
+- Migrated `specimen_backpressure_chain` no longer threads a
   per-hop `Duration` through messages.

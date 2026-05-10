@@ -249,9 +249,9 @@ cargo run --example tcp_echo -p tina-runtime
 Run the paired Tokio-vs-Tina comparisons:
 
 ```bash
-cargo run --manifest-path examples/eiffel_mini_keyspace/Cargo.toml -- compare
-cargo run --manifest-path examples/eiffel_supervised_worker/Cargo.toml -- compare
-cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- compare
+cargo run --manifest-path examples/specimen_mini_keyspace/Cargo.toml -- compare
+cargo run --manifest-path examples/specimen_supervised_worker/Cargo.toml -- compare
+cargo run --manifest-path examples/specimen_replay_dst/Cargo.toml -- compare
 ```
 
 `make` targets:
@@ -271,7 +271,7 @@ cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- compare
 | [`tina-runtime/examples/tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs) | Runtime-owned TCP from listener through connection close, including bounded multi-client overlap. |
 | [`tina-tokio-bridge/examples/llama_bridge.rs`](tina-tokio-bridge/examples/llama_bridge.rs) | Bridging an existing Tokio/axum app into a Tina-supervised core. |
 
-The [`examples/`](examples/) directory at the repo root contains **Eiffel**:
+The [`examples/`](examples/) directory at the repo root contains **specimens**:
 paired Tokio-vs-Tina implementations of common service shapes (chat fanout,
 key/value store, axum counter, supervised worker, persistent counter,
 deterministic replay, outbound fetch, graceful shutdown, and more). They are
@@ -279,7 +279,7 @@ specimens for feel and behavior, not a shared harness prison. Cross-cutting
 findings live in
 [`examples/FINDINGS.md`](examples/FINDINGS.md).
 
-Recent Eiffel specimens are also the best place to see the newer app shapes:
+Recent specimens are also the best place to see the newer app shapes:
 rate-limited workers use a `BurstClosed` control message instead of a host
 atomic, outbound HTTP retry keeps retry policy in the caller while the
 reqwest bridge only classifies outcomes, and sharded fanout uses

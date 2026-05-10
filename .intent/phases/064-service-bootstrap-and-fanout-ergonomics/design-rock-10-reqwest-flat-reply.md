@@ -6,7 +6,7 @@ Decision. **No helper.** `flatten_outcome` stays opt-in.
 
 ## The Pain
 
-`eiffel_webhook_publisher` shows three call shapes side by side.
+`specimen_webhook_publisher` shows three call shapes side by side.
 Shape 3 is denser:
 
 ```rust
@@ -25,7 +25,7 @@ Shape 3 then reads like 1 and 2.
 
 ## Why No Helper
 
-`eiffel_webhook_publisher` is the only specimen that mixes all
+`specimen_webhook_publisher` is the only specimen that mixes all
 three shapes. After the Round-4 cleanup, every other caller
 picks one shape per call-site cluster and is consistent inside
 a single isolate. The mixed-mode density is pedagogical only.
@@ -50,7 +50,7 @@ under these constraints:
 
 ## Decision
 
-`flatten_outcome` stays as is. `eiffel_webhook_publisher`
+`flatten_outcome` stays as is. `specimen_webhook_publisher`
 keeps the mixed-mode `reply` site. No `reply_flat` helper.
 
 Finding 7 stays open with this note: the answer is opt-in

@@ -1,0 +1,21 @@
+[package]
+name = "specimen-native-https"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+http = { version = "1", default-features = false, features = ["std"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+tina = { path = "../../tina" }
+tina-http = { path = "../../tina-http" }
+tina-runtime = { path = "../../tina-runtime" }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

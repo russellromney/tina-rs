@@ -27,7 +27,7 @@
   - Rock 5: rewrote `docs/tina-user-guide/08-simulation-and-dst.md`
     around the build/sweep/save/shrink workflow with copyable test
     skeleton and bug-report shape.
-  - Rock 6: upgraded `examples/eiffel_replay_dst` to one saved
+  - Rock 6: upgraded `examples/specimen_replay_dst` to one saved
     `ReplayCase` with `Tick`/`Drain` ops where every op is
     load-bearing (deleting one changes the trace hash), runner,
     sweep demo, shrink demo, and same-seed/different-seed regression
@@ -80,7 +80,7 @@ What already exists outside `dst`:
 - Seeded faults: `FaultConfig`, `LocalSendFaultMode::DelayByRounds`,
   `FaultMode::DelayBy`, `TcpCompletionFaultMode`,
   `ScriptedStorageFaultConfig`.
-- `examples/eiffel_replay_dst` already proves
+- `examples/specimen_replay_dst` already proves
   same-seed/same-hash and different-seed/different-hash with
   `stable_trace_hash`. Uses a hand-rolled `Report` struct.
 - DST tests: `tina-sim/tests/dst_harness.rs`,
@@ -95,7 +95,7 @@ What is duplicated:
   case type, so saved-seed tests reinvent shape per file.
 - Examples and tests reimplement "did the property still hold"
   predicates for shrinking by re-running the workload.
-- `eiffel_replay_dst` rolls its own `Report` instead of speaking the
+- `specimen_replay_dst` rolls its own `Report` instead of speaking the
   shared `ReplayCase`/`ReplayReport` shape.
 
 What must stay raw:
@@ -176,7 +176,7 @@ Read current DST surfaces:
 - `ReplayArtifact`
 - `stable_trace_hash`
 - `docs/tina-user-guide/08-simulation-and-dst.md`
-- `examples/eiffel_replay_dst`
+- `examples/specimen_replay_dst`
 - saved-seed tests in `tina-sim/tests`
 
 Update this status block with:
@@ -381,9 +381,9 @@ Replay case:
 - command:
 ```
 
-## Rock 6 — Eiffel Replay Tutorial
+## Rock 6 — Specimen Replay Tutorial
 
-Upgrade `examples/eiffel_replay_dst` from "same seed same hash" to the
+Upgrade `examples/specimen_replay_dst` from "same seed same hash" to the
 full workflow:
 
 - define one `ReplayCase`;
@@ -446,7 +446,7 @@ No artifact noise.
 - Saved-seed assert helper exists.
 - Seed sweep can return a replayable failing case.
 - Shrink workflow works on a `ReplayCase`.
-- `eiffel_replay_dst` teaches the full loop.
+- `specimen_replay_dst` teaches the full loop.
 - One service-shaped saved case is pinned.
 - Docs say sim proves interleavings; live proves physics.
 

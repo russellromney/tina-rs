@@ -708,7 +708,7 @@ where
     }
 
     /// One-call drain + shutdown that replaces the `Arc::try_unwrap`
-    /// dance Eiffel examples used to write.
+    /// dance Specimen examples used to write.
     ///
     /// Polls until every `BridgeHandle` clone has been dropped or
     /// `drain_timeout` elapses. If the drain completes, consumes the

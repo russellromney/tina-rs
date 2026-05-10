@@ -5,7 +5,7 @@
 Make `tina-rpc` feel like something a normal service author can use.
 
 052 proved the bones: framed request/reply, bounded in-flight work, client
-timeouts, server-reported wire errors, simulation, replay, and Eiffel pressure.
+timeouts, server-reported wire errors, simulation, replay, and Specimen pressure.
 
 058 adds the skin:
 
@@ -30,7 +30,7 @@ Already exists in 052:
 - client isolate with request ids and local deadlines;
 - JSON encoding adapter;
 - deterministic simulator coverage;
-- Eiffel RPC comparison showing wire-visible `Full`.
+- Specimen RPC comparison showing wire-visible `Full`.
 
 Pain observed:
 
@@ -282,7 +282,7 @@ Grug boundary:
 
    Keep it small. This is a liveness/readiness probe, not admin RPC.
 
-9. **Eiffel Typed RPC Comparison**
+9. **Specimen Typed RPC Comparison**
 
    Update the RPC comparison to use the typed surface.
 
@@ -310,7 +310,7 @@ Grug boundary:
   construction.
 - Domain errors do not silently collapse to `Internal`.
 - Request id is trace correlation only, not a metric cardinality bomb.
-- Eiffel typed RPC example runs live.
+- Specimen typed RPC example runs live.
 - Simulator still covers the raw protocol path.
 
 ## Done Means

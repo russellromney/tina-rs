@@ -2,15 +2,15 @@
 
 ## Status
 
-- Done: plan created from Eiffel Round 4 findings.
+- Done: plan created from Specimen Round 4 findings.
 - Done in `round4-trailing-followup` / #25 work: `examples/FINDINGS.md`
   was cleaned into Active/Closed lists; stale README references were fixed;
-  `eiffel_webhook_publisher` replaced its host `Done` condvar with
-  `observe_isolate_complete`; `eiffel_outbound_http` replaced the
+  `specimen_webhook_publisher` replaced its host `Done` condvar with
+  `observe_isolate_complete`; `specimen_outbound_http` replaced the
   per-request `mpsc` bridge with one scripting Driver isolate that ends via
   `stop_with(report)` + `observe_result`.
 - In progress: none.
-- Open: implement low-risk helpers, design the model-changing helpers, update Eiffel examples.
+- Open: implement low-risk helpers, design the model-changing helpers, update Specimen examples.
 - Deferred: fake-async pipeline syntax, hidden retries, hidden queues, broad workflow macros.
 
 ## Goal
@@ -31,7 +31,7 @@ Invent cancellation messages per isolate.
 064 turns the proven repeated pain into small Tina primitives, but only where
 the helper keeps the truth visible.
 
-The working rule from Eiffel:
+The working rule from Specimen:
 
 ```text
 ergonomics may remove bookkeeping.
@@ -114,7 +114,7 @@ Do:
 - move 062-closed items to resolved;
 - fix stale names (`SingleSleepGate` -> shipped `SingleCallGate`, or remove
   when the shipped helper does not solve that case);
-- fix stale example names (`eiffel_graceful_pool_shutdown`, not old sketches);
+- fix stale example names (`specimen_graceful_pool_shutdown`, not old sketches);
 - fix stale README references and finding numbers;
 - keep active findings only for product work still needed.
 
@@ -161,8 +161,8 @@ Rules:
 
 Apply to:
 
-- `eiffel_graceful_pool_shutdown`;
-- `eiffel_bounded_batcher` if natural;
+- `specimen_graceful_pool_shutdown`;
+- `specimen_bounded_batcher` if natural;
 - any Round 4 example with the exact drain pattern.
 
 Proof:
@@ -202,7 +202,7 @@ Rules:
 
 Apply to:
 
-- `eiffel_supervised_worker`.
+- `specimen_supervised_worker`.
 
 Proof:
 
@@ -349,7 +349,7 @@ Rules:
 
 Proof:
 
-- one happy-path Eiffel example gets shorter;
+- one happy-path Specimen example gets shorter;
 - one pressure test still shows `Full` or `Timeout`;
 - saved simulator seed if simulator shape is practical.
 
@@ -419,7 +419,7 @@ Rules:
 
 Proof:
 
-- `eiffel_cancellation_chain` can use the new shape, or the design explains
+- `specimen_cancellation_chain` can use the new shape, or the design explains
   why domain `Stop` remains the right first form;
 - caller timeout and explicit cancel are distinguishable in trace.
 
@@ -459,9 +459,9 @@ Rules:
 
 Proof:
 
-- `eiffel_graceful_shutdown` either migrates or documents why app-level driver
+- `specimen_graceful_shutdown` either migrates or documents why app-level driver
   is still the honest shape;
-- Do not use `eiffel_webhook_publisher` as evidence for a new `HostBarrier`;
+- Do not use `specimen_webhook_publisher` as evidence for a new `HostBarrier`;
   `round4-trailing-followup` already removed that specimen's condvar by using
   `observe_isolate_complete`.
 
@@ -508,7 +508,7 @@ Rules:
 
 Proof:
 
-- `eiffel_two_stage_pipeline` gets clearer, not merely shorter;
+- `specimen_two_stage_pipeline` gets clearer, not merely shorter;
 - README says what is hidden and what is not;
 - if the helper fails the honesty test, leave the example explicit and record
   why.
@@ -644,6 +644,6 @@ review safely.
   named later phase;
 - every model-changing helper touched by the phase has a design note before
   code;
-- Eiffel examples are updated only where the new shape is clearer or more
+- Specimen examples are updated only where the new shape is clearer or more
   honest;
 - `examples/FINDINGS.md` ends with a sharper active list than it started with.
