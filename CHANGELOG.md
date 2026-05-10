@@ -4,6 +4,47 @@ This file records completed work.
 
 ## Unreleased
 
+### Server-side HTTP/1.1 keep-alive
+
+`tina_http::HttpListener` / `HttpConnection` can now serve multiple
+sequential requests on one TCP/TLS stream. Opt-in via
+`HttpLimits::keepalive_idle_timeout = Some(d)`; `None` (the
+default) keeps the legacy one-request-per-connection behaviour, so
+this is non-breaking.
+
+What stays explicit:
+- **Per-request close intent.** HTTP/1.0 default close, an
+  explicit `Connection: close` request header, parse errors, and
+  service-call errors (`Full` / `Closed` / `Timeout`) all force
+  close after the response. A streaming response that ends short
+  of its declared `Content-Length` also forces close — the wire
+  framing lies and the connection cannot be safely reused.
+- **Idle timeout.** Between requests the connection waits up to
+  `keepalive_idle_timeout` for the next request's head to start
+  and complete. On expiry the connection isolate stops cleanly
+  (same path as the existing first-request slow-loris guard); no
+  408 is written because the runtime rejects `tcp_close_stream`
+  while a `tcp_read` is pending.
+- **No pipelining.** Per-request reset between iterations drops
+  any read-ahead bytes; well-behaved HTTP/1.1 clients wait for
+  each response.
+- **Generation-tagged head deadline.** Each iteration bumps a
+  per-connection `request_generation`. The `HeaderDeadline`
+  message carries the generation; stale deadlines from prior
+  iterations are dropped silently. Same pattern as the keepalive
+  client's per-request deadline guard.
+
+Tests:
+- 8 integration tests in `tina-http/tests/server_keepalive.rs`
+  drive a hand-rolled `std::net::TcpStream` against the
+  keepalive-enabled `HttpListener`: three sequential requests on
+  one socket, HTTP/1.0 → close, `Connection: close` → close, idle
+  timeout fires deterministically, default config still serves
+  one-then-close, slow-loris on the second request fires the
+  deadline, body cap still enforced per request, mixed
+  GET/POST/echo on one socket.
+- Existing tests unchanged.
+
 ### 066A hostile-review fixes
 
 Round of correctness, vocabulary, and proof fixes on top of 066A
