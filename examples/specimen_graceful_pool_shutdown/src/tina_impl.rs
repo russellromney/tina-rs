@@ -16,8 +16,8 @@ use std::time::Duration;
 use tina::pool::{AcquireFailure, CloseMode, PoolConfig, PoolLease, ReleaseDisposition};
 use tina::prelude::*;
 use tina_runtime::pool::{
-    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_effect, close_effect, release_effect,
-    try_acquired,
+    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_result_effect, close_effect,
+    release_result_effect,
 };
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep};
 
@@ -72,32 +72,22 @@ enum JobState {
     Releasing,
 }
 
+#[derive(Debug)]
 enum DriverMsg {
     Begin,
     AcquireReturned {
         job: u32,
-        outcome: CallOutcome<WorkerPoolReply<WorkerHandle>>,
+        result: Result<PoolLease<WorkerHandle>, AcquireFailure>,
     },
     WorkerReturned {
         job: u32,
         outcome: CallOutcome<WorkerReply>,
     },
-    ReleaseReturned { job: u32 },
+    ReleaseReturned {
+        job: u32,
+    },
     CloseReturned,
     Shutdown,
-}
-
-impl std::fmt::Debug for DriverMsg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Begin => f.write_str("Begin"),
-            Self::AcquireReturned { job, .. } => write!(f, "AcquireReturned({job})"),
-            Self::WorkerReturned { job, .. } => write!(f, "WorkerReturned({job})"),
-            Self::ReleaseReturned { job } => write!(f, "ReleaseReturned({job})"),
-            Self::CloseReturned => f.write_str("CloseReturned"),
-            Self::Shutdown => f.write_str("Shutdown"),
-        }
-    }
 }
 
 struct Driver {
@@ -119,13 +109,15 @@ impl Driver {
                 let mut effects = Vec::with_capacity(CALLERS);
                 for j in 0..CALLERS as u32 {
                     self.jobs.insert(j, JobState::Acquiring);
-                    effects.push(acquire_effect(self.pool, CALL_TIMEOUT, move |outcome| {
-                        DriverMsg::AcquireReturned { job: j, outcome }
-                    }));
+                    effects.push(acquire_result_effect(
+                        self.pool,
+                        CALL_TIMEOUT,
+                        move |result| DriverMsg::AcquireReturned { job: j, result },
+                    ));
                 }
                 Effect::Batch(effects)
             }
-            DriverMsg::AcquireReturned { job, outcome } => match try_acquired(outcome) {
+            DriverMsg::AcquireReturned { job, result } => match result {
                 Ok(lease) => {
                     let worker = *lease.handle();
                     self.jobs.insert(job, JobState::Working { lease });
@@ -162,9 +154,13 @@ impl Driver {
                 } else {
                     self.outcome.failed += 1;
                 }
-                release_effect(lease, self.pool, disposition, CALL_TIMEOUT, move |_| {
-                    DriverMsg::ReleaseReturned { job }
-                })
+                release_result_effect(
+                    lease,
+                    self.pool,
+                    disposition,
+                    CALL_TIMEOUT,
+                    move |_| DriverMsg::ReleaseReturned { job },
+                )
             }
             DriverMsg::ReleaseReturned { job } => {
                 self.jobs.remove(&job);
