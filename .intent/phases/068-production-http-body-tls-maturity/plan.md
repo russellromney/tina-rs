@@ -21,7 +21,7 @@
     deterministically (saved hash matches across two sim runs). Sim
     can script TLS connect outcomes including bytes; bind/accept-side
     full HTTP-byte replay deferred.
-  - Rock 6 — `examples/eiffel_native_https` lands. Tina
+  - Rock 6 — `examples/specimen_native_https` lands. Tina
     `HttpsListener` + Counter vs hand-rolled `tokio + tokio-rustls`,
     same scripted rustls client. Both sides report identical counter
     behaviour.
@@ -104,7 +104,7 @@
   - **Smell fix**: replaced fragile `expect("listener set...")`
     invariants with defensive `if let` branches (orphan-close stream
     or `stop()` if the invariant is ever violated).
-  - **Eiffel fix**: `Driver` previously fabricated a fake
+  - **Specimen fix**: `Driver` previously fabricated a fake
     `Bind { Timeout }` for any non-`Replied` `CallOutcome`. Now it
     forwards the full `CallOutcome` and `run()` discriminates
     `Full`/`Closed`/`Timeout` honestly via `anyhow::bail!`.
@@ -148,7 +148,7 @@
     `TlsCertificate`/`TlsName`/`Timeout` connect failures mapping to
     `Transport(Connect, _)`.
   - Cleanup pass: semi-grug comments throughout new code.
-  - Eiffel `Counter` handler: dropped redundant match wrapper.
+  - Specimen `Counter` handler: dropped redundant match wrapper.
 - Open: make `tina-http` speak HTTPS with existing Tina TLS rails.
 - Deferred: HTTP/2, gRPC, ALPN, ACME, cert reload, mTLS, SNI routing,
   system-root defaults, proxies, redirects, cookies, chunked transfer, broad
@@ -222,7 +222,7 @@ Stay separate:
   TLS lane has one worker thread per shard, and both sides of a TLS
   handshake need to drive that worker concurrently — they deadlock.
   Same constraint applies to client + server in the same shard. Both
-  the smoke tests and the eiffel example respect this by running the
+  the smoke tests and the specimen respect this by running the
   counterparty in a raw OS thread (rustls directly). A multi-worker
   TLS lane is deferred.
 
@@ -474,9 +474,9 @@ Rules:
 If 069 has landed, use `ReplayCase`; otherwise use existing saved
 seed/fingerprint and leave a migration note.
 
-## Rock 6 — Eiffel Specimen
+## Rock 6 — Specimen Specimen
 
-Add `examples/eiffel_native_https`.
+Add `examples/specimen_native_https`.
 
 Shape:
 
@@ -520,7 +520,7 @@ Docs must say:
 | Transport | TCP tests still pass | TCP/TLS errors distinguishable |
 | Pool | serial HTTPS submit if supported | concurrent pressure visible |
 | Sim | HTTP bytes over scripted TLS replay | scripted cert failure maps to HTTPS error |
-| Docs/Eiffel | simple native HTTPS shown | reqwest escape hatch named |
+| Docs/Specimen | simple native HTTPS shown | reqwest escape hatch named |
 
 ## Done Means
 
@@ -530,7 +530,7 @@ Docs must say:
 - Host/SNI/cert-name behavior is explicit and tested.
 - Pool support is honest: serial-admission only or deferred.
 - Sim has HTTPS-over-TLS replay, or records exact missing primitive.
-- Eiffel specimen lands, or README says why not.
+- Specimen specimen lands, or README says why not.
 - Docs stop saying TLS is out of scope without pointing here.
 
 ## Hostile Review

@@ -45,12 +45,12 @@ through one shipped primitive.
 
 ## Specimens Already On This Pattern
 
-- `eiffel_graceful_pool_shutdown` — driver counts and stops
+- `specimen_graceful_pool_shutdown` — driver counts and stops
   with `DriverOutcome`.
-- `eiffel_dynamic_worker_pool` — coord stops with `Report`.
-- `eiffel_webhook_publisher` — `observe_isolate_complete` on
+- `specimen_dynamic_worker_pool` — coord stops with `Report`.
+- `specimen_webhook_publisher` — `observe_isolate_complete` on
   the driver.
-- `eiffel_outbound_http` — scripting driver stops with typed
+- `specimen_outbound_http` — scripting driver stops with typed
   outcome.
 
 If a future specimen wants "settled across multiple isolates",

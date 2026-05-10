@@ -24,8 +24,8 @@ Already exists:
 - cross-shard sends and calls;
 - topology reports;
 - simulator multi-shard coverage;
-- Eiffel keyspace comparison;
-- Eiffel findings about sharded maps/counters being absent.
+- Specimen keyspace comparison;
+- Specimen findings about sharded maps/counters being absent.
 
 Compromise:
 
@@ -228,7 +228,7 @@ API home:
    - scatter/gather aggregate;
    - partial failure report.
 
-   Reuse Eiffel comparison style where useful.
+   Reuse Specimen comparison style where useful.
 
 9. **DST**
 
@@ -379,7 +379,7 @@ Proof landed:
   can't quietly drop the contract). The aggregate-timeout coord uses
   the shipped `ReplyAdapter` to translate counter replies into its
   own message type.
-- `examples/eiffel_sharded_keyspace` (3 smoke tests) is a paired
+- `examples/specimen_sharded_keyspace` (3 smoke tests) is a paired
   Tokio-vs-Tina sharded keyspace. Same SET/GET/DEL/SUM/QUIT script,
   same FNV placement, byte-identical `Report`. Tokio side is
   `Vec<Arc<Mutex<HashMap>>>` with hand-rolled placement; Tina side is
@@ -397,7 +397,7 @@ Out-of-scope for first form:
   until more shipped examples prove the shape is stable.
 
 Surfaced finding (recorded here, not in `examples/FINDINGS.md` — that
-file is reserved for Eiffel-comparison findings):
+file is reserved for Specimen-comparison findings):
 
 - Scatter/gather coordinators need a `ReplyBridge`-style isolate to
   translate replies between typed addresses (the runtime does not let

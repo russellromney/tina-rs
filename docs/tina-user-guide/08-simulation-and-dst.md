@@ -74,7 +74,7 @@ Rules:
 A good alphabet usually has three or four variants: one or two
 "queue work", one "drain time", maybe one "introduce pressure". The
 `burst overflow` saved case (`tina-sim/tests/saved_replay_cases.rs`)
-is `Burst { size }` and `Step`. The `eiffel_replay_dst` example is
+is `Burst { size }` and `Step`. The `specimen_replay_dst` example is
 `Tick(u32)` and `Drain`. Both fit on one screen.
 
 When the alphabet feels right, the case literal reads like a script
@@ -387,7 +387,7 @@ Good Tina simulation targets:
 
 ## See Also
 
-- `examples/eiffel_replay_dst` — the copyable specimen.
+- `examples/specimen_replay_dst` — the copyable specimen.
 - `tina_sim::dst` module — `History`, `ReplayCase` (with `new` /
   `expecting` / `simulator_config`), `ReplayReport` (with
   `from_case_and_events` / `pinned_constants`), `ReplayConfig` (with

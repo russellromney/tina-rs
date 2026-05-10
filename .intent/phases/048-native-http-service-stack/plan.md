@@ -75,7 +75,7 @@ it.
 
 ## Coordination With 047
 
-048a runs in parallel with 047 (Eiffel ergonomics harvest). The overlap
+048a runs in parallel with 047 (Specimen ergonomics harvest). The overlap
 surface is small but real:
 
 - 047's `tcp_write_all` / `tcp_read_to_eof` helpers are load-bearing for
@@ -89,7 +89,7 @@ surface is small but real:
   copy. When 047 ships it, the example shrinks. No API freeze either way.
 - 047's stable trace fingerprint helps DST in rock 8. Until it lands, the
   DST work hashes the `Debug` projection — same shape as
-  `eiffel_replay_dst`. When 047 ships it, swap.
+  `specimen_replay_dst`. When 047 ships it, swap.
 
 Concrete file-conflict surface between 048a and 047: only the workspace
 `Cargo.toml` `members = [...]` line where 048a registers `tina-http`.
@@ -260,7 +260,7 @@ server body.
 7. **Native HTTP Example**
 
    Add a root-level comparison or example, probably
-   `examples/eiffel_native_http`.
+   `examples/specimen_native_http`.
 
    It should include:
 
@@ -477,7 +477,7 @@ presets. Examples should never need to hand-roll a timeout/limit triple.
   hammered by concurrent inbound TCP requests in threaded mode produces
   `CallOutcome::Full` at the connection isolate's call into the
   service, mapped to `503 Service Unavailable` over the wire.
-- Paired comparison `examples/eiffel_outbound_http` — axum + reqwest
+- Paired comparison `examples/specimen_outbound_http` — axum + reqwest
   on Tokio side, native `HttpListener` + service-shaped `HttpClient`
   on Tina side, same scripted endpoint sequence.
 

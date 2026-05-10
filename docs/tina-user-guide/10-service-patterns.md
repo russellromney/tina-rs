@@ -131,7 +131,7 @@ without exposing borrow/release" the older `PendingReplies` frontend
 pattern is still appropriate; the pool is for explicit borrow.
 
 See [`docs/tina-user-guide/11-ergonomics-checklist.md`](./11-ergonomics-checklist.md#bounded-worker-pool)
-for the helpers and `examples/eiffel_pool_cancel_reclaim` for a
+for the helpers and `examples/specimen_pool_cancel_reclaim` for a
 worked example of the cancel-reclaim flow.
 
 ### Sharded
@@ -182,7 +182,7 @@ These are local multi-shard patterns. They are **not** a distributed
 database, **not** consensus, **not** remoting, **not** automatic
 rebalancing.
 
-A worked example lives in `examples/eiffel_sharded_keyspace`: a paired
+A worked example lives in `examples/specimen_sharded_keyspace`: a paired
 Tokio (`Vec<Arc<Mutex<HashMap>>>` with hand-rolled FNV-1a placement) and
 Tina (`ShardPlacement` + `ShardServiceTable::try_from_placement(...)` +
 per-shard `Store` isolates with `placement.require_owner_str(...)`)

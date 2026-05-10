@@ -1,6 +1,6 @@
-# Eiffel Findings — Current Product Work
+# Specimen Findings — Current Product Work
 
-This file is the current action list. Eiffel examples are specimens: they
+This file is the current action list. Examples are specimens: they
 show how Tokio and Tina code feel for the same kind of job. When the same
 Tina pain appears across specimens, it becomes runtime/API work here.
 
@@ -16,7 +16,7 @@ moves to the [Closed](#closed) section below with the same number.
 
 ### 2. ScatterCoord setup is heavy for the happy path
 
-**Surfaced by:** `eiffel_sharded_fanout_read`.
+**Surfaced by:** `specimen_sharded_fanout_read`.
 
 A bounded scatter/gather over three shards needs:
 
@@ -41,8 +41,8 @@ typed partial-outcome surface — convenience may not collapse `Full` /
 
 ### 3. Self-address at registration time
 
-**Surfaced by:** `eiffel_sharded_fanout_read`,
-`eiffel_dynamic_worker_pool`.
+**Surfaced by:** `specimen_sharded_fanout_read`,
+`specimen_dynamic_worker_pool`.
 
 The `ReplyAdapter` pattern needs the coord's own address to wire the
 adapter, and the coord needs the adapter's address before it can fan out.
@@ -58,20 +58,20 @@ turn.
 
 Self-address half shipped on the single-shard runtimes:
 `Runtime::register_with_capacity_using(cap, |self_addr| ...)` and
-the threaded mirror. `eiffel_dynamic_worker_pool` migrated to it;
+the threaded mirror. `specimen_dynamic_worker_pool` migrated to it;
 the chicken-and-egg `Begin { self_addr }` variant is gone.
 Multi-shard parity (`MultiShardRuntime` /
 `ThreadedMultiShardRuntime` / simulator) is deferred until a
 multi-shard example needs it.
 
 Still open: the cross-isolate handshake half — `Bind { bridge }` in
-`eiffel_sharded_fanout_read` is *not* about self-address, it's about
+`specimen_sharded_fanout_read` is *not* about self-address, it's about
 two isolates needing each other's addresses at registration. That
 needs a paired-registration primitive or a different shape.
 
 ### 7. Reqwest-bridge flatten edge: useful but per-call-site
 
-**Surfaced by:** `eiffel_webhook_publisher`.
+**Surfaced by:** `specimen_webhook_publisher`.
 
 The `tina-reqwest-bridge` ergonomics polish shipped
 `flatten_outcome(outcome) -> Result<R, ReqwestCallError>` as an
@@ -106,7 +106,7 @@ why some are layered is confusing.
 
 ### 8. External cancellation API — first form shipped
 
-**Surfaced by:** `eiffel_cancellation_chain`.
+**Surfaced by:** `specimen_cancellation_chain`.
 
 **Resolved (Tina cancellation phase):** Tina now ships
 `call_with_handle(addr, msg, t).reply(...)` returning a caller-owned
@@ -130,9 +130,8 @@ phase 072 (deferred from 066 alongside the `Deadline` value).
 
 ### 9. Drain helper for `PendingReplies` at service stop
 
-**Surfaced by:** `eiffel_graceful_drain_server` (and originally
-`eiffel_graceful_pool_shutdown` before its migration to
-`WorkerPool` in 067).
+**Surfaced by:** `specimen_graceful_pool_shutdown`,
+`specimen_graceful_drain_server`.
 
 `PendingReplies::drain()` returns `Vec<(K, DeferredReply<R>)>`,
 which the user has to map into `Effect::Batch(reply_to(slot,
@@ -165,22 +164,21 @@ flag is the bridge-side version of the same idea.
   `drain_replies_with_into_effect` /
   `drain_replies_with_into_stop`, all typed so a
   `PendingReplies<K, R>` only produces `Effect<I>` when
-  `I::Reply = R`. `eiffel_graceful_pool_shutdown` uses
-  `pending.drain_replies_into_stop::<Self>(R::Closed)`.
-  `eiffel_graceful_pool_shutdown` no longer uses this pattern post
-  067 migration — it relies on
+  `I::Reply = R`. `specimen_graceful_pool_shutdown` used
+  `pending.drain_replies_into_stop::<Self>(R::Closed)` before
+  its 067 migration; it now relies on
   `WorkerPoolMsg::Close(CloseMode::Drain)` for the same
-  parked-callers-get-`Closed` outcome — but the helper is still
-  load-bearing for `PendingReplies`-shaped frontends. The deadline
-  half of this finding (DrainGate) folds into finding 15 (Deadline
-  as first-class context).
+  parked-callers-get-`Closed` outcome. The helper is still
+  load-bearing for `PendingReplies`-shaped frontends. The
+  deadline half of this finding (DrainGate) folds into finding
+  15 (Deadline as first-class context).
 - An isolate-state `DrainGate` helper that holds the deadline +
   the pending-count predicate, with an `is_done` /
   `drained_within_timeout` accessor that the handler reuses.
 
 ### 11. Multi-stage pipeline ergonomics
 
-**Surfaced by:** `eiffel_two_stage_pipeline`.
+**Surfaced by:** `specimen_two_stage_pipeline`.
 
 A 3-stage pipeline reads as 4 enum variants in `PipelineMsg`
 (Submit + Parsed + Validated + Executed), each with its own match
@@ -201,7 +199,7 @@ match-state-machine form remains semantic truth.
 
 ### 12. Rust footgun replication: shared receiver in worker pool
 
-**Surfaced by:** `eiffel_graceful_pool_shutdown` (Tokio side).
+**Surfaced by:** `specimen_graceful_pool_shutdown` (Tokio side).
 
 Not a Tina finding per se — but worth recording as the *kind of
 footgun* Tina structurally avoids. The Tokio shutdown path needs
@@ -220,7 +218,7 @@ guide's lifecycle chapter as a contrast with the Tokio shape.
 
 ### 13. Tina-owned database client (`tina-sqlx-bridge`)
 
-**Surfaced by:** `eiffel_sqlite_counter`.
+**Surfaced by:** `specimen_sqlite_counter`.
 
 There is no native or bridged path for "Tina service talks to a
 database" today. The honest first-form shape used in the specimen
@@ -248,8 +246,8 @@ witness.
 
 ### 14. Spawn API surfaces the child's address
 
-**Surfaced by:** `eiffel_dynamic_worker_pool`,
-`eiffel_supervised_worker`.
+**Surfaced by:** `specimen_dynamic_worker_pool`,
+`specimen_supervised_worker`.
 
 `spawn(ChildDefinition::new(...))` returns nothing. The parent does
 not learn the child's `Address`. Today this is OK because the
@@ -287,7 +285,7 @@ API gets revisited.
 
 ### 16. Multi-worker TLS lane (or split accept/stream lanes)
 
-**Surfaced by:** `eiffel_native_https`, `tina-http/tests/client_tls_smoke.rs`.
+**Surfaced by:** `specimen_native_https`, `tina-http/tests/client_tls_smoke.rs`.
 
 The runtime's TLS lane is one worker thread per shard. The worker
 processes one TLS op at a time: a `tls_accept` poll (busy-waiting
@@ -323,7 +321,7 @@ bottleneck.
 
 ### 15. Deadline as first-class context
 
-**Surfaced by:** `eiffel_backpressure_chain`.
+**Surfaced by:** `specimen_backpressure_chain`.
 
 A multi-hop chain has to thread a deadline (or a remaining-budget
 duration) through every call. Today this is `Duration` in the
@@ -355,7 +353,7 @@ existing README references stay valid.
 
 ### 17. Host-thread `call_blocking` — Phase 068 follow-up
 
-Surfaced by `eiffel_native_https` and native HTTP/TLS tests.
+Surfaced by `specimen_native_https` and native HTTP/TLS tests.
 `ThreadedRuntime::call_blocking(addr, msg, timeout)` now performs
 the ordinary typed Tina call through a temporary driver isolate and
 returns `CallOutcome<R>` to the host thread. The HTTPS specimen and
@@ -373,7 +371,7 @@ existing trace facts only; they do not infer hidden causality.
 
 ### 1. `observe_result` on `ThreadedMultiShardRuntime` — Phase 062 Rock 1
 
-Surfaced by `eiffel_sharded_fanout_read`, `eiffel_sharded_keyspace`.
+Surfaced by `specimen_sharded_fanout_read`, `specimen_sharded_keyspace`.
 `runtime.observe_result::<Report, _, _>(addr)` now exists on the
 multi-shard threaded shell with the same single-claim semantics as
 the single-shard form. Both 053 specimens use it directly; the
@@ -381,8 +379,8 @@ the single-shard form. Both 053 specimens use it directly; the
 
 ### 4. Synchronous `try_send_outcome` — Phase 062 Rocks 3 & 4
 
-Surfaced by `eiffel_rate_limited_worker`,
-`eiffel_hot_key_fairness`. `runtime.try_send_outcome(addr, msg,
+Surfaced by `specimen_rate_limited_worker`,
+`specimen_hot_key_fairness`. `runtime.try_send_outcome(addr, msg,
 &outcomes)` plus a shared `HostBurstOutcomes` accumulator removes
 the per-send observer closure, the Arc-cloned counters, and the
 manual observed barrier. `runtime.send_observed_until(addr,
@@ -397,9 +395,9 @@ so the helper removes bookkeeping, not the worker roundtrip.
 
 ### 5. Single-in-flight gate for timer-driven workers — Phase 062 Rock 5
 
-Surfaced by `eiffel_rate_limited_worker`,
-`eiffel_hot_key_fairness`, and reinforced by
-`eiffel_periodic_batcher` / `eiffel_graceful_drain_server`.
+Surfaced by `specimen_rate_limited_worker`,
+`specimen_hot_key_fairness`, and reinforced by
+`specimen_periodic_batcher` / `specimen_graceful_drain_server`.
 `tina_runtime::SingleCallGate` names the "at most one timer/call in
 flight, plus N queued" invariant. `submit()` returns `true` when
 the caller should schedule; `complete()` returns `true` when more
@@ -409,13 +407,13 @@ still writes `sleep(...).reply(...)` so every event is visible.
 
 ### 6. Bridge call retry classifier — Phase 062 Rock 6
 
-Surfaced by `eiffel_retrying_outbound_http`,
-`eiffel_webhook_fanout`. `ReqwestOutcomeExt::classify` returns
+Surfaced by `specimen_retrying_outbound_http`,
+`specimen_webhook_fanout`. `ReqwestOutcomeExt::classify` returns
 `ReqwestOutcomeClass::{Succeeded, Transient(reason),
 Fatal(reason)}` with typed reason payloads. The raw layered
 `ReqwestCallOutcome` and `flatten_outcome` are unchanged; the
-classifier is opt-in sugar. `eiffel_retrying_outbound_http` and
-`eiffel_webhook_fanout` now match three arms instead of six.
+classifier is opt-in sugar. `specimen_retrying_outbound_http` and
+`specimen_webhook_fanout` now match three arms instead of six.
 
 ### 10. Retry helper at the service edge — Phase 062 Rock 4
 

@@ -175,7 +175,7 @@ impl fmt::Display for PressureSummary {
 /// printed by pressure-capable specimens.
 ///
 /// The line format is intentionally boring `key=value` pairs so the
-/// outer pressure runners (e.g. `eiffel_cpu_run`, `eiffel_mem_run`)
+/// outer pressure runners (e.g. `specimen_cpu_run`, `specimen_mem_run`)
 /// can grep for the leading `pressure ` prefix and surface what each
 /// specimen produced. Specimens that do not opt in print whatever
 /// they want and the runner passes through.

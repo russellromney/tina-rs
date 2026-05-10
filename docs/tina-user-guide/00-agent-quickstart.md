@@ -116,4 +116,4 @@ Sweep seeds with `sweep_seeds`. Shrink the failing history with
 
 Do not roll a per-test `Report` struct or hand-rolled fingerprint
 comparison. See the [Simulation And DST](08-simulation-and-dst.md)
-chapter and `examples/eiffel_replay_dst` for the copyable shape.
+chapter and `examples/specimen_replay_dst` for the copyable shape.

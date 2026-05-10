@@ -48,7 +48,7 @@
 //!
 //! `TracingObserver` is a [`tina_runtime::TraceObserver`]. Wire it at
 //! build time and every event flows into the subscriber as it happens.
-//! See `eiffel_tracing_demo` for a runnable version.
+//! See `specimen_tracing_demo` for a runnable version.
 //!
 //! ```ignore
 //! use std::sync::Arc;

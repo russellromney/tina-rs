@@ -3,7 +3,7 @@
 //!
 //! Proves the call-shaped client composes with the native server: no
 //! Tokio, no stdlib reference, just two isolate trees over real
-//! loopback. Drives the same Counter scenario `eiffel_native_http`
+//! loopback. Drives the same Counter scenario `specimen_native_http`
 //! uses scripted-stdlib for, but every TCP byte on both sides is
 //! Tina-owned.
 

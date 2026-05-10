@@ -1,12 +1,12 @@
-# Eiffel Findings History
+# Specimen Findings History
 
-This is the longer field journal from prior Eiffel rounds. The current action
+This is the longer field journal from prior Specimen rounds. The current action
 list lives in [`FINDINGS.md`](FINDINGS.md).
 
 Cross-cutting observations from the Tokio-vs-Tina comparisons in this
 directory. Per-comparison ergonomic notes live in each comparison's own
-`README.md` (e.g. `eiffel_real_io_chat/README.md`,
-`eiffel_mini_keyspace/README.md`); this file collects the patterns that show
+`README.md` (e.g. `specimen_real_io_chat/README.md`,
+`specimen_mini_keyspace/README.md`); this file collects the patterns that show
 up across more than one comparison and the runtime/API suggestions they
 imply.
 
@@ -15,8 +15,8 @@ we can track when something keeps reappearing vs. when it was a one-off.
 
 ## Round 1 closed items (Phase 059 + Phase 053)
 
-These nine findings were the first Eiffel round's product action list. All
-nine landed in Phase 059 ("Eiffel actionable ergonomics") or Phase 053
+These nine findings were the first Specimen round's product action list. All
+nine landed in Phase 059 ("Specimen actionable ergonomics") or Phase 053
 ("Sharded service primitives"). Kept here for archaeology; new code should
 not copy the patterns these replaced.
 
@@ -83,12 +83,12 @@ form. See Round 2 finding 4 for the actionable follow-up.
 `tina_http` ships `Router` (stateless handlers) and `StatefulRouter<S>`
 (handlers with `&mut S`), both with `.get`/`.post`/`.put`/`.delete`/`.patch`
 sugar over the generic `.route(method, path, handler)`, plus opt-in
-`.method_not_allowed()` to distinguish 405 from 404. `eiffel_native_http` and
-`eiffel_outbound_http` use `StatefulRouter<Counter>`.
+`.method_not_allowed()` to distinguish 405 from 404. `specimen_native_http` and
+`specimen_outbound_http` use `StatefulRouter<Counter>`.
 
 ### 7. Bridge specimen cleanup — landed in 059 Rock 7
 
-`eiffel_axum_counter` and `eiffel_ws_room` rewritten to the specimens-rule
+`specimen_axum_counter` and `specimen_ws_room` rewritten to the specimens-rule
 shape. Both use the `BridgeHost::new` / `register_bridge` /
 `drain_and_shutdown` lifecycle. Follow-up bridge polish rebased the
 HTTP-shaped bridge specimens onto `tina_tower_bridge::TinaTowerService`,
@@ -113,7 +113,7 @@ is the blessed shape.
 ## What feels good (keep these)
 
 ### Owned state through isolates is the right model
-*Surfaced by:* `eiffel_mini_keyspace`.
+*Surfaced by:* `specimen_mini_keyspace`.
 
 Declaring `Store` as an isolate that owns a `BTreeMap` removed the
 `Arc<Mutex<_>>` temptation entirely — there is no syntactic path to shared
@@ -122,7 +122,7 @@ convention. Every comparison so far has reinforced that this is the model's
 core strength.
 
 ### `call(addr, msg, timeout).reply(map_outcome)` is honest
-*Surfaced by:* `eiffel_mini_keyspace`.
+*Surfaced by:* `specimen_mini_keyspace`.
 
 Request/reply at an isolate boundary reads like what it is: send a message,
 the answer comes back as another message. Verbose vs. async/await, but no
@@ -130,7 +130,7 @@ hidden state machine and no implicit cancellation point. The right shape for
 a system we want to model formally later.
 
 ### `BridgeHandle` composes cleanly with `axum::State`
-*Surfaced by:* `eiffel_axum_counter`.
+*Surfaced by:* `specimen_axum_counter`.
 
 `BridgeHandle::new(...)` produces a `Clone` value that drops straight into
 `Router::with_state(...)`, and `bridge.call(req).await` is the whole call
@@ -138,7 +138,7 @@ site. The fact that this composes with axum's extractor model with zero
 adapter glue is the single strongest thing about the bridge story so far.
 
 ### Visible HTTP backpressure
-*Surfaced by:* `eiffel_axum_counter`.
+*Surfaced by:* `specimen_axum_counter`.
 
 `BridgeError::{Full,Closed,Timeout}` reach an axum handler as a real error
 variant, so HTTP-shaped pushback (503 etc.) is visible at the call site
@@ -146,7 +146,7 @@ instead of silently buffered. The Tokio side's `Arc<Mutex<_>>` pattern
 cannot offer this property at all.
 
 ### Subscriber pruning falls out of `retain` + `try_send`
-*Surfaced by:* `eiffel_ws_room`.
+*Surfaced by:* `specimen_ws_room`.
 
 The Room isolate's publish path is one expression:
 `subscribers.retain(|tx| tx.send(text.clone()).is_ok())`. Dead subscribers
@@ -155,7 +155,7 @@ are removed in the same pass as the broadcast. The Tokio
 `RecvError::Lagged` that callers usually swallow.
 
 ### Out-of-order multiplexing without a shared map
-*Surfaced by:* `eiffel_mux_client`.
+*Surfaced by:* `specimen_mux_client`.
 
 The Tina client never builds an `Arc<Mutex<HashMap<u32, oneshot::Sender>>>`
 because the parser, the buffer, and the pending counter all live behind
@@ -165,8 +165,8 @@ The Tokio recipe needs a reader task, a submit task, a shared map, and a
 oneshot per request.
 
 ### State machines as `enum` + `match` are legible
-*Surfaced by:* `eiffel_mini_keyspace`, `eiffel_outbound_fetch`,
-`eiffel_persistent_counter`.
+*Surfaced by:* `specimen_mini_keyspace`, `specimen_outbound_fetch`,
+`specimen_persistent_counter`.
 
 Once written, an isolate's `handle` is one of the easier-to-trace pieces of
 code in the example. Each transition is one arm. Each effect is one
@@ -175,7 +175,7 @@ roles (server connection, durable state machine, outbound TCP client) — the
 same `Begin → IO → IO → ... → Done` skeleton fits all three.
 
 ### Append-before-apply is enforced by message shape
-*Surfaced by:* `eiffel_persistent_counter`.
+*Surfaced by:* `specimen_persistent_counter`.
 
 The Tina counter cannot update `self.value` until `AppendDurable(Ok(()))`
 returns, because that is the only message variant where the new value is
@@ -184,7 +184,7 @@ only break under crash. Durability ordering becomes a typestate property
 rather than a discipline.
 
 ### Supervision policy is named, finite, and observable
-*Surfaced by:* `eiffel_supervised_worker`.
+*Surfaced by:* `specimen_supervised_worker`.
 
 `runtime.supervise(parent, SupervisorConfig::new(OneForOne, RestartBudget::new(N)))`
 is the entire restart story. The policy has a name, the budget is finite,
@@ -194,17 +194,17 @@ maintained. Tokio shops re-write the supervise loop every time, slightly
 differently, with no shared vocabulary.
 
 ### Deterministic replay is a real, asserted property
-*Surfaced by:* `eiffel_replay_dst`.
+*Surfaced by:* `specimen_replay_dst`.
 
 `Simulator::new(seed)` plus `run_until_quiescent` plus
 `stable_trace_hash(...)` produces a fingerprint that is byte-identical
 across two runs of the same seed and *different* across two seeds. Tokio
 has no analogue — `start_paused: true` is a paused clock, not a seeded
-scheduler. This is the property the rest of Eiffel silently relies on:
+scheduler. This is the property the rest of Specimen silently relies on:
 every other comparison can in principle be replayed under seeded faults.
 
 ### Tina-as-client and Tina-as-server are the same Tina
-*Surfaced by:* `eiffel_outbound_fetch`.
+*Surfaced by:* `specimen_outbound_fetch`.
 
 `tcp_connect(addr).reply(...)` reads the same as `tcp_bind` and
 `tcp_accept` from server comparisons. The `Connected` reply also returns
@@ -212,7 +212,7 @@ both endpoints (`local`, `peer`), where `tokio::net::TcpStream::connect`
 returns just the stream and forces a separate `.local_addr()` call.
 
 ### `signal_wait` is the whole signal story at the user-code surface
-*Surfaced by:* `eiffel_graceful_shutdown`.
+*Surfaced by:* `specimen_graceful_shutdown`.
 
 `signal_wait("sigint", timeout).reply(SignalMsg::Received)` is one
 runtime call. The reply carries the signal name, so a single watcher
@@ -223,7 +223,7 @@ producer absorbs shutdown via a normal match arm. State machines
 treat shutdown the way they treat every other event.
 
 ### Cancellation as a message arm beats `select!` for inspectability
-*Surfaced by:* `eiffel_graceful_shutdown`.
+*Surfaced by:* `specimen_graceful_shutdown`.
 
 Tokio's idiom for "do work or shutdown, whichever arrives first" is
 `select! { _ = sleep(...) => ..., _ = ctrl_c => ... }`. It's correct
@@ -237,7 +237,7 @@ no longer cares. The same property that makes Tina more verbose
 inspectable in the trace.
 
 ### `runtime.shutdown_report()` is a primitive Tokio doesn't have
-*Surfaced by:* `eiffel_graceful_shutdown`.
+*Surfaced by:* `specimen_graceful_shutdown`.
 
 When a Tokio runtime shuts down, what was in flight, when, in what
 order, against which task — gone. Whatever the application was
@@ -249,9 +249,9 @@ via telemetry — but it's worth flagging as the kind of primitive
 that only exists when the runtime knows about the work it owns.
 
 ### Tina can be shorter than Tokio when the work is genuinely stateful
-*Surfaced by:* `eiffel_native_http`.
+*Surfaced by:* `specimen_native_http`.
 
-`eiffel_native_http` is the first specimen where the Tina side has
+`specimen_native_http` is the first specimen where the Tina side has
 *fewer* lines than the Tokio side: 73 vs 87 for an HTTP/1.1 counter.
 The Tina side is `Counter` (one `#[isolate]` impl with a
 `(method, path)` match) plus an
@@ -274,10 +274,10 @@ elsewhere (mailbox factory, side channels, manual shard types via
 ## What feels bad (papercuts)
 
 ### Mailbox boilerplate per example — resolved in Phase 047
-*Surfaced by:* `eiffel_mini_keyspace`, `eiffel_real_io_chat`,
-`eiffel_axum_counter`, `eiffel_ws_room`, `eiffel_mux_client`,
-`eiffel_supervised_worker`, `eiffel_persistent_counter`,
-`eiffel_outbound_fetch`, `eiffel_graceful_shutdown`.
+*Surfaced by:* `specimen_mini_keyspace`, `specimen_real_io_chat`,
+`specimen_axum_counter`, `specimen_ws_room`, `specimen_mux_client`,
+`specimen_supervised_worker`, `specimen_persistent_counter`,
+`specimen_outbound_fetch`, `specimen_graceful_shutdown`.
 
 Before Phase 047, every Tina example rolled its own `Mailbox<T>` +
 `MailboxFactory` implementation backed by `Rc<RefCell<VecDeque<_>>>`.
@@ -289,10 +289,10 @@ explicit-step runtimes and `DefaultThreadedMailboxFactory` for threaded
 runtimes. Capacity is still explicit at registration and spawn.
 
 ### The runtime knows; the user has to scrape — partly resolved in Phase 047
-*Surfaced by:* `eiffel_mini_keyspace`, `eiffel_real_io_chat`,
-`eiffel_mux_client`, `eiffel_supervised_worker`, `eiffel_persistent_counter`,
-`eiffel_outbound_fetch`, `eiffel_outbound_http`, `eiffel_graceful_shutdown`,
-`eiffel_replay_dst`.
+*Surfaced by:* `specimen_mini_keyspace`, `specimen_real_io_chat`,
+`specimen_mux_client`, `specimen_supervised_worker`, `specimen_persistent_counter`,
+`specimen_outbound_fetch`, `specimen_outbound_http`, `specimen_graceful_shutdown`,
+`specimen_replay_dst`.
 
 The most-recurring papercut in the suite. Before Phase 047, the runtime *had* the
 information the driver thread needs — every comparison's "wait for X
@@ -301,39 +301,39 @@ internally. But the only public way to read it is `complete_trace()`
 polling or hand-rolled side channels. Every comparison invents its
 own variant:
 
-- `eiffel_mini_keyspace`, `eiffel_real_io_chat`:
+- `specimen_mini_keyspace`, `specimen_real_io_chat`:
   `Arc<Mutex<Option<SocketAddr>>>` because `tcp_bind` won't tell the
   spawning thread what port it got. **Resolved:** `observe_next_bound()`.
-- `eiffel_mux_client`: `Arc<Mutex<Vec<u32>>>` to harvest arrival
+- `specimen_mux_client`: `Arc<Mutex<Vec<u32>>>` to harvest arrival
   order from the client isolate.
-- `eiffel_supervised_worker`: `Arc<Mutex<Option<Address<...>>>>` plus
+- `specimen_supervised_worker`: `Arc<Mutex<Option<Address<...>>>>` plus
   an `AtomicU64` generation counter so the driver can wait for the
   *next* worker incarnation after a restart. **Partly resolved:**
   `observe_child_restarted()` replaces the generation counter; initial
   child address publish still needs a small slot until Tina grows an
   observe-child-spawned shape.
-- `eiffel_persistent_counter`: a `u64` correlation id (`op`) threaded
+- `specimen_persistent_counter`: a `u64` correlation id (`op`) threaded
   through every continuation message so the driver can know when a
   *specific* increment has finished.
-- `eiffel_outbound_fetch`: `Arc<AtomicBool>` `done` flag the driver
+- `specimen_outbound_fetch`: `Arc<AtomicBool>` `done` flag the driver
   spins on while the fetcher isolate completes. **Resolved:**
   `observe_isolate_complete()` for the *completion* signal; the
   per-fetch `Arc<Outcome>` (successful / failed / bytes counters)
   is still app data.
-- `eiffel_outbound_http`: per-request `std::sync::mpsc` channel +
+- `specimen_outbound_http`: per-request `std::sync::mpsc` channel +
   short-lived `Driver` isolate that does `call(client, ...,
   timeout).reply(Returned)` and forwards the result. The pattern is
   the documented bridge between sync host code and isolate-driven
   `call(...)`; small but recurs at every sync-host call site.
-- `eiffel_graceful_shutdown`: `Arc<Telemetry>` with four atomics
+- `specimen_graceful_shutdown`: `Arc<Telemetry>` with four atomics
   (produced, processed, signal_received, producer_stopped) plus a
   three-condition spin-loop on the driver thread.
-- `eiffel_mini_keyspace`, `eiffel_supervised_worker`: `complete_trace()`
+- `specimen_mini_keyspace`, `specimen_supervised_worker`: `complete_trace()`
   polled in a loop for `CallKind::TcpStreamClose` /
   `SupervisorRestartTriggered` events the runtime already emits.
   **Partly resolved:** operation and restart waiters cover the common
   cases; terminal/shutdown observation is still future work.
-- `eiffel_replay_dst`: `format!("{event:?}").hash(...)` to fingerprint
+- `specimen_replay_dst`: `format!("{event:?}").hash(...)` to fingerprint
   the trace because there was no stable event hash. **Resolved:**
   `RuntimeEvent::stable_hash()` and `stable_trace_hash()`.
 
@@ -351,12 +351,12 @@ specimens-rewrite pass, the cleanest unifying primitive would be a
 typed observation handle that resolves to the isolate's *final state*
 (a typed `Result<AppData, ObservationError>`), retiring the
 `Arc<Outcome>` / `Arc<Telemetry>` / `Driver`-isolate-+-mpsc patterns
-across `eiffel_mux_client`, `eiffel_persistent_counter`,
-`eiffel_outbound_fetch`, `eiffel_outbound_http`, and
-`eiffel_graceful_shutdown` at once.
+across `specimen_mux_client`, `specimen_persistent_counter`,
+`specimen_outbound_fetch`, `specimen_outbound_http`, and
+`specimen_graceful_shutdown` at once.
 
 ### Tokio + Tina signal handlers do not coexist cleanly in one process
-*Surfaced by:* `eiffel_graceful_shutdown`.
+*Surfaced by:* `specimen_graceful_shutdown`.
 
 Both `tokio::signal::ctrl_c()` and `tina_runtime::signal_wait("sigint", _)`
 register process-global handlers via `signal-hook`. `signal-hook` chains
@@ -367,7 +367,7 @@ but is the kind of cross-runtime sharp edge that is hard to debug when
 something does break, and there is no public API to query "which
 handlers are registered" or "tear down my registrations."
 
-`eiffel_graceful_shutdown` works around it by spawning each side as a
+`specimen_graceful_shutdown` works around it by spawning each side as a
 subprocess in `compare` mode. Worth a public note in any "embedding
 Tina inside a Tokio app" guide.
 
@@ -377,7 +377,7 @@ that want to swap signal ownership cleanly.
 
 
 ### "Process a list of things" has no native shape — partly resolved in Phase 047
-*Surfaced by:* `eiffel_mini_keyspace`, `eiffel_mux_client`.
+*Surfaced by:* `specimen_mini_keyspace`, `specimen_mux_client`.
 
 A `VecDeque<Command>` plus "do them one at a time" required a hand-rolled
 recursive `next_effect()` helper that pops + dispatches + tail-calls into
@@ -385,7 +385,7 @@ itself via response messages. There is no built-in iteration combinator and
 nothing that resembles `for cmd in commands { ... .await }`. This shape is
 going to recur in every connection handler.
 
-`eiffel_mux_client` ran into the same gap from a slightly different angle:
+`specimen_mux_client` ran into the same gap from a slightly different angle:
 issuing three independent `tcp_write` effects on a single stream as a
 `batch(...)` wedged the runtime; the example had to concatenate the three
 requests into one payload. Multiplexing in Tina currently has to either
@@ -402,7 +402,7 @@ still the right pattern for "process a list" — what changed is that the
 caveat is documented and the runtime gives it a name.
 
 ### Mailbox capacities are load-bearing magic numbers — partly resolved in Phase 047
-*Surfaced by:* `eiffel_mini_keyspace`, `eiffel_real_io_chat`.
+*Surfaced by:* `specimen_mini_keyspace`, `specimen_real_io_chat`.
 
 **Phase 047 replacement (docs):** `docs/mailbox-capacity.md` names the
 "reply slots count against the requester's mailbox" rule plainly, ships a
@@ -418,7 +418,7 @@ Tests in `tina-runtime/tests/capacity_truth.rs` pin the rule. A separate
 We pick 16 because other tests pick 16. Pick 4 and the run silently breaks
 — no compile-time hint, no warning, just dropped messages or deadlock.
 
-`eiffel_real_io_chat` exposes the specific *cause* that makes capacities
+`specimen_real_io_chat` exposes the specific *cause* that makes capacities
 load-bearing: every `send_observed(...).reply(...)` outcome comes back
 through the *requester's* mailbox. A connection isolate that fans out a
 burst of 64 admissions has to absorb 64 reply messages before it can
@@ -442,7 +442,7 @@ that relationship is implicit.
   registration so the two concerns aren't tangled.
 
 ### Result-shaped continuations carry dead `Err` arms
-*Surfaced by:* `eiffel_mini_keyspace`, `eiffel_graceful_shutdown`.
+*Surfaced by:* `specimen_mini_keyspace`, `specimen_graceful_shutdown`.
 
 Two flavors of the same shape — runtime calls return outcomes that
 are wider than the common case, forcing every call site to write
@@ -451,11 +451,11 @@ match arms for failure modes that effectively never fire.
 - **`CallOutcome<Reply>` for in-process calls.** For a call to a
   store isolate that always replies, the `Timeout` / `Closed` arms
   are unreachable but still have to be matched on every call site
-  (`eiffel_mini_keyspace`).
+  (`specimen_mini_keyspace`).
 - **`Result<(), CallError>` on `sleep(...).reply(...)`.** Every Tina
   handler that uses `sleep(...).reply(...)` ends up with a
   `TimerFired(_, Result<(), CallError>)` continuation whose `Err`
-  arm is dead code on healthy systems (`eiffel_graceful_shutdown`).
+  arm is dead code on healthy systems (`specimen_graceful_shutdown`).
   The same will apply to other "rarely fail" runtime calls.
 
 **Improvement:**
@@ -467,7 +467,7 @@ match arms for failure modes that effectively never fire.
   effectively-infallible runtime calls.
 
 ### `Result<T, CallError>` payloads dead-code-flagged when both arms `stop()`
-*Surfaced by:* `eiffel_mux_client`, `eiffel_outbound_fetch`.
+*Surfaced by:* `specimen_mux_client`, `specimen_outbound_fetch`.
 
 A close cousin of the entry above. When a continuation variant
 carries `Result<T, CallError>` but the handler treats both `Ok` and
@@ -503,9 +503,9 @@ type (above) would retire the issue entirely for runtime calls
 that genuinely can't fail.
 
 ### Hand-zeroed counter fields at every isolate spawn site
-*Surfaced by:* `eiffel_real_io_chat`, `eiffel_mini_keyspace`,
-`eiffel_mux_client`, `eiffel_persistent_counter`,
-`eiffel_outbound_fetch`.
+*Surfaced by:* `specimen_real_io_chat`, `specimen_mini_keyspace`,
+`specimen_mux_client`, `specimen_persistent_counter`,
+`specimen_outbound_fetch`.
 
 Pre-rewrite, each example's isolate spawn site listed its
 zero-initialized counters by hand:
@@ -548,7 +548,7 @@ The new ergonomics-checklist entry "Default-zero state on isolates"
 codifies it. Every specimen rewrite uses it where it applies.
 
 ### Bridge-hosted services: two runtimes that don't compose cleanly
-*Surfaced by:* `eiffel_axum_counter`, `eiffel_ws_room`, `eiffel_mux_client`.
+*Surfaced by:* `specimen_axum_counter`, `specimen_ws_room`, `specimen_mux_client`.
 
 A bridge service is one Tina runtime (its own thread) plus a Tokio
 runtime that hosts axum and calls into the bridge. That is exactly
@@ -558,7 +558,7 @@ the call site (see "What feels good"). The friction is at the seams.
 Two failure modes hit during the comparisons:
 
 - **Sync recv inside a Tokio current_thread `block_on(...)` deadlocks
-  the executor.** `eiffel_mux_client` originally used
+  the executor.** `specimen_mux_client` originally used
   `std::sync::mpsc::Receiver::recv()` to wait for a server-shutdown
   signal inside the Tokio runtime hosting the responder. The
   current_thread runtime cannot drive futures while the OS thread is
@@ -581,9 +581,9 @@ plus `drain_and_shutdown()`. The bridge is still a two-runtime compromise,
 not native Tina HTTP.
 
 ### Continuation enum growth
-*Surfaced by:* `eiffel_persistent_counter`, `eiffel_outbound_fetch`,
-`eiffel_mini_keyspace`, `eiffel_mux_client`, `eiffel_graceful_shutdown`,
-`eiffel_outbound_http`.
+*Surfaced by:* `specimen_persistent_counter`, `specimen_outbound_fetch`,
+`specimen_mini_keyspace`, `specimen_mux_client`, `specimen_graceful_shutdown`,
+`specimen_outbound_http`.
 
 The user-guide ergonomics page already lists this; the new comparisons
 confirm it lands harder when the protocol has more than three steps.
@@ -610,7 +610,7 @@ The spelled-out shape is consistent now; the real win would be sugar
 that hides the per-step variant for linear pipelines.
 
 ### No `read_to_end` / `write_all` at the runtime-call layer — partly resolved in Phase 047
-*Surfaced by:* `eiffel_outbound_fetch`.
+*Surfaced by:* `specimen_outbound_fetch`.
 
 **Phase 047 replacement (docs):** `docs/tcp-loops.md` ships canonical
 write-all and read-to-eof patterns at the user level. Driver-level
@@ -632,7 +632,7 @@ re-implement the same loop until a helper lands.
 or a documented snippet in the TCP guide.
 
 ### Threaded and explicit-step API surfaces have drifted apart — partly resolved in Phase 047
-*Surfaced by:* `eiffel_supervised_worker`.
+*Surfaced by:* `specimen_supervised_worker`.
 
 **Phase 047 replacement:** `Runtime::try_supervise` and
 `ThreadedRuntime::try_supervise` ship as non-panicking variants that both
@@ -674,7 +674,7 @@ and at minimum document the divergence in the porting guide and
 call it out at the type level.
 
 ### `tina::isolate` vs `tina_runtime::isolate` divergence is invisible until simulator — resolved in Phase 047
-*Surfaced by:* `eiffel_replay_dst`.
+*Surfaced by:* `specimen_replay_dst`.
 
 **Phase 047 replacement:** `tina_runtime::RuntimeCallable` is a sealed
 marker trait implemented only for `RuntimeCall<M>`, decorated with
@@ -697,7 +697,7 @@ emit a targeted diagnostic when an isolate using `#[tina::isolate(...)]`
 is registered with `Simulator::register_with_mailbox_capacity`.
 
 ### Simulated process restart needs a fresh runtime
-*Surfaced by:* `eiffel_persistent_counter`.
+*Surfaced by:* `specimen_persistent_counter`.
 
 There is no public "warm-restart" or "re-recover" path on a live
 `ThreadedRuntime`. The persistence example splits into two
@@ -711,10 +711,10 @@ documented helper, or expose a `runtime.simulate_restart()` for tests
 that re-recovers without tearing down the host process.
 
 ### `shard = SomeShard` is mandatory even with one shard — resolved in Phase 047
-*Surfaced by:* `eiffel_mini_keyspace`, `eiffel_axum_counter`,
-`eiffel_ws_room`, `eiffel_supervised_worker`,
-`eiffel_persistent_counter`, `eiffel_outbound_fetch`,
-`eiffel_replay_dst`, `eiffel_graceful_shutdown`.
+*Surfaced by:* `specimen_mini_keyspace`, `specimen_axum_counter`,
+`specimen_ws_room`, `specimen_supervised_worker`,
+`specimen_persistent_counter`, `specimen_outbound_fetch`,
+`specimen_replay_dst`, `specimen_graceful_shutdown`.
 
 **Phase 047 replacement:** `tina::SingleShard` is a built-in `Shard`
 type re-exported from `tina::prelude`. The `#[tina::isolate]` and
@@ -724,14 +724,14 @@ one-off `KeyspaceShard` / `RoomShard` / etc. struct just to satisfy the
 macro. Multi-shard programs continue to declare their own shard types.
 
 ### Comparisons don't yet expose load-shedding metrics
-*Surfaced by:* `eiffel_cpu_run`, `eiffel_mem_run`.
+*Surfaced by:* `specimen_cpu_run`, `specimen_mem_run`.
 
 The CPU contention runner can answer "did the comparison still pass
 under N spinners?" but it cannot answer "did Tina shed load visibly while
 Tokio buffered silently?" — because the existing comparisons assert a
 fixed scripted output and do not yet expose accepted/full/closed counts
 under load. The closest existing metric is
-`eiffel_real_io_chat::SideReport::saw_visible_full`.
+`specimen_real_io_chat::SideReport::saw_visible_full`.
 
 **Improvement:** when load drivers land in individual comparisons,
 surface a uniform overload-counter shape (accepted/full/closed/timeouts)
@@ -739,7 +739,7 @@ that the contention/memory runners can diff between baseline and
 constrained runs.
 
 ### Constraint runners are platform-asymmetric
-*Surfaced by:* `eiffel_mem_run`.
+*Surfaced by:* `specimen_mem_run`.
 
 `RLIMIT_AS` is a real cap on Linux but is unhelpful on macOS — sub-GB
 caps reject child spawn with `EINVAL` because of address-space reserved
@@ -801,7 +801,7 @@ side, or multi-shard service placement so the dispatcher and the
 service run on different threads with their own scheduling rates.
 
 ### Outbound HTTP: visible call boundary vs. hidden await
-*Surfaced by:* `eiffel_outbound_http`.
+*Surfaced by:* `specimen_outbound_http`.
 
 The Tokio side's outbound is `client.get(url).send().await?.text().await?`.
 One line. Cancellation, backpressure, the state machine, and the
@@ -824,9 +824,9 @@ reflect the current state, with style-only resolutions noted where
 
 1. **Typed observation handle that resolves to the isolate's final
    state.** *Five comparisons.*
-   (`eiffel_mux_client`, `eiffel_persistent_counter`,
-   `eiffel_outbound_fetch`, `eiffel_outbound_http`,
-   `eiffel_graceful_shutdown`.)
+   (`specimen_mux_client`, `specimen_persistent_counter`,
+   `specimen_outbound_fetch`, `specimen_outbound_http`,
+   `specimen_graceful_shutdown`.)
    The single biggest unifying primitive. Every isolate that has
    "the host wants to read app data after I stop" reaches for the
    same shape: `Arc<AtomicU32>` / `Arc<Mutex<Vec<_>>>` / a per-op
@@ -837,7 +837,7 @@ reflect the current state, with style-only resolutions noted where
 
 2. **Continuation enum sugar / narrower outcome types.** *Six
    comparisons.* `CounterMsg`, `FetchMsg`, `MuxMsg`, `ProducerMsg`,
-   `DriverMsg`, plus `eiffel_mini_keyspace`'s `next_effect()`
+   `DriverMsg`, plus `specimen_mini_keyspace`'s `next_effect()`
    recursion. **Style resolved:** the
    [ergonomics checklist](../docs/tina-user-guide/11-ergonomics-checklist.md)
    pins `Result<T, CallError>` variants + variant-constructor
@@ -856,20 +856,20 @@ reflect the current state, with style-only resolutions noted where
 4. **Sugar / docs for "sequence of calls then continue," and an
    explicit contract for `batch(...)` on same-stream effects.**
    *Two comparisons.* `next_effect()` recursive helper in
-   keyspace; the wedge that hit `eiffel_mux_client` when batching
+   keyspace; the wedge that hit `specimen_mux_client` when batching
    same-stream writes alongside a read. **Partly resolved:**
    `tina::sequence(...)` documented; same-stream caveat called out
    on `Effect::Batch`. Still no combinator for "for each command,
    call store, accumulate."
 
 5. **`tcp_read_to_eof` / `tcp_write_all` companions.** *Two
-   comparisons.* `eiffel_outbound_fetch` hand-rolls the partial-
+   comparisons.* `specimen_outbound_fetch` hand-rolls the partial-
    write loop and the read-to-EOF loop. **Partly resolved:** user
    patterns in `docs/tcp-loops.md`. Driver-level helpers
    deliberately deferred to keep per-step trace events visible.
 
 6. **Bless a "first-child-spawned" observation handle.** *One
-   comparison.* `eiffel_supervised_worker`'s `WorkerSlot` is the
+   comparison.* `specimen_supervised_worker`'s `WorkerSlot` is the
    one remaining `Arc<Mutex<Option<Address>>>` side channel after
    `observe_child_restarted()` retired the generation counter.
 
@@ -885,16 +885,16 @@ reflect the current state, with style-only resolutions noted where
 
 9. **Document the Tokio + Tina signal-handler coexistence pattern,
    optionally expose `runtime.unregister_signal_handlers()`.**
-   *One comparison.* `eiffel_graceful_shutdown` deliberately drops
+   *One comparison.* `specimen_graceful_shutdown` deliberately drops
    the `both` mode for this reason.
 
 10. **Tiny routing shape for `tina_http`.** *One comparison.*
-    `eiffel_native_http`'s server handler matches on
+    `specimen_native_http`'s server handler matches on
     `(method, path)` arms; an axum-style declarative router would
     close the last per-line gap to `axum::Router`.
 
 11. **Uniform overload-counter shape on per-comparison `Report`s,
-    so `eiffel_cpu_run` and `eiffel_mem_run` can diff baseline vs.
+    so `specimen_cpu_run` and `specimen_mem_run` can diff baseline vs.
     constrained.** *Two runners.*
 
 ## How to add to this file

@@ -36,7 +36,7 @@ exit status.
 
 ## Runner behavior
 
-The pressure runners (`eiffel_cpu_run`, `eiffel_mem_run`) capture the
+The pressure runners (`specimen_cpu_run`, `specimen_mem_run`) capture the
 target's stdout, intercept lines starting with `pressure `, and
 re-emit them in the runner's summary. Other lines pass through to
 the runner's stdout verbatim. A specimen that emits no `pressure`

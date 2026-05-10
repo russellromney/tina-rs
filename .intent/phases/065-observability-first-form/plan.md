@@ -375,9 +375,9 @@ Add one doc page `docs/tina-user-guide/19-tracing.md`:
 
 Update `docs/tina-user-guide/README.md` to list the new entry.
 
-Update one Eiffel example to print structured tracing output. Pick
-`eiffel_outbound_http` (already exercises bridge + late reply) or
-`eiffel_supervised_worker` (lifecycle + restart). The example wires
+Update one Specimen example to print structured tracing output. Pick
+`specimen_outbound_http` (already exercises bridge + late reply) or
+`specimen_supervised_worker` (lifecycle + restart). The example wires
 `tracing_subscriber::fmt` and calls `tina_tracing::events::emit_events`
 on the captured trace before the runtime drops; the example output
 gains structured `kind`, `reason`, `call_id`, `shard`, `isolate` lines.
@@ -421,7 +421,7 @@ Proof:
   `tina-mailbox-spsc`, or `tina-supervisor`. `cargo tree` confirms.
 - A doc page lives at `docs/tina-user-guide/19-tracing.md` and is linked
   from the user-guide README.
-- One Eiffel example prints structured tracing output for a real run.
+- One Specimen example prints structured tracing output for a real run.
 - No new event kinds added to the runtime. No global subscriber installed
   unless the caller calls `install_global_default_subscriber`.
 

@@ -8,7 +8,7 @@ Design only. Not shipped in 064.
 
 Remove the host-side `Arc<Mutex<Option<Address<ChildMsg>>>>` slot and
 the `WorkerMsg::Boot { ctx.me() }` variant from
-`eiffel_supervised_worker`.
+`specimen_supervised_worker`.
 
 Candidate API:
 
@@ -90,7 +90,7 @@ or hide a soundness gap.
 
 ## Decision For 064
 
-Leave the slot+`Boot` pattern in `eiffel_supervised_worker`. The
+Leave the slot+`Boot` pattern in `specimen_supervised_worker`. The
 example already documents it explicitly:
 
 > Until Tina ships an observe-child-spawned waiter, this is the

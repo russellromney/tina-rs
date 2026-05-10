@@ -68,7 +68,7 @@ work; the runtime event vocabulary work is non-trivial.
 
 ## Decision
 
-`eiffel_cancellation_chain`'s `DriverMsg::Stop` stays. No
+`specimen_cancellation_chain`'s `DriverMsg::Stop` stays. No
 helper this phase.
 
 This note locks in:

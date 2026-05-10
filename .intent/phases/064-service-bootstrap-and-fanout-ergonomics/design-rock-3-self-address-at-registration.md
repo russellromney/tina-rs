@@ -14,7 +14,7 @@ the workaround is a `Begin { self_addr }` (or `Bind { self_addr }`)
 message whose only job is to land the address into state:
 
 ```rust
-// eiffel_dynamic_worker_pool today
+// specimen_dynamic_worker_pool today
 let coord_addr = runtime.register_with_capacity::<_, Infallible>(coord, cap)?;
 runtime.try_send(coord_addr, CoordMsg::Begin { self_addr: coord_addr })?;
 ```
@@ -219,14 +219,14 @@ plain `impl Isolate` types too.
 
 ## Migration
 
-`eiffel_dynamic_worker_pool`'s `CoordMsg::Begin { self_addr }` is
+`specimen_dynamic_worker_pool`'s `CoordMsg::Begin { self_addr }` is
 the textbook case: the variant exists only to land the address
 into coord state. After this rock, the example registers the
 coord with a `|self_addr| Coordinator { self_addr, ... }`
 constructor and the host kicks the work with a typed
 `CoordMsg::Start` that no longer carries an address.
 
-`eiffel_sharded_fanout_read`'s `Bind { bridge }` is **not**
+`specimen_sharded_fanout_read`'s `Bind { bridge }` is **not**
 migrated by this rock. The coord still needs the *adapter's*
 address, which is allocated separately and is not the coord's
 self-address. Self-address-at-registration solves only the

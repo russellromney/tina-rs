@@ -9,7 +9,7 @@ Design only. Not shipped this phase.
 A bounded helper that owns a fixed-capacity table of `CallHandle`s
 keyed by user-chosen `RequestId` would let isolates write the
 "cancel-all-my-pending-calls" pattern without rolling their own
-storage. The eiffel cancellation chain example shows the cost of *not*
+storage. The specimen cancellation chain example shows the cost of *not*
 having it: the driver stores `Vec<CallHandle<WorkerReply>>` and drains
 it on cancel.
 
@@ -31,7 +31,7 @@ either:
 2. A `tina_runtime`-side helper that wraps `Vec` plus an explicit
    capacity check.
 
-Option 2 is what the eiffel example currently does inline; promoting
+Option 2 is what the specimen currently does inline; promoting
 it to a helper would shave ~10 lines per cancel-aware isolate but adds
 an API to maintain. Option 1 is the load-bearing primitive but bumps
 phase 066 from "first-form cancel" to "bounded-cancel-set + first-form
@@ -39,7 +39,7 @@ cancel," which dilutes the rock.
 
 ## Decision
 
-Ship the first-form primitive (Rocks 2 + 3) plus the eiffel update
+Ship the first-form primitive (Rocks 2 + 3) plus the specimen update
 (Rock 6) without the helper. Promote the helper in phase 067 alongside
 the bounded pool work — pools and pending-call sets share the same
 "bounded handle table with explicit cleanup" shape, and 067 will pin

@@ -1,7 +1,7 @@
 # Ergonomics Checklist
 
 Phases 047, 048, 052, and 058 retired most of the hand-rolled
-boilerplate that early Eiffel examples carried. This page lists the
+boilerplate that early Specimen examples carried. This page lists the
 primitives you should reach for when writing a new Tina program,
 example, or test.
 
@@ -28,7 +28,7 @@ the `shard = ...` argument from `#[tina::isolate]` /
 `#[tina_runtime::isolate]` — both default to `SingleShard`. Multi-shard
 programs still declare their own shard type explicitly.
 
-Do not declare a per-program `EiffelShard` / `MyShard` just to satisfy
+Do not declare a per-program `SpecimenShard` / `MyShard` just to satisfy
 the macro.
 
 ### Bound address
@@ -345,7 +345,7 @@ async/await plus correlator demux for many in-flight calls.
 
 For raw-frame specimen clients, `Json::encode(&args_tuple, max_payload)`
 plus `Frame::request(...)` is enough. That is what
-`examples/eiffel_rpc` does so the client code stays local and visible.
+`examples/specimen_rpc` does so the client code stays local and visible.
 
 Do not reach for `serde_json::to_vec` directly unless you have a
 specific reason. The `Encoding` trait is the public seam.
@@ -694,7 +694,7 @@ live in crate tests.
 
 ## When in doubt
 
-- Read [`examples/eiffel_rpc/src/tina_impl.rs`](../../examples/eiffel_rpc/src/tina_impl.rs)
+- Read [`examples/specimen_rpc/src/tina_impl.rs`](../../examples/specimen_rpc/src/tina_impl.rs)
   as a current-shape reference.
 - Read [`examples/FINDINGS.md`](../../examples/FINDINGS.md) for the
   history of why these primitives exist.

@@ -20,7 +20,7 @@
     pending calls. Late replies for stopped owners classify as
     `OwnerStopped`, distinct from explicit cancel in both the settlement
     event and the rejection event.
-  - Rock 6 `examples/eiffel_cancellation_chain` rewritten on the new shape;
+  - Rock 6 `examples/specimen_cancellation_chain` rewritten on the new shape;
     Tina-side polls the trace until rejection count converges before
     snapshotting (no slow-CI flake), Tokio-side asserts the loose
     `before + after <= FANOUT` so refactors that add an await between
@@ -395,18 +395,18 @@ Proof:
 - callers settle now, not at original timeout;
 - no stale cap after stop.
 
-## Rock 6: Eiffel Cancellation Chain
+## Rock 6: Specimen Cancellation Chain
 
-Update existing Eiffel specimens first. Do not create a new specimen unless the
+Update existing Specimen specimens first. Do not create a new specimen unless the
 existing ones cannot honestly show the new model.
 
 Primary target:
 
-- `examples/eiffel_cancellation_chain`
+- `examples/specimen_cancellation_chain`
 
 Secondary target if deadline propagation lands cleanly:
 
-- `examples/eiffel_backpressure_chain`
+- `examples/specimen_backpressure_chain`
 
 The specimen should show:
 
@@ -427,7 +427,7 @@ record that honestly and keep the domain `Stop` pattern.
 3. PendingCallSet.
 4. Owner-stop cleanup.
 5. Deadline value.
-6. Eiffel cancellation chain update.
+6. Specimen cancellation chain update.
 
 ## Done Means
 
