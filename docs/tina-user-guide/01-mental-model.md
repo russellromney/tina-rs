@@ -37,6 +37,16 @@ The runtime owns scheduling, time, I/O, calls, and supervision.
 
 The isolate only says what should happen next.
 
+A handler that asks for "now" gets it from the runtime, not
+`Instant::now()` — `ctx.now()` is the runtime/sim-stamped clock.
+Budgets that flow through a chain of calls are
+[`Deadline`](11-ergonomics-checklist.md#deadlines) values: built once
+via `ctx.deadline_after(d)`, read at each hop with
+`deadline.remaining_or_zero(ctx.now())`. Outstanding caller-owned
+calls go in a bounded
+[`PendingCallSet`](11-ergonomics-checklist.md#bounded-pending-call-handles)
+keyed by request id, the inverse of `PendingReplies`.
+
 ## Why This Exists
 
 Tokio makes it easy to accept work faster than the process can finish it.

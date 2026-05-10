@@ -1109,11 +1109,12 @@ where
             );
 
             let caller = self.build_message_caller(message.call_context, isolate_id);
+            let now = self.clock.now();
 
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
                 catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller)
+                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller, now)
                 }))
             };
 
@@ -3590,6 +3591,7 @@ where
         shard: &mut S,
         isolate_id: IsolateId,
         caller: Option<MessageCaller>,
+        now: std::time::Instant,
     ) -> ErasedEffect<S, F>;
 }
 
@@ -3643,13 +3645,14 @@ where
         shard: &mut S,
         isolate_id: IsolateId,
         caller: Option<MessageCaller>,
+        now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
         let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a handler message with the wrong type")
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }
@@ -3685,13 +3688,14 @@ where
         shard: &mut S,
         isolate_id: IsolateId,
         caller: Option<MessageCaller>,
+        now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
         let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a handler message with the wrong type")
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }

@@ -3,19 +3,26 @@
 //! - C does the slow work via `sleep(work).reply(Done)`. When `Done`
 //!   fires it returns `reply(())`, completing the `IsolateCall` that
 //!   B made.
-//! - B receives the request from A, calls C with `remaining_budget`,
-//!   and translates C's outcome (`CallOutcome::Replied / Timeout / ...`)
-//!   into a typed `BReply` so A can name where the timeout was
-//!   observed. The deadline is propagated as an explicit `Duration`
-//!   in the request.
-//! - A walks the script. For each iteration it calls B with
-//!   `TOTAL_DEADLINE` and a matching `IsolateCall` timeout. The reply
-//!   tells A whether the chain succeeded or which hop ran out of
-//!   budget.
+//! - B receives the request from A. The request carries a
+//!   [`Deadline`] (runtime/sim-honest absolute time, anchored at
+//!   `Context::now()` upstream), so B's call to C uses
+//!   `deadline.remaining_or_zero(ctx.now())` — the budget shrinks by
+//!   whatever time B's hop spent. B translates C's outcome
+//!   (`CallOutcome::Replied / Timeout / ...`) into a typed `BReply`
+//!   so A can name where the timeout was observed.
+//! - A walks the script. For each iteration it builds a `Deadline`
+//!   from `Context::now() + TOTAL_DEADLINE` and forwards it to B.
+//!   The reply tells A whether the chain succeeded or which hop ran
+//!   out of budget.
 //!
 //! The `Driver` isolate is the host's bridge: it walks the script,
 //! calls A for each iteration, and accumulates a `Report` to publish
 //! via `stop_with`.
+//!
+//! Deadline is a value, not a wish: it does not retry, does not
+//! cancel work, and is read against an explicit `now`. Replay-claimed
+//! tests see deterministic deadlines because the simulator stamps
+//! `Context::now()` from its virtual clock anchor.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -65,7 +72,7 @@ impl ServiceC {
 enum BMsg {
     Forward {
         iteration: u32,
-        budget: Duration,
+        deadline: Deadline,
     },
     CDone(CallOutcome<()>),
 }
@@ -83,14 +90,16 @@ struct ServiceB {
 
 #[tina_runtime::isolate(message = BMsg, reply = BReply)]
 impl ServiceB {
-    fn handle(&mut self, msg: BMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: BMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
-            BMsg::Forward { iteration, budget } => {
-                // Propagate the budget as the IsolateCall timeout. If
-                // C cannot finish in `budget`, B observes
-                // `CallOutcome::Timeout` and translates it to a typed
-                // `CTimedOut` reply.
-                call(self.c_addr, CMsg::Compute { iteration }, budget).reply(BMsg::CDone)
+            BMsg::Forward { iteration, deadline } => {
+                // Read the remaining budget against B's own `now`.
+                // Whatever time A's hop spent already shrank the
+                // deadline; the call to C waits no longer than what
+                // is left. Expired deadline -> `Duration::ZERO`, which
+                // surfaces as `CallOutcome::Timeout`.
+                let timeout = deadline.remaining_or_zero(ctx.now());
+                call(self.c_addr, CMsg::Compute { iteration }, timeout).reply(BMsg::CDone)
             }
             BMsg::CDone(outcome) => match outcome {
                 CallOutcome::Replied(()) => reply(BReply::Ok),
@@ -119,28 +128,32 @@ enum AReply {
 
 struct ServiceA {
     b_addr: Address<BMsg, BReply>,
-    deadline: Duration,
+    budget: Duration,
 }
 
 #[tina_runtime::isolate(message = AMsg, reply = AReply)]
 impl ServiceA {
-    fn handle(&mut self, msg: AMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: AMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
-            AMsg::Submit { iteration } => call(
-                self.b_addr,
-                BMsg::Forward {
-                    iteration,
-                    budget: self.deadline,
-                },
-                // A's outer timeout is generous: it gives B room to
-                // surface a typed `CTimedOut` reply *after* B's own
-                // `call(C, ..., deadline)` fires. If A's outer timeout
-                // raced B's downstream call exactly, A would observe
-                // `CallOutcome::Timeout` first and lose the per-hop
-                // attribution that this specimen exists to teach.
-                self.deadline + Duration::from_millis(50),
-            )
-            .reply(AMsg::BDone),
+            AMsg::Submit { iteration } => {
+                // Anchor the deadline at A's `now`. Downstream hops
+                // read it against their own `now`, so the budget
+                // shrinks as it travels.
+                let deadline = ctx.deadline_after(self.budget);
+                call(
+                    self.b_addr,
+                    BMsg::Forward { iteration, deadline },
+                    // A's outer timeout is generous: it gives B room
+                    // to surface a typed `CTimedOut` reply *after* B's
+                    // own `call(C, ..., remaining_or_zero)` fires. If
+                    // A's outer timeout raced B's downstream call
+                    // exactly, A would observe `CallOutcome::Timeout`
+                    // first and lose the per-hop attribution this
+                    // specimen exists to teach.
+                    self.budget + Duration::from_millis(50),
+                )
+                .reply(AMsg::BDone)
+            }
             AMsg::BDone(outcome) => match outcome {
                 CallOutcome::Replied(BReply::Ok) => reply(AReply::Success),
                 CallOutcome::Replied(BReply::CTimedOut) => reply(AReply::CTimedOut),
@@ -226,7 +239,7 @@ pub fn run() -> anyhow::Result<Report> {
         .register_with_capacity::<_, Infallible>(
             ServiceA {
                 b_addr,
-                deadline: Duration::from_millis(TOTAL_DEADLINE_MS),
+                budget: Duration::from_millis(TOTAL_DEADLINE_MS),
             },
             8,
         )

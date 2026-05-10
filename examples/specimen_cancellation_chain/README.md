@@ -30,12 +30,24 @@ cargo test --manifest-path examples/specimen_cancellation_chain/Cargo.toml
 
 ## What feels worse than Tokio
 
-- Cancellation is bookkeeping: each pending call needs its own
-  `CallHandle` stored in isolate state. The driver fans the cancels
-  back out as a `Batch`, one cancel per stored handle. There is no
-  one-shot `JoinSet::abort_all()` analogue — see Rock 4 of
-  `.intent/phases/066-cancellation-and-deadline-model/plan.md` for
-  the bounded-set helper that closes that gap.
+- Cancellation is bookkeeping: each pending call has a `CallHandle`
+  the driver stores in a `PendingCallSet` keyed by worker index. The
+  driver drains the set on cancel and fans the cancels back out as a
+  `Batch`, one cancel per stored handle. There is no one-shot
+  `JoinSet::abort_all()` analogue — and there will not be: explicit
+  drain-and-cancel keeps each per-call outcome typed.
+
+## What changed in 072
+
+The driver used to keep a `Vec<CallHandle<WorkerReply>>` and
+`drain(..)` it on cancel. It now uses
+`PendingCallSet<u32, WorkerReply>::with_capacity(FANOUT)` — bounded
+storage, typed `Full` / `DuplicateKey` errors on insert, explicit
+`remove(&key)` on each completion. The cancel-all pattern is the
+same drain-and-cancel that the old shape did by hand; the difference
+is that the slot table cannot grow past `FANOUT`, and the cleanup
+contract is now spelled out in the type rather than buried in a
+`Vec` convention.
 
 ## What feels better
 

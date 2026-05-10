@@ -264,17 +264,35 @@ where
         &self.capacity_name
     }
 
-    /// Snapshot for the count surface. `len` -> current,
+    /// Snapshot for the count surface. `live_len` -> current,
     /// `high_water` -> high water, `full_rejects` -> full count.
+    ///
+    /// `current` excludes slots whose caller already went away
+    /// (state == `Closed`) and are awaiting a sweep — those would
+    /// inflate the live count and the discovery line would
+    /// overstate pressure.
     pub fn capacity_report(&self) -> tina::capacity::CapacitySurfaceReport {
         tina::capacity::CapacitySurfaceReport::count(
             self.capacity_name.clone(),
             self.capacity_mode,
             self.capacity,
-            self.len(),
+            self.live_len(),
             self.high_water,
             self.full_rejects,
         )
+    }
+
+    /// Number of slots whose caller is still waiting. Filters out
+    /// `Closed` (caller cancelled / timed out) which a later sweep
+    /// will reclaim.
+    fn live_len(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| {
+                s.as_ref()
+                    .is_some_and(|e| e.reply.state() == DeferredSlotState::Open)
+            })
+            .count()
     }
 
     /// Returns the maximum number of live promises this box may hold.
@@ -799,6 +817,30 @@ mod pending_replies_tests {
         assert_eq!(report.current_messages, 2);
         assert_eq!(report.high_water_messages, 2);
         assert_eq!(report.full_count, 1);
+    }
+
+    #[test]
+    fn capacity_report_excludes_closed_slots_awaiting_sweep() {
+        // Two callers go in, both Open, high_water hits 2. Then
+        // caller 1 goes away (state -> Closed) without a sweep.
+        // capacity_report.current must drop to 1 — live count, not
+        // occupancy. high_water is sticky at 2.
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(4).named("p");
+        let shared1 =
+            std::sync::Arc::new(DeferredSlotShared::new(10, std::any::TypeId::of::<u32>()));
+        let slot1 = tina::runtime_internal::deferred_from_handle(
+            tina::runtime_internal::handle_from_shared(shared1.clone()),
+        );
+        box_.try_insert(1, slot1).unwrap();
+        box_.try_insert(2, fake_slot(11)).unwrap();
+        // Now flip slot 1 to Closed. No sweep happens yet.
+        shared1.set_state(DeferredSlotState::Closed);
+        let report = box_.capacity_report();
+        assert_eq!(
+            report.current_messages, 1,
+            "current should exclude closed slots awaiting sweep"
+        );
+        assert_eq!(report.high_water_messages, 2, "high water is sticky");
     }
 
     #[test]

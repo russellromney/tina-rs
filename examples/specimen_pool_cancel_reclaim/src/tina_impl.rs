@@ -1,7 +1,8 @@
 //! Tina side. The driver uses `call_with_handle` to retain a
-//! `CallHandle` per parked waiter, fires `cancel_call` on each, and
-//! confirms via the pool's `PressureReport` that the cancels were
-//! reclaimed before the retry wave runs.
+//! `CallHandle` per parked waiter — stored in a bounded
+//! [`PendingCallSet`] keyed by waiter index — fires `cancel_call` on
+//! each, and confirms via the pool's `PressureReport` that the cancels
+//! were reclaimed before the retry wave runs.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -49,7 +50,10 @@ enum Wave {
 struct Driver {
     pool: Address<WorkerPoolMsg<Resource>, WorkerPoolReply<Resource>>,
     held: Option<PoolLease<Resource>>,
-    park_handles: Vec<tina::CallHandle<WorkerPoolReply<Resource>>>,
+    /// Bounded park-waiter table. Sized to `WAITERS`; insert-Full is a
+    /// configuration bug, not a runtime condition. Drained on
+    /// `CancelAll`, the explicit cancel-all-my-pending-calls pattern.
+    park_handles: tina::PendingCallSet<u32, WorkerPoolReply<Resource>>,
     report: Report,
 }
 
@@ -68,7 +72,8 @@ impl Driver {
             }
             DriverMsg::BeginWaiters => {
                 let mut effects = Vec::with_capacity(WAITERS);
-                for _ in 0..WAITERS {
+                for idx in 0..WAITERS {
+                    let key = idx as u32;
                     let (effect, handle) =
                         acquire_with_handle_effect(self.pool, CALL_TIMEOUT, move |outcome| {
                             DriverMsg::AcquireReturned {
@@ -76,7 +81,9 @@ impl Driver {
                                 result: try_acquired(outcome),
                             }
                         });
-                    self.park_handles.push(handle);
+                    self.park_handles
+                        .insert(key, handle)
+                        .expect("park-handle table sized to WAITERS");
                     effects.push(effect);
                 }
                 batch(effects)
@@ -114,7 +121,10 @@ impl Driver {
             },
             DriverMsg::CancelAll => {
                 let mut effects = Vec::with_capacity(self.park_handles.len());
-                for handle in self.park_handles.drain(..) {
+                // Bounded drain — same effect shape, slot table is
+                // explicit so a stray park-handle could not silently
+                // outlive its `(idx)` key.
+                for (_idx, handle) in self.park_handles.drain() {
                     effects.push(cancel_call(handle).reply(|_| DriverMsg::CancelReturned));
                 }
                 batch(effects)
@@ -195,7 +205,7 @@ pub fn run() -> anyhow::Result<Report> {
             Driver {
                 pool: pool_addr,
                 held: None,
-                park_handles: Vec::new(),
+                park_handles: tina::PendingCallSet::with_capacity(WAITERS),
                 report: Report::default(),
             },
             64,

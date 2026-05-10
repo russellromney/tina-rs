@@ -123,10 +123,27 @@ rejection reason from a bounded recently-cancelled ring:
 / RuntimeStopped }` or the deferred-path equivalent; ring-evicted
 fall-through is the generic `NoPendingCall` / `CallerClosed`.
 
+**Resolved (Tina pending-call helper phase):** the bounded
+[`PendingCallSet<K, R>`](../tina/src/pending_call_set.rs) helper now
+ships in `tina`. Specimens that previously hand-rolled
+`Vec<CallHandle<R>>` use it: `specimen_cancellation_chain` keys the
+table by worker index, `specimen_pool_cancel_reclaim` keys by waiter
+index. Insert returns `Full` / `DuplicateKey` as typed errors —
+duplicate-key is rejected even when the prior handle has settled,
+because an auto-sweep would create a silent ABA bug if a `Returned`
+continuation for the prior call were already queued in the user's
+mailbox. Forgetting `remove(&key)` therefore *does* leak slots until
+the set is dropped, drained, or `sweep_terminal()`-pruned — that
+leak is loud (eventual `Full`); silent ABA would not be. No `Drop`
+magic, no background timer; the drain-and-cancel pattern stays in
+user code — the helper does not own the workflow. End-to-end fill
+-> cancel -> refill and fill -> timeout -> refill proofs in
+`tina-runtime/tests/pending_call_set.rs`.
+
 **Still open:** runtime-level `runtime.cancel_isolate(addr)` (third
 form — closes every call an isolate owns) is a small wrapper around
-`cancel_call`; deferred until the bounded `PendingCallSet` lands in
-phase 072 (deferred from 066 alongside the `Deadline` value).
+`cancel_call` and `PendingCallSet::drain`; will land when a real
+service consumer asks for it.
 
 ### 9. Drain helper for `PendingReplies` at service stop
 
@@ -331,20 +348,29 @@ typed downstream timeout reaches the caller before the outer
 times out. With N hops, the slack accumulates and there is no
 helper that names the "outer = innermost + slack" pattern.
 
-**Decision:** do not freeze a wall-clock `Deadline` API here.
-Deadline is really a clock-truth problem. A live-only helper could
-exist later, but it must say it has no simulator/replay claim. A
-replayable deadline should wait for the runtime/simulator clock
-model, likely in the DST/replay usability work.
+**Decision:** do not freeze a wall-clock `Deadline` API. Deadline is
+really a clock-truth problem. A live-only helper could exist later,
+but it must say it has no simulator/replay claim. A replayable
+deadline waited for the runtime/simulator clock model.
 
-**Status:** scheduled in phase 072
-(`.intent/phases/072-deadline-and-pending-call-set/plan.md`,
-deferred from 066 alongside the bounded `PendingCallSet` helper).
-Plan settles the clock-truth rule —
-`Deadline::from_instant(now, dur)` takes `now: Instant` explicitly so
-DST-claimed code cannot silently depend on `std::time::Instant`,
-with `Context::deadline_after(duration)` as the runtime/sim-aware
-sugar. No live-only `Deadline::after` shortcut ships.
+**Resolved (Tina deadline phase):** [`Deadline`](../tina/src/lib.rs)
+ships with the explicit-`now` constructor
+`Deadline::from_instant(now, after)` plus
+`Context::now()` / `Context::deadline_after(after)` as the
+runtime/sim-aware sugar. The runtime stamps `Context::now()` from its
+monotonic `Clock` before each handler turn; the simulator stamps it
+from a stable virtual-clock anchor + `virtual_now`. There is no
+`Deadline::after(Duration)` shortcut: it would have to call
+`Instant::now()` internally and silently break DST/replay.
+
+`Deadline` is a budget value: it does not retry, does not extend,
+and does not cancel work. `remaining(now)` returns `Option<Duration>`,
+`remaining_or_zero(now)` returns the duration suitable for use as a
+call timeout (zero -> "do not wait"). Honest under both runtimes —
+proved by `tina-runtime/tests/deadline.rs` (live) and
+`tina-sim/tests/deadline.rs` (deterministic virtual time).
+`specimen_backpressure_chain` propagates a `Deadline` through A → B
+so each hop sees the *remaining* budget against its own `now`.
 
 ### 19. Pool consumer ergonomics — host-side acquire and scenario runner
 

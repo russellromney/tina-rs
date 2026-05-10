@@ -283,6 +283,10 @@ The `suggest=` hint is advice. Read it, decide, freeze.
   whenever a CI test asserts on that surface. A refactor that
   reorders construction or renames internals must not silently
   retarget the assertion.
+- Use a dotted token form (e.g. `pool.orders.waiters`).
+  `CapacitySummary::push` rejects empty names and names with
+  whitespace or control characters so the discovery line stays
+  parseable.
 
 ### Worked example
 

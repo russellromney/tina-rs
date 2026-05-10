@@ -23,6 +23,12 @@ use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 pub enum CapacityNameError {
     /// Two surfaces tried to register under the same name.
     Duplicate(String),
+    /// Name is empty.
+    Empty,
+    /// Name contains whitespace or non-printable characters that
+    /// would break the `key=value` shape of the discovery line.
+    /// Use a dotted token form (e.g. `pool.orders.waiters`).
+    InvalidName(String),
 }
 
 impl fmt::Display for CapacityNameError {
@@ -31,11 +37,26 @@ impl fmt::Display for CapacityNameError {
             Self::Duplicate(name) => {
                 write!(f, "duplicate capacity surface name {name:?}")
             }
+            Self::Empty => f.write_str("capacity surface name is empty"),
+            Self::InvalidName(name) => write!(
+                f,
+                "capacity surface name {name:?} contains whitespace or \
+                 control characters; use a dotted token form like \
+                 \"pool.orders.waiters\""
+            ),
         }
     }
 }
 
 impl std::error::Error for CapacityNameError {}
+
+/// True if `name` is a valid surface name: non-empty and free of
+/// whitespace/control characters. Surface names appear unquoted
+/// after `surface=` in the discovery line, so anything that breaks
+/// `key=value` parsing is rejected at the boundary.
+fn name_is_valid(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || c.is_control())
+}
 
 /// Why a [`SurfaceAssertion`] failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,9 +138,18 @@ impl CapacitySummary {
         Self::default()
     }
 
-    /// Add a report. Rejects duplicate names so CI tests cannot
-    /// silently pick the wrong surface.
+    /// Add a report. Rejects empty names, names with whitespace or
+    /// control characters, and duplicate names. Validation runs at
+    /// the summary boundary so the discovery line stays
+    /// grep-friendly and CI tests cannot silently pick the wrong
+    /// surface.
     pub fn push(&mut self, report: CapacitySurfaceReport) -> Result<(), CapacityNameError> {
+        if report.name.is_empty() {
+            return Err(CapacityNameError::Empty);
+        }
+        if !name_is_valid(&report.name) {
+            return Err(CapacityNameError::InvalidName(report.name));
+        }
         if self.reports.iter().any(|r| r.name == report.name) {
             return Err(CapacityNameError::Duplicate(report.name));
         }
@@ -295,6 +325,42 @@ mod tests {
         s.push(report("a", 4, 0, 0, 0)).unwrap();
         let err = s.push(report("a", 4, 0, 0, 0)).unwrap_err();
         assert_eq!(err, CapacityNameError::Duplicate("a".into()));
+    }
+
+    #[test]
+    fn summary_push_rejects_empty_name() {
+        let mut s = CapacitySummary::new();
+        let err = s.push(report("", 4, 0, 0, 0)).unwrap_err();
+        assert_eq!(err, CapacityNameError::Empty);
+    }
+
+    #[test]
+    fn summary_push_rejects_whitespace_in_name() {
+        // A space in the name would break the surface=name field of
+        // the discovery line into "surface=foo bar=...".
+        let mut s = CapacitySummary::new();
+        let err = s.push(report("foo bar", 4, 0, 0, 0)).unwrap_err();
+        assert_eq!(err, CapacityNameError::InvalidName("foo bar".into()));
+    }
+
+    #[test]
+    fn summary_push_rejects_tab_and_newline() {
+        let mut s = CapacitySummary::new();
+        assert!(matches!(
+            s.push(report("foo\tbar", 4, 0, 0, 0)),
+            Err(CapacityNameError::InvalidName(_))
+        ));
+        assert!(matches!(
+            s.push(report("foo\nbar", 4, 0, 0, 0)),
+            Err(CapacityNameError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn summary_push_accepts_dotted_form() {
+        let mut s = CapacitySummary::new();
+        s.push(report("pool.orders.waiters", 4, 0, 0, 0)).unwrap();
+        s.push(report("frontend.pending", 4, 0, 0, 0)).unwrap();
     }
 
     #[test]
