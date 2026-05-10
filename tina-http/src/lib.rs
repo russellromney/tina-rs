@@ -74,6 +74,7 @@
 pub mod body_metrics;
 pub mod client;
 pub mod connection;
+pub mod keepalive;
 pub mod listener;
 pub mod listener_tls;
 pub mod parse;
@@ -88,14 +89,18 @@ pub mod types;
 pub use body_metrics::{BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
+pub use keepalive::{
+    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveOutcome,
+    KeepalivePoolHandles, OriginKey, build_keepalive_pool,
+};
 pub use listener::{HttpListener, HttpListenerMsg};
 pub use listener_tls::{
     HttpsListener, HttpsListenerMsg, HttpsReady, HttpsServerConfig, HttpsStartupError,
     TlsServerIdentity,
 };
 pub use parse::{
-    HttpResponseHead, ParseProgress, ResponseParseProgress, encode_request, encode_response,
-    parse_request_head, parse_response_head,
+    HttpResponseHead, ParseProgress, ResponseParseProgress, encode_keepalive_request,
+    encode_request, encode_response, parse_request_head, parse_response_head,
 };
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
