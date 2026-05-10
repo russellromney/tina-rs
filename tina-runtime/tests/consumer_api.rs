@@ -543,15 +543,20 @@ fn downstream_consumer_sees_late_isolate_call_reply_rejected_after_timeout() {
         count_call_completed(runtime.trace(), CallKind::IsolateCall),
         0
     );
+    // Late reply after timeout now surfaces with the specific
+    // `CallerTimedOut` reason — recorded in the runtime's
+    // recently-cancelled ring at harvest time. `NoPendingCall`
+    // remains the fall-through if the ring evicts the entry, which
+    // does not happen at this small scale.
     assert!(
         runtime.trace().iter().any(|event| matches!(
             event.kind(),
             RuntimeEventKind::CallReplyRejected {
-                reason: CallReplyRejectedReason::NoPendingCall,
+                reason: CallReplyRejectedReason::CallerTimedOut,
                 ..
             }
         )),
-        "late reply after timeout should be explicit in the trace"
+        "late reply after timeout should surface as CallerTimedOut in the trace"
     );
 }
 

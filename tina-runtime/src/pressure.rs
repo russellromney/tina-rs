@@ -33,11 +33,23 @@ pub struct PressureSummary {
     /// User code closed the resource while the call was pending.
     pub completion_rejected_resource_closed: u64,
     /// An isolate-call reply could not be matched against an
-    /// outstanding pending call (typically caller already timed out).
+    /// outstanding pending call. Used as the fall-through when the
+    /// recently-cancelled ring no longer holds the call_id; the
+    /// more specific cancelled / timed-out / owner / runtime counters
+    /// take precedence when known.
     pub reply_rejected_no_pending_call: u64,
     /// An isolate-call reply arrived after the caller explicitly
     /// cancelled the wait via `cancel_call(handle)`.
     pub reply_rejected_caller_cancelled: u64,
+    /// An isolate-call reply arrived after the call's mandatory
+    /// timeout fired.
+    pub reply_rejected_caller_timed_out: u64,
+    /// An isolate-call reply arrived after the owning isolate
+    /// stopped.
+    pub reply_rejected_owner_stopped: u64,
+    /// An isolate-call reply arrived after the runtime began
+    /// shutting down.
+    pub reply_rejected_runtime_stopped: u64,
     /// The bounded reply transport between callee and caller was
     /// full. This is the cross-shard reply mailbox; it has its own
     /// budget separate from the caller's inbox.
@@ -86,6 +98,15 @@ impl PressureSummary {
                     CallReplyRejectedReason::CallerCancelled => {
                         summary.reply_rejected_caller_cancelled += 1;
                     }
+                    CallReplyRejectedReason::CallerTimedOut => {
+                        summary.reply_rejected_caller_timed_out += 1;
+                    }
+                    CallReplyRejectedReason::OwnerStopped => {
+                        summary.reply_rejected_owner_stopped += 1;
+                    }
+                    CallReplyRejectedReason::RuntimeStopped => {
+                        summary.reply_rejected_runtime_stopped += 1;
+                    }
                 },
                 RuntimeEventKind::SendRejected { reason, .. } => match reason {
                     SendRejectedReason::Full => summary.send_rejected_full += 1,
@@ -104,6 +125,9 @@ impl PressureSummary {
             || self.completion_rejected_resource_closed > 0
             || self.reply_rejected_no_pending_call > 0
             || self.reply_rejected_caller_cancelled > 0
+            || self.reply_rejected_caller_timed_out > 0
+            || self.reply_rejected_owner_stopped > 0
+            || self.reply_rejected_runtime_stopped > 0
             || self.reply_rejected_reply_path_full > 0
             || self.reply_rejected_requester_shard_closed > 0
             || self.send_rejected_full > 0
@@ -121,18 +145,26 @@ impl PressureSummary {
 
 impl fmt::Display for PressureSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // New 066-cancel counters are appended at the end of `reply[]`
+        // so positional matchers built before 066 still find
+        // `no_pending=`, `path_full=`, `shard_closed=` at the same
+        // offsets.
         write!(
             formatter,
             "completion[mbox_full={} requester_closed={} resource_closed={}] \
-             reply[no_pending={} cancelled={} path_full={} shard_closed={}] \
+             reply[no_pending={} path_full={} shard_closed={} \
+             cancelled={} timed_out={} owner_stopped={} runtime_stopped={}] \
              send[full={} closed={}]",
             self.completion_rejected_mailbox_full,
             self.completion_rejected_requester_closed,
             self.completion_rejected_resource_closed,
             self.reply_rejected_no_pending_call,
-            self.reply_rejected_caller_cancelled,
             self.reply_rejected_reply_path_full,
             self.reply_rejected_requester_shard_closed,
+            self.reply_rejected_caller_cancelled,
+            self.reply_rejected_caller_timed_out,
+            self.reply_rejected_owner_stopped,
+            self.reply_rejected_runtime_stopped,
             self.send_rejected_full,
             self.send_rejected_closed,
         )

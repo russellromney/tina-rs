@@ -799,6 +799,7 @@ fn assert_dispatch_attempts_have_terminal_outcomes(trace: &[RuntimeEvent]) {
             RuntimeEventKind::CallCompleted { .. }
                 | RuntimeEventKind::CallFailed { .. }
                 | RuntimeEventKind::CallCompletionRejected { .. }
+                | RuntimeEventKind::CallCancelled { .. }
         )
     });
     assert_eq!(
@@ -1482,7 +1483,6 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
         CallKind::TcpAccept,
         CallKind::TcpRead,
         CallKind::Sleep,
-        CallKind::IsolateCall,
     ] {
         assert_event_exists(
             &trace,
@@ -1499,6 +1499,23 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
             },
         );
     }
+    // Pending isolate-calls now settle as `CallCancelled { RuntimeStopped }`
+    // at shutdown so observers can attribute the cause and so any caller
+    // still holding a `CallHandle` sees `state() == Cancelled` (not a
+    // forever-`Pending` lie).
+    assert_event_exists(
+        &trace,
+        "shutdown should cancel pending isolate calls with RuntimeStopped",
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallCancelled {
+                    cause: tina::CancelCause::RuntimeStopped,
+                    ..
+                }
+            )
+        },
+    );
 }
 
 #[test]

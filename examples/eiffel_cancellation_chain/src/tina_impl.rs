@@ -189,30 +189,41 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
 
-    // Count worker replies rejected after cancellation. The runtime
-    // distinguishes "caller cancelled" from "caller closed for other
-    // reasons" via the recently-cancelled ring: a late reply from a
-    // worker whose call was explicitly cancelled lands as
-    // `CallReplyRejected { CallerCancelled }` (direct `reply`) or
-    // `DeferredReplyRejected { CallerCancelled }` (captured slot).
-    let trace = runtime.trace();
-    let replies_after_cancel = trace
-        .events()
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.kind(),
-                RuntimeEventKind::CallReplyRejected {
-                    reason: CallReplyRejectedReason::CallerCancelled,
-                    ..
-                } | RuntimeEventKind::DeferredReplyRejected {
-                    reason: DeferredReplyRejectedReason::CallerCancelled,
-                    ..
-                }
-            )
-        })
-        .count() as u32;
-    report.replies_after_cancel = replies_after_cancel;
+    // Wait for the worker isolates to drain their late `WorkerMsg::Done`
+    // continuations and bounce them through the runtime as typed
+    // rejection events before snapshotting the trace. Without this,
+    // a thermally throttled CI runner can race: `result.wait` returns
+    // when the *driver* stops, but the workers' SleepReply firings
+    // are independent. Polling until either the count converges to
+    // `FANOUT - replies_before_cancel` or a budget elapses keeps the
+    // host from over-specifying timing.
+    fn count_rejected(snapshot: &tina_runtime::TraceSnapshot) -> u32 {
+        snapshot
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallReplyRejected {
+                        reason: CallReplyRejectedReason::CallerCancelled,
+                        ..
+                    } | RuntimeEventKind::DeferredReplyRejected {
+                        reason: DeferredReplyRejectedReason::CallerCancelled,
+                        ..
+                    }
+                )
+            })
+            .count() as u32
+    }
+    let target = FANOUT.saturating_sub(report.replies_before_cancel);
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < drain_deadline {
+        if count_rejected(&runtime.trace()) >= target {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    report.replies_after_cancel = count_rejected(&runtime.trace());
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();

@@ -108,7 +108,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Type-erased payload for [`Effect::StopWith`].
 ///
@@ -1412,7 +1412,11 @@ pub enum DeferredSlotState {
 /// - double cancel returns `AlreadyCancelled`; cancel after settle
 ///   returns `AlreadyCompleted`;
 /// - does not release pool leases — that is its own primitive;
-/// - dropping the handle does not cancel.
+/// - dropping the handle does not cancel; the call runs to completion;
+/// - the runtime stamps the handle with the originating shard id on
+///   dispatch. A `cancel_call` issued from a different shard returns
+///   `CancelOutcome::WrongShard` instead of falling through to a
+///   silent wrong-result.
 ///
 /// Type-system guarantees (compile-fail proofs):
 ///
@@ -1490,19 +1494,34 @@ const HANDLE_STATE_CANCELLED: u8 = 2;
 /// Shared state between a [`CallHandle`] and the runtime's pending-call
 /// registry. Runtime-only; user code cannot construct one.
 ///
-/// **Concurrency invariant.** All writes (`set_state`, `set_call_id`)
-/// happen on one shard thread — the runtime that owns the pending
-/// entry. Reads can come from another thread (a host polling
-/// `handle.state()`). Writers use `Release`, readers use `Acquire`, so
-/// observers see a consistent transition without seeing torn payloads.
+/// **Concurrency invariant.** All writes (`set_state`, `set_call_id`,
+/// `set_shard_id`) happen on one shard thread — the runtime that owns
+/// the pending entry. Reads can come from another thread (a host
+/// polling `handle.state()`, or another shard's runtime checking the
+/// shard fingerprint before honoring a cross-shard cancel). Writers
+/// use `Release`, readers use `Acquire`, so observers see a consistent
+/// transition without seeing torn payloads.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct CallHandleShared {
     state: AtomicU8,
     /// `0` until dispatched, then `CallId::get()`.
     call_id: AtomicU64,
+    /// `u32::MAX` until dispatched, then `ShardId::get()`. Stamped at
+    /// the same site as `call_id` so a non-`MAX` shard id implies
+    /// a non-zero call id (single-writer + Release/Acquire).
+    ///
+    /// Used by the runtime to reject a cross-shard `cancel_call` —
+    /// the pending-call registry lives on the originating shard, so
+    /// a different shard's runtime would silently fall through to
+    /// `AlreadyCompleted` if it attempted the lookup.
+    shard_id: AtomicU32,
     expected_reply_type_id: TypeId,
 }
+
+/// Sentinel for `shard_id` "not yet stamped." `u32::MAX` is reserved
+/// so any user-defined `ShardId` is distinguishable from "unstamped."
+const SHARD_ID_UNSTAMPED: u32 = u32::MAX;
 
 impl CallHandleShared {
     /// Builds a fresh `Pending` shared cell. Runtime-only.
@@ -1511,6 +1530,7 @@ impl CallHandleShared {
         Self {
             state: AtomicU8::new(HANDLE_STATE_PENDING),
             call_id: AtomicU64::new(0),
+            shard_id: AtomicU32::new(SHARD_ID_UNSTAMPED),
             expected_reply_type_id,
         }
     }
@@ -1544,37 +1564,49 @@ impl CallHandleShared {
         if raw == 0 { None } else { Some(raw) }
     }
 
+    /// Returns the originating shard id, or `None` while not yet
+    /// dispatched. Stamped together with `call_id`.
+    pub fn shard_id(&self) -> Option<u32> {
+        let raw = self.shard_id.load(Ordering::Acquire);
+        if raw == SHARD_ID_UNSTAMPED {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+
     /// Stamps the call id on dispatch. Runtime-only.
     ///
-    /// `debug_assert!`s catch double-stamp during development. In
-    /// release we keep the *first* stamp (so a buggy refactor cannot
-    /// silently retarget the handle), trace via `eprintln!` so the
-    /// regression is visible, and refuse the second store. Crashing
-    /// the shard on an internal-invariant violation would be worse
-    /// than logging it.
+    /// The two `set_call_id` sites in `tina-runtime`'s
+    /// `dispatch_isolate_call` are mutually exclusive (success vs.
+    /// send-rejected branches); a second stamp on the same handle
+    /// would be a runtime invariant violation, so we panic loudly
+    /// on it rather than silently first-stamp-wins.
     #[doc(hidden)]
     pub fn set_call_id(&self, call_id: u64) {
-        debug_assert!(call_id != 0, "runtime call id must be non-zero");
-        if call_id == 0 {
-            return;
-        }
-        match self.call_id.compare_exchange(
-            0,
-            call_id,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {}
-            Err(prior) => {
-                debug_assert!(
-                    false,
-                    "call id stamped twice: prior={prior} new={call_id}"
-                );
-                eprintln!(
-                    "tina: CallHandleShared double-stamp detected (prior={prior} new={call_id}); keeping first"
-                );
-            }
-        }
+        assert!(call_id != 0, "runtime call id must be non-zero");
+        let prior = self.call_id.swap(call_id, Ordering::Release);
+        assert!(
+            prior == 0,
+            "tina: CallHandleShared::set_call_id stamped twice (prior={prior} new={call_id}); \
+             this is a tina-runtime invariant violation",
+        );
+    }
+
+    /// Stamps the originating shard id on dispatch. Runtime-only.
+    /// Same single-stamp invariant as `set_call_id`.
+    #[doc(hidden)]
+    pub fn set_shard_id(&self, shard_id: u32) {
+        assert!(
+            shard_id != SHARD_ID_UNSTAMPED,
+            "ShardId == u32::MAX is reserved as the unstamped sentinel",
+        );
+        let prior = self.shard_id.swap(shard_id, Ordering::Release);
+        assert!(
+            prior == SHARD_ID_UNSTAMPED,
+            "tina: CallHandleShared::set_shard_id stamped twice (prior={prior} new={shard_id}); \
+             this is a tina-runtime invariant violation",
+        );
     }
 
     /// Returns the dispatching `Address<_, R>`'s `R` type id.
@@ -1620,8 +1652,11 @@ pub enum CancelOutcome {
     AlreadyCompleted,
     /// Already cancelled.
     AlreadyCancelled,
-    /// Handle minted but its effect never ran.
-    NotDispatched,
+    /// The handle was minted on a different shard. The cancel did
+    /// not run; the originating shard's pending-call entry is
+    /// untouched. Send the cancel to the right shard, or store the
+    /// handle on the originating isolate and cancel from there.
+    WrongShard,
 }
 
 impl CancelOutcome {

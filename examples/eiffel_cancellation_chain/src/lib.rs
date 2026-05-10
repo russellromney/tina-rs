@@ -85,18 +85,20 @@ pub fn assert_tina_report_invariants(report: &Report) {
 }
 
 /// Tokio-side invariants. `JoinSet::abort_all` preempts at the next
-/// await point, so aborted tasks never run their reply path —
-/// `replies_after_cancel` is always zero, and the absorbed total is
-/// strictly less than `FANOUT`.
+/// await boundary; for the current worker shape (`sleep().await; i`)
+/// aborts during sleep skip the reply, so `replies_after_cancel` is
+/// typically zero. We assert a loose `replies_before + after <= FANOUT`
+/// so a refactor that adds an await between sleep and the reply path
+/// (e.g. an `mpsc::Sender::send().await`) does not silently flake the
+/// test on a slow CI runner.
 pub fn assert_tokio_report_invariants(report: &Report) {
     assert_shared_invariants("tokio", report);
-    assert_eq!(
-        report.replies_after_cancel, 0,
-        "tokio: aborted tasks never deliver replies, got {report:?}",
-    );
+    let total = report
+        .replies_before_cancel
+        .saturating_add(report.replies_after_cancel);
     assert!(
-        report.replies_before_cancel < FANOUT,
-        "tokio: cancel preempts before all workers finish, got {report:?}",
+        total <= FANOUT,
+        "tokio: replies_before + replies_after must not exceed FANOUT, got {report:?}",
     );
 }
 

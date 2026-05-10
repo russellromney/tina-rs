@@ -546,11 +546,11 @@ fn downstream_consumer_replays_late_isolate_call_reply_rejected_after_timeout() 
         first.event_record().iter().any(|event| matches!(
             event.kind(),
             RuntimeEventKind::CallReplyRejected {
-                reason: CallReplyRejectedReason::NoPendingCall,
+                reason: CallReplyRejectedReason::CallerTimedOut,
                 ..
             }
         )),
-        "late reply after timeout should be explicit in the trace"
+        "late reply after timeout should surface as CallerTimedOut"
     );
 }
 

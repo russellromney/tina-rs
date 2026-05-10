@@ -606,6 +606,9 @@ pub fn call_reply_rejected_reason_name(reason: CallReplyRejectedReason) -> &'sta
         CallReplyRejectedReason::ReplyPathFull => "ReplyPathFull",
         CallReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
         CallReplyRejectedReason::CallerCancelled => "CallerCancelled",
+        CallReplyRejectedReason::CallerTimedOut => "CallerTimedOut",
+        CallReplyRejectedReason::OwnerStopped => "OwnerStopped",
+        CallReplyRejectedReason::RuntimeStopped => "RuntimeStopped",
     }
 }
 
@@ -617,6 +620,9 @@ pub fn deferred_reply_rejected_reason_name(reason: DeferredReplyRejectedReason) 
         DeferredReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
         DeferredReplyRejectedReason::TypeMismatch => "TypeMismatch",
         DeferredReplyRejectedReason::CallerCancelled => "CallerCancelled",
+        DeferredReplyRejectedReason::CallerTimedOut => "CallerTimedOut",
+        DeferredReplyRejectedReason::OwnerStopped => "OwnerStopped",
+        DeferredReplyRejectedReason::RuntimeStopped => "RuntimeStopped",
     }
 }
 

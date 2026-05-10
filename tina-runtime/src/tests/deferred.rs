@@ -324,7 +324,9 @@ fn caller_timeout_closes_open_slot_with_terminal_rejected_event() {
     // Caller observed Timeout.
     assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Timeout]);
 
-    // Slot got a terminal CallerClosed reject.
+    // Slot got a terminal `CallerTimedOut` reject. Distinct from
+    // `CallerClosed` (lifecycle) and `CallerCancelled` (explicit
+    // cancel) so observers can attribute the cause.
     let closed_count = runtime
         .trace()
         .iter()
@@ -332,7 +334,7 @@ fn caller_timeout_closes_open_slot_with_terminal_rejected_event() {
             matches!(
                 e.kind(),
                 RuntimeEventKind::DeferredReplyRejected {
-                    reason: DeferredReplyRejectedReason::CallerClosed,
+                    reason: DeferredReplyRejectedReason::CallerTimedOut,
                     ..
                 }
             )
@@ -1451,7 +1453,8 @@ fn caller_isolate_stop_distinct_from_caller_timeout_path() {
     // Service captured the slot. Caller is still alive but won't run
     // again. Now advance past the deadline so caller-side timeout
     // fires, which surfaces as the deferred slot's terminal
-    // Rejected{CallerClosed} fact.
+    // `Rejected{CallerTimedOut}` fact. Distinct from `CallerClosed`
+    // (lifecycle) so the trace attributes the cause specifically.
     clock.advance(Duration::from_millis(60));
     step_to_idle(&mut runtime);
 
@@ -1462,7 +1465,7 @@ fn caller_isolate_stop_distinct_from_caller_timeout_path() {
             matches!(
                 e.kind(),
                 RuntimeEventKind::DeferredReplyRejected {
-                    reason: DeferredReplyRejectedReason::CallerClosed,
+                    reason: DeferredReplyRejectedReason::CallerTimedOut,
                     ..
                 }
             )
@@ -1791,7 +1794,8 @@ fn bridge_worker_cancelled_caller_does_not_leak_slot() {
     // Caller still has only the Timeout — no late ghost reply.
     assert_eq!(out.borrow().as_slice(), [CallOutcome::Timeout]);
 
-    // Slot was closed eagerly when caller timed out.
+    // Slot was closed eagerly when caller timed out — `CallerTimedOut`
+    // names the cause specifically.
     let closed = runtime
         .trace()
         .iter()
@@ -1799,7 +1803,7 @@ fn bridge_worker_cancelled_caller_does_not_leak_slot() {
             matches!(
                 e.kind(),
                 RuntimeEventKind::DeferredReplyRejected {
-                    reason: DeferredReplyRejectedReason::CallerClosed,
+                    reason: DeferredReplyRejectedReason::CallerTimedOut,
                     ..
                 }
             )

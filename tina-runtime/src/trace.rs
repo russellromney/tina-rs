@@ -86,12 +86,31 @@ pub enum EffectKind {
 /// `compile_fail` doctest on [`tina::reply_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredReplyRejectedReason {
-    /// The original caller already timed out, closed, or otherwise stopped.
+    /// The original caller already closed for a reason not classified
+    /// below: e.g. requester shard failure, transport issue, or a
+    /// pre-066 lifecycle path we have not yet split out.
     CallerClosed,
 
     /// Caller invoked `cancel_call(handle)`. Distinct from
-    /// `CallerClosed` (timeout / stop).
+    /// `CallerClosed` (lifecycle), `CallerTimedOut` (deadline),
+    /// `OwnerStopped` (owner isolate stopped), and `RuntimeStopped`
+    /// (runtime shutting down) so observers can attribute the cause.
     CallerCancelled,
+
+    /// The mandatory call timeout fired before the reply arrived.
+    /// Distinct from `CallerCancelled`: the user did not explicitly
+    /// `cancel_call` — the deadline elapsed.
+    CallerTimedOut,
+
+    /// The owning isolate stopped while this call was pending.
+    /// Distinct from `CallerCancelled` so traces can tell explicit
+    /// cancel from owner lifecycle.
+    OwnerStopped,
+
+    /// The runtime began shutting down before the reply arrived.
+    /// Distinct from `OwnerStopped` so traces can tell isolate-scoped
+    /// teardown from process-scoped teardown.
+    RuntimeStopped,
 
     /// The bounded reply transport path back to the requester was full.
     ReplyPathFull,
@@ -266,15 +285,27 @@ pub enum CallCompletionRejectedReason {
 pub enum CallReplyRejectedReason {
     /// The call was no longer pending by the time the callee replied.
     ///
-    /// This usually means the caller's timeout already fired, or the call was
-    /// otherwise settled before the reply arrived.
+    /// Used as the fall-through when no more specific cause is on
+    /// record — for example, after the bounded recently-cancelled
+    /// ring evicts the call_id. The more specific
+    /// `CallerCancelled` / `CallerTimedOut` / `OwnerStopped` /
+    /// `RuntimeStopped` reasons take precedence when known.
     NoPendingCall,
 
     /// The original caller explicitly cancelled the wait via
-    /// `cancel_call(handle)` before the reply arrived. Distinct from
-    /// [`Self::NoPendingCall`] so timeout, lifecycle close, and
-    /// explicit cancel stay distinguishable in the trace.
+    /// `cancel_call(handle)` before the reply arrived.
     CallerCancelled,
+
+    /// The mandatory call timeout fired before the reply arrived.
+    /// Distinct from `CallerCancelled` (explicit) and
+    /// `NoPendingCall` (no record).
+    CallerTimedOut,
+
+    /// The owning isolate stopped while this call was pending.
+    OwnerStopped,
+
+    /// The runtime began shutting down before the reply arrived.
+    RuntimeStopped,
 
     /// The bounded reply transport path back to the requester was full.
     ReplyPathFull,
@@ -799,6 +830,9 @@ fn deferred_reply_rejected_tag(reason: DeferredReplyRejectedReason) -> u8 {
         DeferredReplyRejectedReason::RequesterShardClosed => 3,
         DeferredReplyRejectedReason::TypeMismatch => 4,
         DeferredReplyRejectedReason::CallerCancelled => 5,
+        DeferredReplyRejectedReason::CallerTimedOut => 6,
+        DeferredReplyRejectedReason::OwnerStopped => 7,
+        DeferredReplyRejectedReason::RuntimeStopped => 8,
     }
 }
 
@@ -920,6 +954,9 @@ fn call_reply_rejected_tag(reason: CallReplyRejectedReason) -> u8 {
         CallReplyRejectedReason::ReplyPathFull => 2,
         CallReplyRejectedReason::RequesterShardClosed => 3,
         CallReplyRejectedReason::CallerCancelled => 4,
+        CallReplyRejectedReason::CallerTimedOut => 5,
+        CallReplyRejectedReason::OwnerStopped => 6,
+        CallReplyRejectedReason::RuntimeStopped => 7,
     }
 }
 

@@ -4,6 +4,123 @@ This file records completed work.
 
 ## Unreleased
 
+### 066A hostile-review fixes
+
+Round of correctness, vocabulary, and proof fixes on top of 066A
+following an independent review. The first-form `CallHandle` /
+`cancel_call` API surface is unchanged for the common path; the
+deltas below tighten classification, close half-work, and add the
+plan-mandated proof tests.
+
+**Cross-shard cancel — typed rejection, not silent wrong-result:**
+- `CallHandleShared` now stamps `shard_id` on dispatch alongside
+  `call_id`. `dispatch_cancel_call` checks the stamp and returns
+  the new `CancelOutcome::WrongShard` if the cancel runs on a
+  different shard than the originating one.
+- `CancelOutcome::NotDispatched` removed — the only reachable path
+  to it (cancel batched ahead of its own `call_with_handle` effect
+  in one isolate handler) was both rare and a wrong-result hazard
+  (cancel returned `NotDispatched` while the call still ran). The
+  cancel-dispatch path now `expect`s the `call_id` stamp; user code
+  that batches cancel before call panics loudly instead.
+
+**Cause-aware late-reply classification:**
+- The recently-cancelled ring now stores `(CallId, CancelCause)`,
+  not just `CallId`. Late callee replies for cancelled / timed-out /
+  owner-stopped / runtime-stopped calls surface with the matching
+  cause-specific rejection reason instead of the generic
+  `NoPendingCall` / `CallerClosed`.
+- Two new helper enums of variants: `CallReplyRejectedReason` and
+  `DeferredReplyRejectedReason` each gain `CallerTimedOut`,
+  `OwnerStopped`, `RuntimeStopped`. Stable hashing tags and
+  `tina-tracing` string names extended.
+- Timeout, owner-stop, and shutdown all record into the ring with
+  their respective cause; previously only explicit `cancel_call`
+  did, leaving the timeout path classifying late replies as
+  generic `NoPendingCall`.
+
+**Runtime shutdown wires `RuntimeStopped`:**
+- `cancel_in_flight_calls_for_shutdown` now emits
+  `CallCancelled { RuntimeStopped }` for pending isolate calls and
+  transitions any caller-held `CallHandle` to `Cancelled` state. A
+  user holding a handle while the runtime shuts down sees
+  `state() == Cancelled`, not a forever-`Pending` lie.
+- `CancelCause::CallerTimedOut` and `CancelCause::RuntimeStopped`
+  were dead variants in 066A; now both are emitted by the runtime.
+
+**Owner-stop late-reply distinct from explicit cancel:**
+- Owner-stop cleanup now closes captured deferred slots with
+  `DeferredReplyRejectedReason::OwnerStopped`. Previously it
+  conflated owner-stop with `CallerCancelled`, which broke the plan's
+  "trace facts must distinguish" rule (owner-stop and explicit
+  cancel must stay distinct in the trace).
+
+**`PressureSummary` extension is additive:**
+- New counters `reply_rejected_caller_timed_out`,
+  `reply_rejected_owner_stopped`, `reply_rejected_runtime_stopped`.
+- `Display` format now appends the new keys after the pre-066
+  `path_full=` / `shard_closed=` entries — pre-066 positional
+  matchers continue to find their fields at the same offsets.
+
+**API surface tightening:**
+- `CallHandleShared::set_call_id`: reverted to a loud
+  `assert!`-on-double-stamp instead of the 066A first-stamp-wins
+  + `eprintln!`. The two `set_call_id` sites in the runtime are
+  mutually exclusive; the path is dead defense and should panic.
+- `CallHandleShared::set_shard_id` (new) follows the same shape.
+- `CallHandle` `must_use` message clarifies that drop is a no-op
+  and the call runs to completion.
+
+**Tests added (Plan Rocks 2/3/5 proof items):**
+- `late_reply_after_cancel_surfaces_specifically_as_caller_cancelled`
+  (runtime + sim) — asserts the *specific* `CallerCancelled` reason
+  and asserts the absence of the generic `CallerClosed` /
+  `NoPendingCall`. Catches a regression that removes the cause-aware
+  ring without breaking the test (the previous assertion accepted
+  either, so the ring could have been silently removed).
+- `double_cancel_returns_already_cancelled` (sim) — drives the
+  `AlreadyCancelled` outcome through dual handles wrapping the same
+  shared cell via `runtime_internal`. User code can't reach this
+  with a `!Clone` move-only handle; the runtime can (e.g. owner-stop
+  then a queued cancel effect dispatches).
+- `late_reply_after_timeout_surfaces_as_caller_timed_out` (sim) —
+  pins the new `CallerTimedOut` rejection reason and asserts the
+  trace does NOT bleed `CallerCancelled` into a timed-out scenario.
+- `owner_stop_cancels_pending_handles_and_classifies_late_replies`
+  (sim) — full Rock 5 proof: 3 pending calls, owner stops, each
+  handle transitions to `Cancelled`, trace records 3 ×
+  `CallCancelled { OwnerStopped }` plus 3 ×
+  `DeferredReplyRejected { OwnerStopped }`, no late reply reaches
+  the owner's translator.
+- `cancel_admit_cycle_does_not_leak_capacity` (sim) — Rock 3 proof:
+  32 cancel/admit cycles produce 32 dispatches and 32
+  cancellations, no `Full` rejection appears.
+- `cross_shard_cancel_is_rejected_with_wrong_shard` (sim) — H1
+  regression test: a handle stamped with a foreign shard id returns
+  `CancelOutcome::WrongShard`, not silent `AlreadyCompleted`.
+
+**Existing tests rewritten:**
+- The 066A `late_reply_after_cancel_is_visibly_rejected` test
+  accepted either `NoPendingCall` *or* `CallerCancelled`, which let
+  the cause-aware ring be silently removed. Replaced with a
+  specific-reason assertion.
+- The 066A `double_cancel_returns_already_cancelled` test punted on
+  exercising the `AlreadyCancelled` outcome with a comment about
+  move-only handles. Now actually tests it.
+- Three `tests/deferred.rs` and one `tests/consumer_api.rs` test
+  updated to assert the new `CallerTimedOut` rejection reason
+  instead of the old `CallerClosed`.
+
+**Tokio side of `eiffel_cancellation_chain` invariant relaxed:**
+- 066A asserted `replies_after_cancel == 0` strictly; that holds for
+  the current worker shape (`sleep().await; i`) but tripwires any
+  refactor that adds an await between sleep and the reply path.
+  Now asserts the loose `replies_before + after <= FANOUT`.
+- Tina side of the example now polls the trace until rejection
+  count converges before snapshotting, with a 2s safety budget.
+  Removes the slow-CI flake where workers' late replies hadn't
+  arrived by the time `result.wait` returned.
+
 ### Cancellation: first-form `CallHandle` and `cancel_call`
 
 **Breaking trace surface changes** (downstream consumers — lint

@@ -187,7 +187,7 @@ fn sim_caller_timeout_emits_terminal_caller_closed_rejected() {
         count_kind(sim.trace(), |k| matches!(
             k,
             RuntimeEventKind::DeferredReplyRejected {
-                reason: DeferredReplyRejectedReason::CallerClosed,
+                reason: DeferredReplyRejectedReason::CallerTimedOut,
                 ..
             }
         )),
