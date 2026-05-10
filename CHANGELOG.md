@@ -21,10 +21,14 @@ What stays explicit:
 - No pipelining: per-request reset drops read-ahead bytes between
   iterations.
 
-Eight integration tests in `tina-http/tests/server_keepalive.rs` cover
+Nine integration tests in `tina-http/tests/server_keepalive.rs` cover
 sequential reuse, close intent, idle timeout, default one-shot behavior,
 slow-loris timeout on a later request, per-request body caps, and mixed
-GET/POST traffic on one socket.
+GET/POST traffic on one socket. The final test drives the native
+listener through `tina_http::build_keepalive_pool` and asserts one
+server `TcpAccept` across the whole script. `specimen_outbound_http`
+now uses the same pooled keepalive client shape against a
+keepalive-enabled Tina listener.
 
 ### HTTP/1.1 keepalive pool
 

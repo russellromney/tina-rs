@@ -8,15 +8,13 @@
   `HttpLimits::keepalive_idle_timeout` is `Some(d)`. Per-request
   close intent is honored: HTTP/1.0, explicit `Connection: close`,
   parse error, service-call error, peer EOF, and idle timeout all
-  close cleanly. Eight integration tests in
-  `tina-http/tests/server_keepalive.rs` plus a DST replay test cover
+  close cleanly. Nine integration tests in
+  `tina-http/tests/server_keepalive.rs` cover
   reuse, idle close, slow-loris on subsequent requests, body cap,
-  and mixed GET/POST flow.
+  mixed GET/POST flow, and the real keepalive pool driving the real
+  listener over one accepted server stream.
 - In progress: none.
-- Open: end-to-end test that drives the server with
-  `tina_http::build_keepalive_pool` (the client side from PR #50)
-  and asserts a single TCP accept across N requests. Lands once
-  #50 merges.
+- Open: none.
 - Deferred: idle-timeout + max-requests-per-connection as separate
   knobs (one knob covers both for first form), 408 emission on
   slow-loris (waits for runtime `tcp_cancel_read` affordance),
@@ -34,7 +32,9 @@ the Tina ecosystem — every test of the client against
 - No HTTP pipelining (request 2 sent before request 1's response
   completes). The reset between iterations drops any read-ahead
   bytes; well-behaved HTTP/1.1 clients don't pipeline.
-- No HTTP/2, no WebSocket upgrade, no chunked transfer.
+- No HTTP/2 or WebSocket upgrade.
+- No chunked request bodies. Response-side chunked streaming already
+  exists and can ride keepalive when the response completes cleanly.
 - No max-requests-per-connection knob in first form. Server can
   always close on its own decision but the configuration surface
   doesn't grow until evidence demands it.
@@ -110,6 +110,7 @@ cannot ride this connection.
 - `slow_loris_on_second_request_fires_deadline_via_trace`
 - `body_cap_still_enforced_on_subsequent_keepalive_request`
 - `keepalive_serves_mixed_get_and_post_with_bodies`
+- `keepalive_pool_reuses_native_listener_connection_across_requests`
 
 The two slow-loris-style tests observe the deadline via the
 runtime trace (`Sleep` `CallCompleted`) rather than peer-side FIN,

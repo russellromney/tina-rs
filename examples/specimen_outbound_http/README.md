@@ -39,25 +39,26 @@ atomically per `POST`. The whole thing fits in one async block.
 
 ## Tina shape
 
-Three first-class HTTP isolates, plus a scripting Driver:
+Three first-class HTTP pieces, driven from the host:
 
 - **`Counter`** — `#[isolate(message = HttpRequest, reply =
   HttpResponse)]`. The handler dispatches through a
   `StatefulRouter<Counter>` (Phase 059 Rock 6) and returns an
   `HttpResponse`. `.method_not_allowed()` distinguishes 405 from 404.
 - **`HttpListener<SingleShard>`** — bound with
-  `HttpServerConfig::dev()`; ties the counter address to the
-  network. Address comes back via `runtime.observe_next_bound()`.
-- **`HttpClient<SingleShard>`** — long-lived client isolate
-  registered with `HttpClientConfig::dev()`. Each request goes
-  through `call(client, HttpClientMsg::call(target, request),
-  timeout)`.
-- **`Driver`** — single isolate that walks the whole script. A
-  `Step` field tracks where the sequence is; each step dispatches
-  one `call(client, ...).reply(DriverMsg::Returned)`. After the last
-  step the driver `stop_with(report)`s and the host reads the
-  typed `Report` through `runtime.observe_result::<Report>` (Phase
-  059 Rock 1) — no `mpsc::channel`, no per-request bridge.
+  `HttpServerConfig::dev()` plus
+  `limits.keepalive_idle_timeout = Some(...)`; ties the counter
+  address to the network. Address comes back via
+  `runtime.observe_next_bound()`.
+- **`build_keepalive_pool`** — registers one pool isolate plus one
+  `KeepaliveConnection` isolate. The script acquires a `PoolLease`,
+  sends every request through the leased connection, releases the
+  lease, then stops the connection isolate. The trace asserts the
+  server saw exactly one `TcpAccept` for the whole sequence.
+- **Host script** — uses `ThreadedRuntime::call_blocking` for the
+  test/specimen boundary. This removes the old one-off Driver isolate
+  without changing the service truth: acquire, request, release, close
+  are still ordinary typed Tina calls.
 
 ## Discussion
 
@@ -66,13 +67,16 @@ What feels better:
 - **Native HTTP types from beginning to end.** Both server and
   client speak `HttpRequest` / `HttpResponse` directly. There's no
   "convert axum's `Request<Body>` into a Tina message" hop.
-- **Visible backpressure.** `HttpClient`'s `call(...)` returns a
-  `CallOutcome<Result<HttpResponse, HttpClientError>>`; the
-  `Full`, `Closed`, `Timeout` arms surface as typed errors at the
-  call site. The `reqwest::Client` version has no equivalent.
-- **One typed final value.** `stop_with(report)` +
-  `observe_result::<Report>` is the whole host-isolate bridge. The
-  earlier `Driver` + `mpsc::Sender` per request is gone.
+- **Visible backpressure.** The client side acquires a bounded pool
+  lease before it can send. `AcquireOutcome`, `KeepaliveOutcome`, and
+  `ReleaseOutcome` keep pool pressure, request errors, and release
+  truth separate.
+- **One TCP accept.** The Tina side proves reuse by counting
+  `CallCompleted { call_kind: TcpAccept }` in the runtime trace after
+  the script finishes.
+- **No Driver isolate for host scripts.** `call_blocking` is the
+  copied host-test shape. Real services still use
+  `call(...).reply(...)` inside their handlers.
 - **`HttpServerConfig::dev()` / `HttpClientConfig::dev()`.**
   Roomy presets for examples; `pressure()` is the cap-matters
   variant (per the checklist entry on HTTP server / client
@@ -80,11 +84,11 @@ What feels better:
 
 What feels worse:
 
+- **Pool lifecycle is explicit.** The host must acquire, release,
+  close the pool, and stop the connection isolate. That is more
+  ceremony than `reqwest::Client`, but every resource transition is
+  named and testable.
 - **Configuring one runtime to host both server and client** means
-  the spawn order matters (server first, then client), and shutdown
-  is two `try_send`s plus a `runtime.shutdown()`. Tokio's
-  `with_graceful_shutdown` is one bookkeeping line shorter.
-- **`Step` enum + `dispatch`/`absorb` is one explicit state
-  machine per scripted scenario.** Tokio's async/await reads
-  linearly. The continuation pattern from chapter 16 of the user
-  guide names this shape; the trace is honest about every step.
+  the spawn order matters (server first, then pool), and shutdown is
+  pool close + connection stop + listener stop + `runtime.shutdown()`.
+  Tokio's `with_graceful_shutdown` is shorter.

@@ -2,9 +2,11 @@
 //! HTTP server and drives it via its own outbound HTTP client.
 //!
 //! - Tokio: `axum` server + `reqwest` client.
-//! - Tina: `tina_http::HttpListener` server + `tina_http::HttpClient`,
-//!   bridged to the host thread via a tiny `Driver` isolate that
-//!   forwards each call's outcome through an `std::sync::mpsc`.
+//! - Tina: `tina_http::HttpListener` server +
+//!   `tina_http::build_keepalive_pool` client. The host drives the
+//!   script with `ThreadedRuntime::call_blocking`, while the pool and
+//!   connection isolates keep admission, reuse, and close decisions
+//!   typed.
 //!
 //! Read [`tokio_impl`] and [`tina_impl`] top-to-bottom; the README
 //! compares feel.

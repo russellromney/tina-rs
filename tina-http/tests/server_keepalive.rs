@@ -14,7 +14,14 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use tina_http::HttpLimits;
+use http::StatusCode;
+use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, ReleaseDisposition, ReleaseOutcome};
+use tina_http::{
+    HttpClientConfig, HttpLimits, HttpRequest, HttpTarget, KeepaliveConnAddr,
+    KeepaliveConnectionMsg, KeepaliveOutcome, build_keepalive_pool,
+};
+use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
+use tina_runtime::{CallKind, CallOutcome, RuntimeEventKind};
 
 use common::{HarnessConfig, TestHarness};
 
@@ -121,6 +128,80 @@ fn assert_body_ends_with(response: &[u8], body: &str) {
         text.ends_with(body),
         "expected body {body:?} at end of {text:?}"
     );
+}
+
+fn tcp_accept_completion_count(harness: &TestHarness) -> usize {
+    harness
+        .snapshot_trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpAccept,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn acquire_keepalive_connection(
+    harness: &TestHarness,
+    pool: tina::Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>,
+) -> tina::pool::PoolLease<KeepaliveConnAddr> {
+    match harness
+        .runtime_handle()
+        .call_blocking(pool, WorkerPoolMsg::Acquire, Duration::from_secs(2))
+        .expect("host acquire call")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => lease,
+        other => panic!("expected acquired keepalive lease, got {other:?}"),
+    }
+}
+
+fn pooled_request(
+    harness: &TestHarness,
+    conn: KeepaliveConnAddr,
+    request: HttpRequest,
+) -> (StatusCode, bool) {
+    match harness
+        .runtime_handle()
+        .call_blocking(
+            conn,
+            KeepaliveConnectionMsg::request(request, Duration::from_secs(2)),
+            Duration::from_secs(3),
+        )
+        .expect("host keepalive request call")
+    {
+        CallOutcome::Replied(KeepaliveOutcome::Request {
+            result: Ok(response),
+            must_retire,
+        }) => (response.status, must_retire),
+        other => panic!("expected keepalive response, got {other:?}"),
+    }
+}
+
+fn release_keepalive_connection(
+    harness: &TestHarness,
+    pool: tina::Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>,
+    lease: tina::pool::PoolLease<KeepaliveConnAddr>,
+) {
+    match harness
+        .runtime_handle()
+        .call_blocking(
+            pool,
+            WorkerPoolMsg::Release {
+                lease,
+                disposition: ReleaseDisposition::Reuse,
+            },
+            Duration::from_secs(2),
+        )
+        .expect("host release call")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => {}
+        other => panic!("expected released keepalive lease, got {other:?}"),
+    }
 }
 
 /// Read whatever is available within `timeout`; returns the bytes
@@ -428,5 +509,77 @@ fn keepalive_serves_mixed_get_and_post_with_bodies() {
     assert_body_ends_with(&resp, "1");
 
     drop(stream);
+    harness.shutdown();
+}
+
+#[test]
+fn keepalive_pool_reuses_native_listener_connection_across_requests() {
+    let harness = keepalive_harness();
+    let handles = build_keepalive_pool(
+        harness.runtime_handle(),
+        HttpTarget::http_with_host(harness.addr, "x"),
+        HttpClientConfig::dev(),
+        PoolConfig::new(1, 4),
+        16,
+        16,
+    )
+    .expect("build keepalive pool");
+
+    let lease = acquire_keepalive_connection(&harness, handles.pool);
+    let conn = *lease.handle();
+
+    for request in [
+        HttpRequest::get("/counter").build(),
+        HttpRequest::post("/counter").build(),
+        HttpRequest::post("/counter").build(),
+        HttpRequest::post("/counter").build(),
+        HttpRequest::get("/counter").build(),
+    ] {
+        let (status, must_retire) = pooled_request(&harness, conn, request);
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !must_retire,
+            "native keepalive listener should keep the connection reusable"
+        );
+    }
+
+    let (status, must_retire) =
+        pooled_request(&harness, conn, HttpRequest::get("/missing").build());
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        !must_retire,
+        "404 is an ordinary response and should not retire the connection"
+    );
+
+    release_keepalive_connection(&harness, handles.pool, lease);
+    match harness
+        .runtime_handle()
+        .call_blocking(
+            handles.pool,
+            WorkerPoolMsg::Close(CloseMode::Drain),
+            Duration::from_secs(2),
+        )
+        .expect("close pool")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Closed) => {}
+        other => panic!("expected pool closed ack, got {other:?}"),
+    }
+    for conn in handles.connections {
+        let _ = harness.runtime_handle().call_blocking(
+            conn,
+            KeepaliveConnectionMsg::Stop,
+            Duration::from_secs(2),
+        );
+    }
+
+    // Let the listener process any peer EOF caused by stopping the
+    // client-side keepalive connection before we inspect the trace.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        tcp_accept_completion_count(&harness),
+        1,
+        "client pool should have driven all requests over one accepted server stream"
+    );
+
     harness.shutdown();
 }
