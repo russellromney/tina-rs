@@ -23,7 +23,7 @@ use tina_runtime::{
 };
 use tina_sqlx_bridge::{
     InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgPoolConfig, PgRequest,
-    PgResponse, PgWorker, send_request,
+    PgResponse, PgRows, PgWorker, send_request,
 };
 
 fn database_url() -> Option<String> {
@@ -322,6 +322,233 @@ fn fetch_one_too_many_rows_is_too_many_rows() {
     );
     let m = bridge.metrics.snapshot();
     assert_eq!(m.too_many_rows, 1);
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_under_cap_returns_all_rows_not_truncated() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT generate_series(1, 5)::INT8", 100),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert_eq!(rows.len(), 5);
+            assert!(!truncated, "5 rows under a cap of 100 must not truncate");
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(row.get_i64(0), Some((i as i64) + 1));
+            }
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.responses_rows, 1);
+    assert_eq!(m.responses_truncated, 0);
+    assert_eq!(m.rows_returned, 5);
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_at_cap_truncates_without_buffering_extras() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    // Cap at 3, query produces 100. Bridge must stop after 4 pulls
+    // (3 kept + 1 to discriminate "more on the wire") and never grow
+    // its buffer past 3.
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT generate_series(1, 100)::INT8", 3),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert_eq!(rows.len(), 3, "rows beyond cap must not land in the buffer");
+            assert!(truncated, "must signal truncation when more rows existed");
+            assert_eq!(rows[0].get_i64(0), Some(1));
+            assert_eq!(rows[2].get_i64(0), Some(3));
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.responses_rows, 1);
+    assert_eq!(m.responses_truncated, 1);
+    assert_eq!(m.rows_returned, 3, "rows_returned reflects buffered count");
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_zero_rows_returns_empty_not_truncated() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT 1::INT8 WHERE false", 10),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert!(rows.is_empty());
+            assert!(!truncated);
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_caller_max_rows_is_capped_by_config_ceiling() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    // Config ceiling: 5. Caller asks for 1000. Effective cap: 5.
+    let cfg = PgConfig::new()
+        .with_pool(
+            PgPoolConfig::new(&url)
+                .with_max_connections(2)
+                .with_acquire_timeout(Duration::from_secs(2)),
+        )
+        .with_default_timeout(Duration::from_secs(5))
+        .with_poll_interval(Duration::from_millis(2))
+        .with_max_in_flight(2)
+        .with_max_response_rows(5);
+    let bridge = PgWorker::<SingleShard>::install(&runtime, cfg).expect("install");
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT generate_series(1, 100)::INT8", 1000),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert_eq!(rows.len(), 5, "config ceiling caps caller's request");
+            assert!(truncated);
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_typed_helper_returns_pgrows() {
+    use tina_sqlx_bridge::fetch_many_call;
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+
+    let sink = Arc::new(Sink::default());
+
+    #[derive(Debug)]
+    enum HelperMsg {
+        Run,
+        Done(tina_sqlx_bridge::PgFetchManyOutcome),
+    }
+    struct HelperIsolate {
+        worker: PgAddress,
+        sink: Arc<Mutex<Option<Result<PgRows, PgError>>>>,
+        done: Arc<std::sync::Condvar>,
+    }
+    impl Isolate for HelperIsolate {
+        tina::isolate_types! {
+            message: HelperMsg,
+            reply: (),
+            send: tina::Outbound<Infallible>,
+            spawn: Infallible,
+            call: RuntimeCall<HelperMsg>,
+            shard: SingleShard,
+        }
+        fn handle(
+            &mut self,
+            msg: HelperMsg,
+            _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                HelperMsg::Run => fetch_many_call(
+                    self.worker,
+                    "SELECT generate_series(1, 4)::INT8",
+                    vec![],
+                    10,
+                    Duration::from_secs(5),
+                )
+                .reply(HelperMsg::Done),
+                HelperMsg::Done(outcome) => {
+                    let stored = match outcome {
+                        CallOutcome::Replied(r) => Some(r),
+                        _ => None,
+                    };
+                    *self.sink.lock().unwrap() = stored;
+                    self.done.notify_all();
+                    stop()
+                }
+            }
+        }
+    }
+    let _ = sink; // silence the wider Sink in this scope.
+
+    let result_slot: Arc<Mutex<Option<Result<PgRows, PgError>>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(std::sync::Condvar::new());
+    let isolate = HelperIsolate {
+        worker: bridge.address,
+        sink: Arc::clone(&result_slot),
+        done: Arc::clone(&done),
+    };
+    let addr = runtime
+        .register_with_capacity::<_, Infallible>(isolate, 4)
+        .expect("register");
+    runtime.try_send(addr, HelperMsg::Run).expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut guard = result_slot.lock().unwrap();
+    while guard.is_none() {
+        let now = Instant::now();
+        if now >= deadline {
+            panic!("helper never finished");
+        }
+        let (g, _) = done.wait_timeout(guard, deadline - now).unwrap();
+        guard = g;
+    }
+    let result = guard.take().unwrap();
+    drop(guard);
+
+    match result {
+        Ok(rows) => {
+            assert_eq!(rows.len(), 4);
+            assert!(!rows.truncated);
+        }
+        Err(e) => panic!("typed helper failed: {e}"),
+    }
     shutdown(runtime);
 }
 

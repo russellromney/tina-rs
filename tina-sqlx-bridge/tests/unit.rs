@@ -153,6 +153,23 @@ fn pg_request_builder_params_replaces_vector() {
     assert_eq!(params, vec![PgValue::Bool(true), PgValue::Null]);
 }
 
+#[test]
+fn pg_request_fetch_many_carries_max_rows_and_params() {
+    let req = PgRequest::fetch_many("SELECT * FROM t WHERE k > $1", 100).param(7_i64);
+    match req {
+        PgRequest::FetchMany {
+            sql,
+            params,
+            max_rows,
+        } => {
+            assert!(sql.contains("FROM t"));
+            assert_eq!(max_rows, 100);
+            assert_eq!(params, vec![PgValue::I64(7)]);
+        }
+        _ => panic!("expected FetchMany"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
@@ -196,6 +213,12 @@ fn config_rejects_zero_poll_interval() {
 fn config_rejects_zero_max_request_params() {
     let cfg = good_config().with_max_request_params(0);
     assert_eq!(cfg.validate(), Err(PgConfigError::ZeroMaxRequestParams));
+}
+
+#[test]
+fn config_rejects_zero_max_response_rows() {
+    let cfg = good_config().with_max_response_rows(0);
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroMaxResponseRows));
 }
 
 #[test]

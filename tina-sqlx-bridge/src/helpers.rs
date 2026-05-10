@@ -64,6 +64,38 @@ pub type PgExecutedOutcome = CallOutcome<Result<u64, PgError>>;
 /// `Ok(Some(row))` is one row. `TooManyRows` lands in `Err`.
 pub type PgFetchOneOutcome = CallOutcome<Result<Option<PgRow>, PgError>>;
 
+/// Reply shape from [`fetch_many_call`]. `Ok((rows, truncated))`
+/// gives the buffered rows and whether the bridge stopped pulling
+/// at its cap.
+pub type PgFetchManyOutcome = CallOutcome<Result<PgRows, PgError>>;
+
+/// Buffered query result. Carried inside [`PgFetchManyOutcome`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PgRows {
+    /// Buffered rows, in result order.
+    pub rows: Vec<PgRow>,
+    /// `true` if Postgres had more rows on the wire and the bridge
+    /// stopped pulling at its effective cap.
+    pub truncated: bool,
+}
+
+impl PgRows {
+    /// Number of buffered rows.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// `true` iff no rows were returned.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Iterate buffered rows.
+    pub fn iter(&self) -> impl Iterator<Item = &PgRow> {
+        self.rows.iter()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw path: full-truth IsolateCall.
 // ---------------------------------------------------------------------------
@@ -107,6 +139,30 @@ impl ExecuteCall {
     {
         self.inner
             .reply(move |raw| translator(project_executed(raw)))
+    }
+}
+
+/// Prepared `FetchMany` call.
+pub struct FetchManyCall {
+    inner: IsolateCall<PgMsg, PgResult>,
+}
+
+impl std::fmt::Debug for FetchManyCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchManyCall").finish_non_exhaustive()
+    }
+}
+
+impl FetchManyCall {
+    /// Turn this prepared call into one continuation message.
+    pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(PgFetchManyOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.inner
+            .reply(move |raw| translator(project_fetch_many(raw)))
     }
 }
 
@@ -174,6 +230,29 @@ pub fn fetch_one_call(
     }
 }
 
+/// Build a `FetchMany` call with the typed reply shape
+/// `CallOutcome<Result<PgRows, PgError>>`. Effective row cap is
+/// `min(max_rows, PgConfig::max_response_rows)`.
+pub fn fetch_many_call(
+    addr: PgAddress,
+    sql: impl Into<String>,
+    params: Vec<crate::types::PgValue>,
+    max_rows: usize,
+    timeout: Duration,
+) -> FetchManyCall {
+    FetchManyCall {
+        inner: send_request(
+            addr,
+            PgRequest::FetchMany {
+                sql: sql.into(),
+                params,
+                max_rows,
+            },
+            timeout,
+        ),
+    }
+}
+
 fn project_executed(outcome: PgCallOutcome) -> PgExecutedOutcome {
     match outcome {
         CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected })) => {
@@ -197,9 +276,24 @@ fn project_fetch_one(outcome: PgCallOutcome) -> PgFetchOneOutcome {
         CallOutcome::Replied(Ok(PgResponse::Row(row))) => CallOutcome::Replied(Ok(Some(row))),
         CallOutcome::Replied(Ok(PgResponse::NoRows)) => CallOutcome::Replied(Ok(None)),
         // Same invariant note as `project_executed`.
-        CallOutcome::Replied(Ok(PgResponse::Executed { .. })) => CallOutcome::Replied(Err(
-            PgError::Internal("fetch_one_call: worker returned Executed response".into()),
-        )),
+        CallOutcome::Replied(Ok(_)) => CallOutcome::Replied(Err(PgError::Internal(
+            "fetch_one_call: worker returned non-FetchOne response".into(),
+        ))),
+        CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
+        CallOutcome::Full => CallOutcome::Full,
+        CallOutcome::Closed => CallOutcome::Closed,
+        CallOutcome::Timeout => CallOutcome::Timeout,
+    }
+}
+
+fn project_fetch_many(outcome: PgCallOutcome) -> PgFetchManyOutcome {
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            CallOutcome::Replied(Ok(PgRows { rows, truncated }))
+        }
+        CallOutcome::Replied(Ok(_)) => CallOutcome::Replied(Err(PgError::Internal(
+            "fetch_many_call: worker returned non-FetchMany response".into(),
+        ))),
         CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
         CallOutcome::Full => CallOutcome::Full,
         CallOutcome::Closed => CallOutcome::Closed,
@@ -312,6 +406,13 @@ impl PgOutcomeExt for PgFetchOneOutcome {
     type Success = Option<PgRow>;
     fn classify(self) -> PgOutcomeClass<Option<PgRow>> {
         classify_inner(self, |row| row)
+    }
+}
+
+impl PgOutcomeExt for PgFetchManyOutcome {
+    type Success = PgRows;
+    fn classify(self) -> PgOutcomeClass<PgRows> {
+        classify_inner(self, |rows| rows)
     }
 }
 

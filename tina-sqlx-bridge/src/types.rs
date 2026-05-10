@@ -256,6 +256,21 @@ pub enum PgRequest {
         /// Positional parameters bound in order.
         params: Vec<PgValue>,
     },
+    /// Run one query and stream rows up to a cap.
+    ///
+    /// The bridge pulls at most `min(max_rows, config.max_response_rows) + 1`
+    /// rows from SQLx. Past the effective cap, it stops pulling and
+    /// returns [`PgResponse::Rows`] with `truncated = true` — never
+    /// growing the bridge's resident set past the cap.
+    FetchMany {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+        /// Caller's row cap. Bridge applies the lesser of this and
+        /// [`PgConfig::max_response_rows`].
+        max_rows: usize,
+    },
 }
 
 impl PgRequest {
@@ -272,6 +287,18 @@ impl PgRequest {
         Self::FetchOne {
             sql: sql.into(),
             params: Vec::new(),
+        }
+    }
+
+    /// `FetchMany` request with no parameters and a per-call row cap.
+    ///
+    /// Effective cap is the lesser of `max_rows` and
+    /// [`PgConfig::max_response_rows`].
+    pub fn fetch_many(sql: impl Into<String>, max_rows: usize) -> Self {
+        Self::FetchMany {
+            sql: sql.into(),
+            params: Vec::new(),
+            max_rows,
         }
     }
 
@@ -292,7 +319,9 @@ impl PgRequest {
     /// ```
     pub fn param(mut self, value: impl Into<PgValue>) -> Self {
         match &mut self {
-            Self::Execute { params, .. } | Self::FetchOne { params, .. } => {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
                 params.push(value.into());
             }
         }
@@ -303,7 +332,9 @@ impl PgRequest {
     /// [`Self::param`] is discarded.
     pub fn params(mut self, values: Vec<PgValue>) -> Self {
         match &mut self {
-            Self::Execute { params, .. } | Self::FetchOne { params, .. } => {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
                 *params = values;
             }
         }
@@ -323,6 +354,16 @@ pub enum PgResponse {
     Row(PgRow),
     /// `FetchOne` matched zero rows.
     NoRows,
+    /// `FetchMany` outcome. Rows are buffered up to the effective
+    /// cap; `truncated = true` means there were more rows on the
+    /// wire that the bridge stopped pulling.
+    Rows {
+        /// Buffered rows, in result order.
+        rows: Vec<PgRow>,
+        /// `true` if Postgres had more rows to send and the bridge
+        /// hit its cap. The buffered rows are still valid.
+        truncated: bool,
+    },
 }
 
 /// One Postgres result row plus its column names.
@@ -478,6 +519,9 @@ pub enum PgConfigError {
     ZeroPollInterval,
     /// `max_request_params == 0`.
     ZeroMaxRequestParams,
+    /// `max_response_rows == 0`. Use a request `max_rows` of `0` for
+    /// "no rows expected"; the config ceiling must be `>= 1`.
+    ZeroMaxResponseRows,
     /// SQLx pool config requested zero connections. SQLx requires at
     /// least one. Distinct from a "no public cap" error: pool size is
     /// caller-owned.
@@ -499,6 +543,7 @@ impl std::fmt::Display for PgConfigError {
             Self::ZeroDefaultTimeout => f.write_str("default_timeout must be > 0"),
             Self::ZeroPollInterval => f.write_str("poll_interval must be > 0"),
             Self::ZeroMaxRequestParams => f.write_str("max_request_params must be >= 1"),
+            Self::ZeroMaxResponseRows => f.write_str("max_response_rows must be >= 1"),
             Self::ZeroPoolMaxConnections => f.write_str("pool max_connections must be >= 1"),
             Self::ZeroPoolAcquireTimeout => f.write_str("pool acquire_timeout must be > 0"),
         }
@@ -591,6 +636,11 @@ pub struct PgConfig {
     /// Max positional params per request. Over the cap rejects with
     /// [`PgError::InvalidRequest`] before the spawned task runs.
     pub max_request_params: usize,
+    /// Hard ceiling on rows the bridge will buffer for a single
+    /// [`PgRequest::FetchMany`]. The request's own `max_rows` is
+    /// further capped to this value, so a caller cannot ask for
+    /// `usize::MAX` and force unbounded buffering.
+    pub max_response_rows: usize,
 }
 
 impl PgConfig {
@@ -605,6 +655,7 @@ impl PgConfig {
             default_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(2),
             max_request_params: 64,
+            max_response_rows: 4096,
         }
     }
 
@@ -656,6 +707,12 @@ impl PgConfig {
         self
     }
 
+    /// Sets `max_response_rows`.
+    pub fn with_max_response_rows(mut self, max: usize) -> Self {
+        self.max_response_rows = max;
+        self
+    }
+
     /// Validates the full config — Tina-side fields plus the
     /// embedded `pool` config when it is `Some`. Used by
     /// [`crate::PgWorker::install`] (config-built pool path).
@@ -698,6 +755,9 @@ impl PgConfig {
         }
         if self.max_request_params == 0 {
             return Err(PgConfigError::ZeroMaxRequestParams);
+        }
+        if self.max_response_rows == 0 {
+            return Err(PgConfigError::ZeroMaxResponseRows);
         }
         Ok(())
     }

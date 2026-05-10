@@ -182,9 +182,9 @@ mod types;
 mod worker;
 
 pub use helpers::{
-    ExecuteCall, FetchOneCall, PgAddress, PgCallOutcome, PgExecutedOutcome, PgFatalReason,
-    PgFetchOneOutcome, PgOutcomeClass, PgOutcomeExt, PgResult, PgTransientReason, execute_call,
-    fetch_one_call, send_request,
+    ExecuteCall, FetchManyCall, FetchOneCall, PgAddress, PgCallOutcome, PgExecutedOutcome,
+    PgFatalReason, PgFetchManyOutcome, PgFetchOneOutcome, PgOutcomeClass, PgOutcomeExt, PgResult,
+    PgRows, PgTransientReason, execute_call, fetch_many_call, fetch_one_call, send_request,
 };
 pub use metrics::{PgMetrics, PgMetricsHandle};
 pub use types::{

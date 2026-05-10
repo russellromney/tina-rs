@@ -45,6 +45,7 @@ fn request_kind_name(request: &PgRequest) -> &'static str {
     match request {
         PgRequest::Execute { .. } => "execute",
         PgRequest::FetchOne { .. } => "fetch_one",
+        PgRequest::FetchMany { .. } => "fetch_many",
     }
 }
 
@@ -276,8 +277,9 @@ impl<S: Shard + 'static> PgWorker<S> {
         let abandoned = Arc::new(AtomicBool::new(false));
         let abandoned_for_task = Arc::clone(&abandoned);
         let metrics_for_task = Arc::clone(&self.metrics);
+        let max_response_rows = self.config.max_response_rows;
         self.runtime.spawn(async move {
-            let result = run_request(&pool, request).await;
+            let result = run_request(&pool, request, max_response_rows).await;
             tally_worker_terminal(&metrics_for_task, &result);
             if abandoned_for_task.load(Ordering::Acquire) {
                 metrics_for_task
@@ -406,6 +408,15 @@ fn emit_replied(result: &PgResult, request_kind: &'static str) {
             kind = "replied",
             outcome = "no_rows",
             request_kind,
+        ),
+        Ok(PgResponse::Rows { rows, truncated }) => event!(
+            target: TRACE_TARGET_CALL,
+            Level::DEBUG,
+            kind = "replied",
+            outcome = "rows",
+            request_kind,
+            row_count = rows.len() as u64,
+            truncated = *truncated,
         ),
         Err(err) => {
             let reason = pg_error_reason(err);
@@ -562,6 +573,7 @@ fn validate_request(request: &PgRequest, config: &PgConfig) -> Result<(), PgErro
     let (sql, params_len) = match request {
         PgRequest::Execute { sql, params } => (sql, params.len()),
         PgRequest::FetchOne { sql, params } => (sql, params.len()),
+        PgRequest::FetchMany { sql, params, .. } => (sql, params.len()),
     };
     if sql.trim().is_empty() {
         return Err(PgError::InvalidRequest("empty sql".into()));
@@ -582,9 +594,19 @@ fn tally_worker_terminal(metrics: &MetricsInner, result: &PgResult) {
         }
         Ok(PgResponse::Row(_)) => {
             metrics.responses_row.fetch_add(1, Ordering::Relaxed);
+            metrics.rows_returned.fetch_add(1, Ordering::Relaxed);
         }
         Ok(PgResponse::NoRows) => {
             metrics.responses_no_rows.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(PgResponse::Rows { rows, truncated }) => {
+            metrics.responses_rows.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .rows_returned
+                .fetch_add(rows.len() as u64, Ordering::Relaxed);
+            if *truncated {
+                metrics.responses_truncated.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Err(PgError::PoolAcquireTimeout) => {
             metrics
@@ -609,7 +631,7 @@ fn tally_worker_terminal(metrics: &MetricsInner, result: &PgResult) {
     }
 }
 
-async fn run_request(pool: &PgPool, request: PgRequest) -> PgResult {
+async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize) -> PgResult {
     match request {
         PgRequest::Execute { sql, params } => {
             let mut q = sqlx::query(&sql);
@@ -631,7 +653,7 @@ async fn run_request(pool: &PgPool, request: PgRequest) -> PgResult {
             // Stream at most two rows so a query that accidentally
             // returns a large result set surfaces `TooManyRows`
             // without first buffering the whole thing in bridge
-            // memory. Bounded `FetchMany` is a follow-up.
+            // memory.
             let mut stream = q.fetch(pool);
             let first = match stream.try_next().await {
                 Ok(opt) => opt,
@@ -646,6 +668,49 @@ async fn run_request(pool: &PgPool, request: PgRequest) -> PgResult {
                 Ok(Some(_)) => Err(PgError::TooManyRows),
                 Err(e) => Err(map_sqlx_error(e)),
             }
+        }
+        PgRequest::FetchMany {
+            sql,
+            params,
+            max_rows,
+        } => {
+            // Effective cap: caller's `max_rows` capped by the
+            // bridge's `max_response_rows` ceiling. We pull at most
+            // `cap + 1` rows so we can distinguish "exactly cap rows"
+            // from "Postgres had more." Either way we never grow the
+            // bridge's buffer past `cap`.
+            let cap = core::cmp::min(max_rows, max_response_rows);
+            let mut q = sqlx::query(&sql);
+            for p in params {
+                q = bind_param(q, p);
+            }
+            let mut stream = q.fetch(pool);
+            let mut rows: Vec<PgRow> = Vec::with_capacity(cap.min(64));
+            let mut truncated = false;
+            loop {
+                if rows.len() == cap {
+                    // Pull one more to discriminate "exactly cap" vs
+                    // "more on the wire"; if there's another row, we
+                    // drop it on the floor and set truncated.
+                    match stream.try_next().await {
+                        Ok(None) => break,
+                        Ok(Some(_)) => {
+                            truncated = true;
+                            break;
+                        }
+                        Err(e) => return Err(map_sqlx_error(e)),
+                    }
+                }
+                match stream.try_next().await {
+                    Ok(None) => break,
+                    Ok(Some(row)) => match decode_row(&row) {
+                        Ok(decoded) => rows.push(decoded),
+                        Err(e) => return Err(e),
+                    },
+                    Err(e) => return Err(map_sqlx_error(e)),
+                }
+            }
+            Ok(PgResponse::Rows { rows, truncated })
         }
     }
 }
