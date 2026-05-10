@@ -16,9 +16,9 @@ use std::rc::Rc;
 use tina::prelude::*;
 use tina_runtime::{RuntimeEventKind, SendRejectedReason};
 use tina_sim::dst::{
-    History, ReplayCase, ReplayConfig, ReplayReport, assert_replay_case, check_replay_case,
+    ReplayCase, ReplayConfig, ReplayReport, assert_replay_case, check_replay_case,
 };
-use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator, SimulatorConfig};
+use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
 const SOURCE_ROLE: &str = "source";
 const SINK_ROLE: &str = "sink";
@@ -93,9 +93,7 @@ impl Sink {
 }
 
 fn run_burst_overflow_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
-    let mut config = case.config.simulator.clone();
-    config.seed = case.seed;
-    let mut sim = Simulator::new(SingleShard, config);
+    let mut sim = Simulator::new(SingleShard, case.simulator_config());
 
     let received = Rc::new(RefCell::new(Vec::new()));
     let sink = sim.register_with_mailbox_capacity(
@@ -159,34 +157,25 @@ fn run_burst_overflow_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
 /// delay perturbing delivery rounds, the trace has a stable shape but
 /// only because seed + config + history are all visible on the case.
 fn burst_overflow_case() -> ReplayCase<Op> {
-    let history = History::new(
+    let faults = FaultConfig {
+        local_send: LocalSendFaultMode::DelayByRounds {
+            one_in: 2,
+            rounds: 1,
+        },
+        ..Default::default()
+    };
+    let config = ReplayConfig::with_faults(faults)
+        .with_mailbox(SOURCE_ROLE, 8)
+        .with_mailbox(SINK_ROLE, 2);
+    ReplayCase::new(
         "burst overflow under local-send delay",
         7,
-        vec![Op::Burst { size: 4 }, Op::Step, Op::Burst { size: 4 }],
-    );
-    let config = ReplayConfig {
-        simulator: SimulatorConfig {
-            faults: FaultConfig {
-                local_send: LocalSendFaultMode::DelayByRounds {
-                    one_in: 2,
-                    rounds: 1,
-                },
-                ..Default::default()
-            },
-            ..SimulatorConfig::default()
-        },
-        mailboxes: [(SOURCE_ROLE, 8), (SINK_ROLE, 2)].into_iter().collect(),
-    };
-    ReplayCase {
-        name: "burst overflow under local-send delay",
-        seed: 7,
         config,
-        scenario: "two bursts of 4 sends into a capacity-2 sink under seeded local-send delay",
-        history,
-        expected_event_count: BURST_OVERFLOW_EVENT_COUNT,
-        expected_trace_hash: BURST_OVERFLOW_TRACE_HASH,
-        invariant: "mailbox full produces SendRejected{ reason: Full } that the trace records",
-    }
+        "two bursts of 4 sends into a capacity-2 sink under seeded local-send delay",
+        vec![Op::Burst { size: 4 }, Op::Step, Op::Burst { size: 4 }],
+        "mailbox full produces SendRejected{ reason: Full } that the trace records",
+    )
+    .expecting(BURST_OVERFLOW_EVENT_COUNT, BURST_OVERFLOW_TRACE_HASH)
 }
 
 // Pinned by `burst_overflow_case_replays_byte_for_byte`. Refresh only

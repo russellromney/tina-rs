@@ -455,6 +455,27 @@ pub fn emit_event(event: &RuntimeEvent) {
             slot_id = slot_id.get(),
             call_id = call_id.get(),
         ),
+        RuntimeEventKind::CallCancelled { call_id, cause } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::DEBUG,
+            kind = "call_cancelled",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            cancel_cause = cancel_cause_name(cause),
+        ),
+    }
+}
+
+/// Stable string name for a [`tina::CancelCause`].
+pub fn cancel_cause_name(cause: tina::CancelCause) -> &'static str {
+    match cause {
+        tina::CancelCause::CallerCancelled => "CallerCancelled",
+        tina::CancelCause::CallerTimedOut => "CallerTimedOut",
+        tina::CancelCause::OwnerStopped => "OwnerStopped",
+        tina::CancelCause::RuntimeStopped => "RuntimeStopped",
     }
 }
 
@@ -557,6 +578,7 @@ pub fn call_kind_name(kind: CallKind) -> &'static str {
         CallKind::Sleep => "sleep",
         CallKind::ObservedSend => "observed_send",
         CallKind::IsolateCall => "isolate_call",
+        CallKind::CancelCall => "cancel_call",
     }
 }
 
@@ -583,6 +605,10 @@ pub fn call_reply_rejected_reason_name(reason: CallReplyRejectedReason) -> &'sta
         CallReplyRejectedReason::NoPendingCall => "NoPendingCall",
         CallReplyRejectedReason::ReplyPathFull => "ReplyPathFull",
         CallReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
+        CallReplyRejectedReason::CallerCancelled => "CallerCancelled",
+        CallReplyRejectedReason::CallerTimedOut => "CallerTimedOut",
+        CallReplyRejectedReason::OwnerStopped => "OwnerStopped",
+        CallReplyRejectedReason::RuntimeStopped => "RuntimeStopped",
     }
 }
 
@@ -593,6 +619,10 @@ pub fn deferred_reply_rejected_reason_name(reason: DeferredReplyRejectedReason) 
         DeferredReplyRejectedReason::ReplyPathFull => "ReplyPathFull",
         DeferredReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
         DeferredReplyRejectedReason::TypeMismatch => "TypeMismatch",
+        DeferredReplyRejectedReason::CallerCancelled => "CallerCancelled",
+        DeferredReplyRejectedReason::CallerTimedOut => "CallerTimedOut",
+        DeferredReplyRejectedReason::OwnerStopped => "OwnerStopped",
+        DeferredReplyRejectedReason::RuntimeStopped => "RuntimeStopped",
     }
 }
 

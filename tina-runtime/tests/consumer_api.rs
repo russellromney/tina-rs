@@ -543,15 +543,20 @@ fn downstream_consumer_sees_late_isolate_call_reply_rejected_after_timeout() {
         count_call_completed(runtime.trace(), CallKind::IsolateCall),
         0
     );
+    // Late reply after timeout now surfaces with the specific
+    // `CallerTimedOut` reason — recorded in the runtime's
+    // recently-cancelled ring at harvest time. `NoPendingCall`
+    // remains the fall-through if the ring evicts the entry, which
+    // does not happen at this small scale.
     assert!(
         runtime.trace().iter().any(|event| matches!(
             event.kind(),
             RuntimeEventKind::CallReplyRejected {
-                reason: CallReplyRejectedReason::NoPendingCall,
+                reason: CallReplyRejectedReason::CallerTimedOut,
                 ..
             }
         )),
-        "late reply after timeout should be explicit in the trace"
+        "late reply after timeout should surface as CallerTimedOut in the trace"
     );
 }
 
@@ -592,7 +597,11 @@ fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_mail
 }
 
 #[test]
-fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_stops() {
+fn downstream_consumer_sees_call_cancelled_owner_stopped_when_requester_stops() {
+    // Rock 5: stopping a requester with a pending call now emits
+    // `CallCancelled { OwnerStopped }`. The worker's later reply is
+    // rejected as `CallReplyRejected { NoPendingCall }` because the
+    // pending entry was already cleaned up.
     let outcomes = Rc::new(RefCell::new(Vec::new()));
     let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
     let target = runtime.register_with_capacity(ReplyWorker, 8);
@@ -609,14 +618,20 @@ fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_stop
     drive(&mut runtime);
 
     assert!(outcomes.borrow().is_empty());
-    assert_eq!(
-        count_call_completion_rejected(
-            runtime.trace(),
-            CallKind::IsolateCall,
-            CallCompletionRejectedReason::RequesterClosed,
-        ),
-        1
-    );
+    let owner_stopped_cancels = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCancelled {
+                    cause: tina::CancelCause::OwnerStopped,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(owner_stopped_cancels, 1);
 }
 
 #[derive(Debug, Clone)]

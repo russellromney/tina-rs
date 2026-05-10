@@ -31,14 +31,41 @@
 use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tina::{Address, AddressGeneration, IsolateId, ShardId};
+use tina::{
+    Address, AddressGeneration, CallHandle, CallHandleInner, CallHandleShared, CancelOutcome,
+    IsolateId, ShardId,
+};
 
 type ErasedReply = Box<dyn Any>;
 type ErasedCallOutcome = CallOutcome<ErasedReply>;
 type IsolateCallTranslator<M> = Box<dyn FnOnce(ErasedCallOutcome) -> M>;
 type ErasedIsolateCallTranslator = Box<dyn FnOnce(ErasedCallOutcome) -> Box<dyn Any>>;
+type CancelCallTranslator<M> = Box<dyn FnOnce(CancelOutcome) -> M>;
+type ErasedCancelCallTranslator = Box<dyn FnOnce(CancelOutcome) -> Box<dyn Any>>;
+
+fn erase_isolate_call_translator<R, M, F>(translator: F) -> IsolateCallTranslator<M>
+where
+    R: 'static,
+    F: FnOnce(CallOutcome<R>) -> M + 'static,
+{
+    Box::new(move |outcome| match outcome {
+        CallOutcome::Replied(reply) => {
+            let reply = *reply.downcast::<R>().unwrap_or_else(|_| {
+                panic!(
+                    "isolate call reply had the wrong type; expected {}",
+                    std::any::type_name::<R>()
+                )
+            });
+            translator(CallOutcome::Replied(reply))
+        }
+        CallOutcome::Full => translator(CallOutcome::Full),
+        CallOutcome::Closed => translator(CallOutcome::Closed),
+        CallOutcome::Timeout => translator(CallOutcome::Timeout),
+    })
+}
 
 /// Stable identifier for one runtime-issued call.
 ///
@@ -1160,6 +1187,15 @@ enum RuntimeCallKind<M> {
         timeout: Duration,
         translator: IsolateCallTranslator<M>,
         expected_reply_type_id: std::any::TypeId,
+        /// Optional caller-owned cancellation cell. Present when the
+        /// effect was built via [`call_with_handle`]; the runtime stamps
+        /// the assigned `CallId` here on dispatch and updates state on
+        /// completion or cancellation.
+        handle_shared: Option<Arc<CallHandleShared>>,
+    },
+    CancelCall {
+        handle_shared: Arc<CallHandleShared>,
+        translator: CancelCallTranslator<M>,
     },
 }
 
@@ -1236,21 +1272,52 @@ impl<M> RuntimeCall<M> {
                 target_generation: destination.generation(),
                 message: Box::new(message),
                 timeout,
-                translator: Box::new(move |outcome| match outcome {
-                    CallOutcome::Replied(reply) => {
-                        let reply = *reply.downcast::<R>().unwrap_or_else(|_| {
-                            panic!(
-                                "isolate call reply had the wrong type; expected {}",
-                                std::any::type_name::<R>()
-                            )
-                        });
-                        translator(CallOutcome::Replied(reply))
-                    }
-                    CallOutcome::Full => translator(CallOutcome::Full),
-                    CallOutcome::Closed => translator(CallOutcome::Closed),
-                    CallOutcome::Timeout => translator(CallOutcome::Timeout),
-                }),
+                translator: erase_isolate_call_translator::<R, _, _>(translator),
                 expected_reply_type_id: std::any::TypeId::of::<R>(),
+                handle_shared: None,
+            },
+        }
+    }
+
+    /// Like [`Self::isolate_call`] but carries a caller-owned shared
+    /// cell for cancellation. The runtime stamps the assigned `CallId`
+    /// on `handle_shared` at dispatch time.
+    pub fn isolate_call_with_handle<T, R, F>(
+        destination: Address<T, R>,
+        message: T,
+        timeout: Duration,
+        translator: F,
+        handle_shared: Arc<CallHandleShared>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        R: 'static,
+        F: FnOnce(CallOutcome<R>) -> M + 'static,
+    {
+        Self {
+            kind: RuntimeCallKind::IsolateCall {
+                target_shard: destination.shard(),
+                target_isolate: destination.isolate(),
+                target_generation: destination.generation(),
+                message: Box::new(message),
+                timeout,
+                translator: erase_isolate_call_translator::<R, _, _>(translator),
+                expected_reply_type_id: std::any::TypeId::of::<R>(),
+                handle_shared: Some(handle_shared),
+            },
+        }
+    }
+
+    /// Creates a cancel-call request that closes one pending isolate
+    /// call's caller-side wait.
+    pub fn cancel_call_with_handle<F>(handle_shared: Arc<CallHandleShared>, translator: F) -> Self
+    where
+        F: FnOnce(CancelOutcome) -> M + 'static,
+    {
+        Self {
+            kind: RuntimeCallKind::CancelCall {
+                handle_shared,
+                translator: Box::new(translator),
             },
         }
     }
@@ -1277,6 +1344,9 @@ impl<M> RuntimeCall<M> {
             RuntimeCallKind::IsolateCall { .. } => {
                 panic!("isolate call does not carry a backend CallInput")
             }
+            RuntimeCallKind::CancelCall { .. } => {
+                panic!("cancel call does not carry a backend CallInput")
+            }
         }
     }
 
@@ -1292,6 +1362,9 @@ impl<M> RuntimeCall<M> {
             }
             RuntimeCallKind::IsolateCall { .. } => {
                 panic!("isolate call does not carry backend call parts")
+            }
+            RuntimeCallKind::CancelCall { .. } => {
+                panic!("cancel call does not carry backend call parts")
             }
         }
     }
@@ -1331,6 +1404,7 @@ impl<M> RuntimeCall<M> {
                 timeout,
                 translator,
                 expected_reply_type_id,
+                handle_shared,
             } => RuntimeCallParts::IsolateCall {
                 target_shard,
                 target_isolate,
@@ -1339,12 +1413,25 @@ impl<M> RuntimeCall<M> {
                 timeout,
                 translator,
                 expected_reply_type_id,
+                handle_shared,
+            },
+            RuntimeCallKind::CancelCall {
+                handle_shared,
+                translator,
+            } => RuntimeCallParts::CancelCall {
+                handle_shared,
+                translator,
             },
         }
     }
 }
 
 /// Publicly destructurable runtime action carried by [`RuntimeCall`].
+///
+/// `IsolateCall::handle_shared` and the `CancelCall` variant carry the
+/// caller-owned cancellation cell so sibling runtime crates (`tina-sim`,
+/// future deterministic backends) can implement the same cancel
+/// semantics without reaching into private fields.
 #[doc(hidden)]
 pub enum RuntimeCallParts<M> {
     /// Backend-owned I/O/time request.
@@ -1383,6 +1470,16 @@ pub enum RuntimeCallParts<M> {
         translator: IsolateCallTranslator<M>,
         /// `TypeId::of::<R>()` for the dispatching `Address<_, R>`.
         expected_reply_type_id: std::any::TypeId,
+        /// Optional caller-owned cancellation cell. Set by
+        /// [`call_with_handle`].
+        handle_shared: Option<Arc<CallHandleShared>>,
+    },
+    /// Cancel-call request: close one pending isolate call's wait.
+    CancelCall {
+        /// Caller-owned shared cell identifying the call.
+        handle_shared: Arc<CallHandleShared>,
+        /// Outcome translator.
+        translator: CancelCallTranslator<M>,
     },
 }
 
@@ -1396,6 +1493,7 @@ impl<M> std::fmt::Debug for RuntimeCall<M> {
                     RuntimeCallKind::Backend { request, .. } => request.kind(),
                     RuntimeCallKind::ObservedSend { .. } => crate::trace::CallKind::ObservedSend,
                     RuntimeCallKind::IsolateCall { .. } => crate::trace::CallKind::IsolateCall,
+                    RuntimeCallKind::CancelCall { .. } => crate::trace::CallKind::CancelCall,
                 },
             )
             .finish_non_exhaustive()
@@ -1440,6 +1538,15 @@ pub(crate) enum ErasedCallKind {
         /// Used to typecheck deferred-reply payloads before they
         /// reach the translator's downcast.
         expected_reply_type_id: std::any::TypeId,
+        /// Optional caller-owned cancellation cell.
+        handle_shared: Option<Arc<CallHandleShared>>,
+    },
+    /// Cancel-call request: close one pending isolate call's wait.
+    CancelCall {
+        /// Caller-owned shared cell identifying the call.
+        handle_shared: Arc<CallHandleShared>,
+        /// Outcome translator erased to `Any`.
+        translator: ErasedCancelCallTranslator,
     },
 }
 
@@ -1453,6 +1560,7 @@ impl std::fmt::Debug for ErasedCall {
                     ErasedCallKind::Backend { request, .. } => request.kind(),
                     ErasedCallKind::ObservedSend { .. } => crate::trace::CallKind::ObservedSend,
                     ErasedCallKind::IsolateCall { .. } => crate::trace::CallKind::IsolateCall,
+                    ErasedCallKind::CancelCall { .. } => crate::trace::CallKind::CancelCall,
                 },
             )
             .finish_non_exhaustive()
@@ -1522,6 +1630,7 @@ where
                 timeout,
                 translator,
                 expected_reply_type_id,
+                handle_shared,
             } => ErasedCall {
                 kind: ErasedCallKind::IsolateCall {
                     send: crate::ErasedSend {
@@ -1535,6 +1644,18 @@ where
                         Box::new(translator(outcome)) as Box<dyn Any>
                     }),
                     expected_reply_type_id,
+                    handle_shared,
+                },
+            },
+            RuntimeCallParts::CancelCall {
+                handle_shared,
+                translator,
+            } => ErasedCall {
+                kind: ErasedCallKind::CancelCall {
+                    handle_shared,
+                    translator: Box::new(move |outcome| {
+                        Box::new(translator(outcome)) as Box<dyn Any>
+                    }),
                 },
             },
         }
@@ -2007,6 +2128,116 @@ where
             translator,
         ))
     }
+}
+
+/// Prepared isolate-call helper that also produces a caller-owned
+/// [`CallHandle`] for cancellation, returned by [`call_with_handle`].
+#[doc(hidden)]
+pub struct IsolateCallWithHandle<T, R> {
+    destination: Address<T, R>,
+    message: T,
+    timeout: Duration,
+    marker: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<T, R> IsolateCallWithHandle<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+{
+    fn new(destination: Address<T, R>, message: T, timeout: Duration) -> Self {
+        Self {
+            destination,
+            message,
+            timeout,
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Returns `(effect, handle)`. Store the handle in isolate state
+    /// and return the effect; runtime stamps `CallId` on dispatch.
+    pub fn reply<I, F, M>(self, translator: F) -> (tina::Effect<I>, tina::CallHandle<R>)
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(CallOutcome<R>) -> M + 'static,
+        M: 'static,
+    {
+        let shared = Arc::new(CallHandleShared::new(std::any::TypeId::of::<R>()));
+        let effect = tina::Effect::Call(RuntimeCall::isolate_call_with_handle(
+            self.destination,
+            self.message,
+            self.timeout,
+            translator,
+            shared.clone(),
+        ));
+        let handle = tina::runtime_internal::call_handle_from_shared::<R>(shared);
+        (effect, handle)
+    }
+}
+
+/// Builder returned by [`cancel_call`].
+#[doc(hidden)]
+pub struct CancelCallBuilder {
+    inner: CallHandleInner,
+}
+
+impl CancelCallBuilder {
+    fn new(inner: CallHandleInner) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the cancel effect; the [`CancelOutcome`] arrives back
+    /// as `translator(outcome)`.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(CancelOutcome) -> M + 'static,
+        M: 'static,
+    {
+        let shared = tina::runtime_internal::call_handle_inner_into_shared(self.inner);
+        tina::Effect::Call(RuntimeCall::cancel_call_with_handle(shared, translator))
+    }
+}
+
+/// Like [`call`], but `.reply(...)` also produces a caller-owned
+/// [`tina::CallHandle`]. Pair with [`cancel_call`] to close the wait
+/// later. Move-only handle: one cancel per call.
+pub fn call_with_handle<T, R>(
+    destination: Address<T, R>,
+    message: T,
+    timeout: Duration,
+) -> IsolateCallWithHandle<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+{
+    IsolateCallWithHandle::new(destination, message, timeout)
+}
+
+/// Closes the caller-side wait of one pending isolate call.
+///
+/// Reclaims call capacity. Does not cancel external work already
+/// accepted by a backend, does not release pool leases, does not retry.
+/// Late replies become typed rejected facts (`CallReplyRejected`,
+/// `DeferredReplyRejected`) with reason `CallerCancelled`.
+pub fn cancel_call<R>(handle: CallHandle<R>) -> CancelCallBuilder
+where
+    R: 'static,
+{
+    let inner = tina::runtime_internal::call_handle_into_inner(handle);
+    CancelCallBuilder::new(inner)
+}
+
+/// Returns the runtime-assigned [`CallId`] for `handle`, or `None` if
+/// its effect has not yet been dispatched.
+///
+/// `tina::CallHandle::call_id` returns a raw `u64` because `tina` is
+/// the trait crate and must not depend on this crate's `CallId`. Use
+/// this helper from runtime-aware code to keep the typed identity.
+pub fn call_handle_call_id<R>(handle: &CallHandle<R>) -> Option<CallId> {
+    tina::runtime_internal::call_handle_shared(handle)
+        .call_id()
+        .map(CallId::new)
 }
 
 /// Returns a helper that calls another isolate and requires a timeout.
