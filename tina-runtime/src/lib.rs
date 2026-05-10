@@ -63,6 +63,7 @@ mod multi_shard;
 mod observation;
 mod observer;
 pub mod persistence;
+pub mod pool;
 pub mod pressure;
 pub mod sharded;
 mod single_call_gate;

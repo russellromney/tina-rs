@@ -1,8 +1,8 @@
 # eiffel_graceful_pool_shutdown
 
-Stop a worker pool while callers are pending. Every still-pending
-caller must see a typed terminal reply — no silent drop, no host
-hang.
+Stop a bounded `WorkerPool` while callers are still parked. Every
+still-pending caller must see a typed terminal reply — no silent drop,
+no host hang.
 
 ## Run
 
@@ -12,63 +12,59 @@ cargo test --manifest-path examples/eiffel_graceful_pool_shutdown/Cargo.toml
 
 ## Tina shape
 
-`Frontend` holds `PendingReplies::with_capacity(MAX_PENDING)`. On
-`Shutdown` it drains the box and replies `Closed` to every
-pending caller in one `Effect::Batch` plus a trailing `stop()`,
-expressed with the typed `drain_replies_into_stop` helper:
+`tina_runtime::pool::WorkerPool` owns the worker addresses as
+resources. Each caller does the explicit three-step:
 
-```rust
-FrontendMsg::Shutdown => {
-    self.pending.drain_replies_into_stop::<Self>(FrontendReply::Closed)
-}
+```text
+acquire (call WorkerPoolMsg::Acquire)
+  -> AcquireOutcome::Acquired(lease) | Full | Closed | Timeout
+work    (call worker, WorkerMsg::Do)
+release (release_effect(lease, pool, Reuse|Retire, ...))
+  -> ReleaseOutcome::Released | Retired | StaleLease | DoubleRelease | PoolClosed
 ```
 
-The helper is compile-time typed so a `PendingReplies<K, R>`
-only produces `Effect<I>` when `I::Reply = R`. The method name
-says `stop` on purpose — nothing else in the helper appends
-`stop()` for you, and the underlying `pending.drain()` /
-`reply_to(slot, ...)` semantics are unchanged. Empty box returns
-plain `Effect::Stop` (no Batch wrapper).
+On `Shutdown` the driver sends one `WorkerPoolMsg::Close(CloseMode::Drain)`.
+The pool replies `Closed` to every parked waiter in one batch and
+acknowledges the close itself. Outstanding leases drain normally; once
+the call-site releases them the pool reports `Retired` (the close
+turns every release into a retire) so capacity is honestly accounted.
 
-## What feels good
+## Tokio shape
 
-- `drain_replies_into_stop::<Self>(R::Closed)` is the one-liner
-  for the common service-stop pattern. Slots are visited in
-  internal-table order, which matches admission order only when
-  the table has not been swept and reused.
-- The terminal reply is still a regular `reply_to(slot, ...)`
-  under the hood — no special path. Use the longer-form
-  `pending.drain()` + manual loop when the per-caller reply
-  needs to carry the key.
-- After `Shutdown`, the frontend stops cleanly. Callers that
-  submitted *after* the frontend stopped see a typed
-  bridge-layer outcome (mailbox-full or closed) at their
-  original `call(...).reply(...)` site.
+The tokio side keeps the original `mpsc::channel` worker pool: a
+buffered job channel, oneshot reply per submission, `JoinSet::abort_all`
+plus an explicit `drop(rx)` on shutdown. The two sides converge at
+the same `Report { completed, closed, failed }` shape.
 
-## What feels worse
+## Where Full / Closed / Timeout appear
 
-- `Shutdown` rides the same bounded mailbox as the regular
-  `Submit` traffic. With six in-flight callers and a 64-slot
-  frontend mailbox there is plenty of room; the host calls
-  `runtime.send_observed_until(...)` (Phase 062 Rock 4) which
-  retries `MailboxFull` / `IngressFull` up to a deadline. The
-  hand-rolled retry loop is gone, but the underlying shape (a
-  control message rides the data mailbox) is the same one in
-  `eiffel_hot_key_fairness`'s `Drain(admitted)`. See FINDINGS
-  finding 9 (drain helper for `PendingReplies` at service stop)
-  for the related product gap.
+| outcome     | when                                                          |
+|-------------|---------------------------------------------------------------|
+| `Acquired`  | a worker was idle (or one was just released to this caller)   |
+| `Full`      | all workers busy *and* the waiter table at `max_waiters`      |
+| `Closed`    | shutdown landed while caller was parked                       |
+| `Timeout`   | caller's `call(pool, Acquire, ...)` timeout fired (and the    |
+|             | pool sweeps the slot on its next message)                     |
 
-## Tokio footgun
+These four cases are distinct enum variants; nothing collapses them
+into a generic error.
 
-The first version of `tokio_impl::run` aborted the workers but
-forgot to drop the shared `Arc<Mutex<mpsc::Receiver>>`. Buffered
-jobs (and their reply oneshots) stayed alive, so callers queued
-behind the in-flight ones blocked forever. The fix was a single
-`drop(rx)` after `abort_all` — easy to miss because the workers
-were correctly aborted and the test passed under low burst.
+## Why explicit release is more verbose but safer
 
-Tina's path makes this structurally impossible: `pending.drain()`
-returns *every* captured slot, the `Effect::Batch(reply_to)` ships
-a typed `Closed` to each, and `stop()` settles the runtime. There
-is no second container holding live promises behind the explicit
-queue.
+A pool lease is move-only and identity-checked (pool id, resource id,
+generation). Forgetting `release(lease, ...)` leaks a resource until
+the pool closes — but **dropping the lease silently does nothing on
+purpose**. There is no `Drop` magic that auto-returns the lease, and
+no auto-retry on a busy release mailbox. You either name the
+disposition (`Reuse` / `Retire`) at the call site or you keep the
+lease.
+
+## How caller cancellation removes waiters
+
+Acquire via `call_with_handle(pool, WorkerPoolMsg::Acquire, timeout)`
+gives the caller a `CallHandle`. Firing `cancel_call(handle)` closes
+the caller-side wait; the pool's deferred reply slot for that waiter
+moves to `Closed`. The pool sweeps closed slots on every incoming
+message, so capacity is reclaimed without a separate `CancelWaiter`
+ping. FIFO order of remaining waiters is preserved across mid-queue
+cancels.

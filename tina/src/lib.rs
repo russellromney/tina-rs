@@ -1924,3 +1924,5 @@ pub mod prelude {
         restart_children, send, sequence, spawn, stop, stop_with,
     };
 }
+
+pub mod pool;
