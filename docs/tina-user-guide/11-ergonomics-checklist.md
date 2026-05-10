@@ -151,13 +151,26 @@ is not stable across releases.
 ### Saved-seed regression test
 
 Use `ReplayCase` plus `assert_replay_case` in `tina_sim::dst` for
-"saved seed, saved bug" tests. The case is plain Rust data: name,
-seed, full `SimulatorConfig`, declared mailbox capacities, history,
-pinned event count, pinned `stable_trace_hash`. The runner reads
-every knob from the case.
+"saved seed, saved bug" tests. Build the case via
+`ReplayCase::new(...).expecting(count, hash)` and the config via
+`ReplayConfig::with_faults(...).with_mailbox(role, cap)` so name and
+seed are typed once and the case fits on one screen.
 
 ```rust
-use tina_sim::dst::{assert_replay_case, ReplayCase, ReplayConfig, ReplayReport};
+use tina_sim::dst::{assert_replay_case, ReplayCase, ReplayConfig};
+
+const SOURCE: &str = "source";
+const SINK: &str = "sink";
+
+fn case() -> ReplayCase<Op> {
+    let config = ReplayConfig::with_faults(my_faults())
+        .with_mailbox(SOURCE, 8)
+        .with_mailbox(SINK, 2);
+    ReplayCase::new(/* name */ "...", /* seed */ 7, config,
+                    /* scenario */ "...", vec![/* ops */],
+                    /* invariant */ "...")
+        .expecting(34, 0xe22d_12a5_1cd8_cf10)
+}
 
 #[test]
 fn saved_seed_replays_bug() {
@@ -166,14 +179,33 @@ fn saved_seed_replays_bug() {
 }
 ```
 
-When the saved hash drifts, the panic names the case, history, config,
-expected vs actual count/hash, and the next decision (fix the
-regression or update the constants).
+In the runner, build the simulator via `case.simulator_config()` —
+one line, seed already set:
+
+```rust
+let mut sim = Simulator::new(MyShard, case.simulator_config());
+let sink = sim.register_with_mailbox_capacity(Sink::default(), case.config.mailbox(SINK));
+```
 
 Do not roll a per-test `Report` struct, hand-rolled fingerprint
 comparison, or "is this the same trace?" pinning logic. Do not pin
 only the trace hash and skip the projection counts that name the
 invariant.
+
+### Discover the saved constants
+
+Use `observe_replay_case` plus `ReplayReport::pinned_constants` to
+get the initial `expected_event_count` and `expected_trace_hash` for
+a new case:
+
+```rust
+let report = observe_replay_case(&case(), run_case);
+println!("{}", report.pinned_constants());
+```
+
+Then chain `.expecting(count, hash)` on the case literal. Do not
+guess; do not run the regression test with placeholder zeros and
+copy from the panic.
 
 ### Sweep seeds for a bad case
 

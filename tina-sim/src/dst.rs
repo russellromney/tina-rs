@@ -669,6 +669,55 @@ pub struct ReplayCase<Op> {
     pub invariant: &'static str,
 }
 
+impl<Op> ReplayCase<Op> {
+    /// Builds one [`ReplayCase`] with `expected_event_count` /
+    /// `expected_trace_hash` left at zero. Use [`ReplayCase::expecting`]
+    /// to pin the saved constants once they are known.
+    ///
+    /// Internally constructs `History::new(name, seed, ops)` so the
+    /// case name and seed are typed exactly once.
+    pub fn new(
+        name: &'static str,
+        seed: u64,
+        config: ReplayConfig,
+        scenario: &'static str,
+        ops: Vec<Op>,
+        invariant: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            seed,
+            config,
+            scenario,
+            history: History::new(name, seed, ops),
+            expected_event_count: 0,
+            expected_trace_hash: 0,
+            invariant,
+        }
+    }
+
+    /// Pins the saved-replay constants. Chain after [`ReplayCase::new`]
+    /// once the values have been observed via [`observe_replay_case`].
+    pub fn expecting(mut self, expected_event_count: usize, expected_trace_hash: u64) -> Self {
+        self.expected_event_count = expected_event_count;
+        self.expected_trace_hash = expected_trace_hash;
+        self
+    }
+
+    /// Returns a [`SimulatorConfig`] whose `seed` is `case.seed` and
+    /// whose other fields come from `case.config.simulator`. The
+    /// runner uses this to build its `Simulator` in one line:
+    ///
+    /// ```ignore
+    /// let mut sim = Simulator::new(MyShard, case.simulator_config());
+    /// ```
+    pub fn simulator_config(&self) -> SimulatorConfig {
+        let mut config = self.config.simulator.clone();
+        config.seed = self.seed;
+        config
+    }
+}
+
 /// What one runner observed for a [`ReplayCase`].
 ///
 /// A runner is a normal function `fn(&ReplayCase<Op>) -> ReplayReport<Output>`
@@ -716,6 +765,85 @@ impl<Output> ReplayReport<Output> {
             output,
         }
     }
+
+    /// Returns the observed `expected_event_count` / `expected_trace_hash`
+    /// pair as a multi-line string ready to paste into a `ReplayCase`.
+    /// Use after [`observe_replay_case`] when first pinning a case.
+    pub fn pinned_constants(&self) -> String {
+        format!(
+            "expected_event_count: {}\nexpected_trace_hash: 0x{:016x}",
+            self.event_count, self.trace_hash,
+        )
+    }
+}
+
+fn assert_case_history_coherent<Op>(case: &ReplayCase<Op>) {
+    debug_assert_eq!(
+        case.name,
+        case.history.name(),
+        "ReplayCase.name and history.name() drifted",
+    );
+    debug_assert_eq!(
+        case.seed,
+        case.history.seed(),
+        "ReplayCase.seed and history.seed() drifted",
+    );
+}
+
+fn assert_report_identity<Op, Output>(case: &ReplayCase<Op>, report: &ReplayReport<Output>) {
+    debug_assert_eq!(
+        report.name, case.name,
+        "runner returned report.name {:?} for case {:?}; \
+         build the report with ReplayReport::from_case_and_events",
+        report.name, case.name,
+    );
+    debug_assert_eq!(
+        report.seed, case.seed,
+        "runner returned report.seed {} for case {:?} (expected {})",
+        report.seed, case.name, case.seed,
+    );
+    debug_assert_eq!(
+        report.scenario, case.scenario,
+        "runner returned report.scenario for case {:?} that does not match the case",
+        case.name,
+    );
+    debug_assert!(
+        report.config == case.config,
+        "runner returned report.config for case {:?} that does not match the case",
+        case.name,
+    );
+}
+
+/// Runs `runner` once and returns the observed [`ReplayReport`] without
+/// comparing it to any pinned constants. The blessed way to discover
+/// `expected_event_count` and `expected_trace_hash` for a new case.
+///
+/// Workflow for a new case:
+///
+/// ```ignore
+/// // 1. Write case() via ReplayCase::new(...) without `.expecting(...)`,
+/// //    plus a runner that returns ReplayReport::from_case_and_events.
+/// // 2. Run once via observe_replay_case to discover the constants:
+/// let report = observe_replay_case(&case(), run_case);
+/// println!("{}", report.pinned_constants());
+/// // 3. Chain `.expecting(printed_count, printed_hash)` on the case.
+/// // 4. The regression test then uses assert_replay_case forever.
+/// ```
+///
+/// Debug-asserts the same case/runner identity guards as
+/// [`check_replay_case`], so a buggy runner trips the same panic.
+pub fn observe_replay_case<Op, Output, Runner>(
+    case: &ReplayCase<Op>,
+    mut runner: Runner,
+) -> ReplayReport<Output>
+where
+    Op: Clone,
+    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+{
+    assert_case_history_coherent(case);
+    let report = runner(case);
+    assert_report_identity(case, &report);
+    report
 }
 
 /// Why a [`ReplayCase`] did not match what was pinned.
@@ -839,38 +967,9 @@ where
     Op: Clone,
     Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
 {
-    debug_assert_eq!(
-        case.name,
-        case.history.name(),
-        "ReplayCase.name and history.name() drifted",
-    );
-    debug_assert_eq!(
-        case.seed,
-        case.history.seed(),
-        "ReplayCase.seed and history.seed() drifted",
-    );
+    assert_case_history_coherent(case);
     let report = runner(case);
-    debug_assert_eq!(
-        report.name, case.name,
-        "runner returned report.name {:?} for case {:?}; \
-         build the report with ReplayReport::from_case_and_events",
-        report.name, case.name,
-    );
-    debug_assert_eq!(
-        report.seed, case.seed,
-        "runner returned report.seed {} for case {:?} (expected {})",
-        report.seed, case.name, case.seed,
-    );
-    debug_assert_eq!(
-        report.scenario, case.scenario,
-        "runner returned report.scenario for case {:?} that does not match the case",
-        case.name,
-    );
-    debug_assert!(
-        report.config == case.config,
-        "runner returned report.config for case {:?} that does not match the case",
-        case.name,
-    );
+    assert_report_identity(case, &report);
     if report.event_count != case.expected_event_count
         || report.trace_hash != case.expected_trace_hash
     {
@@ -1282,6 +1381,48 @@ mod replay_case_tests {
     fn replay_config_mailbox_panics_on_missing_role() {
         let cfg = ReplayConfig::new();
         let _ = cfg.mailbox("anything");
+    }
+
+    #[test]
+    fn observe_replay_case_returns_report_without_comparing() {
+        // A case with placeholder constants (the new-case state) must
+        // not panic — observe is the discovery path.
+        let pending = ReplayCase::<u32>::new(
+            "fake replay case",
+            7,
+            ReplayConfig::new(),
+            "produces three handler-started events",
+            vec![1, 2, 3],
+            "trace shape matches saved fixture",
+        );
+        let report = observe_replay_case(&pending, run_three_events);
+        assert_eq!(report.event_count, 3);
+        assert_eq!(report.trace_hash, case().expected_trace_hash);
+        let printed = report.pinned_constants();
+        assert!(printed.contains("expected_event_count: 3"));
+        assert!(printed.contains("expected_trace_hash: 0x"));
+    }
+
+    #[test]
+    fn replay_case_new_then_expecting_matches_struct_literal() {
+        let built = ReplayCase::<u32>::new(
+            "fake replay case",
+            7,
+            ReplayConfig::new(),
+            "produces three handler-started events",
+            vec![1, 2, 3],
+            "trace shape matches saved fixture",
+        )
+        .expecting(case().expected_event_count, case().expected_trace_hash);
+        assert_eq!(built, case());
+    }
+
+    #[test]
+    fn case_simulator_config_overrides_seed_from_case() {
+        let mut c = case();
+        c.seed = 999;
+        let sim_config = c.simulator_config();
+        assert_eq!(sim_config.seed, 999);
     }
 
     #[test]
