@@ -408,14 +408,22 @@ Update bridge guide:
 
 Two buckets:
 
-- **deferred** — earns its own phase later;
+- **shipping** — A, B, C in one PR after the first-form lands;
 - **declined** — not coming, reason stays loud.
 
-### Deferred
+The original plan said C waits on B and B is independent of A. After
+landing the first-form and re-reading the cancel/tx interaction, B is
+still independent of A and C still depends on B — but the dependency
+is small. SQLx 0.8's `Transaction` rolls back on drop, so a mid-tx
+cancel is just a normal sqlx error from the cancelled statement and
+the spawn's drop path handles cleanup. No new tx-aware cancel logic
+needed. So all three ship in one slice.
+
+### Shipping
 
 #### A. FetchMany
 
-Smallest. Land first.
+Smallest. Land first commit.
 
 Streaming peek already works for FetchOne. Same shape, larger cap.
 
@@ -440,7 +448,7 @@ fail-past-N sets `max_rows + 1` and checks `truncated`.
 
 #### B. Transactions
 
-Two shapes. Pick before coding.
+Two shapes considered. Picked.
 
 **Shape 1 — atomic script.** Caller sends ordered list of requests.
 Bridge runs them in one transaction. COMMIT on all-OK. ROLLBACK on
@@ -481,15 +489,66 @@ Bad:
 - idle / leak policy is a real choice;
 - unhappy paths multiply: caller drop, bridge close, runtime drop.
 
-Pick Shape 1 first. Covers most real transactions. No state machine
-surprises. Add Shape 2 only when Specimen or a real user pushes.
+Ship Shape 1. Covers most real transactions. No state machine surprises.
+Add Shape 2 only when Specimen or a real user pushes.
+
+Concrete shape:
+
+```rust
+pub enum PgRequest {
+    Execute { sql, params },
+    FetchOne { sql, params },
+    FetchMany { sql, params, max_rows },
+    Transaction { steps: Vec<PgStep> },
+}
+
+pub enum PgStep {  // no nested Transaction
+    Execute { sql, params },
+    FetchOne { sql, params },
+    FetchMany { sql, params, max_rows },
+}
+
+pub enum PgResponse {
+    Executed { rows_affected },
+    Row(PgRow),
+    NoRows,
+    Rows { rows: Vec<PgRow>, truncated: bool },
+    Transaction(PgTransactionOutcome),
+}
+
+pub enum PgTransactionOutcome {
+    Committed { steps: Vec<PgStepOk> },
+    RolledBack {
+        completed: Vec<PgStepOk>,
+        failed_at: usize,
+        error: PgError,
+    },
+}
+
+pub enum PgStepOk {
+    Executed(u64),
+    Row(PgRow),
+    NoRows,
+    Rows { rows: Vec<PgRow>, truncated: bool },
+}
+```
+
+Validation:
+
+- nested `PgRequest::Transaction` inside a step is `InvalidRequest`;
+- empty `steps` is `InvalidRequest`;
+- `max_in_flight` cap counts a Transaction as one slot, not N.
 
 Cancel/timeout interaction:
 
 - per-attempt timeout still fires;
-- future still runs to completion (075 cancellation rule);
-- connection stays held until the script finishes;
-- consider a separate `tx_timeout` distinct from `default_timeout`.
+- spawn's `sqlx::Transaction` drops on early return — sqlx ROLLBACKs;
+- caller sees `PgError::Timeout`;
+- late `tx.send` is best-effort; tally records the eventual outcome
+  (most likely a `Sqlx` error from the cancelled statement);
+- one `tx_timeout` knob distinct from `default_timeout`. When unset
+  on a Transaction request, fall back to `default_timeout` so users
+  who do not care don't have to think about it.
 
 #### C. DB-side CancelRequest
 
@@ -512,24 +571,53 @@ Two paths:
    SQLx startup negotiation. Check current SQLx 0.8 API surface
    (`PgConnection::pg_id()` etc.) before committing.
 
-Pick path 1 first. Correct, boring, drives `late_results` toward zero
-in normal operation. Move to path 2 only if sidecar overhead becomes a
+Ship path 1. Correct, boring, drives `late_results` toward zero in
+normal operation. Move to path 2 only if sidecar overhead becomes a
 real complaint.
 
-New metric: `db_cancels_sent`. Not the same as `late_results`. Doc:
-even a successful cancel does not kill every query.
+Shape:
 
-### Order
+- opt-in via config: `PgConfig::with_cancel_on_timeout(pool_size)`;
+  default off (0). When on, bridge builds a sidecar `PgPool` from the
+  same URL with `pool_size` connections;
+- supplied-pool path (`install_with_pool`) does not auto-build a
+  sidecar — caller passes one separately if they want cancellation;
+- when admit runs, spawn does one extra round trip:
+  `SELECT pg_backend_pid()`, write to `Arc<AtomicI32>` on the slot,
+  then run the user's request;
+- when bridge per-attempt timeout fires and the atomic PID is
+  non-zero, fire-and-forget `tokio::spawn(sidecar.execute("SELECT
+  pg_cancel_backend($1)"))`;
+- if PID is still zero at timeout (admit is still in pool acquire),
+  no cancel — there's nothing to cancel yet;
+- spawn clears the atomic to zero after the user's query returns so
+  a late timeout does not target a freed connection.
+
+New metric: `db_cancels_sent`. Not the same as `late_results`. One
+counts Tina firing a cancel; the other counts SQLx eventually
+returning. Doc: a successful cancel does not kill every query;
+some operations are not cancellable mid-flight.
+
+Cost: one extra round trip per admitted request when cancel is on.
+Default off keeps that opt-in.
+
+### Commit order
+
+One PR. Three commits, in order. Each commit is fully tested before
+the next lands on top.
 
 ```text
-A FetchMany    -> simplest; reuses streaming peek; small surface
-B Transactions -> shape 1 first; constrains cancel/timeout interaction
-C CancelRequest -> waits on B; mid-tx cancel is different from
-                   single-statement cancel; ship cancel knowing what
-                   it is cancelling
+1. FetchMany       -> small surface, reuses streaming peek
+2. Transactions    -> atomic script (Shape 1), no nesting
+3. CancelRequest   -> opt-in sidecar pool, default off
 ```
 
-A and B are independent. C waits on B.
+Why one PR not three: B is small (atomic script over existing
+primitives, no long-lived state); C is small if path 1 is picked
+(sidecar pool + one atomic + fire-and-forget). The total surface is
+under 1k new lines and the integration tests share a real Postgres.
+Splitting to three PRs trades CI cost for review granularity that does
+not pay back here.
 
 ### Declined
 
