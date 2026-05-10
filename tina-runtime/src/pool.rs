@@ -8,20 +8,35 @@
 //! waiters are reclaimed without disturbing FIFO order of the rest.
 //!
 //! No pool-side waiter timeout. The caller's `call(...)` timeout is
-//! the only deadline.
+//! the only deadline; a fired timeout closes the deferred slot, which
+//! the next pool sweep reclaims (counted under `cancel_count`).
+//!
+//! # Cancel-race recovery
+//!
+//! When the pool dispatches an `Acquired` reply (immediate or via
+//! `dispatch_to_next_waiter`) it stores an observer for the consumed
+//! deferred slot under `(resource_id, generation)`. On every handler
+//! turn the pool walks this set: a `Replied` slot was delivered
+//! cleanly and is dropped from the set; a `Closed` slot was rejected
+//! by the runtime (caller cancelled between dispatch and delivery), so
+//! the pool returns the resource to Idle and bumps
+//! `dispatch_recovered`. Without this back-channel a cancel race
+//! would leak the resource forever.
 
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tina::pool::{
     AcquireOutcome, CloseMode, PoolConfig, PoolId, PoolLease, PoolPressureReport,
-    ReleaseDisposition, ReleaseOutcome, ResourceId,
+    ReleaseDisposition, ReleaseOutcome, runtime_internal as pool_internal,
 };
+use tina::runtime_internal::{deferred_handle_ref, handle_shared};
 use tina::{
-    Context, DeferredReply, DeferredSlotState, Effect, Isolate, Outbound, Shard, batch, noop,
-    reply, reply_to,
+    Context, DeferredReply, DeferredSlotShared, DeferredSlotState, Effect, Isolate, Outbound,
+    Shard, batch, noop, reply, reply_to,
 };
 
 use crate::call::RuntimeCall;
@@ -30,7 +45,7 @@ fn mint_pool_id() -> PoolId {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nz = NonZeroU64::new(raw).expect("pool id counter wrapped to zero");
-    PoolId::from_raw(nz)
+    pool_internal::pool_id_from_raw(nz)
 }
 
 /// Messages handled by [`WorkerPool`]. `H` is the resource handle.
@@ -39,7 +54,8 @@ where
     H: Send + 'static,
 {
     /// Acquire one resource. Pool replies immediately with `Acquired` /
-    /// `Full` / `Closed`, or parks the caller and replies later.
+    /// `Full` / `Closed` / `WrongShard`, or parks the caller and
+    /// replies later.
     Acquire,
     /// Return a lease.
     Release {
@@ -114,10 +130,25 @@ enum ResourceState {
     Retired,
 }
 
+/// One in-flight Acquired dispatch the pool needs to confirm landed.
+struct InFlightDispatch {
+    resource_id: u32,
+    generation: u64,
+    slot: Arc<DeferredSlotShared>,
+}
+
 /// Bounded worker pool isolate.
 ///
 /// `H` is the resource handle (e.g. `tina::Address<WorkerMsg, WReply>`);
 /// must be cheap-clone + `Send`. `S` is the shard the pool runs on.
+///
+/// # Mailbox sizing
+///
+/// `max_waiters` caps parked callers but not in-flight `Acquire`
+/// messages. Register the pool with mailbox capacity
+/// `>= max_waiters + expected burst` so the runtime layer doesn't
+/// reject acquires as `CallOutcome::Full` before the pool's own
+/// `AcquireOutcome::Full` path can engage.
 pub struct WorkerPool<H, S>
 where
     H: Send + Clone + 'static,
@@ -125,16 +156,19 @@ where
 {
     pool_id: PoolId,
     config: PoolConfig,
-    resources: Vec<H>,
+    resources: Vec<Option<H>>,
     states: Vec<ResourceState>,
     idle: std::collections::VecDeque<u32>,
     waiter_slab: Vec<Option<Waiter<H>>>,
     waiter_queue: std::collections::VecDeque<u32>,
+    in_flight: Vec<InFlightDispatch>,
     full_count: u64,
-    timeout_count: u64,
     cancel_count: u64,
     retired_count: u64,
     closed_count: u64,
+    wrong_shard_count: u64,
+    no_caller_drops: u64,
+    dispatch_recovered: u64,
     closed: Option<CloseMode>,
     _shard: PhantomData<fn() -> S>,
 }
@@ -172,19 +206,23 @@ where
         for _ in 0..max_waiters {
             waiter_slab.push(None);
         }
+        let resources_opt: Vec<Option<H>> = resources.into_iter().map(Some).collect();
         Self {
             pool_id,
             config,
-            resources,
+            resources: resources_opt,
             states,
             idle,
             waiter_slab,
             waiter_queue: std::collections::VecDeque::with_capacity(max_waiters),
+            in_flight: Vec::new(),
             full_count: 0,
-            timeout_count: 0,
             cancel_count: 0,
             retired_count: 0,
             closed_count: 0,
+            wrong_shard_count: 0,
+            no_caller_drops: 0,
+            dispatch_recovered: 0,
             closed: None,
             _shard: PhantomData,
         }
@@ -197,22 +235,28 @@ where
 
     /// Snapshot the current pressure state.
     pub fn pressure(&self) -> PoolPressureReport {
-        let leased = self
-            .states
-            .iter()
-            .filter(|s| matches!(s, ResourceState::Leased { .. }))
-            .count();
+        let mut available = 0usize;
+        let mut leased = 0usize;
+        for s in &self.states {
+            match s {
+                ResourceState::Idle { .. } => available += 1,
+                ResourceState::Leased { .. } => leased += 1,
+                ResourceState::Retired => {}
+            }
+        }
         PoolPressureReport {
             capacity: self.config.capacity,
-            available: self.idle.len(),
+            available,
             leased,
             waiters: self.live_waiter_count(),
             max_waiters: self.config.max_waiters,
             full_count: self.full_count,
-            timeout_count: self.timeout_count,
+            closed_count: self.closed_count,
+            wrong_shard_count: self.wrong_shard_count,
             cancel_count: self.cancel_count,
             retired_count: self.retired_count,
-            closed_count: self.closed_count,
+            no_caller_drops: self.no_caller_drops,
+            dispatch_recovered: self.dispatch_recovered,
             closed: self.closed.is_some(),
         }
     }
@@ -225,34 +269,58 @@ where
     // Open. The runtime cannot distinguish caller-cancel vs
     // caller-timeout at the slot level (that lives in trace facts), so
     // both increment `cancel_count` here.
-    fn sweep_waiters(&mut self) -> usize {
-        let mut reclaimed = 0usize;
-        let live_slab_indices: Vec<u32> = self
-            .waiter_slab
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|_| i as u32))
-            .collect();
-        for slab_idx in live_slab_indices {
-            let entry = self.waiter_slab[slab_idx as usize]
+    fn sweep_waiters(&mut self) {
+        let mut reclaimed_any = false;
+        for slot in self.waiter_slab.iter_mut() {
+            let drop_it = slot
                 .as_ref()
-                .expect("entry filtered as Some");
-            if entry.reply.state() != DeferredSlotState::Open {
-                self.waiter_slab[slab_idx as usize] = None;
+                .is_some_and(|w| w.reply.state() != DeferredSlotState::Open);
+            if drop_it {
+                *slot = None;
                 self.cancel_count += 1;
-                reclaimed += 1;
+                reclaimed_any = true;
             }
         }
-        if reclaimed > 0 {
-            let alive: std::collections::VecDeque<u32> = self
-                .waiter_queue
-                .iter()
-                .copied()
-                .filter(|idx| self.waiter_slab[*idx as usize].is_some())
-                .collect();
-            self.waiter_queue = alive;
+        if reclaimed_any {
+            let slab = &self.waiter_slab;
+            self.waiter_queue
+                .retain(|idx| slab[*idx as usize].is_some());
         }
-        reclaimed
+    }
+
+    // Walk in-flight dispatches: drop entries whose slot is Replied,
+    // recover entries whose slot is Closed (caller cancelled between
+    // our dispatch and the runtime delivering the reply).
+    fn sweep_in_flight(&mut self) {
+        let mut i = 0;
+        while i < self.in_flight.len() {
+            let state = self.in_flight[i].slot.state();
+            match state {
+                DeferredSlotState::Open => i += 1,
+                DeferredSlotState::Replied => {
+                    self.in_flight.swap_remove(i);
+                }
+                DeferredSlotState::Closed => {
+                    let entry = self.in_flight.swap_remove(i);
+                    self.recover_dispatched(entry.resource_id, entry.generation);
+                }
+            }
+        }
+    }
+
+    fn recover_dispatched(&mut self, resource_id: u32, generation: u64) {
+        let state = &mut self.states[resource_id as usize];
+        match state {
+            ResourceState::Leased { generation: g } if *g == generation => {
+                *state = ResourceState::Idle {
+                    next_generation: generation.saturating_add(1),
+                };
+                self.idle.push_back(resource_id);
+                self.dispatch_recovered += 1;
+            }
+            // Released, retired, or otherwise advanced — nothing to recover.
+            _ => {}
+        }
     }
 
     fn alloc_waiter_slot(&mut self) -> u32 {
@@ -279,13 +347,32 @@ where
                 panic!("mint_lease on retired resource_id={resource_id}")
             }
         };
-        let handle = self.resources[resource_id as usize].clone();
-        PoolLease::new(
+        let handle = self
+            .resources
+            .get(resource_id as usize)
+            .and_then(|r| r.as_ref())
+            .expect("resource present for non-retired slot")
+            .clone();
+        pool_internal::lease_new(
             self.pool_id,
-            ResourceId::from_raw(resource_id),
+            pool_internal::resource_id_from_raw(resource_id),
             generation,
             handle,
         )
+    }
+
+    fn track_dispatch(
+        &mut self,
+        resource_id: u32,
+        generation: u64,
+        slot: &DeferredReply<WorkerPoolReply<H>>,
+    ) {
+        let shared: Arc<DeferredSlotShared> = handle_shared(deferred_handle_ref(slot)).clone();
+        self.in_flight.push(InFlightDispatch {
+            resource_id,
+            generation,
+            slot: shared,
+        });
     }
 
     fn dispatch_to_next_waiter(&mut self, resource_id: u32) -> Option<Effect<Self>> {
@@ -296,6 +383,8 @@ where
                 None => continue,
             };
             let lease = self.mint_lease(resource_id);
+            let generation = lease.generation();
+            self.track_dispatch(resource_id, generation, &waiter.reply);
             return Some(reply_to::<Self>(
                 waiter.reply,
                 WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease)),
@@ -306,39 +395,51 @@ where
     }
 
     fn handle_acquire(&mut self, ctx: &mut Context<'_, S, WorkerPoolReply<H>>) -> Effect<Self> {
-        self.sweep_waiters();
-
         if self.closed.is_some() {
+            self.closed_count += 1;
             return reply(WorkerPoolReply::Acquire(AcquireOutcome::Closed));
         }
 
+        // Acquire-with-resource and acquire-as-waiter both need a
+        // deferred slot so the in-flight tracker can observe the
+        // delivery and recover the resource if the caller cancels.
+        // `reply()` (immediate) gives no observable slot. So always
+        // take_reply_slot first; classify the outcome after.
+        let slot = match ctx.take_reply_slot() {
+            Ok(s) => s,
+            Err(tina::TakeReplySlotError::NoCaller) => {
+                self.no_caller_drops += 1;
+                return noop();
+            }
+            Err(tina::TakeReplySlotError::CrossShardUnsupported) => {
+                self.wrong_shard_count += 1;
+                // No slot to reply through; surface the typed outcome
+                // via the runtime's normal reply path. CrossShard
+                // means the caller's own shard handles the reply
+                // locally on its side, not the pool's.
+                return reply(WorkerPoolReply::Acquire(AcquireOutcome::WrongShard));
+            }
+        };
+
         if let Some(resource_id) = self.idle.pop_front() {
             let lease = self.mint_lease(resource_id);
-            return reply(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease)));
+            let generation = lease.generation();
+            self.track_dispatch(resource_id, generation, &slot);
+            return reply_to::<Self>(
+                slot,
+                WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease)),
+            );
         }
 
         if self.live_waiter_count() >= self.config.max_waiters {
             self.full_count += 1;
-            return reply(WorkerPoolReply::Acquire(AcquireOutcome::Full));
+            return reply_to::<Self>(slot, WorkerPoolReply::Acquire(AcquireOutcome::Full));
         }
 
-        match ctx.take_reply_slot() {
-            Ok(slot) => {
-                let slab_idx = self.alloc_waiter_slot();
-                self.waiter_slab[slab_idx as usize] = Some(Waiter { reply: slot });
-                self.waiter_queue.push_back(slab_idx);
-                noop()
-            }
-            // Acquire delivered as plain `send`, not `call` — caller
-            // can't get an outcome. Drop.
-            Err(tina::TakeReplySlotError::NoCaller) => noop(),
-            // Cross-shard captures aren't supported; surface as Full
-            // so the caller picks a local-shard route.
-            Err(tina::TakeReplySlotError::CrossShardUnsupported) => {
-                self.full_count += 1;
-                reply(WorkerPoolReply::Acquire(AcquireOutcome::Full))
-            }
-        }
+        let slab_idx = self.alloc_waiter_slot();
+        self.waiter_slab[slab_idx as usize] = Some(Waiter { reply: slot });
+        self.waiter_queue.push_back(slab_idx);
+        noop()
     }
 
     fn handle_release(
@@ -346,9 +447,9 @@ where
         lease: PoolLease<H>,
         disposition: ReleaseDisposition,
     ) -> Effect<Self> {
-        let (lease_pool_id, lease_resource_id, lease_generation, _handle) = lease.into_parts();
+        let (lease_pool_id, lease_resource_id, lease_generation, _handle) =
+            pool_internal::lease_into_parts(lease);
 
-        // Wrong-pool release is always stale.
         if lease_pool_id != self.pool_id {
             return reply(WorkerPoolReply::Release(ReleaseOutcome::StaleLease));
         }
@@ -357,21 +458,35 @@ where
             return reply(WorkerPoolReply::Release(ReleaseOutcome::StaleLease));
         };
 
-        // Force-closed pools reject every late release.
+        // Force-closed pools retire the resource on release and tell
+        // the caller the lease is stale.
         if matches!(self.closed, Some(CloseMode::Force)) {
+            if let ResourceState::Leased { generation } = state {
+                if *generation == lease_generation {
+                    self.states[raw_idx as usize] = ResourceState::Retired;
+                    self.resources[raw_idx as usize] = None;
+                    self.retired_count += 1;
+                }
+            }
             return reply(WorkerPoolReply::Release(ReleaseOutcome::PoolClosed));
         }
 
         match state {
             ResourceState::Leased { generation } if *generation == lease_generation => {
-                if matches!(disposition, ReleaseDisposition::Retire) || self.closed.is_some() {
+                if matches!(disposition, ReleaseDisposition::Retire) {
                     self.states[raw_idx as usize] = ResourceState::Retired;
+                    self.resources[raw_idx as usize] = None;
                     self.retired_count += 1;
                     return reply(WorkerPoolReply::Release(ReleaseOutcome::Retired));
                 }
-                self.states[raw_idx as usize] = ResourceState::Idle {
-                    next_generation: lease_generation + 1,
-                };
+                let next_generation = lease_generation.saturating_add(1);
+                self.states[raw_idx as usize] = ResourceState::Idle { next_generation };
+                if self.closed.is_some() {
+                    // Drain mode: release is honored as Released, the
+                    // resource sits Idle but cannot be re-acquired
+                    // because new acquires are rejected.
+                    return reply(WorkerPoolReply::Release(ReleaseOutcome::Released));
+                }
                 let mut effects = Vec::with_capacity(2);
                 if let Some(handover) = self.dispatch_to_next_waiter(raw_idx) {
                     effects.push(handover);
@@ -462,7 +577,11 @@ where
         msg: WorkerPoolMsg<H>,
         ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
+        // Always sweep first: cancelled waiters and rejected
+        // dispatches both need to be reclaimed before any state
+        // decision in this turn.
         self.sweep_waiters();
+        self.sweep_in_flight();
         match msg {
             WorkerPoolMsg::Acquire => self.handle_acquire(ctx),
             WorkerPoolMsg::Release { lease, disposition } => {

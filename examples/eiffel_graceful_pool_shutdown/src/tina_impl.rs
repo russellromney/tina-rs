@@ -143,7 +143,7 @@ impl Driver {
                     self.outcome.closed += 1;
                     self.maybe_finish()
                 }
-                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Timeout)) => {
+                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::WrongShard)) => {
                     self.jobs.remove(&job);
                     self.outcome.failed += 1;
                     self.maybe_finish()
@@ -226,10 +226,8 @@ pub fn run() -> anyhow::Result<Report> {
         );
     }
 
-    let pool: WorkerPool<WorkerHandle, SingleShard> = WorkerPool::new(
-        PoolConfig::new(WORKERS, CALLERS, Duration::from_secs(5)),
-        workers,
-    );
+    let pool: WorkerPool<WorkerHandle, SingleShard> =
+        WorkerPool::new(PoolConfig::new(WORKERS, CALLERS), workers);
     let pool_addr = runtime
         .register_with_capacity::<_, Infallible>(pool, 64)
         .map_err(|e| anyhow::anyhow!("register pool: {e:?}"))?;

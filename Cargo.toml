@@ -52,6 +52,7 @@ exclude = [
     "examples/eiffel_hot_key_fairness",
     "examples/eiffel_two_stage_pipeline",
     "examples/eiffel_graceful_pool_shutdown",
+    "examples/eiffel_pool_cancel_reclaim",
 ]
 resolver = "2"
 

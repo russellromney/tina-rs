@@ -68,3 +68,18 @@ moves to `Closed`. The pool sweeps closed slots on every incoming
 message, so capacity is reclaimed without a separate `CancelWaiter`
 ping. FIFO order of remaining waiters is preserved across mid-queue
 cancels.
+
+If the cancel races the dispatch — caller cancels between the pool
+emitting `Acquired(lease)` and the runtime delivering it — the
+deferred reply is rejected, the value drops, and the pool's
+`sweep_in_flight` notices the rejection on its next handler turn and
+returns the resource to Idle (counted under `dispatch_recovered`). No
+cancel timing leaks a resource.
+
+## Driver shape caveat
+
+This specimen's `Driver` keeps in-flight per-job state in a
+`HashMap<u32, JobState>` for clarity. A production driver should
+use a fixed-capacity table (slab, ring, or `PendingReplies`) so the
+in-flight set has the same kind of bound the pool itself enforces;
+`HashMap` is unbounded.
