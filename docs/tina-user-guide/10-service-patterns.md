@@ -98,22 +98,41 @@ Use for first form and low-concurrency stateful services.
 
 ### Pool
 
-One frontend isolate owns N worker isolates.
+One pool isolate owns N worker isolates as resources.
 
 ```text
-Registry -> PoolFrontend -> Worker 0
-                         -> Worker 1
-                         -> Worker N
+Registry -> WorkerPool -> Worker 0
+                       -> Worker 1
+                       -> Worker N
 ```
+
+`tina_runtime::pool::WorkerPool<H, S>` is the bundled shape. Caller
+acquires a `PoolLease<H>`, does work against the held handle, then
+returns the lease via `Reuse` or `Retire`.
 
 Pressure is:
 
-- frontend mailbox capacity
-- worker mailbox capacities
-- max in-flight routing state
-- caller timeout
+- pool mailbox capacity (sized `>= max_waiters + burst`)
+- `PoolConfig::max_waiters` — caps parked acquirers; surface as
+  `AcquireOutcome::Full` once full
+- worker mailbox capacities (each worker is a normal isolate)
+- caller timeout (the pool does not enforce a separate waiter
+  deadline; the caller's `call(...)` timeout is the only one)
 
-Use when calls are independent and can run in parallel.
+Acquires can be cancelled via `cancel_call(handle)` from
+`acquire_with_handle_effect`; the pool reclaims the waiter slot on
+the next sweep. Drain vs Force close are explicit on
+`WorkerPoolMsg::Close(CloseMode::*)`.
+
+Use when calls are independent and can run in parallel and the
+caller wants explicit acquire/release lifecycle (DB connection,
+worker, AWS client). For "fan one inbound call to one of N workers
+without exposing borrow/release" the older `PendingReplies` frontend
+pattern is still appropriate; the pool is for explicit borrow.
+
+See [`docs/tina-user-guide/11-ergonomics-checklist.md`](./11-ergonomics-checklist.md#bounded-worker-pool)
+for the helpers and `examples/eiffel_pool_cancel_reclaim` for a
+worked example of the cancel-reclaim flow.
 
 ### Sharded
 

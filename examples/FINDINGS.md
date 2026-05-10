@@ -125,8 +125,9 @@ phase 067.
 
 ### 9. Drain helper for `PendingReplies` at service stop
 
-**Surfaced by:** `eiffel_graceful_pool_shutdown`,
-`eiffel_graceful_drain_server`.
+**Surfaced by:** `eiffel_graceful_drain_server` (and originally
+`eiffel_graceful_pool_shutdown` before its migration to
+`WorkerPool` in 067).
 
 `PendingReplies::drain()` returns `Vec<(K, DeferredReply<R>)>`,
 which the user has to map into `Effect::Batch(reply_to(slot,
@@ -160,9 +161,14 @@ flag is the bridge-side version of the same idea.
   `drain_replies_with_into_stop`, all typed so a
   `PendingReplies<K, R>` only produces `Effect<I>` when
   `I::Reply = R`. `eiffel_graceful_pool_shutdown` uses
-  `pending.drain_replies_into_stop::<Self>(R::Closed)`. The
-  deadline half of this finding (DrainGate) folds into
-  finding 15 (Deadline as first-class context).
+  `pending.drain_replies_into_stop::<Self>(R::Closed)`.
+  `eiffel_graceful_pool_shutdown` no longer uses this pattern post
+  067 migration — it relies on
+  `WorkerPoolMsg::Close(CloseMode::Drain)` for the same
+  parked-callers-get-`Closed` outcome — but the helper is still
+  load-bearing for `PendingReplies`-shaped frontends. The deadline
+  half of this finding (DrainGate) folds into finding 15 (Deadline
+  as first-class context).
 - An isolate-state `DrainGate` helper that holds the deadline +
   the pending-count predicate, with an `is_done` /
   `drained_within_timeout` accessor that the handler reuses.
