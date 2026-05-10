@@ -2,8 +2,9 @@
 
 ![tina-rs hero](tina.png)
 
-Tina is a Rust runtime for building concurrent services out of shard-local
-state machines, bounded queues, and runtime-owned effects.
+Tina is a Rust concurrency framework for services built from isolated state
+machines: each one owns its state, communicates through bounded queues, and
+asks the runtime to perform side effects.
 
 In Tokio, the main unit of concurrency is a `Future`: a function-shaped state
 machine that yields at `.await` points. That works well for many I/O-heavy
@@ -18,6 +19,9 @@ An isolate handles one message synchronously and returns an `Effect`. Effects
 are data: send a message, reply to a caller, sleep, read from a socket, write
 to a journal, spawn a child, stop. The runtime interprets effects, owns I/O
 and time, and resumes isolates by delivering continuation messages.
+
+The project includes its own runtimes: `tina-runtime` for live execution and
+`tina-sim` for deterministic simulation.
 
 This means Tina is a runtime, but not an async/await runtime. It is closer to
 a bounded actor/runtime system with thread-per-core scheduling and
