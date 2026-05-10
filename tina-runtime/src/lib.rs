@@ -146,7 +146,7 @@ pub use tina_macros::runtime_isolate as isolate;
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
     DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
-    RuntimeEvent, RuntimeEventKind, SendRejectedReason, SupervisionRejectedReason,
+    RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason, SupervisionRejectedReason,
     stable_trace_hash,
 };
 

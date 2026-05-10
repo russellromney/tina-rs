@@ -1,19 +1,15 @@
-//! Tina HTTPS server. `Driver` isolate gates startup on the typed
-//! call-shaped `Start` reply; main thread drives the scripted client
-//! once `Ready` lands.
+//! Tina HTTPS server. The host gates startup on the typed call-shaped
+//! `Start` reply, then drives the scripted client once `Ready` lands.
 
 use std::convert::Infallible;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_http::{
-    HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg, HttpsReady, HttpsServerConfig,
-    HttpsStartupError, StatefulRouter, TlsServerIdentity,
+    HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg, HttpsServerConfig, StatefulRouter,
+    TlsServerIdentity,
 };
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, call,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
 
 use crate::{Report, scripted_client, tls_identity};
 
@@ -46,41 +42,6 @@ impl Counter {
     }
 }
 
-#[derive(Debug, Clone)]
-enum DriverMsg {
-    Start {
-        listener: Address<HttpsListenerMsg, Result<HttpsReady, HttpsStartupError>>,
-        timeout: Duration,
-    },
-    Returned(CallOutcome<Result<HttpsReady, HttpsStartupError>>),
-}
-
-/// Forward the full `CallOutcome` so the example surfaces the real
-/// reason a non-`Replied` outcome happened — `Full`, `Closed`, or
-/// `Timeout` are distinct from a typed `HttpsStartupError`.
-struct Driver {
-    sender: mpsc::Sender<CallOutcome<Result<HttpsReady, HttpsStartupError>>>,
-}
-
-#[tina::isolate(message = DriverMsg, call = RuntimeCall<DriverMsg>)]
-impl Driver {
-    fn handle(
-        &mut self,
-        msg: DriverMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            DriverMsg::Start { listener, timeout } => {
-                call(listener, HttpsListenerMsg::Start, timeout).reply(DriverMsg::Returned)
-            }
-            DriverMsg::Returned(outcome) => {
-                let _ = self.sender.send(outcome);
-                stop()
-            }
-        }
-    }
-}
-
 pub fn run() -> anyhow::Result<Report> {
     let identity_bundle = tls_identity::generate();
     let identity = TlsServerIdentity::from_der(
@@ -104,23 +65,13 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let (tx, rx) = mpsc::channel();
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(Driver { sender: tx }, 8)
-        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
-    runtime
-        .try_send(
-            driver,
-            DriverMsg::Start {
-                listener,
-                timeout: Duration::from_secs(5),
-            },
+    let outcome = runtime
+        .call_blocking(
+            listener,
+            HttpsListenerMsg::Start,
+            Duration::from_secs(5),
         )
-        .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
-
-    let outcome = rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| anyhow::anyhow!("https startup never replied"))?;
+        .map_err(|e| anyhow::anyhow!("https startup call failed: {e:?}"))?;
     let ready = match outcome {
         CallOutcome::Replied(Ok(ready)) => ready,
         CallOutcome::Replied(Err(error)) => {

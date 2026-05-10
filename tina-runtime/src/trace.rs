@@ -757,6 +757,122 @@ impl RuntimeEvent {
     }
 }
 
+/// Convenience queries over runtime traces.
+///
+/// These helpers summarize facts that are already present in the trace. They
+/// do not hide call outcomes or infer missing causality; they just replace the
+/// repeated `matches!(event.kind(), ...)` scans that show up in tests and
+/// specimen harnesses.
+pub trait RuntimeTraceExt {
+    /// Counts runtime-owned calls of `call_kind` that completed successfully.
+    fn count_completed(&self, call_kind: CallKind) -> usize;
+
+    /// Returns true when any runtime-owned call of `call_kind` completed
+    /// successfully.
+    fn any_completed(&self, call_kind: CallKind) -> bool {
+        self.count_completed(call_kind) > 0
+    }
+
+    /// Counts runtime-owned calls of `call_kind` that failed before their
+    /// translated continuation was delivered.
+    fn count_failed(&self, call_kind: CallKind) -> usize;
+
+    /// Returns true when any runtime-owned call of `call_kind` failed before
+    /// its translated continuation was delivered.
+    fn any_failed(&self, call_kind: CallKind) -> bool {
+        self.count_failed(call_kind) > 0
+    }
+
+    /// Counts failed runtime-owned calls of `call_kind` whose reason matches
+    /// `predicate`.
+    fn count_failed_with(
+        &self,
+        call_kind: CallKind,
+        predicate: impl FnMut(CallError) -> bool,
+    ) -> usize;
+
+    /// Returns true when any failed runtime-owned call of `call_kind` has a
+    /// reason matching `predicate`.
+    fn any_failed_with(
+        &self,
+        call_kind: CallKind,
+        predicate: impl FnMut(CallError) -> bool,
+    ) -> bool {
+        self.count_failed_with(call_kind, predicate) > 0
+    }
+
+    /// Counts runtime-owned call completions of `call_kind` that could not be
+    /// delivered back to their requester.
+    fn count_completion_rejected(&self, call_kind: CallKind) -> usize;
+
+    /// Returns true when any runtime-owned call completion of `call_kind`
+    /// could not be delivered back to its requester.
+    fn any_completion_rejected(&self, call_kind: CallKind) -> bool {
+        self.count_completion_rejected(call_kind) > 0
+    }
+}
+
+impl RuntimeTraceExt for [RuntimeEvent] {
+    fn count_completed(&self, call_kind: CallKind) -> usize {
+        self.iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted {
+                        call_kind: actual,
+                        ..
+                    } if actual == call_kind
+                )
+            })
+            .count()
+    }
+
+    fn count_failed(&self, call_kind: CallKind) -> usize {
+        self.iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallFailed {
+                        call_kind: actual,
+                        ..
+                    } if actual == call_kind
+                )
+            })
+            .count()
+    }
+
+    fn count_failed_with(
+        &self,
+        call_kind: CallKind,
+        mut predicate: impl FnMut(CallError) -> bool,
+    ) -> usize {
+        self.iter()
+            .filter(|event| match event.kind() {
+                RuntimeEventKind::CallFailed {
+                    call_kind: actual,
+                    reason,
+                    ..
+                } => actual == call_kind && predicate(reason),
+                _ => false,
+            })
+            .count()
+    }
+
+    fn count_completion_rejected(&self, call_kind: CallKind) -> usize {
+        self.iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompletionRejected {
+                        call_kind: actual,
+                        ..
+                    } if actual == call_kind
+                )
+            })
+            .count()
+    }
+}
+
 /// Stable, allocation-free FNV-1a hasher used for trace fingerprints.
 ///
 /// FNV-1a is chosen over `std::hash::DefaultHasher` because its bytewise
@@ -1282,5 +1398,52 @@ mod stable_hash_tests {
         let forward = stable_trace_hash([&a, &b]);
         let reversed = stable_trace_hash([&b, &a]);
         assert_ne!(forward, reversed);
+    }
+
+    #[test]
+    fn trace_query_helpers_count_call_facts() {
+        let trace = [
+            RuntimeEvent::new(
+                EventId::new(1),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::CallCompleted {
+                    call_id: CallId::new(1),
+                    call_kind: CallKind::TlsBind,
+                },
+            ),
+            RuntimeEvent::new(
+                EventId::new(2),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::CallFailed {
+                    call_id: CallId::new(2),
+                    call_kind: CallKind::TlsBind,
+                    reason: CallError::TlsCertificate,
+                },
+            ),
+            RuntimeEvent::new(
+                EventId::new(3),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id: CallId::new(3),
+                    call_kind: CallKind::TlsRead,
+                    reason: CallCompletionRejectedReason::MailboxFull,
+                },
+            ),
+        ];
+
+        assert_eq!(trace.count_completed(CallKind::TlsBind), 1);
+        assert!(trace.any_completed(CallKind::TlsBind));
+        assert_eq!(trace.count_failed(CallKind::TlsBind), 1);
+        assert!(trace.any_failed_with(CallKind::TlsBind, |reason| {
+            reason == CallError::TlsCertificate
+        }));
+        assert_eq!(trace.count_completion_rejected(CallKind::TlsRead), 1);
+        assert!(!trace.any_failed(CallKind::TlsRead));
     }
 }

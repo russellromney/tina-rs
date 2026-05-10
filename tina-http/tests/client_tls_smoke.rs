@@ -6,7 +6,6 @@ use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -18,8 +17,7 @@ use tina_http::{
     HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, HttpTransportPhase, TlsTrustRoots,
 };
 use tina_runtime::{
-    CallError, CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
+    CallError, CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
 #[derive(Debug, Default)]
@@ -103,58 +101,6 @@ fn spawn_one_shot_https_server(server_config: rustls::ServerConfig) -> SocketAdd
     addr
 }
 
-#[derive(Debug, Clone)]
-enum DriverMsg {
-    Fetch {
-        client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
-        target: HttpTarget,
-        request: HttpRequest,
-        timeout: Duration,
-    },
-    Returned(CallOutcome<Result<HttpResponse, HttpClientError>>),
-}
-
-struct Driver {
-    sender: mpsc::Sender<Result<HttpResponse, HttpClientError>>,
-}
-
-impl Isolate for Driver {
-    tina::isolate_types! {
-        message: DriverMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
-        shard: TestShard,
-    }
-
-    fn handle(
-        &mut self,
-        msg: DriverMsg,
-        _ctx: &mut Context<'_, TestShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            DriverMsg::Fetch {
-                client,
-                target,
-                request,
-                timeout,
-            } => call(client, HttpClientMsg::call(target, request), timeout)
-                .reply(DriverMsg::Returned),
-            DriverMsg::Returned(outcome) => {
-                let result = match outcome {
-                    CallOutcome::Replied(inner) => inner,
-                    CallOutcome::Full => Err(HttpClientError::Busy),
-                    CallOutcome::Closed => Err(HttpClientError::Closed),
-                    CallOutcome::Timeout => Err(HttpClientError::Timeout),
-                };
-                let _ = self.sender.send(result);
-                stop()
-            }
-        }
-    }
-}
-
 fn run_one_fetch(
     target: HttpTarget,
     request: HttpRequest,
@@ -174,24 +120,19 @@ fn run_one_fetch(
             16,
         )
         .expect("register client");
-    let (tx, rx) = mpsc::channel();
-    let driver = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 8)
-        .expect("register driver");
-    runtime
-        .try_send(
-            driver,
-            DriverMsg::Fetch {
-                client,
-                target,
-                request,
-                timeout: Duration::from_secs(5),
-            },
+    let result = match runtime
+        .call_blocking(
+            client,
+            HttpClientMsg::call(target, request),
+            Duration::from_secs(5),
         )
-        .expect("send Fetch");
-    let result = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("driver delivers result");
+        .expect("client call runs")
+    {
+        CallOutcome::Replied(inner) => inner,
+        CallOutcome::Full => Err(HttpClientError::Busy),
+        CallOutcome::Closed => Err(HttpClientError::Closed),
+        CallOutcome::Timeout => Err(HttpClientError::Timeout),
+    };
     let _ = runtime.shutdown();
     result
 }

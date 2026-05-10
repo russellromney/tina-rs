@@ -7,15 +7,17 @@
 //! `Runtime` and processes a bounded `mpsc` command queue.
 
 use std::alloc::Global;
-use std::sync::Arc;
+use std::convert::Infallible;
+use std::marker::PhantomData;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use betelgeuse::{IOLoopHandle, io_loop};
-use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, TrySendError};
+use tina::{Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard, TrySendError};
 use tina_supervisor::SupervisorConfig;
 
-use crate::call::IntoErasedCall;
+use crate::call::{CallOutcome, IntoErasedCall, RuntimeCall, call};
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::{self, BetelgeuseDriver};
@@ -116,6 +118,57 @@ where
 {
     Run(ThreadedCommandFn<S, F>),
     Shutdown,
+}
+
+enum HostCallMsg<M, R> {
+    Begin {
+        target: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    },
+    Returned(CallOutcome<R>),
+}
+
+struct HostCallDriver<S, M, R>
+where
+    S: Shard + 'static,
+{
+    sender: mpsc::Sender<CallOutcome<R>>,
+    _marker: PhantomData<(S, M)>,
+}
+
+impl<S, M, R> Isolate for HostCallDriver<S, M, R>
+where
+    S: Shard + 'static,
+    M: Send + 'static,
+    R: Send + 'static,
+{
+    tina::isolate_types! {
+        message: HostCallMsg<M, R>,
+        reply: (),
+        send: TinaOutbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<HostCallMsg<M, R>>,
+        shard: S,
+    }
+
+    fn handle(
+        &mut self,
+        msg: HostCallMsg<M, R>,
+        _ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            HostCallMsg::Begin {
+                target,
+                message,
+                timeout,
+            } => call(target, message, timeout).reply(HostCallMsg::Returned),
+            HostCallMsg::Returned(outcome) => {
+                let _ = self.sender.send(outcome);
+                tina::stop()
+            }
+        }
+    }
 }
 
 /// One live shard-owned runtime worker.
@@ -835,6 +888,61 @@ where
     /// Returns a handle-owned topology snapshot without probing the worker.
     pub fn topology(&self) -> LiveTopologyReport {
         LiveTopologyReport::single(self.metrics.report())
+    }
+
+    /// Performs one typed isolate call from the host thread and waits for its
+    /// ordinary [`CallOutcome`].
+    ///
+    /// This is a host convenience for tests, specimens, and setup code that
+    /// would otherwise need a one-off driver isolate just to issue
+    /// `call(address, message, timeout).reply(...)`. It still uses the normal
+    /// Tina call path internally: `Full`, `Closed`, and `Timeout` stay visible
+    /// as [`CallOutcome`] values, and accepted work is not cancelled by
+    /// dropping the host-side wait.
+    pub fn call_blocking<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let driver = HostCallDriver::<S, M, R> {
+            sender: reply_tx,
+            _marker: PhantomData,
+        };
+        self.call(move |runtime| {
+            let driver_addr =
+                runtime.register_with_capacity::<HostCallDriver<S, M, R>, Infallible>(driver, 2);
+            match runtime.try_send(
+                driver_addr,
+                HostCallMsg::Begin {
+                    target: address,
+                    message,
+                    timeout,
+                },
+            ) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    panic!("fresh host-call driver mailbox was unexpectedly full");
+                }
+                Err(TrySendError::Closed(_)) => {
+                    panic!("fresh host-call driver mailbox was unexpectedly closed");
+                }
+            }
+        })?;
+
+        match reply_rx.recv_timeout(timeout) {
+            Ok(outcome) => Ok(outcome),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(CallOutcome::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                Err(ThreadedRuntimeError::WorkerStopped)
+            }
+        }
     }
 
     /// Returns the live runtime capability table for this worker.
