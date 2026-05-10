@@ -2,10 +2,11 @@
 
 ## Status
 
-- Done: design drafted from Eiffel worker-pool, sharded, reqwest, and DB bridge
-  pressure.
-- In progress: blocked on 066 cancellation/deadline vocabulary for final API.
-- Open: implement one bounded pool primitive after 066 first form lands.
+- Done: design drafted from specimen worker-pool, sharded, reqwest, SQLite,
+  and DB bridge pressure.
+- In progress: blocked on 066 final merge/rebase, not on more API design.
+- Open: implement one bounded pool primitive after 066 `CallHandle` /
+  `cancel_call` lands.
 - Deferred: DB connection pool, HTTP keep-alive pool extraction, AWS pool,
   generic job framework, hidden submit queue.
 
@@ -23,7 +24,13 @@ A pool owns scarce resources.
 A pool is not an unbounded waiting room.
 ```
 
-This phase comes after 066. Pool waiters need cancellation and deadline truth.
+This phase comes after 066.
+
+Pool waiters need cancellation truth. They should use the 066 first-form
+primitive: `call_with_handle(...).reply(...)` plus `cancel_call(handle)`.
+
+Do not wait for `Deadline` or `PendingCallSet`; those are deferred 066 rocks.
+Use existing per-call `Duration` timeouts and explicit pool waiter cleanup.
 
 Compiler rule:
 
@@ -204,7 +211,7 @@ primitive.
 Candidate:
 
 ```rust
-call(pool, PoolMsg::Acquire, deadline.remaining_or_zero())
+call_with_handle(pool, PoolMsg::Acquire, acquire_timeout)
     .reply(AppMsg::Acquired)
 
 call(pool, PoolMsg::Release {
@@ -233,11 +240,17 @@ Rules:
 - `max_waiters == 0` means shed immediately when all resources are busy;
 - waiter table uses fixed-capacity storage: slab/ring/table or equivalent, not
   a growing `HashMap`;
+- stored waiters are deferred reply slots owned by the pool, not magic runtime
+  observers;
 - waiter order is FIFO in first form;
 - cancelled/timed-out waiters are removed without disturbing the order of
   remaining waiters;
-- caller timeout removes waiter and frees waiter capacity;
-- explicit cancel removes waiter and frees waiter capacity;
+- caller timeout closes the deferred slot; the pool must prune the closed
+  waiter on the next release/close/sweep path and free waiter capacity;
+- explicit `cancel_call(handle)` closes the deferred slot; the pool must prune
+  it the same way;
+- do not claim "timeout removes waiter" unless the table actually drops the
+  entry and `PoolPressureReport.waiters` decreases;
 - drain close / `CloseMode::Drain` stops new acquire, closes waiters as
   `Closed`, and lets outstanding leases return/retire;
 - force close / `CloseMode::Force` stops new acquire, closes waiters as
@@ -258,14 +271,16 @@ Proof:
 - immediate acquire when resource idle;
 - queued waiter when resource busy and waiter cap available;
 - `Full` when resources busy and waiter cap full/zero;
-- timeout removes waiter;
-- explicit cancel removes waiter;
+- timeout closes the caller wait and pool pruning removes the waiter;
+- explicit cancel closes the caller wait and pool pruning removes the waiter;
+- fill waiter table, let callers timeout/cancel, then prove new waiters can be
+  admitted after the pool prunes closed slots;
 - close settles waiters as `Closed`;
 - release hands resource to next waiter in deterministic order;
-- FIFO waiter order is proved, including after cancelling middle waiters;
+- FIFO waiter order is proved, including after cancelling/timing out middle
+  waiters;
 - drain close and force close have separate tests for waiters and late releases;
-- fill waiter table, timeout/cancel/close all waiters, then admit new waiters
-  without stale `Full`;
+- close all waiters, then admit new waiters without stale `Full`;
 - release acknowledgement reports stale/double/wrong-pool/closed outcomes;
 - pressure report counts full/timeout/cancel/retire/closed truth.
 
@@ -362,17 +377,18 @@ Proof:
 - worker failure path retires lease or produces a typed release rejection;
 - pressure report shows leased/waiter/retired/full counts.
 
-## Rock 7: Eiffel Migration
+## Rock 7: Specimen Migration
 
 Update existing pool-shaped specimens first. Do not create a new specimen unless
 the existing ones cannot honestly show the new pool model.
 
 Primary targets:
 
-- `eiffel_dynamic_worker_pool`;
-- `eiffel_graceful_pool_shutdown`.
+- `eiffel_dynamic_worker_pool` / renamed `specimen_dynamic_worker_pool`;
+- `eiffel_graceful_pool_shutdown` / renamed
+  `specimen_graceful_pool_shutdown`.
 
-Only add a new `eiffel_bounded_worker_pool` if both existing examples are too
+Only add a new bounded-worker-pool specimen if both existing examples are too
 pedagogical or too specialized to carry the lesson.
 
 README must compare:
@@ -409,25 +425,30 @@ Especially name where truth differs:
 
 It consumes from 066:
 
-- `Deadline`;
 - caller-owned call handles;
 - explicit cancel vs timeout distinction;
 - capacity reclamation rules;
 - late-reply trace vocabulary.
 
-If 066 does not land enough implementation, 067 may land as design-only plus
-tests/examples for the parts that do not need cancellation.
+It does **not** consume deferred 066 rocks:
+
+- no `Deadline` helper;
+- no `PendingCallSet`.
+
+If 066 does not land cleanly, do not start 067 implementation. Pools are too
+easy to get subtly wrong without the cancellation primitive.
 
 ## Done Means
 
 - one bounded acquire/release pool exists;
 - API home for generic vocabulary and concrete worker pool is decided;
 - waiter capacity is bounded and tested;
-- timeout/cancel/close reclaim waiter capacity;
+- timeout/cancel/close reclaim waiter capacity after explicit pool-side
+  pruning;
 - release has visible acknowledgement;
 - stale/double release is rejected visibly;
 - close modes and resource-health policy are documented and tested;
 - pressure report exists;
-- one Eiffel example uses the pool;
+- one specimen/example uses the pool;
 - DB/HTTP/AWS pool follow-ups can reuse the vocabulary instead of inventing
   their own.
