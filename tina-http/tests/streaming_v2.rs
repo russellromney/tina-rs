@@ -402,3 +402,389 @@ fn chunked_decoder_round_trips_a_known_payload() {
     let decoded = decode_chunked(wire).unwrap();
     assert_eq!(decoded, b"hello, world");
 }
+
+/// Property-style: send a list of pseudo-random byte chunks
+/// through the live wire, decode the chunked-encoded body, and
+/// compare against the concatenation. Run for several different
+/// chunk-shape patterns. Uses a deterministic LCG so failures
+/// reproduce.
+#[test]
+fn chunked_round_trip_property_across_random_payloads() {
+    fn pseudo_random(seed: u64, n: usize) -> Vec<u8> {
+        // Tiny LCG. Not crypto; just deterministic and uniform-ish.
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((state >> 24) as u8);
+        }
+        out
+    }
+
+    // Chunk-shape patterns: single huge chunk, many tiny chunks,
+    // mixed sizes, sizes that straddle 16 (one-hex-digit boundary)
+    // and 256 (two-hex-digit boundary), and a 0-byte chunk in the
+    // middle (which IterBodySource collapses to Eof — so the
+    // remainder is dropped, and the decoded payload should be the
+    // bytes BEFORE the empty).
+    let patterns: Vec<(&str, Vec<usize>)> = vec![
+        ("one big chunk", vec![4096]),
+        ("many tiny", vec![1, 1, 1, 1, 1, 1, 1, 1]),
+        ("mixed", vec![15, 16, 17, 255, 256, 257]),
+        ("hex boundary", vec![15, 16, 4095, 4096]),
+        ("empty terminates early", vec![10, 0, 99]), // 99 is dropped
+    ];
+
+    for (label, sizes) in patterns {
+        let metrics = BodyMetrics::new();
+        let runtime = build_runtime();
+
+        // Pre-compute the chunks the iterator will yield.
+        let mut seed: u64 = 0x1234_5678_DEAD_BEEFu64;
+        let chunks: Vec<Vec<u8>> = sizes
+            .iter()
+            .map(|&n| {
+                seed = seed
+                    .wrapping_add(n as u64)
+                    .wrapping_mul(0xA1B2_C3D4_E5F6_0708);
+                pseudo_random(seed, n)
+            })
+            .collect();
+
+        // Expected decoded payload = concat of chunks UP TO the
+        // first empty (IterBodySource collapses Some(empty) to
+        // Eof, so anything after is unreachable).
+        let mut expected = Vec::new();
+        for chunk in chunks.iter() {
+            if chunk.is_empty() {
+                break;
+            }
+            expected.extend_from_slice(chunk);
+        }
+
+        let known_source = runtime
+            .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+                IterBodySource::new(std::iter::empty::<Vec<u8>>()),
+                16,
+            )
+            .expect("register dummy known");
+        let chunked_source = runtime
+            .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+                IterBodySource::new(chunks.into_iter()),
+                16,
+            )
+            .expect("register chunked source");
+        let service = runtime
+            .register_with_capacity::<StreamRouter, Infallible>(
+                StreamRouter {
+                    known_source,
+                    chunked_source,
+                    known_length: 0,
+                },
+                16,
+            )
+            .expect("register service");
+
+        let listener_isolate = HttpListener::<TestShard>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            service,
+            HttpLimits::default(),
+            Duration::from_secs(2),
+            16,
+        )
+        .with_metrics(metrics.clone());
+        let listener = runtime
+            .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+            .expect("register listener");
+        let bound = runtime.observe_next_bound();
+        runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+        let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+        let response = scripted_get(addr, "/chunked");
+        let (head, body_wire) = split_head_body(&response);
+        assert!(
+            head.contains("Transfer-Encoding: chunked\r\n"),
+            "[{label}] chunked head missing"
+        );
+        let decoded =
+            decode_chunked(body_wire).unwrap_or_else(|e| panic!("[{label}] decode failed: {e}"));
+        assert_eq!(
+            decoded, expected,
+            "[{label}] decoded body must match concatenation of chunks before any empty"
+        );
+
+        let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+        let _ = runtime.shutdown();
+
+        let snap = metrics.snapshot();
+        assert!(snap.drained(), "[{label}] charges drain");
+        assert_eq!(
+            snap.body_io_error_count, 0,
+            "[{label}] no io_error on happy chunked path"
+        );
+    }
+}
+
+// ---------------------------------------------------------------
+// Gap-fill tests added after the second hostile review.
+// ---------------------------------------------------------------
+
+/// Edge: source replies `Eof` on the first `Next`. Wire should be
+/// just the head + `0\r\n\r\n` terminator. Body high-water = 0.
+#[test]
+fn chunked_empty_body_emits_only_terminator() {
+    let metrics = BodyMetrics::new();
+
+    let runtime = build_runtime();
+
+    let known_source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(std::iter::empty::<Vec<u8>>()),
+            16,
+        )
+        .expect("register dummy known source");
+    let chunked_source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(std::iter::empty::<Vec<u8>>()),
+            16,
+        )
+        .expect("register chunked source");
+    let service = runtime
+        .register_with_capacity::<StreamRouter, Infallible>(
+            StreamRouter {
+                known_source,
+                chunked_source,
+                known_length: 0,
+            },
+            16,
+        )
+        .expect("register service");
+
+    let listener_isolate = HttpListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let response = scripted_get(addr, "/chunked");
+    let (head, body) = split_head_body(&response);
+    assert!(head.contains("Transfer-Encoding: chunked\r\n"));
+    assert_eq!(
+        body, b"0\r\n\r\n",
+        "empty chunked body wire = just the terminator; got {body:?}"
+    );
+    let decoded = decode_chunked(body).expect("decoder accepts the terminator");
+    assert_eq!(decoded, &[] as &[u8]);
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let snap = metrics.snapshot();
+    assert!(snap.drained());
+    assert_eq!(
+        snap.response_body_high_water, 0,
+        "no body bytes were ever resident; high water stays at 0"
+    );
+    assert_eq!(snap.body_io_error_count, 0, "empty chunked is not an error");
+}
+
+/// Edge: known-length stream with `content_length = 0`. Source is
+/// never pulled. Wire is just the head; body is empty. No
+/// `body_io_error_count` despite no bytes flowing.
+#[test]
+fn known_length_zero_does_not_pull_source() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Tracks how many times `Next` was issued. For
+    /// `content_length=0` we expect zero pulls.
+    struct CountingSource {
+        pulls: Arc<AtomicUsize>,
+    }
+    impl Isolate for CountingSource {
+        tina::isolate_types! {
+            message: tina_http::ResponseChunkMsg,
+            reply: tina_http::ResponseChunkReply,
+            send: tina::Outbound<Infallible>,
+            spawn: Infallible,
+            call: Infallible,
+            shard: TestShard,
+        }
+        fn handle(
+            &mut self,
+            _msg: tina_http::ResponseChunkMsg,
+            _ctx: &mut Context<'_, TestShard, Self::Reply>,
+        ) -> Effect<Self> {
+            self.pulls.fetch_add(1, Ordering::Relaxed);
+            reply(tina_http::ResponseChunkReply::Eof)
+        }
+    }
+
+    let metrics = BodyMetrics::new();
+    let runtime = build_runtime();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let known_source = runtime
+        .register_with_capacity::<CountingSource, Infallible>(
+            CountingSource {
+                pulls: Arc::clone(&pulls),
+            },
+            16,
+        )
+        .expect("register counting source");
+    // Unused but required by the router shape.
+    let chunked_source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(std::iter::empty::<Vec<u8>>()),
+            16,
+        )
+        .expect("register dummy chunked source");
+    let service = runtime
+        .register_with_capacity::<StreamRouter, Infallible>(
+            StreamRouter {
+                known_source,
+                chunked_source,
+                known_length: 0,
+            },
+            16,
+        )
+        .expect("register service");
+
+    let listener_isolate = HttpListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let response = scripted_get(addr, "/known");
+    let (head, body) = split_head_body(&response);
+    assert!(head.contains("Content-Length: 0\r\n"));
+    assert_eq!(body, b"", "zero-length body");
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        0,
+        "content_length=0 must never pull the source"
+    );
+    let snap = metrics.snapshot();
+    assert!(snap.drained());
+    assert_eq!(snap.response_body_high_water, 0);
+    assert_eq!(snap.body_io_error_count, 0);
+}
+
+/// Source's first reply is `Timeout`. The chunked path must
+/// record both `body_timeout_count` (cause) and
+/// `body_io_error_count` (the wire is now an unterminated
+/// chunked stream — user-visible truncation).
+#[test]
+fn chunked_source_timeout_records_both_timeout_and_io_error() {
+    /// Source that never replies. Caller's call-deadline fires.
+    struct DeadSource;
+    impl Isolate for DeadSource {
+        tina::isolate_types! {
+            message: tina_http::ResponseChunkMsg,
+            reply: tina_http::ResponseChunkReply,
+            send: tina::Outbound<Infallible>,
+            spawn: Infallible,
+            call: Infallible,
+            shard: TestShard,
+        }
+        fn handle(
+            &mut self,
+            _msg: tina_http::ResponseChunkMsg,
+            _ctx: &mut Context<'_, TestShard, Self::Reply>,
+        ) -> Effect<Self> {
+            tina::prelude::noop()
+        }
+    }
+
+    let metrics = BodyMetrics::new();
+    let runtime = build_runtime();
+
+    let known_source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(std::iter::empty::<Vec<u8>>()),
+            16,
+        )
+        .expect("register dummy known");
+    // Tight inner timeout so the test runs fast. The connection
+    // isolate's stream_call_timeout is set from the listener's
+    // service_call_timeout below.
+    let chunked_source = runtime
+        .register_with_capacity::<DeadSource, Infallible>(DeadSource, 16)
+        .expect("register dead source");
+    let service = runtime
+        .register_with_capacity::<StreamRouter, Infallible>(
+            StreamRouter {
+                known_source,
+                chunked_source,
+                known_length: 0,
+            },
+            16,
+        )
+        .expect("register service");
+
+    let listener_isolate = HttpListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        HttpLimits::default(),
+        // service_call_timeout doubles as stream_call_timeout
+        // for chunk pulls. 200 ms is enough for the head to land
+        // and then to time out on the first chunk pull.
+        Duration::from_millis(200),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let response = scripted_get(addr, "/chunked");
+    let (head, body_wire) = split_head_body(&response);
+    assert!(head.contains("Transfer-Encoding: chunked\r\n"));
+    // Wire body was never produced — terminator never reached
+    // the wire either. Decoder either errors or returns empty.
+    assert!(
+        decode_chunked(body_wire).is_err() || body_wire.is_empty(),
+        "timed-out chunked source must not produce a clean terminator; got {body_wire:?}"
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let snap = metrics.snapshot();
+    assert!(snap.drained());
+    assert_eq!(
+        snap.body_timeout_count, 1,
+        "source-call deadline fired exactly once; got {snap:?}"
+    );
+    assert_eq!(
+        snap.body_io_error_count, 1,
+        "wire truncation symptom recorded alongside the timeout cause; got {snap:?}"
+    );
+}

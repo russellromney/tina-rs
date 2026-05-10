@@ -245,7 +245,11 @@ impl<S: Shard + 'static> Isolate for IterBodySource<S> {
         reply: ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        // RuntimeCall (not Infallible) so the isolate can register
+        // on both the threaded runtime and the deterministic
+        // simulator. We never make outbound calls; the channel is
+        // there only to satisfy the simulator's bound.
+        call: tina_runtime::RuntimeCall<ResponseChunkMsg>,
         shard: S,
     }
 

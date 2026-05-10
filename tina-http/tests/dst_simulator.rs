@@ -466,3 +466,102 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     assert_eq!(hash, hash2, "same-seed reruns must agree on fingerprint");
     assert_eq!(len, len2, "same-seed reruns must agree on trace length");
 }
+
+// ---------------------------------------------------------------
+// Chunked-stream DST: register IterBodySource + a chunked service,
+// drive a single GET /big-chunked, compare fingerprints across two
+// passes with the same seed.
+// ---------------------------------------------------------------
+
+use tina_http::{IterBodySource, ResponseChunkMsg, ResponseChunkReply};
+
+struct ChunkedDemoService {
+    source: tina::Address<ResponseChunkMsg, ResponseChunkReply>,
+}
+
+impl Isolate for ChunkedDemoService {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: tina_runtime::RuntimeCall<HttpRequest>,
+        shard: SimShard,
+    }
+    fn handle(
+        &mut self,
+        request: HttpRequest,
+        _ctx: &mut Context<'_, SimShard, Self::Reply>,
+    ) -> Effect<Self> {
+        let response = if request.path == "/big-chunked" {
+            HttpResponse::stream_chunked(StatusCode::OK, self.source)
+        } else {
+            HttpResponse::not_found()
+        };
+        reply(response)
+    }
+}
+
+fn run_chunked_pass(bind_addr: SocketAddr, config: SimulatorConfig) -> (u64, usize) {
+    let mut sim = Simulator::new(SimShard, config);
+
+    // Two-chunk source: enough to exercise pull/write/pull/write/eof
+    // without needing many trace events.
+    let chunks: Vec<Vec<u8>> = vec![b"first ".to_vec(), b"second".to_vec()];
+    let source =
+        sim.register_with_mailbox_capacity(IterBodySource::<SimShard>::new(chunks.into_iter()), 16);
+    let service = sim.register_with_mailbox_capacity(ChunkedDemoService { source }, 16);
+    let listener_isolate = HttpListener::<SimShard>::new(
+        bind_addr,
+        service,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    );
+    let listener = sim.register_with_mailbox_capacity(listener_isolate, 8);
+
+    sim.try_send(listener, HttpListenerMsg::Start)
+        .expect("send Start");
+    drive_steps(&mut sim, 256);
+    sim.try_send(listener, HttpListenerMsg::Stop)
+        .expect("send Stop");
+    drive_steps(&mut sim, 256);
+
+    let trace = sim.trace();
+    (stable_trace_hash(trace.iter()), trace.len())
+}
+
+fn chunked_request_bytes() -> Vec<u8> {
+    b"GET /big-chunked HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec()
+}
+
+#[test]
+fn chunked_response_same_seed_replays_identical_fingerprint() {
+    let bind: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+    let peer: SocketAddr = "10.0.0.1:55100".parse().unwrap();
+    let seed = 0xABCD_1234u64;
+
+    let make_cfg = || {
+        build_config(
+            seed,
+            bind,
+            vec![one_chunk_peer(peer, 0, chunked_request_bytes())],
+        )
+    };
+
+    let (hash_a, len_a) = run_chunked_pass(bind, make_cfg());
+    let (hash_b, len_b) = run_chunked_pass(bind, make_cfg());
+
+    assert_eq!(
+        hash_a, hash_b,
+        "same seed + same script → identical chunked-trace fingerprint"
+    );
+    assert_eq!(len_a, len_b, "same seed → identical event count");
+    assert!(len_a > 0, "trace should not be empty");
+}
+
+// We don't ship a "different seed → different fingerprint" test
+// for chunked: with no fault injection and a single peer the seed
+// has nothing to perturb, so different seeds produce identical
+// traces by design. The same-seed determinism property — which is
+// the load-bearing one for replay — is proven by the test above.
