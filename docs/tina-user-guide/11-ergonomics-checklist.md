@@ -634,6 +634,78 @@ match pending.try_insert(id, slot) {
 Don't store slots in a plain `HashMap`. No cap, no sweep — abandoned
 slots eat capacity forever.
 
+### Bounded pending call handles
+
+`PendingReplies` is for *deferred reply slots you owe other callers*.
+For the inverse — *outstanding `call_with_handle` calls you own as
+the caller* — use `tina::PendingCallSet::<K, R>::with_capacity(n)`.
+Same hard rules: bounded storage, typed `Full` / `DuplicateKey` on
+insert, explicit `remove(&key)` on each completion (no `Drop` magic).
+
+```rust
+let mut calls: PendingCallSet<RequestId, MyReply> =
+    PendingCallSet::with_capacity(64);
+
+let (effect, handle) = call_with_handle(target, msg, timeout)
+    .reply(move |outcome| Msg::Returned { id, outcome });
+calls.insert(id, handle).expect("not at capacity");
+
+// On completion / timeout / explicit cancel — drop the slot:
+Msg::Returned { id, outcome } => {
+    self.calls.remove(&id);
+    /* handle outcome */
+}
+
+// Owner-stop / cancel-all is one drain in user code:
+let mut effects = Vec::with_capacity(self.calls.len());
+for (_, handle) in self.calls.drain() {
+    effects.push(cancel_call(handle).reply(Msg::Cancelled));
+}
+batch(effects)
+```
+
+The cancel-all loop is intentionally explicit. The set does not
+build effects itself — that would force `tina` to depend on
+`cancel_call`, and would hide the per-handle `CancelOutcome` truth
+behind one helper call. Long explicit code is okay, short
+dishonest code is not.
+
+### Deadlines
+
+`Deadline` is a value, not a wish. It does not retry, does not
+cancel work, and does not extend itself. It is the budget you
+propagate through a chain of calls so each hop sees the *same*
+shrinking remainder.
+
+Build a deadline from inside a handler:
+
+```rust
+let deadline = ctx.deadline_after(Duration::from_secs(2));
+call(downstream, Msg::Forward { deadline }, deadline.remaining_or_zero(ctx.now()))
+    .reply(Msg::DownstreamReturned)
+```
+
+`Context::deadline_after` and `Context::now` read from the
+runtime/sim-stamped clock, so the same code is honest under live
+runtime, simulator, and DST replay. The simulator anchors `now` at
+its virtual clock; you do **not** call `std::time::Instant::now()`
+yourself.
+
+Pass `deadline.remaining_or_zero(ctx.now())` as the call timeout in
+each hop. An expired deadline produces `Duration::ZERO`, which the
+runtime turns into a normal `CallOutcome::Timeout` — visible truth,
+no silent extension.
+
+Outside a handler (host code, tests, hand-rolled simulator drivers)
+use the explicit constructor:
+
+```rust
+let deadline = Deadline::from_instant(now, Duration::from_secs(2));
+```
+
+There is no `Deadline::after(Duration)` shortcut. It would have to
+call `Instant::now()` internally and silently break DST/replay.
+
 ### Continuation messages for runtime calls
 
 Use `Result<T, CallError>` directly in the message variant, then pass

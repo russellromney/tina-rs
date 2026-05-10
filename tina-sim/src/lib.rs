@@ -107,6 +107,14 @@ where
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
     virtual_now: Duration,
+    /// Stable `Instant` anchor that pairs with `virtual_now` to give
+    /// the simulator a deterministic "now" the same shape as the live
+    /// runtime's `Clock`. Stamped once at construction and never
+    /// mutated; handlers see `virtual_anchor + virtual_now`. Replay
+    /// traces use the same anchor so a recorded run yields the same
+    /// `Context::now()` values, even though the wall-clock value of
+    /// `virtual_anchor` itself is implementation-private.
+    virtual_anchor: std::time::Instant,
     step_ordinal: u64,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
@@ -171,6 +179,7 @@ where
             ids,
             trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
             virtual_now: Duration::ZERO,
+            virtual_anchor: std::time::Instant::now(),
             step_ordinal: 0,
             timers: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             next_timer_ordinal: 0,
@@ -470,11 +479,12 @@ where
             );
 
             let caller = self.build_message_caller(message.call_context, isolate_id);
+            let now = self.virtual_anchor + self.virtual_now;
 
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
                 catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller)
+                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller, now)
                 }))
             };
 

@@ -109,6 +109,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Type-erased payload for [`Effect::StopWith`].
 ///
@@ -781,6 +782,12 @@ where
     shard: &'a mut S,
     current_isolate: IsolateId,
     caller: Option<MessageCaller>,
+    /// Runtime/sim-stamped current time. `None` for hand-built contexts
+    /// in tests that do not exercise time. Calls to [`Context::now`] or
+    /// [`Context::deadline_after`] panic loudly when this is `None`,
+    /// making "I forgot to plumb a clock" a runtime fault rather than a
+    /// hidden `Instant::now()` call.
+    now: Option<Instant>,
     _reply: PhantomData<fn(R) -> R>,
 }
 
@@ -808,6 +815,7 @@ where
             shard,
             current_isolate,
             caller: None,
+            now: None,
             _reply: PhantomData,
         }
     }
@@ -820,6 +828,21 @@ where
     #[doc(hidden)]
     pub fn with_caller(mut self, caller: MessageCaller) -> Self {
         self.caller = Some(caller);
+        self
+    }
+
+    /// Stamps the runtime/sim-observed current time. Runtime-only
+    /// constructor: live runtimes pass their `Clock::now()`, the
+    /// simulator passes a deterministic `Instant` derived from its
+    /// virtual clock anchor and `virtual_now`. Set before invoking
+    /// [`Isolate::handle`].
+    ///
+    /// `Context::now` and `Context::deadline_after` read this field
+    /// and panic if it has not been stamped — the rule is that handlers
+    /// that ask for time get the runtime's truth, not `Instant::now()`.
+    #[doc(hidden)]
+    pub fn with_now(mut self, now: Instant) -> Self {
+        self.now = Some(now);
         self
     }
 
@@ -886,6 +909,39 @@ where
     /// to capture (i.e. a deferred reply slot can still be taken this turn).
     pub fn has_caller(&self) -> bool {
         self.caller.is_some()
+    }
+
+    /// Current time as observed by the runtime/simulator that invoked
+    /// this handler.
+    ///
+    /// Live runtimes return their monotonic clock's `now()`. The
+    /// simulator returns a deterministic `Instant` derived from its
+    /// virtual-time anchor plus `virtual_now`, so DST/replay tests see
+    /// the same `now` they advanced the simulator to.
+    ///
+    /// **Panics** if the runtime did not stamp a current time before
+    /// invoking the handler. Hand-built test contexts (built via
+    /// [`Context::new`] or [`Context::new_typed`] without `with_now`)
+    /// hit this path. Tests that need a clock should construct the
+    /// context with [`Context::with_now`].
+    pub fn now(&self) -> Instant {
+        self.now.expect(
+            "Context::now() requires the runtime/simulator to have stamped a current time \
+             via Context::with_now before invoking the handler. Hand-built test contexts \
+             must call .with_now(now) explicitly; live runtime / simulator handler paths \
+             stamp this for you.",
+        )
+    }
+
+    /// Builds a [`Deadline`] anchored at `Context::now() + after`.
+    ///
+    /// Sugar over [`Deadline::from_instant`]. The deadline is honest under
+    /// live and simulator runtimes because the runtime stamped the
+    /// "now" the deadline derives from. Compare against
+    /// [`Context::now`] (or pass forward through other handlers — propagate,
+    /// don't re-stamp) when you need to know how much budget remains.
+    pub fn deadline_after(&self, after: Duration) -> Deadline {
+        Deadline::from_instant(self.now(), after)
     }
 
     /// Returns the identifier of the shard currently executing the handler.
@@ -1666,6 +1722,110 @@ impl CancelOutcome {
     }
 }
 
+/// Absolute deadline anchored to a runtime/simulator-stamped `Instant`.
+///
+/// `Deadline` is a value type. It does not cancel anything by itself
+/// and does not own a clock — it carries the absolute monotonic time
+/// at which a budget runs out, plus accessors that take an explicit
+/// `now: Instant`. Callers compare the stored deadline to a `now` they
+/// got from the runtime ([`Context::now`]) or the simulator's virtual
+/// clock; there is no hidden `Instant::now()` call.
+///
+/// # Honest under live and simulator clocks
+///
+/// The intended construction sites are:
+///
+/// - [`Context::deadline_after`] — sugar that anchors to the runtime's
+///   stamped `now`. Live runtimes pass their monotonic clock; the
+///   simulator passes its virtual-clock-derived `Instant`. Both produce
+///   `Deadline` values whose `remaining_or_zero(ctx.now())` answers the
+///   same question.
+/// - [`Deadline::from_instant`] — explicit constructor for host code
+///   and tests where the caller controls "now" (host edge,
+///   property-based tests, hand-rolled simulator drivers).
+///
+/// There is **no** `Deadline::after(Duration)` shortcut: it would have
+/// to call `Instant::now()` internally, which silently breaks DST/replay.
+///
+/// # First form is a budget, not a wish
+///
+/// `Deadline` does not retry, does not extend itself, and does not
+/// cancel work. It is the budget you propagate through a chain of calls
+/// (A → B → C) so each hop sees the *same* shrinking remainder. To stop
+/// waiting when the budget runs out, pass `remaining_or_zero(now)` as
+/// the call timeout: an expired deadline becomes a `Duration::ZERO`
+/// timeout, which the runtime turns into the usual `CallOutcome::Timeout`.
+///
+/// ```
+/// use std::time::Duration;
+/// use tina::Deadline;
+///
+/// let now = std::time::Instant::now();
+/// let deadline = Deadline::from_instant(now, Duration::from_millis(500));
+///
+/// // Half the budget consumed elsewhere…
+/// let later = now + Duration::from_millis(250);
+/// assert!(!deadline.expired(later));
+/// assert!(deadline.remaining_or_zero(later) <= Duration::from_millis(250));
+///
+/// // After the deadline:
+/// let after = now + Duration::from_secs(1);
+/// assert!(deadline.expired(after));
+/// assert_eq!(deadline.remaining_or_zero(after), Duration::ZERO);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use = "Deadline is a budget; pass it through, compare against `now`, or store it"]
+pub struct Deadline {
+    deadline: Instant,
+}
+
+impl Deadline {
+    /// Builds a deadline anchored at `now + after`.
+    ///
+    /// `now` is taken explicitly so DST/replay-claimed code cannot
+    /// silently depend on `std::time::Instant::now()`. Inside a handler,
+    /// prefer [`Context::deadline_after`]; outside (host code, tests,
+    /// simulator drivers), pass an `Instant` you control.
+    ///
+    /// `after.checked_add` overflow saturates at `Instant::now() + ~292
+    /// years`, which the standard library treats as a never-expiring
+    /// deadline; this matches the fact that overflow at the runtime
+    /// boundary already maps to a saturating timer. The accessors
+    /// stay honest under saturation.
+    pub fn from_instant(now: Instant, after: Duration) -> Self {
+        Self {
+            deadline: now.checked_add(after).unwrap_or(now),
+        }
+    }
+
+    /// Returns the absolute deadline `Instant` for code that wants to
+    /// build its own arithmetic. Most callers should prefer
+    /// [`remaining_or_zero`](Self::remaining_or_zero) or
+    /// [`expired`](Self::expired).
+    pub const fn instant(self) -> Instant {
+        self.deadline
+    }
+
+    /// Time left until the deadline, given an explicit `now`. Returns
+    /// `None` if the deadline has already passed.
+    pub fn remaining(self, now: Instant) -> Option<Duration> {
+        self.deadline.checked_duration_since(now)
+    }
+
+    /// Time left until the deadline, given an explicit `now`. Returns
+    /// `Duration::ZERO` once the deadline has passed — the right shape
+    /// to pass straight to a call timeout, where `ZERO` means "do not
+    /// wait."
+    pub fn remaining_or_zero(self, now: Instant) -> Duration {
+        self.remaining(now).unwrap_or(Duration::ZERO)
+    }
+
+    /// Whether the deadline has already passed at `now`.
+    pub fn expired(self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+}
+
 /// Reasons [`Context::take_reply_slot`] may refuse a capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TakeReplySlotError {
@@ -1926,10 +2086,13 @@ pub mod runtime_internal {
 pub mod prelude {
     pub use crate::{
         Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition, Context,
-        DeferredReply, Effect, Isolate, IsolateId, Outbound, RestartableChildDefinition, Shard,
-        ShardId, SingleShard, batch, isolate, isolate_types, noop, reply, reply_to,
-        restart_children, send, sequence, spawn, stop, stop_with,
+        Deadline, DeferredReply, Effect, Isolate, IsolateId, Outbound, PendingCallSet,
+        PendingCallSetInsertError, RestartableChildDefinition, Shard, ShardId, SingleShard, batch,
+        isolate, isolate_types, noop, reply, reply_to, restart_children, send, sequence, spawn,
+        stop, stop_with,
     };
 }
 
+mod pending_call_set;
 pub mod pool;
+pub use pending_call_set::{PendingCallSet, PendingCallSetInsertError};

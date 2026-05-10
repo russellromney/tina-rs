@@ -1,6 +1,7 @@
 //! Tina side. The driver fans out one IsolateCall per worker via
-//! [`call_with_handle`], stores each [`CallHandle`] in isolate state,
-//! and on the host's `Cancel` signal cancels each one explicitly with
+//! [`call_with_handle`], stores each [`CallHandle`] in a bounded
+//! [`PendingCallSet`] keyed by worker index, and on the host's `Cancel`
+//! signal drains the set and cancels each entry explicitly with
 //! [`cancel_call`]. Worker replies that arrive after cancellation are
 //! rejected by the runtime as
 //! `CallReplyRejected { CallerCancelled }` and never reach the
@@ -62,8 +63,15 @@ impl Worker {
 #[derive(Debug)]
 enum DriverMsg {
     Begin,
-    Returned(CallOutcome<WorkerReply>),
-    /// External cancel signal. Cancels each pending call by handle.
+    /// Worker reply continuation. The `u32` is the same key that
+    /// indexed the `PendingCallSet` slot — the driver removes it on
+    /// completion so the slot is reusable.
+    Returned {
+        worker: u32,
+        outcome: CallOutcome<WorkerReply>,
+    },
+    /// External cancel signal. Drains the pending set and cancels each
+    /// stored handle.
     Cancel,
     /// One cancel completed. The driver does not inspect the outcome
     /// here — the per-cancel truth lives in `CallCancelled` trace
@@ -76,7 +84,10 @@ enum DriverMsg {
 
 struct Driver {
     workers: Vec<Address<WorkerMsg, WorkerReply>>,
-    pending: Vec<CallHandle<WorkerReply>>,
+    /// Bounded slot table: one entry per worker, keyed by worker index.
+    /// `with_capacity(FANOUT)` rejects extra inserts as `Full` rather
+    /// than growing — a known-size fan-out fits exactly.
+    pending: PendingCallSet<u32, WorkerReply>,
     replies_before_cancel: u32,
     cancel_observed: bool,
 }
@@ -91,17 +102,24 @@ impl Driver {
         match msg {
             DriverMsg::Begin => {
                 let mut effects = Vec::with_capacity(self.workers.len());
-                self.pending.reserve(self.workers.len());
-                for worker in &self.workers {
-                    let (effect, handle) =
-                        call_with_handle(*worker, WorkerMsg::Do, CALL_TIMEOUT)
-                            .reply(DriverMsg::Returned);
-                    self.pending.push(handle);
+                for (idx, worker) in self.workers.iter().enumerate() {
+                    let key = idx as u32;
+                    let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, CALL_TIMEOUT)
+                        .reply(move |outcome| DriverMsg::Returned { worker: key, outcome });
+                    // Bounded insert; FANOUT-sized table never overflows.
+                    self.pending
+                        .insert(key, handle)
+                        .map_err(|_| ())
+                        .expect("pending set sized to FANOUT");
                     effects.push(effect);
                 }
                 Effect::Batch(effects)
             }
-            DriverMsg::Returned(outcome) => {
+            DriverMsg::Returned { worker, outcome } => {
+                // Explicit slot cleanup on completion — Tina's
+                // PendingCallSet has no Drop magic. A normal reply
+                // settled the call; the slot is reusable.
+                self.pending.remove(&worker);
                 if let CallOutcome::Replied(_) = outcome {
                     self.replies_before_cancel += 1;
                 }
@@ -110,7 +128,9 @@ impl Driver {
             DriverMsg::Cancel => {
                 self.cancel_observed = true;
                 let mut effects = Vec::with_capacity(self.pending.len());
-                for handle in self.pending.drain(..) {
+                // Drain the set; `cancel_call` is the explicit
+                // cancel-all pattern in user code (no helper hides it).
+                for (_key, handle) in self.pending.drain() {
                     effects.push(cancel_call(handle).reply(|_| DriverMsg::Cancelled));
                 }
                 Effect::Batch(effects)
@@ -152,7 +172,7 @@ pub fn run() -> anyhow::Result<Report> {
         .register_with_capacity::<_, Infallible>(
             Driver {
                 workers,
-                pending: Vec::new(),
+                pending: PendingCallSet::with_capacity(FANOUT as usize),
                 replies_before_cancel: 0,
                 cancel_observed: false,
             },
