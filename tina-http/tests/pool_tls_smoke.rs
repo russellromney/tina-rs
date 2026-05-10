@@ -305,7 +305,7 @@ fn pool_serial_admission_works_with_https_target() {
     assert_eq!(result.status, StatusCode::OK);
     let body = match &result.body {
         HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_) => Vec::new(),
+        HttpResponseBody::Stream(_) | HttpResponseBody::ChunkedStream(_) => Vec::new(),
     };
     assert_eq!(body, b"pool-ok");
 

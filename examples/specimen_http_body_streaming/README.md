@@ -1,16 +1,22 @@
 # specimen_http_body_streaming
 
-A 256 KiB response body served chunk-by-chunk to a slow reader. The
-shared `slow_reader_client` reads in 1 KiB slices with a 2 ms pause
-between each read, which makes the kernel's send buffer back up
-against the server. Both sides have to deal with that pressure;
-they deal with it very differently.
+A 256 KiB response body served chunk-by-chunk to a slow reader.
+The shared `slow_reader_client` reads in 1 KiB slices with a 2 ms
+pause between each read, which makes the kernel's send buffer back
+up against the server. Both sides have to deal with that pressure;
+they deal with it differently.
 
-- Tokio: `axum::body::Body::from(big_vec)`. The whole 256 KiB lives
-  in `Vec<u8>` before the response starts.
-- Tina: `HttpResponse::with_stream(...)` + a `BigBody` chunk-source
-  isolate. Each pull is one `CHUNK_BYTES` chunk; nothing else is
-  resident in the connection at the time of writing.
+- Tokio: `axum::body::Body::from(big_vec)`. The whole 256 KiB is
+  resident in `Vec<u8>` before the response starts.
+- Tina: `HttpResponse::stream_known_length(...)` over an
+  `IterBodySource` that wraps a closure-iterator. Each chunk is
+  pulled only after the previous one drains; nothing else sits in
+  the connection.
+
+The Tina service also routes `/big-chunked` to
+`HttpResponse::stream_chunked(...)` for an unknown-length body
+framed by `Transfer-Encoding: chunked`. Same source contract,
+different framing — the API forces the choice.
 
 ## Run
 
@@ -37,17 +43,17 @@ footprint numbers tell the real story:
 - Tokio reports `tokio_response_alloc_floor=262144`. This is a
   *lower bound*: we know the `Vec<u8>` we hand to `Body::from(...)`
   is 256 KiB and lives until the response finishes streaming.
-  Hyper queues more bytes for its writer task — we don't see
+  Hyper queues more bytes for its writer task — we do not see
   those.
 - Tina reports `tina_response_high_water=4096`. This is the
   *exact peak* observed via `BodyMetrics`: at no point did the
   connection isolate hold more than one chunk's worth of body.
   64× smaller than the body itself.
 
-Both numbers are honest. Tokio's is "at least this much"
-because that body model has no per-chunk hook to measure
-through. Tina's is "exactly this much" because every chunk goes
-through a charge/release pair.
+Both numbers are honest. Tokio's is "at least this much" because
+the body model has no per-chunk hook to measure through. Tina's
+is "exactly this much" because every chunk goes through a
+charge/release pair.
 
 ## Read
 
@@ -62,64 +68,82 @@ whole body and wraps it in `Body::from(...)`. From there
 `hyper`/`tokio` own the wire pacing — the body Vec is held alive
 inside the response future until the last byte goes on the wire.
 There is no observable per-chunk pull point and no body-pressure
-counter. The whole response is the unit of work.
+counter.
 
 ## Tina shape
 
-A `BigBody` isolate produces one `CHUNK_BYTES` chunk per
-`ResponseChunkMsg::Next` call, then `Eof`. The connection isolate
-pulls chunks via `call(source, Next, t).reply(StreamChunk)`,
-writes each chunk via `tcp_write`, and only pulls the next chunk
-*after* the previous chunk has fully drained. The high-water at
-peak is therefore one chunk's worth — not the whole body.
+A closure-iterator yields one `CHUNK_BYTES` chunk per call.
+[`IterBodySource::new(iter)`](../../tina-http/src/streaming.rs)
+wraps the iterator into an `Isolate` that answers
+`ResponseChunkMsg::Next` with the next yielded value, or `Eof`
+when the iterator drains. No custom `Isolate` impl needed for the
+common case.
 
-`BodyMetrics::new()` is shared with the listener. The connection
-charges bytes when a chunk is queued for `tcp_write` and releases
-them when the runtime accepts the bytes. After shutdown,
-`metrics.snapshot()` reports the high-water observed across the
-whole run.
+The service handler returns one of:
+
+```rust
+HttpResponse::stream_known_length(StatusCode::OK, n, source)  // Content-Length
+HttpResponse::stream_chunked(StatusCode::OK, source)          // Transfer-Encoding: chunked
+```
+
+The choice is loud. There is no "guess a length" path; if you
+don't know the length, you say so.
+
+The connection isolate pulls chunks via `call(source, Next, t)`
+and writes each chunk only after the previous chunk has fully
+drained. `BodyMetrics` charges body bytes when the chunk is
+queued and releases them when the runtime accepts the bytes — so
+`response_body_high_water` is the peak resident at any moment.
 
 ## Discussion
 
-What feels better on Tokio:
+What got shorter:
 
-- **The shape is shorter.** `Body::from(vec)` is one line. axum
-  signs you up for a working response with no further thought.
-- **For small bodies you're done.** The whole-body-resident model
-  is a non-issue for a 1 KB response.
+- The chunk source went from a hand-rolled `BigBody` `Isolate` impl
+  with `tina::isolate_types!` and `ResponseChunkMsg`/`ResponseChunkReply`
+  arms down to a plain closure-iterator wrapped in
+  `IterBodySource::new`.
+- The framing choice moved from "build a `ResponseStream` literal"
+  into a typed constructor (`stream_known_length` vs
+  `stream_chunked`). Caller sees both options at the call site.
 
-What feels better on Tina:
+What stayed explicit:
 
-- **Every chunk has a name.** `Next` → `Chunk(bytes)` → write →
-  `Wrote(count)` → next `Next`. Each step is a runtime trace event;
-  if a chunk source stalls, the trace tells you exactly which
-  `Next` is outstanding.
-- **The body buffer is bounded by your chunk size.** The connection
-  isolate holds at most one chunk in `pending_response`. The
-  high-water counter proves this on every run; a regression that
-  silently buffers the whole body would push that counter up.
-- **Slow client backpressure is real backpressure.** Until the
-  current chunk's `tcp_write` finishes, the next `Next` does not
-  fire. The chunk source naturally waits — no extra signalling.
-- **Failure shape is visible.** If the source returns
-  `CallOutcome::Timeout`, the wire is torn down and
-  `body_timeout_count` increments. If `tcp_write` returns
-  `Wrote(Err(_))`, `body_io_error_count` increments. You can
-  assert these in tests.
+- Every chunk is a runtime call: `Next` -> `Chunk(bytes)` -> wire
+  write -> `Wrote(count)` -> next `Next`. Each step shows up in
+  the trace. No hidden buffering task.
+- The connection isolate registration is still by hand. The
+  service isolate is still by hand. Tina does not pretend HTTP
+  body streaming is "just `async fn`".
+- Pressure is still visible. `BodyMetrics` is shared between
+  listener and connection by `with_metrics(metrics.clone())`;
+  `snapshot().response_body_high_water` reads at any time.
+- Failure shape is still typed: source `Timeout` increments
+  `body_timeout_count`; source `Closed`/`Full` and wire write
+  failures increment `body_io_error_count`; source under-produce
+  for known-length is also an IO error. Tests assert each.
+
+How known vs chunked works:
+
+- Known length: emit `Content-Length: N`, write raw bytes, close
+  after exactly N bytes drained. Source under-produce or peer
+  close shows up as `body_io_error_count`. Source over-produce
+  is truncated to N — the wire stays honest.
+- Chunked: emit `Transfer-Encoding: chunked`, frame each `Chunk`
+  reply as `<size in hex>\r\n<bytes>\r\n`, write `0\r\n\r\n` on
+  source `Eof`. The connection writes the terminator on its own;
+  the source just signals end-of-stream.
 
 What this suggests:
 
-- Tokio's body model is shorter for the common case; Tina's body
-  model is shorter for the case where you actually need to know how
-  big the in-flight body is. Different audiences, both honest.
-- "Stream the body" on Tokio means "produce a `futures::Stream`."
-  On Tina it means "register a chunk-source isolate and answer
-  `Next`." Both are first-class; the names of the steps differ.
-- A specimen that wanted to compare *upload* (slow client uploads
-  to the server, server reads chunk by chunk and hashes) would
-  show the same shape from the other side: streaming-request via
-  `HttpLimits::inbound_stream_chunk_size`. That deferral is on
-  purpose — one specimen, one direction.
+- The "hand-roll an Isolate just to yield bytes" gap is gone for
+  iterator-style sources. A source that really does need
+  `Isolate` (file reads, accumulating state) still implements it
+  by hand, and `IterBodySource` doesn't get in the way.
+- The framing API is now loud enough that "guess a Content-Length"
+  is a type error. Tokio's `Body::from(...)` collapses everything
+  through the same constructor; Tina makes the framing a visible
+  call-site choice.
 
 ## What this does *not* prove
 
@@ -130,3 +154,8 @@ What this suggests:
 - Wall-clock numbers are noisy on a single machine. The
   `tina_response_high_water` line is the property worth pinning,
   not the milliseconds.
+- The chunked path is response-only. Tina's HTTP/1 client does
+  not currently decode chunked responses (still a parser-level
+  `UnsupportedTransferEncoding`). Real chunked clients exist
+  elsewhere; the point of this slice is the server-side framing
+  choice.

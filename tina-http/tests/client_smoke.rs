@@ -151,7 +151,7 @@ fn larger_body_spans_multiple_reads() {
 
     let result = run_one_request(canned).expect("client succeeds");
     assert_eq!(result.status, StatusCode::OK);
-    assert_eq!(result.body.declared_length(), body.len());
+    assert_eq!(result.body.declared_length(), Some(body.len()));
     assert_eq!(result.body, body);
 }
 
@@ -163,7 +163,7 @@ fn call_site_reads_like_any_other_tina_call() {
     let canned = b"HTTP/1.1 204 No Content\r\nServer: x\r\n\r\n".to_vec();
     let result = run_one_request(canned).expect("client succeeds");
     assert_eq!(result.status, StatusCode::NO_CONTENT);
-    assert_eq!(result.body.declared_length(), 0);
+    assert_eq!(result.body.declared_length(), Some(0));
 }
 
 #[test]

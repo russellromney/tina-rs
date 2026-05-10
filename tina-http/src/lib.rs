@@ -1,6 +1,5 @@
-//! Native HTTP/1.1 and HTTPS/1.1 for tina-rs. No Tokio edge.
-//! `Content-Length` framing only on both request and response — no
-//! chunked, no pipelining, no `Expect: 100-continue`.
+//! Native HTTP/1.1 and HTTPS/1.1 for tina-rs. No Tokio edge. No
+//! pipelining, no `Expect: 100-continue`.
 //!
 //! # Body model
 //!
@@ -8,24 +7,33 @@
 //! connection isolate) or **streamed** (pulled chunk-by-chunk from
 //! a chunk-source isolate).
 //!
-//! - Request: streaming activates when
-//!   [`HttpLimits::inbound_stream_chunk_size`] is `Some(N)` and the
-//!   request declares a non-zero `Content-Length`. Dispatch happens
-//!   as soon as the head parses; the service pulls body chunks via
-//!   `call(stream.source, HttpConnectionMsg::body_next(), timeout)`.
-//!   Clean `Eof` and truncated [`RequestChunkReply::Error`] are
-//!   distinct.
-//! - Response: callers build a streamed response with
-//!   [`HttpResponse::with_stream`], handing in a [`ResponseStream`]
-//!   whose `content_length` is declared up front. The connection
-//!   writes the head with that length and pulls chunks via
-//!   `call(source, ResponseChunkMsg::Next, t)` until `Eof`.
+//! ## Request bodies
 //!
-//! Unknown-length streaming responses are deliberately not part of
-//! the first form: the type system gives no way to ask for them.
-//! Chunked transfer-encoding is rejected on both directions as
-//! `UnsupportedTransferEncoding` (501 server-side, parse error
-//! client-side).
+//! `Content-Length` framing only. Streaming activates when
+//! [`HttpLimits::inbound_stream_chunk_size`] is `Some(N)` and the
+//! request declares a non-zero `Content-Length`. Dispatch happens
+//! as soon as the head parses; the service pulls body chunks via
+//! `call(stream.source, HttpConnectionMsg::body_next(), timeout)`.
+//! Clean `Eof` and truncated [`RequestChunkReply::Error`] are
+//! distinct. Chunked request bodies are rejected as
+//! [`RequestParseError::UnsupportedTransferEncoding`].
+//!
+//! ## Response bodies
+//!
+//! Two framings, picked at the call site:
+//!
+//! - [`HttpResponse::stream_known_length`] —
+//!   `Content-Length: N`. Source must deliver exactly N bytes.
+//! - [`HttpResponse::stream_chunked`] —
+//!   `Transfer-Encoding: chunked`. No length declared up front;
+//!   the connection writes the chunked terminator on source `Eof`.
+//!
+//! There is no "guess a length" path. If you don't know the
+//! length, you say so.
+//!
+//! For the common iterator-style source, [`IterBodySource`] wraps
+//! any `Iterator<Item = Vec<u8>> + Send + 'static` into a chunk
+//! source — no custom `Isolate` impl needed.
 //!
 //! # Body pressure
 //!
@@ -93,7 +101,8 @@ pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
 pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
 pub use streaming::{
-    RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
+    ChunkedResponseStream, IterBodySource, RequestChunkReply, RequestStream, ResponseChunkMsg,
+    ResponseChunkReply, ResponseStream,
 };
 pub use target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
 pub use transport::HttpTransport;

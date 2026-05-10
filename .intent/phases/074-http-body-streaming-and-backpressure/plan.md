@@ -3,31 +3,59 @@
 ## Status
 
 - Done:
-  - plan drafted after 068 native HTTPS first form;
+  - plan drafted after the native HTTPS slice;
   - Rock 0 audit (see findings below);
-  - first-form framing decision: `Content-Length` only on both
-    request and response. Unknown-length streaming responses are a
-    typed error, not a hidden whole-body buffer. Chunked
-    transfer-encoding stays out of first form on both sides.
-  - 071 status: not yet shipped; this phase ships a small local
-    `BodyPressureReport` and marks migration to the 071 shape as a
-    follow-up TODO.
-- In progress:
-  - Rock 1 — request body per-pull timeout (already explicit per
-    call; add a body-IO read deadline race on TCP for parity with
-    TLS' `tls_io_timeout`);
-  - Rock 3 — local body pressure report;
-  - Rock 4/5 — HTTP/HTTPS parity and lifecycle proofs;
-  - Rock 6 — `specimen_http_body_streaming`;
-  - Rock 7 — docs.
+  - body-pressure counters (`BodyMetrics` + `BodyPressureReport`)
+    wired through `HttpListener` and `HttpsListener`;
+  - HTTP/HTTPS parity proofs and lifecycle/drain tests;
+  - first-form streaming surface: `Content-Length` only on both
+    sides, mid-body errors typed, parser-level body cap;
+  - first specimen: `specimen_http_body_streaming` with
+    in-flight body pinned at one chunk while Tokio side holds
+    the whole `Vec`.
+  - **Upward shift (this commit):**
+    - `IterBodySource<S>` adapter — wraps any
+      `Iterator<Item = Vec<u8>>` into a chunk source so the
+      common case needs no custom `Isolate` impl.
+    - Loud-API constructors: `HttpResponse::stream_known_length`
+      (`Content-Length` framing) and `HttpResponse::stream_chunked`
+      (`Transfer-Encoding: chunked` framing). Both are typed
+      compile-time choices; there is no "guess a length" path.
+    - Narrow chunked transfer-encoding implemented for the
+      response side. Connection isolate frames each chunk as
+      `size CRLF data CRLF` and writes `0 CRLF CRLF` on `Eof`.
+      `encode_response_head` switches on `body.declared_length()`
+      to pick `Content-Length` vs `Transfer-Encoding: chunked`.
+      Body charge counts data bytes only, not framing overhead.
+    - `streaming_v2` integration tests: chunked encoding wire
+      correctness, iterator-source over both framings,
+      mid-stream client close visible via `body_io_error_count`.
+    - Specimen rewritten to use the blessed shape (`IterBodySource`
+      + `stream_known_length`); a second route demonstrates
+      `stream_chunked` for unknown-length.
+- Open: a live-tick metrics emitter (timer-driven snapshot); the
+  current `metrics.snapshot()` is already callable any time but
+  there's no built-in periodic emit. Recorded as a follow-up
+  observability slice rather than this phase.
 - Deferred:
   - HTTP/2;
   - gRPC;
   - redirects, cookies, proxies;
   - ACME, mTLS, cert reload, SNI routing;
   - broad web-framework surface;
-  - chunked transfer-encoding (request and response);
-  - migrating `BodyPressureReport` to 071 capacity report shape.
+  - chunked transfer-encoding on the **request** side (server
+    still rejects chunked requests as
+    `UnsupportedTransferEncoding`); the response side now
+    supports chunked emit;
+  - chunked decoding on the HTTP/1 client (server-side
+    chunked-emit only);
+  - cancel signal from connection back to chunk source on wire
+    failure (today the source is left idle; failure is visible
+    via `body_io_error_count`);
+  - live-tick metrics emitter (snapshot is live; there's no
+    built-in periodic emit);
+  - migrating body-pressure counters into the shared
+    capacity-report shape when that lands.
 
 ### Rock 0 — Audit findings
 
