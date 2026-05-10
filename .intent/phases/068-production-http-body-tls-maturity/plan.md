@@ -29,6 +29,39 @@
     `18-bridge-crates.md`, `examples/README.md`, `FINDINGS.md` (new
     finding 16: multi-worker TLS lane).
 - In progress: none.
+- Post-review fixes (PR feedback round 3):
+  - **Bug fix**: Stop racing with a pending `tls_accept` previously
+    surfaced `CallFailed { call_kind: TlsListenerClose, reason:
+    ResourceBusy }` because the lane rejects close while accept is
+    pending. The listener swallowed the failure and stopped, so the
+    `TlsListenerId` orphaned in the lane until full shutdown. Fix:
+    `Stop` now sets `stopping=true` and defers the listener-close.
+    The `Accepted(...)` handler observes `stopping` once accept lands
+    and triggers `tls_close_listener` from there, by which point the
+    lane is free.
+  - **Bug fix**: `Start` is now idempotent. A second `Start` replies
+    `HttpsStartupError::AlreadyStarted` rather than issuing a second
+    `tls_bind` that would leak the first listener.
+  - **Bug fix**: Stop sent before `Bound(Ok)` lands now closes the
+    listener cleanly via the new `Bound(Ok)` stopping branch — used
+    to leak in this race.
+  - **Bug fix**: `apply_host_policy` rejects empty policy values
+    (`""`) as `InvalidHostHeaderValue` instead of letting them ride
+    onto the wire as `Host: \r\n`.
+  - **Smell fix**: replaced fragile `expect("listener set...")`
+    invariants with defensive `if let` branches (orphan-close stream
+    or `stop()` if the invariant is ever violated).
+  - **Eiffel fix**: `Driver` previously fabricated a fake
+    `Bind { Timeout }` for any non-`Replied` `CallOutcome`. Now it
+    forwards the full `CallOutcome` and `run()` discriminates
+    `Full`/`Closed`/`Timeout` honestly via `anyhow::bail!`.
+  - Tests added:
+    `second_start_returns_already_started_without_rebinding`,
+    `stop_with_pending_accept_closes_listener_cleanly`,
+    `stop_before_bound_completes_does_not_leave_listener_held`,
+    `empty_host_policy_value_is_typed_error`,
+    `empty_http_host_policy_is_typed_error`.
+
 - Post-review fixes (PR feedback round 2):
   - Boxed `HttpClientMsg::Call(Box<OutboundCall>)` to silence
     `clippy::large_enum_variant` — `OutboundCall` carries an

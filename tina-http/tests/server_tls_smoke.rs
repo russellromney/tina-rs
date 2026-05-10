@@ -82,6 +82,7 @@ struct Driver {
     sender: mpsc::Sender<DriverOutcome>,
 }
 
+#[derive(Debug)]
 enum DriverOutcome {
     Replied(Result<HttpsReady, HttpsStartupError>),
     NonReply(&'static str),
@@ -281,6 +282,220 @@ fn observe_next_tls_bound_resolves_when_listener_binds() {
 }
 
 #[test]
+fn second_start_returns_already_started_without_rebinding() {
+    let GeneratedIdentity { identity, cert_der: _ } = generate_identity();
+
+    let runtime = build_runtime();
+    let counter = runtime
+        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
+        .expect("register counter");
+    let listener_isolate = HttpsListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        counter,
+        HttpsServerConfig::dev(identity),
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register https listener");
+
+    // First Start succeeds and binds.
+    let (tx_a, rx_a) = mpsc::channel();
+    let driver_a = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_a }, 8)
+        .expect("register driver A");
+    runtime
+        .try_send(
+            driver_a,
+            DriverMsg::Begin {
+                listener,
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .expect("send Begin A");
+    let outcome_a = rx_a
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first startup reply");
+    assert!(
+        matches!(outcome_a, DriverOutcome::Replied(Ok(_))),
+        "first Start should succeed, got {outcome_a:?}"
+    );
+
+    // Second Start replies AlreadyStarted; no second tls_bind issued.
+    let (tx_b, rx_b) = mpsc::channel();
+    let driver_b = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx_b }, 8)
+        .expect("register driver B");
+    runtime
+        .try_send(
+            driver_b,
+            DriverMsg::Begin {
+                listener,
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .expect("send Begin B");
+    let outcome_b = rx_b
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second startup reply");
+    assert!(
+        matches!(
+            outcome_b,
+            DriverOutcome::Replied(Err(HttpsStartupError::AlreadyStarted))
+        ),
+        "second Start should reply AlreadyStarted, got {outcome_b:?}"
+    );
+
+    let _ = runtime.try_send(listener, HttpsListenerMsg::Stop);
+    let trace = runtime.shutdown().unwrap_or_default();
+    let tls_bind_completions = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                tina_runtime::RuntimeEventKind::CallCompleted {
+                    call_kind: tina_runtime::CallKind::TlsBind,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        tls_bind_completions, 1,
+        "exactly one tls_bind should have completed (got {tls_bind_completions})",
+    );
+}
+
+#[test]
+fn stop_with_pending_accept_closes_listener_cleanly() {
+    // Repro for the resource-leak bug: Stop sent while a tls_accept
+    // is in flight previously triggered ResourceBusy on
+    // tls_close_listener. The fix defers the close until the
+    // pending accept lands. The trace must show a clean
+    // TlsListenerClose completion (not CallFailed).
+    let GeneratedIdentity { identity, cert_der: _ } = generate_identity();
+
+    let runtime = build_runtime();
+    let counter = runtime
+        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
+        .expect("register counter");
+    let listener_isolate = HttpsListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        counter,
+        HttpsServerConfig::dev(identity),
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register https listener");
+
+    let (tx, rx) = mpsc::channel();
+    let driver = runtime
+        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 8)
+        .expect("register driver");
+    runtime
+        .try_send(
+            driver,
+            DriverMsg::Begin {
+                listener,
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .expect("send Begin");
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("startup reply");
+    assert!(matches!(outcome, DriverOutcome::Replied(Ok(_))));
+
+    // Stop while tls_accept is in flight (no client connecting).
+    let stopped = runtime.observe_isolate_complete(listener);
+    runtime
+        .try_send(listener, HttpsListenerMsg::Stop)
+        .expect("send Stop");
+    stopped
+        .wait(Duration::from_secs(5))
+        .expect("listener isolate stops cleanly after Stop");
+
+    let trace = runtime.shutdown().unwrap_or_default();
+    let listener_close_completed = trace.iter().any(|event| {
+        matches!(
+            event.kind(),
+            tina_runtime::RuntimeEventKind::CallCompleted {
+                call_kind: tina_runtime::CallKind::TlsListenerClose,
+                ..
+            }
+        )
+    });
+    let listener_close_failed = trace.iter().any(|event| {
+        matches!(
+            event.kind(),
+            tina_runtime::RuntimeEventKind::CallFailed {
+                call_kind: tina_runtime::CallKind::TlsListenerClose,
+                ..
+            }
+        )
+    });
+    assert!(
+        listener_close_completed,
+        "tls_close_listener must complete cleanly; trace: {trace:#?}",
+    );
+    assert!(
+        !listener_close_failed,
+        "tls_close_listener must not fail with ResourceBusy; trace: {trace:#?}",
+    );
+}
+
+#[test]
+fn stop_before_bound_completes_does_not_leave_listener_held() {
+    // Stop sent before the user observes Bound: the listener may
+    // already be in the lane (Bound landed first in the mailbox)
+    // or still pending (Stop landed first). Either way, the
+    // listener isolate must close out cleanly without holding a
+    // TlsListenerId.
+    let GeneratedIdentity { identity, cert_der: _ } = generate_identity();
+
+    let runtime = build_runtime();
+    let counter = runtime
+        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
+        .expect("register counter");
+    let listener_isolate = HttpsListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        counter,
+        HttpsServerConfig::dev(identity),
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register https listener");
+
+    let stopped = runtime.observe_isolate_complete(listener);
+    // Pipeline Start and Stop into the mailbox back-to-back; the
+    // worker may schedule them in either order, but both
+    // outcomes must converge on a clean shutdown.
+    runtime
+        .try_send(listener, HttpsListenerMsg::Start)
+        .expect("send Start");
+    runtime
+        .try_send(listener, HttpsListenerMsg::Stop)
+        .expect("send Stop");
+    stopped
+        .wait(Duration::from_secs(5))
+        .expect("listener stops cleanly");
+
+    let trace = runtime.shutdown().unwrap_or_default();
+    let listener_close_failed = trace.iter().any(|event| {
+        matches!(
+            event.kind(),
+            tina_runtime::RuntimeEventKind::CallFailed {
+                call_kind: tina_runtime::CallKind::TlsListenerClose,
+                ..
+            }
+        )
+    });
+    assert!(
+        !listener_close_failed,
+        "tls_close_listener must not fail with ResourceBusy or similar; trace: {trace:#?}",
+    );
+}
+
+#[test]
 fn https_listener_typed_failure_on_invalid_key_does_not_leak_listener() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     // Real cert + garbage private key → rustls `with_single_cert` fails.
@@ -332,6 +547,9 @@ fn https_listener_typed_failure_on_invalid_key_does_not_leak_listener() {
             "expected typed bind failure on invalid key, got HttpsReady at {addr}",
             addr = ready.local_addr,
         ),
+        DriverOutcome::Replied(Err(other)) => {
+            panic!("expected Bind {{ TlsCertificate }}, got {other:?}")
+        }
         DriverOutcome::NonReply(reason) => panic!("startup call did not reply: {reason}"),
     }
 

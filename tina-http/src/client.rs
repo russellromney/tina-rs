@@ -368,6 +368,12 @@ fn apply_host_policy(
     let Some(policy_value) = policy_value else {
         return Ok(request);
     };
+    // Empty host is a valid `HeaderValue` byte string but produces
+    // `Host: \r\n` on the wire — silently surprising. Reject so the
+    // user picks `host: None` if that was the intent.
+    if policy_value.is_empty() {
+        return Err(HttpClientError::InvalidHostHeaderValue);
+    }
     if request.headers.contains_key(HOST) {
         return Err(HttpClientError::DuplicateHostHeader);
     }

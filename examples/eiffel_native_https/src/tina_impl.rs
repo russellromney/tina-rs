@@ -55,8 +55,11 @@ enum DriverMsg {
     Returned(CallOutcome<Result<HttpsReady, HttpsStartupError>>),
 }
 
+/// Forward the full `CallOutcome` so the example surfaces the real
+/// reason a non-`Replied` outcome happened — `Full`, `Closed`, or
+/// `Timeout` are distinct from a typed `HttpsStartupError`.
 struct Driver {
-    sender: mpsc::Sender<Result<HttpsReady, HttpsStartupError>>,
+    sender: mpsc::Sender<CallOutcome<Result<HttpsReady, HttpsStartupError>>>,
 }
 
 #[tina::isolate(message = DriverMsg, call = RuntimeCall<DriverMsg>)]
@@ -70,16 +73,8 @@ impl Driver {
             DriverMsg::Start { listener, timeout } => {
                 call(listener, HttpsListenerMsg::Start, timeout).reply(DriverMsg::Returned)
             }
-            DriverMsg::Returned(CallOutcome::Replied(inner)) => {
-                let _ = self.sender.send(inner);
-                stop()
-            }
-            DriverMsg::Returned(_) => {
-                let _ = self
-                    .sender
-                    .send(Err(HttpsStartupError::Bind {
-                        source: tina_runtime::CallError::Timeout,
-                    }));
+            DriverMsg::Returned(outcome) => {
+                let _ = self.sender.send(outcome);
                 stop()
             }
         }
@@ -123,10 +118,18 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
 
-    let ready = rx
+    let outcome = rx
         .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| anyhow::anyhow!("https startup never replied"))?
-        .map_err(|e| anyhow::anyhow!("https startup failed: {e:?}"))?;
+        .map_err(|_| anyhow::anyhow!("https startup never replied"))?;
+    let ready = match outcome {
+        CallOutcome::Replied(Ok(ready)) => ready,
+        CallOutcome::Replied(Err(error)) => {
+            anyhow::bail!("https startup failed: {error:?}")
+        }
+        CallOutcome::Full => anyhow::bail!("https startup call back-pressured (mailbox full)"),
+        CallOutcome::Closed => anyhow::bail!("https listener closed before reply"),
+        CallOutcome::Timeout => anyhow::bail!("https startup timed out before listener replied"),
+    };
 
     let report = scripted_client(ready.local_addr, identity_bundle.cert_der);
 

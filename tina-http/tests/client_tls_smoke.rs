@@ -240,6 +240,41 @@ fn explicit_host_policy_overrides_default() {
 }
 
 #[test]
+fn empty_host_policy_value_is_typed_error() {
+    // Empty Host on the wire (`Host: \r\n`) is silently surprising;
+    // reject so the user picks `host: None` if that was the intent.
+    let bundle = build_cert_bundle();
+    let addr = spawn_one_shot_https_server(bundle.server_config);
+    let trust = TlsTrustRoots::from_der(vec![bundle.cert_der]);
+    let target = HttpTarget::Https {
+        addr,
+        server_name: "localhost".to_string(),
+        trust_roots: trust,
+        host: HttpHostPolicy::Explicit(String::new()),
+    };
+    let result = run_one_fetch(target, empty_request("/host"));
+    assert!(
+        matches!(result, Err(HttpClientError::InvalidHostHeaderValue)),
+        "expected InvalidHostHeaderValue for empty policy, got {result:?}"
+    );
+}
+
+#[test]
+fn empty_http_host_policy_is_typed_error() {
+    // Symmetric proof for plain HTTP targets.
+    use std::net::TcpListener as StdTcpListener;
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind plain");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    let target = HttpTarget::http_with_host(addr, "");
+    let result = run_one_fetch(target, empty_request("/"));
+    assert!(
+        matches!(result, Err(HttpClientError::InvalidHostHeaderValue)),
+        "expected InvalidHostHeaderValue on empty HTTP host, got {result:?}"
+    );
+}
+
+#[test]
 fn invalid_host_policy_value_is_typed_error() {
     // Failure surfaces at encode — no tls_connect runs. `\n` makes
     // `HeaderValue::from_str` reject the policy value.
