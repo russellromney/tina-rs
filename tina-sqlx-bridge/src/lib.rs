@@ -24,6 +24,37 @@
 //!   `pg_cancel_backend(pid)` against the captured backend so
 //!   Postgres stops actually executing the query.
 //!
+//! # Cargo features (value types)
+//!
+//! Beyond the boring core (`bool`, `i64`, `f64`, `String`,
+//! `Vec<u8>`), wider Postgres types are gated behind cargo features.
+//! Each feature pulls the matching SQLx feature too, so SQLx itself
+//! can encode and decode the type:
+//!
+//! - `uuid` — `PgValue::Uuid(uuid::Uuid)` <-> Postgres `UUID`.
+//! - `json` — `PgValue::Json(serde_json::Value)` <-> Postgres
+//!   `JSON` and `JSONB` (both decode to the same Rust value; bind
+//!   sends as `JSONB`).
+//! - `numeric` — `PgValue::Numeric(rust_decimal::Decimal)` <->
+//!   Postgres `NUMERIC`. `Decimal` carries up to 28-29 significant
+//!   digits.
+//! - `time` — temporal types via the `time` crate:
+//!   `Timestamp(PrimitiveDateTime)` for `TIMESTAMP`,
+//!   `TimestampTz(OffsetDateTime)` for `TIMESTAMPTZ`,
+//!   `Date(Date)` for `DATE`.
+//!
+//! Trade-offs the crate has already made:
+//!
+//! - `rust_decimal` over `bigdecimal` — fits in 16 bytes, fast,
+//!   covers the common case. Users who need arbitrary precision
+//!   should ask for a `bigdecimal` feature in a follow-up.
+//! - `time` over `chrono` — fewer transitive deps, tighter API. A
+//!   `chrono` feature can be added side by side later.
+//!
+//! Columns whose Postgres type isn't enabled (or isn't covered at
+//! all) decode to [`PgError::Decode`] with the type name. Nothing is
+//! silently coerced.
+//!
 //! Generic `sqlx::Database` support, user-struct row mapping, an
 //! ORM, migrations, and a transaction *handle* (vs. atomic script)
 //! are explicit non-goals. See the phase plan for the declined set

@@ -18,6 +18,20 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
     "macros",
 ] }
+# Optional value-type extensions. Each is off by default; the
+# `PgValue` variant, From/accessor impls, and encode/decode branches
+# only exist when the matching cargo feature is on. The crate also
+# enables the corresponding sqlx feature so SQLx itself can encode
+# and decode the type.
+uuid = { version = "1", default-features = false, optional = true }
+serde_json = { version = "1", default-features = false, features = [
+    "std",
+], optional = true }
+rust_decimal = { version = "1", default-features = false, optional = true }
+time = { version = "0.3", default-features = false, features = [
+    "std",
+    "macros",
+], optional = true }
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "rt-multi-thread",
@@ -40,3 +54,22 @@ tracing = { version = "0.1", default-features = false, features = [
 [features]
 default = []
 tracing = ["dep:tracing"]
+# Postgres `UUID` <-> `uuid::Uuid` round trips.
+uuid = ["dep:uuid", "sqlx/uuid"]
+# Postgres `JSON` and `JSONB` <-> `serde_json::Value` round trips.
+# Both Postgres types decode to the same Rust value; the bridge
+# does not distinguish JSON vs JSONB on the read path.
+json = ["dep:serde_json", "sqlx/json"]
+# Postgres `NUMERIC` <-> `rust_decimal::Decimal` round trips.
+# `Decimal` carries up to 28-29 significant digits; users who need
+# arbitrary precision should reach for a future `bigdecimal`
+# feature instead.
+numeric = ["dep:rust_decimal", "sqlx/rust_decimal"]
+# Postgres temporal types via the `time` crate:
+# - `TIMESTAMPTZ` <-> `time::OffsetDateTime`
+# - `TIMESTAMP`   <-> `time::PrimitiveDateTime`
+# - `DATE`        <-> `time::Date`
+# We use `time` over `chrono` because it has fewer transitive deps
+# and a tighter API surface; a separate `chrono` feature can be
+# added later if there's demand.
+time = ["dep:time", "sqlx/time"]

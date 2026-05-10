@@ -9,12 +9,14 @@ pub(crate) const MAX_MAILBOX_CAPACITY: usize = 1 << 20;
 
 /// Postgres value at the bridge boundary.
 ///
-/// First form is intentionally narrow: the six types most queries
-/// actually use. Anything else (UUID, NUMERIC, JSON/B, TIMESTAMP,
-/// arrays) decodes to [`PgError::Decode`] today and earns first-class
-/// support in a follow-up. The narrow set keeps the bridge honest:
-/// every variant has a matching encode and decode path, and unknown
-/// types fail visibly instead of being silently coerced to TEXT.
+/// The base variants cover the boring core of Postgres types: bool,
+/// signed integers up to 64 bits, float, text, and bytes. Wider
+/// types (UUID, JSON/B, NUMERIC, temporal) are gated behind cargo
+/// features (`uuid`, `json`, `numeric`, `time`); enabling the
+/// feature pulls the matching SQLx feature too, so the bridge can
+/// encode and decode the type. Unsupported column types still fail
+/// visibly with [`PgError::Decode`] rather than being silently
+/// coerced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PgValue {
     /// SQL `NULL`. On bind, the null is sent untyped and Postgres
@@ -33,6 +35,30 @@ pub enum PgValue {
     String(String),
     /// Postgres `BYTEA`.
     Bytes(Vec<u8>),
+    /// Postgres `UUID`. Available when the `uuid` feature is on.
+    #[cfg(feature = "uuid")]
+    Uuid(uuid::Uuid),
+    /// Postgres `JSON` or `JSONB`. Available when the `json` feature
+    /// is on. Both Postgres types decode to the same `serde_json::Value`;
+    /// on bind, the value is sent as `JSONB`.
+    #[cfg(feature = "json")]
+    Json(serde_json::Value),
+    /// Postgres `NUMERIC`. Available when the `numeric` feature is
+    /// on. `rust_decimal::Decimal` carries up to 28-29 significant
+    /// digits; values past that range round-trip lossily.
+    #[cfg(feature = "numeric")]
+    Numeric(rust_decimal::Decimal),
+    /// Postgres `TIMESTAMP` (without time zone). Available when the
+    /// `time` feature is on.
+    #[cfg(feature = "time")]
+    Timestamp(time::PrimitiveDateTime),
+    /// Postgres `TIMESTAMPTZ` (with time zone). Available when the
+    /// `time` feature is on.
+    #[cfg(feature = "time")]
+    TimestampTz(time::OffsetDateTime),
+    /// Postgres `DATE`. Available when the `time` feature is on.
+    #[cfg(feature = "time")]
+    Date(time::Date),
 }
 
 impl PgValue {
@@ -78,6 +104,66 @@ impl PgValue {
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner [`uuid::Uuid`] if this is `Uuid`. None
+    /// otherwise.
+    #[cfg(feature = "uuid")]
+    pub fn as_uuid(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Uuid(u) => Some(*u),
+            _ => None,
+        }
+    }
+
+    /// Borrow the inner [`serde_json::Value`] if this is `Json`. None
+    /// otherwise.
+    #[cfg(feature = "json")]
+    pub fn as_json(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Json(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner [`rust_decimal::Decimal`] if this is
+    /// `Numeric`. None otherwise.
+    #[cfg(feature = "numeric")]
+    pub fn as_numeric(&self) -> Option<rust_decimal::Decimal> {
+        match self {
+            Self::Numeric(d) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner [`time::PrimitiveDateTime`] if this is
+    /// `Timestamp`. None otherwise.
+    #[cfg(feature = "time")]
+    pub fn as_timestamp(&self) -> Option<time::PrimitiveDateTime> {
+        match self {
+            Self::Timestamp(t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner [`time::OffsetDateTime`] if this is
+    /// `TimestampTz`. None otherwise.
+    #[cfg(feature = "time")]
+    pub fn as_timestamptz(&self) -> Option<time::OffsetDateTime> {
+        match self {
+            Self::TimestampTz(t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner [`time::Date`] if this is `Date`. None
+    /// otherwise.
+    #[cfg(feature = "time")]
+    pub fn as_date(&self) -> Option<time::Date> {
+        match self {
+            Self::Date(d) => Some(*d),
             _ => None,
         }
     }
@@ -216,6 +302,48 @@ impl From<&[u8]> for PgValue {
 impl<const N: usize> From<&[u8; N]> for PgValue {
     fn from(v: &[u8; N]) -> Self {
         Self::Bytes(v.to_vec())
+    }
+}
+
+#[cfg(feature = "uuid")]
+impl From<uuid::Uuid> for PgValue {
+    fn from(v: uuid::Uuid) -> Self {
+        Self::Uuid(v)
+    }
+}
+
+#[cfg(feature = "json")]
+impl From<serde_json::Value> for PgValue {
+    fn from(v: serde_json::Value) -> Self {
+        Self::Json(v)
+    }
+}
+
+#[cfg(feature = "numeric")]
+impl From<rust_decimal::Decimal> for PgValue {
+    fn from(v: rust_decimal::Decimal) -> Self {
+        Self::Numeric(v)
+    }
+}
+
+#[cfg(feature = "time")]
+impl From<time::PrimitiveDateTime> for PgValue {
+    fn from(v: time::PrimitiveDateTime) -> Self {
+        Self::Timestamp(v)
+    }
+}
+
+#[cfg(feature = "time")]
+impl From<time::OffsetDateTime> for PgValue {
+    fn from(v: time::OffsetDateTime) -> Self {
+        Self::TimestampTz(v)
+    }
+}
+
+#[cfg(feature = "time")]
+impl From<time::Date> for PgValue {
+    fn from(v: time::Date) -> Self {
+        Self::Date(v)
     }
 }
 
@@ -608,6 +736,48 @@ impl PgRow {
     /// not a bytea cell.
     pub fn get_bytes(&self, idx: usize) -> Option<&[u8]> {
         self.col(idx).and_then(PgValue::as_bytes)
+    }
+
+    /// Read column `idx` as `uuid::Uuid`. None if missing column,
+    /// NULL, or not a uuid cell.
+    #[cfg(feature = "uuid")]
+    pub fn get_uuid(&self, idx: usize) -> Option<uuid::Uuid> {
+        self.col(idx).and_then(PgValue::as_uuid)
+    }
+
+    /// Borrow column `idx` as `serde_json::Value`. None if missing
+    /// column, NULL, or not a json/jsonb cell.
+    #[cfg(feature = "json")]
+    pub fn get_json(&self, idx: usize) -> Option<&serde_json::Value> {
+        self.col(idx).and_then(PgValue::as_json)
+    }
+
+    /// Read column `idx` as `rust_decimal::Decimal`. None if missing
+    /// column, NULL, or not a numeric cell.
+    #[cfg(feature = "numeric")]
+    pub fn get_numeric(&self, idx: usize) -> Option<rust_decimal::Decimal> {
+        self.col(idx).and_then(PgValue::as_numeric)
+    }
+
+    /// Read column `idx` as `time::PrimitiveDateTime`. None if
+    /// missing column, NULL, or not a timestamp cell.
+    #[cfg(feature = "time")]
+    pub fn get_timestamp(&self, idx: usize) -> Option<time::PrimitiveDateTime> {
+        self.col(idx).and_then(PgValue::as_timestamp)
+    }
+
+    /// Read column `idx` as `time::OffsetDateTime`. None if missing
+    /// column, NULL, or not a timestamptz cell.
+    #[cfg(feature = "time")]
+    pub fn get_timestamptz(&self, idx: usize) -> Option<time::OffsetDateTime> {
+        self.col(idx).and_then(PgValue::as_timestamptz)
+    }
+
+    /// Read column `idx` as `time::Date`. None if missing column,
+    /// NULL, or not a date cell.
+    #[cfg(feature = "time")]
+    pub fn get_date(&self, idx: usize) -> Option<time::Date> {
+        self.col(idx).and_then(PgValue::as_date)
     }
 }
 

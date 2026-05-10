@@ -90,6 +90,52 @@ fn pg_value_into_consumes_without_clone() {
     assert_eq!(PgValue::I64(1).into_string(), None);
 }
 
+#[cfg(feature = "uuid")]
+#[test]
+fn pg_value_uuid_round_trip_through_from_and_accessor() {
+    let id = uuid::Uuid::from_u128(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef);
+    let v: PgValue = id.into();
+    assert_eq!(v, PgValue::Uuid(id));
+    assert_eq!(v.as_uuid(), Some(id));
+    assert_eq!(PgValue::I64(1).as_uuid(), None);
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn pg_value_json_round_trip() {
+    let payload = serde_json::json!({ "k": "v", "n": 7 });
+    let v: PgValue = payload.clone().into();
+    match &v {
+        PgValue::Json(inner) => assert_eq!(inner, &payload),
+        _ => panic!("expected Json"),
+    }
+    assert_eq!(v.as_json(), Some(&payload));
+}
+
+#[cfg(feature = "numeric")]
+#[test]
+fn pg_value_numeric_round_trip() {
+    use core::str::FromStr;
+    let d = rust_decimal::Decimal::from_str("3.14159").unwrap();
+    let v: PgValue = d.into();
+    assert_eq!(v, PgValue::Numeric(d));
+    assert_eq!(v.as_numeric(), Some(d));
+}
+
+#[cfg(feature = "time")]
+#[test]
+fn pg_value_temporal_round_trip() {
+    use time::macros::{date, datetime, time as t};
+    let d = date!(2024 - 03 - 14);
+    let dt = time::PrimitiveDateTime::new(d, t!(09:30:00));
+    let dtz = datetime!(2024-03-14 09:30:00 UTC);
+    assert_eq!(PgValue::from(d).as_date(), Some(d));
+    assert_eq!(PgValue::from(dt).as_timestamp(), Some(dt));
+    assert_eq!(PgValue::from(dtz).as_timestamptz(), Some(dtz));
+    // Wrong-shape accessors return None.
+    assert_eq!(PgValue::from(d).as_timestamp(), None);
+}
+
 // ---------------------------------------------------------------------------
 // Row accessors
 // ---------------------------------------------------------------------------

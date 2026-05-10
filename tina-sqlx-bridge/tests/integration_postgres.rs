@@ -21,6 +21,13 @@ use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
 };
+#[cfg(any(
+    feature = "uuid",
+    feature = "json",
+    feature = "numeric",
+    feature = "time"
+))]
+use tina_sqlx_bridge::PgValue;
 use tina_sqlx_bridge::{
     InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgPoolConfig, PgRequest,
     PgResponse, PgRows, PgStep, PgStepOk, PgTransactionOutcome, PgWorker, send_request,
@@ -1158,6 +1165,212 @@ fn cancel_on_timeout_disabled_by_default_no_cancels_sent() {
         snap.db_cancels_sent, 0,
         "cancel must stay off by default: {snap:?}",
     );
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn unsupported_type_decode_hints_at_feature() {
+    // Without the `time` feature, a TIMESTAMPTZ column decodes to
+    // PgError::Decode with a hint pointing at the cargo feature
+    // that fixes it. This test runs whether or not the feature is
+    // enabled — when it is, the column decodes successfully and
+    // we skip the assertion. The point is locking the
+    // turn-this-feature-on hint for the unfeatured build.
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT now()::TIMESTAMPTZ"),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        // `time` feature off path: hint must call out the feature.
+        #[cfg(not(feature = "time"))]
+        CallOutcome::Replied(Err(PgError::Decode(msg))) => {
+            assert!(
+                msg.contains("\"time\" feature"),
+                "expected hint about the time feature, got {msg}",
+            );
+        }
+        // `time` feature on path: column decodes cleanly.
+        #[cfg(feature = "time")]
+        CallOutcome::Replied(Ok(PgResponse::Row(_))) => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn uuid_round_trip() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let id = uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT $1::UUID").param(PgValue::from(id)),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.col(0).and_then(PgValue::as_uuid), Some(id));
+        }
+        other => panic!("uuid: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[cfg(feature = "json")]
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn json_and_jsonb_round_trip() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let payload = serde_json::json!({ "k": "v", "n": 7, "list": [1, 2] });
+
+    // JSONB
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT $1::JSONB").param(PgValue::from(payload.clone())),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.col(0).and_then(PgValue::as_json), Some(&payload));
+        }
+        other => panic!("jsonb: {other:?}"),
+    }
+
+    // JSON (not JSONB) — same Rust type, different Postgres column.
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT '{\"k\":\"v\"}'::JSON"),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            let v = row.col(0).and_then(PgValue::as_json).expect("json cell");
+            assert_eq!(v, &serde_json::json!({ "k": "v" }));
+        }
+        other => panic!("json: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[cfg(feature = "numeric")]
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn numeric_round_trip() {
+    use core::str::FromStr;
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let d = rust_decimal::Decimal::from_str("12345.678901234").unwrap();
+
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT $1::NUMERIC").param(PgValue::from(d)),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.col(0).and_then(PgValue::as_numeric), Some(d));
+        }
+        other => panic!("numeric: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[cfg(feature = "time")]
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn temporal_round_trip() {
+    use time::macros::{date, datetime, time as t};
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+
+    let d = date!(2024 - 06 - 15);
+    let dt = time::PrimitiveDateTime::new(d, t!(12:34:56));
+    let dtz = datetime!(2024-06-15 12:34:56 UTC);
+
+    // DATE
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT $1::DATE").param(PgValue::from(d)),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.col(0).and_then(PgValue::as_date), Some(d));
+        }
+        other => panic!("date: {other:?}"),
+    }
+
+    // TIMESTAMP
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT $1::TIMESTAMP").param(PgValue::from(dt)),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.col(0).and_then(PgValue::as_timestamp), Some(dt));
+        }
+        other => panic!("timestamp: {other:?}"),
+    }
+
+    // TIMESTAMPTZ
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT $1::TIMESTAMPTZ").param(PgValue::from(dtz)),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.col(0).and_then(PgValue::as_timestamptz), Some(dtz));
+        }
+        other => panic!("timestamptz: {other:?}"),
+    }
     shutdown(runtime);
 }
 

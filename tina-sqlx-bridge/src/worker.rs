@@ -1036,6 +1036,18 @@ fn bind_param<'q>(
         PgValue::F64(f) => q.bind(f),
         PgValue::String(s) => q.bind(s),
         PgValue::Bytes(b) => q.bind(b),
+        #[cfg(feature = "uuid")]
+        PgValue::Uuid(u) => q.bind(u),
+        #[cfg(feature = "json")]
+        PgValue::Json(v) => q.bind(v),
+        #[cfg(feature = "numeric")]
+        PgValue::Numeric(d) => q.bind(d),
+        #[cfg(feature = "time")]
+        PgValue::Timestamp(t) => q.bind(t),
+        #[cfg(feature = "time")]
+        PgValue::TimestampTz(t) => q.bind(t),
+        #[cfg(feature = "time")]
+        PgValue::Date(d) => q.bind(d),
     }
 }
 
@@ -1071,10 +1083,36 @@ fn decode_cell(row: &SqlxRow, idx: usize, type_name: &str) -> Result<PgValue, Pg
             PgValue::String(try_get!(String)?)
         }
         "BYTEA" => PgValue::Bytes(try_get!(Vec<u8>)?),
+        #[cfg(feature = "uuid")]
+        "UUID" => PgValue::Uuid(try_get!(uuid::Uuid)?),
+        #[cfg(feature = "json")]
+        "JSON" | "JSONB" => PgValue::Json(try_get!(serde_json::Value)?),
+        #[cfg(feature = "numeric")]
+        "NUMERIC" => PgValue::Numeric(try_get!(rust_decimal::Decimal)?),
+        #[cfg(feature = "time")]
+        "TIMESTAMP" => PgValue::Timestamp(try_get!(time::PrimitiveDateTime)?),
+        #[cfg(feature = "time")]
+        "TIMESTAMPTZ" => PgValue::TimestampTz(try_get!(time::OffsetDateTime)?),
+        #[cfg(feature = "time")]
+        "DATE" => PgValue::Date(try_get!(time::Date)?),
         other => {
-            return Err(PgError::Decode(format!(
-                "column {idx}: unsupported Postgres type {other}"
-            )));
+            // Hint the cargo-feature fix for types we recognize but
+            // don't have enabled; otherwise just name the type.
+            let hint = match other {
+                "UUID" => Some("uuid"),
+                "JSON" | "JSONB" => Some("json"),
+                "NUMERIC" => Some("numeric"),
+                "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" => Some("time"),
+                _ => None,
+            };
+            let detail = match hint {
+                Some(feat) => format!(
+                    "column {idx}: Postgres type {other} requires the \"{feat}\" \
+                     feature on tina-sqlx-bridge",
+                ),
+                None => format!("column {idx}: unsupported Postgres type {other}"),
+            };
+            return Err(PgError::Decode(detail));
         }
     })
 }
