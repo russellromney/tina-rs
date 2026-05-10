@@ -59,7 +59,7 @@ pub fn run() -> anyhow::Result<Report> {
     });
 
     let server_addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
-    let (bytes, ok, wall_ms) = slow_reader_client(server_addr);
+    let (bytes, ok, wall_ms) = slow_reader_client(server_addr, "/big");
     let _ = shutdown_tx.send(());
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -77,5 +77,7 @@ pub fn run() -> anyhow::Result<Report> {
         exit_clean: true,
         tokio_response_alloc_floor: Some(TOKIO_RESPONSE_ALLOC_FLOOR),
         tina_response_high_water: None,
+        tina_chunked_decoded_bytes: None,
+        tina_chunked_wire_bytes: None,
     })
 }

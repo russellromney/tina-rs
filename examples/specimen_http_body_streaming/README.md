@@ -32,10 +32,19 @@ Both sides:
 side=tokio bytes_received=262144 status_ok=true wall_clock_ms=~600
            exit_clean=true tokio_response_alloc_floor=262144
            tina_response_high_water=n/a
+           tina_chunked_wire_bytes=n/a tina_chunked_decoded_bytes=n/a
 side=tina  bytes_received=262144 status_ok=true wall_clock_ms=~600
            exit_clean=true tokio_response_alloc_floor=n/a
            tina_response_high_water=4096
+           tina_chunked_wire_bytes=262661 tina_chunked_decoded_bytes=262144
 ```
+
+The Tina line reports two chunked numbers: `tina_chunked_wire_bytes`
+is the raw `Transfer-Encoding: chunked` body (data + framing
+overhead) and `tina_chunked_decoded_bytes` is the decoded payload.
+The decoded length matches `RESPONSE_BODY_BYTES`; the wire is
+larger by the per-chunk size header overhead. The smoke test
+asserts both.
 
 Wall-clock is similar (the slow reader paces both). The body
 footprint numbers tell the real story:

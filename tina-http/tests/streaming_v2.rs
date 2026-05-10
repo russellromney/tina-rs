@@ -225,15 +225,19 @@ fn stream_chunked_emits_transfer_encoding_chunked_with_terminator() {
 
     let snap = metrics.snapshot();
     assert!(snap.drained());
-    assert!(
-        snap.response_body_high_water > 0,
-        "body bytes were charged at least once on the chunked path"
-    );
-    assert!(
-        snap.response_body_high_water <= total_decoded.len(),
-        "high water cannot exceed total body bytes; got {}, total {}",
-        snap.response_body_high_water,
-        total_decoded.len()
+    // Peak charge is exactly the largest single chunk because the
+    // connection pulls chunk N+1 only after chunk N drains. The
+    // chunks here are 7, 8, 5 bytes; 8 is the max.
+    let largest_chunk = vec![b"hello, ".len(), b"chunked ".len(), b"world".len()]
+        .into_iter()
+        .max()
+        .unwrap();
+    assert_eq!(largest_chunk, 8);
+    assert_eq!(
+        snap.response_body_high_water, largest_chunk,
+        "peak body in flight equals the largest single chunk; \
+         got {}, expected {}",
+        snap.response_body_high_water, largest_chunk
     );
     assert_eq!(snap.body_io_error_count, 0, "chunked happy path");
 }
@@ -315,9 +319,13 @@ fn early_client_close_during_chunked_records_body_io_error() {
         snap.drained(),
         "all charges release on shutdown even mid-stream; got {snap:?}"
     );
+    // Bounded both ways: at least one io_error (the client did
+    // close mid-stream), at most a few — a regression that
+    // counted per byte rather than per failed write would push
+    // this well over 4.
     assert!(
-        snap.body_io_error_count >= 1,
-        "client close mid-stream must surface as at least one body_io_error; got {snap:?}"
+        (1..=4).contains(&snap.body_io_error_count),
+        "client close mid-stream must surface as 1..=4 body_io_errors; got {snap:?}"
     );
 }
 

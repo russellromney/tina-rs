@@ -821,7 +821,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             }
             CallOutcome::Timeout => {
                 // Source took too long to produce the next chunk.
+                // The wire is now in an incomplete state — for
+                // known-length streams the Content-Length is short,
+                // for chunked streams there is no terminator. Both
+                // are user-visible truncations. We record the
+                // *cause* (timeout) and the *symptom*
+                // (io_error/truncation) so a snapshot reader can
+                // see both why and what.
                 self.record_body_timeout();
+                self.record_body_io_error();
                 self.stream_source = None;
                 self.stream_chunked = false;
                 self.begin_close()
@@ -861,10 +869,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     /// Frames `bytes` as one HTTP/1.1 chunked-transfer chunk:
     /// `<size in hex>\r\n<bytes>\r\n`. Body charge counts only the
-    /// data bytes, not the framing overhead.
+    /// data bytes, not the framing overhead. Hex digits are
+    /// lowercase for parity with curl/hyper/nginx — the spec
+    /// allows either case but the wire convention is lowercase.
     fn write_chunked_data(&mut self, bytes: Vec<u8>) -> Effect<Self> {
         let n = bytes.len();
-        let mut framed = format!("{:X}\r\n", n).into_bytes();
+        let mut framed = format!("{:x}\r\n", n).into_bytes();
         framed.extend_from_slice(&bytes);
         framed.extend_from_slice(b"\r\n");
         self.pending_response = framed;

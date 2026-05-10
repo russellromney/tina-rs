@@ -2,6 +2,7 @@
 //! chunk source — no custom `Isolate` impl. The service routes
 //! `/big` to a known-length stream and `/big-chunked` to an
 //! unknown-length stream framed by `Transfer-Encoding: chunked`.
+//! The smoke run exercises both routes.
 //!
 //! The `BodyMetrics` shared with the listener records the
 //! response-body high-water across the whole run. Each chunk is
@@ -23,11 +24,13 @@ use tina_http::{
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 
-use crate::{CHUNK_BYTES, RESPONSE_BODY_BYTES, Report, slow_reader_client};
+use crate::{
+    CHUNK_BYTES, RESPONSE_BODY_BYTES, Report, decode_chunked, slow_reader_client,
+};
 
 /// Service: `/big` returns a known-length stream, `/big-chunked`
 /// returns a chunked stream. Both pull from chunk sources the
-/// caller supplies — same producer, different framing.
+/// caller supplies — same producer shape, different framing.
 struct StreamingService {
     known_source: Address<ResponseChunkMsg, ResponseChunkReply>,
     chunked_source: Address<ResponseChunkMsg, ResponseChunkReply>,
@@ -61,9 +64,9 @@ impl Isolate for StreamingService {
     }
 }
 
-/// Iterator that yields exactly enough chunks to cover
-/// `RESPONSE_BODY_BYTES`. Each chunk is `CHUNK_BYTES` of the same
-/// filler byte, except the last which may be shorter.
+/// Closure-iterator that yields enough chunks to cover
+/// `RESPONSE_BODY_BYTES`. Each chunk is `CHUNK_BYTES` of `b'a'`,
+/// except the last which may be shorter.
 fn body_chunks() -> impl Iterator<Item = Vec<u8>> + Send + 'static {
     let mut sent = 0usize;
     std::iter::from_fn(move || {
@@ -77,20 +80,16 @@ fn body_chunks() -> impl Iterator<Item = Vec<u8>> + Send + 'static {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime: ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory> =
+        ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
     let metrics = BodyMetrics::new();
 
-    let known_source = runtime
-        .register_with_capacity::<IterBodySource<SingleShard>, Infallible>(
-            IterBodySource::new(body_chunks()),
-            16,
-        )
+    // `IterBodySource::register` wraps the iterator and registers
+    // the source isolate in one step — no turbofish, no
+    // `Infallible` placeholder.
+    let known_source = IterBodySource::<SingleShard>::register(&runtime, body_chunks(), 16)
         .map_err(|e| anyhow::anyhow!("register known source: {e:?}"))?;
-    let chunked_source = runtime
-        .register_with_capacity::<IterBodySource<SingleShard>, Infallible>(
-            IterBodySource::new(body_chunks()),
-            16,
-        )
+    let chunked_source = IterBodySource::<SingleShard>::register(&runtime, body_chunks(), 16)
         .map_err(|e| anyhow::anyhow!("register chunked source: {e:?}"))?;
     let service = runtime
         .register_with_capacity::<_, Infallible>(
@@ -121,7 +120,15 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("listener bind: {e:?}"))?;
 
-    let (bytes, ok, wall_ms) = slow_reader_client(server_addr);
+    // `/big` exercises slow-reader pressure on the known-length
+    // path; `/big-chunked` exercises round-trip + decode on the
+    // chunked path. Each chunk source is single-use so we have
+    // exactly one request per source — no need to slow-read the
+    // chunked path; the round-trip proves wire shape and the
+    // metrics already prove pressure boundedness from `/big`.
+    let (known_bytes, known_ok, wall_ms_known) = slow_reader_client(server_addr, "/big");
+    let (chunked_wire_bytes, chunked_decoded_len, chunked_ok) =
+        chunked_request_decoded(server_addr)?;
 
     runtime
         .try_send(listener, HttpListenerMsg::Stop)
@@ -130,11 +137,43 @@ pub fn run() -> anyhow::Result<Report> {
 
     let snap = metrics.snapshot();
     Ok(Report {
-        bytes_received: bytes,
-        status_ok: ok,
-        wall_clock_ms: wall_ms,
+        bytes_received: known_bytes,
+        status_ok: known_ok && chunked_ok,
+        wall_clock_ms: wall_ms_known,
         exit_clean: snap.drained(),
         tokio_response_alloc_floor: None,
         tina_response_high_water: Some(snap.response_body_high_water),
+        tina_chunked_wire_bytes: Some(chunked_wire_bytes),
+        tina_chunked_decoded_bytes: Some(chunked_decoded_len),
     })
+}
+
+/// Fetches `/big-chunked`, captures the whole response, decodes
+/// the chunked body, and verifies the head advertises chunked
+/// framing. Returns `(wire_body_bytes, decoded_bytes, status_ok)`.
+fn chunked_request_decoded(
+    addr: std::net::SocketAddr,
+) -> anyhow::Result<(usize, usize, bool)> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.write_all(b"GET /big-chunked HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let separator = b"\r\n\r\n";
+    let head_end = response
+        .windows(separator.len())
+        .position(|w| w == separator)
+        .ok_or_else(|| anyhow::anyhow!("chunked response missing CRLFCRLF"))?;
+    let head_text = std::str::from_utf8(&response[..head_end])
+        .map_err(|_| anyhow::anyhow!("chunked head not ASCII"))?;
+    let status_ok = head_text.starts_with("HTTP/1.1 200")
+        && head_text.contains("Transfer-Encoding: chunked\r\n");
+    let body_wire = &response[head_end + separator.len()..];
+    let decoded =
+        decode_chunked(body_wire).map_err(|e| anyhow::anyhow!("chunked decode failed: {e}"))?;
+    Ok((body_wire.len(), decoded.len(), status_ok))
 }

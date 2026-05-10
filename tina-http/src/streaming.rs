@@ -147,12 +147,30 @@ pub struct RequestStream {
 /// `Iterator<Item = Vec<u8>> + Send + 'static` into an [`Isolate`]
 /// that answers [`ResponseChunkMsg::Next`] by yielding the next
 /// item, or [`ResponseChunkReply::Eof`] when the iterator drains.
-/// An empty `Vec<u8>` from the iterator is treated as `Eof`.
 ///
-/// Boxes the iterator so the resulting type is `IterBodySource<S>`
-/// — one concrete type per shard — which keeps `register_with_capacity`
-/// tractable. The iterator runs once per `Next` reply, so each chunk
-/// is bounded by however much the iterator produces in one step.
+/// # Contract
+///
+/// - `Some(non_empty_bytes)` → wire chunk of those bytes.
+/// - `None` → end of stream (`Eof`).
+/// - `Some(empty_vec)` → also end of stream. The chunked-encoding
+///   wire format reserves `0\r\n\r\n` as the terminator, so an
+///   empty mid-stream chunk has no honest representation; we treat
+///   it as `Eof` rather than emit anything ambiguous.
+///
+/// # Single-use
+///
+/// The iterator drains once and is gone. After it returns `None`,
+/// every subsequent `Next` call replies `Eof`. To serve the same
+/// content again, register a fresh [`IterBodySource`] for the
+/// next request — the source isolate is per-stream, not per-route.
+///
+/// # Boxing
+///
+/// The iterator is boxed so the resulting type is
+/// `IterBodySource<S>` — one concrete type per shard — which keeps
+/// `register_with_capacity` tractable. The iterator runs once per
+/// `Next` reply, so each chunk is bounded by however much the
+/// iterator produces in one step.
 ///
 /// # Example
 ///
@@ -189,6 +207,35 @@ impl<S: Shard + 'static> IterBodySource<S> {
             iter: Box::new(iter),
             _shard: PhantomData,
         }
+    }
+
+    /// Registers an iterator-backed chunk source on `runtime` and
+    /// returns its address. Equivalent to:
+    ///
+    /// ```rust,ignore
+    /// runtime.register_with_capacity::<IterBodySource<S>, Infallible>(
+    ///     IterBodySource::new(iter),
+    ///     mailbox_capacity,
+    /// )
+    /// ```
+    ///
+    /// but without the turbofish or the `Infallible` placeholder.
+    /// Use this when you don't already have a custom registration
+    /// closure.
+    pub fn register<F, I>(
+        runtime: &tina_runtime::ThreadedRuntime<S, F>,
+        iter: I,
+        mailbox_capacity: usize,
+    ) -> Result<Address<ResponseChunkMsg, ResponseChunkReply>, tina_runtime::ThreadedRuntimeError>
+    where
+        S: Send + Sync,
+        F: tina_runtime::MailboxFactory + Send + 'static,
+        I: Iterator<Item = Vec<u8>> + Send + 'static,
+    {
+        runtime.register_with_capacity::<IterBodySource<S>, Infallible>(
+            IterBodySource::new(iter),
+            mailbox_capacity,
+        )
     }
 }
 

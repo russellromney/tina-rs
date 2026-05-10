@@ -100,9 +100,18 @@ pub use parse::{
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
 pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
+// `ResponseStream` and `ChunkedResponseStream` exist as types
+// behind the `HttpResponseBody` variants, but callers never name
+// them: the loud-API constructors `HttpResponse::stream_known_length`
+// and `HttpResponse::stream_chunked` build them directly from a
+// `(length, source)` or `source` argument. `ResponseStream` stays
+// re-exported because the older `HttpResponse::with_stream`
+// constructor takes one by value; `ChunkedResponseStream` does not
+// need a public name since there is no `with_chunked_stream`
+// equivalent — `stream_chunked` is the only constructor.
 pub use streaming::{
-    ChunkedResponseStream, IterBodySource, RequestChunkReply, RequestStream, ResponseChunkMsg,
-    ResponseChunkReply, ResponseStream,
+    IterBodySource, RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply,
+    ResponseStream,
 };
 pub use target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
 pub use transport::HttpTransport;

@@ -135,6 +135,12 @@ pub struct HttpResponse {
 ///   (`Content-Length` framing).
 /// - We do not know the length and stream the bytes —
 ///   `ChunkedStream` (`Transfer-Encoding: chunked` framing).
+///
+/// Callers usually do not construct these variants directly. The
+/// loud-API constructors on [`HttpResponse`] — [`HttpResponse::with_body`]
+/// for buffered, [`HttpResponse::stream_known_length`] for
+/// `Content-Length`, and [`HttpResponse::stream_chunked`] for
+/// chunked — pick the variant for you.
 #[derive(Debug, Clone)]
 pub enum HttpResponseBody {
     /// All response bytes built up-front by the service.
@@ -161,6 +167,13 @@ impl HttpResponseBody {
     /// Returns the declared body length when one is known. `None`
     /// for `ChunkedStream` because chunked framing is precisely the
     /// "no declared length" case.
+    ///
+    /// The `Option` is intentional: encoding callers should branch
+    /// on `Some(n)` → emit `Content-Length: n` vs `None` → emit
+    /// `Transfer-Encoding: chunked`. Returning a sentinel `0` for
+    /// chunked would confuse that branch with a genuine zero-length
+    /// body. If you only need the variant tag, match on `body`
+    /// directly.
     pub fn declared_length(&self) -> Option<usize> {
         match self {
             Self::Buffered(bytes) => Some(bytes.len()),

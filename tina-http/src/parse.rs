@@ -245,11 +245,21 @@ fn is_origin_form(target: &str) -> bool {
 
 /// Serialises a response head onto a wire buffer using HTTP/1.1 framing.
 ///
-/// Emits status line + headers + `Content-Length` (taken from the
-/// body's declared length) + optional `Connection: close` + the empty
-/// terminator line. Body bytes are *not* appended — the connection
-/// isolate writes them separately so streaming can write chunk by
-/// chunk.
+/// Emits status line + headers + framing line + optional
+/// `Connection: close` + the empty terminator line. The framing
+/// line is picked from the body variant:
+///
+/// - `Buffered(_)` / `Stream(_)` → `Content-Length: N`.
+/// - `ChunkedStream(_)`         → `Transfer-Encoding: chunked`.
+///
+/// **Caller-supplied `Content-Length` and `Transfer-Encoding`
+/// headers are dropped.** Framing is owned by the body type, not
+/// the caller. If the caller wants chunked, they build a
+/// `ChunkedStream` body; setting `Transfer-Encoding: chunked` on a
+/// `Buffered(_)` body has no effect on the wire.
+///
+/// Body bytes are *not* appended — the connection isolate writes
+/// them separately so streaming can write chunk by chunk.
 pub fn encode_response_head(
     response: &crate::types::HttpResponse,
     connection_close: bool,
