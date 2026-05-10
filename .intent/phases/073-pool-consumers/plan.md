@@ -12,10 +12,13 @@
   waiters) & force close + Stop-after-Force, HTTPS origin identity
   and real HTTPS keepalive smoke, multi-slot pool, pressure report,
   DST replay determinism.
+- Done: server-side keepalive landed in 076, and the keepalive pool is
+  now proven end-to-end against the native listener. `specimen_outbound_http`
+  uses the pooled keepalive shape.
 - In progress: none.
-- Open: Rocks 2–4 (server-side keepalive then DB pool + bridge
-  audit, then additional specimens). Rock 5 multi-shard memo waits
-  for a second consumer.
+- Open: DB pool consumers moved to 077. Bridge convention audit moved
+  to 081. Host-side ergonomics moved to 078. Cancellation follow-up
+  moved to 079.
 - Deferred: multi-shard pool, keyed cluster pool, automatic lease
   reclaim.
 
