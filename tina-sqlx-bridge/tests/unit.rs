@@ -6,7 +6,7 @@ use tina_runtime::CallOutcome;
 use tina_sqlx_bridge::{
     PgCancelConfig, PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt,
     PgPoolConfig, PgRequest, PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome,
-    PgTransientReason, PgValue, U64TooLarge,
+    PgTransientReason, PgType, PgValue, U64TooLarge,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +69,67 @@ fn pg_value_option_some_and_none() {
 }
 
 #[test]
+fn typed_null_builders_match_pg_type() {
+    assert_eq!(PgValue::null_bool(), PgValue::TypedNull(PgType::Bool));
+    assert_eq!(PgValue::null_i64(), PgValue::TypedNull(PgType::I64));
+    assert_eq!(PgValue::null_f64(), PgValue::TypedNull(PgType::F64));
+    assert_eq!(PgValue::null_text(), PgValue::TypedNull(PgType::Text));
+    assert_eq!(PgValue::null_bytes(), PgValue::TypedNull(PgType::Bytes));
+    let v: PgValue = PgType::Bool.into();
+    assert_eq!(v, PgValue::TypedNull(PgType::Bool));
+}
+
+#[test]
+fn typed_null_is_null() {
+    assert!(PgValue::Null.is_null());
+    assert!(PgValue::null_bool().is_null());
+    assert!(PgValue::null_text().is_null());
+    assert!(!PgValue::I64(0).is_null());
+    assert!(!PgValue::Bool(false).is_null());
+}
+
+#[test]
+fn typed_null_accessors_return_none() {
+    // TypedNull is a NULL, not a value — typed accessors return None.
+    assert_eq!(PgValue::null_bool().as_bool(), None);
+    assert_eq!(PgValue::null_i64().as_i64(), None);
+    assert_eq!(PgValue::null_text().as_str(), None);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+fn typed_null_uuid_builder_and_accessor() {
+    let v = PgValue::null_uuid();
+    assert_eq!(v, PgValue::TypedNull(PgType::Uuid));
+    assert!(v.is_null());
+    assert_eq!(v.as_uuid(), None);
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn typed_null_json_builder_and_accessor() {
+    let v = PgValue::null_json();
+    assert_eq!(v, PgValue::TypedNull(PgType::Json));
+    assert!(v.is_null());
+}
+
+#[cfg(feature = "numeric")]
+#[test]
+fn typed_null_numeric_builder_and_accessor() {
+    let v = PgValue::null_numeric();
+    assert_eq!(v, PgValue::TypedNull(PgType::Numeric));
+    assert!(v.is_null());
+}
+
+#[cfg(feature = "time")]
+#[test]
+fn typed_null_temporal_builders() {
+    assert!(PgValue::null_timestamp().is_null());
+    assert!(PgValue::null_timestamptz().is_null());
+    assert!(PgValue::null_date().is_null());
+}
+
+#[test]
 fn pg_value_accessors_match_variant() {
     assert_eq!(PgValue::I64(7).as_i64(), Some(7));
     assert_eq!(PgValue::Bool(true).as_bool(), Some(true));
@@ -88,6 +149,52 @@ fn pg_value_into_consumes_without_clone() {
     let b = PgValue::Bytes(vec![9, 9]);
     assert_eq!(b.into_bytes(), Some(vec![9, 9]));
     assert_eq!(PgValue::I64(1).into_string(), None);
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+fn pg_value_uuid_round_trip_through_from_and_accessor() {
+    let id = uuid::Uuid::from_u128(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef);
+    let v: PgValue = id.into();
+    assert_eq!(v, PgValue::Uuid(id));
+    assert_eq!(v.as_uuid(), Some(id));
+    assert_eq!(PgValue::I64(1).as_uuid(), None);
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn pg_value_json_round_trip() {
+    let payload = serde_json::json!({ "k": "v", "n": 7 });
+    let v: PgValue = payload.clone().into();
+    match &v {
+        PgValue::Json(inner) => assert_eq!(inner, &payload),
+        _ => panic!("expected Json"),
+    }
+    assert_eq!(v.as_json(), Some(&payload));
+}
+
+#[cfg(feature = "numeric")]
+#[test]
+fn pg_value_numeric_round_trip() {
+    use core::str::FromStr;
+    let d = rust_decimal::Decimal::from_str("3.14159").unwrap();
+    let v: PgValue = d.into();
+    assert_eq!(v, PgValue::Numeric(d));
+    assert_eq!(v.as_numeric(), Some(d));
+}
+
+#[cfg(feature = "time")]
+#[test]
+fn pg_value_temporal_round_trip() {
+    use time::macros::{date, datetime, time as t};
+    let d = date!(2024 - 03 - 14);
+    let dt = time::PrimitiveDateTime::new(d, t!(09:30:00));
+    let dtz = datetime!(2024-03-14 09:30:00 UTC);
+    assert_eq!(PgValue::from(d).as_date(), Some(d));
+    assert_eq!(PgValue::from(dt).as_timestamp(), Some(dt));
+    assert_eq!(PgValue::from(dtz).as_timestamptz(), Some(dtz));
+    // Wrong-shape accessors return None.
+    assert_eq!(PgValue::from(d).as_timestamp(), None);
 }
 
 // ---------------------------------------------------------------------------
