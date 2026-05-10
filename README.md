@@ -2,8 +2,8 @@
 
 ![tina-rs hero](tina.png)
 
-Tina is a Rust runtime for building concurrent services without `async` /
-`await` as the application control-flow primitive.
+Tina is a Rust runtime for building concurrent services out of shard-local
+state machines, bounded queues, and runtime-owned effects.
 
 In Tokio, the main unit of concurrency is a `Future`: a function-shaped state
 machine that yields at `.await` points. That works well for many I/O-heavy
