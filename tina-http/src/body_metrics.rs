@@ -16,8 +16,8 @@
 //!   for outbound bytes. Charged when a chunk is queued for the
 //!   wire write, released as the runtime drains it.
 //! - `body_full_count` — bodies rejected for exceeding
-//!   [`HttpLimits::max_body_bytes`]. Charge at the parser, before
-//!   any service dispatch.
+//!   [`crate::HttpLimits::max_body_bytes`]. Charge at the
+//!   parser, before any service dispatch.
 //! - `body_timeout_count` — body chunk read/write timeouts and
 //!   timed-out source pulls.
 //! - `body_io_error_count` — non-timeout body IO errors. A

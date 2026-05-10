@@ -153,23 +153,34 @@ No body pressure report at all today.
 
 ### Framing decision
 
-`Content-Length` framing only, on both request and response.
+Two framings supported on the response side; request side is
+`Content-Length` only.
 
 - Request side: chunked transfer-encoding stays rejected as
   `RequestParseError::UnsupportedTransferEncoding` (501 Not
-  Implemented). Already enforced by the parser.
-- Response side: the public response API only frames known length
-  (`HttpResponseBody::Buffered(Vec<u8>)` and
-  `ResponseStream { content_length, source }`). There is no
-  unknown-length variant — callers cannot accidentally pretend-stream
-  by buffering a `Vec` to compute its length. Building a streamed
-  response without declaring length is a type error, not a runtime
-  surprise.
+  Implemented). Already enforced by the parser. Chunked request
+  decoding is deferred to a separate slice.
+- Response side: two loud-API constructors pick the framing.
+  - [`HttpResponse::stream_known_length`] →
+    `Content-Length: N`. Source delivers exactly N bytes.
+  - [`HttpResponse::stream_chunked`] →
+    `Transfer-Encoding: chunked`. Source produces chunks until
+    `Eof`; the connection writes the `0 CRLF CRLF` terminator on
+    its own.
+  - The buffered path (`HttpResponseBody::Buffered(Vec<u8>)`)
+    keeps emitting `Content-Length` from the vec length.
 
-We deliberately do not implement chunked encoding in first form.
-Chunked is a real protocol, not a one-line addition; it deserves
-its own slice. Today's narrow `Content-Length`-only contract is
-honest about what we ship.
+There is no "guess a length" path. `HttpResponseBody::declared_length`
+returns `Option<usize>`; encoding picks `Content-Length` for
+`Some(n)` and `Transfer-Encoding: chunked` for `None`. Building a
+streamed response without making the framing choice is a type
+error.
+
+The narrow chunked emitter shipped here lives in
+`tina-http/src/connection.rs` (search for `write_chunked_data` /
+`finish_stream_eof`). It does not yet pair with chunked decoding
+on the client side, and the symmetric request-side decoder is
+deferred — both are open follow-ups.
 
 ## Grug Truth
 

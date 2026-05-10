@@ -484,8 +484,18 @@ pub struct HttpLimits {
     /// .reply(...)`; each call returns a chunk of up to `chunk_size`
     /// bytes (or `Eof`). The connection only issues `tcp_read` when
     /// the buffer is empty and more body is owed, so a slow service
-    /// applies real backpressure to TCP reads and only the in-flight
-    /// chunk is resident.
+    /// applies real backpressure to TCP reads.
+    ///
+    /// **Resident-bytes caveat.** Subsequent socket reads are
+    /// capped by `chunk_size`, but the initial post-head residual
+    /// is bounded only by the per-syscall ceiling (`READ_CHUNK = 4096`
+    /// bytes). The first `tcp_read` is issued before we know the
+    /// `Content-Length` and pulls up to `READ_CHUNK` bytes; whatever
+    /// arrived past the head ends up resident in the chunk buffer
+    /// even if `chunk_size` is smaller. After that initial slice
+    /// drains, subsequent reads honor `chunk_size`. To bound the
+    /// peak honestly under `chunk_size`, send the head and body in
+    /// separate writes so the head-read returns no body bytes.
     ///
     /// When `None` (the default), the connection accumulates the full
     /// body up to `max_body_bytes` and dispatches a

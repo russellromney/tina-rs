@@ -358,13 +358,116 @@ fn streaming_request_charges_per_chunk_and_releases_per_pull() {
         snap.request_body_high_water > 0,
         "must have charged at least one chunk's worth"
     );
+    // Subsequent socket reads honor `chunk_size`, but the initial
+    // head-read returns up to `READ_CHUNK = 4096` bytes — so the
+    // residual buffer between dispatch and first service pull can
+    // be that big. Bounded by READ_CHUNK regardless of body size.
     assert!(
-        snap.request_body_high_water <= body.len(),
-        "high water cannot exceed declared length"
+        snap.request_body_high_water <= 4096,
+        "high water bounded by per-syscall ceiling READ_CHUNK; got {}",
+        snap.request_body_high_water
     );
     assert!(
         snap.drained(),
         "every charge must release after stream completes; got {snap:?}"
+    );
+}
+
+/// Regression for the chunk-size cap on follow-up socket reads:
+/// if the head and body arrive in separate writes, the initial
+/// `tcp_read` returns just the head, all body reads are post-
+/// dispatch, and each is capped by `chunk_size`. Peak resident
+/// under that pattern is exactly `chunk_size`.
+#[test]
+fn streaming_request_caps_resident_bytes_at_chunk_size_when_head_and_body_split() {
+    let metrics = BodyMetrics::new();
+    let chunk_size = 256;
+    let body: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let consumer = runtime
+        .register_with_capacity::<StreamingConsumer, Infallible>(
+            StreamingConsumer {
+                chunk_call_timeout: Duration::from_secs(2),
+                pending_source: None,
+                total: 0,
+            },
+            32,
+        )
+        .expect("register consumer");
+
+    let limits = HttpLimits {
+        inbound_stream_chunk_size: Some(chunk_size),
+        ..HttpLimits::default()
+    };
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener_isolate = HttpListener::<TestShard, StreamMsg>::new(
+        bind,
+        consumer,
+        limits,
+        Duration::from_secs(5),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard, StreamMsg>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    // Phase 1: send only the head. The connection's first
+    // tcp_read parses the head but receives zero body bytes.
+    let head = format!(
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    // Pause so the head-read returns just head bytes. With this
+    // separation, subsequent reads (driven by service body_next
+    // pulls) are all chunk_size-capped.
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Phase 2: dribble the body bytes. Every socket read on the
+    // server side is capped by chunk_size, so the buffer never
+    // holds more than that.
+    stream.write_all(&body).unwrap();
+    stream.flush().unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(
+        std::str::from_utf8(&response)
+            .unwrap()
+            .starts_with("HTTP/1.1 200"),
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let snap = metrics.snapshot();
+    assert!(snap.drained(), "charges drain on shutdown; got {snap:?}");
+    assert!(snap.request_body_high_water > 0, "body bytes were charged");
+    assert!(
+        snap.request_body_high_water <= chunk_size,
+        "split head/body upload caps high water at chunk_size = {}; got {}. \
+         If this fails, the per-pull socket-read cap regressed.",
+        chunk_size,
+        snap.request_body_high_water
     );
 }
 

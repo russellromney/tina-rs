@@ -580,11 +580,20 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             return self.serve_chunk_from_buffer();
         }
         // Need to pull more bytes from the socket. Cap the request at
-        // what we still need so the kernel does not over-read.
+        // three independent limits and take the smallest:
+        //   1. Bytes still owed by `Content-Length`. We never want
+        //      to read past the body.
+        //   2. Per-syscall ceiling `READ_CHUNK`. Bounds any one
+        //      read regardless of declared length.
+        //   3. The user's configured `inbound_stream_chunk_size`.
+        //      Without this, a small chunk-size config would
+        //      still let `READ_CHUNK` body bytes sit resident,
+        //      defeating the body-pressure story.
         let want = self
             .inbound_total
             .saturating_sub(self.inbound_received)
-            .min(READ_CHUNK);
+            .min(READ_CHUNK)
+            .min(self.inbound_chunk_size.max(1));
         if want == 0 {
             // Defensive: nothing left to read but delivered != total.
             // Treat as truncation — reply Eof so the service notices
