@@ -846,6 +846,73 @@ where
     report
 }
 
+/// One labelled `(event_count, trace_hash)` pair from a
+/// [`discover_constants`] sweep. The `Display` impl prints a
+/// commented block ready to paste into a `.expecting(...)` chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredConstants {
+    /// Caller-supplied label naming which case this row is for.
+    pub label: &'static str,
+    /// Observed event count.
+    pub event_count: usize,
+    /// Observed `stable_trace_hash`.
+    pub trace_hash: u64,
+}
+
+impl std::fmt::Display for DiscoveredConstants {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "// {}", self.label)?;
+        writeln!(f, "expected_event_count: {}", self.event_count)?;
+        write!(f, "expected_trace_hash: 0x{:016x}", self.trace_hash)
+    }
+}
+
+/// Bulk discovery: runs each `(label, case)` pair through `runner` once
+/// without comparing to pinned constants, and returns one
+/// [`DiscoveredConstants`] per case. Use when first pinning a batch of
+/// related cases that share the same `Op` type and runner — typical for
+/// a single test file with three or four saved-seed regressions.
+///
+/// ```ignore
+/// #[test]
+/// #[ignore] // local discovery, run with --ignored after adding a case
+/// fn discover_constants_for_service_cases() {
+///     let cases = [
+///         ("portable_service_case", portable_service_case()),
+///         ("audit_full_case", audit_full_case()),
+///         ("requester_stop_case", requester_stop_case()),
+///         ("shard_failure_case", shard_failure_case()),
+///     ];
+///     for d in discover_constants(cases, run_service_case) {
+///         eprintln!("{d}\n");
+///     }
+/// }
+/// ```
+///
+/// Each call passes through [`observe_replay_case`], so the same
+/// case/runner identity guards apply.
+pub fn discover_constants<Op, Output, Runner, Cases>(
+    cases: Cases,
+    mut runner: Runner,
+) -> Vec<DiscoveredConstants>
+where
+    Op: Clone,
+    Cases: IntoIterator<Item = (&'static str, ReplayCase<Op>)>,
+    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+{
+    cases
+        .into_iter()
+        .map(|(label, case)| {
+            let report = observe_replay_case(&case, &mut runner);
+            DiscoveredConstants {
+                label,
+                event_count: report.event_count,
+                trace_hash: report.trace_hash,
+            }
+        })
+        .collect()
+}
+
 /// Why a [`ReplayCase`] did not match what was pinned.
 ///
 /// Returned by [`check_replay_case`] when the observed event count or
@@ -1507,6 +1574,65 @@ mod replay_case_tests {
         assert_eq!(built.history.operations(), &[10, 20]);
         assert_eq!(built.expected_event_count, 0);
         assert_eq!(built.expected_trace_hash, 0);
+    }
+
+    #[test]
+    fn discover_constants_returns_one_entry_per_case() {
+        // Two different cases sharing the same Op type and runner.
+        let case_a = ReplayCase::<u32>::new(
+            "fake replay case",
+            7,
+            ReplayConfig::new(),
+            "produces three handler-started events",
+            vec![1, 2, 3],
+            "trace shape matches saved fixture",
+        );
+        let case_b = ReplayCase::<u32>::new(
+            "fake replay case",
+            7,
+            ReplayConfig::new(),
+            "produces three handler-started events",
+            vec![10, 20, 30],
+            "trace shape matches saved fixture",
+        );
+        let discovered = discover_constants(
+            [("alpha", case_a.clone()), ("beta", case_b.clone())],
+            run_three_events,
+        );
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered[0].label, "alpha");
+        assert_eq!(discovered[1].label, "beta");
+        // The runner ignores history operations, so both cases observe
+        // the same trace shape — but the discover sweep returns both
+        // rows, not a deduped one.
+        assert_eq!(discovered[0].event_count, 3);
+        assert_eq!(discovered[1].event_count, 3);
+        assert_eq!(discovered[0].trace_hash, discovered[1].trace_hash);
+    }
+
+    #[test]
+    fn discovered_constants_display_is_pasteable() {
+        let row = DiscoveredConstants {
+            label: "audit_full_case",
+            event_count: 22,
+            trace_hash: 0x73e4_304f_3390_e1bd,
+        };
+        let printed = row.to_string();
+        // Pin the exact format users paste under each case factory.
+        assert_eq!(
+            printed,
+            "// audit_full_case\nexpected_event_count: 22\nexpected_trace_hash: 0x73e4304f3390e1bd",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ReplayCase.seed and history.seed() drifted")]
+    fn discover_constants_runs_through_observe_guards() {
+        // A case with case.seed != history.seed must still trip the
+        // identity guard during bulk discovery.
+        let mut bad = case();
+        bad.seed = 12345;
+        let _ = discover_constants([("bad", bad)], run_three_events);
     }
 
     #[test]

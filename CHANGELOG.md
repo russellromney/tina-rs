@@ -69,8 +69,12 @@ This file records completed work.
   `ReplayConfig::with_faults(...)` and `with_mailbox(role, cap)`
   replace nested struct literals; `observe_replay_case` plus
   `ReplayReport::pinned_constants()` are the blessed discovery path
-  for first constants; the user guide gains a "Pick Your Op
-  Alphabet" section that names the mental move.
+  for first constants; `discover_constants` runs a batch of cases
+  sharing the same `Op`/runner and prints one pasteable
+  comment-headed block per case so adding or perturbing several
+  related cases at once is a single `cargo test --ignored` away;
+  the user guide gains a "Pick Your Op Alphabet" section that names
+  the mental move.
 
 ### Phase 065 Observability First Form
 
