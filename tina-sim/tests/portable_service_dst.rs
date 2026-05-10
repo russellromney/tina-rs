@@ -11,7 +11,7 @@ use tina_runtime::{
 };
 use tina_sim::dst::{
     DstRun, History, InvariantSuite, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig,
-    assert_replay_case, delete_shrink,
+    assert_replay_case, delete_shrink, discover_constants,
 };
 use tina_sim::{MultiShardReplayArtifact, MultiShardSimulator, MultiShardSimulatorConfig};
 
@@ -560,4 +560,29 @@ fn baobab_dst_shrinks_requester_stop_history() {
     let shrunk_output = run_service_history(shrunk.shrunk()).output().clone();
     assert!(shrunk_output.accepted.is_empty());
     assert!(shrunk_output.journal_appended > 0);
+}
+
+#[test]
+#[ignore] // run with `cargo test -- --ignored` after adding or perturbing a saved case
+fn discover_constants_for_service_cases() {
+    // One-shot bulk discovery for every saved case in this file.
+    // Output is a stack of pasteable blocks like:
+    //
+    //     // portable_service_case
+    //     expected_event_count: 128
+    //     expected_trace_hash: 0x3d79b0635b08cc75
+    //
+    // Paste each block into the matching case 's `.expecting(...)` chain.
+    let cases = [
+        ("portable_service_case", portable_service_case()),
+        ("audit_full_case", audit_full_case()),
+        ("requester_stop_case", requester_stop_case()),
+        ("shard_failure_case", shard_failure_case()),
+    ];
+    for d in discover_constants(cases, run_service_case) {
+        eprintln!(
+            "{d}
+"
+        );
+    }
 }

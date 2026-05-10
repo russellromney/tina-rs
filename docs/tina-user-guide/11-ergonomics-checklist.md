@@ -196,16 +196,36 @@ invariant.
 
 Use `observe_replay_case` plus `ReplayReport::pinned_constants` to
 get the initial `expected_event_count` and `expected_trace_hash` for
-a new case:
+a single new case:
 
 ```rust
 let report = observe_replay_case(&case(), run_case);
 println!("{}", report.pinned_constants());
 ```
 
-Then chain `.expecting(count, hash)` on the case literal. Do not
-guess; do not run the regression test with placeholder zeros and
-copy from the panic.
+For a batch of cases sharing the same `Op` and runner — typical for
+one test file with three or four saved-seed regressions — use
+`discover_constants` instead so one `cargo test --ignored` run
+prints every block in pasteable form:
+
+```rust
+#[test]
+#[ignore]
+fn discover_constants_for_my_cases() {
+    let cases = [
+        ("happy_path_case", happy_path_case()),
+        ("overflow_case", overflow_case()),
+    ];
+    for d in discover_constants(cases, run_my_case) {
+        eprintln!("{d}\n");
+    }
+}
+```
+
+Either way, chain `.expecting(count, hash)` on the case literal
+afterwards. Do not guess; do not run the regression test with
+placeholder zeros and copy from the panic; do not write a separate
+discovery test per case when one bulk test prints them all.
 
 ### Sweep seeds for a bad case
 

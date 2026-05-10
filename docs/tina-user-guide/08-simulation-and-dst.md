@@ -191,8 +191,39 @@ fn pin_constants() {
 
 Then chain `.expecting(34, 0xe22d_12a5_1cd8_cf10)` on the
 `ReplayCase::new(...)` call, drop the `#[ignore]` test, and use
-`assert_replay_case` for the regression. The next time the trace
-shape drifts, the panic tells you what to look at.
+`assert_replay_case` for the regression.
+
+When a single test file owns several saved cases sharing the same `Op`
+type and runner, use `discover_constants` to print all of them in one
+go. The output is a stack of pasteable comment-headed blocks:
+
+```rust
+use tina_sim::dst::discover_constants;
+
+#[test]
+#[ignore] // run with `cargo test -- --ignored` after adding a case
+fn discover_constants_for_my_cases() {
+    let cases = [
+        ("happy_path_case", happy_path_case()),
+        ("overflow_case", overflow_case()),
+        ("requester_stop_case", requester_stop_case()),
+    ];
+    for d in discover_constants(cases, run_my_case) {
+        eprintln!("{d}\n");
+    }
+    // // happy_path_case
+    // expected_event_count: 47
+    // expected_trace_hash: 0x9c4f2d18aabbccdd
+    //
+    // // overflow_case
+    // expected_event_count: 22
+    // expected_trace_hash: 0x73e4304f3390e1bd
+    // ...
+}
+```
+
+Either way, the next time the trace shape drifts, the
+`assert_replay_case` panic tells you what to look at.
 
 ## Run Same Case Twice
 
@@ -361,7 +392,7 @@ Good Tina simulation targets:
   `expecting` / `simulator_config`), `ReplayReport` (with
   `from_case_and_events` / `pinned_constants`), `ReplayConfig` (with
   `with_faults` / `with_mailbox` / `mailbox`), `observe_replay_case`,
-  `assert_replay_case`, `check_replay_case`, `sweep_seeds`,
-  `shrink_replay_case`, `assert_replays`, `delete_shrink`,
-  `InvariantSuite`.
+  `discover_constants`, `assert_replay_case`, `check_replay_case`,
+  `sweep_seeds`, `shrink_replay_case`, `assert_replays`,
+  `delete_shrink`, `InvariantSuite`.
 - `tina_runtime::stable_trace_hash` — the canonical fingerprint.
