@@ -192,7 +192,7 @@ fn https_client_replays_through_scripted_tls() {
     assert_eq!(response.status, StatusCode::OK);
     let body = match &response.body {
         HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_) => Vec::new(),
+        HttpResponseBody::Stream(_) | HttpResponseBody::ChunkedStream(_) => Vec::new(),
     };
     assert_eq!(body, b"hello");
 }

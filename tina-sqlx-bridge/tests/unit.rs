@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use tina_runtime::CallOutcome;
 use tina_sqlx_bridge::{
-    PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt, PgPoolConfig,
-    PgRequest, PgResponse, PgRow, PgTransientReason, PgValue, U64TooLarge,
+    PgCancelConfig, PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt,
+    PgPoolConfig, PgRequest, PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome,
+    PgTransientReason, PgValue, U64TooLarge,
 };
 
 // ---------------------------------------------------------------------------
@@ -153,6 +154,90 @@ fn pg_request_builder_params_replaces_vector() {
     assert_eq!(params, vec![PgValue::Bool(true), PgValue::Null]);
 }
 
+#[test]
+fn pg_step_builder_param_and_replace() {
+    let step = PgStep::execute("UPDATE t SET v = $1 WHERE k = $2")
+        .param(7_i64)
+        .param("seven");
+    match step {
+        PgStep::Execute { params, .. } => {
+            assert_eq!(
+                params,
+                vec![PgValue::I64(7), PgValue::String("seven".into())]
+            );
+        }
+        _ => panic!("expected Execute"),
+    }
+    let replaced = PgStep::fetch_one("SELECT 1")
+        .param(1)
+        .params(vec![PgValue::Bool(false)]);
+    match replaced {
+        PgStep::FetchOne { params, .. } => {
+            assert_eq!(params, vec![PgValue::Bool(false)]);
+        }
+        _ => panic!("expected FetchOne"),
+    }
+}
+
+#[test]
+fn pg_request_transaction_carries_steps() {
+    let req = PgRequest::transaction(vec![
+        PgStep::execute("INSERT INTO t VALUES ($1)").param(1_i64),
+        PgStep::fetch_one("SELECT 1::INT8"),
+    ]);
+    match req {
+        PgRequest::Transaction { steps } => {
+            assert_eq!(steps.len(), 2);
+        }
+        _ => panic!("expected Transaction"),
+    }
+}
+
+#[test]
+fn pg_request_param_is_noop_on_transaction() {
+    // `.param(...)` on a Transaction is a no-op, not a panic. Steps
+    // carry their own parameters.
+    let req = PgRequest::transaction(vec![PgStep::execute("SELECT 1")])
+        .param(99_i64)
+        .params(vec![PgValue::Bool(true)]);
+    match req {
+        PgRequest::Transaction { steps } => assert_eq!(steps.len(), 1),
+        _ => panic!("expected Transaction"),
+    }
+}
+
+#[test]
+fn classify_committed_transaction_succeeds() {
+    use tina_sqlx_bridge::PgTransactionCallOutcome;
+    let outcome: PgTransactionCallOutcome =
+        CallOutcome::Replied(Ok(PgTransactionOutcome::Committed {
+            steps: vec![PgStepOk::Executed { rows_affected: 1 }],
+        }));
+    match outcome.classify() {
+        PgOutcomeClass::Succeeded(PgTransactionOutcome::Committed { steps }) => {
+            assert_eq!(steps.len(), 1);
+        }
+        other => panic!("expected Succeeded(Committed), got {other:?}"),
+    }
+}
+
+#[test]
+fn pg_request_fetch_many_carries_max_rows_and_params() {
+    let req = PgRequest::fetch_many("SELECT * FROM t WHERE k > $1", 100).param(7_i64);
+    match req {
+        PgRequest::FetchMany {
+            sql,
+            params,
+            max_rows,
+        } => {
+            assert!(sql.contains("FROM t"));
+            assert_eq!(max_rows, 100);
+            assert_eq!(params, vec![PgValue::I64(7)]);
+        }
+        _ => panic!("expected FetchMany"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
@@ -199,6 +284,12 @@ fn config_rejects_zero_max_request_params() {
 }
 
 #[test]
+fn config_rejects_zero_max_response_rows() {
+    let cfg = good_config().with_max_response_rows(0);
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroMaxResponseRows));
+}
+
+#[test]
 fn config_rejects_zero_pool_max_connections() {
     let cfg =
         good_config().with_pool(PgPoolConfig::new("postgres://invalid/").with_max_connections(0));
@@ -210,6 +301,27 @@ fn config_rejects_zero_pool_acquire_timeout() {
     let cfg = good_config()
         .with_pool(PgPoolConfig::new("postgres://invalid/").with_acquire_timeout(Duration::ZERO));
     assert_eq!(cfg.validate(), Err(PgConfigError::ZeroPoolAcquireTimeout));
+}
+
+#[test]
+fn config_rejects_zero_cancel_pool_size() {
+    let cfg = good_config().with_cancel(PgCancelConfig::new().with_pool_size(0));
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroCancelPoolSize));
+}
+
+#[test]
+fn config_rejects_zero_cancel_acquire_timeout() {
+    let cfg = good_config().with_cancel(PgCancelConfig::new().with_acquire_timeout(Duration::ZERO));
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroCancelAcquireTimeout));
+}
+
+#[test]
+fn with_cancel_on_timeout_sets_default_acquire_timeout() {
+    let cfg = good_config().with_cancel_on_timeout(2);
+    assert!(cfg.cancel.is_some());
+    let cancel = cfg.cancel.as_ref().unwrap();
+    assert_eq!(cancel.pool_size, 2);
+    assert!(cancel.acquire_timeout > Duration::ZERO);
 }
 
 #[test]

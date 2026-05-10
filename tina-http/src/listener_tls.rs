@@ -14,6 +14,7 @@ use tina_runtime::{
     CallError, TlsListenerId, TlsStreamId, tls_accept, tls_bind, tls_close, tls_close_listener,
 };
 
+use crate::body_metrics::BodyMetrics;
 use crate::connection::{HttpConnection, HttpConnectionMsg};
 use crate::transport::HttpTransport;
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
@@ -120,6 +121,9 @@ pub struct HttpsListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stat
     identity: TlsServerIdentity,
     tls_accept_timeout: Duration,
     tls_io_timeout: Duration,
+    /// Optional shared body-pressure counters threaded into every
+    /// connection child (parity with the plain HTTP listener).
+    metrics: Option<BodyMetrics>,
     listener: Option<TlsListenerId>,
     /// Set on the first `Start`. Second Start replies `AlreadyStarted`.
     started: bool,
@@ -145,11 +149,20 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpsListener<S,
             identity: config.identity,
             tls_accept_timeout: config.tls_accept_timeout,
             tls_io_timeout: config.tls_io_timeout,
+            metrics: None,
             listener: None,
             started: false,
             stopping: false,
             _shard: PhantomData,
         }
+    }
+
+    /// Attaches a [`BodyMetrics`] to this listener. Mirror of
+    /// [`crate::HttpListener::with_metrics`] so a single
+    /// `BodyMetrics` instance can cover both transports on one shard.
+    pub fn with_metrics(mut self, metrics: BodyMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -267,12 +280,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpsListener<S, M> {
     fn build_connection_child(&self, stream: TlsStreamId) -> ChildDefinition<HttpConnection<S, M>> {
         ChildDefinition::new(
-            HttpConnection::<S, M>::with_transport(
+            HttpConnection::<S, M>::with_transport_and_metrics(
                 HttpTransport::Tls(stream),
                 self.service,
                 self.limits,
                 self.service_call_timeout,
                 self.tls_io_timeout,
+                self.metrics.clone(),
             ),
             self.connection_mailbox_capacity,
         )

@@ -13,7 +13,7 @@ use tina_runtime::{
 };
 use tina_sqlx_bridge::{
     InstallError, InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgRequest,
-    PgWorker, send_request,
+    PgStep, PgWorker, send_request,
 };
 
 #[derive(Default)]
@@ -184,6 +184,22 @@ fn install_without_pool_config_errors_with_missing_pool_config() {
 }
 
 #[test]
+fn install_with_pool_silently_ignores_cancel_config() {
+    // Caller may build a config with cancel set (e.g. from a shared
+    // template) but install with a supplied pool. The bridge does
+    // not error — it just builds without a sidecar. Cancel is a
+    // no-op on this path. Lock that contract: install succeeds, no
+    // panic, no cancel firing later.
+    let runtime = make_runtime();
+    let cfg = config_for_admission_tests().with_cancel_on_timeout(1);
+    let (bridge, _tokio_rt) = install_lazy(&runtime, cfg);
+    // The bridge is alive; closing exercises drop ordering.
+    bridge.closer.close();
+    assert_eq!(bridge.metrics.snapshot().db_cancels_sent, 0);
+    shutdown(runtime);
+}
+
+#[test]
 fn install_with_invalid_config_errors_with_config() {
     let runtime = make_runtime();
     let cfg = PgConfig::bridge_only().with_default_timeout(Duration::ZERO);
@@ -250,6 +266,66 @@ fn empty_sql_replies_invalid_request() {
         other => panic!("expected InvalidRequest, got {other:?}"),
     }
     assert_eq!(bridge.metrics.snapshot().invalid, 1);
+    shutdown(runtime);
+}
+
+#[test]
+fn empty_transaction_replies_invalid_request() {
+    let runtime = make_runtime();
+    let (bridge, _tokio_rt) = install_lazy(&runtime, config_for_admission_tests());
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller, CallerMsg::Run(PgRequest::transaction(vec![])))
+        .expect("send");
+    let outcome = sink.wait_one(Duration::from_secs(3));
+    match outcome {
+        CallOutcome::Replied(Err(PgError::InvalidRequest(msg))) => {
+            assert!(msg.contains("no steps"), "got {msg}");
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+fn transaction_with_empty_step_sql_replies_invalid_request_indexed() {
+    let runtime = make_runtime();
+    let (bridge, _tokio_rt) = install_lazy(&runtime, config_for_admission_tests());
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(PgRequest::transaction(vec![
+                PgStep::execute("SELECT 1"),
+                PgStep::execute("   "),
+            ])),
+        )
+        .expect("send");
+    let outcome = sink.wait_one(Duration::from_secs(3));
+    match outcome {
+        CallOutcome::Replied(Err(PgError::InvalidRequest(msg))) => {
+            assert!(
+                msg.contains("step 1"),
+                "expected indexed message, got {msg}"
+            );
+            assert!(msg.contains("empty"), "got {msg}");
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
     shutdown(runtime);
 }
 

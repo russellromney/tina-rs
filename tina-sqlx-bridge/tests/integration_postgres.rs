@@ -23,7 +23,7 @@ use tina_runtime::{
 };
 use tina_sqlx_bridge::{
     InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgPoolConfig, PgRequest,
-    PgResponse, PgWorker, send_request,
+    PgResponse, PgRows, PgStep, PgStepOk, PgTransactionOutcome, PgWorker, send_request,
 };
 
 fn database_url() -> Option<String> {
@@ -327,6 +327,233 @@ fn fetch_one_too_many_rows_is_too_many_rows() {
 
 #[test]
 #[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_under_cap_returns_all_rows_not_truncated() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT generate_series(1, 5)::INT8", 100),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert_eq!(rows.len(), 5);
+            assert!(!truncated, "5 rows under a cap of 100 must not truncate");
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(row.get_i64(0), Some((i as i64) + 1));
+            }
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.responses_rows, 1);
+    assert_eq!(m.responses_truncated, 0);
+    assert_eq!(m.rows_returned, 5);
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_at_cap_truncates_without_buffering_extras() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    // Cap at 3, query produces 100. Bridge must stop after 4 pulls
+    // (3 kept + 1 to discriminate "more on the wire") and never grow
+    // its buffer past 3.
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT generate_series(1, 100)::INT8", 3),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert_eq!(rows.len(), 3, "rows beyond cap must not land in the buffer");
+            assert!(truncated, "must signal truncation when more rows existed");
+            assert_eq!(rows[0].get_i64(0), Some(1));
+            assert_eq!(rows[2].get_i64(0), Some(3));
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.responses_rows, 1);
+    assert_eq!(m.responses_truncated, 1);
+    assert_eq!(m.rows_returned, 3, "rows_returned reflects buffered count");
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_zero_rows_returns_empty_not_truncated() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT 1::INT8 WHERE false", 10),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert!(rows.is_empty());
+            assert!(!truncated);
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_caller_max_rows_is_capped_by_config_ceiling() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    // Config ceiling: 5. Caller asks for 1000. Effective cap: 5.
+    let cfg = PgConfig::new()
+        .with_pool(
+            PgPoolConfig::new(&url)
+                .with_max_connections(2)
+                .with_acquire_timeout(Duration::from_secs(2)),
+        )
+        .with_default_timeout(Duration::from_secs(5))
+        .with_poll_interval(Duration::from_millis(2))
+        .with_max_in_flight(2)
+        .with_max_response_rows(5);
+    let bridge = PgWorker::<SingleShard>::install(&runtime, cfg).expect("install");
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_many("SELECT generate_series(1, 100)::INT8", 1000),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Rows { rows, truncated })) => {
+            assert_eq!(rows.len(), 5, "config ceiling caps caller's request");
+            assert!(truncated);
+        }
+        other => panic!("fetch_many: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_many_typed_helper_returns_pgrows() {
+    use tina_sqlx_bridge::fetch_many_call;
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+
+    let sink = Arc::new(Sink::default());
+
+    #[derive(Debug)]
+    enum HelperMsg {
+        Run,
+        Done(tina_sqlx_bridge::PgFetchManyOutcome),
+    }
+    struct HelperIsolate {
+        worker: PgAddress,
+        sink: Arc<Mutex<Option<Result<PgRows, PgError>>>>,
+        done: Arc<std::sync::Condvar>,
+    }
+    impl Isolate for HelperIsolate {
+        tina::isolate_types! {
+            message: HelperMsg,
+            reply: (),
+            send: tina::Outbound<Infallible>,
+            spawn: Infallible,
+            call: RuntimeCall<HelperMsg>,
+            shard: SingleShard,
+        }
+        fn handle(
+            &mut self,
+            msg: HelperMsg,
+            _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                HelperMsg::Run => fetch_many_call(
+                    self.worker,
+                    "SELECT generate_series(1, 4)::INT8",
+                    vec![],
+                    10,
+                    Duration::from_secs(5),
+                )
+                .reply(HelperMsg::Done),
+                HelperMsg::Done(outcome) => {
+                    let stored = match outcome {
+                        CallOutcome::Replied(r) => Some(r),
+                        _ => None,
+                    };
+                    *self.sink.lock().unwrap() = stored;
+                    self.done.notify_all();
+                    stop()
+                }
+            }
+        }
+    }
+    let _ = sink; // silence the wider Sink in this scope.
+
+    let result_slot: Arc<Mutex<Option<Result<PgRows, PgError>>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(std::sync::Condvar::new());
+    let isolate = HelperIsolate {
+        worker: bridge.address,
+        sink: Arc::clone(&result_slot),
+        done: Arc::clone(&done),
+    };
+    let addr = runtime
+        .register_with_capacity::<_, Infallible>(isolate, 4)
+        .expect("register");
+    runtime.try_send(addr, HelperMsg::Run).expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut guard = result_slot.lock().unwrap();
+    while guard.is_none() {
+        let now = Instant::now();
+        if now >= deadline {
+            panic!("helper never finished");
+        }
+        let (g, _) = done.wait_timeout(guard, deadline - now).unwrap();
+        guard = g;
+    }
+    let result = guard.take().unwrap();
+    drop(guard);
+
+    match result {
+        Ok(rows) => {
+            assert_eq!(rows.len(), 4);
+            assert!(!rows.truncated);
+        }
+        Err(e) => panic!("typed helper failed: {e}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
 fn fetch_one_does_not_buffer_huge_result_sets() {
     // Pre-fix this query buffered ~10M rows in bridge memory before
     // discovering the row count and surfacing TooManyRows. Post-fix
@@ -526,6 +753,411 @@ fn pool_acquire_timeout_distinct_from_tina_full() {
 
     // Drain A so the runtime can shut down cleanly.
     let _ = sink_a.wait_one(Duration::from_secs(10));
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_commits_when_all_steps_succeed() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let table = unique_table();
+
+    // Create the table outside the transaction.
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!(
+            "CREATE TABLE {table} (id INT8 PRIMARY KEY, value INT8 NOT NULL)"
+        )),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    // Atomic script: insert two rows and read one back.
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::transaction(vec![
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (1, 100)")),
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (2, 200)")),
+            PgStep::fetch_one(format!("SELECT value FROM {table} WHERE id = 1")),
+        ]),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Transaction(PgTransactionOutcome::Committed {
+            steps,
+        }))) => {
+            assert_eq!(steps.len(), 3);
+            assert!(matches!(steps[0], PgStepOk::Executed { rows_affected: 1 }));
+            assert!(matches!(steps[1], PgStepOk::Executed { rows_affected: 1 }));
+            match &steps[2] {
+                PgStepOk::Row(row) => assert_eq!(row.get_i64(0), Some(100)),
+                other => panic!("step 2: expected Row, got {other:?}"),
+            }
+        }
+        other => panic!("transaction: {other:?}"),
+    }
+
+    // Verify both rows are visible after commit.
+    let count = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one(format!("SELECT count(*)::INT8 FROM {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match count {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.get_i64(0), Some(2));
+        }
+        other => panic!("count: {other:?}"),
+    }
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("DROP TABLE {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.transactions_committed, 1);
+    assert_eq!(m.transactions_rolled_back, 0);
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_rolls_back_on_step_failure() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let table = unique_table();
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!(
+            "CREATE TABLE {table} (id INT8 PRIMARY KEY, value INT8 NOT NULL)"
+        )),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    // Step 0 succeeds, step 1 violates the PK (id = 1 again),
+    // step 2 never runs. Whole script must roll back.
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::transaction(vec![
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (1, 100)")),
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (1, 200)")),
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (2, 300)")),
+        ]),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Transaction(PgTransactionOutcome::RolledBack {
+            completed,
+            failed_at,
+            error,
+        }))) => {
+            assert_eq!(completed.len(), 1, "only step 0 ran before failure");
+            assert_eq!(failed_at, 1);
+            assert!(matches!(error, PgError::Sqlx(_)), "got {error:?}");
+        }
+        other => panic!("transaction: {other:?}"),
+    }
+
+    // Confirm rollback: no rows visible.
+    let count = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one(format!("SELECT count(*)::INT8 FROM {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match count {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.get_i64(0), Some(0), "rollback must hide all rows");
+        }
+        other => panic!("count: {other:?}"),
+    }
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("DROP TABLE {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.transactions_committed, 0);
+    assert_eq!(m.transactions_rolled_back, 1);
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_step_can_be_fetch_many_with_truncation() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::transaction(vec![PgStep::fetch_many(
+            "SELECT generate_series(1, 50)::INT8",
+            3,
+        )]),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Transaction(PgTransactionOutcome::Committed {
+            steps,
+        }))) => match &steps[0] {
+            PgStepOk::Rows { rows, truncated } => {
+                assert_eq!(rows.len(), 3);
+                assert!(truncated);
+            }
+            other => panic!("step 0: {other:?}"),
+        },
+        other => panic!("transaction: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_typed_helper_returns_outcome() {
+    use tina_sqlx_bridge::transaction_call;
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+
+    let result_slot: Arc<Mutex<Option<Result<PgTransactionOutcome, PgError>>>> =
+        Arc::new(Mutex::new(None));
+    let done = Arc::new(std::sync::Condvar::new());
+
+    #[derive(Debug)]
+    enum HelperMsg {
+        Run,
+        Done(tina_sqlx_bridge::PgTransactionCallOutcome),
+    }
+    struct HelperIsolate {
+        worker: PgAddress,
+        slot: Arc<Mutex<Option<Result<PgTransactionOutcome, PgError>>>>,
+        done: Arc<std::sync::Condvar>,
+    }
+    impl Isolate for HelperIsolate {
+        tina::isolate_types! {
+            message: HelperMsg,
+            reply: (),
+            send: tina::Outbound<Infallible>,
+            spawn: Infallible,
+            call: RuntimeCall<HelperMsg>,
+            shard: SingleShard,
+        }
+        fn handle(
+            &mut self,
+            msg: HelperMsg,
+            _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                HelperMsg::Run => transaction_call(
+                    self.worker,
+                    vec![
+                        PgStep::execute("SELECT 1::INT8"),
+                        PgStep::fetch_one("SELECT 2::INT8"),
+                    ],
+                    Duration::from_secs(5),
+                )
+                .reply(HelperMsg::Done),
+                HelperMsg::Done(outcome) => {
+                    let stored = match outcome {
+                        CallOutcome::Replied(r) => Some(r),
+                        _ => None,
+                    };
+                    *self.slot.lock().unwrap() = stored;
+                    self.done.notify_all();
+                    stop()
+                }
+            }
+        }
+    }
+    let isolate = HelperIsolate {
+        worker: bridge.address,
+        slot: Arc::clone(&result_slot),
+        done: Arc::clone(&done),
+    };
+    let addr = runtime
+        .register_with_capacity::<_, Infallible>(isolate, 4)
+        .expect("register");
+    runtime.try_send(addr, HelperMsg::Run).expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut guard = result_slot.lock().unwrap();
+    while guard.is_none() {
+        let now = Instant::now();
+        if now >= deadline {
+            panic!("helper never finished");
+        }
+        let (g, _) = done.wait_timeout(guard, deadline - now).unwrap();
+        guard = g;
+    }
+    let result = guard.take().unwrap();
+    drop(guard);
+
+    match result {
+        Ok(PgTransactionOutcome::Committed { steps }) => assert_eq!(steps.len(), 2),
+        other => panic!("typed helper: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn cancel_on_timeout_actually_shortens_late_completion() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    // 100ms bridge timeout, query sleeps 5s. With cancel on, the
+    // detached SQLx future should return well under 5s once Postgres
+    // processes the pg_cancel_backend.
+    let cfg = PgConfig::new()
+        .with_pool(
+            PgPoolConfig::new(&url)
+                .with_max_connections(2)
+                .with_acquire_timeout(Duration::from_secs(2)),
+        )
+        .with_default_timeout(Duration::from_millis(100))
+        .with_poll_interval(Duration::from_millis(2))
+        .with_max_in_flight(2)
+        .with_cancel_on_timeout(1);
+    let bridge = PgWorker::<SingleShard>::install(&runtime, cfg).expect("install");
+
+    let started = Instant::now();
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute("SELECT pg_sleep(5)"),
+        Duration::from_secs(15),
+        Duration::from_secs(20),
+    );
+    assert!(
+        matches!(outcome, CallOutcome::Replied(Err(PgError::Timeout))),
+        "outcome: {outcome:?}",
+    );
+
+    // Wait for the late tally to fire (sqlx_errors should bump
+    // because pg_cancel_backend turns the running query into an
+    // error). Without cancel this would take ~5s; with cancel it
+    // should land within a couple hundred ms of the timeout.
+    let late_deadline = Instant::now() + Duration::from_secs(4);
+    while bridge.metrics.snapshot().late_results == 0 {
+        if Instant::now() >= late_deadline {
+            panic!(
+                "late_results never incremented: {:?}",
+                bridge.metrics.snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let total = started.elapsed();
+    let snap = bridge.metrics.snapshot();
+
+    assert!(snap.timeouts >= 1, "{snap:?}");
+    assert!(snap.late_results >= 1, "{snap:?}");
+    assert!(
+        snap.db_cancels_sent >= 1,
+        "expected cancel to fire: {snap:?}",
+    );
+    // Generous bound: even with cancel, the wall-clock end-to-end is
+    // dominated by the sleep + poll overhead; 4s is well below the
+    // uncancelled 5s and well above the cancelled latency on a slow
+    // CI box.
+    assert!(
+        total < Duration::from_secs(4),
+        "cancel should have shortened the wall clock; got {total:?}",
+    );
+    // Cancelled queries surface as Sqlx errors on the spawn side.
+    assert!(
+        snap.sqlx_errors >= 1,
+        "cancelled query should tally as sqlx_error: {snap:?}",
+    );
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn cancel_on_timeout_disabled_by_default_no_cancels_sent() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    // No `.with_cancel_on_timeout(...)` — default is off.
+    let cfg = PgConfig::new()
+        .with_pool(
+            PgPoolConfig::new(&url)
+                .with_max_connections(2)
+                .with_acquire_timeout(Duration::from_secs(2)),
+        )
+        .with_default_timeout(Duration::from_millis(100))
+        .with_poll_interval(Duration::from_millis(2))
+        .with_max_in_flight(2);
+    let bridge = PgWorker::<SingleShard>::install(&runtime, cfg).expect("install");
+
+    let outcome = one(
+        &runtime,
+        &bridge,
+        // Short sleep so the test does not hang on the late tally.
+        PgRequest::execute("SELECT pg_sleep(0.5)"),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    assert!(matches!(
+        outcome,
+        CallOutcome::Replied(Err(PgError::Timeout))
+    ));
+
+    // Wait for late tally so the assertion is stable.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while bridge.metrics.snapshot().late_results == 0 {
+        if Instant::now() >= deadline {
+            panic!("late_results never incremented");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snap = bridge.metrics.snapshot();
+    assert_eq!(
+        snap.db_cancels_sent, 0,
+        "cancel must stay off by default: {snap:?}",
+    );
     shutdown(runtime);
 }
 

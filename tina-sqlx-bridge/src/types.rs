@@ -256,6 +256,137 @@ pub enum PgRequest {
         /// Positional parameters bound in order.
         params: Vec<PgValue>,
     },
+    /// Run one query and stream rows up to a cap.
+    ///
+    /// The bridge pulls at most `min(max_rows, config.max_response_rows) + 1`
+    /// rows from SQLx. Past the effective cap, it stops pulling and
+    /// returns [`PgResponse::Rows`] with `truncated = true` — never
+    /// growing the bridge's resident set past the cap.
+    FetchMany {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+        /// Caller's row cap. Bridge applies the lesser of this and
+        /// [`PgConfig::max_response_rows`].
+        max_rows: usize,
+    },
+    /// Run an atomic script of [`PgStep`]s inside one transaction.
+    ///
+    /// Bridge takes one connection from the pool, opens a SQLx
+    /// `Transaction`, runs each step in order, and either commits
+    /// (all steps succeeded) or rolls back (first failing step). The
+    /// reply is a single [`PgResponse::Transaction`] carrying the
+    /// per-step outcomes plus commit/rollback truth. No nested
+    /// transactions; nesting is rejected at admission with
+    /// [`PgError::InvalidRequest`]. Empty `steps` is also rejected.
+    ///
+    /// Counts as one slot against `max_in_flight`, holds one
+    /// connection for the script's wall-clock duration. The bridge's
+    /// per-attempt deadline applies to the script as a whole.
+    Transaction {
+        /// Ordered list of statements. Must be non-empty.
+        steps: Vec<PgStep>,
+    },
+}
+
+/// One statement inside a [`PgRequest::Transaction`] script. The
+/// shapes mirror [`PgRequest`] minus `Transaction` — nested
+/// transactions are rejected at admission.
+#[derive(Debug, Clone)]
+pub enum PgStep {
+    /// Run one row-less statement.
+    Execute {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+    },
+    /// Run one query expected to return zero or one row.
+    FetchOne {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+    },
+    /// Run one query and stream rows up to a cap.
+    FetchMany {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+        /// Caller's row cap; clamped by `PgConfig::max_response_rows`.
+        max_rows: usize,
+    },
+}
+
+impl PgStep {
+    /// `Execute` step with no parameters.
+    pub fn execute(sql: impl Into<String>) -> Self {
+        Self::Execute {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
+    }
+
+    /// `FetchOne` step with no parameters.
+    pub fn fetch_one(sql: impl Into<String>) -> Self {
+        Self::FetchOne {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
+    }
+
+    /// `FetchMany` step with no parameters and a per-step row cap.
+    pub fn fetch_many(sql: impl Into<String>, max_rows: usize) -> Self {
+        Self::FetchMany {
+            sql: sql.into(),
+            params: Vec::new(),
+            max_rows,
+        }
+    }
+
+    /// Append one parameter. Chainable.
+    pub fn param(mut self, value: impl Into<PgValue>) -> Self {
+        match &mut self {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
+                params.push(value.into());
+            }
+        }
+        self
+    }
+
+    /// Replace the parameter list.
+    pub fn params(mut self, values: Vec<PgValue>) -> Self {
+        match &mut self {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
+                *params = values;
+            }
+        }
+        self
+    }
+
+    /// Borrow the SQL text. Used by validation.
+    pub(crate) fn sql(&self) -> &str {
+        match self {
+            Self::Execute { sql, .. }
+            | Self::FetchOne { sql, .. }
+            | Self::FetchMany { sql, .. } => sql,
+        }
+    }
+
+    /// Borrow the parameter slice. Used by validation.
+    pub(crate) fn params_slice(&self) -> &[PgValue] {
+        match self {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => params,
+        }
+    }
 }
 
 impl PgRequest {
@@ -272,6 +403,18 @@ impl PgRequest {
         Self::FetchOne {
             sql: sql.into(),
             params: Vec::new(),
+        }
+    }
+
+    /// `FetchMany` request with no parameters and a per-call row cap.
+    ///
+    /// Effective cap is the lesser of `max_rows` and
+    /// [`PgConfig::max_response_rows`].
+    pub fn fetch_many(sql: impl Into<String>, max_rows: usize) -> Self {
+        Self::FetchMany {
+            sql: sql.into(),
+            params: Vec::new(),
+            max_rows,
         }
     }
 
@@ -292,20 +435,43 @@ impl PgRequest {
     /// ```
     pub fn param(mut self, value: impl Into<PgValue>) -> Self {
         match &mut self {
-            Self::Execute { params, .. } | Self::FetchOne { params, .. } => {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
                 params.push(value.into());
             }
+            // Transaction has no top-level params; build steps with
+            // `PgStep::param` and pass them via `.steps(...)`.
+            Self::Transaction { .. } => {}
         }
         self
     }
 
     /// **Replace** the parameter list. Anything previously added by
-    /// [`Self::param`] is discarded.
+    /// [`Self::param`] is discarded. No-op on `Transaction` — build
+    /// steps and pass them via [`Self::steps`] instead.
     pub fn params(mut self, values: Vec<PgValue>) -> Self {
         match &mut self {
-            Self::Execute { params, .. } | Self::FetchOne { params, .. } => {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
                 *params = values;
             }
+            Self::Transaction { .. } => {}
+        }
+        self
+    }
+
+    /// Build a transaction request from an ordered list of steps.
+    pub fn transaction(steps: Vec<PgStep>) -> Self {
+        Self::Transaction { steps }
+    }
+
+    /// Replace the steps of a `Transaction` request. No-op on
+    /// non-Transaction variants.
+    pub fn steps(mut self, new_steps: Vec<PgStep>) -> Self {
+        if let Self::Transaction { steps } = &mut self {
+            *steps = new_steps;
         }
         self
     }
@@ -323,6 +489,61 @@ pub enum PgResponse {
     Row(PgRow),
     /// `FetchOne` matched zero rows.
     NoRows,
+    /// `FetchMany` outcome. Rows are buffered up to the effective
+    /// cap; `truncated = true` means there were more rows on the
+    /// wire that the bridge stopped pulling.
+    Rows {
+        /// Buffered rows, in result order.
+        rows: Vec<PgRow>,
+        /// `true` if Postgres had more rows to send and the bridge
+        /// hit its cap. The buffered rows are still valid.
+        truncated: bool,
+    },
+    /// `Transaction` outcome. Either every step committed or the
+    /// first failing step rolled the whole script back.
+    Transaction(PgTransactionOutcome),
+}
+
+/// Result of a transactional script.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PgTransactionOutcome {
+    /// All steps succeeded; the bridge ran `COMMIT`.
+    Committed {
+        /// Per-step outcomes in input order.
+        steps: Vec<PgStepOk>,
+    },
+    /// At least one step failed; the bridge ran `ROLLBACK`. Records
+    /// the steps that completed before the failure plus the failing
+    /// step's index and error.
+    RolledBack {
+        /// Per-step outcomes for steps before the failure.
+        completed: Vec<PgStepOk>,
+        /// Index into the original `steps` of the failing step.
+        failed_at: usize,
+        /// Error returned by the failing step.
+        error: PgError,
+    },
+}
+
+/// Successful outcome of a single [`PgStep`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PgStepOk {
+    /// `Execute` succeeded with this many rows affected.
+    Executed {
+        /// Rows affected, as reported by Postgres.
+        rows_affected: u64,
+    },
+    /// `FetchOne` returned exactly one row.
+    Row(PgRow),
+    /// `FetchOne` returned zero rows.
+    NoRows,
+    /// `FetchMany` returned a buffered set, possibly truncated.
+    Rows {
+        /// Buffered rows, in result order.
+        rows: Vec<PgRow>,
+        /// Set when the bridge hit its row cap.
+        truncated: bool,
+    },
 }
 
 /// One Postgres result row plus its column names.
@@ -478,6 +699,15 @@ pub enum PgConfigError {
     ZeroPollInterval,
     /// `max_request_params == 0`.
     ZeroMaxRequestParams,
+    /// `max_response_rows == 0`. Use a request `max_rows` of `0` for
+    /// "no rows expected"; the config ceiling must be `>= 1`.
+    ZeroMaxResponseRows,
+    /// `cancel.pool_size == 0`. The cancel sidecar needs at least one
+    /// connection to fire `pg_cancel_backend`.
+    ZeroCancelPoolSize,
+    /// `cancel.acquire_timeout == 0`. SQLx would reject every cancel
+    /// acquire immediately.
+    ZeroCancelAcquireTimeout,
     /// SQLx pool config requested zero connections. SQLx requires at
     /// least one. Distinct from a "no public cap" error: pool size is
     /// caller-owned.
@@ -499,6 +729,9 @@ impl std::fmt::Display for PgConfigError {
             Self::ZeroDefaultTimeout => f.write_str("default_timeout must be > 0"),
             Self::ZeroPollInterval => f.write_str("poll_interval must be > 0"),
             Self::ZeroMaxRequestParams => f.write_str("max_request_params must be >= 1"),
+            Self::ZeroMaxResponseRows => f.write_str("max_response_rows must be >= 1"),
+            Self::ZeroCancelPoolSize => f.write_str("cancel.pool_size must be >= 1"),
+            Self::ZeroCancelAcquireTimeout => f.write_str("cancel.acquire_timeout must be > 0"),
             Self::ZeroPoolMaxConnections => f.write_str("pool max_connections must be >= 1"),
             Self::ZeroPoolAcquireTimeout => f.write_str("pool acquire_timeout must be > 0"),
         }
@@ -506,6 +739,59 @@ impl std::fmt::Display for PgConfigError {
 }
 
 impl std::error::Error for PgConfigError {}
+
+/// Sidecar cancel-pool settings.
+///
+/// When set, the bridge builds a small `sqlx::PgPool` from the same
+/// URL as the main pool and uses it to fire `pg_cancel_backend(pid)`
+/// when the per-attempt timeout fires on a request whose backend PID
+/// has been captured. Only available on the [`crate::PgWorker::install`]
+/// path (config-built pool); the supplied-pool path leaves DB
+/// cancellation to the caller.
+///
+/// Cost: one extra round trip per admitted request to capture
+/// `pg_backend_pid()` before running the user's query. Default off
+/// keeps that opt-in.
+#[derive(Debug, Clone)]
+pub struct PgCancelConfig {
+    /// Sidecar pool size. Tiny by default — cancel calls are short
+    /// and rare.
+    pub pool_size: u32,
+    /// SQLx `acquire_timeout` for the sidecar pool. The bridge does
+    /// not wait on the cancel's own deadline directly; this just
+    /// bounds how long the sidecar will hold a fire-and-forget cancel
+    /// task.
+    pub acquire_timeout: Duration,
+}
+
+impl PgCancelConfig {
+    /// Cancel sidecar with conservative defaults (`pool_size = 1`,
+    /// `acquire_timeout = 2s`).
+    pub fn new() -> Self {
+        Self {
+            pool_size: 1,
+            acquire_timeout: Duration::from_secs(2),
+        }
+    }
+
+    /// Sidecar pool size.
+    pub fn with_pool_size(mut self, n: u32) -> Self {
+        self.pool_size = n;
+        self
+    }
+
+    /// Sidecar acquire timeout.
+    pub fn with_acquire_timeout(mut self, t: Duration) -> Self {
+        self.acquire_timeout = t;
+        self
+    }
+}
+
+impl Default for PgCancelConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// SQLx pool settings the bridge will apply when it builds its own
 /// pool. Ignored when the bridge is given a caller-supplied
@@ -591,6 +877,28 @@ pub struct PgConfig {
     /// Max positional params per request. Over the cap rejects with
     /// [`PgError::InvalidRequest`] before the spawned task runs.
     pub max_request_params: usize,
+    /// Hard ceiling on rows the bridge will buffer for a single
+    /// [`PgRequest::FetchMany`]. The request's own `max_rows` is
+    /// further capped to this value, so a caller cannot ask for
+    /// `usize::MAX` and force unbounded buffering.
+    pub max_response_rows: usize,
+    /// Optional DB-side cancel sidecar. When `Some`, the bridge fires
+    /// `pg_cancel_backend(pid)` from a small dedicated pool when the
+    /// per-attempt timeout elapses on a request whose backend PID
+    /// was captured. Default `None` — opt in via
+    /// [`Self::with_cancel_on_timeout`].
+    ///
+    /// **Only honored on [`crate::PgWorker::install`].** The
+    /// supplied-pool path ([`crate::PgWorker::install_with_pool`])
+    /// silently ignores this field — the bridge cannot construct a
+    /// sidecar pool without an owned URL, and the caller already
+    /// owns connection lifetimes.
+    ///
+    /// **Sidecar URL** is the same as `pool.url`. There is no knob
+    /// to point the sidecar at a different host. The sidecar exists
+    /// to fire one-shot `pg_cancel_backend` calls; co-locating it
+    /// with the main pool is the boring choice.
+    pub cancel: Option<PgCancelConfig>,
 }
 
 impl PgConfig {
@@ -605,6 +913,8 @@ impl PgConfig {
             default_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(2),
             max_request_params: 64,
+            max_response_rows: 4096,
+            cancel: None,
         }
     }
 
@@ -656,6 +966,36 @@ impl PgConfig {
         self
     }
 
+    /// Sets `max_response_rows`.
+    pub fn with_max_response_rows(mut self, max: usize) -> Self {
+        self.max_response_rows = max;
+        self
+    }
+
+    /// Enables DB-side cancellation with a sidecar pool of `pool_size`
+    /// and a default `acquire_timeout`. Use [`Self::with_cancel`] to
+    /// set both knobs explicitly.
+    ///
+    /// When the bridge per-attempt timeout fires, the bridge runs
+    /// `pg_cancel_backend($1)` against the captured backend PID via
+    /// the sidecar pool. Adds one round trip per admitted request to
+    /// capture `pg_backend_pid()` before running the user's query.
+    ///
+    /// Only honored on [`crate::PgWorker::install`]; the
+    /// supplied-pool path ignores it.
+    pub fn with_cancel_on_timeout(mut self, pool_size: u32) -> Self {
+        self.cancel = Some(PgCancelConfig::new().with_pool_size(pool_size));
+        self
+    }
+
+    /// Sets the full cancel config explicitly. Use this when you want
+    /// to override the sidecar's `acquire_timeout` from
+    /// [`PgCancelConfig::default`].
+    pub fn with_cancel(mut self, cancel: PgCancelConfig) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
     /// Validates the full config — Tina-side fields plus the
     /// embedded `pool` config when it is `Some`. Used by
     /// [`crate::PgWorker::install`] (config-built pool path).
@@ -698,6 +1038,17 @@ impl PgConfig {
         }
         if self.max_request_params == 0 {
             return Err(PgConfigError::ZeroMaxRequestParams);
+        }
+        if self.max_response_rows == 0 {
+            return Err(PgConfigError::ZeroMaxResponseRows);
+        }
+        if let Some(cancel) = &self.cancel {
+            if cancel.pool_size == 0 {
+                return Err(PgConfigError::ZeroCancelPoolSize);
+            }
+            if cancel.acquire_timeout.is_zero() {
+                return Err(PgConfigError::ZeroCancelAcquireTimeout);
+            }
         }
         Ok(())
     }

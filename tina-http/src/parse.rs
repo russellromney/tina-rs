@@ -245,11 +245,21 @@ fn is_origin_form(target: &str) -> bool {
 
 /// Serialises a response head onto a wire buffer using HTTP/1.1 framing.
 ///
-/// Emits status line + headers + `Content-Length` (taken from the
-/// body's declared length) + optional `Connection: close` + the empty
-/// terminator line. Body bytes are *not* appended — the connection
-/// isolate writes them separately so streaming can write chunk by
-/// chunk.
+/// Emits status line + headers + framing line + optional
+/// `Connection: close` + the empty terminator line. The framing
+/// line is picked from the body variant:
+///
+/// - `Buffered(_)` / `Stream(_)` → `Content-Length: N`.
+/// - `ChunkedStream(_)`         → `Transfer-Encoding: chunked`.
+///
+/// **Caller-supplied `Content-Length` and `Transfer-Encoding`
+/// headers are dropped.** Framing is owned by the body type, not
+/// the caller. If the caller wants chunked, they build a
+/// `ChunkedStream` body; setting `Transfer-Encoding: chunked` on a
+/// `Buffered(_)` body has no effect on the wire.
+///
+/// Body bytes are *not* appended — the connection isolate writes
+/// them separately so streaming can write chunk by chunk.
 pub fn encode_response_head(
     response: &crate::types::HttpResponse,
     connection_close: bool,
@@ -272,7 +282,11 @@ pub fn encode_response_head(
 
     let mut wrote_connection = false;
     for (name, value) in response.headers.iter() {
-        if name == http::header::CONTENT_LENGTH {
+        if name == http::header::CONTENT_LENGTH || name == http::header::TRANSFER_ENCODING {
+            // We pick the framing header based on the body variant,
+            // so a caller-supplied `Content-Length` /
+            // `Transfer-Encoding` is dropped. Anything else we emit
+            // verbatim.
             continue;
         } else if name == http::header::CONNECTION {
             if connection_close {
@@ -285,9 +299,19 @@ pub fn encode_response_head(
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b"Content-Length: ");
-    out.extend_from_slice(response.body.declared_length().to_string().as_bytes());
-    out.extend_from_slice(b"\r\n");
+    // Framing: `Content-Length` when known, `Transfer-Encoding:
+    // chunked` when not. The connection writer follows the same
+    // branch when it frames each chunk on the wire.
+    match response.body.declared_length() {
+        Some(length) => {
+            out.extend_from_slice(b"Content-Length: ");
+            out.extend_from_slice(length.to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        None => {
+            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        }
+    }
     if connection_close && !wrote_connection {
         out.extend_from_slice(b"Connection: close\r\n");
     }
@@ -305,7 +329,8 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
     let mut out = encode_response_head(response, connection_close);
     match &response.body {
         crate::types::HttpResponseBody::Buffered(bytes) => out.extend_from_slice(bytes),
-        crate::types::HttpResponseBody::Stream(_) => {
+        crate::types::HttpResponseBody::Stream(_)
+        | crate::types::HttpResponseBody::ChunkedStream(_) => {
             panic!("encode_response cannot serialise a streaming body; use encode_response_head")
         }
     }
