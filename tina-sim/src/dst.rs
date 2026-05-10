@@ -4,14 +4,16 @@
 //! history-as-data runs, replay checks, deletion shrinking, and trace
 //! invariants without becoming a general property-testing framework.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 
 use tina::{AddressGeneration, IsolateId, ShardId};
 use tina_runtime::{
     CallError, CallId, CauseId, EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
+    stable_trace_hash,
 };
 
-use crate::DurableImage;
+use crate::{DurableImage, FaultConfig, SimulatorConfig};
 
 /// One replayable generated or hand-authored operation history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,4 +576,881 @@ where
         left, right,
         "semantic projection mismatch between {left_name} and {right_name}"
     );
+}
+
+/// Visible simulator-replay knobs needed to redo one story.
+///
+/// `ReplayConfig` is plain data on a [`ReplayCase`]. It carries every
+/// simulator-replay knob the runner needs: the full
+/// [`SimulatorConfig`] (faults plus scripted TCP/UDP/DNS/TLS/signal/
+/// process/storage configs) and the per-isolate mailbox capacities.
+///
+/// The `simulator.seed` field is overridden by `case.seed` at run
+/// time, so the case's `seed` is the source of truth.
+///
+/// Mailbox capacities are keyed by a stable `&'static str` role name
+/// the runner picks. Use [`ReplayConfig::mailbox`] to read them. A
+/// missing entry is a loud panic — the runner is asking for a
+/// capacity the case never declared.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplayConfig {
+    /// Full simulator config. `simulator.seed` is overridden by
+    /// `case.seed` when the runner builds its `Simulator`.
+    pub simulator: SimulatorConfig,
+    /// Per-isolate mailbox capacities, keyed by a runner-chosen role
+    /// name.
+    pub mailboxes: BTreeMap<&'static str, usize>,
+}
+
+impl ReplayConfig {
+    /// Returns a `ReplayConfig` with default simulator config (no
+    /// seeded faults, no scripted IO) and no declared mailboxes.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a `ReplayConfig` with the given seeded faults and no
+    /// declared mailboxes.
+    pub fn with_faults(faults: FaultConfig) -> Self {
+        Self {
+            simulator: SimulatorConfig {
+                faults,
+                ..SimulatorConfig::default()
+            },
+            mailboxes: BTreeMap::new(),
+        }
+    }
+
+    /// Inserts one mailbox capacity by role name and returns `self`.
+    pub fn with_mailbox(mut self, role: &'static str, capacity: usize) -> Self {
+        self.mailboxes.insert(role, capacity);
+        self
+    }
+
+    /// Returns the declared mailbox capacity for `role`, panicking if
+    /// the case never declared one. Loud panic surfaces missing
+    /// declarations early.
+    pub fn mailbox(&self, role: &'static str) -> usize {
+        *self.mailboxes.get(role).unwrap_or_else(|| {
+            panic!(
+                "ReplayConfig.mailboxes has no entry for role {role:?}; \
+                 declare it on the ReplayCase so the saved case is self-contained"
+            )
+        })
+    }
+}
+
+/// A bug captured as visible Rust data.
+///
+/// A `ReplayCase` is everything a coding agent needs to redo a Tina
+/// failure: a stable name, the seed, visible simulator knobs, an
+/// explicit operation history, the human-readable scenario and
+/// invariant, and the pinned event count + trace hash that prove the
+/// run is the same one that was saved.
+///
+/// Construct one in a small `pub fn case() -> ReplayCase<Op>` and call
+/// [`assert_replay_case`] from a `#[test]`. Pin
+/// `expected_event_count`/`expected_trace_hash` on first run; bump them
+/// only after a conscious trace-shape review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayCase<Op> {
+    /// Stable case name (matches `history.name()` in normal use).
+    pub name: &'static str,
+    /// Replay seed (matches `history.seed()` in normal use).
+    pub seed: u64,
+    /// Visible simulator-replay knobs.
+    pub config: ReplayConfig,
+    /// One-line scenario description for failure messages and bug reports.
+    pub scenario: &'static str,
+    /// Explicit operation history.
+    pub history: History<Op>,
+    /// Pinned event count for the saved replay.
+    pub expected_event_count: usize,
+    /// Pinned `stable_trace_hash` for the saved replay.
+    pub expected_trace_hash: u64,
+    /// Human-readable invariant the case proves.
+    pub invariant: &'static str,
+}
+
+/// What one runner observed for a [`ReplayCase`].
+///
+/// A runner is a normal function `fn(&ReplayCase<Op>) -> ReplayReport<Output>`
+/// that builds the simulator with `case.seed` + `case.config.faults`,
+/// drives `case.history.operations()`, and returns the projected output
+/// alongside the observed event count and `stable_trace_hash`.
+///
+/// Use [`ReplayReport::from_case_and_events`] to fill in the boilerplate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayReport<Output> {
+    /// Case name.
+    pub name: &'static str,
+    /// Replay seed.
+    pub seed: u64,
+    /// Visible simulator-replay knobs from the case.
+    pub config: ReplayConfig,
+    /// Scenario tag from the case.
+    pub scenario: &'static str,
+    /// Observed event count for this run.
+    pub event_count: usize,
+    /// Observed `stable_trace_hash` for this run.
+    pub trace_hash: u64,
+    /// Caller-supplied semantic projection.
+    pub output: Output,
+}
+
+impl<Output> ReplayReport<Output> {
+    /// Builds a report from a case, the full event trace, and a caller
+    /// projection.
+    ///
+    /// The trace hash is computed via
+    /// [`tina_runtime::stable_trace_hash`]; never via debug strings.
+    pub fn from_case_and_events<Op>(
+        case: &ReplayCase<Op>,
+        events: &[RuntimeEvent],
+        output: Output,
+    ) -> Self {
+        Self {
+            name: case.name,
+            seed: case.seed,
+            config: case.config.clone(),
+            scenario: case.scenario,
+            event_count: events.len(),
+            trace_hash: stable_trace_hash(events.iter()),
+            output,
+        }
+    }
+}
+
+/// Why a [`ReplayCase`] did not match what was pinned.
+///
+/// Returned by [`check_replay_case`] when the observed event count or
+/// trace hash diverged from `expected_event_count` /
+/// `expected_trace_hash`. The `Display` impl is the actionable message
+/// `assert_replay_case` panics with; it includes the case's history so
+/// a coding agent reading only the panic can see what the case did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayMismatch<Op> {
+    /// Case name.
+    pub name: &'static str,
+    /// Replay seed.
+    pub seed: u64,
+    /// Visible simulator-replay knobs from the case.
+    pub config: ReplayConfig,
+    /// Scenario tag from the case.
+    pub scenario: &'static str,
+    /// Invariant tag from the case.
+    pub invariant: &'static str,
+    /// Pinned event count.
+    pub expected_event_count: usize,
+    /// Observed event count.
+    pub actual_event_count: usize,
+    /// Pinned trace hash.
+    pub expected_trace_hash: u64,
+    /// Observed trace hash.
+    pub actual_trace_hash: u64,
+    /// History from the case, included so the panic message is
+    /// self-contained.
+    pub history: History<Op>,
+}
+
+impl<Op> ReplayMismatch<Op> {
+    /// Returns true when the observed event count diverged.
+    pub const fn count_diverged(&self) -> bool {
+        self.expected_event_count != self.actual_event_count
+    }
+
+    /// Returns true when the observed trace hash diverged.
+    pub const fn hash_diverged(&self) -> bool {
+        self.expected_trace_hash != self.actual_trace_hash
+    }
+}
+
+impl<Op: Debug> std::fmt::Display for ReplayMismatch<Op> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "replay case `{}` no longer matches saved trace shape",
+            self.name
+        )?;
+        writeln!(f, "  seed:      {}", self.seed)?;
+        writeln!(f, "  scenario:  {}", self.scenario)?;
+        writeln!(f, "  invariant: {}", self.invariant)?;
+        writeln!(f, "  config:    {:?}", self.config)?;
+        writeln!(f, "  history ({} ops):", self.history.len())?;
+        for op in self.history.operations() {
+            writeln!(f, "      - {op:?}")?;
+        }
+        writeln!(
+            f,
+            "  events:    expected {}, got {}{}",
+            self.expected_event_count,
+            self.actual_event_count,
+            if self.count_diverged() {
+                " (diverged)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(
+            f,
+            "  hash:      expected 0x{:016x}, got 0x{:016x}{}",
+            self.expected_trace_hash,
+            self.actual_trace_hash,
+            if self.hash_diverged() {
+                " (diverged)"
+            } else {
+                ""
+            },
+        )?;
+        write!(
+            f,
+            "  next step: decide whether behavior changed or only trace vocabulary/order \
+             changed, then either fix the regression or update \
+             expected_event_count/expected_trace_hash on the case."
+        )
+    }
+}
+
+/// Runs `runner` once and checks the report against the case's pinned
+/// `expected_event_count` and `expected_trace_hash`.
+///
+/// The runner is `FnMut` so stateful runners are allowed:
+///
+/// ```ignore
+/// fn run_case(case: &ReplayCase<Op>) -> ReplayReport<Output>;
+/// ```
+///
+/// Returns the report on success and a boxed [`ReplayMismatch`] on
+/// divergence (boxed so the `Result` payload stays small for clippy's
+/// `result_large_err`). Use [`assert_replay_case`] from a `#[test]`
+/// for the "saved seed, saved bug" workflow.
+///
+/// Debug-asserts:
+/// - `case.name` and `case.seed` match the bundled `case.history`, so
+///   the two source-of-truth fields cannot silently drift;
+/// - the runner's [`ReplayReport`] identity (`name`, `seed`,
+///   `scenario`, `config`) matches the case it was given, so a runner
+///   cannot return a report for a different case and pass by accident.
+///   The blessed `ReplayReport::from_case_and_events` constructor
+///   copies these fields straight from the case, so a correct runner
+///   never trips this check.
+pub fn check_replay_case<Op, Output, Runner>(
+    case: &ReplayCase<Op>,
+    mut runner: Runner,
+) -> Result<ReplayReport<Output>, Box<ReplayMismatch<Op>>>
+where
+    Op: Clone,
+    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+{
+    debug_assert_eq!(
+        case.name,
+        case.history.name(),
+        "ReplayCase.name and history.name() drifted",
+    );
+    debug_assert_eq!(
+        case.seed,
+        case.history.seed(),
+        "ReplayCase.seed and history.seed() drifted",
+    );
+    let report = runner(case);
+    debug_assert_eq!(
+        report.name, case.name,
+        "runner returned report.name {:?} for case {:?}; \
+         build the report with ReplayReport::from_case_and_events",
+        report.name, case.name,
+    );
+    debug_assert_eq!(
+        report.seed, case.seed,
+        "runner returned report.seed {} for case {:?} (expected {})",
+        report.seed, case.name, case.seed,
+    );
+    debug_assert_eq!(
+        report.scenario, case.scenario,
+        "runner returned report.scenario for case {:?} that does not match the case",
+        case.name,
+    );
+    debug_assert!(
+        report.config == case.config,
+        "runner returned report.config for case {:?} that does not match the case",
+        case.name,
+    );
+    if report.event_count != case.expected_event_count
+        || report.trace_hash != case.expected_trace_hash
+    {
+        return Err(Box::new(ReplayMismatch {
+            name: case.name,
+            seed: case.seed,
+            config: case.config.clone(),
+            scenario: case.scenario,
+            invariant: case.invariant,
+            expected_event_count: case.expected_event_count,
+            actual_event_count: report.event_count,
+            expected_trace_hash: case.expected_trace_hash,
+            actual_trace_hash: report.trace_hash,
+            history: case.history.clone(),
+        }));
+    }
+    Ok(report)
+}
+
+/// Test sugar over [`check_replay_case`].
+///
+/// Panics with the [`ReplayMismatch`] message when the case no longer
+/// reproduces. The panic message names the case, seed, scenario,
+/// invariant, config, history operations, expected vs actual
+/// count/hash, and the next review step.
+pub fn assert_replay_case<Op, Output, Runner>(
+    case: &ReplayCase<Op>,
+    runner: Runner,
+) -> ReplayReport<Output>
+where
+    Op: Clone + Debug,
+    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+{
+    match check_replay_case(case, runner) {
+        Ok(report) => report,
+        Err(mismatch) => panic!("{mismatch}"),
+    }
+}
+
+/// One shrunk replay case with refreshed expected count/hash.
+///
+/// Returned by [`shrink_replay_case`]. The `shrunk_case` is ready for
+/// `assert_replay_case` — its `expected_event_count` and
+/// `expected_trace_hash` reflect the smaller history's observed shape,
+/// not the original case's pinned values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShrinkReport<Op, Output> {
+    /// Original history length.
+    pub original_len: usize,
+    /// Shrunk history length.
+    pub shrunk_len: usize,
+    /// How many candidate deletions were attempted.
+    pub attempts: usize,
+    /// Caller-supplied reason describing the bug being preserved.
+    pub reason: String,
+    /// Shrunk case with refreshed `expected_*` constants.
+    pub shrunk_case: ReplayCase<Op>,
+    /// Runner's report for the shrunk case.
+    pub shrunk_report: ReplayReport<Output>,
+}
+
+impl<Op, Output> std::fmt::Display for ShrinkReport<Op, Output>
+where
+    Op: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "shrunk `{}` from {} ops to {} ops in {} attempts",
+            self.shrunk_case.name, self.original_len, self.shrunk_len, self.attempts
+        )?;
+        writeln!(f, "reason: {}", self.reason)?;
+        writeln!(f, "case:")?;
+        writeln!(f, "    name:      {}", self.shrunk_case.name)?;
+        writeln!(f, "    seed:      {}", self.shrunk_case.seed)?;
+        writeln!(f, "    config:    {:?}", self.shrunk_case.config)?;
+        writeln!(f, "    scenario:  {}", self.shrunk_case.scenario)?;
+        writeln!(f, "    invariant: {}", self.shrunk_case.invariant)?;
+        writeln!(f, "    history ({} ops):", self.shrunk_case.history.len())?;
+        for op in self.shrunk_case.history.operations() {
+            writeln!(f, "        - {op:?}")?;
+        }
+        writeln!(
+            f,
+            "    expected_event_count: {}",
+            self.shrunk_case.expected_event_count
+        )?;
+        writeln!(
+            f,
+            "    expected_trace_hash:  0x{:016x}",
+            self.shrunk_case.expected_trace_hash
+        )?;
+        write!(
+            f,
+            "review step: paste these constants only after confirming the smaller \
+             case still proves the same bug/invariant the larger case did."
+        )
+    }
+}
+
+/// Deletion-shrinks a [`ReplayCase`] while the bug still reproduces.
+///
+/// For every candidate (one operation removed), a new `ReplayCase` is
+/// built that preserves `name`, `seed`, `config`, `scenario`, and
+/// `invariant`. The runner produces a fresh report; `still_fails`
+/// decides whether the candidate still exhibits the bug. Accepted
+/// candidates seed further deletion attempts.
+///
+/// On return, `shrunk_case.expected_event_count` and
+/// `shrunk_case.expected_trace_hash` are refreshed to match the smaller
+/// case's observed shape — the larger case's pinned constants do not
+/// carry over.
+///
+/// The shrinker honors `config.max_attempts`. The operation list stays
+/// visible Rust data throughout.
+pub fn shrink_replay_case<Op, Output, Runner, StillFails>(
+    case: &ReplayCase<Op>,
+    config: ShrinkConfig,
+    reason: impl Into<String>,
+    mut runner: Runner,
+    mut still_fails: StillFails,
+) -> ShrinkReport<Op, Output>
+where
+    Op: Clone,
+    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+    StillFails: FnMut(&ReplayReport<Output>) -> bool,
+{
+    let original_len = case.history.len();
+    let mut current_case = case.clone();
+    let mut current_report = runner(&current_case);
+    let mut index = 0;
+    let mut attempts = 0;
+    while index < current_case.history.len() && attempts < config.max_attempts {
+        let mut candidate_ops = current_case.history.operations().to_vec();
+        candidate_ops.remove(index);
+        let candidate_history = current_case.history.with_operations(candidate_ops);
+        let candidate = ReplayCase {
+            name: current_case.name,
+            seed: current_case.seed,
+            config: current_case.config.clone(),
+            scenario: current_case.scenario,
+            history: candidate_history,
+            expected_event_count: current_case.expected_event_count,
+            expected_trace_hash: current_case.expected_trace_hash,
+            invariant: current_case.invariant,
+        };
+        attempts += 1;
+        let candidate_report = runner(&candidate);
+        if still_fails(&candidate_report) {
+            current_case = candidate;
+            current_report = candidate_report;
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+
+    current_case.expected_event_count = current_report.event_count;
+    current_case.expected_trace_hash = current_report.trace_hash;
+
+    ShrinkReport {
+        original_len,
+        shrunk_len: current_case.history.len(),
+        attempts,
+        reason: reason.into(),
+        shrunk_case: current_case,
+        shrunk_report: current_report,
+    }
+}
+
+/// One pasteable failing case from a [`sweep_seeds`] run.
+///
+/// The `failing_case` is ready for `assert_replay_case`: its
+/// `expected_event_count` and `expected_trace_hash` are refreshed to
+/// the observed values so the bug is pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepFailure<Op, Output> {
+    /// Sweep name.
+    pub name: &'static str,
+    /// How many seeds the sweep examined before stopping.
+    pub seeds_examined: usize,
+    /// The failing seed.
+    pub failing_seed: u64,
+    /// The failing case with refreshed `expected_*` constants.
+    pub failing_case: ReplayCase<Op>,
+    /// The runner's report for the failing case.
+    pub failing_report: ReplayReport<Output>,
+    /// Why the caller's `check` rejected the report.
+    pub reason: String,
+}
+
+impl<Op, Output> std::fmt::Display for SweepFailure<Op, Output>
+where
+    Op: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "sweep `{}` failed at seed {} after {} seeds examined",
+            self.name, self.failing_seed, self.seeds_examined
+        )?;
+        writeln!(f, "reason: {}", self.reason)?;
+        writeln!(f, "case:")?;
+        writeln!(f, "    name:      {}", self.failing_case.name)?;
+        writeln!(f, "    seed:      {}", self.failing_case.seed)?;
+        writeln!(f, "    config:    {:?}", self.failing_case.config)?;
+        writeln!(f, "    scenario:  {}", self.failing_case.scenario)?;
+        writeln!(f, "    invariant: {}", self.failing_case.invariant)?;
+        writeln!(f, "    history ({} ops):", self.failing_case.history.len())?;
+        for op in self.failing_case.history.operations() {
+            writeln!(f, "        - {op:?}")?;
+        }
+        writeln!(
+            f,
+            "    expected_event_count: {}",
+            self.failing_case.expected_event_count
+        )?;
+        writeln!(
+            f,
+            "    expected_trace_hash:  0x{:016x}",
+            self.failing_case.expected_trace_hash
+        )?;
+        write!(
+            f,
+            "paste this case into a `#[test]` and call \
+             `assert_replay_case(&CASE, run_case)`."
+        )
+    }
+}
+
+/// One successful [`sweep_seeds`] run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepSuccess {
+    /// Sweep name.
+    pub name: &'static str,
+    /// How many seeds the sweep examined.
+    pub seeds_examined: usize,
+}
+
+/// Sweeps a list of seeds, materializing one [`ReplayCase`] per seed and
+/// returning the first failing case as a pasteable [`SweepFailure`].
+///
+/// `make_case` must be pure and deterministic in `seed` — every
+/// generated operation must be materialized into the returned
+/// `ReplayCase.history` before the simulator runs. There is no hidden
+/// random generator in this helper.
+///
+/// `run_case` is the same runner used with [`assert_replay_case`].
+///
+/// `check` is the caller's pass/fail predicate over the report. Return
+/// `Err(reason)` to declare the seed a failure; the sweep stops and
+/// returns the case + report so the caller can paste them into a
+/// regression test.
+///
+/// The returned `SweepFailure.failing_case` has its
+/// `expected_event_count` and `expected_trace_hash` refreshed to the
+/// observed values, so it can be replayed by `assert_replay_case`
+/// directly — pinning the bug as a saved seed.
+pub fn sweep_seeds<Op, Output, Seeds, MakeCase, Runner, Check>(
+    name: &'static str,
+    seeds: Seeds,
+    mut make_case: MakeCase,
+    mut runner: Runner,
+    mut check: Check,
+) -> Result<SweepSuccess, Box<SweepFailure<Op, Output>>>
+where
+    Seeds: IntoIterator<Item = u64>,
+    MakeCase: FnMut(u64) -> ReplayCase<Op>,
+    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+    Check: FnMut(&ReplayReport<Output>) -> Result<(), String>,
+{
+    let mut seeds_examined = 0;
+    for seed in seeds {
+        let case = make_case(seed);
+        seeds_examined += 1;
+        let report = runner(&case);
+        if let Err(reason) = check(&report) {
+            let mut failing_case = case;
+            failing_case.expected_event_count = report.event_count;
+            failing_case.expected_trace_hash = report.trace_hash;
+            return Err(Box::new(SweepFailure {
+                name,
+                seeds_examined,
+                failing_seed: seed,
+                failing_case,
+                failing_report: report,
+                reason,
+            }));
+        }
+    }
+    Ok(SweepSuccess {
+        name,
+        seeds_examined,
+    })
+}
+
+#[cfg(test)]
+mod replay_case_tests {
+    use super::*;
+
+    fn fake_event(id: u64) -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(id),
+            None,
+            ShardId::new(0),
+            IsolateId::new(1),
+            RuntimeEventKind::HandlerStarted,
+        )
+    }
+
+    fn case() -> ReplayCase<u32> {
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        ReplayCase {
+            name: "fake replay case",
+            seed: 7,
+            config: ReplayConfig::new(),
+            scenario: "produces three handler-started events",
+            history: History::new("fake replay case", 7, vec![1, 2, 3]),
+            expected_event_count: events.len(),
+            expected_trace_hash: stable_trace_hash(events.iter()),
+            invariant: "trace shape matches saved fixture",
+        }
+    }
+
+    fn run_three_events(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let sum: u32 = case.history.operations().iter().sum();
+        ReplayReport::from_case_and_events(case, &events, sum)
+    }
+
+    #[test]
+    fn assert_replay_case_passes_for_pinned_shape() {
+        let report = assert_replay_case(&case(), run_three_events);
+        assert_eq!(report.event_count, 3);
+        assert_eq!(report.output, 6);
+        assert_eq!(report.trace_hash, case().expected_trace_hash);
+    }
+
+    #[test]
+    fn check_replay_case_returns_mismatch_when_count_drifts() {
+        let mut drifted = case();
+        drifted.expected_event_count = 99;
+        let mismatch = check_replay_case(&drifted, run_three_events).expect_err("count drift");
+        assert!(mismatch.count_diverged());
+        assert_eq!(mismatch.actual_event_count, 3);
+        assert_eq!(mismatch.expected_event_count, 99);
+
+        let rendered = mismatch.to_string();
+        assert!(rendered.contains("fake replay case"));
+        assert!(rendered.contains("seed:      7"));
+        assert!(rendered.contains("expected 99, got 3"));
+        assert!(rendered.contains("next step"));
+        // History must be in the failure message so an agent reading
+        // only the panic can see what the case did.
+        assert!(rendered.contains("history (3 ops)"));
+        assert!(rendered.contains("- 1"));
+        assert!(rendered.contains("- 2"));
+        assert!(rendered.contains("- 3"));
+    }
+
+    #[test]
+    #[should_panic(expected = "ReplayCase.seed and history.seed() drifted")]
+    fn check_replay_case_debug_asserts_seed_drift() {
+        let mut bad = case();
+        bad.seed = 999;
+        let _ = check_replay_case(&bad, run_three_events);
+    }
+
+    #[test]
+    #[should_panic(expected = "ReplayCase.name and history.name() drifted")]
+    fn check_replay_case_debug_asserts_name_drift() {
+        let mut bad = case();
+        bad.name = "drifted name";
+        let _ = check_replay_case(&bad, run_three_events);
+    }
+
+    #[test]
+    #[should_panic(expected = "runner returned report.name")]
+    fn check_replay_case_debug_asserts_report_identity_mismatch() {
+        // A misbehaving runner that hand-builds a report for the
+        // wrong case must trip the identity guard, not slip through
+        // because the count/hash happen to align.
+        fn lying_runner(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            ReplayReport {
+                name: "some other case",
+                seed: case.seed,
+                config: case.config.clone(),
+                scenario: case.scenario,
+                event_count: events.len(),
+                trace_hash: stable_trace_hash(events.iter()),
+                output: 0,
+            }
+        }
+        let _ = check_replay_case(&case(), lying_runner);
+    }
+
+    #[test]
+    fn replay_config_mailbox_returns_declared_capacity() {
+        let cfg = ReplayConfig::new()
+            .with_mailbox("source", 8)
+            .with_mailbox("sink", 2);
+        assert_eq!(cfg.mailbox("source"), 8);
+        assert_eq!(cfg.mailbox("sink"), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "ReplayConfig.mailboxes has no entry for role")]
+    fn replay_config_mailbox_panics_on_missing_role() {
+        let cfg = ReplayConfig::new();
+        let _ = cfg.mailbox("anything");
+    }
+
+    #[test]
+    fn check_replay_case_returns_mismatch_when_hash_drifts() {
+        let mut drifted = case();
+        drifted.expected_trace_hash = drifted.expected_trace_hash.wrapping_add(1);
+        let mismatch = check_replay_case(&drifted, run_three_events).expect_err("hash drift");
+        assert!(mismatch.hash_diverged());
+        assert!(!mismatch.count_diverged());
+        let rendered = mismatch.to_string();
+        assert!(rendered.contains("hash:      expected"));
+        assert!(rendered.contains("(diverged)"));
+    }
+
+    fn make_seeded_case(seed: u64) -> ReplayCase<u32> {
+        let history = History::new("sweep fixture", seed, vec![1, 2, 3]);
+        ReplayCase {
+            name: "sweep fixture",
+            seed,
+            config: ReplayConfig::new(),
+            scenario: "seed sweep over a fixed history",
+            history,
+            expected_event_count: 0,
+            expected_trace_hash: 0,
+            invariant: "report.output stays under threshold",
+        }
+    }
+
+    fn run_seeded_case(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+        let events: Vec<RuntimeEvent> = (1..=(case.seed % 5 + 1)).map(fake_event).collect();
+        let output = case.history.operations().iter().sum::<u32>() + case.seed as u32;
+        ReplayReport::from_case_and_events(case, &events, output)
+    }
+
+    #[test]
+    fn sweep_seeds_returns_success_when_all_pass() {
+        let outcome = sweep_seeds(
+            "fixture sweep",
+            0..5,
+            make_seeded_case,
+            run_seeded_case,
+            |_report| Ok(()),
+        );
+        let success = outcome.expect("all good");
+        assert_eq!(success.name, "fixture sweep");
+        assert_eq!(success.seeds_examined, 5);
+    }
+
+    #[test]
+    fn sweep_seeds_returns_first_failing_pasteable_case() {
+        let outcome = sweep_seeds(
+            "fixture sweep",
+            0..10,
+            make_seeded_case,
+            run_seeded_case,
+            |report| {
+                if report.output >= 9 {
+                    Err(format!("output {} >= 9", report.output))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let failure = outcome.expect_err("seed 3 should fail (sum=6, +3 = 9)");
+        assert_eq!(failure.failing_seed, 3);
+        assert!(failure.seeds_examined >= 4);
+        // Refreshed expected constants make the case pasteable.
+        assert_eq!(
+            failure.failing_case.expected_event_count,
+            failure.failing_report.event_count
+        );
+        assert_eq!(
+            failure.failing_case.expected_trace_hash,
+            failure.failing_report.trace_hash
+        );
+        // The case can be replayed by `assert_replay_case`.
+        let replay = assert_replay_case(&failure.failing_case, run_seeded_case);
+        assert_eq!(replay.event_count, failure.failing_report.event_count);
+        assert_eq!(replay.trace_hash, failure.failing_report.trace_hash);
+
+        let rendered = failure.to_string();
+        assert!(rendered.contains("sweep `fixture sweep` failed at seed 3"));
+        assert!(rendered.contains("expected_trace_hash:"));
+        assert!(rendered.contains("paste this case"));
+    }
+
+    #[test]
+    fn make_case_is_deterministic_per_seed() {
+        // Two calls produce the same visible case before any simulator runs.
+        let a = make_seeded_case(7);
+        let b = make_seeded_case(7);
+        assert_eq!(a, b);
+    }
+
+    fn run_full_history_case(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+        // Each operation contributes one fake event; sum is the projection.
+        let events: Vec<RuntimeEvent> = (1..=case.history.len() as u64).map(fake_event).collect();
+        let sum: u32 = case.history.operations().iter().sum();
+        ReplayReport::from_case_and_events(case, &events, sum)
+    }
+
+    #[test]
+    fn shrink_replay_case_drops_irrelevant_ops_and_refreshes_constants() {
+        let case = ReplayCase {
+            name: "shrink fixture",
+            seed: 11,
+            config: ReplayConfig::new(),
+            scenario: "history sum stays >= 5",
+            history: History::new("shrink fixture", 11, vec![5, 1, 1, 1]),
+            // Original constants come from a hypothetical larger run; the
+            // shrinker must refresh them.
+            expected_event_count: 999,
+            expected_trace_hash: 0xdead_beef,
+            invariant: "sum invariant survives deletion",
+        };
+
+        let report = shrink_replay_case(
+            &case,
+            ShrinkConfig::default(),
+            "sum stays >= 5",
+            run_full_history_case,
+            |report| report.output >= 5,
+        );
+
+        assert!(report.shrunk_len <= report.original_len);
+        assert_eq!(report.shrunk_case.history.operations(), &[5]);
+        // Refreshed for the smaller case, not inherited from the original.
+        assert_ne!(report.shrunk_case.expected_event_count, 999);
+        assert_ne!(report.shrunk_case.expected_trace_hash, 0xdead_beef);
+        assert_eq!(
+            report.shrunk_case.expected_event_count,
+            report.shrunk_report.event_count
+        );
+        assert_eq!(
+            report.shrunk_case.expected_trace_hash,
+            report.shrunk_report.trace_hash
+        );
+        // The shrunk case is itself replayable.
+        let replay = assert_replay_case(&report.shrunk_case, run_full_history_case);
+        assert_eq!(replay.event_count, report.shrunk_report.event_count);
+
+        let rendered = report.to_string();
+        assert!(rendered.contains("shrunk `shrink fixture`"));
+        assert!(rendered.contains("review step"));
+    }
+
+    #[test]
+    fn shrink_replay_case_honors_max_attempts() {
+        let case = ReplayCase {
+            name: "shrink cap",
+            seed: 0,
+            config: ReplayConfig::new(),
+            scenario: "all ops contribute",
+            history: History::new("shrink cap", 0, vec![1; 16]),
+            expected_event_count: 0,
+            expected_trace_hash: 0,
+            invariant: "no op may be removed",
+        };
+        let report = shrink_replay_case(
+            &case,
+            ShrinkConfig { max_attempts: 3 },
+            "no op is droppable",
+            run_full_history_case,
+            |_report| false,
+        );
+        assert_eq!(report.attempts, 3);
+        assert_eq!(report.shrunk_len, report.original_len);
+    }
 }

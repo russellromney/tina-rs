@@ -119,13 +119,12 @@ pub use call::{
     TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
     TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
     UdpSocketId, call, call_handle_call_id, call_with_handle, cancel_call, dns_lookup, file_close,
-    file_create,
-    file_fsync, file_open, file_read, file_read_at, file_size, file_write, file_write_at,
-    journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file,
-    rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load,
-    sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read,
-    tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read,
-    tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
+    file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir,
+    remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit,
+    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+    tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
+    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 pub use deferred::{
     InsertError as PendingRepliesInsertError, PendingReplies,
@@ -253,9 +252,7 @@ pub const CANCELLED_CALL_RING_CAPACITY: usize = 64;
 /// Maps a `CancelCause` to the matching `CallReplyRejectedReason` for
 /// late-reply rejection. Kept inline here so the runtime and the
 /// simulator both call the same translation.
-pub fn call_reply_reason_for_cause(
-    cause: tina::CancelCause,
-) -> trace::CallReplyRejectedReason {
+pub fn call_reply_reason_for_cause(cause: tina::CancelCause) -> trace::CallReplyRejectedReason {
     match cause {
         tina::CancelCause::CallerCancelled => trace::CallReplyRejectedReason::CallerCancelled,
         tina::CancelCause::CallerTimedOut => trace::CallReplyRejectedReason::CallerTimedOut,
@@ -1426,10 +1423,7 @@ where
                                 self.push_event(
                                     isolate_id,
                                     Some(cause),
-                                    RuntimeEventKind::CallReplyRejected {
-                                        call_id,
-                                        reason,
-                                    },
+                                    RuntimeEventKind::CallReplyRejected { call_id, reason },
                                 );
                             }
                         }
@@ -2060,10 +2054,7 @@ where
                             let original_cause = entry.cause;
                             let _ = entry.translator.take();
                             handle_shared.set_state(tina::CallHandleState::Cancelled);
-                            self.record_cancelled_call(
-                                call_id,
-                                tina::CancelCause::CallerCancelled,
-                            );
+                            self.record_cancelled_call(call_id, tina::CancelCause::CallerCancelled);
                             self.close_deferred_slot_for_call_with_reason(
                                 call_id,
                                 trace::DeferredReplyRejectedReason::CallerCancelled,
@@ -2205,11 +2196,10 @@ where
         // O(n²) from repeated `Vec::remove`. Important for routers
         // with many in-flight calls.
         let original = std::mem::take(&mut self.pending_isolate_calls);
-        let (mut owned, kept): (Vec<_>, Vec<_>) =
-            original.into_iter().partition(|entry| {
-                entry.requester.isolate == owner_isolate
-                    && entry.requester.generation == owner_generation
-            });
+        let (mut owned, kept): (Vec<_>, Vec<_>) = original.into_iter().partition(|entry| {
+            entry.requester.isolate == owner_isolate
+                && entry.requester.generation == owner_generation
+        });
         self.pending_isolate_calls = kept;
         for entry in owned.iter_mut() {
             self.record_cancelled_call(entry.call_id, tina::CancelCause::OwnerStopped);
@@ -3151,12 +3141,22 @@ where
                     reply.cause,
                     CallOutcome::Replied(message.into_any()),
                 ) {
+                    // Cross-shard late reply path: same cause-aware
+                    // classification as the local-reply path. Without
+                    // this, a cancelled or timed-out cross-shard call
+                    // loses the new `CallerCancelled` / `CallerTimedOut`
+                    // / `OwnerStopped` / `RuntimeStopped` truth and
+                    // surfaces as the generic `NoPendingCall`.
+                    let reason = match self.recently_cancelled_cause(reply.call_id) {
+                        Some(c) => call_reply_reason_for_cause(c),
+                        None => CallReplyRejectedReason::NoPendingCall,
+                    };
                     self.push_event(
                         reply.requester.isolate,
                         Some(reply.cause),
                         RuntimeEventKind::CallReplyRejected {
                             call_id: reply.call_id,
-                            reason: CallReplyRejectedReason::NoPendingCall,
+                            reason,
                         },
                     );
                 }

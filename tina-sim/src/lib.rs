@@ -756,10 +756,7 @@ where
                                 self.push_event(
                                     isolate_id,
                                     Some(cause),
-                                    RuntimeEventKind::CallReplyRejected {
-                                        call_id,
-                                        reason,
-                                    },
+                                    RuntimeEventKind::CallReplyRejected { call_id, reason },
                                 );
                             }
                         }
@@ -3768,7 +3765,6 @@ where
         }
     }
 
-
     fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == tina_runtime::CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
@@ -3792,11 +3788,10 @@ where
     ) {
         // Single-pass partition: O(n) over pending calls.
         let original = std::mem::take(&mut self.pending_isolate_calls);
-        let (mut owned, kept): (Vec<_>, Vec<_>) =
-            original.into_iter().partition(|entry| {
-                entry.requester.isolate == owner_isolate
-                    && entry.requester.generation == owner_generation
-            });
+        let (mut owned, kept): (Vec<_>, Vec<_>) = original.into_iter().partition(|entry| {
+            entry.requester.isolate == owner_isolate
+                && entry.requester.generation == owner_generation
+        });
         self.pending_isolate_calls = kept;
         for entry in owned.iter_mut() {
             self.record_cancelled_call(entry.call_id, tina::CancelCause::OwnerStopped);
@@ -3874,10 +3869,7 @@ where
                             let original_cause = entry.cause;
                             let _ = entry.translator.take();
                             handle_shared.set_state(tina::CallHandleState::Cancelled);
-                            self.record_cancelled_call(
-                                call_id,
-                                tina::CancelCause::CallerCancelled,
-                            );
+                            self.record_cancelled_call(call_id, tina::CancelCause::CallerCancelled);
                             self.close_deferred_slot_for_call_with_reason(
                                 call_id,
                                 tina_runtime::DeferredReplyRejectedReason::CallerCancelled,

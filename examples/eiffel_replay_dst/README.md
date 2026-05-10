@@ -1,15 +1,21 @@
 # eiffel_replay_dst
 
-A demonstration of the *capability* the two ecosystems don't share:
-deterministic replay.
+The copyable specimen for the Tina DST workflow.
 
-The Tina side runs under `tina-sim` with seeded fault injection. Two
-runs at the same seed produce byte-identical traces — same length,
-same `stable_trace_hash`. A run at a *different* seed produces a
-different fingerprint, which proves the property is non-trivial.
+```text
+same seed, same story
+saved seed, saved bug
+```
 
-The Tokio side runs the same nominal workload twice. Messages are
-deterministic; wall-clock timings are not.
+The Tina side runs under `tina-sim` with seeded fault injection and a
+saved `ReplayCase`. `assert_replay_case` re-runs the case and checks
+the observed event count and `stable_trace_hash` against pinned
+constants. Same seed, byte-identical fingerprint. Different seed,
+different fingerprint.
+
+The Tokio side runs the same nominal workload twice on a
+`current_thread` runtime. Messages are deterministic; wall-clock
+timings drift. There is no replay story.
 
 ## Run
 
@@ -19,80 +25,99 @@ cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- tokio
 cargo run --manifest-path examples/eiffel_replay_dst/Cargo.toml -- tina
 ```
 
-You'll see something like:
-
-```
-side=tina  seed_a=42 run_a1_events=64 run_a2_events=64 fingerprints_match=true
-           seed_b=99 run_b1_fingerprint_differs=true messages_received=6
-side=tokio messages_match=true timings_match=false
-           run1_us=[8, 3142, 8200, 12699, 16521, 25867]
-           run2_us=[18, 3837, 8908, 12119, 15787, 20855]
-```
-
-`fingerprints_match=true` is the Tina property. `timings_match=false`
-is the Tokio property — and the README *won't* assert it (under
-unusually quiet systems both runs can land on identical microsecond
-boundaries by accident; the smoke test asserts only what's
-non-flakey).
+The Tina mode prints the saved case shape, a tiny seed sweep, and a
+deletion-shrink demo. The shrink output is the format you paste into a
+bug report.
 
 ## Read
 
-- [`src/tokio_impl.rs`](src/tokio_impl.rs)
-- [`src/tina_impl.rs`](src/tina_impl.rs)
+- [`src/tina_impl.rs`](src/tina_impl.rs) — `Op`, `case()`, `run_case`.
+- [`src/tokio_impl.rs`](src/tokio_impl.rs) — same workload, no replay.
+- [`tests/smoke.rs`](tests/smoke.rs) — `assert_replay_case`,
+  same-seed/same-hash, different-seed/different-hash.
 
-## Tokio shape
+## ReplayCase Shape
 
-A `current_thread` runtime; a producer task that writes 6 numbers
-into an mpsc with 1–3ms sleeps; a consumer that records each message
-plus its `Instant::now().elapsed()`. Run twice. Messages stay
-stable; timings drift because there is no virtual clock.
+```rust
+ReplayCase {
+    name: "eiffel_replay_dst saved seed",
+    seed: 42,
+    config: ReplayConfig {
+        simulator: SimulatorConfig {
+            faults: FaultConfig {
+                local_send: LocalSendFaultMode::DelayByRounds { one_in: 4, rounds: 1 },
+                ..Default::default()
+            },
+            ..SimulatorConfig::default()
+        },
+        mailboxes: [("producer", 16), ("sink", 16)].into_iter().collect(),
+    },
+    scenario: "history-driven ticks fan out into a sink under seeded delivery delays",
+    history: History::new("...", 42, vec![Op::Tick(0), ..., Op::Drain]),
+    expected_event_count: 54,
+    expected_trace_hash: 0xc878_d2a4_3912_9480,
+    invariant: "every Tick op produces one SinkMsg::Got(value) in trace order",
+}
+```
 
-## Tina shape
+This is plain Rust data. Copy the literal into another file and the
+bug travels — every knob the runner needs (full `SimulatorConfig`,
+seed, every mailbox capacity, the operation history) is on the case.
 
-`tina_sim::Simulator` with seeded fault injection: 1-in-3 timer
-wakes get pushed by an extra millisecond, deterministically chosen
-by the seed; 1-in-4 local sends get delayed by a round. The seed is
-the input; the trace is the output.
+## Copy This Into Your Bug Report
 
-The fingerprint comes from `tina_runtime::stable_trace_hash(...)`
-(047 Rock 3) — a deterministic hash over the typed trace events,
-not `format!("{event:?}").hash(...)`.
+When `assert_replay_case` fires or `sweep_seeds` returns a failure,
+the panic / `Display` form already includes the case shape as
+readable lines (not as Rust source). Paste it into the issue:
 
-## Discussion
+```text
+Replay case:
+- name:                 eiffel_replay_dst saved seed
+- seed:                 42
+- config:               ReplayConfig { simulator: SimulatorConfig { ... }, mailboxes: {...} }
+- scenario:             history-driven ticks fan out into a sink under seeded delivery delays
+- invariant:            every Tick op produces one SinkMsg::Got(value) in trace order
+- history (8 ops):      Tick(0), Tick(1), Tick(2), Drain, Tick(3), Tick(4), Tick(5), Drain
+- expected events:      54
+- expected hash:        0xc878d2a439129480
+- command:              cargo test --manifest-path examples/eiffel_replay_dst/Cargo.toml
+```
 
-What feels better:
+For code, copy the `case()` function in [`src/tina_impl.rs`](src/tina_impl.rs).
 
-- **Replay is a primitive, not a discipline.** Same seed, same
-  trace, byte-for-byte. There is no "be careful where you reach for
-  `Instant::now()`" rule because the simulator doesn't have a
+## Tokio Shape
+
+A `current_thread` runtime; a producer task that writes 6 numbers into
+an mpsc with 1–3ms sleeps; a consumer that records each message plus
+its `Instant::now().elapsed()`. Run twice. Messages stay stable;
+timings drift because there is no virtual clock.
+
+## Tina Shape
+
+`tina_sim::Simulator` with seeded fault injection: 1-in-3 timer wakes
+get pushed by an extra millisecond, deterministically chosen by the
+seed; 1-in-4 local sends get delayed by a round. The seed plus the
+explicit `History` plus the visible `ReplayConfig` plus the pinned
+event count and trace hash specify the run.
+
+The fingerprint comes from `tina_runtime::stable_trace_hash` — a
+deterministic hash over the typed trace events, not
+`format!("{event:?}").hash(...)`.
+
+## Why This Is The Specimen
+
+- **Replay is a primitive, not a discipline.** Same `ReplayCase`,
+  same hash, byte-for-byte. There is no "be careful where you reach
+  for `Instant::now()`" rule because the simulator does not have a
   wall clock to reach for.
 - **`stable_trace_hash` is the canonical fingerprint.** No
   `format!("{event:?}")` hashing; the runtime owns the stable
   serialization.
-- **Faults are knobs, not happenstance.** `FaultMode::DelayBy {
-  one_in: 3, by: 1ms }` makes the seed do real work — the test isn't
-  asserting on a quiet system.
+- **Faults are knobs, not happenstance.**
+  `FaultMode::DelayBy { one_in: 3, by: 1ms }` makes the seed do real
+  work — the test does not assert on a quiet system.
+- **Bugs travel as data.** The whole case is one `struct` literal.
+  Paste it into a bug report; the next reader replays it.
 
-What feels worse:
-
-- **Two parallel report shapes.** Each side observes a different
-  thing (Tina: trace fingerprints; Tokio: timings drift), so each
-  has its own `Report`. The shared template doesn't fit; the
-  smoke tests are structurally different.
-- **Continuation `_ => Tick(next)` discards `sleep`'s `Result`.**
-  Per the new checklist, runtime-call replies should carry
-  `Result<T, CallError>`; here we map the unit success to a typed
-  `Tick(u32)` directly. For sleep this is OK (the producer treats
-  any sleep failure as "still tick"), but it's the same pattern
-  that `IoFailed` had before we cleaned it up elsewhere.
-
-What this suggests:
-
-- The replay property is the strongest single argument for the
-  Tina runtime model. It's also the property that's hardest to
-  *show* without a comparison; this example is the canonical "look
-  at the same fingerprint twice" demo.
-- The fault-injection knobs (`FaultMode::DelayBy`,
-  `LocalSendFaultMode::DelayByRounds`) are the surface most worth
-  growing for serious DST work — different fault modes per call
-  kind, scenario presets, etc.
+For the full workflow (sweep seeds, shrink history, save bad seed),
+read [`docs/tina-user-guide/08-simulation-and-dst.md`](../../docs/tina-user-guide/08-simulation-and-dst.md).

@@ -493,9 +493,8 @@ impl OwnerDriver {
             OwnerDriverMsg::BeginAll => {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for worker in &self.workers {
-                    let (effect, handle) =
-                        call_with_handle(*worker, WorkerMsg::Hold, CALL_TIMEOUT)
-                            .reply(OwnerDriverMsg::Returned);
+                    let (effect, handle) = call_with_handle(*worker, WorkerMsg::Hold, CALL_TIMEOUT)
+                        .reply(OwnerDriverMsg::Returned);
                     self.pending.push(handle);
                     effects.push(effect);
                 }
@@ -647,9 +646,7 @@ fn cancel_admit_cycle_does_not_leak_capacity() {
         "each cycle must produce exactly one cancel outcome",
     );
     assert!(
-        obs.cancels
-            .iter()
-            .all(|o| *o == CancelOutcome::Cancelled),
+        obs.cancels.iter().all(|o| *o == CancelOutcome::Cancelled),
         "every cancel in the cycle must succeed; got {obs:?}",
     );
     assert!(
@@ -731,9 +728,9 @@ fn cross_shard_cancel_is_rejected_with_wrong_shard() {
     // with the foreign shard id and a non-zero call_id, and run
     // dispatch_cancel_call's translator through the typed outcome
     // path by issuing the cancel effect.
-    let foreign = std::sync::Arc::new(tina::CallHandleShared::new(
-        std::any::TypeId::of::<WorkerReply>(),
-    ));
+    let foreign = std::sync::Arc::new(tina::CallHandleShared::new(std::any::TypeId::of::<
+        WorkerReply,
+    >()));
     foreign.set_call_id(CallId::new(u64::MAX).get());
     foreign.set_shard_id(99);
     let foreign_handle: CallHandle<WorkerReply> =
