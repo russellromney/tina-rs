@@ -541,8 +541,9 @@ waiter slots on caller cancel via `cancel_call(handle)`.
 ```rust
 use tina::pool::{PoolConfig, ReleaseDisposition};
 use tina_runtime::pool::{
-    WorkerPool, acquire_result_effect, acquire_with_handle_effect,
-    release_result_effect, close_effect, pressure_effect,
+    WorkerPool, acquire_effect, acquire_result_effect,
+    acquire_with_handle_effect, release_effect, release_result_effect,
+    close_effect, pressure_effect,
 };
 
 let pool = WorkerPool::<MyHandle, SingleShard>::new(

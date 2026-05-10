@@ -348,8 +348,8 @@ sugar. No live-only `Deadline::after` shortcut ships.
 
 ### 19. Pool consumer ergonomics — host-side acquire and scenario runner
 
-**Surfaced by:** `eiffel_pool_cancel_reclaim` (and to a lesser extent
-`eiffel_graceful_pool_shutdown`).
+**Surfaced by:** `specimen_pool_cancel_reclaim` (and to a lesser extent
+`specimen_graceful_pool_shutdown`).
 
 The cancel-reclaim specimen is ~245 lines tina vs ~113 lines tokio.
 Roughly 115 of the gap is a `Driver` isolate that exists *only*
