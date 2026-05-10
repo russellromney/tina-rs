@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
@@ -1885,6 +1885,13 @@ pub mod runtime_internal {
         }
     }
 
+    /// Borrow the inner handle of a typed slot without consuming it.
+    /// Pair with [`handle_shared`] to clone the shared slot for an
+    /// observer that survives `reply_to`.
+    pub fn deferred_handle_ref<R>(slot: &DeferredReply<R>) -> &DeferredReplyHandle {
+        &slot.handle
+    }
+
     /// Build a typed [`CallHandle`] from a runtime-allocated shared cell.
     pub fn call_handle_from_shared<R>(shared: Arc<CallHandleShared>) -> CallHandle<R> {
         CallHandle {
@@ -1924,3 +1931,5 @@ pub mod prelude {
         restart_children, send, sequence, spawn, stop, stop_with,
     };
 }
+
+pub mod pool;
