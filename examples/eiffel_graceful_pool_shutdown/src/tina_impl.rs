@@ -13,12 +13,13 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, PoolLease, ReleaseDisposition};
+use tina::pool::{AcquireFailure, CloseMode, PoolConfig, PoolLease, ReleaseDisposition};
 use tina::prelude::*;
-use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, call, sleep,
+use tina_runtime::pool::{
+    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_effect, close_effect, release_effect,
+    try_acquired,
 };
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep};
 
 use crate::{CALLERS, Report, SHUTDOWN_AFTER_MS, WORK_MS, WORKERS};
 
@@ -115,41 +116,28 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
-                let pool = self.pool;
                 let mut effects = Vec::with_capacity(CALLERS);
                 for j in 0..CALLERS as u32 {
                     self.jobs.insert(j, JobState::Acquiring);
-                    effects.push(
-                        call(pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
-                            .reply(move |outcome| DriverMsg::AcquireReturned { job: j, outcome }),
-                    );
+                    effects.push(acquire_effect(self.pool, CALL_TIMEOUT, move |outcome| {
+                        DriverMsg::AcquireReturned { job: j, outcome }
+                    }));
                 }
                 Effect::Batch(effects)
             }
-            DriverMsg::AcquireReturned { job, outcome } => match outcome {
-                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
+            DriverMsg::AcquireReturned { job, outcome } => match try_acquired(outcome) {
+                Ok(lease) => {
                     let worker = *lease.handle();
                     self.jobs.insert(job, JobState::Working { lease });
-                    call(worker, WorkerMsg::Do, CALL_TIMEOUT)
+                    tina_runtime::call(worker, WorkerMsg::Do, CALL_TIMEOUT)
                         .reply(move |outcome| DriverMsg::WorkerReturned { job, outcome })
                 }
-                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Closed)) => {
+                Err(AcquireFailure::Closed) | Err(AcquireFailure::Full) => {
                     self.jobs.remove(&job);
                     self.outcome.closed += 1;
                     self.maybe_finish()
                 }
-                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Full)) => {
-                    self.jobs.remove(&job);
-                    self.outcome.closed += 1;
-                    self.maybe_finish()
-                }
-                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::WrongShard)) => {
-                    self.jobs.remove(&job);
-                    self.outcome.failed += 1;
-                    self.maybe_finish()
-                }
-                CallOutcome::Replied(_) => unreachable!("non-Acquire reply to Acquire call"),
-                _ => {
+                Err(_) => {
                     self.jobs.remove(&job);
                     self.outcome.failed += 1;
                     self.maybe_finish()
@@ -162,33 +150,30 @@ impl Driver {
                 let JobState::Working { lease } = state else {
                     return noop();
                 };
-                let disposition = match &outcome {
-                    CallOutcome::Replied(_) => ReleaseDisposition::Reuse,
-                    _ => ReleaseDisposition::Retire,
+                let succeeded = matches!(outcome, CallOutcome::Replied(_));
+                let disposition = if succeeded {
+                    ReleaseDisposition::Reuse
+                } else {
+                    ReleaseDisposition::Retire
                 };
-                let counted_completed = matches!(outcome, CallOutcome::Replied(_));
                 self.jobs.insert(job, JobState::Releasing);
-                if counted_completed {
+                if succeeded {
                     self.outcome.completed += 1;
                 } else {
                     self.outcome.failed += 1;
                 }
-                tina_runtime::pool::release_effect(
-                    lease,
-                    self.pool,
-                    disposition,
-                    CALL_TIMEOUT,
-                    move |_| DriverMsg::ReleaseReturned { job },
-                )
+                release_effect(lease, self.pool, disposition, CALL_TIMEOUT, move |_| {
+                    DriverMsg::ReleaseReturned { job }
+                })
             }
             DriverMsg::ReleaseReturned { job } => {
                 self.jobs.remove(&job);
                 self.maybe_finish()
             }
             DriverMsg::Shutdown => {
-                let pool = self.pool;
-                call(pool, WorkerPoolMsg::Close(CloseMode::Drain), CALL_TIMEOUT)
-                    .reply(|_| DriverMsg::CloseReturned)
+                close_effect(self.pool, CloseMode::Drain, CALL_TIMEOUT, |_| {
+                    DriverMsg::CloseReturned
+                })
             }
             DriverMsg::CloseReturned => noop(),
         }

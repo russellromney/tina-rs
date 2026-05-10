@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tina::pool::{
-    AcquireOutcome, CloseMode, PoolConfig, PoolId, PoolLease, PoolPressureReport,
-    ReleaseDisposition, ReleaseOutcome, runtime_internal as pool_internal,
+    AcquireFailure, AcquireOutcome, CloseMode, PoolConfig, PoolId, PoolLease, PoolPressureReport,
+    ReleaseDisposition, ReleaseFailure, ReleaseOutcome, runtime_internal as pool_internal,
 };
 use tina::runtime_internal::{deferred_handle_ref, handle_shared};
 use tina::{
@@ -137,6 +137,17 @@ struct InFlightDispatch {
     slot: Arc<DeferredSlotShared>,
 }
 
+#[derive(Default)]
+struct PoolCounters {
+    full: u64,
+    cancel: u64,
+    retired: u64,
+    closed: u64,
+    wrong_shard: u64,
+    no_caller_drops: u64,
+    dispatch_recovered: u64,
+}
+
 /// Bounded worker pool isolate.
 ///
 /// `H` is the resource handle (e.g. `tina::Address<WorkerMsg, WReply>`);
@@ -162,13 +173,7 @@ where
     waiter_slab: Vec<Option<Waiter<H>>>,
     waiter_queue: std::collections::VecDeque<u32>,
     in_flight: Vec<InFlightDispatch>,
-    full_count: u64,
-    cancel_count: u64,
-    retired_count: u64,
-    closed_count: u64,
-    wrong_shard_count: u64,
-    no_caller_drops: u64,
-    dispatch_recovered: u64,
+    counters: PoolCounters,
     closed: Option<CloseMode>,
     _shard: PhantomData<fn() -> S>,
 }
@@ -216,13 +221,7 @@ where
             waiter_slab,
             waiter_queue: std::collections::VecDeque::with_capacity(max_waiters),
             in_flight: Vec::new(),
-            full_count: 0,
-            cancel_count: 0,
-            retired_count: 0,
-            closed_count: 0,
-            wrong_shard_count: 0,
-            no_caller_drops: 0,
-            dispatch_recovered: 0,
+            counters: PoolCounters::default(),
             closed: None,
             _shard: PhantomData,
         }
@@ -250,13 +249,13 @@ where
             leased,
             waiters: self.live_waiter_count(),
             max_waiters: self.config.max_waiters,
-            full_count: self.full_count,
-            closed_count: self.closed_count,
-            wrong_shard_count: self.wrong_shard_count,
-            cancel_count: self.cancel_count,
-            retired_count: self.retired_count,
-            no_caller_drops: self.no_caller_drops,
-            dispatch_recovered: self.dispatch_recovered,
+            full_count: self.counters.full,
+            closed_count: self.counters.closed,
+            wrong_shard_count: self.counters.wrong_shard,
+            cancel_count: self.counters.cancel,
+            retired_count: self.counters.retired,
+            no_caller_drops: self.counters.no_caller_drops,
+            dispatch_recovered: self.counters.dispatch_recovered,
             closed: self.closed.is_some(),
         }
     }
@@ -277,7 +276,7 @@ where
                 .is_some_and(|w| w.reply.state() != DeferredSlotState::Open);
             if drop_it {
                 *slot = None;
-                self.cancel_count += 1;
+                self.counters.cancel += 1;
                 reclaimed_any = true;
             }
         }
@@ -316,7 +315,7 @@ where
                     next_generation: generation.saturating_add(1),
                 };
                 self.idle.push_back(resource_id);
-                self.dispatch_recovered += 1;
+                self.counters.dispatch_recovered += 1;
             }
             // Released, retired, or otherwise advanced — nothing to recover.
             _ => {}
@@ -396,7 +395,7 @@ where
 
     fn handle_acquire(&mut self, ctx: &mut Context<'_, S, WorkerPoolReply<H>>) -> Effect<Self> {
         if self.closed.is_some() {
-            self.closed_count += 1;
+            self.counters.closed += 1;
             return reply(WorkerPoolReply::Acquire(AcquireOutcome::Closed));
         }
 
@@ -408,11 +407,11 @@ where
         let slot = match ctx.take_reply_slot() {
             Ok(s) => s,
             Err(tina::TakeReplySlotError::NoCaller) => {
-                self.no_caller_drops += 1;
+                self.counters.no_caller_drops += 1;
                 return noop();
             }
             Err(tina::TakeReplySlotError::CrossShardUnsupported) => {
-                self.wrong_shard_count += 1;
+                self.counters.wrong_shard += 1;
                 // No slot to reply through; surface the typed outcome
                 // via the runtime's normal reply path. CrossShard
                 // means the caller's own shard handles the reply
@@ -432,7 +431,7 @@ where
         }
 
         if self.live_waiter_count() >= self.config.max_waiters {
-            self.full_count += 1;
+            self.counters.full += 1;
             return reply_to::<Self>(slot, WorkerPoolReply::Acquire(AcquireOutcome::Full));
         }
 
@@ -465,7 +464,7 @@ where
                 if *generation == lease_generation {
                     self.states[raw_idx as usize] = ResourceState::Retired;
                     self.resources[raw_idx as usize] = None;
-                    self.retired_count += 1;
+                    self.counters.retired += 1;
                 }
             }
             return reply(WorkerPoolReply::Release(ReleaseOutcome::PoolClosed));
@@ -476,7 +475,7 @@ where
                 if matches!(disposition, ReleaseDisposition::Retire) {
                     self.states[raw_idx as usize] = ResourceState::Retired;
                     self.resources[raw_idx as usize] = None;
-                    self.retired_count += 1;
+                    self.counters.retired += 1;
                     return reply(WorkerPoolReply::Release(ReleaseOutcome::Retired));
                 }
                 let next_generation = lease_generation.saturating_add(1);
@@ -522,7 +521,7 @@ where
         let mut effects: Vec<Effect<Self>> = Vec::new();
         for slot in self.waiter_slab.iter_mut() {
             if let Some(waiter) = slot.take() {
-                self.closed_count += 1;
+                self.counters.closed += 1;
                 effects.push(reply_to::<Self>(
                     waiter.reply,
                     WorkerPoolReply::Acquire(AcquireOutcome::Closed),
@@ -534,6 +533,44 @@ where
         effects.push(reply(WorkerPoolReply::Closed));
         batch(effects)
     }
+}
+
+/// Build an [`Effect`] that acquires a resource from the pool.
+///
+/// Sugar over `call(pool, WorkerPoolMsg::Acquire, timeout).reply(...)`.
+/// Use [`acquire_with_handle_effect`] when the caller wants a
+/// [`tina::CallHandle`] for cancellation.
+pub fn acquire_effect<I, H, F, M>(
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    timeout: std::time::Duration,
+    translator: F,
+) -> Effect<I>
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
+    M: 'static,
+{
+    crate::call::call(pool, WorkerPoolMsg::Acquire, timeout).reply(translator)
+}
+
+/// Build an `(Effect, CallHandle)` pair for cancellable acquire.
+///
+/// The caller stores the [`tina::CallHandle`] and later fires
+/// `cancel_call(handle)` to close the wait. The pool's sweep on the
+/// next handler turn reclaims the waiter slot.
+pub fn acquire_with_handle_effect<I, H, F, M>(
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    timeout: std::time::Duration,
+    translator: F,
+) -> (Effect<I>, tina::CallHandle<WorkerPoolReply<H>>)
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
+    M: 'static,
+{
+    crate::call::call_with_handle(pool, WorkerPoolMsg::Acquire, timeout).reply(translator)
 }
 
 /// Build an [`Effect`] that releases a lease back to the pool.
@@ -556,6 +593,103 @@ where
 {
     crate::call::call(pool, WorkerPoolMsg::Release { lease, disposition }, timeout)
         .reply(translator)
+}
+
+/// Sugar for `call(pool, WorkerPoolMsg::PressureReport, timeout).reply(...)`.
+pub fn pressure_effect<I, H, F, M>(
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    timeout: std::time::Duration,
+    translator: F,
+) -> Effect<I>
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
+    M: 'static,
+{
+    crate::call::call(pool, WorkerPoolMsg::PressureReport, timeout).reply(translator)
+}
+
+/// Fold a pool acquire reply into `Result<PoolLease<H>, AcquireFailure>`.
+///
+/// Collapses the three-layer match every consumer would otherwise
+/// write: `CallOutcome` → `WorkerPoolReply::Acquire` →
+/// `AcquireOutcome::Acquired`. Each non-Acquired outcome becomes a
+/// distinct [`AcquireFailure`] variant; `Full` / `Closed` /
+/// `WrongShard` stay distinguishable from transport-level failures.
+pub fn try_acquired<H>(
+    outcome: crate::call::CallOutcome<WorkerPoolReply<H>>,
+) -> Result<PoolLease<H>, AcquireFailure>
+where
+    H: Send + 'static,
+{
+    use crate::call::CallOutcome;
+    match outcome {
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
+            Ok(lease)
+        }
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Full)) => {
+            Err(AcquireFailure::Full)
+        }
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Closed)) => {
+            Err(AcquireFailure::Closed)
+        }
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::WrongShard)) => {
+            Err(AcquireFailure::WrongShard)
+        }
+        CallOutcome::Replied(_) => Err(AcquireFailure::WrongReply),
+        CallOutcome::Timeout => Err(AcquireFailure::CallTimeout),
+        CallOutcome::Full => Err(AcquireFailure::CallFull),
+        CallOutcome::Closed => Err(AcquireFailure::CallClosed),
+    }
+}
+
+/// Fold a pool release reply into `Result<(), ReleaseFailure>`.
+///
+/// `Released` → `Ok(())`. Every other outcome becomes a typed
+/// [`ReleaseFailure`].
+pub fn try_released<H>(
+    outcome: crate::call::CallOutcome<WorkerPoolReply<H>>,
+) -> Result<(), ReleaseFailure>
+where
+    H: Send + 'static,
+{
+    use crate::call::CallOutcome;
+    match outcome {
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => Ok(()),
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Retired)) => {
+            Err(ReleaseFailure::Retired)
+        }
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::StaleLease)) => {
+            Err(ReleaseFailure::StaleLease)
+        }
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::DoubleRelease)) => {
+            Err(ReleaseFailure::DoubleRelease)
+        }
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::PoolClosed)) => {
+            Err(ReleaseFailure::PoolClosed)
+        }
+        CallOutcome::Replied(_) => Err(ReleaseFailure::WrongReply),
+        CallOutcome::Timeout => Err(ReleaseFailure::CallTimeout),
+        CallOutcome::Full => Err(ReleaseFailure::CallFull),
+        CallOutcome::Closed => Err(ReleaseFailure::CallClosed),
+    }
+}
+
+/// Sugar for `call(pool, WorkerPoolMsg::Close(mode), timeout).reply(...)`.
+pub fn close_effect<I, H, F, M>(
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    mode: CloseMode,
+    timeout: std::time::Duration,
+    translator: F,
+) -> Effect<I>
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
+    M: 'static,
+{
+    crate::call::call(pool, WorkerPoolMsg::Close(mode), timeout).reply(translator)
 }
 
 // Manual Isolate impl: message and reply types are generic over H,

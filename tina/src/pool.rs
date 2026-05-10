@@ -51,6 +51,22 @@ impl PoolConfig {
             max_waiters,
         }
     }
+
+    /// Roomy preset for examples and dev: capacity 4, 32 waiters.
+    pub const fn dev() -> Self {
+        Self::new(4, 32)
+    }
+
+    /// Tight preset for pressure tests: capacity 1, 4 waiters.
+    pub const fn pressure() -> Self {
+        Self::new(1, 4)
+    }
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self::dev()
+    }
 }
 
 /// Pool identity. Stamped into every lease so a release that names
@@ -254,7 +270,7 @@ pub enum CloseMode {
 /// Snapshot of pool pressure.
 #[must_use = "PoolPressureReport carries pool-state truth — discarding \
               it hides backpressure visibility"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PoolPressureReport {
     /// Configured resource capacity.
     pub capacity: usize,
@@ -290,6 +306,52 @@ pub struct PoolPressureReport {
     pub dispatch_recovered: u64,
     /// True once a [`CloseMode`] has been applied.
     pub closed: bool,
+}
+
+/// Why an acquire did not yield a lease, after the bridge layer.
+///
+/// Returned by helpers that fold `CallOutcome<WorkerPoolReply<H>>`
+/// into one flat result. Keeps the layered truth distinct: pool-level
+/// outcomes (`Full`, `Closed`, `WrongShard`) are different from
+/// transport-level outcomes (`CallTimeout`, `CallClosed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireFailure {
+    /// Pool said `Full` — no resource and no waiter slot.
+    Full,
+    /// Pool said `Closed`.
+    Closed,
+    /// Pool said `WrongShard`.
+    WrongShard,
+    /// Caller's `call(...)` timeout fired before the pool replied.
+    CallTimeout,
+    /// Pool isolate's mailbox refused the call.
+    CallFull,
+    /// Pool isolate is gone.
+    CallClosed,
+    /// Reply variant was not `Acquire(...)` — protocol error.
+    WrongReply,
+}
+
+/// Why a release was not `Released`, after the bridge layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseFailure {
+    /// Pool accepted but dropped the resource (Retire requested or
+    /// pool override).
+    Retired,
+    /// Lease did not match anything live in the pool.
+    StaleLease,
+    /// Same `(resource_id, generation)` was already returned.
+    DoubleRelease,
+    /// Pool was force-closed.
+    PoolClosed,
+    /// Caller's `call(...)` timeout fired before the pool replied.
+    CallTimeout,
+    /// Pool isolate's mailbox refused the call.
+    CallFull,
+    /// Pool isolate is gone.
+    CallClosed,
+    /// Reply variant was not `Release(...)` — protocol error.
+    WrongReply,
 }
 
 /// Internals exposed for runtime crates.

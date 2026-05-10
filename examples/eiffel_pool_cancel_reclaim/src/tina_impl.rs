@@ -7,15 +7,13 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::pool::{
-    AcquireOutcome, PoolConfig, PoolLease, PoolPressureReport, ReleaseDisposition,
-};
+use tina::pool::{PoolConfig, PoolLease, ReleaseDisposition};
 use tina::prelude::*;
-use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call, call_with_handle,
-    cancel_call,
+use tina_runtime::pool::{
+    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_effect, acquire_with_handle_effect,
+    pressure_effect, release_effect, try_acquired,
 };
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, cancel_call};
 
 use crate::{Report, WAITERS};
 
@@ -80,15 +78,16 @@ impl Driver {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DriverMsg::BeginPrime => call(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
-                .reply(move |outcome| DriverMsg::AcquireReturned { wave: Wave::Prime, outcome }),
+            DriverMsg::BeginPrime => acquire_effect(self.pool, CALL_TIMEOUT, move |outcome| {
+                DriverMsg::AcquireReturned { wave: Wave::Prime, outcome }
+            }),
             DriverMsg::BeginWaiters => {
                 let mut effects = Vec::with_capacity(WAITERS);
                 for _ in 0..WAITERS {
                     let (effect, handle) =
-                        call_with_handle(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT).reply(
-                            move |outcome| DriverMsg::AcquireReturned { wave: Wave::Park, outcome },
-                        );
+                        acquire_with_handle_effect(self.pool, CALL_TIMEOUT, move |outcome| {
+                            DriverMsg::AcquireReturned { wave: Wave::Park, outcome }
+                        });
                     self.park_handles.push(handle);
                     effects.push(effect);
                 }
@@ -96,10 +95,7 @@ impl Driver {
             }
             DriverMsg::AcquireReturned { wave, outcome } => match wave {
                 Wave::Prime => {
-                    if let CallOutcome::Replied(WorkerPoolReply::Acquire(
-                        AcquireOutcome::Acquired(lease),
-                    )) = outcome
-                    {
+                    if let Ok(lease) = try_acquired(outcome) {
                         self.held = Some(lease);
                     }
                     noop()
@@ -108,11 +104,8 @@ impl Driver {
                     // Cancel-reclaim flow: park-wave outcomes should
                     // never deliver. If one races through, hand the
                     // resource back so we don't deadlock.
-                    if let CallOutcome::Replied(WorkerPoolReply::Acquire(
-                        AcquireOutcome::Acquired(lease),
-                    )) = outcome
-                    {
-                        return tina_runtime::pool::release_effect(
+                    if let Ok(lease) = try_acquired(outcome) {
+                        return release_effect(
                             lease,
                             self.pool,
                             ReleaseDisposition::Reuse,
@@ -122,12 +115,10 @@ impl Driver {
                     }
                     noop()
                 }
-                Wave::Retry => match outcome {
-                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(
-                        lease,
-                    ))) => {
+                Wave::Retry => match try_acquired(outcome) {
+                    Ok(lease) => {
                         self.report.retried_resourced += 1;
-                        tina_runtime::pool::release_effect(
+                        release_effect(
                             lease,
                             self.pool,
                             ReleaseDisposition::Reuse,
@@ -135,11 +126,11 @@ impl Driver {
                             |_| DriverMsg::ReleaseReturned,
                         )
                     }
-                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Full)) => {
+                    Err(tina::pool::AcquireFailure::Full) => {
                         self.report.retried_full += 1;
                         noop()
                     }
-                    _ => noop(),
+                    Err(_) => noop(),
                 },
             },
             DriverMsg::CancelAll => {
@@ -157,38 +148,25 @@ impl Driver {
             DriverMsg::RetryAll => {
                 let mut effects = Vec::with_capacity(WAITERS);
                 for _ in 0..WAITERS {
-                    let effect = call(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT).reply(
-                        move |outcome| DriverMsg::AcquireReturned { wave: Wave::Retry, outcome },
-                    );
-                    // Track admitted as soon as we send; full is the
-                    // only failure path the test asserts on.
-                    self.report.retried_admitted += 1;
-                    effects.push(effect);
+                    effects.push(acquire_effect(self.pool, CALL_TIMEOUT, move |outcome| {
+                        DriverMsg::AcquireReturned { wave: Wave::Retry, outcome }
+                    }));
                 }
-                // We optimistically count admitted on send; the
-                // AcquireReturned handler will revert to retried_full
-                // if the pool says Full (and `assert_report_invariants`
-                // only checks retried_full == 0 plus admitted >= WAITERS).
                 self.report.retried_admitted = WAITERS;
                 batch(effects)
             }
             DriverMsg::PressureSnapshot => {
-                call(self.pool, WorkerPoolMsg::PressureReport, CALL_TIMEOUT)
-                    .reply(DriverMsg::PressureReturned)
+                pressure_effect(self.pool, CALL_TIMEOUT, DriverMsg::PressureReturned)
             }
             DriverMsg::PressureReturned(outcome) => {
-                if let CallOutcome::Replied(WorkerPoolReply::Pressure(PoolPressureReport {
-                    cancel_count,
-                    ..
-                })) = outcome
-                {
-                    self.report.cancelled = cancel_count as usize;
+                if let CallOutcome::Replied(WorkerPoolReply::Pressure(report)) = outcome {
+                    self.report.cancelled = report.cancel_count as usize;
                 }
                 noop()
             }
             DriverMsg::ReleaseHeld => {
                 if let Some(lease) = self.held.take() {
-                    tina_runtime::pool::release_effect(
+                    release_effect(
                         lease,
                         self.pool,
                         ReleaseDisposition::Reuse,
