@@ -45,3 +45,22 @@ forever. The pool's `sweep_in_flight` checks every dispatch's slot
 state on each handler turn and reverts `Leased` → `Idle` for any
 dispatch whose slot is now `Closed`. The recovered count surfaces in
 the pressure report as `dispatch_recovered`.
+
+## Capacity discovery — `unknown -> measured -> fixed`
+
+The waiter cap is a count cap. Pick a number, run load, read
+high water, freeze. The specimen does it:
+
+1. **Unknown.** Pick `WAITERS = 4`. Mark it `Tuning`.
+2. **Measured.** Driver reads `PressureReport`, projects it onto
+   the count surface, prints one line:
+   ```text
+   capacity surface=pool.demo.waiters mode=tuning max=4 cur=0 high=4 full=0 suggest="tuning cap is tight; raise then re-measure"
+   ```
+3. **Fixed.** Read `high`. Pick `Fixed(high * safety_factor)`.
+   Drop the `Tuning` flag.
+
+The tokio side leaves `waiters_high_water` and `discovery_line`
+empty. `tokio::sync::Semaphore` does not expose live waiters,
+high water, or a configured cap. Same workflow needs hand
+instrumentation there.
