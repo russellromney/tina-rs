@@ -226,6 +226,29 @@ fn bridge_only_config_has_no_pool() {
     assert!(cfg.validate().is_ok(), "bridge-only must validate");
 }
 
+#[test]
+fn validate_tina_ignores_pool_settings() {
+    // A caller who builds a config from a URL but then plans to pass
+    // a supplied pool should not be rejected for `pool` fields the
+    // bridge promises not to apply on the supplied-pool path.
+    let cfg = good_config().with_pool(
+        PgPoolConfig::new("postgres://invalid/")
+            .with_max_connections(0)
+            .with_acquire_timeout(Duration::ZERO),
+    );
+    assert!(cfg.validate().is_err(), "full validate should reject");
+    assert!(
+        cfg.validate_tina().is_ok(),
+        "tina-only validate must ignore pool fields",
+    );
+}
+
+#[test]
+fn validate_tina_still_rejects_tina_side_zeros() {
+    let cfg = good_config().with_max_in_flight(0);
+    assert_eq!(cfg.validate_tina(), Err(PgConfigError::ZeroMaxInFlight),);
+}
+
 // ---------------------------------------------------------------------------
 // Classifier
 // ---------------------------------------------------------------------------

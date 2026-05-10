@@ -24,6 +24,10 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
 ] }
+# Used only for `TryStreamExt::try_next` on SQLx row streams. Pulled
+# in transitively by sqlx-core; declaring it here keeps the import
+# explicit at the use site.
+futures-util = { version = "0.3", default-features = false }
 # Optional tracing emission. Enables per-call events under
 # `tina_sqlx.bridge.call` (`admission_rejected`, `admitted`, `replied`,
 # `timeout`) and lifecycle events under `tina_sqlx.bridge` (`close`).

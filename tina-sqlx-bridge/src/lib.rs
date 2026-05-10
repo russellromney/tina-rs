@@ -102,26 +102,34 @@
 //!
 //! - Before admission: no SQLx work starts.
 //! - After admission, the spawned task runs on Tokio. The bridge's
-//!   per-attempt deadline aborts the task; bytes already on the wire
-//!   stay on the wire. Postgres may still execute the work.
-//! - Caller `CallOutcome::Timeout` is **not** the same as bridge
-//!   `PgError::Timeout`. The first means the caller stopped waiting;
-//!   the second means the bridge stopped waiting. Either may happen
-//!   first; either may leave Postgres still working.
+//!   per-attempt deadline detaches the result receiver and surfaces
+//!   `PgError::Timeout` to the caller. The spawned future is
+//!   **not** aborted — it keeps running until SQLx returns
+//!   naturally. The connection stays held until then.
 //! - The bridge does **not** issue a Postgres `CancelRequest` in
-//!   first form. That is its own design pass.
+//!   first form. Postgres keeps executing the query until it
+//!   completes. Treat `PgError::Timeout` as "Tina stopped waiting,"
+//!   not "the database stopped working." DB-side cancellation is a
+//!   deferred follow-up.
+//! - Caller `CallOutcome::Timeout` is **not** the same as bridge
+//!   `PgError::Timeout`. The first means the caller stopped
+//!   waiting; the second means the bridge stopped waiting.
 //!
 //! # Late results
 //!
-//! When the bridge's per-attempt timeout fires and the spawned task
-//! later completes, the worker tally happens (success or sqlx error)
-//! and `late_results` increments. That is worker-terminal truth, not
-//! caller-observed truth.
+//! When the bridge's per-attempt timeout fires, the abandoned flag
+//! is set and the receiver is dropped. The spawned task continues;
+//! when it finishes, `tally_worker_terminal` records the actual
+//! outcome (success / SQLx error / decode / pool variant) and the
+//! abandoned flag triggers `late_results`. The eventual `tx.send` is
+//! a no-op against a dropped receiver. So `late_results` is reliable
+//! for cases where SQLx returned a value after the bridge gave up.
 //!
-//! When the *caller's* IsolateCall deadline fires
-//! (`CallOutcome::Timeout`) the runtime drops the bridge's eventual
-//! reply as `CallReplyRejected` — visible in the Tina trace. The
-//! bridge does not see this and does not count it.
+//! `late_results` does **not** count Postgres-side execution that
+//! continues past the future drop, nor does it count the
+//! caller-observed `CallOutcome::Timeout` path. The first needs a
+//! `CancelRequest` story; the second lives in the runtime trace as
+//! `CallReplyRejected`.
 //!
 //! # Bridge vs SQLite bridge
 //!
@@ -150,9 +158,11 @@
 //!   is not observed by `tina-sim`. Replay parity is best-effort at
 //!   the bridge boundary only.
 //! - Cancellation precision: once the spawned SQLx task starts on
-//!   Tokio, the bridge can abort the task but cannot guarantee that
-//!   bytes are not already on the wire. Late results land in
-//!   `late_results`, not in caller-observed metrics.
+//!   Tokio, the bridge cannot stop it. The per-attempt timeout
+//!   detaches but does not abort; Postgres keeps executing until the
+//!   query naturally completes. Late completions are tallied in
+//!   `late_results`, not in caller-observed metrics. DB-side
+//!   `CancelRequest` is a deferred follow-up.
 //! - Polling latency: the bridge wakes via Tina's `sleep` to
 //!   re-check the result channel each `poll_interval`. That is
 //!   visible chatter in the trace and adds bounded latency to

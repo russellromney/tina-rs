@@ -403,10 +403,14 @@ pub enum PgError {
     /// Bridge has been closed and rejects new work. The SQLx pool is
     /// not necessarily closed.
     Closed,
-    /// Bridge per-attempt deadline elapsed. The spawned task is
-    /// aborted; if it had already reached Postgres, late completion
-    /// counts in `late_results`. Distinct from `CallOutcome::Timeout`,
-    /// which means the *caller's* IsolateCall deadline elapsed.
+    /// Bridge per-attempt deadline elapsed. The spawned SQLx future
+    /// is detached (the bridge drops its result receiver) and runs
+    /// to natural completion; the eventual outcome is tallied and
+    /// `late_results` increments. The bridge does **not** issue a
+    /// Postgres `CancelRequest`, so the query keeps running on the
+    /// server and the connection stays held until the future
+    /// returns. Distinct from `CallOutcome::Timeout`, which means
+    /// the *caller's* IsolateCall deadline elapsed.
     Timeout,
     /// SQLx pool could not acquire a connection within its own
     /// `acquire_timeout`. Tina admission was fine; the bottleneck was
@@ -652,9 +656,28 @@ impl PgConfig {
         self
     }
 
-    /// Validates the Tina-side config. Pool config is validated only
-    /// when present (the supplied-pool path skips it).
+    /// Validates the full config — Tina-side fields plus the
+    /// embedded `pool` config when it is `Some`. Used by
+    /// [`crate::PgWorker::install`] (config-built pool path).
     pub fn validate(&self) -> Result<(), PgConfigError> {
+        self.validate_tina()?;
+        if let Some(pool) = &self.pool {
+            if pool.max_connections == 0 {
+                return Err(PgConfigError::ZeroPoolMaxConnections);
+            }
+            if pool.acquire_timeout.is_zero() {
+                return Err(PgConfigError::ZeroPoolAcquireTimeout);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates only the Tina-side fields, ignoring `pool`. Used by
+    /// [`crate::PgWorker::install_with_pool`] where the supplied
+    /// `sqlx::PgPool` owns its SQLx settings — rejecting on
+    /// `PgConfig::pool` here would punish a caller for fields the
+    /// bridge promised not to apply.
+    pub fn validate_tina(&self) -> Result<(), PgConfigError> {
         if self.mailbox_capacity == 0 {
             return Err(PgConfigError::ZeroMailboxCapacity);
         }
@@ -675,14 +698,6 @@ impl PgConfig {
         }
         if self.max_request_params == 0 {
             return Err(PgConfigError::ZeroMaxRequestParams);
-        }
-        if let Some(pool) = &self.pool {
-            if pool.max_connections == 0 {
-                return Err(PgConfigError::ZeroPoolMaxConnections);
-            }
-            if pool.acquire_timeout.is_zero() {
-                return Err(PgConfigError::ZeroPoolAcquireTimeout);
-            }
         }
         Ok(())
     }

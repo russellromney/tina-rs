@@ -327,6 +327,42 @@ fn fetch_one_too_many_rows_is_too_many_rows() {
 
 #[test]
 #[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn fetch_one_does_not_buffer_huge_result_sets() {
+    // Pre-fix this query buffered ~10M rows in bridge memory before
+    // discovering the row count and surfacing TooManyRows. Post-fix
+    // the streaming peek aborts after the second row, so this
+    // returns quickly and never grows the bridge's resident set.
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let started = Instant::now();
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one("SELECT generate_series(1, 10000000)::INT8"),
+        Duration::from_secs(10),
+        Duration::from_secs(15),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(outcome, CallOutcome::Replied(Err(PgError::TooManyRows))),
+        "outcome: {outcome:?}",
+    );
+    // Two rows worth of round-trip is comfortably under one second
+    // even on slow CI; pre-fix this took multiple seconds and
+    // allocated several hundred MB.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "fetch_one returned in {elapsed:?}; suspect we're buffering",
+    );
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
 fn sql_error_then_recovery() {
     let url = match database_url() {
         Some(u) => u,
@@ -384,10 +420,15 @@ fn per_attempt_bridge_timeout_surfaces_timeout_and_records_late_result() {
         .with_max_in_flight(2);
     let bridge = PgWorker::<SingleShard>::install(&runtime, cfg).expect("install");
 
+    // `pg_sleep(...)` returns a VOID column (which the bridge's
+    // narrow decoder rejects). Project a decodable INT8 from it so
+    // late completion tallies as `responses_row` instead of
+    // `decode_errors`, keeping the success-path assertion below
+    // meaningful.
     let outcome = one(
         &runtime,
         &bridge,
-        PgRequest::fetch_one("SELECT pg_sleep(1)"),
+        PgRequest::fetch_one("SELECT 1::INT8 FROM pg_sleep(1)"),
         Duration::from_secs(10),
         Duration::from_secs(15),
     );
@@ -395,11 +436,28 @@ fn per_attempt_bridge_timeout_surfaces_timeout_and_records_late_result() {
         matches!(outcome, CallOutcome::Replied(Err(PgError::Timeout))),
         "outcome: {outcome:?}",
     );
-    // Spawn aborts; pg_sleep is sometimes still observable in metrics
-    // as a late result if the future raced. Either way: the bridge
-    // counted the timeout exactly once.
-    let m = bridge.metrics.snapshot();
-    assert!(m.timeouts >= 1);
+    // Caller saw Timeout at ~50ms. The detached SQLx future keeps
+    // running until pg_sleep(1) returns ~1s later; at that point
+    // tally + late_results fire. Poll briefly so the assertion
+    // doesn't race the detached task.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut snap = bridge.metrics.snapshot();
+    while snap.late_results == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        snap = bridge.metrics.snapshot();
+    }
+    assert!(snap.timeouts >= 1, "timeouts: {}", snap.timeouts);
+    assert!(
+        snap.late_results >= 1,
+        "late_results never incremented after detached task: {snap:?}",
+    );
+    // The detached future is no longer aborted, so the actual
+    // worker-terminal must have been recorded too. pg_sleep
+    // returns one row → responses_row should be 1.
+    assert!(
+        snap.responses_row >= 1,
+        "detached task should have completed and tallied: {snap:?}",
+    );
     shutdown(runtime);
 }
 

@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use futures_util::TryStreamExt;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow as SqlxRow};
 use sqlx::{Column, Row as _, TypeInfo};
 use tina::prelude::*;
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
-use tokio::task::AbortHandle;
 #[cfg(feature = "tracing")]
 use tracing::{Level, event};
 
@@ -78,7 +78,6 @@ pub enum PgMsg {
 struct InFlight {
     started_at: Instant,
     receiver: oneshot::Receiver<PgResult>,
-    abort: AbortHandle,
     abandoned: Arc<AtomicBool>,
     request_kind: &'static str,
 }
@@ -277,7 +276,7 @@ impl<S: Shard + 'static> PgWorker<S> {
         let abandoned = Arc::new(AtomicBool::new(false));
         let abandoned_for_task = Arc::clone(&abandoned);
         let metrics_for_task = Arc::clone(&self.metrics);
-        let task = self.runtime.spawn(async move {
+        self.runtime.spawn(async move {
             let result = run_request(&pool, request).await;
             tally_worker_terminal(&metrics_for_task, &result);
             if abandoned_for_task.load(Ordering::Acquire) {
@@ -285,15 +284,15 @@ impl<S: Shard + 'static> PgWorker<S> {
                     .late_results
                     .fetch_add(1, Ordering::Relaxed);
             }
+            // Receiver may already be dropped (timeout path); send is
+            // best-effort. The tally above is the source of truth.
             let _ = tx.send(result);
         });
-        let abort = task.abort_handle();
         self.in_flight.insert(
             id,
             InFlight {
                 started_at: Instant::now(),
                 receiver: rx,
-                abort,
                 abandoned,
                 request_kind,
             },
@@ -332,8 +331,17 @@ impl<S: Shard + 'static> PgWorker<S> {
             }
             Err(oneshot::error::TryRecvError::Empty) => {
                 if in_flight.started_at.elapsed() >= self.config.default_timeout {
+                    // Mark abandoned and drop the receiver; the
+                    // spawned task continues until its SQLx future
+                    // completes naturally. When it does, tally records
+                    // the actual outcome and `late_results`
+                    // increments. We do not abort the task — abort
+                    // would cancel SQLx at the next .await point and
+                    // skip the tally entirely, while doing nothing to
+                    // stop Postgres from finishing the query.
+                    // Postgres-side cancellation needs `CancelRequest`
+                    // and is a deferred follow-up.
                     in_flight.abandoned.store(true, Ordering::Release);
-                    in_flight.abort.abort();
                     self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
                     self.note_terminal();
                     #[cfg(feature = "tracing")]
@@ -511,7 +519,11 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        config.validate()?;
+        // Tina-only validation: `config.pool` is ignored on this path
+        // because the supplied `PgPool` owns its SQLx settings.
+        // Validating `config.pool` here would reject callers for
+        // fields the bridge promised not to apply.
+        config.validate_tina()?;
         let cap = config.mailbox_capacity;
         let (worker, metrics) = Self::assemble(config, pool, tokio_handle, None);
         let closer = worker.closer();
@@ -616,24 +628,23 @@ async fn run_request(pool: &PgPool, request: PgRequest) -> PgResult {
             for p in params {
                 q = bind_param(q, p);
             }
-            // `fetch_all` with a peek lets us distinguish zero / one /
-            // many cleanly. For larger result sets a streaming
-            // `FetchMany` belongs in a follow-up; first form caps at
-            // exactly one row.
-            let mut rows = match q.fetch_all(pool).await {
-                Ok(rs) => rs,
+            // Stream at most two rows so a query that accidentally
+            // returns a large result set surfaces `TooManyRows`
+            // without first buffering the whole thing in bridge
+            // memory. Bounded `FetchMany` is a follow-up.
+            let mut stream = q.fetch(pool);
+            let first = match stream.try_next().await {
+                Ok(opt) => opt,
                 Err(e) => return Err(map_sqlx_error(e)),
             };
-            match rows.len() {
-                0 => Ok(PgResponse::NoRows),
-                1 => {
-                    let row = rows.swap_remove(0);
-                    match decode_row(&row) {
-                        Ok(r) => Ok(PgResponse::Row(r)),
-                        Err(e) => Err(e),
-                    }
-                }
-                _ => Err(PgError::TooManyRows),
+            let row = match first {
+                None => return Ok(PgResponse::NoRows),
+                Some(row) => row,
+            };
+            match stream.try_next().await {
+                Ok(None) => decode_row(&row).map(PgResponse::Row),
+                Ok(Some(_)) => Err(PgError::TooManyRows),
+                Err(e) => Err(map_sqlx_error(e)),
             }
         }
     }

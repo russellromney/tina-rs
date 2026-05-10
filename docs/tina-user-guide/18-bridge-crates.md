@@ -265,20 +265,26 @@ surfaces them separately so retry/backoff decisions can be honest.
   the eventual reply as `CallReplyRejected` and that truth lives in
   the trace.
 - `PgError::Timeout` (worker side): the bridge's *per-attempt*
-  deadline (`PgConfig::default_timeout`) elapsed. The bridge aborts
-  the spawned task and bumps `timeouts`. If the SQLx future
-  completes anyway before the abort takes effect, `late_results`
-  bumps too.
+  deadline (`PgConfig::default_timeout`) elapsed. The bridge
+  detaches the result receiver, surfaces `PgError::Timeout`, and
+  bumps `timeouts`. The spawned SQLx future is **not** aborted; it
+  runs to natural completion. When it finishes, `late_results`
+  bumps and the actual worker-terminal counter (`responses_*`,
+  `sqlx_errors`, `decode_errors`, etc.) increments — that's the
+  honest record of what Postgres actually did, even though the
+  caller already moved on.
 - `PgError::PoolAcquireTimeout`: SQLx's pool deadline
   (`PgPoolConfig::acquire_timeout`) elapsed before a connection was
   available.
 
 **Cancellation non-claim.** Once a query reaches Postgres, the bridge
-cannot stop it. Aborting the Tokio task drops the SQLx future locally
-but does not issue a Postgres `CancelRequest`. That is its own
-design pass and an explicit non-goal in first form. Treat
-`PgError::Timeout` as "Tina stopped waiting," not "the database
-stopped working."
+cannot stop it. The per-attempt timeout detaches the spawned task's
+result receiver but does **not** abort the future or issue a
+Postgres `CancelRequest`; the SQLx future runs to natural
+completion and the connection stays held until then. DB-side
+`CancelRequest` is its own design pass and an explicit non-goal in
+first form. Treat `PgError::Timeout` as "Tina stopped waiting,"
+not "the database stopped working."
 
 **`outcome.classify()`** (via `PgOutcomeExt`) returns
 `PgOutcomeClass::{Succeeded, Transient(reason), Fatal(reason)}` for
