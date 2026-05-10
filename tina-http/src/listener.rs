@@ -51,6 +51,10 @@ pub struct HttpListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stati
     service_call_timeout: Duration,
     connection_mailbox_capacity: usize,
     listener: Option<ListenerId>,
+    /// Set on the first `Start`. A second `Start` is a no-op so the
+    /// listener cannot leak the first `ListenerId` by issuing a
+    /// second `tcp_bind` that overwrites it.
+    started: bool,
     stopping: bool,
     _shard: PhantomData<S>,
 }
@@ -80,6 +84,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, 
             service_call_timeout,
             connection_mailbox_capacity,
             listener: None,
+            started: false,
             stopping: false,
             _shard: PhantomData,
         }
@@ -123,11 +128,36 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HttpListenerMsg::Start => tcp_bind(self.bind_addr).reply(HttpListenerMsg::Bound),
+            HttpListenerMsg::Start => {
+                if self.started {
+                    // Idempotent: second Start would issue another
+                    // tcp_bind and overwrite self.listener, leaking
+                    // the first. Reply type is `()` so we can't
+                    // surface a typed error like HttpsListener does
+                    // — the runtime trace records exactly one
+                    // TcpBind completion, which is the contract.
+                    return noop();
+                }
+                self.started = true;
+                tcp_bind(self.bind_addr).reply(HttpListenerMsg::Bound)
+            }
 
             HttpListenerMsg::Bound(Ok((listener, local_addr))) => {
                 self.listener = Some(listener);
                 let _ = local_addr;
+                if self.stopping {
+                    // Stop arrived while bind was in flight. Close
+                    // the just-bound listener immediately rather
+                    // than starting the accept loop. (Pre-068 this
+                    // path raced: bind would push the listener into
+                    // the lane and the isolate would `stop()` from
+                    // the Stop handler without ever issuing
+                    // tcp_close_listener — listener leaked until
+                    // full runtime shutdown.)
+                    let listener = self.listener.take().expect("set just above");
+                    return tcp_close_listener(listener)
+                        .reply(HttpListenerMsg::ListenerClosed);
+                }
                 tcp_accept(listener).reply(HttpListenerMsg::Accepted)
             }
             HttpListenerMsg::Bound(Err(_)) => stop(),
@@ -142,7 +172,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // touch the listener again.
                     return tcp_close_stream(stream).reply(HttpListenerMsg::StreamClosed);
                 }
-                let listener = self.listener.expect("listener set after bind");
+                let Some(listener) = self.listener else {
+                    // State-machine invariant says listener=Some when
+                    // !stopping after a successful Bound(Ok). If we
+                    // ever land here, defensively orphan-close the
+                    // just-accepted stream rather than panicking.
+                    return tcp_close_stream(stream).reply(HttpListenerMsg::StreamClosed);
+                };
                 let child = self.build_connection_child(stream);
                 batch(vec![
                     spawn(child),

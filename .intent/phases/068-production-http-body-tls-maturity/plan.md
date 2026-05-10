@@ -29,6 +29,36 @@
     `18-bridge-crates.md`, `examples/README.md`, `FINDINGS.md` (new
     finding 16: multi-worker TLS lane).
 - In progress: none.
+- Post-review fixes (PR feedback round 4 — broader sweep):
+  - **Symmetry fix**: applied the same idempotency / state-machine
+    fixes to plain `HttpListener` after a sweep showed the TCP twin
+    had identical bugs. `Start` is now idempotent (no-op the second
+    time, since reply type is `()` and we can't surface
+    `AlreadyStarted` without a breaking API change). `Stop` racing
+    with a pending `tcp_bind` now closes the just-bound listener
+    via the `Bound(Ok)` stopping branch. `expect("listener set
+    after bind")` replaced with defensive `if let` (orphan-close
+    stream).
+  - Plain HTTP did NOT have the Stop-with-pending-accept leak
+    because the TCP lane uses "close wins" — pending accepts get
+    cancelled when `tcp_close_listener` runs. Recorded as runtime
+    asymmetry (TCP close wins, TLS rejects with `ResourceBusy`)
+    that motivated the deferred-close pattern in `HttpsListener`.
+  - Test added: `second_start_does_not_rebind_or_leak_listener` in
+    `server_smoke.rs` — sends a second Start to an already-running
+    listener and asserts the trace shows exactly one `TcpBind`.
+
+  Other findings logged but deferred (cross-cutting / API-shape):
+  - `HttpClient` stale-Connected close result is silently dropped
+    (`HttpClientMsg::Closed(_) => noop()`). Pre-068.
+  - `HttpConnection::handle_body_chunk_read` reports an I/O error
+    mid-body to the service as `RequestChunkReply::Eof` — the
+    service can't tell short delivery from error. Needs a richer
+    streaming-body reply variant.
+  - TLS lane silent `let _ = tcp.set_*_timeout(...)` failures.
+  - TCP/TLS lane close-semantics asymmetry (close-wins vs
+    `ResourceBusy`) — runtime change.
+
 - Post-review fixes (PR feedback round 3):
   - **Bug fix**: Stop racing with a pending `tls_accept` previously
     surfaced `CallFailed { call_kind: TlsListenerClose, reason:
