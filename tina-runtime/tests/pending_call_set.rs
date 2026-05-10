@@ -19,9 +19,39 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, call_with_handle,
-    cancel_call, sleep,
+    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEventKind, SleepReply,
+    ThreadedRuntime, call_with_handle, cancel_call, sleep,
 };
+
+/// Polls `cond` until it returns true or `total` elapses. Same shape
+/// as the helper in `cancel_call.rs`. The 10ms step keeps the test
+/// portable on slow / thermally throttled CI runners; we count a
+/// final post-budget check so the pass condition is not "did the
+/// last poll happen to fire before the deadline."
+fn wait_for(total: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cond()
+}
+
+const POLL_BUDGET: Duration = Duration::from_secs(5);
+
+fn count_trace_events(
+    runtime: &Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    matches: impl Fn(&RuntimeEventKind) -> bool,
+) -> usize {
+    runtime
+        .trace()
+        .events()
+        .iter()
+        .filter(|event| matches(&event.kind()))
+        .count()
+}
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const PENDING_CAPACITY: usize = 4;
@@ -152,7 +182,6 @@ impl Driver {
                 });
             self.pending
                 .insert(key, handle)
-                .map_err(|_| ())
                 .expect("first form: bounded set sized to PENDING_CAPACITY refills cleanly");
             self.report.inserted += 1;
             effects.push(effect);
@@ -195,27 +224,65 @@ fn fill_cancel_refill_reclaims_capacity() {
     runtime
         .try_send(driver, DriverMsg::FillBatch1)
         .expect("FillBatch1");
-    // Let the workers start their slow sleep so cancel hits "delivered
-    // but not yet replied" rather than "still queued."
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait for every batch-1 IsolateCall to dispatch so cancels hit
+    // "delivered, still pending" rather than "queued, never
+    // dispatched." Filtering by `IsolateCall` keeps the count honest
+    // — `CancelCall` and other kinds also generate dispatch events.
+    assert!(
+        wait_for(POLL_BUDGET, || count_trace_events(
+            &runtime,
+            |kind| matches!(
+                kind,
+                RuntimeEventKind::CallDispatchAttempted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        ) >= PENDING_CAPACITY),
+        "batch 1 did not dispatch every call within the poll budget"
+    );
 
     runtime
         .try_send(driver, DriverMsg::CancelAll)
         .expect("CancelAll");
-    // Give cancels time to settle and reclaim capacity. CancelOutcome
-    // arrives synchronously through the `.reply(...)` translator.
-    std::thread::sleep(Duration::from_millis(20));
+    // Wait for every cancel to land as a `CallCancelled` trace event.
+    // This guarantees the per-cancel translator has fired (and the
+    // resulting `Cancelled` message is queued in the driver mailbox)
+    // before we send Finish — otherwise Finish could race past the
+    // cancel acks.
+    assert!(
+        wait_for(POLL_BUDGET, || count_trace_events(
+            &runtime,
+            |kind| matches!(kind, RuntimeEventKind::CallCancelled { .. })
+        ) >= PENDING_CAPACITY),
+        "not every batch-1 call was cancelled within the poll budget"
+    );
 
     runtime
         .try_send(driver, DriverMsg::FillBatch2)
         .expect("FillBatch2");
-
-    // Wait long enough for the second batch's slow workers to finish.
-    std::thread::sleep(Duration::from_millis(WORK_MS + 100));
+    // Wait for batch 2's IsolateCalls to complete. Filter by
+    // `IsolateCall` because `CancelCall` completions from the prior
+    // CancelAll batch also emit `CallCompleted`; counting both would
+    // fire the wait early and Finish would race past the real
+    // `Returned` continuations for batch 2.
+    assert!(
+        wait_for(POLL_BUDGET, || count_trace_events(
+            &runtime,
+            |kind| matches!(
+                kind,
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        ) >= PENDING_CAPACITY),
+        "batch 2 did not complete within the poll budget"
+    );
 
     runtime.try_send(driver, DriverMsg::Finish).expect("Finish");
 
-    let report = result.wait(Duration::from_secs(5)).expect("driver report");
+    let report = result.wait(POLL_BUDGET).expect("driver report");
 
     assert!(report.exit_clean, "driver should have exited cleanly");
     assert_eq!(
@@ -335,10 +402,7 @@ impl TimeoutDriver {
                         worker: key,
                         outcome,
                     });
-                    self.pending
-                        .insert(key, handle)
-                        .map_err(|_| ())
-                        .expect("first batch fits");
+                    self.pending.insert(key, handle).expect("first batch fits");
                     self.report.inserted += 1;
                     effects.push(effect);
                 }
@@ -356,7 +420,6 @@ impl TimeoutDriver {
                         });
                     self.pending
                         .insert(key, handle)
-                        .map_err(|_| ())
                         .expect("refill must succeed if timeout cleanup reclaimed slots");
                     self.report.inserted += 1;
                     effects.push(effect);
@@ -431,24 +494,50 @@ fn fill_timeout_refill_reclaims_capacity() {
         .try_send(driver, TimeoutDriverMsg::FillTimeoutBatch)
         .expect("FillTimeoutBatch");
 
-    // Wait long enough for every TIMEOUT_BUDGET_MS budget to fire and
-    // its translator to remove the slot. Slow workers will still be
-    // sleeping when this returns; their late replies would be rejected
-    // as `CallReplyRejected { CallerTimedOut }`.
-    std::thread::sleep(Duration::from_millis(TIMEOUT_BUDGET_MS + 50));
+    // Wait for every batch-1 IsolateCall to time out. Filter on
+    // `IsolateCall` so unrelated kinds (e.g. CancelCall, runtime
+    // I/O calls) cannot accidentally satisfy the count.
+    assert!(
+        wait_for(POLL_BUDGET, || count_trace_events(
+            &runtime,
+            |kind| matches!(
+                kind,
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        ) >= PENDING_CAPACITY),
+        "batch 1 did not time out within the poll budget"
+    );
 
     runtime
         .try_send(driver, TimeoutDriverMsg::FillFastBatch)
         .expect("FillFastBatch");
 
-    // Fast workers reply quickly.
-    std::thread::sleep(Duration::from_millis(60));
+    // Wait for batch 2's fast workers to complete. Filter by
+    // `IsolateCall` so this never accidentally counts a CancelCall
+    // completion (there should be none in this test, but the filter
+    // matches the convention).
+    assert!(
+        wait_for(POLL_BUDGET, || count_trace_events(
+            &runtime,
+            |kind| matches!(
+                kind,
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        ) >= PENDING_CAPACITY),
+        "batch 2 did not complete within the poll budget"
+    );
 
     runtime
         .try_send(driver, TimeoutDriverMsg::Finish)
         .expect("Finish");
 
-    let report = result.wait(Duration::from_secs(5)).expect("driver report");
+    let report = result.wait(POLL_BUDGET).expect("driver report");
 
     assert!(report.exit_clean);
     assert_eq!(
@@ -532,7 +621,6 @@ impl AbaDriver {
                         });
                 self.pending
                     .insert(42, handle)
-                    .map_err(|_| ())
                     .expect("first insert succeeds");
                 effect
             }
@@ -616,15 +704,22 @@ fn duplicate_key_under_settled_handle_is_rejected_not_silently_replaced() {
         .try_send(driver, AbaDriverMsg::AttemptDuplicateInsert)
         .expect("AttemptDuplicateInsert");
 
-    // Now let A's timeout fire so its `Returned` is processed and the
-    // driver shuts down cleanly.
-    std::thread::sleep(Duration::from_millis(150));
+    // Wait for A's timeout to fire so the driver's AReturned handler
+    // runs and the report's `first_call_timed_out` flag flips. Polling
+    // the trace for `CallFailed` is more honest than a 150ms sleep.
+    assert!(
+        wait_for(POLL_BUDGET, || count_trace_events(
+            &runtime,
+            |kind| matches!(kind, RuntimeEventKind::CallFailed { .. })
+        ) >= 1),
+        "A's call did not time out within the poll budget"
+    );
 
     runtime
         .try_send(driver, AbaDriverMsg::Finish)
         .expect("Finish");
 
-    let report = result.wait(Duration::from_secs(5)).expect("driver report");
+    let report = result.wait(POLL_BUDGET).expect("driver report");
 
     assert!(report.exit_clean);
     assert!(
