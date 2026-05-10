@@ -403,3 +403,165 @@ Update bridge guide:
 - Ergonomic helpers/accessors ship with the first form.
 - Generic SQLx, transactions, streaming rows, and DB cancellation remain
   explicit future work.
+
+## Follow-Ups
+
+Two buckets:
+
+- **deferred** — earns its own phase later;
+- **declined** — not coming, reason stays loud.
+
+### Deferred
+
+#### A. FetchMany
+
+Smallest. Land first.
+
+Streaming peek already works for FetchOne. Same shape, larger cap.
+
+```text
+PgRequest::fetch_many(sql, max_rows)
+  -> PgResponse::Rows { rows: Vec<PgRow>, truncated: bool }
+```
+
+Rules:
+
+- read at most `max_rows + 1` rows from the SQLx stream;
+- past `max_rows`: stop pulling, set `truncated = true`;
+- bridge config keeps `max_response_rows` ceiling; caller cannot ask
+  for `usize::MAX`;
+- helper: `fetch_many_call`;
+- per-row / per-cell byte caps deferred; first form caps row count.
+
+Open: truncated success vs hard `ResponseTooLarge` error?
+
+Pick `truncated = true`. Rows are still useful. Caller who wants strict
+fail-past-N sets `max_rows + 1` and checks `truncated`.
+
+#### B. Transactions
+
+Two shapes. Pick before coding.
+
+**Shape 1 — atomic script.** Caller sends ordered list of requests.
+Bridge runs them in one transaction. COMMIT on all-OK. ROLLBACK on
+first error. Reply with per-step outcomes.
+
+```text
+PgTransaction::new()
+    .step(PgRequest::execute("UPDATE ... -100 ..."))
+    .step(PgRequest::execute("UPDATE ... +100 ..."))
+    .commit_call(addr, timeout)
+    .reply(AppMsg::Transferred)
+```
+
+Good:
+
+- one Tina admission;
+- one pool acquire;
+- no tx-id threading;
+- no long-lived bridge state.
+
+Bad:
+
+- cannot rollback based on app logic between steps.
+
+**Shape 2 — transaction handle.** `Begin -> TxId`. Subsequent
+`Execute(TxId, ...)` runs on the pinned connection. `Commit(TxId)` /
+`Rollback(TxId)` close it. Bridge holds `HashMap<TxId, PoolConnection>`
+plus idle timeout so a forgotten handle does not leak a connection.
+
+Good:
+
+- full flexibility.
+
+Bad:
+
+- long-lived per-call state;
+- tx-id threading;
+- idle / leak policy is a real choice;
+- unhappy paths multiply: caller drop, bridge close, runtime drop.
+
+Pick Shape 1 first. Covers most real transactions. No state machine
+surprises. Add Shape 2 only when Specimen or a real user pushes.
+
+Cancel/timeout interaction:
+
+- per-attempt timeout still fires;
+- future still runs to completion (075 cancellation rule);
+- connection stays held until the script finishes;
+- consider a separate `tx_timeout` distinct from `default_timeout`.
+
+#### C. DB-side CancelRequest
+
+Highest payoff for late-result truth. Hardest protocol work.
+
+Postgres `CancelRequest`:
+
+- separate TCP connection;
+- carries target backend `(pid, secret_key)`;
+- best effort — Postgres may ignore mid-flight.
+
+Two paths:
+
+1. **`pg_cancel_backend(pid)` via sidecar pool.** Portable. No protocol
+   work. Capture PID once via `SELECT pg_backend_pid()`; store on the
+   in-flight slot. On timeout, spawn a sidecar task: `SELECT
+   pg_cancel_backend($1)`.
+
+2. **Raw cancel connection.** Lower level. Needs `(pid, secret)` from
+   SQLx startup negotiation. Check current SQLx 0.8 API surface
+   (`PgConnection::pg_id()` etc.) before committing.
+
+Pick path 1 first. Correct, boring, drives `late_results` toward zero
+in normal operation. Move to path 2 only if sidecar overhead becomes a
+real complaint.
+
+New metric: `db_cancels_sent`. Not the same as `late_results`. Doc:
+even a successful cancel does not kill every query.
+
+### Order
+
+```text
+A FetchMany    -> simplest; reuses streaming peek; small surface
+B Transactions -> shape 1 first; constrains cancel/timeout interaction
+C CancelRequest -> waits on B; mid-tx cancel is different from
+                   single-statement cancel; ship cancel knowing what
+                   it is cancelling
+```
+
+A and B are independent. C waits on B.
+
+### Declined
+
+Two original non-goals get no follow-up. Reasons stay loud so a future
+contributor does not quietly add them.
+
+#### D. Generic `sqlx::Database`
+
+Generic over `sqlx::Database` needs its own decode trait, its own value
+enum (or generic `Encode + Decode`), per-database error mapping. Type
+soup. One concrete bridge per backend is the boring answer.
+
+If MySQL or another SQLx backend earns adoption, ship
+`tina-mysql-bridge` (or similar) as a *separate crate* with the same
+shape. Do not generalize this crate.
+
+051E said no. Same call here.
+
+#### E. ORM, migrations, schema discovery, user-struct row mapping
+
+Different products from "bounded ingress around a SQL pool."
+
+User-struct mapping alone needs a derive macro, type-level column
+matching, and a nullable/missing-column story. Each of the four items
+would dwarf the bridge they live next to.
+
+Existing answers are better:
+
+- `sqlx`'s own `query_as!` for struct mapping (when offline metadata
+  is acceptable);
+- `sqlx-migrate` / `refinery` for migrations;
+- domain-specific SQL builders for query construction;
+- application code on top of `PgRow` for ad-hoc decode.
+
+Bridge job: bounded admission and visible pressure. Not modeling.
