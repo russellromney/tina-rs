@@ -1,48 +1,36 @@
 //! Capacity vocabulary.
 //!
-//! Pure data types. The runtime collects, the simulator asserts, the
-//! bridge specimens emit. None of the *mechanism* lives here.
+//! Pure data. Runtime collects, simulator asserts, specimens emit.
+//! No mechanism lives here.
 //!
-//! Capacity is not a big number guessed once:
+//! Capacity is not a guess:
 //!
 //! ```text
 //! unknown -> measured -> fixed
 //! ```
 //!
-//! Count protects scheduler fairness. Weight (PR 2) protects
-//! memory-ish payload. Shared weight (PR 2) protects a group of
-//! queues. Every `Full` says which cap filled.
+//! Count caps protect scheduler fairness. Future weight caps will
+//! protect memory-ish payload; future shared scopes will protect a
+//! group of queues.
 //!
-//! # First form (PR 1)
+//! Today's vocabulary:
 //!
-//! - [`CapacityMode`]: `Fixed` and `Tuning`. Tuning is `Fixed` with
-//!   a loud "this number was chosen for discovery, please report
-//!   high water" flag — the cap is still a hard upper bound.
-//! - [`CapacityPolicy`]: dev / test / prod gates that decide which
-//!   modes are allowed.
-//! - [`CapacitySpec`]: the value a user hands a bounded surface
-//!   constructor: cap + mode + optional name.
-//! - [`CapacitySurfaceReport`]: snapshot a bounded surface produces.
-//! - [`CapacityFull`]: typed reason a `Full`-shaped rejection
-//!   happened — local message count today, plus weight/shared
-//!   variants reserved for PR 2 so callers can match exhaustively
-//!   without an API break later.
-//!
-//! Weight, shared scope, and unbounded modes land in PR 2.
+//! - [`CapacityMode`]: `Fixed` (measured) or `Tuning` (discovery).
+//!   Tuning is still a hard cap; the flag just says "report high
+//!   water loudly".
+//! - [`CapacityPolicy`]: dev / test / prod stub. Both modes pass
+//!   everywhere today. Future unbounded modes plug in here.
+//! - [`CapacitySurfaceReport`]: one snapshot per bounded surface.
 
 use core::fmt;
 
-/// How a surface's cap was chosen.
-///
-/// The cap is *always* a hard upper bound. `Tuning` only signals
-/// intent so dashboards / discovery formatters can say "read the
-/// high water and freeze".
+/// How the cap was chosen. Cap is always a hard upper bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapacityMode {
-    /// A real measured cap. Production-acceptable.
+    /// Measured cap. Use in production.
     Fixed,
-    /// Cap chosen for discovery. Still a hard upper bound; report
-    /// high-water loudly so the user can pick a `Fixed` number.
+    /// Discovery cap. Still hard. Reports surface high water so
+    /// the user can pick a `Fixed` number.
     Tuning,
 }
 
@@ -62,33 +50,26 @@ impl fmt::Display for CapacityMode {
     }
 }
 
-/// Deployment profile gating which capacity modes are allowed.
+/// Deployment profile. Decides which modes pass validation.
 ///
-/// Validation is done at config time via
-/// [`CapacityPolicy::validate_mode`]. Wiring this to runtime startup
-/// is the caller's job — the policy itself is data.
+/// Both modes pass everywhere today. The shape exists so future
+/// unbounded modes can plug in here without touching call sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapacityPolicy {
-    /// Local dev. Allows tuning. Unbounded modes (PR 2) allowed
-    /// with explicit expiry.
+    /// Local dev.
     Development,
-    /// CI. Allows tuning. Unbounded with expiry allowed; ugly
-    /// no-expiry rejected.
+    /// CI.
     Test,
-    /// Production. Allows fixed and tuning (early production is
-    /// where real high-water data first appears). Unbounded modes
-    /// rejected.
+    /// Production.
     Production,
 }
 
 /// Why [`CapacityPolicy::validate_mode`] rejected a mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapacityPolicyError {
-    /// The mode is not allowed under the configured policy.
-    ///
-    /// `surface` names the offending surface so the rejection
-    /// message can point at it; `mode` and `policy` describe the
-    /// disagreement.
+    /// Mode not allowed under this policy. The error names the
+    /// surface, the mode, and the policy so the message points at
+    /// the offender.
     ModeNotAllowed {
         /// Surface whose mode failed validation.
         surface: String,
@@ -117,141 +98,54 @@ impl fmt::Display for CapacityPolicyError {
 impl std::error::Error for CapacityPolicyError {}
 
 impl CapacityPolicy {
-    /// Reject a [`CapacityMode`] that is not allowed under this
-    /// policy. PR 1 only sees `Fixed` and `Tuning`; both are
-    /// always allowed today, but production keeps the hook so PR 2
-    /// can plug unbounded rejection here without an API break.
+    /// Validate `mode` for `surface` under this policy.
+    ///
+    /// Today every `(policy, mode)` pair passes. The signature is
+    /// stable so call sites can pre-wire validation before
+    /// unbounded modes land.
     pub fn validate_mode(
         self,
-        surface: &str,
-        mode: CapacityMode,
+        _surface: &str,
+        _mode: CapacityMode,
     ) -> Result<(), CapacityPolicyError> {
-        // Fixed and Tuning are allowed everywhere in PR 1. The
-        // signature stays so PR 2 can add `UnboundedForNow` /
-        // `UnboundedWithoutExpiry` rejections without changing
-        // call sites.
-        let _ = (surface, mode);
-        match (self, mode) {
-            (_, CapacityMode::Fixed) | (_, CapacityMode::Tuning) => Ok(()),
-        }
-    }
-}
-
-/// Why a `Full`-shaped rejection happened.
-///
-/// PR 1 only ever produces `LocalMessages`; the other variants are
-/// declared today so user code that wants exhaustive matching does
-/// not need to be edited when PR 2 adds weight and shared scopes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapacityFull {
-    /// The local count cap on this surface filled.
-    LocalMessages,
-    /// The local weight cap on this surface filled. (PR 2.)
-    LocalWeight,
-    /// A shared-weight scope this surface participates in filled.
-    /// (PR 2; the scope id type also lands then.)
-    SharedWeight,
-}
-
-impl CapacityFull {
-    /// Short label for one-line reports.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::LocalMessages => "local_messages",
-            Self::LocalWeight => "local_weight",
-            Self::SharedWeight => "shared_weight",
-        }
-    }
-}
-
-impl fmt::Display for CapacityFull {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
-    }
-}
-
-/// What the user hands a bounded-surface constructor.
-///
-/// ```ignore
-/// CapacitySpec::fixed(128)
-/// CapacitySpec::tuning(256).named("orders.mailbox")
-/// ```
-///
-/// The cap is the hard upper bound. `mode` says how it was chosen.
-/// `name` overrides the surface's default-generated name; pin it
-/// for CI/DST assertions, omit it for ad-hoc use.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapacitySpec {
-    /// Hard upper bound on count. Always honored.
-    pub max: usize,
-    /// Whether the cap was measured (`Fixed`) or chosen for
-    /// discovery (`Tuning`).
-    pub mode: CapacityMode,
-    /// Optional explicit name. `None` means the surface uses its
-    /// default-generated name.
-    pub name: Option<String>,
-}
-
-impl CapacitySpec {
-    /// A measured cap.
-    pub fn fixed(max: usize) -> Self {
-        Self {
-            max,
-            mode: CapacityMode::Fixed,
-            name: None,
-        }
-    }
-
-    /// A discovery cap. Still a hard upper bound; just report
-    /// high-water loudly so the user can promote it to `Fixed`.
-    pub fn tuning(max: usize) -> Self {
-        Self {
-            max,
-            mode: CapacityMode::Tuning,
-            name: None,
-        }
-    }
-
-    /// Override the surface's default name. Pin for CI/DST tests.
-    pub fn named(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
-        self
+        Ok(())
     }
 }
 
 /// Snapshot of one bounded count surface.
 ///
-/// Weight fields are reserved for PR 2. They are present today as
-/// `Option`s so first-form callers do not need to change the report
-/// shape when weight surfaces start filling them in.
+/// Weight fields are reserved for future weighted surfaces. They
+/// are always `None` / `0` today; the shape carries them so adding
+/// weight later does not break readers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapacitySurfaceReport {
-    /// Stable name. Defaults to a generated `<kind>.<n>.<role>` form;
-    /// explicit `.named(...)` is the blessed shape for CI/DST.
+    /// Stable surface name. Use dotted form, e.g.
+    /// `pool.orders.waiters`. Discovery formatter assumes no
+    /// whitespace in the name.
     pub name: String,
     /// How the cap was chosen.
     pub mode: CapacityMode,
-    /// Configured count cap. `None` is reserved for unbounded modes
-    /// (PR 2); first-form surfaces always set it.
+    /// Configured count cap. `None` is reserved for future
+    /// unbounded modes; today's surfaces always set it.
     pub max_messages: Option<usize>,
     /// Live count right now.
     pub current_messages: usize,
     /// Highest live count observed since construction.
     pub high_water_messages: usize,
-    /// Cumulative `Full`-shaped rejections caused by this count cap.
+    /// Cumulative count-cap `Full` rejections.
     pub full_count: u64,
-    /// Configured weight cap. PR 2.
+    /// Configured weight cap. Reserved.
     pub max_weight: Option<usize>,
-    /// Live weight right now. PR 2.
+    /// Live weight right now. Reserved.
     pub current_weight: Option<usize>,
-    /// High-water weight since construction. PR 2.
+    /// High-water weight since construction. Reserved.
     pub high_water_weight: Option<usize>,
-    /// Cumulative weight-related `Full` rejections. PR 2.
+    /// Cumulative weight-cap `Full` rejections. Reserved.
     pub weight_full_count: u64,
 }
 
 impl CapacitySurfaceReport {
-    /// Build a count-only report. Weight fields land empty.
+    /// Build a count-only report. Weight fields stay empty.
     pub fn count(
         name: impl Into<String>,
         mode: CapacityMode,
@@ -274,22 +168,9 @@ impl CapacitySurfaceReport {
         }
     }
 
-    /// True iff this report ever observed a `Full`-shaped rejection
-    /// (count or weight).
+    /// True if this surface ever hit `Full` (count or weight).
     pub fn ever_full(&self) -> bool {
         self.full_count > 0 || self.weight_full_count > 0
-    }
-
-    /// High-water as a fraction of cap, in basis points (0..=10_000).
-    /// Useful for "we touched 90% of cap" dashboards. Returns
-    /// `None` if `max_messages` is `None`.
-    pub fn fill_basis_points(&self) -> Option<u32> {
-        let max = self.max_messages?;
-        if max == 0 {
-            return Some(10_000);
-        }
-        let bp = (self.high_water_messages.saturating_mul(10_000)) / max;
-        Some(bp.min(10_000) as u32)
     }
 }
 
@@ -298,75 +179,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capacity_spec_fixed_default_name_is_none() {
-        let spec = CapacitySpec::fixed(8);
-        assert_eq!(spec.max, 8);
-        assert_eq!(spec.mode, CapacityMode::Fixed);
-        assert!(spec.name.is_none());
-    }
-
-    #[test]
-    fn capacity_spec_named_overrides() {
-        let spec = CapacitySpec::tuning(16).named("orders.mailbox");
-        assert_eq!(spec.mode, CapacityMode::Tuning);
-        assert_eq!(spec.name.as_deref(), Some("orders.mailbox"));
-    }
-
-    #[test]
-    fn capacity_policy_allows_fixed_everywhere() {
+    fn capacity_policy_allows_every_known_mode() {
         for policy in [
             CapacityPolicy::Development,
             CapacityPolicy::Test,
             CapacityPolicy::Production,
         ] {
-            policy
-                .validate_mode("any", CapacityMode::Fixed)
-                .expect("fixed allowed");
+            for mode in [CapacityMode::Fixed, CapacityMode::Tuning] {
+                policy
+                    .validate_mode("any", mode)
+                    .expect("Fixed and Tuning pass everywhere today");
+            }
         }
     }
 
     #[test]
-    fn capacity_policy_allows_tuning_everywhere_in_pr1() {
-        // PR 1 keeps tuning allowed in production. Promotion to
-        // warn/reject lives in PR 2 with the shared-budget pieces.
-        for policy in [
-            CapacityPolicy::Development,
-            CapacityPolicy::Test,
-            CapacityPolicy::Production,
-        ] {
-            policy
-                .validate_mode("any", CapacityMode::Tuning)
-                .expect("tuning allowed in PR 1");
-        }
-    }
-
-    #[test]
-    fn surface_report_count_round_trips() {
+    fn count_constructor_populates_message_fields() {
         let r = CapacitySurfaceReport::count("p.waiters", CapacityMode::Fixed, 4, 3, 4, 1);
         assert_eq!(r.max_messages, Some(4));
         assert_eq!(r.current_messages, 3);
         assert_eq!(r.high_water_messages, 4);
         assert_eq!(r.full_count, 1);
         assert!(r.ever_full());
-        assert_eq!(r.fill_basis_points(), Some(10_000));
     }
 
     #[test]
-    fn surface_report_basis_points_partial() {
+    fn ever_full_is_false_when_neither_counter_fired() {
         let r = CapacitySurfaceReport::count("p.waiters", CapacityMode::Tuning, 100, 0, 23, 0);
-        assert_eq!(r.fill_basis_points(), Some(2_300));
         assert!(!r.ever_full());
     }
 
     #[test]
-    fn capacity_full_labels_are_distinct() {
-        assert_ne!(
-            CapacityFull::LocalMessages.label(),
-            CapacityFull::LocalWeight.label()
-        );
-        assert_ne!(
-            CapacityFull::LocalWeight.label(),
-            CapacityFull::SharedWeight.label()
-        );
+    fn capacity_mode_label_is_distinct() {
+        assert_ne!(CapacityMode::Fixed.label(), CapacityMode::Tuning.label());
     }
 }

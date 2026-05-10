@@ -282,8 +282,8 @@ pub struct PoolPressureReport {
     pub waiters: usize,
     /// Configured waiter capacity.
     pub max_waiters: usize,
-    /// Highest live `waiters` value observed since pool construction.
-    /// Pair with `max_waiters` and `full_count` for a count-capacity
+    /// Highest live `waiters` value since pool construction. Pair
+    /// with `max_waiters` and `full_count` for a count-capacity
     /// snapshot.
     pub high_water_waiters: usize,
     /// Cumulative `Full` outcomes.
@@ -313,10 +313,12 @@ pub struct PoolPressureReport {
 }
 
 impl PoolPressureReport {
-    /// Project this pool-shaped report onto a generic
-    /// [`crate::capacity::CapacitySurfaceReport`] for the *waiter*
-    /// surface. The resource surface is not count-capped (capacity is
-    /// fixed at construction); waiters are.
+    /// Project this report onto the waiter count surface. Resource
+    /// count is not capped at runtime (capacity is fixed at build),
+    /// so only waiters need a capacity surface.
+    ///
+    /// The caller picks the surface name and mode. Pin an explicit
+    /// name when CI tests assert on this surface.
     pub fn to_waiters_capacity_report(
         &self,
         name: impl Into<String>,

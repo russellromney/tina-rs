@@ -144,10 +144,9 @@ impl Driver {
                     self.report.cancelled = report.cancel_count as usize;
                     self.report.waiters_high_water = report.high_water_waiters;
                     self.report.waiters_max = report.max_waiters;
-                    // Project the pool report onto the generic
-                    // capacity surface and emit a discovery line.
-                    // Pin an explicit name so a CI assertion does not
-                    // silently retarget if the pool is renamed.
+                    // Project onto the count surface and emit a
+                    // discovery line. Pin the name so CI does not
+                    // retarget by accident.
                     let surface = report.to_waiters_capacity_report(
                         "pool.demo.waiters",
                         tina::capacity::CapacityMode::Tuning,

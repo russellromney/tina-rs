@@ -1234,10 +1234,10 @@ fn pressure_report_counts_full() {
 
 #[test]
 fn pressure_report_tracks_high_water_waiters() {
-    // 1 resource, 4 waiter slots. Issue 4 acquires: first holds the
-    // resource, three park as waiters. high_water_waiters peaks at 3.
-    // Release the held lease — pool dispatches one parked waiter, so
-    // live waiters drops to 2 — but high water is sticky and stays at 3.
+    // 1 resource, 4 waiter slots. Issue 4 acquires: first gets the
+    // resource, three park as waiters. high_water_waiters hits 3.
+    // Release the lease — pool dispatches one parked waiter, live
+    // waiters drops to 2. High water stays 3.
     let h = build(PoolConfig::new(1, 4), vec![1]);
 
     h.runtime
@@ -1281,8 +1281,8 @@ fn pressure_report_tracks_high_water_waiters() {
     assert_eq!(after.waiters, 2, "one parked waiter dispatched");
     assert_eq!(after.high_water_waiters, 3, "high water is sticky");
 
-    // Project to the count-capacity surface report. Name is explicit so
-    // a CI assertion does not silently retarget.
+    // Project to the count surface. Pin the name so a CI test
+    // cannot silently retarget if internals get renamed.
     let report =
         after.to_waiters_capacity_report("pool.demo.waiters", tina::capacity::CapacityMode::Fixed);
     assert_eq!(report.name, "pool.demo.waiters");
@@ -1308,9 +1308,9 @@ fn pressure_report_tracks_high_water_waiters() {
 
 #[test]
 fn pressure_report_capacity_surface_records_full_under_overload() {
-    // 1 resource, 0 waiters: every acquire after the first sheds with
-    // Full. The capacity-shaped report should record those rejections
-    // and the discovery formatter should suggest "raise cap".
+    // 1 resource, 0 waiters: every acquire after the first sheds
+    // with Full. The capacity surface records those rejections and
+    // the discovery formatter suggests "raise cap".
     let h = build(PoolConfig::new(1, 0), vec![1]);
 
     h.runtime

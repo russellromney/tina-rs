@@ -1,15 +1,18 @@
 //! Runtime-side capacity collection and assertions.
 //!
 //! Vocabulary lives in [`tina::capacity`]. This module collects
-//! [`CapacitySurfaceReport`]s into a [`CapacitySummary`] and offers
-//! tiny `Result`-flavored assertions plus a one-line discovery
-//! formatter so users can move from "I do not know the cap" to
-//! "I picked a fixed cap" without reading runtime internals.
+//! reports into a [`CapacitySummary`], offers `Result` assertions,
+//! and prints one-line discovery output.
+//!
+//! Discovery line shape matches [`format_pressure_line`]'s
+//! `key=value` convention:
 //!
 //! ```text
-//! pool.1.waiters       fixed   max=4    high=4   full=2   suggest=raise cap or shed
-//! orders.mailbox       tuning  max=64   high=11  full=0   suggest=cap looks loose; freeze around 16
+//! capacity surface=pool.1.waiters mode=fixed  max=4  cur=0 high=4  full=2 suggest="saw Full — raise cap or shed earlier"
+//! capacity surface=orders.mailbox mode=tuning max=64 cur=0 high=11 full=0 suggest="tuning cap is loose; freeze near 2x high water"
 //! ```
+//!
+//! [`format_pressure_line`]: crate::format_pressure_line
 
 use std::fmt;
 
@@ -98,11 +101,11 @@ impl fmt::Display for CapacityAssertError {
 
 impl std::error::Error for CapacityAssertError {}
 
-/// Collected snapshot of every bounded surface a system reports.
+/// One snapshot of every bounded surface a system reports.
 ///
 /// Names must be unique within one summary. Iterate via
-/// [`Self::reports`] for human / dashboard output; reach for one
-/// surface by name via [`Self::surface`].
+/// [`Self::reports`] for dashboards; look up by name via
+/// [`Self::surface`].
 #[derive(Debug, Default, Clone)]
 pub struct CapacitySummary {
     reports: Vec<CapacitySurfaceReport>,
@@ -114,8 +117,8 @@ impl CapacitySummary {
         Self::default()
     }
 
-    /// Register a report. Rejects duplicate names so a CI assertion
-    /// never silently picks the wrong surface.
+    /// Add a report. Rejects duplicate names so CI tests cannot
+    /// silently pick the wrong surface.
     pub fn push(&mut self, report: CapacitySurfaceReport) -> Result<(), CapacityNameError> {
         if self.reports.iter().any(|r| r.name == report.name) {
             return Err(CapacityNameError::Duplicate(report.name));
@@ -134,13 +137,13 @@ impl CapacitySummary {
         self.reports.is_empty()
     }
 
-    /// Iterator over every registered report.
+    /// Iterator over every report.
     pub fn reports(&self) -> impl Iterator<Item = &CapacitySurfaceReport> {
         self.reports.iter()
     }
 
-    /// Look up a single surface by name. Returns an assertion handle
-    /// so test code can chain `.no_full()` / `.high_water_at_most(N)`.
+    /// Look up one surface by name. Returns a handle so test code
+    /// can chain `.no_full()` / `.high_water_at_most(N)`.
     pub fn surface<'a>(&'a self, name: &str) -> SurfaceAssertion<'a> {
         SurfaceAssertion {
             name: name.to_string(),
@@ -148,14 +151,14 @@ impl CapacitySummary {
         }
     }
 
-    /// True if any surface ever reported a `Full`-shaped rejection.
+    /// True if any surface ever hit `Full`.
     pub fn any_full(&self) -> bool {
         self.reports.iter().any(|r| r.ever_full())
     }
 }
 
-/// Result-flavored assertions for one surface. Keeps test code free
-/// of failure-string parsing.
+/// `Result` assertions for one surface. Keeps test code free of
+/// string parsing.
 pub struct SurfaceAssertion<'a> {
     name: String,
     report: Option<&'a CapacitySurfaceReport>,
@@ -208,39 +211,30 @@ impl<'a> SurfaceAssertion<'a> {
             })
         }
     }
-
-    /// Assert wrapper: panics on failure. Use sparingly — the
-    /// `Result`-returning forms compose better in test pipelines.
-    #[track_caller]
-    pub fn assert_no_full(&self) {
-        if let Err(e) = self.no_full() {
-            panic!("{e}");
-        }
-    }
-
-    /// Assert wrapper for [`Self::high_water_at_most`].
-    #[track_caller]
-    pub fn assert_high_water_at_most(&self, limit: usize) {
-        if let Err(e) = self.high_water_at_most(limit) {
-            panic!("{e}");
-        }
-    }
 }
 
-/// Human-readable next-action hint for the discovery formatter.
+/// Next-action hint for the discovery formatter.
+///
+/// Thresholds are basis points of `high_water / max`:
+///
+/// - `Fixed` is supposed to be tight. Below 25% is loose; above
+///   85% is tight.
+/// - `Tuning` expects more headroom. Below 25% is very loose;
+///   above 75% is tight enough to re-measure.
 fn suggest_next(report: &CapacitySurfaceReport) -> &'static str {
     let max = match report.max_messages {
         Some(m) => m,
-        None => return "unbounded — pick a fixed cap (PR 2 escape hatch)",
+        // No reachable producer of `None` today. Future unbounded
+        // modes will replace this hint.
+        None => return "no cap configured — pick a fixed cap",
     };
     if report.full_count > 0 {
         return "saw Full — raise cap or shed earlier";
     }
-    let high = report.high_water_messages;
     if max == 0 {
         return "cap is zero — increase or remove this surface";
     }
-    let bp = (high.saturating_mul(10_000)) / max;
+    let bp = (report.high_water_messages.saturating_mul(10_000)) / max;
     match (report.mode, bp) {
         (CapacityMode::Tuning, b) if b < 2_500 => "tuning cap is loose; freeze near 2x high water",
         (CapacityMode::Tuning, b) if b < 7_500 => "tuning cap fits; freeze near 1.5x high water",
@@ -251,10 +245,13 @@ fn suggest_next(report: &CapacitySurfaceReport) -> &'static str {
     }
 }
 
-/// One-line discovery line per surface.
+/// One `key=value` line per surface. Matches
+/// [`format_pressure_line`](crate::format_pressure_line) so the
+/// same greppers work. The `suggest=` value is double-quoted
+/// because it contains spaces.
 ///
 /// ```text
-/// pool.1.waiters       fixed   max=4    cur=0   high=4   full=2   suggest=saw Full — raise cap or shed earlier
+/// capacity surface=pool.1.waiters mode=fixed max=4 cur=0 high=4 full=2 suggest="saw Full — raise cap or shed earlier"
 /// ```
 pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
     let max = match report.max_messages {
@@ -262,7 +259,7 @@ pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
         None => "-".to_string(),
     };
     format!(
-        "{name:<24} {mode:<7} max={max:<6} cur={cur:<5} high={high:<5} full={full:<4} suggest={hint}",
+        "capacity surface={name} mode={mode} max={max} cur={cur} high={high} full={full} suggest={hint:?}",
         name = report.name,
         mode = report.mode.label(),
         max = max,
@@ -273,7 +270,7 @@ pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
     )
 }
 
-/// Render a full discovery report (one line per surface).
+/// One discovery line per surface, joined with newlines.
 pub fn format_discovery_report(summary: &CapacitySummary) -> String {
     let mut out = String::new();
     for r in summary.reports() {
@@ -346,15 +343,31 @@ mod tests {
     }
 
     #[test]
-    fn discovery_line_emits_dotted_form() {
+    fn discovery_line_uses_key_value_form() {
         let r = report("pool.1.waiters", 4, 0, 4, 2);
         let line = format_discovery_line(&r);
-        assert!(line.contains("pool.1.waiters"), "{line}");
-        assert!(line.contains("fixed"), "{line}");
+        // surface name and key=value pairs all appear, no padding.
+        assert!(line.starts_with("capacity "), "{line}");
+        assert!(line.contains("surface=pool.1.waiters"), "{line}");
+        assert!(line.contains("mode=fixed"), "{line}");
         assert!(line.contains("max=4"), "{line}");
+        assert!(line.contains("cur=0"), "{line}");
         assert!(line.contains("high=4"), "{line}");
         assert!(line.contains("full=2"), "{line}");
         assert!(line.contains("raise cap"), "{line}");
+    }
+
+    #[test]
+    fn discovery_line_quotes_suggest_string() {
+        // suggest= value contains spaces; pure k=v parsers need it
+        // quoted so they don't split the hint into separate fields.
+        let r = report("a", 4, 0, 4, 0);
+        let line = format_discovery_line(&r);
+        let suggest_idx = line.find("suggest=").expect("suggest=");
+        assert!(
+            line[suggest_idx..].starts_with("suggest=\""),
+            "expected double-quoted suggest=, got {line}"
+        );
     }
 
     #[test]
@@ -362,11 +375,11 @@ mod tests {
         let mut s = CapacitySummary::new();
         s.push(report("a", 4, 0, 0, 0)).unwrap();
         s.push(report("b", 4, 0, 0, 1)).unwrap();
-        let report = format_discovery_report(&s);
-        let lines: Vec<&str> = report.lines().collect();
+        let out = format_discovery_report(&s);
+        let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("a"), "{lines:?}");
-        assert!(lines[1].starts_with("b"), "{lines:?}");
+        assert!(lines[0].contains("surface=a"), "{lines:?}");
+        assert!(lines[1].contains("surface=b"), "{lines:?}");
     }
 
     #[test]
@@ -376,8 +389,12 @@ mod tests {
     }
 
     #[test]
-    fn suggest_next_recognizes_full_pressure() {
-        let r = CapacitySurfaceReport::count("a", CapacityMode::Fixed, 4, 0, 4, 1);
+    fn suggest_next_recognizes_full_pressure_over_loose_advice() {
+        // Even when high water is low, a non-zero full_count must
+        // win — load that *did* shed should not be suggested as
+        // "loose, shrink the cap".
+        let r = CapacitySurfaceReport::count("a", CapacityMode::Fixed, 100, 0, 1, 5);
         assert!(suggest_next(&r).contains("Full"));
+        assert!(!suggest_next(&r).contains("loose"));
     }
 }

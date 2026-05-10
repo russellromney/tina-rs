@@ -241,35 +241,31 @@ where
         }
     }
 
-    /// Override the surface's default capacity name.
+    /// Override the default capacity name.
     ///
-    /// Default is `pending_replies.<auto_seq>` where `<auto_seq>` is
-    /// a process-wide monotonic counter. Pin an explicit name for
-    /// CI / DST assertions so a refactor that reorders construction
-    /// cannot silently retarget the assertion.
+    /// Default is `pending_replies.<n>` where `<n>` is a
+    /// process-wide counter. Pin an explicit name for CI tests so
+    /// a refactor that reorders construction cannot silently
+    /// retarget the assertion.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.capacity_name = name.into();
         self
     }
 
-    /// Mark the slot cap as a tuning value.
-    ///
-    /// The cap is still a hard upper bound. `Tuning` only signals
-    /// that the number was chosen for discovery so reports surface
-    /// high water loudly.
+    /// Mark the slot cap as `Tuning`. Cap is still hard. The flag
+    /// just says "report high water loudly".
     pub fn with_capacity_mode(mut self, mode: tina::capacity::CapacityMode) -> Self {
         self.capacity_mode = mode;
         self
     }
 
-    /// Stable name used in [`Self::capacity_report`].
+    /// Name carried in [`Self::capacity_report`].
     pub fn capacity_name(&self) -> &str {
         &self.capacity_name
     }
 
-    /// Capacity-shaped snapshot of this pending-replies box. Maps
-    /// `len` to current, `high_water` to high-water, and
-    /// `full_rejects` to full count.
+    /// Snapshot for the count surface. `len` -> current,
+    /// `high_water` -> high water, `full_rejects` -> full count.
     pub fn capacity_report(&self) -> tina::capacity::CapacitySurfaceReport {
         tina::capacity::CapacitySurfaceReport::count(
             self.capacity_name.clone(),

@@ -48,23 +48,19 @@ the pressure report as `dispatch_recovered`.
 
 ## Capacity discovery — `unknown -> measured -> fixed`
 
-The pool's waiter cap is a *count* capacity. Pick it once, observe
-high water under load, freeze the number. The specimen drives this:
+The waiter cap is a count cap. Pick a number, run load, read
+high water, freeze. The specimen does it:
 
-1. **Unknown.** First-pass code reaches for "a big number" — say
-   `WAITERS = 4`. Mark it `CapacityMode::Tuning` so the report says
-   so out loud.
-2. **Measured.** Run the specimen. The driver pulls a
-   `PressureReport`, projects it onto the generic capacity surface
-   (`pool.demo.waiters`), and emits one discovery line:
+1. **Unknown.** Pick `WAITERS = 4`. Mark it `Tuning`.
+2. **Measured.** Driver reads `PressureReport`, projects it onto
+   the count surface, prints one line:
    ```text
-   pool.demo.waiters        tuning  max=4    cur=0   high=4   full=0    suggest=tuning cap is tight; raise then re-measure
+   capacity surface=pool.demo.waiters mode=tuning max=4 cur=0 high=4 full=0 suggest="tuning cap is tight; raise then re-measure"
    ```
-3. **Fixed.** Read `high` and pick `Fixed(high * safety_factor)`.
-   Drop the `Tuning` flag once the cap matches observed pressure.
+3. **Fixed.** Read `high`. Pick `Fixed(high * safety_factor)`.
+   Drop the `Tuning` flag.
 
-The `tokio_impl` keeps `waiters_high_water` and `discovery_line`
-empty: `tokio::sync::Semaphore` exposes neither a high-water-mark
-nor a configured cap, so the same workflow on that side requires
-hand-instrumentation. The asymmetry is the point — capacity
-visibility is part of Tina's discipline, not an add-on.
+The tokio side leaves `waiters_high_water` and `discovery_line`
+empty. `tokio::sync::Semaphore` does not expose live waiters,
+high water, or a configured cap. Same workflow needs hand
+instrumentation there.

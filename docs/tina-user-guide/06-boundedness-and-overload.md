@@ -165,42 +165,41 @@ Linux/Fly/Docker limits.
 
 ## Capacity Is Not A Guess
 
-Bounded queues need numbers. Picking those numbers is a workflow:
+Bounded queues need numbers. Pick the number this way:
 
 ```text
 unknown -> measured -> fixed
 ```
 
-Don't write `usize::MAX`. Don't write 10_000. Pick a number, mark it
-**Tuning**, run the workload, read **high water**, freeze a **Fixed**
-cap with a small safety factor.
+Do not write `usize::MAX`. Do not write 10_000. Pick a number, mark
+it `Tuning`, run the load, read the high water, freeze a `Fixed`
+cap a bit higher.
 
-Vocabulary lives in `tina::capacity`:
+Types live in `tina::capacity`:
 
-- `CapacityMode::Fixed` — a measured cap. Production-acceptable.
-- `CapacityMode::Tuning` — a discovery cap. **Still a hard upper
-  bound.** The flag only tells the report to surface high water
-  loudly so you know what to freeze it at.
-- `CapacityPolicy::{Development, Test, Production}` — gates which
-  modes are allowed. Both modes pass everywhere today; weight,
-  shared scopes, and unbounded escape hatches land in a later phase.
-- `CapacitySurfaceReport` — `{ name, mode, max_messages, current,
-  high_water, full_count, ... }`. Every count surface produces one.
+- `CapacityMode::Fixed` — measured cap. Use in production.
+- `CapacityMode::Tuning` — discovery cap. Still a hard cap. The
+  flag just says "report high water loudly".
+- `CapacityPolicy::{Development, Test, Production}` — placeholder
+  for which modes are allowed. Today all pass. Future unbounded
+  modes plug in here.
+- `CapacitySurfaceReport` — one snapshot per bounded surface:
+  name, mode, cap, current, high water, full count.
 
-Two count surfaces report today:
+Two surfaces report today:
 
-- `WorkerPool` waiters — surface name defaults to
-  `pool.<id>.waiters`. Pin an explicit name with `.named(...)` when
-  CI / DST tests assert on this surface.
-- `PendingReplies` slots — surface name defaults to
-  `pending_replies.<n>`. Same `.named(...)` story.
+- `WorkerPool` waiters — projected from `PoolPressureReport` via
+  `to_waiters_capacity_report(name, mode)`. The caller picks the
+  name.
+- `PendingReplies` slots — call `capacity_report()` on the box.
+  The default name is `pending_replies.<n>`; pin a real one with
+  `.named(...)` for CI tests.
 
-`tina-runtime::CapacitySummary` collects reports and offers
-`Result`-flavored assertions:
+`CapacitySummary` collects reports and offers tiny `Result`
+assertions:
 
 ```rust
 use tina_runtime::{CapacitySummary, format_discovery_line};
-use tina::capacity::CapacityMode;
 
 let mut summary = CapacitySummary::new();
 summary.push(report)?;
@@ -209,20 +208,16 @@ summary.surface("orders.mailbox").no_full()?;
 summary.surface("pool.demo.waiters").high_water_at_most(96)?;
 ```
 
-`format_discovery_line(&report)` prints one boring `key=value`-ish
-line per surface with a next-action hint:
+`format_discovery_line(&report)` prints one `key=value` line per
+surface, same shape as `format_pressure_line`:
 
 ```text
-pool.demo.waiters     tuning  max=4    cur=0   high=4   full=0   suggest=tuning cap is tight; raise then re-measure
-orders.mailbox        fixed   max=64   cur=0   high=11  full=0   suggest=fixed cap is loose; consider shrinking
+capacity surface=pool.demo.waiters mode=tuning max=4  cur=0 high=4  full=0 suggest="tuning cap is tight; raise then re-measure"
+capacity surface=orders.mailbox    mode=fixed  max=64 cur=0 high=11 full=0 suggest="fixed cap is loose; consider shrinking"
 ```
 
-The hint is advice, not a metric. Read it, decide, freeze the cap.
-
-`PoolPressureReport::to_waiters_capacity_report(name, mode)` and
-`PendingReplies::capacity_report()` are the two adapters that emit
-the generic shape today; new bounded surfaces will follow the same
-pattern.
+The `suggest=` hint is advice, not a metric. Read it, decide,
+freeze the cap.
 
 ## What Counts As Failure
 

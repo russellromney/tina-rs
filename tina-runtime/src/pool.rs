@@ -29,7 +29,6 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::pool::{
     AcquireFailure, AcquireOutcome, CloseMode, PoolConfig, PoolId, PoolLease, PoolPressureReport,
     ReleaseDisposition, ReleaseFailure, ReleaseOutcome, runtime_internal as pool_internal,
@@ -180,8 +179,6 @@ where
     in_flight: Vec<InFlightDispatch>,
     counters: PoolCounters,
     closed: Option<CloseMode>,
-    capacity_name: String,
-    capacity_mode: CapacityMode,
     _shard: PhantomData<fn() -> S>,
 }
 
@@ -219,7 +216,6 @@ where
             waiter_slab.push(None);
         }
         let resources_opt: Vec<Option<H>> = resources.into_iter().map(Some).collect();
-        let capacity_name = format!("pool.{}.waiters", pool_id.get().get());
         Self {
             pool_id,
             config,
@@ -231,48 +227,8 @@ where
             in_flight: Vec::new(),
             counters: PoolCounters::default(),
             closed: None,
-            capacity_name,
-            capacity_mode: CapacityMode::Fixed,
             _shard: PhantomData,
         }
-    }
-
-    /// Override the surface's default capacity name.
-    ///
-    /// Default is `pool.<pool_id>.waiters`. Pin an explicit name when
-    /// CI / DST tests assert on this surface, so a refactor that
-    /// renames internals does not silently retarget the assertion.
-    pub fn named(mut self, name: impl Into<String>) -> Self {
-        self.capacity_name = name.into();
-        self
-    }
-
-    /// Mark the waiter cap as a tuning value.
-    ///
-    /// The cap is still hard. `Tuning` only signals that the number
-    /// was chosen for discovery so reports surface high water loudly.
-    pub fn with_capacity_mode(mut self, mode: CapacityMode) -> Self {
-        self.capacity_mode = mode;
-        self
-    }
-
-    /// Stable name used in [`Self::capacity_report`].
-    pub fn capacity_name(&self) -> &str {
-        &self.capacity_name
-    }
-
-    /// Capacity-shaped snapshot of the pool's waiter surface. Maps
-    /// `live waiters` to count, `high_water_waiters` to high-water,
-    /// and the existing `full` counter to `full_count`.
-    pub fn capacity_report(&self) -> CapacitySurfaceReport {
-        CapacitySurfaceReport::count(
-            self.capacity_name.clone(),
-            self.capacity_mode,
-            self.config.max_waiters,
-            self.live_waiter_count(),
-            self.counters.high_water_waiters,
-            self.counters.full,
-        )
     }
 
     /// This pool's identity. Useful for diagnostic logging.
