@@ -583,10 +583,11 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
     }
 
     fn deliver_success(&mut self, must_retire: bool) -> Effect<Self> {
-        let in_flight = self.in_flight.take().expect("in_flight present at delivery");
-        let head = in_flight
-            .parsed_head
-            .expect("head parsed before delivery");
+        let in_flight = self
+            .in_flight
+            .take()
+            .expect("in_flight present at delivery");
+        let head = in_flight.parsed_head.expect("head parsed before delivery");
         let body_end = in_flight.head_len + head.content_length;
         let body = in_flight.read_buf[in_flight.head_len..body_end].to_vec();
         let response = HttpResponse {

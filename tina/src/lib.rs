@@ -2101,6 +2101,7 @@ pub mod prelude {
     };
 }
 
+pub mod capacity;
 mod pending_call_set;
 pub mod pool;
 pub use pending_call_set::{PendingCallSet, PendingCallSetInsertError};

@@ -249,16 +249,41 @@ type PoolAddr = Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<Keepal
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DriverEvent {
-    Acquired { id: u32, generation: u64 },
-    AcquireFull { id: u32 },
-    AcquireClosed { id: u32 },
-    AcquireCallTimeout { id: u32 },
-    AcquireCallFull { id: u32 },
-    AcquireCallClosed { id: u32 },
-    Request { id: u32, status: u16, must_retire: bool },
-    RequestErr { id: u32, message: String },
-    Released { id: u32, outcome: ReleaseOutcome },
-    Stopped { id: u32 },
+    Acquired {
+        id: u32,
+        generation: u64,
+    },
+    AcquireFull {
+        id: u32,
+    },
+    AcquireClosed {
+        id: u32,
+    },
+    AcquireCallTimeout {
+        id: u32,
+    },
+    AcquireCallFull {
+        id: u32,
+    },
+    AcquireCallClosed {
+        id: u32,
+    },
+    Request {
+        id: u32,
+        status: u16,
+        must_retire: bool,
+    },
+    RequestErr {
+        id: u32,
+        message: String,
+    },
+    Released {
+        id: u32,
+        outcome: ReleaseOutcome,
+    },
+    Stopped {
+        id: u32,
+    },
     Cancelled,
     PoolClosed,
     Pressure(PoolPressureReport),
@@ -387,11 +412,7 @@ impl Isolate for Driver {
             DriverMsg::AcquireWithHandle { id, timeout } => {
                 let (effect, handle) = call_with_handle(self.pool, WorkerPoolMsg::Acquire, timeout)
                     .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome });
-                self.state
-                    .lock()
-                    .expect("state")
-                    .handles
-                    .push((id, handle));
+                self.state.lock().expect("state").handles.push((id, handle));
                 effect
             }
             DriverMsg::Cancel { id } => {
@@ -622,7 +643,11 @@ impl TestRig {
     fn driver(
         &self,
         handles: &KeepalivePoolHandles,
-    ) -> (Address<DriverMsg>, Arc<Mutex<DriverState>>, mpsc::Receiver<DriverEvent>) {
+    ) -> (
+        Address<DriverMsg>,
+        Arc<Mutex<DriverState>>,
+        mpsc::Receiver<DriverEvent>,
+    ) {
         let state = Arc::new(Mutex::new(DriverState::default()));
         let (tx, rx) = mpsc::channel();
         let driver = Driver {
@@ -690,7 +715,10 @@ fn sequential_requests_reuse_one_connection() {
                 timeout: Duration::from_secs(2),
             },
         );
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id));
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id),
+        );
 
         let _ = rig.rt().try_send(
             driver,
@@ -701,14 +729,21 @@ fn sequential_requests_reuse_one_connection() {
                 call_timeout: Duration::from_secs(2),
             },
         );
-        let event =
-            wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id));
+        let event = wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id),
+        );
         match event {
             DriverEvent::Request {
-                status, must_retire, ..
+                status,
+                must_retire,
+                ..
             } => {
                 assert_eq!(status, 200);
-                assert!(!must_retire, "keepalive server: response should be reusable");
+                assert!(
+                    !must_retire,
+                    "keepalive server: response should be reusable"
+                );
             }
             _ => unreachable!(),
         }
@@ -720,7 +755,10 @@ fn sequential_requests_reuse_one_connection() {
                 disposition: ReleaseDisposition::Reuse,
             },
         );
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id));
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id),
+        );
     }
 
     assert_eq!(
@@ -815,11 +853,15 @@ fn server_close_after_first_response_marks_must_retire_and_reconnects() {
                 call_timeout: Duration::from_secs(2),
             },
         );
-        let event =
-            wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id));
+        let event = wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id),
+        );
         match event {
             DriverEvent::Request {
-                status, must_retire, ..
+                status,
+                must_retire,
+                ..
             } => {
                 assert_eq!(status, 200);
                 assert!(
@@ -876,7 +918,10 @@ fn acquire_full_visible_when_capacity_busy_and_no_waiter_slots() {
         },
     );
     let event = wait_for_event(&rx, |e| {
-        matches!(e, DriverEvent::AcquireFull { id: 2 } | DriverEvent::Acquired { id: 2, .. })
+        matches!(
+            e,
+            DriverEvent::AcquireFull { id: 2 } | DriverEvent::Acquired { id: 2, .. }
+        )
     });
     assert!(
         matches!(event, DriverEvent::AcquireFull { id: 2 }),
@@ -912,8 +957,9 @@ fn acquire_call_timeout_reclaims_waiter_capacity() {
             timeout: Duration::from_millis(150),
         },
     );
-    let event =
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireCallTimeout { id: 2 }));
+    let event = wait_for_event(&rx, |e| {
+        matches!(e, DriverEvent::AcquireCallTimeout { id: 2 })
+    });
     assert!(matches!(event, DriverEvent::AcquireCallTimeout { id: 2 }));
 
     // Third waiter must succeed in parking — capacity reclaimed.
@@ -924,8 +970,9 @@ fn acquire_call_timeout_reclaims_waiter_capacity() {
             timeout: Duration::from_millis(100),
         },
     );
-    let event =
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireCallTimeout { id: 3 }));
+    let event = wait_for_event(&rx, |e| {
+        matches!(e, DriverEvent::AcquireCallTimeout { id: 3 })
+    });
     assert!(
         matches!(event, DriverEvent::AcquireCallTimeout { id: 3 }),
         "third waiter parked then timed out, proving the second waiter's slot was reclaimed"
@@ -974,8 +1021,9 @@ fn acquire_cancel_reclaims_waiter_capacity() {
             timeout: Duration::from_millis(100),
         },
     );
-    let event =
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireCallTimeout { id: 3 }));
+    let event = wait_for_event(&rx, |e| {
+        matches!(e, DriverEvent::AcquireCallTimeout { id: 3 })
+    });
     assert!(matches!(event, DriverEvent::AcquireCallTimeout { id: 3 }));
 
     rig.shutdown();
@@ -1017,8 +1065,7 @@ fn drain_close_blocks_new_acquires_and_lets_outstanding_release() {
             disposition: ReleaseDisposition::Reuse,
         },
     );
-    let event =
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: 1, .. }));
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: 1, .. }));
     if let DriverEvent::Released { outcome, .. } = event {
         assert_eq!(outcome, ReleaseOutcome::Released);
     }
@@ -1071,8 +1118,7 @@ fn force_close_marks_outstanding_lease_stale_on_release() {
             disposition: ReleaseDisposition::Reuse,
         },
     );
-    let event =
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: 1, .. }));
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: 1, .. }));
     if let DriverEvent::Released { outcome, .. } = event {
         assert_eq!(outcome, ReleaseOutcome::PoolClosed);
     }
@@ -1404,7 +1450,10 @@ fn capacity_two_pool_serves_two_concurrent_acquires_with_two_connections() {
                 timeout: Duration::from_secs(2),
             },
         );
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id));
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id),
+        );
     }
 
     // Both leases held concurrently. Issue a request on each so we
@@ -1419,7 +1468,10 @@ fn capacity_two_pool_serves_two_concurrent_acquires_with_two_connections() {
                 call_timeout: Duration::from_secs(2),
             },
         );
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id));
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id),
+        );
     }
 
     // Mid-flight pressure (still holding both leases): 2 leased.
@@ -1445,7 +1497,10 @@ fn capacity_two_pool_serves_two_concurrent_acquires_with_two_connections() {
                 disposition: ReleaseDisposition::Reuse,
             },
         );
-        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id));
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id),
+        );
     }
 
     let _ = rig.rt().try_send(

@@ -44,6 +44,10 @@ pub mod types;
 
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
+pub use keepalive::{
+    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveOutcome,
+    KeepalivePoolHandles, OriginKey, build_keepalive_pool,
+};
 pub use listener::{HttpListener, HttpListenerMsg};
 pub use listener_tls::{
     HttpsListener, HttpsListenerMsg, HttpsReady, HttpsServerConfig, HttpsStartupError,
@@ -52,10 +56,6 @@ pub use listener_tls::{
 pub use parse::{
     HttpResponseHead, ParseProgress, ResponseParseProgress, encode_keepalive_request,
     encode_request, encode_response, parse_request_head, parse_response_head,
-};
-pub use keepalive::{
-    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveOutcome,
-    KeepalivePoolHandles, OriginKey, build_keepalive_pool,
 };
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;

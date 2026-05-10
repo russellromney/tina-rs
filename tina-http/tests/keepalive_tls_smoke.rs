@@ -115,8 +115,7 @@ impl TlsKeepaliveServer {
                                     };
                                     buf.extend_from_slice(&chunk[..n]);
                                 };
-                                let head_str =
-                                    std::str::from_utf8(&buf[..head_end]).unwrap_or("");
+                                let head_str = std::str::from_utf8(&buf[..head_end]).unwrap_or("");
                                 let cl = parse_content_length(head_str);
                                 let body_end = head_end + cl;
                                 while buf.len() < body_end {
@@ -252,12 +251,10 @@ impl Isolate for Driver {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DriverMsg::BeginAcquire => call(
-                self.pool,
-                WorkerPoolMsg::Acquire,
-                Duration::from_secs(5),
-            )
-            .reply(DriverMsg::AcquireReturned),
+            DriverMsg::BeginAcquire => {
+                call(self.pool, WorkerPoolMsg::Acquire, Duration::from_secs(5))
+                    .reply(DriverMsg::AcquireReturned)
+            }
             DriverMsg::AcquireReturned(outcome) => match outcome {
                 CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
                     self.lease = Some(lease);
@@ -278,9 +275,7 @@ impl Isolate for Driver {
             }
             DriverMsg::RequestReturned(outcome) => {
                 match outcome {
-                    CallOutcome::Replied(KeepaliveOutcome::Request {
-                        result: Ok(_), ..
-                    }) => {
+                    CallOutcome::Replied(KeepaliveOutcome::Request { result: Ok(_), .. }) => {
                         let _ = self.notify.send(DriverEvent::RequestOk);
                     }
                     CallOutcome::Replied(KeepaliveOutcome::Request { result: Err(e), .. }) => {

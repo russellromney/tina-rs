@@ -163,6 +163,138 @@ When testing a Tina service under load, collect:
 First pass can run without hard memory caps. Later pressure passes can use
 Linux/Fly/Docker limits.
 
+## Capacity Is Not A Guess
+
+Bounded queues need numbers. Do not write `usize::MAX`. Do not
+write 10_000. Pick the number this way:
+
+```text
+unknown -> measured -> fixed
+```
+
+### The four steps
+
+1. **Pick a number.** Mark it `Tuning`. The cap is still hard. The
+   flag just says "report high water loudly".
+2. **Run the load.** Real workload, not a smoke test.
+3. **Read the high water** off a `CapacitySurfaceReport`.
+4. **Freeze a `Fixed` cap** a bit higher than high water. Common
+   choice: `2 * high_water` for elastic loads, `1.2 * high_water`
+   for steady loads.
+
+### Types
+
+`tina::capacity`:
+
+- `CapacityMode::Fixed` — measured cap. Use in production.
+- `CapacityMode::Tuning` — discovery cap. Still hard. The flag
+  surfaces high water loudly.
+- `CapacityPolicy::{Development, Test, Production}` — placeholder
+  for which modes pass validation. Today all pass.
+- `CapacitySurfaceReport` — one snapshot per bounded surface:
+  name, mode, cap, current, high water, full count.
+
+`tina-runtime`:
+
+- `CapacitySummary` — collects reports, looks up by name.
+- `SurfaceAssertion` — `.no_full()`, `.high_water_at_most(N)`,
+  `.full_count_eq(N)`. Returns `Result`.
+- `format_discovery_line(&report)` — one `key=value` line.
+
+### Step 3 in code
+
+Two surfaces report today. Each has its own way to read the
+report.
+
+**`PendingReplies`** lives in user code. Call
+`capacity_report()` directly:
+
+```rust
+let pending = PendingReplies::<u64, MyReply>::with_capacity(MAX)
+    .named("orders.pending")           // pin for CI
+    .with_capacity_mode(CapacityMode::Tuning);
+
+// ...later, in handler scope...
+let report = self.pending.capacity_report();
+```
+
+If a different isolate needs the report, add a snapshot message
+to the holder isolate:
+
+```rust
+enum FrontendMsg {
+    // ...other variants...
+    CapacitySnapshot,
+}
+
+enum FrontendReply {
+    // ...other variants...
+    Capacity(CapacitySurfaceReport),
+}
+
+// In handle:
+FrontendMsg::CapacitySnapshot => {
+    reply(FrontendReply::Capacity(self.pending.capacity_report()))
+}
+```
+
+**`WorkerPool`** is owned by the runtime once registered. It
+already has a `PressureReport` message; project the reply onto a
+capacity surface:
+
+```rust
+let surface = pool_pressure.to_waiters_capacity_report(
+    "pool.orders.waiters",       // caller picks the name
+    CapacityMode::Tuning,
+);
+```
+
+### Step 4 in code
+
+```rust
+let mut summary = CapacitySummary::new();
+summary.push(surface)?;
+
+// Print one line per surface.
+println!("{}", format_discovery_line(
+    summary.surface("pool.orders.waiters").report()?
+));
+
+// Or assert in CI.
+summary.surface("pool.orders.waiters").no_full()?;
+summary.surface("pool.orders.waiters").high_water_at_most(96)?;
+```
+
+Output of `format_discovery_line` (same shape as
+`format_pressure_line`):
+
+```text
+capacity surface=pool.orders.waiters mode=tuning max=4  cur=0 high=4  full=0 suggest="tuning cap is tight; raise then re-measure"
+capacity surface=orders.pending      mode=fixed  max=64 cur=0 high=11 full=0 suggest="fixed cap is loose; consider shrinking"
+```
+
+The `suggest=` hint is advice. Read it, decide, freeze.
+
+### Naming rule
+
+- Default name is fine for human reports.
+- Pin an explicit name with `.named(...)` (PendingReplies) or by
+  passing the name to `to_waiters_capacity_report` (WorkerPool)
+  whenever a CI test asserts on that surface. A refactor that
+  reorders construction or renames internals must not silently
+  retarget the assertion.
+- Use a dotted token form (e.g. `pool.orders.waiters`).
+  `CapacitySummary::push` rejects empty names and names with
+  whitespace or control characters so the discovery line stays
+  parseable.
+
+### Worked example
+
+`examples/specimen_pool_cancel_reclaim` runs the full loop:
+configure pool with `Tuning`, drive load, pull `PressureReport`,
+project to a capacity surface, format a discovery line, assert
+on it.
+
 ## What Counts As Failure
 
 Good failure:
