@@ -87,10 +87,8 @@ pub enum HttpsStartupError {
     /// `tls_bind` failed. `source` is the typed runtime error
     /// (`TlsCertificate`, `Io`, `TlsFull`, ...).
     Bind { source: CallError },
-    /// `Start` was sent more than once on the same listener. The
-    /// previous bind (if it succeeded) still owns the
-    /// `TlsListenerId` — there is no second bind, no second
-    /// listener.
+    /// Second `Start` on the same listener. The first bind still
+    /// owns the listener — no second bind happens.
     AlreadyStarted,
 }
 
@@ -123,9 +121,7 @@ pub struct HttpsListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stat
     tls_accept_timeout: Duration,
     tls_io_timeout: Duration,
     listener: Option<TlsListenerId>,
-    /// Set on the first `Start`. Subsequent `Start`s reply
-    /// `HttpsStartupError::AlreadyStarted` rather than issuing a
-    /// second `tls_bind` that would leak the first listener.
+    /// Set on the first `Start`. Second Start replies `AlreadyStarted`.
     started: bool,
     stopping: bool,
     _shard: PhantomData<S>,
@@ -175,10 +171,6 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         match msg {
             HttpsListenerMsg::Start => {
                 if self.started {
-                    // Idempotency: second Start would issue a second
-                    // tls_bind and either fail (port in use) or leak
-                    // the first listener. Either way the second
-                    // caller gets a typed error.
                     return reply(Err(HttpsStartupError::AlreadyStarted));
                 }
                 self.started = true;
@@ -193,16 +185,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpsListenerMsg::Bound(Ok((listener, local_addr))) => {
                 self.listener = Some(listener);
                 if self.stopping {
-                    // Stop arrived while bind was in flight. Don't
-                    // start the accept loop; close the listener
-                    // immediately. No reply: the original caller
-                    // has either gone away (call-shape timed out)
-                    // or used the trace-shaped Send.
-                    if let Some(listener) = self.listener.take() {
-                        return tls_close_listener(listener)
-                            .reply(HttpsListenerMsg::ListenerClosed);
-                    }
-                    return stop();
+                    // Stop arrived while bind was in flight. Close
+                    // the just-bound listener; no reply.
+                    let listener = self.listener.take().expect("set just above");
+                    return tls_close_listener(listener)
+                        .reply(HttpsListenerMsg::ListenerClosed);
                 }
                 let ready_effect: Effect<Self> = reply(Ok(HttpsReady { local_addr }));
                 let accept_effect: Effect<Self> = tls_accept(listener, self.tls_accept_timeout)
@@ -216,26 +203,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
             HttpsListenerMsg::Accepted(Ok((stream, _peer))) => {
                 if self.stopping {
-                    // Stop is in progress. Close the orphan stream;
-                    // also close the listener if we haven't yet —
-                    // the lane is now free of the just-completed
-                    // accept and `tls_close_listener` will succeed.
-                    let close_orphan: Effect<Self> = tls_close(stream, self.tls_io_timeout)
+                    // Orphan-close the just-accepted stream.
+                    return tls_close(stream, self.tls_io_timeout)
                         .reply(HttpsListenerMsg::StreamClosed);
-                    if let Some(listener) = self.listener.take() {
-                        return batch(vec![
-                            close_orphan,
-                            tls_close_listener(listener)
-                                .reply(HttpsListenerMsg::ListenerClosed),
-                        ]);
-                    }
-                    return close_orphan;
                 }
                 let Some(listener) = self.listener else {
-                    // State-machine invariant says listener=Some when
-                    // !stopping after a successful Bound(Ok). If we
-                    // ever land here, defensively orphan-close the
-                    // just-accepted stream rather than panicking.
+                    // Defensive: invariant says listener=Some when
+                    // !stopping. If violated, orphan-close.
                     return tls_close(stream, self.tls_io_timeout)
                         .reply(HttpsListenerMsg::StreamClosed);
                 };
@@ -248,22 +222,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             }
             HttpsListenerMsg::Accepted(Err(error)) => {
                 if self.stopping {
-                    // Pending accept just completed, so the lane is
-                    // free. Close the listener now.
-                    if let Some(listener) = self.listener.take() {
-                        return tls_close_listener(listener)
-                            .reply(HttpsListenerMsg::ListenerClosed);
-                    }
+                    // The pending accept already cleared via the
+                    // lane's close-wins synthetic `TargetClosed`.
                     return stop();
                 }
                 let Some(listener) = self.listener else {
                     return stop();
                 };
-                // Re-accept on transient errors only. `Timeout` =
-                // empty accept slice; `TlsHandshake` = malformed peer
-                // bytes (no TlsStreamId allocated). Everything else
-                // (`TlsClosed`, `Io`, `InvalidResource`, `TlsFull`)
-                // means re-accepting would busy-loop — close out.
+                // Re-accept on transient errors. `Timeout` = empty
+                // accept slice; `TlsHandshake` = malformed peer
+                // bytes (no `TlsStreamId` allocated). Everything
+                // else would busy-loop — close out.
                 match error {
                     CallError::Timeout | CallError::TlsHandshake => {
                         tls_accept(listener, self.tls_accept_timeout)
@@ -285,18 +254,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     return noop();
                 }
                 self.stopping = true;
-                if self.listener.is_none() {
-                    // Pre-bind: nothing to close. Any in-flight
-                    // tls_bind is cancelled when the isolate stops.
-                    return stop();
+                if let Some(listener) = self.listener.take() {
+                    tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed)
+                } else {
+                    stop()
                 }
-                // Listener is held and an accept is in flight on the
-                // lane. Closing now would return `ResourceBusy`.
-                // Defer: the pending accept lands within
-                // `tls_accept_timeout`, the Accepted(...) handler
-                // observes `stopping` and triggers the close from
-                // there.
-                noop()
             }
 
             HttpsListenerMsg::ListenerClosed(_) => stop(),

@@ -477,14 +477,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn handle_body_chunk_read(&mut self, result: Result<Vec<u8>, CallError>) -> Effect<Self> {
         let bytes = match result {
             Ok(bytes) => bytes,
-            // tcp_read failure mid-body: end the stream. Service sees
-            // delivered bytes < expected and can decide what to do.
-            Err(_) => return reply(RequestChunkReply::Eof),
+            // Surface the typed error so service can tell short
+            // delivery (Eof) from truncation (Error).
+            Err(error) => return reply(RequestChunkReply::Error(error)),
         };
         if bytes.is_empty() {
-            // Peer closed mid-body. Honest move: terminate the stream
-            // with what we have; the service will notice the short
-            // delivery via `delivered < expected`.
+            // Peer closed mid-body. Service notices via `delivered < expected`.
             return reply(RequestChunkReply::Eof);
         }
         self.inbound_received += bytes.len();

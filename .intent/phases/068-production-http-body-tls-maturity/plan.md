@@ -48,16 +48,39 @@
     `server_smoke.rs` — sends a second Start to an already-running
     listener and asserts the trace shows exactly one `TcpBind`.
 
-  Other findings logged but deferred (cross-cutting / API-shape):
-  - `HttpClient` stale-Connected close result is silently dropped
-    (`HttpClientMsg::Closed(_) => noop()`). Pre-068.
-  - `HttpConnection::handle_body_chunk_read` reports an I/O error
-    mid-body to the service as `RequestChunkReply::Eof` — the
-    service can't tell short delivery from error. Needs a richer
-    streaming-body reply variant.
-  - TLS lane silent `let _ = tcp.set_*_timeout(...)` failures.
-  - TCP/TLS lane close-semantics asymmetry (close-wins vs
-    `ResourceBusy`) — runtime change.
+  Round 5 — fix the cross-cutting items the round-4 sweep
+  surfaced:
+
+  - **Runtime: TLS lane close-wins for listeners.** `submit_listener_close`
+    now cancels any pending `tls_accept` on the listener and
+    proceeds with close, mirroring `do_listener_close` on the TCP
+    lane. Cancelled accepts surface as synthetic
+    `Failed(TargetClosed)` completions via a new
+    `cancelled_by_close` queue drained in `advance()`. The
+    deferred-close workaround in `HttpsListener::Stop` is removed;
+    Stop now mirrors `HttpListener::Stop` exactly.
+  - **Runtime: TLS lane close-wins for streams.** `submit_close`
+    now cancels any pending read/write on the stream and removes
+    the stream from `self.streams` synchronously. The worker still
+    flushes through its `Arc<Mutex<TlsRuntimeStream>>` clone, but
+    the lane table entry is freed immediately — so a close that
+    fails with `Failed(Timeout|Io)` no longer leaks the stream
+    resource. `finish_completion` no longer needs to remove on
+    success either.
+  - **`RequestChunkReply::Error(CallError)`.** `handle_body_chunk_read`
+    now surfaces an I/O error mid-body as a typed `Error` reply
+    instead of fabricating `Eof`. The service can distinguish a
+    clean short delivery from a truncated request caused by I/O or
+    peer error. Match-exhaustiveness compile-checks ensure every
+    consumer handles the new variant.
+  - **`HttpClient::Closed(_) => noop()`** — comment added: the
+    runtime now removes the stream resource synchronously at
+    submit-close time, so a failed close doesn't leak. The
+    runtime trace records the outcome.
+  - **`tls.rs: let _ = tcp.set_*_timeout(...)`** — comments added
+    explaining these can only fail for `Some(zero)`/`None` (which
+    we never pass), so the `let _` is explicit acknowledgement,
+    not a silent swallow.
 
 - Post-review fixes (PR feedback round 3):
   - **Bug fix**: Stop racing with a pending `tls_accept` previously

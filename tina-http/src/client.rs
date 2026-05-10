@@ -173,6 +173,9 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
                 }
             }
 
+            // Both runtime lanes free the stream resource at
+            // submit-close time, so a failed close doesn't leak.
+            // Outcome is recorded in the trace.
             HttpClientMsg::Closed(_) => noop(),
         }
     }
