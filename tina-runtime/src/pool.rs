@@ -149,6 +149,7 @@ struct PoolCounters {
     wrong_shard: u64,
     no_caller_drops: u64,
     dispatch_recovered: u64,
+    high_water_waiters: usize,
 }
 
 /// Bounded worker pool isolate.
@@ -252,6 +253,7 @@ where
             leased,
             waiters: self.live_waiter_count(),
             max_waiters: self.config.max_waiters,
+            high_water_waiters: self.counters.high_water_waiters,
             full_count: self.counters.full,
             closed_count: self.counters.closed,
             wrong_shard_count: self.counters.wrong_shard,
@@ -449,7 +451,15 @@ where
         let slab_idx = self.alloc_waiter_slot();
         self.waiter_slab[slab_idx as usize] = Some(Waiter { reply: slot });
         self.waiter_queue.push_back(slab_idx);
+        self.bump_waiter_high_water();
         noop()
+    }
+
+    fn bump_waiter_high_water(&mut self) {
+        let live = self.live_waiter_count();
+        if live > self.counters.high_water_waiters {
+            self.counters.high_water_waiters = live;
+        }
     }
 
     fn handle_release(

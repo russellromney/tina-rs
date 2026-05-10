@@ -107,6 +107,23 @@ where
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
     virtual_now: Duration,
+    /// `Instant` anchor that pairs with `virtual_now` to give the
+    /// simulator a same-shape "now" as the live runtime's `Clock`.
+    /// Stamped once at construction (from `Instant::now()`) and never
+    /// mutated; handlers see `virtual_anchor + virtual_now`.
+    ///
+    /// **Determinism scope.** Within a single simulator run the anchor
+    /// is stable, so every `Context::now()` and every `Deadline` built
+    /// from it is deterministic. *Across* runs the anchor differs
+    /// (`Instant::now()` is wall-clock time at construction). Trace
+    /// events themselves never embed `Instant`s — they record
+    /// `Duration` deltas against `virtual_now`, which IS replay-stable
+    /// — so the DST trace-hash claim still holds. The cross-run
+    /// difference only matters if user code embeds raw `Instant`s in
+    /// `stop_with` payloads or other observed values; user code that
+    /// wants byte-identical replay should compare `virtual_now`
+    /// `Duration`s, not `Instant`s.
+    virtual_anchor: std::time::Instant,
     step_ordinal: u64,
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
@@ -171,6 +188,7 @@ where
             ids,
             trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
             virtual_now: Duration::ZERO,
+            virtual_anchor: std::time::Instant::now(),
             step_ordinal: 0,
             timers: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             next_timer_ordinal: 0,
@@ -470,11 +488,12 @@ where
             );
 
             let caller = self.build_message_caller(message.call_context, isolate_id);
+            let now = self.virtual_anchor + self.virtual_now;
 
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
                 catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller)
+                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller, now)
                 }))
             };
 
