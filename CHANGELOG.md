@@ -215,7 +215,19 @@ API additions:
   case in `tina-sim/tests/timmerhus_dst.rs` from `assert_replays` +
   bare `History` to `assert_replay_case` + `ReplayCase` so the new
   shape is the way for new DST tests, not just an alternative
-  parallel API.
+  parallel API. Followed up by migrating
+  `live_sim_projection_matches_topology_failure_history` and the four
+  saved-seed cases in `tina-sim/tests/portable_service_dst.rs`
+  (`portable_service_dst_replays_whole_service_history`,
+  `portable_service_dst_replays_observed_send_full_before_persistence`,
+  `baobab_dst_replays_observed_send_persistence_and_requester_stop`,
+  `baobab_dst_replays_pressure_shard_failure_and_topology_truth`),
+  each now pinning event count + `stable_trace_hash` alongside the
+  service-projection invariants. The shrink tests still use
+  `delete_shrink` + bare `History` because they exercise shrink
+  itself, not pin a saved trace shape. Random-history tests in
+  `dst_randomized.rs` and harness-exercising tests in
+  `dst_harness.rs` stay on `assert_replays` for the same reason.
 - Added ergonomic helpers driven by real-use friction:
   `ReplayCase::new(...).expecting(count, hash)` builds the case and
   the bundled `History` from one set of name+seed inputs;
