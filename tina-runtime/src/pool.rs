@@ -587,6 +587,14 @@ where
 /// Build an [`Effect`] that acquires a resource from the pool.
 ///
 /// Sugar over `call(pool, WorkerPoolMsg::Acquire, timeout).reply(...)`.
+/// The translator receives the raw
+/// `CallOutcome<WorkerPoolReply<H>>` so callers can inspect both the
+/// transport layer (`Full` / `Closed` / `Timeout` from the runtime)
+/// and the pool layer (the inner `WorkerPoolReply::Acquire(...)`)
+/// independently.
+///
+/// Use [`acquire_result_effect`] when you want the layered outcome
+/// folded into `Result<PoolLease<H>, AcquireFailure>` for you.
 /// Use [`acquire_with_handle_effect`] when the caller wants a
 /// [`tina::CallHandle`] for cancellation.
 pub fn acquire_effect<I, H, F, M>(
@@ -601,6 +609,34 @@ where
     M: 'static,
 {
     crate::call::call(pool, WorkerPoolMsg::Acquire, timeout).reply(translator)
+}
+
+/// Build an [`Effect`] that acquires a resource and folds the
+/// layered outcome through [`try_acquired`] before handing it to the
+/// translator.
+///
+/// The translator receives `Result<PoolLease<H>, AcquireFailure>`.
+/// Pool-layer outcomes (`Full` / `Closed` / `WrongShard`) and
+/// transport-layer outcomes (`CallTimeout` / `CallFull` /
+/// `CallClosed`) stay distinct as enum variants of `AcquireFailure`,
+/// so this fold is no-loss.
+///
+/// Prefer this when the consumer does not need the raw
+/// `WorkerPoolReply` shape. Use [`acquire_effect`] when you do.
+pub fn acquire_result_effect<I, H, F, M>(
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    timeout: std::time::Duration,
+    translator: F,
+) -> Effect<I>
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(Result<PoolLease<H>, AcquireFailure>) -> M + 'static,
+    M: 'static,
+{
+    acquire_effect(pool, timeout, move |outcome| {
+        translator(try_acquired(outcome))
+    })
 }
 
 /// Build an `(Effect, CallHandle)` pair for cancellable acquire.
@@ -625,8 +661,12 @@ where
 /// Build an [`Effect`] that releases a lease back to the pool.
 ///
 /// Sugar over `call(pool, WorkerPoolMsg::Release { ... }, timeout).reply(...)`.
-/// No drop-magic, no hidden retry. Pool address and disposition are
-/// visible at the call site.
+/// The translator receives the raw
+/// `CallOutcome<WorkerPoolReply<H>>`. No drop-magic, no hidden
+/// retry. Pool address and disposition are visible at the call site.
+///
+/// Use [`release_result_effect`] when you want the layered outcome
+/// folded into `Result<(), ReleaseFailure>` for you.
 pub fn release_effect<I, H, F, M>(
     lease: PoolLease<H>,
     pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
@@ -642,6 +682,36 @@ where
 {
     crate::call::call(pool, WorkerPoolMsg::Release { lease, disposition }, timeout)
         .reply(translator)
+}
+
+/// Build an [`Effect`] that releases a lease and folds the layered
+/// outcome through [`try_released`] before handing it to the
+/// translator.
+///
+/// The translator receives `Result<(), ReleaseFailure>`. Pool-layer
+/// outcomes (`Retired` / `StaleLease` / `DoubleRelease` /
+/// `PoolClosed`) and transport-layer outcomes (`CallTimeout` /
+/// `CallFull` / `CallClosed`) stay distinct as variants of
+/// `ReleaseFailure`.
+///
+/// Prefer this when the consumer does not need the raw
+/// `WorkerPoolReply` shape. Use [`release_effect`] when you do.
+pub fn release_result_effect<I, H, F, M>(
+    lease: PoolLease<H>,
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    disposition: ReleaseDisposition,
+    timeout: std::time::Duration,
+    translator: F,
+) -> Effect<I>
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(Result<(), ReleaseFailure>) -> M + 'static,
+    M: 'static,
+{
+    release_effect(lease, pool, disposition, timeout, move |outcome| {
+        translator(try_released(outcome))
+    })
 }
 
 /// Sugar for `call(pool, WorkerPoolMsg::PressureReport, timeout).reply(...)`.

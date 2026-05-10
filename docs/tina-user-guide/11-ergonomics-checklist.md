@@ -541,8 +541,8 @@ waiter slots on caller cancel via `cancel_call(handle)`.
 ```rust
 use tina::pool::{PoolConfig, ReleaseDisposition};
 use tina_runtime::pool::{
-    WorkerPool, acquire_effect, acquire_with_handle_effect, release_effect,
-    close_effect, pressure_effect, try_acquired,
+    WorkerPool, acquire_result_effect, acquire_with_handle_effect,
+    release_result_effect, close_effect, pressure_effect,
 };
 
 let pool = WorkerPool::<MyHandle, SingleShard>::new(
@@ -552,21 +552,36 @@ let pool = WorkerPool::<MyHandle, SingleShard>::new(
 ```
 
 Caller uses the typed effect builders instead of raw
-`call(pool, WorkerPoolMsg::..., timeout).reply(...)`:
+`call(pool, WorkerPoolMsg::..., timeout).reply(...)`. Two flavors:
+
+**Result-flavored** — translator receives a flat
+`Result<PoolLease<H>, AcquireFailure>` / `Result<(), ReleaseFailure>`:
+
+```rust
+acquire_result_effect(pool, timeout, MyMsg::Acquired)
+release_result_effect(lease, pool, ReleaseDisposition::Reuse, timeout, MyMsg::Released)
+```
+
+**Raw** — translator receives `CallOutcome<WorkerPoolReply<H>>` so
+the caller can inspect the transport layer separately:
 
 ```rust
 acquire_effect(pool, timeout, MyMsg::Acquired)
-acquire_with_handle_effect(pool, timeout, MyMsg::Acquired)  // cancellable
 release_effect(lease, pool, ReleaseDisposition::Reuse, timeout, MyMsg::Released)
+acquire_with_handle_effect(pool, timeout, MyMsg::Acquired)  // cancellable
 close_effect(pool, CloseMode::Drain, timeout, MyMsg::Closed)
 pressure_effect(pool, timeout, MyMsg::Pressure)
 ```
 
-In the reply continuation, fold the layered outcome with
-`try_acquired` / `try_released` instead of three nested matches:
+Prefer the result flavors. Pool-layer outcomes (`Full` / `Closed` /
+`WrongShard`) and transport-layer outcomes (`CallTimeout` /
+`CallFull` / `CallClosed`) survive the fold as distinct variants of
+`AcquireFailure` / `ReleaseFailure`, so the no-loss principle holds.
+
+In the reply continuation, match the flat result directly:
 
 ```rust
-match try_acquired(outcome) {
+match result {
     Ok(lease) => /* use lease */,
     Err(AcquireFailure::Full) => /* shed */,
     Err(AcquireFailure::Closed) => /* pool gone */,
@@ -575,6 +590,10 @@ match try_acquired(outcome) {
     Err(_) => /* other transport failure */,
 }
 ```
+
+If you need the `WorkerPoolReply` shape directly (for tracing or
+custom matching), use `acquire_effect` plus `try_acquired(outcome)`
+in the handler.
 
 Lease identity is move-only and identity-checked (pool id, resource
 id, generation). Forging is impossible — constructors are sealed

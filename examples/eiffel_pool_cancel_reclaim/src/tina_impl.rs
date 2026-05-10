@@ -7,11 +7,11 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::pool::{PoolConfig, PoolLease, ReleaseDisposition};
+use tina::pool::{AcquireFailure, PoolConfig, PoolLease, ReleaseDisposition};
 use tina::prelude::*;
 use tina_runtime::pool::{
-    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_effect, acquire_with_handle_effect,
-    pressure_effect, release_effect, try_acquired,
+    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_result_effect,
+    acquire_with_handle_effect, pressure_effect, release_result_effect, try_acquired,
 };
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, cancel_call};
 
@@ -21,15 +21,16 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Resource = u32;
 
+#[derive(Debug)]
 enum DriverMsg {
     BeginPrime,
     BeginWaiters,
     AcquireReturned {
         wave: Wave,
-        outcome: CallOutcome<WorkerPoolReply<Resource>>,
+        result: Result<PoolLease<Resource>, AcquireFailure>,
     },
     CancelAll,
-    CancelReturned(tina::CancelOutcome),
+    CancelReturned,
     RetryAll,
     PressureSnapshot,
     PressureReturned(CallOutcome<WorkerPoolReply<Resource>>),
@@ -43,24 +44,6 @@ enum Wave {
     Prime,
     Park,
     Retry,
-}
-
-impl std::fmt::Debug for DriverMsg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BeginPrime => f.write_str("BeginPrime"),
-            Self::BeginWaiters => f.write_str("BeginWaiters"),
-            Self::AcquireReturned { wave, .. } => write!(f, "AcquireReturned({wave:?})"),
-            Self::CancelAll => f.write_str("CancelAll"),
-            Self::CancelReturned(o) => write!(f, "CancelReturned({o:?})"),
-            Self::RetryAll => f.write_str("RetryAll"),
-            Self::PressureSnapshot => f.write_str("PressureSnapshot"),
-            Self::PressureReturned(_) => f.write_str("PressureReturned"),
-            Self::ReleaseHeld => f.write_str("ReleaseHeld"),
-            Self::ReleaseReturned => f.write_str("ReleaseReturned"),
-            Self::Finish => f.write_str("Finish"),
-        }
-    }
 }
 
 struct Driver {
@@ -78,69 +61,65 @@ impl Driver {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DriverMsg::BeginPrime => acquire_effect(self.pool, CALL_TIMEOUT, move |outcome| {
-                DriverMsg::AcquireReturned { wave: Wave::Prime, outcome }
-            }),
+            DriverMsg::BeginPrime => {
+                acquire_result_effect(self.pool, CALL_TIMEOUT, move |result| {
+                    DriverMsg::AcquireReturned { wave: Wave::Prime, result }
+                })
+            }
             DriverMsg::BeginWaiters => {
                 let mut effects = Vec::with_capacity(WAITERS);
                 for _ in 0..WAITERS {
                     let (effect, handle) =
                         acquire_with_handle_effect(self.pool, CALL_TIMEOUT, move |outcome| {
-                            DriverMsg::AcquireReturned { wave: Wave::Park, outcome }
+                            DriverMsg::AcquireReturned {
+                                wave: Wave::Park,
+                                result: try_acquired(outcome),
+                            }
                         });
                     self.park_handles.push(handle);
                     effects.push(effect);
                 }
                 batch(effects)
             }
-            DriverMsg::AcquireReturned { wave, outcome } => match wave {
-                Wave::Prime => {
-                    if let Ok(lease) = try_acquired(outcome) {
-                        self.held = Some(lease);
-                    }
+            DriverMsg::AcquireReturned { wave, result } => match (wave, result) {
+                (Wave::Prime, Ok(lease)) => {
+                    self.held = Some(lease);
                     noop()
                 }
-                Wave::Park => {
-                    // Cancel-reclaim flow: park-wave outcomes should
-                    // never deliver. If one races through, hand the
-                    // resource back so we don't deadlock.
-                    if let Ok(lease) = try_acquired(outcome) {
-                        return release_effect(
-                            lease,
-                            self.pool,
-                            ReleaseDisposition::Reuse,
-                            CALL_TIMEOUT,
-                            |_| DriverMsg::ReleaseReturned,
-                        );
-                    }
+                // Park-wave acquires should never deliver after cancel.
+                // If one races through, hand the resource back to avoid
+                // deadlock.
+                (Wave::Park, Ok(lease)) => release_result_effect(
+                    lease,
+                    self.pool,
+                    ReleaseDisposition::Reuse,
+                    CALL_TIMEOUT,
+                    |_| DriverMsg::ReleaseReturned,
+                ),
+                (Wave::Retry, Ok(lease)) => {
+                    self.report.retried_resourced += 1;
+                    release_result_effect(
+                        lease,
+                        self.pool,
+                        ReleaseDisposition::Reuse,
+                        CALL_TIMEOUT,
+                        |_| DriverMsg::ReleaseReturned,
+                    )
+                }
+                (Wave::Retry, Err(AcquireFailure::Full)) => {
+                    self.report.retried_full += 1;
                     noop()
                 }
-                Wave::Retry => match try_acquired(outcome) {
-                    Ok(lease) => {
-                        self.report.retried_resourced += 1;
-                        release_effect(
-                            lease,
-                            self.pool,
-                            ReleaseDisposition::Reuse,
-                            CALL_TIMEOUT,
-                            |_| DriverMsg::ReleaseReturned,
-                        )
-                    }
-                    Err(tina::pool::AcquireFailure::Full) => {
-                        self.report.retried_full += 1;
-                        noop()
-                    }
-                    Err(_) => noop(),
-                },
+                _ => noop(),
             },
             DriverMsg::CancelAll => {
                 let mut effects = Vec::with_capacity(self.park_handles.len());
                 for handle in self.park_handles.drain(..) {
-                    effects.push(cancel_call(handle).reply(DriverMsg::CancelReturned));
+                    effects.push(cancel_call(handle).reply(|_| DriverMsg::CancelReturned));
                 }
                 batch(effects)
             }
-            DriverMsg::CancelReturned(_) => {
+            DriverMsg::CancelReturned => {
                 // Per-cancel ack; truth lives in the pool's
                 // `cancel_count` (read via PressureSnapshot).
                 noop()
@@ -148,9 +127,11 @@ impl Driver {
             DriverMsg::RetryAll => {
                 let mut effects = Vec::with_capacity(WAITERS);
                 for _ in 0..WAITERS {
-                    effects.push(acquire_effect(self.pool, CALL_TIMEOUT, move |outcome| {
-                        DriverMsg::AcquireReturned { wave: Wave::Retry, outcome }
-                    }));
+                    effects.push(acquire_result_effect(
+                        self.pool,
+                        CALL_TIMEOUT,
+                        move |result| DriverMsg::AcquireReturned { wave: Wave::Retry, result },
+                    ));
                 }
                 self.report.retried_admitted = WAITERS;
                 batch(effects)
@@ -166,7 +147,7 @@ impl Driver {
             }
             DriverMsg::ReleaseHeld => {
                 if let Some(lease) = self.held.take() {
-                    release_effect(
+                    release_result_effect(
                         lease,
                         self.pool,
                         ReleaseDisposition::Reuse,
