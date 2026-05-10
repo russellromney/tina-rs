@@ -4,6 +4,52 @@ This file records completed work.
 
 ## Unreleased
 
+### DST As A First-Class Dev Mode
+
+- Added a "bug in a box" replay-case shape in `tina_sim::dst`:
+  `ReplayCase`, `ReplayReport`, `ReplayConfig`, plus `assert_replay_case`
+  / `check_replay_case` / `ReplayMismatch`. Cases pin name, seed, full
+  `SimulatorConfig`, declared mailbox capacities, scenario, history,
+  expected event count, and `stable_trace_hash`. Failures name the
+  next decision, not just numbers, and include the case history so a
+  coding agent reading only the panic can see what the case did.
+- `ReplayConfig` carries the full `SimulatorConfig` (seed overridden by
+  `case.seed` at run time) and a `BTreeMap<&'static str, usize>` of
+  per-isolate mailbox capacities. `ReplayConfig::mailbox(role)` panics
+  loudly on a missing role so the runner cannot quietly inherit a
+  literal. `check_replay_case` debug-asserts that `case.name`/
+  `case.seed` match `case.history` so the two source-of-truth fields
+  cannot drift.
+- Added `sweep_seeds` for hand-cranked deterministic seed search.
+  Failures return a `SweepFailure` whose `failing_case` has refreshed
+  expected count/hash and is ready for `assert_replay_case`. All
+  helpers accept `FnMut` runners so stateful runners are allowed.
+- Added `shrink_replay_case` plus `ShrinkReport`. The shrunk case
+  preserves name/seed/config/scenario/invariant, refreshes its
+  expected count/hash, and prints a pasteable Display form with a
+  review step.
+- Rewrote `docs/tina-user-guide/08-simulation-and-dst.md` around the
+  workflow (history → run twice → sweep → save bad seed → shrink →
+  commit) with a copyable test skeleton, bug-report shape, and an
+  explicit note that `Display` output is pasteable as readable lines
+  for bug reports while the `case()` function itself is what to copy
+  for code.
+- Upgraded `examples/eiffel_replay_dst` to be the copyable specimen:
+  one saved `ReplayCase` with `Tick`/`Drain` ops where every op is
+  load-bearing (deleting one changes the trace hash), declared
+  mailbox capacities, runner, sweep demo, shrink demo, and
+  same-seed/different-seed regression tests.
+- Added `tina-sim/tests/saved_replay_cases.rs` with one
+  service-shaped saved case (`burst overflow under local-send delay`)
+  that pins a real `SendRejected{ reason: Full }` mailbox-pressure
+  fact with exact `full_rejections` / `accepted_sends` counts
+  alongside its event count and trace hash.
+- Migrated the existing `remote_full_burst_is_known_edge_contract_and_replays`
+  case in `tina-sim/tests/timmerhus_dst.rs` from `assert_replays` +
+  bare `History` to `assert_replay_case` + `ReplayCase` so the new
+  shape is the way for new DST tests, not just an alternative
+  parallel API.
+
 ### Phase 065 Observability First Form
 
 - Added `tina-tracing`: an adapter crate that turns `RuntimeEvent`s and

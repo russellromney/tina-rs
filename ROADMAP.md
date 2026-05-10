@@ -208,6 +208,19 @@ and reviews live under `.intent/phases/`.
   LocalSystem rail/backpressure e2e gate, saved-seed service/persistence/bridge
   DST histories, real Tina local timing smoke rows, all folded into
   `make verify`.
+- DST as a first-class dev mode: a "bug in a box" `ReplayCase` /
+  `ReplayReport` / `ReplayConfig` shape in `tina_sim::dst` carrying the
+  full `SimulatorConfig` and declared per-isolate mailbox capacities,
+  `assert_replay_case` / `check_replay_case` failure messages that name
+  the next decision and include the case history, debug-asserted
+  name/seed/history coherence, deterministic `sweep_seeds`,
+  `shrink_replay_case` with refreshed expected count/hash on the
+  smaller case, a rewritten user-guide chapter around the
+  build/sweep/save/shrink workflow, an upgraded `eiffel_replay_dst`
+  specimen with load-bearing history ops, one service-shaped saved
+  case pinning a real `SendRejected{ Full }` mailbox-pressure fact
+  with exact pressure counts, and a migrated `timmerhus_dst` saved
+  case so the new helpers are the way for new DST tests.
 
 ## Near-term roadmap
 
@@ -226,7 +239,6 @@ framework before public release-story work.
 | **066 cancellation and deadline model** | Core runtime semantics, not sugar. Split cancellation into isolate stop, one caller-owned pending call, all calls owned by an isolate, resource close, caller timeout, and explicit cancel. Define trace vocabulary, capacity reclamation, late-reply behavior, simulator parity, and a deadline value that can flow through A -> B -> C without hidden retry. Ship only the parts whose semantics are boring; domain `Stop` remains valid where external cancellation would lie. |
 | **067 bounded pool vocabulary** | Real services are pools. Define a Tina-shaped first-form pool contract with visible `Acquire`/`Release`, capacity, max waiters, acquire timeout, idle timeout, `Full`/`Closed`/`Timeout`, caller-owned retry, and no hidden queue. Apply to at least one concrete shape (worker pool or SQLite/HTTP connection pool) before extracting anything generic. This phase should turn repeated pool-shaped Eiffel code into a small bounded primitive without obscuring pressure. |
 | **068 production HTTP body/TLS maturity** | Mature the native HTTP/1 stack before jumping to HTTP/2. Focus on production gaps: demand-driven request body streaming, bounded response streaming, memory accounting that matches `HttpLimits`, graceful listener/connection drain, keep-alive polish, native HTTPS/TLS setup ergonomics, cert/client error reporting, and trace-visible body backpressure. HTTP/2/gRPC remain later phases unless this phase proves the body/TLS substrate is ready. |
-| **069 DST and replay usability** | Turn deterministic simulation from a power-user feature into a product surface. Add fixture helpers, seed capture/replay docs, trace fingerprint helpers, live-vs-sim projection conventions, scripted TCP/TLS/storage examples, compile-fail proof patterns, and one or two Eiffel specimens that demonstrate "capture the bad seed, replay it, shrink it." No new simulator semantics unless the usability work exposes a precise missing primitive. |
 | **070 sharded data and placement structures** | Continue 053's owned-data direction into reusable shapes: sharded counters, sharded maps, session tables, batch `group_by_owner`, stale generation detection, owner-side validation helpers, hot-key reports, and fanout read helpers. The goal is not shared mutable data; the goal is owned per-shard data with easy routing and explicit wrong-shard/closed/full outcomes. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. This phase touches crate names, macros, docs, examples, roadmap/changelog, package metadata, and migration wording. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: design a `flow!`-style authoring surface that makes common workflows read top-to-bottom while preserving named suspension points, mandatory visible failure policy, generated trace step names, and ordinary Tina message/effect expansion. No `await` cosplay, no hidden retries, no hidden `?`, no unbounded queues, and the raw `match msg` form remains the semantic truth. |

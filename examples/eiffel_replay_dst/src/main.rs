@@ -21,18 +21,28 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_tina(report: tina_impl::Report) {
+fn print_tina(demo: tina_impl::Demo) {
+    let case = tina_impl::case();
+    println!("comparison=eiffel_replay_dst side=tina");
     println!(
-        "comparison=eiffel_replay_dst side=tina seed_a={} run_a1_events={} run_a2_events={} \
-         fingerprints_match={} seed_b={} run_b1_fingerprint_differs={} messages_received={}",
-        report.seed_a,
-        report.run_a1_event_count,
-        report.run_a2_event_count,
-        report.run_a1_fingerprint == report.run_a2_fingerprint,
-        report.seed_b,
-        report.run_b1_fingerprint != report.run_a1_fingerprint,
-        report.messages_received,
+        "  saved case: name={:?} seed={} events={} hash=0x{:016x} \
+         scenario={:?} invariant={:?} messages_received={}",
+        case.name,
+        case.seed,
+        demo.saved.event_count,
+        demo.saved.trace_hash,
+        case.scenario,
+        case.invariant,
+        demo.saved.output.messages_received,
     );
+    match &demo.sweep {
+        Ok(success) => println!(
+            "  sweep: name={:?} seeds_examined={} (no failure)",
+            success.name, success.seeds_examined
+        ),
+        Err(failure) => println!("  sweep failure (paste this):\n{failure}"),
+    }
+    println!("  shrink (paste this if it shrunk smaller):\n{}", demo.shrink);
 }
 
 fn print_tokio(report: tokio_impl::Report) {

@@ -148,6 +148,67 @@ deterministic-replay fingerprinting.
 Do not `format!("{event:?}").hash(...)`. The `Debug` representation
 is not stable across releases.
 
+### Saved-seed regression test
+
+Use `ReplayCase` plus `assert_replay_case` in `tina_sim::dst` for
+"saved seed, saved bug" tests. The case is plain Rust data: name,
+seed, full `SimulatorConfig`, declared mailbox capacities, history,
+pinned event count, pinned `stable_trace_hash`. The runner reads
+every knob from the case.
+
+```rust
+use tina_sim::dst::{assert_replay_case, ReplayCase, ReplayConfig, ReplayReport};
+
+#[test]
+fn saved_seed_replays_bug() {
+    let report = assert_replay_case(&case(), run_case);
+    assert_eq!(report.output.full_rejections, 5); // pin the pressure shape too
+}
+```
+
+When the saved hash drifts, the panic names the case, history, config,
+expected vs actual count/hash, and the next decision (fix the
+regression or update the constants).
+
+Do not roll a per-test `Report` struct, hand-rolled fingerprint
+comparison, or "is this the same trace?" pinning logic. Do not pin
+only the trace hash and skip the projection counts that name the
+invariant.
+
+### Sweep seeds for a bad case
+
+Use `sweep_seeds` for hand-cranked deterministic seed search. Not
+QuickCheck. `make_case(seed)` is pure. The first failure returns a
+`SweepFailure` whose `failing_case` has refreshed expected count and
+hash and is ready for `assert_replay_case`.
+
+```rust
+#[test]
+#[ignore] // local search, not every PR
+fn seed_sweep() {
+    let outcome = sweep_seeds("local sweep", 0..1024, make_case, run_case, |r| {
+        if r.output.saw_bug { Err("bug appeared".into()) } else { Ok(()) }
+    });
+    if let Err(failure) = outcome {
+        eprintln!("{failure}"); // pasteable case
+        panic!("found a bad seed");
+    }
+}
+```
+
+Do not invent your own random generator. Do not use a sweep helper
+that hides operations behind a builder.
+
+### Shrink a saved case
+
+Use `shrink_replay_case` to reduce a failing case to the smallest
+history that still proves the bug. The shrunk case carries refreshed
+`expected_event_count` and `expected_trace_hash` so it can be replayed
+by `assert_replay_case` directly.
+
+Do not shrink at the bare `History` level when the surrounding
+config/mailboxes/scenario should travel with the smaller case.
+
 ### Native HTTP server
 
 Use `tina_http::HttpListener::with_config(...)` with

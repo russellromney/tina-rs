@@ -12,7 +12,10 @@ use tina_runtime::{
     LiveShardState, LocalSystem, MailboxFactory, RuntimeEvent, RuntimeEventKind,
     SendRejectedReason, TraceRetention,
 };
-use tina_sim::dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink};
+use tina_sim::dst::{
+    DstRun, History, InvariantSuite, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig,
+    assert_replay_case, assert_replays, delete_shrink,
+};
 use tina_sim::{
     MultiShardReplayArtifact, MultiShardSimulator, MultiShardSimulatorConfig, SimulatorConfig,
 };
@@ -562,14 +565,47 @@ fn run_remote_pressure_history(
     )
 }
 
+// Saved-seed regression case migrated to the `ReplayCase` shape so
+// the `tina_sim::dst` types are the way to write new DST tests, not
+// just an alternative parallel API. Pinning event count + trace hash
+// catches drift in the trace shape; pinning the projection counts
+// catches drift in the pressure/lifecycle invariant.
+const REMOTE_FULL_EVENT_COUNT: usize = REMOTE_FULL_EVENT_COUNT_PIN;
+const REMOTE_FULL_TRACE_HASH: u64 = REMOTE_FULL_TRACE_HASH_PIN;
+
+// The pinned constants live in two consts so refreshing them is one
+// search-and-replace at the top of the file.
+const REMOTE_FULL_EVENT_COUNT_PIN: usize = 12;
+const REMOTE_FULL_TRACE_HASH_PIN: u64 = 0x0300_4e4d_26f6_ddf3;
+
+fn remote_full_pressure_case() -> ReplayCase<PressureOp> {
+    let history = remote_full_pressure_history();
+    ReplayCase {
+        name: "timmerhus remote full pressure",
+        seed: history.seed(),
+        config: ReplayConfig::default(),
+        scenario: "one cross-shard burst into a capacity-1 shard pair under default config",
+        history,
+        expected_event_count: REMOTE_FULL_EVENT_COUNT,
+        expected_trace_hash: REMOTE_FULL_TRACE_HASH,
+        invariant: "remote-shard pair `Full` shows up exactly once and target keeps the first value",
+    }
+}
+
+fn run_remote_full_pressure_case(
+    case: &ReplayCase<PressureOp>,
+) -> ReplayReport<TopologyProjection> {
+    let run = run_remote_pressure_history(&case.history);
+    let (projection, artifact) = run.into_parts();
+    ReplayReport::from_case_and_events(case, artifact.event_record(), projection)
+}
+
 #[test]
 fn remote_full_burst_is_known_edge_contract_and_replays() {
-    let history = remote_full_pressure_history();
-    let run = assert_replays(&history, run_remote_pressure_history);
-
-    assert_eq!(run.output().rejected_full, 1);
-    assert_eq!(run.output().rejected_closed, 0);
-    assert_eq!(run.output().values, vec![10]);
+    let report = assert_replay_case(&remote_full_pressure_case(), run_remote_full_pressure_case);
+    assert_eq!(report.output.rejected_full, 1);
+    assert_eq!(report.output.rejected_closed, 0);
+    assert_eq!(report.output.values, vec![10]);
 }
 
 #[test]

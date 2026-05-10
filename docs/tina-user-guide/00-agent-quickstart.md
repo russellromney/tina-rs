@@ -101,3 +101,19 @@ Map:
 - Can the same logic run in `tina-sim`?
 
 If you cannot answer those, the code is not done.
+
+## When You Find A Bug In Sim
+
+Save it as a `ReplayCase` in `tina_sim::dst`. The case is plain
+Rust data: name, seed, full `SimulatorConfig`, declared mailbox
+capacities, history, pinned event count, pinned `stable_trace_hash`.
+
+Then write one `#[test]` calling `assert_replay_case(&case(),
+run_case)`. Same seed, same story. Saved seed, saved bug.
+
+Sweep seeds with `sweep_seeds`. Shrink the failing history with
+`shrink_replay_case`. Both helpers return pasteable output.
+
+Do not roll a per-test `Report` struct or hand-rolled fingerprint
+comparison. See the [Simulation And DST](08-simulation-and-dst.md)
+chapter and `examples/eiffel_replay_dst` for the copyable shape.
