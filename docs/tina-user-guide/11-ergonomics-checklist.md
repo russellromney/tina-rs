@@ -530,6 +530,72 @@ return tina::reply_to(self.pending.take(&req_id).unwrap(), MyReply::Ok(v));
 Don't hand-roll `Arc<Mutex<HashMap<RequestId, oneshot>>>`. No cap, no
 caller signal, no terminal trace.
 
+### Bounded worker pool
+
+Use `tina_runtime::pool::WorkerPool<H, S>` for "borrow one of N
+resources, do work, return it." The pool isolate owns a fixed list of
+resource handles (`H`, e.g. `Address<WorkerMsg, WorkerReply>`), parks
+overflow callers in a fixed-capacity FIFO waiter table, and reclaims
+waiter slots on caller cancel via `cancel_call(handle)`.
+
+```rust
+use tina::pool::{PoolConfig, ReleaseDisposition};
+use tina_runtime::pool::{
+    WorkerPool, acquire_effect, acquire_with_handle_effect, release_effect,
+    close_effect, pressure_effect, try_acquired,
+};
+
+let pool = WorkerPool::<MyHandle, SingleShard>::new(
+    PoolConfig::dev(),         // or ::pressure(), or ::new(cap, max_waiters)
+    resource_handles,
+);
+```
+
+Caller uses the typed effect builders instead of raw
+`call(pool, WorkerPoolMsg::..., timeout).reply(...)`:
+
+```rust
+acquire_effect(pool, timeout, MyMsg::Acquired)
+acquire_with_handle_effect(pool, timeout, MyMsg::Acquired)  // cancellable
+release_effect(lease, pool, ReleaseDisposition::Reuse, timeout, MyMsg::Released)
+close_effect(pool, CloseMode::Drain, timeout, MyMsg::Closed)
+pressure_effect(pool, timeout, MyMsg::Pressure)
+```
+
+In the reply continuation, fold the layered outcome with
+`try_acquired` / `try_released` instead of three nested matches:
+
+```rust
+match try_acquired(outcome) {
+    Ok(lease) => /* use lease */,
+    Err(AcquireFailure::Full) => /* shed */,
+    Err(AcquireFailure::Closed) => /* pool gone */,
+    Err(AcquireFailure::WrongShard) => /* topology bug */,
+    Err(AcquireFailure::CallTimeout) => /* caller-side timeout */,
+    Err(_) => /* other transport failure */,
+}
+```
+
+Lease identity is move-only and identity-checked (pool id, resource
+id, generation). Forging is impossible — constructors are sealed
+behind `tina::pool::runtime_internal`. Wrong-pool releases return
+`StaleLease`, double-release returns `DoubleRelease`. Drop a lease
+silently and you leak the resource until pool close — the
+`#[must_use]` lint catches the obvious cases.
+
+Caller cancellation reclaims waiter slots without a separate
+`CancelWaiter` ping: `cancel_call(handle)` closes the deferred slot,
+the pool's sweep on the next handler turn reclaims it. A cancel that
+races the dispatch (rejected `reply_to`) is recovered by the pool's
+in-flight back-channel and counted under `dispatch_recovered` in the
+pressure report.
+
+Don't hand-roll a worker frontend with `PendingReplies` for "park
+callers until a worker is free." That's the pool, with explicit
+waiter capacity and identity-checked leases. `PendingReplies` is
+still right for the *sharded-frontend* shape (one slot per inbound
+caller while a downstream call is in flight) — see below.
+
 ### Bounded pending replies
 
 Use `tina_runtime::PendingReplies::<K, R>::with_capacity(n)` as the

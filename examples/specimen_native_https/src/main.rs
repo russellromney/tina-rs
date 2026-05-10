@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
         }
         other => {
             anyhow::bail!(
-                "unknown mode {other:?}; expected tokio, tina, or both. usage: eiffel-native-https [tokio|tina|both]"
+                "unknown mode {other:?}; expected tokio, tina, or both. usage: specimen-native-https [tokio|tina|both]"
             );
         }
     }

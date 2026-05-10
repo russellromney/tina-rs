@@ -120,6 +120,21 @@ Tina should be able to say:
 accepted=12000 full=38000 timeouts=0 exit=clean
 ```
 
+## Bounded Pools
+
+When the bounded thing is "borrow one of N resources, do work, give
+it back," reach for `tina_runtime::pool::WorkerPool`. It bounds two
+quantities — resource count (`PoolConfig::capacity`) and parked
+waiters (`PoolConfig::max_waiters`) — and surfaces overflow as the
+typed outcomes above (`AcquireOutcome::Full` /
+`AcquireOutcome::Closed`). Caller cancellation reclaims waiter
+capacity; the pressure report exposes `full_count`, `cancel_count`,
+`closed_count`, `retired_count`, and `dispatch_recovered` for
+operator dashboards. Don't open-code a worker frontend with a
+`PendingReplies` table when you actually want a borrow/return
+lifecycle. See the [ergonomics
+checklist](./11-ergonomics-checklist.md#bounded-worker-pool).
+
 ## Timeout Is Load Control
 
 Request/reply uses timeout:

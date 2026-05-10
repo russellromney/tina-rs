@@ -52,6 +52,7 @@ exclude = [
     "examples/specimen_hot_key_fairness",
     "examples/specimen_two_stage_pipeline",
     "examples/specimen_graceful_pool_shutdown",
+    "examples/specimen_pool_cancel_reclaim",
 ]
 resolver = "2"
 

@@ -1,0 +1,438 @@
+//! Bounded pool vocabulary.
+//!
+//! Pure data types. The concrete `WorkerPool` lives in `tina-runtime`.
+//!
+//! ```text
+//! borrow thing.
+//! use thing.
+//! return thing, or retire thing.
+//! if no thing, say Full.
+//! if pool closed, say Closed.
+//! if cross shard, say WrongShard.
+//! never pretend thing came back by magic.
+//! ```
+//!
+//! # Caller-side timeout
+//!
+//! There is no `AcquireOutcome::Timeout`. The pool does not enforce a
+//! waiter deadline. When a caller's `call(pool, Acquire, timeout)`
+//! expires, the runtime delivers `CallOutcome::Timeout` to the caller
+//! and closes the pool's deferred reply slot. The pool's next sweep
+//! reclaims the waiter slot and bumps `cancel_count` (cancel and
+//! caller-timeout share the same in-pool reclaim path; the per-cause
+//! breakdown is a runtime trace fact).
+//!
+//! # Pool mailbox is a second bound
+//!
+//! `max_waiters` caps parked callers, but the pool isolate's *mailbox
+//! capacity* (set at registration) caps how many `Acquire` messages
+//! can be in flight before a caller's `call(...)` returns
+//! `CallOutcome::Full` from the runtime layer. Size the mailbox to
+//! `>= max_waiters + burst` to avoid surprises.
+
+use std::num::NonZeroU64;
+
+/// Pool configuration. `capacity` is resource count; `max_waiters`
+/// caps parked callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// Number of resources the pool owns. Must be > 0.
+    pub capacity: usize,
+    /// Maximum number of parked waiters. Zero means shed immediately
+    /// when all resources are busy.
+    pub max_waiters: usize,
+}
+
+impl PoolConfig {
+    /// Construct. The concrete pool validates `capacity > 0` at build.
+    pub const fn new(capacity: usize, max_waiters: usize) -> Self {
+        Self {
+            capacity,
+            max_waiters,
+        }
+    }
+
+    /// Roomy preset for examples and dev: capacity 4, 32 waiters.
+    pub const fn dev() -> Self {
+        Self::new(4, 32)
+    }
+
+    /// Tight preset for pressure tests: capacity 1, 4 waiters.
+    pub const fn pressure() -> Self {
+        Self::new(1, 4)
+    }
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self::dev()
+    }
+}
+
+/// Pool identity. Stamped into every lease so a release that names
+/// the wrong pool is rejected. Constructed only via
+/// [`runtime_internal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PoolId(NonZeroU64);
+
+impl PoolId {
+    /// Raw id.
+    pub const fn get(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+/// Index of one resource slot inside a pool. Constructed only via
+/// [`runtime_internal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResourceId(u32);
+
+impl ResourceId {
+    /// Raw index.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Move-only lease for one borrowed resource.
+///
+/// `H` is the cheap-clone resource handle the user works with (e.g.
+/// [`crate::Address`]). The lease holds an owned `H` plus identity:
+/// pool id, resource id, generation. Release consumes the lease.
+///
+/// Not `Clone`, not `Copy`, no public constructor — only the runtime
+/// can mint one. A lease is not a call-cancel handle and cannot
+/// release a runtime call; a [`crate::CallHandle`] cannot release a
+/// lease.
+#[must_use = "PoolLease must be returned via Release or Retire — \
+              dropping a lease leaks the resource until pool close"]
+pub struct PoolLease<H> {
+    pool_id: PoolId,
+    resource_id: ResourceId,
+    generation: u64,
+    handle: H,
+}
+
+impl<H> PoolLease<H> {
+    /// Pool this lease belongs to.
+    pub fn pool_id(&self) -> PoolId {
+        self.pool_id
+    }
+
+    /// Resource slot this lease names.
+    pub fn resource_id(&self) -> ResourceId {
+        self.resource_id
+    }
+
+    /// Generation under which this lease was minted.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Reference to the resource handle.
+    pub fn handle(&self) -> &H {
+        &self.handle
+    }
+}
+
+impl<H: std::fmt::Debug> std::fmt::Debug for PoolLease<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolLease")
+            .field("pool_id", &self.pool_id)
+            .field("resource_id", &self.resource_id)
+            .field("generation", &self.generation)
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
+/// Outcome of one acquire. Variants stay distinct.
+#[must_use = "AcquireOutcome reports whether the pool actually handed \
+              out a resource — ignoring it leaks the lease or hides \
+              backpressure"]
+pub enum AcquireOutcome<H> {
+    /// Got a resource.
+    Acquired(PoolLease<H>),
+    /// All resources busy, waiter table full (or `max_waiters == 0`).
+    /// Caller did not occupy a waiter slot.
+    Full,
+    /// Pool is closed.
+    Closed,
+    /// Caller is on a different shard than the pool. First form does
+    /// not support cross-shard pool use — the pool isolate runs on
+    /// one shard and only same-shard callers can park as waiters.
+    WrongShard,
+}
+
+impl<H> AcquireOutcome<H> {
+    /// Map only the resource handle inside `Acquired`, preserving
+    /// lease identity. Other variants pass through.
+    pub fn map_acquired<U>(self, f: impl FnOnce(H) -> U) -> AcquireOutcome<U> {
+        match self {
+            Self::Acquired(lease) => {
+                let new_handle = f(lease.handle);
+                AcquireOutcome::Acquired(PoolLease {
+                    pool_id: lease.pool_id,
+                    resource_id: lease.resource_id,
+                    generation: lease.generation,
+                    handle: new_handle,
+                })
+            }
+            Self::Full => AcquireOutcome::Full,
+            Self::Closed => AcquireOutcome::Closed,
+            Self::WrongShard => AcquireOutcome::WrongShard,
+        }
+    }
+
+    /// Reason for non-acquired variants. `None` for `Acquired`.
+    pub fn pressure_reason(&self) -> Option<PoolPressureReason> {
+        match self {
+            Self::Acquired(_) => None,
+            Self::Full => Some(PoolPressureReason::Full),
+            Self::Closed => Some(PoolPressureReason::Closed),
+            Self::WrongShard => Some(PoolPressureReason::WrongShard),
+        }
+    }
+}
+
+impl<H: std::fmt::Debug> std::fmt::Debug for AcquireOutcome<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acquired(lease) => f.debug_tuple("Acquired").field(lease).finish(),
+            Self::Full => f.write_str("Full"),
+            Self::Closed => f.write_str("Closed"),
+            Self::WrongShard => f.write_str("WrongShard"),
+        }
+    }
+}
+
+/// Why an acquire did not yield a resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolPressureReason {
+    /// Resources busy, waiter table full.
+    Full,
+    /// Pool closed.
+    Closed,
+    /// Caller on a different shard than the pool.
+    WrongShard,
+}
+
+/// Caller-owned disposition for a release.
+///
+/// `Reuse` says caller believes the resource is healthy. `Retire`
+/// says it is not. The pool may override `Reuse` to retire a known-bad
+/// resource, but reports that override via [`ReleaseOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseDisposition {
+    /// Caller believes resource is healthy. Pool reuses it.
+    Reuse,
+    /// Caller believes resource is unhealthy. Pool drops it.
+    Retire,
+}
+
+/// Outcome of one release.
+#[must_use = "ReleaseOutcome reports whether the pool actually \
+              accepted the release — ignoring it can hide \
+              double-release / stale-lease bugs"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// Pool accepted; resource went back to idle (or to next waiter).
+    Released,
+    /// Pool accepted and dropped the resource. Caller asked for
+    /// `Retire`, or pool overrode `Reuse` because it knew the
+    /// resource was stale.
+    Retired,
+    /// Pool id, resource id, or generation did not match anything live.
+    StaleLease,
+    /// Pool already saw a release for this `(resource_id, generation)`.
+    DoubleRelease,
+    /// Pool was force-closed; outstanding leases are stale.
+    PoolClosed,
+}
+
+/// How a pool close behaves.
+///
+/// `Drain`: stop new acquires, settle waiters as `Closed`, let
+/// outstanding leases return normally (caller's `Reuse` is honored
+/// as `Released`; the resource sits idle but cannot be re-acquired).
+///
+/// `Force`: stop new acquires, settle waiters as `Closed`, mark
+/// outstanding leases stale — late releases get `PoolClosed` and the
+/// pool retires the resource immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseMode {
+    /// Soft close. Outstanding leases return normally.
+    Drain,
+    /// Hard close. Outstanding leases are stale.
+    Force,
+}
+
+/// Snapshot of pool pressure.
+#[must_use = "PoolPressureReport carries pool-state truth — discarding \
+              it hides backpressure visibility"]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PoolPressureReport {
+    /// Configured resource capacity.
+    pub capacity: usize,
+    /// Resources currently idle (and not retired).
+    pub available: usize,
+    /// Resources currently out on lease.
+    pub leased: usize,
+    /// Callers parked waiting for a resource.
+    pub waiters: usize,
+    /// Configured waiter capacity.
+    pub max_waiters: usize,
+    /// Cumulative `Full` outcomes.
+    pub full_count: u64,
+    /// Cumulative `Closed` outcomes — both parked-waiter shutdowns
+    /// and post-close acquires.
+    pub closed_count: u64,
+    /// Cumulative `WrongShard` outcomes.
+    pub wrong_shard_count: u64,
+    /// Cumulative waiters reclaimed because the caller cancelled via
+    /// `cancel_call(handle)` or the caller's `call(...)` timeout
+    /// fired before the pool replied.
+    pub cancel_count: u64,
+    /// Cumulative resources dropped via `Retire` or pool override.
+    pub retired_count: u64,
+    /// Cumulative `Acquire` messages received via plain `send` (no
+    /// reply path) and dropped. A non-zero value means a caller is
+    /// using the pool API wrong.
+    pub no_caller_drops: u64,
+    /// Cumulative resources reclaimed because the caller cancelled
+    /// between the pool's dispatch and the runtime delivering the
+    /// `Acquired` reply (the deferred-reply rejection path). Pool
+    /// re-marks the resource as Idle.
+    pub dispatch_recovered: u64,
+    /// True once a [`CloseMode`] has been applied.
+    pub closed: bool,
+}
+
+/// Why an acquire did not yield a lease, after the bridge layer.
+///
+/// Returned by helpers that fold `CallOutcome<WorkerPoolReply<H>>`
+/// into one flat result. Keeps the layered truth distinct: pool-level
+/// outcomes (`Full`, `Closed`, `WrongShard`) are different from
+/// transport-level outcomes (`CallTimeout`, `CallClosed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireFailure {
+    /// Pool said `Full` — no resource and no waiter slot.
+    Full,
+    /// Pool said `Closed`.
+    Closed,
+    /// Pool said `WrongShard`.
+    WrongShard,
+    /// Caller's `call(...)` timeout fired before the pool replied.
+    CallTimeout,
+    /// Pool isolate's mailbox refused the call.
+    CallFull,
+    /// Pool isolate is gone.
+    CallClosed,
+    /// Reply variant was not `Acquire(...)` — protocol error.
+    WrongReply,
+}
+
+/// Why a release was not `Released`, after the bridge layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseFailure {
+    /// Pool accepted but dropped the resource (Retire requested or
+    /// pool override).
+    Retired,
+    /// Lease did not match anything live in the pool.
+    StaleLease,
+    /// Same `(resource_id, generation)` was already returned.
+    DoubleRelease,
+    /// Pool was force-closed.
+    PoolClosed,
+    /// Caller's `call(...)` timeout fired before the pool replied.
+    CallTimeout,
+    /// Pool isolate's mailbox refused the call.
+    CallFull,
+    /// Pool isolate is gone.
+    CallClosed,
+    /// Reply variant was not `Release(...)` — protocol error.
+    WrongReply,
+}
+
+/// Internals exposed for runtime crates.
+///
+/// Cross-crate Rust does not have a clean private-but-visible
+/// boundary, so the lease and id constructors here are
+/// `unsafe fn`. The unsafety is not memory-related; it is the
+/// pool's *contract* invariant:
+///
+/// > Only the pool that owns a resource may mint a lease for it.
+///
+/// Calling [`runtime_internal::lease_new`] from outside the pool
+/// implementation lets
+/// application code forge a lease whose identity matches an
+/// outstanding one, release the duplicate, and produce resource
+/// aliasing — the pool will hand the same resource to a new waiter
+/// while the original lease is still live. That is a real
+/// correctness bug for resources that don't tolerate it (DB
+/// connections, files, sockets).
+///
+/// `tina-runtime`'s pool implementation is the only legitimate
+/// caller. It wraps each call in `unsafe { }` with a SAFETY comment
+/// pointing at the pool that minted the lease.
+#[allow(unsafe_code)]
+pub mod runtime_internal {
+    use super::{PoolId, PoolLease, ResourceId};
+    use std::num::NonZeroU64;
+
+    /// Mint a new [`PoolId`].
+    ///
+    /// # Safety
+    ///
+    /// Caller must be a runtime-side pool implementation. Forging a
+    /// `PoolId` that collides with a live pool's id lets a forged
+    /// lease pass the release-time identity check.
+    pub unsafe fn pool_id_from_raw(raw: NonZeroU64) -> PoolId {
+        PoolId(raw)
+    }
+
+    /// Mint a new [`ResourceId`].
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`pool_id_from_raw`] — runtime-internal.
+    pub unsafe fn resource_id_from_raw(raw: u32) -> ResourceId {
+        ResourceId(raw)
+    }
+
+    /// Mint a new [`PoolLease`].
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the pool implementation that owns
+    /// `resource_id` under `pool_id` at `generation`. Constructing a
+    /// lease that duplicates an outstanding lease — or re-uses a
+    /// retired generation — breaks the move-only invariant and lets
+    /// the same resource be handed to two callers concurrently.
+    pub unsafe fn lease_new<H>(
+        pool_id: PoolId,
+        resource_id: ResourceId,
+        generation: u64,
+        handle: H,
+    ) -> PoolLease<H> {
+        PoolLease {
+            pool_id,
+            resource_id,
+            generation,
+            handle,
+        }
+    }
+
+    /// Consume a lease into its parts. Pools use this to validate
+    /// releases. Safe: destructuring a legitimately-issued lease
+    /// cannot break the pool invariant on its own — only
+    /// [`lease_new`] can.
+    pub fn lease_into_parts<H>(lease: PoolLease<H>) -> (PoolId, ResourceId, u64, H) {
+        (
+            lease.pool_id,
+            lease.resource_id,
+            lease.generation,
+            lease.handle,
+        )
+    }
+}

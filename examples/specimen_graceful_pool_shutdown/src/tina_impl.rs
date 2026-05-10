@@ -1,18 +1,31 @@
+//! Tina side using the bounded `WorkerPool`.
+//!
+//! `WORKERS` worker isolates sit behind a `WorkerPool` that owns
+//! their addresses as resources. The driver fans out `CALLERS`
+//! parallel `Acquire`s. Each acquired lease drives one worker call,
+//! then the lease is returned with `Release`. On `Shutdown` the
+//! driver sends `Close(Drain)` to the pool — every still-parked
+//! caller gets a typed `Closed` reply, and outstanding leases drain
+//! normally.
+
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tina::pool::{AcquireFailure, CloseMode, PoolConfig, PoolLease, ReleaseDisposition};
 use tina::prelude::*;
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, PendingRepliesTryCaptureError,
-    SleepReply, ThreadedRuntime, call, sleep,
+use tina_runtime::pool::{
+    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_effect, close_effect, release_effect,
+    try_acquired,
 };
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep};
 
-use crate::{CALLERS, MAX_PENDING, Report, SHUTDOWN_AFTER_MS, WORK_MS, WORKERS};
+use crate::{CALLERS, Report, SHUTDOWN_AFTER_MS, WORK_MS, WORKERS};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-// --- Worker -------------------------------------------------------------
+// --- Worker --------------------------------------------------------------
 
 #[derive(Debug)]
 enum WorkerMsg {
@@ -42,71 +55,9 @@ impl Worker {
     }
 }
 
-// --- Frontend -----------------------------------------------------------
+// --- Driver --------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrontendReply {
-    Completed,
-    Closed,
-}
-
-#[derive(Debug)]
-enum FrontendMsg {
-    Submit,
-    WorkerDone(u64, CallOutcome<WorkerReply>),
-    Shutdown,
-}
-
-struct Frontend {
-    workers: Vec<Address<WorkerMsg, WorkerReply>>,
-    pending: PendingReplies<u64, FrontendReply>,
-    next_qid: u64,
-    next_worker: usize,
-}
-
-#[tina_runtime::isolate(message = FrontendMsg, reply = FrontendReply)]
-impl Frontend {
-    fn handle(
-        &mut self,
-        msg: FrontendMsg,
-        ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            FrontendMsg::Submit => {
-                let qid = self.next_qid;
-                self.next_qid += 1;
-                match self.pending.try_capture(ctx, qid) {
-                    Ok(()) => {
-                        let worker = self.workers[self.next_worker];
-                        self.next_worker = (self.next_worker + 1) % self.workers.len();
-                        call(worker, WorkerMsg::Do, CALL_TIMEOUT)
-                            .reply(move |outcome| FrontendMsg::WorkerDone(qid, outcome))
-                    }
-                    Err(PendingRepliesTryCaptureError::Full) => reply(FrontendReply::Closed),
-                    Err(other) => panic!("try_capture: {other:?}"),
-                }
-            }
-            FrontendMsg::WorkerDone(qid, outcome) => {
-                let Some(slot) = self.pending.take(&qid) else {
-                    return noop();
-                };
-                match outcome {
-                    CallOutcome::Replied(_) => reply_to(slot, FrontendReply::Completed),
-                    _ => reply_to(slot, FrontendReply::Closed),
-                }
-            }
-            FrontendMsg::Shutdown => {
-                // Drain every pending caller as Closed, then stop.
-                // The method name says stop on purpose; nothing else
-                // in the helper appends stop() for you.
-                self.pending
-                    .drain_replies_into_stop::<Self>(FrontendReply::Closed)
-            }
-        }
-    }
-}
-
-// --- Driver -------------------------------------------------------------
+type WorkerHandle = Address<WorkerMsg, WorkerReply>;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct DriverOutcome {
@@ -115,16 +66,45 @@ struct DriverOutcome {
     failed: usize,
 }
 
-#[derive(Debug)]
+enum JobState {
+    Acquiring,
+    Working { lease: PoolLease<WorkerHandle> },
+    Releasing,
+}
+
 enum DriverMsg {
     Begin,
-    Returned(CallOutcome<FrontendReply>),
+    AcquireReturned {
+        job: u32,
+        outcome: CallOutcome<WorkerPoolReply<WorkerHandle>>,
+    },
+    WorkerReturned {
+        job: u32,
+        outcome: CallOutcome<WorkerReply>,
+    },
+    ReleaseReturned { job: u32 },
+    CloseReturned,
+    Shutdown,
+}
+
+impl std::fmt::Debug for DriverMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Begin => f.write_str("Begin"),
+            Self::AcquireReturned { job, .. } => write!(f, "AcquireReturned({job})"),
+            Self::WorkerReturned { job, .. } => write!(f, "WorkerReturned({job})"),
+            Self::ReleaseReturned { job } => write!(f, "ReleaseReturned({job})"),
+            Self::CloseReturned => f.write_str("CloseReturned"),
+            Self::Shutdown => f.write_str("Shutdown"),
+        }
+    }
 }
 
 struct Driver {
-    frontend: Address<FrontendMsg, FrontendReply>,
-    remaining: usize,
+    pool: Address<WorkerPoolMsg<WorkerHandle>, WorkerPoolReply<WorkerHandle>>,
     outcome: DriverOutcome,
+    jobs: HashMap<u32, JobState>,
+    expected: usize,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -136,27 +116,77 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
-                let frontend = self.frontend;
-                let calls: Vec<_> = (0..CALLERS)
-                    .map(|_| {
-                        call(frontend, FrontendMsg::Submit, CALL_TIMEOUT).reply(DriverMsg::Returned)
-                    })
-                    .collect();
-                Effect::Batch(calls)
-            }
-            DriverMsg::Returned(outcome) => {
-                match outcome {
-                    CallOutcome::Replied(FrontendReply::Completed) => self.outcome.completed += 1,
-                    CallOutcome::Replied(FrontendReply::Closed) => self.outcome.closed += 1,
-                    _ => self.outcome.failed += 1,
+                let mut effects = Vec::with_capacity(CALLERS);
+                for j in 0..CALLERS as u32 {
+                    self.jobs.insert(j, JobState::Acquiring);
+                    effects.push(acquire_effect(self.pool, CALL_TIMEOUT, move |outcome| {
+                        DriverMsg::AcquireReturned { job: j, outcome }
+                    }));
                 }
-                self.remaining -= 1;
-                if self.remaining == 0 {
-                    stop_with(self.outcome)
+                Effect::Batch(effects)
+            }
+            DriverMsg::AcquireReturned { job, outcome } => match try_acquired(outcome) {
+                Ok(lease) => {
+                    let worker = *lease.handle();
+                    self.jobs.insert(job, JobState::Working { lease });
+                    tina_runtime::call(worker, WorkerMsg::Do, CALL_TIMEOUT)
+                        .reply(move |outcome| DriverMsg::WorkerReturned { job, outcome })
+                }
+                Err(AcquireFailure::Closed) | Err(AcquireFailure::Full) => {
+                    self.jobs.remove(&job);
+                    self.outcome.closed += 1;
+                    self.maybe_finish()
+                }
+                Err(_) => {
+                    self.jobs.remove(&job);
+                    self.outcome.failed += 1;
+                    self.maybe_finish()
+                }
+            },
+            DriverMsg::WorkerReturned { job, outcome } => {
+                let Some(state) = self.jobs.remove(&job) else {
+                    return noop();
+                };
+                let JobState::Working { lease } = state else {
+                    return noop();
+                };
+                let succeeded = matches!(outcome, CallOutcome::Replied(_));
+                let disposition = if succeeded {
+                    ReleaseDisposition::Reuse
                 } else {
-                    noop()
+                    ReleaseDisposition::Retire
+                };
+                self.jobs.insert(job, JobState::Releasing);
+                if succeeded {
+                    self.outcome.completed += 1;
+                } else {
+                    self.outcome.failed += 1;
                 }
+                release_effect(lease, self.pool, disposition, CALL_TIMEOUT, move |_| {
+                    DriverMsg::ReleaseReturned { job }
+                })
             }
+            DriverMsg::ReleaseReturned { job } => {
+                self.jobs.remove(&job);
+                self.maybe_finish()
+            }
+            DriverMsg::Shutdown => {
+                close_effect(self.pool, CloseMode::Drain, CALL_TIMEOUT, |_| {
+                    DriverMsg::CloseReturned
+                })
+            }
+            DriverMsg::CloseReturned => noop(),
+        }
+    }
+}
+
+impl Driver {
+    fn maybe_finish(&mut self) -> Effect<Self> {
+        let total = self.outcome.completed + self.outcome.closed + self.outcome.failed;
+        if total >= self.expected {
+            stop_with(self.outcome)
+        } else {
+            noop()
         }
     }
 }
@@ -181,23 +211,19 @@ pub fn run() -> anyhow::Result<Report> {
         );
     }
 
-    let frontend = runtime
-        .register_with_capacity::<_, Infallible>(
-            Frontend {
-                workers,
-                pending: PendingReplies::with_capacity(MAX_PENDING),
-                next_qid: 1,
-                next_worker: 0,
-            },
-            64,
-        )
-        .map_err(|e| anyhow::anyhow!("register frontend: {e:?}"))?;
+    let pool: WorkerPool<WorkerHandle, SingleShard> =
+        WorkerPool::new(PoolConfig::new(WORKERS, CALLERS), workers);
+    let pool_addr = runtime
+        .register_with_capacity::<_, Infallible>(pool, 64)
+        .map_err(|e| anyhow::anyhow!("register pool: {e:?}"))?;
+
     let driver = runtime
         .register_with_capacity::<_, Infallible>(
             Driver {
-                frontend,
-                remaining: CALLERS,
+                pool: pool_addr,
                 outcome: DriverOutcome::default(),
+                jobs: HashMap::new(),
+                expected: CALLERS,
             },
             64,
         )
@@ -209,19 +235,13 @@ pub fn run() -> anyhow::Result<Report> {
 
     runtime
         .try_send(driver, DriverMsg::Begin)
-        .map_err(|e| anyhow::anyhow!("kick driver: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     std::thread::sleep(Duration::from_millis(SHUTDOWN_AFTER_MS));
 
-    // Shutdown rides the same bounded mailbox as regular Submits.
-    // `send_observed_until` retries on `MailboxFull` / `IngressFull`
-    // up to the deadline.
-    let close_deadline = std::time::Instant::now() + Duration::from_secs(2);
     runtime
-        .send_observed_until(frontend, close_deadline, Duration::from_millis(2), || {
-            FrontendMsg::Shutdown
-        })
-        .map_err(|e| anyhow::anyhow!("shutdown send: {e:?}"))?;
+        .try_send(driver, DriverMsg::Shutdown)
+        .map_err(|e| anyhow::anyhow!("send Shutdown: {e:?}"))?;
 
     let outcome = result
         .wait(Duration::from_secs(10))
@@ -230,6 +250,7 @@ pub fn run() -> anyhow::Result<Report> {
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
     }
+
     Ok(Report {
         callers: CALLERS,
         completed: outcome.completed,

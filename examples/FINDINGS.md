@@ -111,17 +111,22 @@ why some are layered is confusing.
 **Resolved (Tina cancellation phase):** Tina now ships
 `call_with_handle(addr, msg, t).reply(...)` returning a caller-owned
 `CallHandle`, plus `cancel_call(handle).reply(...)` that closes one
-pending isolate call's wait. The handle is move-only and not `Clone`.
+pending isolate call's wait. The handle is move-only and not `Clone`,
+and is stamped with `(call_id, shard_id)` on dispatch so a cancel
+issued from a different shard is rejected with a typed
+`CancelOutcome::WrongShard` instead of silently no-op'ing.
 Cancellation is visible truth: `CancelOutcome` (`Cancelled` /
-`AlreadyCompleted` / `AlreadyCancelled` / `NotDispatched` /
-`WrongRequester` / `CrossShardUnsupported`) is `#[must_use]`, and
-late callee replies surface as `CallReplyRejected { CallerCancelled }`
-or `DeferredReplyRejected { CallerCancelled }` events.
+`AlreadyCompleted` / `AlreadyCancelled` / `WrongShard`) is
+`#[must_use]`. Late callee replies surface with a cause-specific
+rejection reason from a bounded recently-cancelled ring:
+`CallReplyRejected { CallerCancelled / CallerTimedOut / OwnerStopped
+/ RuntimeStopped }` or the deferred-path equivalent; ring-evicted
+fall-through is the generic `NoPendingCall` / `CallerClosed`.
 
 **Still open:** runtime-level `runtime.cancel_isolate(addr)` (third
 form — closes every call an isolate owns) is a small wrapper around
 `cancel_call`; deferred until the bounded `PendingCallSet` lands in
-phase 067.
+phase 072 (deferred from 066 alongside the `Deadline` value).
 
 ### 9. Drain helper for `PendingReplies` at service stop
 
@@ -159,10 +164,14 @@ flag is the bridge-side version of the same idea.
   `drain_replies_with_into_effect` /
   `drain_replies_with_into_stop`, all typed so a
   `PendingReplies<K, R>` only produces `Effect<I>` when
-  `I::Reply = R`. `specimen_graceful_pool_shutdown` uses
-  `pending.drain_replies_into_stop::<Self>(R::Closed)`. The
-  deadline half of this finding (DrainGate) folds into
-  finding 15 (Deadline as first-class context).
+  `I::Reply = R`. `specimen_graceful_pool_shutdown` used
+  `pending.drain_replies_into_stop::<Self>(R::Closed)` before
+  its 067 migration; it now relies on
+  `WorkerPoolMsg::Close(CloseMode::Drain)` for the same
+  parked-callers-get-`Closed` outcome. The helper is still
+  load-bearing for `PendingReplies`-shaped frontends. The
+  deadline half of this finding (DrainGate) folds into finding
+  15 (Deadline as first-class context).
 - An isolate-state `DrainGate` helper that holds the deadline +
   the pending-count predicate, with an `is_done` /
   `drained_within_timeout` accessor that the handler reuses.
@@ -328,9 +337,14 @@ exist later, but it must say it has no simulator/replay claim. A
 replayable deadline should wait for the runtime/simulator clock
 model, likely in the DST/replay usability work.
 
-**Revisit when:** the clock source is explicit. Then a small
-`Deadline` value can produce `.remaining() -> Duration` for
-existing call APIs without adding hidden cancellation or retry.
+**Status:** scheduled in phase 072
+(`.intent/phases/072-deadline-and-pending-call-set/plan.md`,
+deferred from 066 alongside the bounded `PendingCallSet` helper).
+Plan settles the clock-truth rule —
+`Deadline::from_instant(now, dur)` takes `now: Instant` explicitly so
+DST-claimed code cannot silently depend on `std::time::Instant`,
+with `Context::deadline_after(duration)` as the runtime/sim-aware
+sugar. No live-only `Deadline::after` shortcut ships.
 
 ## Closed
 

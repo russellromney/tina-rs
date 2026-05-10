@@ -65,6 +65,34 @@ Use this when you need to know whether a fire-and-forget message was accepted.
 
 Plain `send(...)` is simpler but does not report pressure back to the sender.
 
+## `AcquireOutcome<H>` / `ReleaseOutcome`
+
+Result of `tina_runtime::pool::WorkerPool` calls.
+
+```text
+AcquireOutcome::Acquired(PoolLease<H>)
+AcquireOutcome::Full         // resources busy + waiter table full
+AcquireOutcome::Closed       // pool closed
+AcquireOutcome::WrongShard   // caller on a different shard
+```
+
+```text
+ReleaseOutcome::Released      // resource returned to idle (or next waiter)
+ReleaseOutcome::Retired       // caller asked Retire, or pool override
+ReleaseOutcome::StaleLease    // wrong pool / wrong resource / wrong gen
+ReleaseOutcome::DoubleRelease // (resource_id, generation) already returned
+ReleaseOutcome::PoolClosed    // pool was force-closed
+```
+
+`AcquireFailure` / `ReleaseFailure` are the flat results returned by
+`try_acquired(call_outcome)` / `try_released(call_outcome)` — they
+fold the pool-layer outcomes above with the transport-layer
+`CallOutcome` (`CallTimeout`, `CallFull`, `CallClosed`,
+`WrongReply`) into one typed `Err` enum so consumers don't need a
+three-layer match. Pool-layer and transport-layer variants stay
+distinct: a `Full` from the pool means "all resources busy + waiter
+cap"; a `CallFull` means "the pool's own mailbox refused the call."
+
 ## `CallError`
 
 Runtime-owned I/O calls return `Result<T, CallError>`.
@@ -95,6 +123,8 @@ and shutdown rails. It is not the same as `CallOutcome`.
 | TCP read fails | `Err(CallError)` |
 | mailbox cannot accept work | `Full` |
 | target/resource is gone | `Closed` |
+| acquire from a `WorkerPool` | `AcquireOutcome<H>` (or `try_acquired`) |
+| release a pool lease | `ReleaseOutcome` (or `try_released`) |
 
 ## Rule
 

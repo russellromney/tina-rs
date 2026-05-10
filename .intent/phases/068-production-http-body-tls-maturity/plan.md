@@ -222,7 +222,7 @@ Stay separate:
   TLS lane has one worker thread per shard, and both sides of a TLS
   handshake need to drive that worker concurrently — they deadlock.
   Same constraint applies to client + server in the same shard. Both
-  the smoke tests and the eiffel example respect this by running the
+  the smoke tests and the specimen respect this by running the
   counterparty in a raw OS thread (rustls directly). A multi-worker
   TLS lane is deferred.
 
