@@ -4,6 +4,134 @@ This file records completed work.
 
 ## Unreleased
 
+### SQLx/Postgres bridge
+
+Added `tina-sqlx-bridge`, a bounded Postgres bridge around
+`sqlx::PgPool`. The bridge owns the Tokio/SQLx side; Tina callers see
+typed `Full`, `Closed`, per-attempt timeout, pool-acquire timeout,
+SQLx/decode errors, and worker-terminal metrics.
+
+The public first form now includes:
+- `PgWorker`, `PgConfig`, `PgPoolConfig`, `InstalledPgBridge`,
+  `PgCloser`, `PgMsg`, `PgRequest`, `PgResponse`, `PgValue`, `PgRow`,
+  `PgError`, `PgMetricsHandle`.
+- `Execute`, `FetchOne`, `FetchMany`, and `Transaction` request shapes
+  with bounded row caps.
+- typed helper calls (`execute_call`, `fetch_one_call`,
+  `fetch_many_call`, `transaction_call`) and `PgOutcomeExt::classify`.
+- opt-in DB-side cancel-on-timeout via a sidecar pool and
+  `pg_cancel_backend`, documented as best-effort rather than guaranteed
+  query death.
+- wider value support for bool, integers, floats, text, bytea, UUID,
+  JSON/JSONB, NUMERIC, DATE, TIMESTAMP, and TIMESTAMPTZ, including
+  typed NULL helpers so NULL does not silently infer the wrong type.
+
+The Postgres counter specimen now drives the bridge with host
+`ThreadedRuntime::call_blocking`, keeping the example as a SQL script
+instead of a fake Driver isolate.
+
+### SQLite bridge
+
+Added `tina-sqlite-bridge`, a serial SQLite bridge around one
+`rusqlite::Connection` on one blocking std thread. The first form is
+deliberately small: one connection, `max_in_flight = 1`,
+`pending_reply_capacity = 1`, autocommit only, explicit pragmas and
+busy timeout, bounded buffered rows, late-result truth, metrics, and
+typed errors for admission, timeout, response cap, busy/constraint/I/O,
+SQLite, and internal faults.
+
+Polish added `execute_call` / `query_call`, row/value accessors, common
+Rust value conversions without silent `u64` wrapping, and a classifier
+for caller-owned retry. `specimen_sqlite_counter` now uses the bridge
+and the host `call_blocking` path; demo modes cover constraint,
+timeout, closed, invalid, and retry surfaces.
+
+### HTTP body streaming and backpressure
+
+Native HTTP/1 now has production-shaped server response streaming:
+`BodyMetrics`, `BodyPressureReport`, `IterBodySource`, typed
+`HttpResponse::stream_known_length`, typed
+`HttpResponse::stream_chunked`, and response-side chunked
+transfer-encoding. The connection isolate pulls chunks on demand and
+tracks high-water / body I/O error counters instead of buffering the
+whole response.
+
+The body-streaming specimen demonstrates the blessed shape:
+`IterBodySource` plus `stream_known_length` for fixed length, and a
+chunked route for unknown length. Deferred work is now explicit:
+request-side chunked bodies, client-side chunked response decoding,
+source cancellation on abandoned wire, and periodic metric emission.
+
+### Native HTTPS first form
+
+Native HTTP can now run over rustls-backed TLS through Tina-owned rails:
+`HttpsListener`, typed startup (`HttpsReady` /
+`HttpsStartupError`), `HttpTarget::Https`, `TlsTrustRoots`,
+`HttpHostPolicy`, and transport-shaped client errors that preserve TLS
+name/cert/handshake/I/O truth. Tests cover listener startup failures,
+client Host/SNI/default-host behavior, untrusted roots, pool-over-HTTPS,
+and simulator TLS replay. `specimen_native_https` compares a Tina HTTPS
+listener with a Tokio + tokio-rustls version over the same scripted
+client.
+
+### Capacity modeling first form
+
+Added Tina capacity vocabulary:
+`tina::capacity::{CapacityMode, CapacityPolicy, CapacitySurfaceReport}`
+and `tina_runtime::capacity::{CapacitySummary, SurfaceAssertion,
+format_discovery_line}`. Worker-pool waiters and pending replies can
+emit capacity reports with high-water and full counts, and docs now
+show the tuning loop: unknown -> measured -> fixed. This is count-first
+and policy-first; weighted capacity, shared shard-local budgets, and
+explicit unbounded-for-now modes remain future work.
+
+### Deadline and PendingCallSet
+
+Added `Deadline` with explicit runtime/simulator clock truth:
+`Context::now()`, `Context::deadline_after(after)`,
+`Deadline::from_instant(now, after)`, and
+`remaining_or_zero(ctx.now())`. There is no ambient
+`Deadline::after()` shortcut, so simulator/replay code does not inherit
+hidden live-clock behavior.
+
+Added bounded `PendingCallSet<K, R>` for caller-owned `CallHandle`
+storage. It uses fixed-capacity storage, rejects duplicate keys, and
+keeps cleanup explicit (`remove`, `drain`, `sweep_terminal`) so it does
+not hide ABA bugs. Cancellation, pool-cancel, and backpressure specimens
+now use the shape.
+
+### Bounded pool vocabulary
+
+Added the first Tina pool primitive and vocabulary: `WorkerPool`,
+`PoolLease`, `AcquireOutcome`, `ReleaseOutcome`, `CloseMode::{Drain,
+Force}`, `ReleaseDisposition::{Reuse, Retire}`, pool pressure reports,
+FIFO waiters, stale lease detection, and typed acquire/release helper
+effects. Force close retires outstanding leases; late release is typed,
+not silent. Follow-on work turned HTTP keepalive into the first real
+consumer.
+
+### Service bootstrap and fanout ergonomics
+
+Round-4 specimen follow-up shipped the boring helper wins and recorded
+design notes for the dangerous ones. Landed pieces include
+self-address-at-registration for single-shard runtimes, bounded
+pending-reply drain helpers, visible-input scatter/gather conventions,
+and specimen cleanups using `stop_with(report)` / `observe_result`
+instead of host side-channels. The design notes deliberately left
+pipeline sugar, generic scatter/gather, flat reqwest continuation
+sugar, work-settled helpers, and cross-isolate paired registration
+unshipped until a real caller proves the shape.
+
+### Specimen round 2 ergonomics
+
+Round-2 specimen work produced and applied the low-risk helpers:
+`ThreadedMultiShardRuntime::observe_result`, `HostBurstOutcomes` and
+`try_send_outcome`, `send_observed_until`, `SingleCallGate`, and
+`ReqwestOutcomeExt::classify`. Sharded, rate-limited, and retrying
+outbound HTTP specimens were migrated so the helpers are the copied
+shape. Self-address multi-shard parity, generic scatter/gather, and
+reqwest flat continuation sugar remain evidence-gated.
+
 ### Server-side HTTP/1.1 keep-alive
 
 `tina_http::HttpListener` / `HttpConnection` can now serve multiple
