@@ -501,6 +501,18 @@ pub struct HttpLimits {
     /// body up to `max_body_bytes` and dispatches a
     /// [`crate::HttpRequestBody::Buffered`].
     pub inbound_stream_chunk_size: Option<usize>,
+    /// When `Some(d)`, the connection serves multiple sequential
+    /// requests on one TCP/TLS stream (HTTP/1.1 keep-alive) and waits
+    /// up to `d` for the next request's head to start (and complete)
+    /// after the previous response was written. On idle expiry the
+    /// connection closes cleanly, the same way it would on peer EOF.
+    /// Per-request close intent is still honored: HTTP/1.0, an
+    /// explicit `Connection: close` header, or any parse / service
+    /// error closes immediately regardless of this knob.
+    ///
+    /// When `None` (the default), the connection serves one request
+    /// per accept and closes — the legacy first-form behaviour.
+    pub keepalive_idle_timeout: Option<std::time::Duration>,
 }
 
 impl Default for HttpLimits {
@@ -511,6 +523,7 @@ impl Default for HttpLimits {
             max_headers: 64,
             header_read_timeout: std::time::Duration::from_secs(10),
             inbound_stream_chunk_size: None,
+            keepalive_idle_timeout: None,
         }
     }
 }
@@ -553,6 +566,7 @@ impl HttpServerConfig {
                 max_headers: 32,
                 header_read_timeout: std::time::Duration::from_millis(500),
                 inbound_stream_chunk_size: None,
+                keepalive_idle_timeout: None,
             },
             service_call_timeout: std::time::Duration::from_secs(1),
             connection_mailbox_capacity: 8,
@@ -597,6 +611,7 @@ impl HttpClientConfig {
                 max_headers: 32,
                 header_read_timeout: std::time::Duration::from_millis(500),
                 inbound_stream_chunk_size: None,
+                keepalive_idle_timeout: None,
             },
             request_timeout: std::time::Duration::from_secs(1),
         }

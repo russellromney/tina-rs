@@ -1,25 +1,30 @@
 //! Tina: native `tina_http::HttpListener` server + native
-//! `tina_http::HttpClient` outbound client. The whole scripted
-//! sequence (GET → 3× POST → GET → GET /missing) runs inside a
-//! single `Driver` isolate that walks the steps via
-//! `call(client, ..., timeout).reply(...)` and ends with
-//! `stop_with(report)`. The host reads the report through
-//! `runtime.observe_result::<Report>` — no `mpsc::channel`, no
-//! per-request bridge.
+//! `tina_http::build_keepalive_pool` outbound client. The host runs the
+//! same scripted sequence as the Tokio side, but every request still
+//! travels through Tina's bounded pool and keepalive connection isolates.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use http::StatusCode;
+use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, ReleaseDisposition, ReleaseOutcome};
 use tina::prelude::*;
 use tina_http::{
-    HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpListener, HttpListenerMsg,
-    HttpRequest, HttpResponse, HttpServerConfig, StatefulRouter,
+    HttpClientConfig, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig,
+    HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg, KeepaliveOutcome, StatefulRouter,
+    build_keepalive_pool,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call};
+use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
+use tina_runtime::{
+    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEventKind, ThreadedRuntime,
+};
 
 use crate::Report;
+
+type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
+type PoolAddr = Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 // -------------------------------------------------------------------
 // Counter service.
@@ -55,147 +60,19 @@ impl Counter {
 }
 
 // -------------------------------------------------------------------
-// Driver: walks the scripted sequence, accumulates the Report, and
-// `stop_with`s it for the host.
-// -------------------------------------------------------------------
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-type ResponseResult = Result<HttpResponse, HttpClientError>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Step {
-    InitialGet,
-    Post(u8),
-    FinalGet,
-    MissingGet,
-    Done,
-}
-
-impl Step {
-    fn next(self) -> Step {
-        match self {
-            Step::InitialGet => Step::Post(0),
-            Step::Post(n) if n + 1 < 3 => Step::Post(n + 1),
-            Step::Post(_) => Step::FinalGet,
-            Step::FinalGet => Step::MissingGet,
-            Step::MissingGet | Step::Done => Step::Done,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum DriverMsg {
-    Begin,
-    Returned(CallOutcome<ResponseResult>),
-}
-
-struct Driver {
-    client: Address<HttpClientMsg, ResponseResult>,
-    target: SocketAddr,
-    step: Step,
-    report: Report,
-}
-
-#[tina_runtime::isolate(message = DriverMsg)]
-impl Driver {
-    fn handle(
-        &mut self,
-        msg: DriverMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            DriverMsg::Begin => self.dispatch(),
-            DriverMsg::Returned(outcome) => {
-                self.absorb(outcome);
-                if self.step == Step::Done {
-                    stop_with(self.report)
-                } else {
-                    self.dispatch()
-                }
-            }
-        }
-    }
-}
-
-impl Driver {
-    fn dispatch(&mut self) -> Effect<Self> {
-        let request = match self.step {
-            Step::InitialGet | Step::FinalGet => {
-                HttpRequest::get("/counter").header("Host", "x").build()
-            }
-            Step::Post(_) => HttpRequest::post("/counter").header("Host", "x").build(),
-            Step::MissingGet => HttpRequest::get("/missing").header("Host", "x").build(),
-            Step::Done => return stop_with(self.report),
-        };
-        call(
-            self.client,
-            HttpClientMsg::call(self.target, request),
-            REQUEST_TIMEOUT,
-        )
-        .reply(DriverMsg::Returned)
-    }
-
-    fn absorb(&mut self, outcome: CallOutcome<ResponseResult>) {
-        let response = match outcome {
-            CallOutcome::Replied(Ok(resp)) => resp,
-            _ => {
-                // Any failure halts the script. The smoke test will
-                // assert the partial Report against expected counts.
-                self.step = Step::Done;
-                return;
-            }
-        };
-        match self.step {
-            Step::InitialGet => {
-                if response.status == StatusCode::OK {
-                    self.report.successful_get += 1;
-                }
-                let body = response.body.as_buffered().unwrap_or(&[]);
-                assert_eq!(
-                    std::str::from_utf8(body).unwrap_or("").trim(),
-                    "0",
-                    "initial GET should report counter=0",
-                );
-            }
-            Step::Post(_) => {
-                if response.status == StatusCode::OK {
-                    self.report.successful_post += 1;
-                }
-            }
-            Step::FinalGet => {
-                if response.status == StatusCode::OK {
-                    self.report.successful_get += 1;
-                }
-                let body = response.body.as_buffered().unwrap_or(&[]);
-                self.report.final_counter_value = std::str::from_utf8(body)
-                    .unwrap_or("0")
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-            }
-            Step::MissingGet => {
-                if response.status == StatusCode::NOT_FOUND {
-                    self.report.got_404_for_missing = true;
-                }
-            }
-            Step::Done => {}
-        }
-        self.step = self.step.next();
-    }
-}
-
-// -------------------------------------------------------------------
-// Run
+// Host-side script.
 // -------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
 
-    // Server: counter service + listener.
+    // Server: counter service + keepalive-enabled listener.
     let counter = runtime
         .register_with_capacity::<_, Infallible>(Counter::default(), 16)
         .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
-    let server_config = HttpServerConfig::dev();
+
+    let mut server_config = HttpServerConfig::dev();
+    server_config.limits.keepalive_idle_timeout = Some(Duration::from_secs(30));
     let listener_addr = runtime
         .register_with_capacity::<_, _>(
             HttpListener::<SingleShard>::with_config(
@@ -214,45 +91,148 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("listener bind: {e:?}"))?;
 
-    // Client: long-lived service-shaped HttpClient.
-    let client = runtime
-        .register_with_capacity::<_, Infallible>(
-            HttpClient::<SingleShard>::new(HttpClientConfig::dev()),
-            16,
-        )
-        .map_err(|e| anyhow::anyhow!("register client: {e:?}"))?;
+    // Client: a one-slot keepalive pool. The pool owns the lease
+    // vocabulary; the connection isolate owns the TCP transport and
+    // reuses it for every request below.
+    let handles = build_keepalive_pool(
+        &runtime,
+        HttpTarget::http_with_host(server_addr, "x"),
+        HttpClientConfig::dev(),
+        PoolConfig::new(1, 4),
+        16,
+        16,
+    )
+    .map_err(|e| anyhow::anyhow!("build keepalive pool: {e:?}"))?;
 
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(
-            Driver {
-                client,
-                target: server_addr,
-                step: Step::InitialGet,
-                report: Report {
-                    exit_clean: true,
-                    ..Report::default()
-                },
-            },
-            16,
-        )
-        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
+    let lease = acquire_connection(&runtime, handles.pool)?;
+    let conn = *lease.handle();
+    let mut report = Report {
+        exit_clean: true,
+        ..Report::default()
+    };
 
-    let result = runtime
-        .observe_result::<Report, _, _>(driver)
-        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+    let response = send_request(&runtime, conn, HttpRequest::get("/counter").build())?;
+    record_get(&mut report, &response, Some("0"))?;
 
-    runtime
-        .try_send(driver, DriverMsg::Begin)
-        .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
+    for _ in 0..3 {
+        let response = send_request(&runtime, conn, HttpRequest::post("/counter").build())?;
+        if response.status == StatusCode::OK {
+            report.successful_post += 1;
+        }
+    }
 
-    let report = result
-        .wait(Duration::from_secs(10))
-        .map_err(|e| anyhow::anyhow!("driver did not finish: {e:?}"))?;
+    let response = send_request(&runtime, conn, HttpRequest::get("/counter").build())?;
+    record_get(&mut report, &response, None)?;
+    report.final_counter_value = body_text(&response).trim().parse().unwrap_or(0);
+
+    let response = send_request(&runtime, conn, HttpRequest::get("/missing").build())?;
+    if response.status == StatusCode::NOT_FOUND {
+        report.got_404_for_missing = true;
+    }
+
+    release_connection(&runtime, handles.pool, lease)?;
+    close_pool(&runtime, handles.pool)?;
+    for conn in handles.connections {
+        let _ = runtime.call_blocking(conn, KeepaliveConnectionMsg::Stop, REQUEST_TIMEOUT);
+    }
 
     runtime
         .try_send(listener_addr, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    let _ = runtime.shutdown();
+    let trace = runtime.shutdown().unwrap_or_default();
+    let accepts = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TcpAccept,
+                    ..
+                }
+            )
+        })
+        .count();
+    anyhow::ensure!(
+        accepts == 1,
+        "keepalive specimen expected one server TCP accept across the script, got {accepts}"
+    );
 
     Ok(report)
+}
+
+fn acquire_connection(
+    runtime: &Runtime,
+    pool: PoolAddr,
+) -> anyhow::Result<tina::pool::PoolLease<KeepaliveConnAddr>> {
+    match runtime.call_blocking(pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)? {
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => Ok(lease),
+        other => anyhow::bail!("expected keepalive pool acquire, got {other:?}"),
+    }
+}
+
+fn send_request(
+    runtime: &Runtime,
+    conn: KeepaliveConnAddr,
+    request: HttpRequest,
+) -> anyhow::Result<HttpResponse> {
+    match runtime.call_blocking(
+        conn,
+        KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
+        REQUEST_TIMEOUT + Duration::from_secs(1),
+    )? {
+        CallOutcome::Replied(KeepaliveOutcome::Request {
+            result: Ok(response),
+            must_retire,
+        }) => {
+            anyhow::ensure!(
+                !must_retire,
+                "native keepalive listener unexpectedly retired the connection"
+            );
+            Ok(response)
+        }
+        other => anyhow::bail!("expected keepalive response, got {other:?}"),
+    }
+}
+
+fn release_connection(
+    runtime: &Runtime,
+    pool: PoolAddr,
+    lease: tina::pool::PoolLease<KeepaliveConnAddr>,
+) -> anyhow::Result<()> {
+    match runtime.call_blocking(
+        pool,
+        WorkerPoolMsg::Release {
+            lease,
+            disposition: ReleaseDisposition::Reuse,
+        },
+        REQUEST_TIMEOUT,
+    )? {
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => Ok(()),
+        other => anyhow::bail!("expected keepalive pool release, got {other:?}"),
+    }
+}
+
+fn close_pool(runtime: &Runtime, pool: PoolAddr) -> anyhow::Result<()> {
+    match runtime.call_blocking(pool, WorkerPoolMsg::Close(CloseMode::Drain), REQUEST_TIMEOUT)? {
+        CallOutcome::Replied(WorkerPoolReply::Closed) => Ok(()),
+        other => anyhow::bail!("expected keepalive pool close, got {other:?}"),
+    }
+}
+
+fn record_get(report: &mut Report, response: &HttpResponse, expected_body: Option<&str>) -> anyhow::Result<()> {
+    if response.status == StatusCode::OK {
+        report.successful_get += 1;
+    }
+    if let Some(expected) = expected_body {
+        anyhow::ensure!(
+            body_text(response).trim() == expected,
+            "GET body mismatch: expected {expected:?}, got {:?}",
+            body_text(response)
+        );
+    }
+    Ok(())
+}
+
+fn body_text(response: &HttpResponse) -> String {
+    String::from_utf8_lossy(response.body.as_buffered().unwrap_or(&[])).to_string()
 }

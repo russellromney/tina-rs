@@ -10,10 +10,10 @@
 //!   `tokio::task::spawn_blocking(...)` for each query. Each call
 //!   moves a clone of the connection into a blocking pool thread.
 //! - **Tina**: drive `tina-sqlite-bridge`. The bridge owns one
-//!   `rusqlite::Connection` on a dedicated blocking thread. Driver
-//!   isolate `call`s in; admission, in-flight, and per-attempt timeout
-//!   are named caps with typed failure modes. Shard thread does no
-//!   SQLite work.
+//!   `rusqlite::Connection` on a dedicated blocking thread. The host
+//!   script calls in with `ThreadedRuntime::call_blocking`; admission,
+//!   in-flight, and per-attempt timeout are named caps with typed
+//!   failure modes. Shard thread does no SQLite work.
 //!
 //! Both sides start from a fresh database, run the script, and
 //! produce the same [`Report`].

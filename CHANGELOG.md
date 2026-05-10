@@ -4,6 +4,32 @@ This file records completed work.
 
 ## Unreleased
 
+### Server-side HTTP/1.1 keep-alive
+
+`tina_http::HttpListener` / `HttpConnection` can now serve multiple
+sequential requests on one TCP/TLS stream. Opt in with
+`HttpLimits::keepalive_idle_timeout = Some(d)`; `None` keeps the
+legacy one-request-per-connection behavior.
+
+What stays explicit:
+- HTTP/1.0 default close, explicit `Connection: close`, parse errors,
+  service-call errors, and short known-length streaming responses all
+  force close after the response.
+- Between requests, the connection waits up to
+  `keepalive_idle_timeout` for the next request head. Stale head
+  deadlines are generation-tagged and ignored.
+- No pipelining: per-request reset drops read-ahead bytes between
+  iterations.
+
+Nine integration tests in `tina-http/tests/server_keepalive.rs` cover
+sequential reuse, close intent, idle timeout, default one-shot behavior,
+slow-loris timeout on a later request, per-request body caps, and mixed
+GET/POST traffic on one socket. The final test drives the native
+listener through `tina_http::build_keepalive_pool` and asserts one
+server `TcpAccept` across the whole script. `specimen_outbound_http`
+now uses the same pooled keepalive client shape against a
+keepalive-enabled Tina listener.
+
 ### HTTP/1.1 keepalive pool
 
 `tina-http` now ships a real keepalive pool consumer of the

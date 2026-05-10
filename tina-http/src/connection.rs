@@ -3,11 +3,29 @@
 //! One [`HttpConnection`] isolate owns one TCP stream. It reads bytes,
 //! parses one request head, accumulates the body up to `Content-Length`,
 //! calls the service isolate via `tina_runtime::call`, serialises the
-//! response, writes it, and closes the stream.
+//! response, and writes it.
 //!
-//! First form is one request per connection: there is no keep-alive
-//! reuse loop. Pipelined extra bytes after the body are dropped on close.
-//! Keep-alive lands in a follow-up slice if user pressure justifies it.
+//! # Keep-alive
+//!
+//! Set [`crate::HttpLimits::keepalive_idle_timeout`] to a `Some(d)` to
+//! keep the connection open after each response and serve the next
+//! request on the same stream. Per-request close intent is still
+//! honored:
+//!
+//! - the request was HTTP/1.0 (default close);
+//! - the request carried `Connection: close`;
+//! - any parse / service error closes immediately;
+//! - peer EOF between requests closes cleanly;
+//! - the idle timer expires before the next request's head completes.
+//!
+//! When `keepalive_idle_timeout` is `None` (the default), the
+//! connection serves one request per accept and closes — the legacy
+//! first-form behaviour.
+//!
+//! Pipelining is not supported: any bytes that arrive after a
+//! request's body but before its response is written are reset between
+//! iterations and effectively dropped. A well-behaved HTTP/1.1 client
+//! waits for each response before sending the next request.
 //!
 //! Backpressure mapping at the service boundary:
 //!
@@ -53,11 +71,20 @@ pub enum HttpConnectionMsg {
     Begin,
     /// `tcp_read` reply.
     Read(Result<Vec<u8>, CallError>),
-    /// Slow-loris guard: fires once after
-    /// [`HttpLimits::header_read_timeout`] from connection start. If
-    /// the connection still has not finished reading the request head,
-    /// the connection stops and lets runtime cleanup close the stream.
-    HeaderDeadline(Result<(), CallError>),
+    /// Per-iteration head/idle deadline. Carries the request
+    /// generation it was scheduled for so that a stale deadline from
+    /// a previous keepalive iteration is recognised and dropped.
+    ///
+    /// On the first iteration, this is the slow-loris guard armed
+    /// from [`HttpLimits::header_read_timeout`]. On subsequent
+    /// iterations (when keepalive is on), it is also the idle guard
+    /// armed from [`HttpLimits::keepalive_idle_timeout`]. If the
+    /// next request's head does not parse before the deadline fires,
+    /// the connection stops and runtime cleanup closes the stream.
+    HeaderDeadline {
+        generation: u64,
+        result: Result<(), CallError>,
+    },
     /// Service `call` reply.
     ServiceReturned(CallOutcome<HttpResponse>),
     /// `tcp_write` reply.
@@ -168,17 +195,23 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     self_shard_id: Option<tina::ShardId>,
     self_isolate_id: Option<tina::IsolateId>,
 
-    // Whether the connection should close after the current response. Set
-    // to true on parse error, on service overload that triggers a 503
-    // close-policy, on peer-side EOF, on response complete (first form is
-    // one request per connection), and on shutdown.
+    // Whether the connection should close after the current response.
+    // Set on parse error, on service-call failure (Full/Closed/Timeout
+    // are mapped to a synthetic response and a close), when the
+    // request itself asks to close (HTTP/1.0, `Connection: close`),
+    // when keepalive is disabled in `HttpLimits`, and on shutdown.
     will_close: bool,
 
-    // Slow-loris guard. While `head_deadline_armed` is true, an
-    // outstanding `sleep` runtime call is racing the head-read; if it
-    // fires before parsing completes, the connection stops and lets runtime
-    // cleanup close the stream. After parsing completes the flag flips,
-    // and the deadline message becomes a no-op when it arrives.
+    // Per-iteration deadline tracking.
+    //
+    // `request_generation` is bumped at the start of every request
+    // iteration (initial and each keepalive round). Outstanding
+    // `HeaderDeadline { generation }` messages from prior iterations
+    // are recognised by generation mismatch and dropped silently.
+    // `head_deadline_armed` flips false when the current head
+    // parses, so a same-generation deadline that fires after parsing
+    // is also a no-op.
+    request_generation: u64,
     head_deadline_armed: bool,
 
     // Latch flipped the first time we reply `Eof` (or `Error`) on
@@ -268,6 +301,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             self_shard_id: None,
             self_isolate_id: None,
             will_close: false,
+            request_generation: 0,
             head_deadline_armed: true,
             body_eof_replied: false,
             _shard: std::marker::PhantomData,
@@ -313,7 +347,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 self.begin_close()
             }
 
-            HttpConnectionMsg::HeaderDeadline(_) => self.handle_header_deadline(),
+            HttpConnectionMsg::HeaderDeadline { generation, .. } => {
+                self.handle_header_deadline(generation)
+            }
 
             HttpConnectionMsg::ServiceReturned(outcome) => self.handle_service_outcome(outcome),
 
@@ -345,10 +381,53 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     /// slow-loris deadline `sleep` in one batch so they race the
     /// client's bytes against the configured timeout.
     fn start(&mut self) -> Effect<Self> {
-        let deadline_effect: Effect<Self> =
-            sleep(self.limits.header_read_timeout).reply(HttpConnectionMsg::HeaderDeadline);
+        self.begin_request_iteration(self.limits.header_read_timeout)
+    }
+
+    /// Schedule the next request iteration: bump the generation,
+    /// arm a deadline tagged with that generation, and start a new
+    /// `tcp_read`. Used both for the initial request (deadline =
+    /// `header_read_timeout`) and each keepalive iteration (deadline
+    /// = `keepalive_idle_timeout`).
+    fn begin_request_iteration(&mut self, deadline: Duration) -> Effect<Self> {
+        // Bound the generation counter the same way the keepalive
+        // client does — 2^64 iterations is unreachable, and silent
+        // overflow would let stale deadlines mis-match.
+        self.request_generation = self
+            .request_generation
+            .checked_add(1)
+            .expect("HttpConnection request_generation overflowed u64");
+        self.head_deadline_armed = true;
+        let generation = self.request_generation;
+        let deadline_effect: Effect<Self> = sleep(deadline)
+            .reply(move |result| HttpConnectionMsg::HeaderDeadline { generation, result });
         let read_effect: Effect<Self> = self.read_more();
         batch(vec![read_effect, deadline_effect])
+    }
+
+    /// Resets per-request state between keepalive iterations. Drops
+    /// any read-ahead bytes (no pipelining), clears the parsed head,
+    /// and resets streaming-body bookkeeping. Does not touch
+    /// `request_generation` or `head_deadline_armed` — those are
+    /// updated by [`Self::begin_request_iteration`].
+    fn reset_for_next_request(&mut self) {
+        self.release_request_all();
+        self.release_response_all();
+        self.read_buf.clear();
+        self.parsed_head = None;
+        self.head_len = 0;
+        self.pending_response.clear();
+        self.pending_buffered_body = None;
+        self.stream_source = None;
+        self.stream_bytes_remaining = 0;
+        self.stream_chunked = false;
+        self.inbound_total = 0;
+        self.inbound_received = 0;
+        self.inbound_delivered = 0;
+        self.inbound_buffer.clear();
+        self.inbound_chunk_size = 0;
+        self.body_eof_replied = false;
+        self.will_close = false;
     }
 
     fn read_more(&mut self) -> Effect<Self> {
@@ -413,13 +492,24 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         self.maybe_dispatch_or_read_more()
     }
 
-    /// Slow-loris guard: this fires after
-    /// [`HttpLimits::header_read_timeout`]. If the connection has not
-    /// yet parsed a request head, it stops the isolate and lets runtime
-    /// cleanup close the stream. If parsing already completed, the deadline
-    /// fires harmlessly.
-    fn handle_header_deadline(&mut self) -> Effect<Self> {
+    /// Slow-loris / idle guard. Fires after
+    /// [`HttpLimits::header_read_timeout`] on the first request and
+    /// after [`HttpLimits::keepalive_idle_timeout`] on each keepalive
+    /// iteration. If the head for the current generation has not
+    /// parsed by the time this arrives, the connection stops and
+    /// runtime cleanup closes the stream. Stale deadlines from
+    /// previous generations are recognised and dropped.
+    fn handle_header_deadline(&mut self, generation: u64) -> Effect<Self> {
+        if generation != self.request_generation {
+            // Stale deadline scheduled for a prior keepalive
+            // iteration. The current iteration has its own deadline
+            // racing the next request's head; this old one is now
+            // a no-op.
+            return noop();
+        }
         if !self.head_deadline_armed {
+            // Same generation but the head already parsed — the
+            // deadline lost the race. No-op.
             return noop();
         }
         self.head_deadline_armed = false;
@@ -468,14 +558,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .parsed_head
             .take()
             .expect("head parsed before dispatch");
-        self.will_close = true;
+        // Decide whether the connection closes after this response.
+        // Force close when keepalive is disabled, or when the request
+        // itself asks for it (HTTP/1.0 default, explicit
+        // `Connection: close`).
+        self.will_close = self.limits.keepalive_idle_timeout.is_none() || head.connection_close;
+
         // The body bytes are about to leave this isolate — either
         // handed to the service buffered, or moved into
         // `inbound_buffer` for streaming. Either way the charge
         // accounting flips: buffered releases everything now;
-        // streaming keeps the inbound_buffer slice charged but
-        // releases the rest (the body had not arrived yet anyway,
-        // so charge==buffer.len() at this point).
+        // streaming keeps the inbound_buffer slice charged after
+        // re-charging the moved prefix below.
         self.release_request_all();
 
         // Decide buffered vs streaming dispatch based on the limits.
@@ -747,7 +841,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             //  - buffered body was queued behind the head -> promote
             //    it, charge once, write it.
             //  - streaming source still owes bytes -> pull next.
-            //  - nothing left -> close.
+            //  - nothing left -> either close or loop back for the
+            //    next keepalive request.
             if let Some(body) = self.pending_buffered_body.take() {
                 let n = body.len();
                 self.pending_response = body;
@@ -768,12 +863,32 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             } else {
                 self.stream_source = None;
                 self.stream_chunked = false;
-                self.begin_close()
+                self.finish_response()
             }
         } else {
             self.pending_response.drain(..count);
             self.write_pending()
         }
+    }
+
+    /// Called once a response has fully drained to the wire. Either
+    /// closes the connection (one-shot mode, or per-request close
+    /// intent) or resets state and starts the next keepalive
+    /// iteration.
+    fn finish_response(&mut self) -> Effect<Self> {
+        if self.will_close {
+            return self.begin_close();
+        }
+        // Keepalive iteration: idle timeout is whatever the user
+        // configured. We only reach here when keepalive is on
+        // (otherwise will_close was forced to true in
+        // dispatch_to_service), so the unwrap is safe.
+        let idle = self
+            .limits
+            .keepalive_idle_timeout
+            .expect("keepalive iteration only happens when timeout is configured");
+        self.reset_for_next_request();
+        self.begin_request_iteration(idle)
     }
 
     /// True when this connection still owes the wire body bytes —
@@ -893,8 +1008,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     /// Source replied `Eof` (or empty chunk). For chunked, queue the
     /// `0 CRLF CRLF` terminator and let the next `handle_wrote`
-    /// close once it drains. For known-length, close now — the
-    /// declared `Content-Length` is canonical.
+    /// finish once it drains. For known-length, the declared
+    /// `Content-Length` is canonical; if the source produced exactly
+    /// that many bytes the connection can still be reused.
     fn finish_stream_eof(&mut self) -> Effect<Self> {
         self.stream_source = None;
         if self.stream_chunked {
@@ -903,7 +1019,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             self.pending_response = b"0\r\n\r\n".to_vec();
             self.write_pending()
         } else {
-            self.begin_close()
+            if self.stream_bytes_remaining > 0 {
+                self.will_close = true;
+            }
+            self.finish_response()
         }
     }
 
