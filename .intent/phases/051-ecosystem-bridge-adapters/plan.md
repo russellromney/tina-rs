@@ -6,8 +6,8 @@
 - 051B — `tina-rpc-tokio` landing review: **landed**.
 - 051C — `tina-tower-bridge`: **landed** (PR #11).
 - 051D — `tina-reqwest-bridge`: **landed** (PR #10).
-- 051G (HTTP-shaped specimens) — `eiffel_axum_counter` and
-  `eiffel_ws_room` rebased onto `TinaTowerService`. **landed in this PR.**
+- 051G (HTTP-shaped specimens) — `specimen_axum_counter` and
+  `specimen_ws_room` rebased onto `TinaTowerService`. **landed in this PR.**
 - 051E — `tina-sqlx-bridge`: **open**.
 - 051F — `tina-aws-bridge`: **open**.
 
@@ -46,7 +46,7 @@ Already exists:
 - `tina-rpc-tokio` is mostly done as part of the RPC usability work;
 - Axum counter comparison;
 - WebSocket room comparison;
-- Eiffel findings about bridge lifecycle and two-runtime confusion.
+- Specimen findings about bridge lifecycle and two-runtime confusion.
 
 Expected before or during this phase:
 
@@ -133,7 +133,7 @@ First remaining bridge crates:
 Then:
 
 - Axum examples/helpers on top of Tower;
-- WebSocket bridge adapter if Eiffel keeps showing the need;
+- WebSocket bridge adapter if Specimen keeps showing the need;
 - `tina-smol-bridge` after the Tokio bridge path is boring.
 
 Hyper-specific bridge waits unless Tower proves insufficient.

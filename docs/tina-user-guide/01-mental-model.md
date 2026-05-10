@@ -116,7 +116,7 @@ What the model enforces:
   explicitly opted out.
 
 The adversarial probe in
-[`examples/eiffel_owned_state_leak`](../../examples/eiffel_owned_state_leak)
+[`examples/specimen_owned_state_leak`](../../examples/specimen_owned_state_leak)
 documents four leak attempts the type system blocks and one
 user-built shared-state pattern that compiles. The four blocks
 live as `compile_fail` doctests. The smoke test asserts the

@@ -7,7 +7,7 @@ is the blessed shape.
 
 ## The Pain
 
-`eiffel_two_stage_pipeline` (three stages: parse, validate,
+`specimen_two_stage_pipeline` (three stages: parse, validate,
 execute) reads as four `PipelineMsg` variants:
 
 ```rust
@@ -64,5 +64,5 @@ small enough that the explicit form remains preferable.
 No helper. No example migration. Finding 11 stays open with
 this note attached: the raw form is the answer.
 
-`eiffel_two_stage_pipeline` keeps its four-variant
+`specimen_two_stage_pipeline` keeps its four-variant
 `PipelineMsg` and per-stage match. README documents the rule.

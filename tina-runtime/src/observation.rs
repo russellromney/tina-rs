@@ -245,7 +245,7 @@ impl OperationDoneWaiter {
 /// direct child of the chosen parent isolate.
 ///
 /// Replaces the `Arc<Mutex<Option<Address<...>>>>` + `AtomicU64` generation
-/// pair in `eiffel_supervised_worker`-style code.
+/// pair in `specimen_supervised_worker`-style code.
 #[derive(Debug)]
 pub struct ChildRestartedWaiter {
     rx: mpsc::Receiver<ChildRestarted>,

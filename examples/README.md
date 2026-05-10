@@ -1,10 +1,15 @@
-# Eiffel Examples
+# Specimen Examples
 
-`examples/` is the home for Eiffel: paired Tokio-vs-Tina implementation
+`examples/` is the home for Specimen: paired Tokio-vs-Tina implementation
 comparisons for common use cases. These are not Tina crate tests and not
 benchmarks. They are ergonomics and functionality probes that should help us
 discover where Tina is safer, awkward, incomplete, broken, or pointing at a
 better model.
+
+The directory prefix is `specimen_` on purpose. A specimen is something you
+put under glass and inspect: small enough to understand, real enough to make
+the shape honest. These crates are not product templates and not scorekeeping
+harnesses.
 
 Cross-cutting ergonomic findings — patterns that show up in more than one
 comparison and the API/runtime suggestions they imply — live in
@@ -131,21 +136,21 @@ than that.
 
 | Directory | Status | Purpose |
 |---|---|---|
-| `eiffel_rpc` | Specimen | Same framed request burst, two implementations: Tina framed RPC with bounded in-flight (overload becomes `Error(Full)` on the wire) vs Tokio with an unbounded queue (silently buffers). |
-| `eiffel_real_io_chat` | Specimen | Slow-consumer chat/fanout over real TCP. |
-| `eiffel_mini_keyspace` | Specimen | Tiny Redis-shaped key/value service over real TCP; tests request/reply continuations and store-isolate ergonomics. |
-| `eiffel_mux_client` | Specimen | Tina as a multiplexed *client* against a Tokio TCP responder; proves out-of-order arrival and tests correlation/parsing in an isolate. |
-| `eiffel_supervised_worker` | Specimen | Worker that panics on poison messages; compares Tokio's hand-rolled `catch_unwind`/respawn loop against Tina's supervisor + restart budget. |
-| `eiffel_persistent_counter` | Specimen | Counter that survives restart via runtime-owned snapshot + journal; compares against a Tokio file-write story. |
-| `eiffel_replay_dst` | Specimen | Same workload run twice under `tina-sim` with one seed; demonstrates deterministic replay versus the Tokio shape that cannot answer the question. |
-| `eiffel_outbound_fetch` | Specimen | "Go fetch these endpoints and aggregate" — Tina as a TCP/DNS *client*, compared to `reqwest`/`hyper`. |
-| `eiffel_outbound_http` | Specimen | Same scripted HTTP endpoint sequence, two clients: `tina_http::HttpClient` (with a `Driver` isolate bridging the host thread) vs `reqwest::Client`. |
-| `eiffel_native_http` | Specimen | Native HTTP/1.1 counter server: `tina_http::HttpListener` + Counter isolate vs `axum`. **First example where the Tina side is shorter than the Tokio side.** |
-| `eiffel_graceful_shutdown` | Specimen | Long-lived service with in-flight work receives SIGINT; compares `tokio::signal` + manual drain against Tina's signal capture and bounded shutdown story. |
-| `eiffel_axum_counter` | Bridge (deferred) | Stateful HTTP counter over axum; tests `tina-tokio-bridge` ergonomics and HTTP-shaped pushback. *Awaiting bridge ergonomics work; not rewritten under the specimens rule yet.* |
-| `eiffel_ws_room` | Bridge (deferred) | WebSocket broadcast room with two clients; tests bridge-hosted bidirectional sessions and subscriber pruning. *Awaiting bridge ergonomics work.* |
-| `eiffel_cpu_run` | Wrapper | Wrapper runner that re-executes any built comparison under N CPU-busy spinner threads; reports baseline vs contended wall-clock and exit status. *Pure subprocess driver; no Tina/Tokio code, no specimens rule applies.* |
-| `eiffel_mem_run` | Wrapper | Wrapper runner that re-executes any built comparison under a series of `RLIMIT_AS` caps (Linux real, macOS best-effort no-op); reports per-tier duration and exit status. *Pure subprocess driver.* |
+| `specimen_rpc` | Specimen | Same framed request burst, two implementations: Tina framed RPC with bounded in-flight (overload becomes `Error(Full)` on the wire) vs Tokio with an unbounded queue (silently buffers). |
+| `specimen_real_io_chat` | Specimen | Slow-consumer chat/fanout over real TCP. |
+| `specimen_mini_keyspace` | Specimen | Tiny Redis-shaped key/value service over real TCP; tests request/reply continuations and store-isolate ergonomics. |
+| `specimen_mux_client` | Specimen | Tina as a multiplexed *client* against a Tokio TCP responder; proves out-of-order arrival and tests correlation/parsing in an isolate. |
+| `specimen_supervised_worker` | Specimen | Worker that panics on poison messages; compares Tokio's hand-rolled `catch_unwind`/respawn loop against Tina's supervisor + restart budget. |
+| `specimen_persistent_counter` | Specimen | Counter that survives restart via runtime-owned snapshot + journal; compares against a Tokio file-write story. |
+| `specimen_replay_dst` | Specimen | Same workload run twice under `tina-sim` with one seed; demonstrates deterministic replay versus the Tokio shape that cannot answer the question. |
+| `specimen_outbound_fetch` | Specimen | "Go fetch these endpoints and aggregate" — Tina as a TCP/DNS *client*, compared to `reqwest`/`hyper`. |
+| `specimen_outbound_http` | Specimen | Same scripted HTTP endpoint sequence, two clients: `tina_http::HttpClient` (with a `Driver` isolate bridging the host thread) vs `reqwest::Client`. |
+| `specimen_native_http` | Specimen | Native HTTP/1.1 counter server: `tina_http::HttpListener` + Counter isolate vs `axum`. **First example where the Tina side is shorter than the Tokio side.** |
+| `specimen_graceful_shutdown` | Specimen | Long-lived service with in-flight work receives SIGINT; compares `tokio::signal` + manual drain against Tina's signal capture and bounded shutdown story. |
+| `specimen_axum_counter` | Bridge (deferred) | Stateful HTTP counter over axum; tests `tina-tokio-bridge` ergonomics and HTTP-shaped pushback. *Awaiting bridge ergonomics work; not rewritten under the specimens rule yet.* |
+| `specimen_ws_room` | Bridge (deferred) | WebSocket broadcast room with two clients; tests bridge-hosted bidirectional sessions and subscriber pruning. *Awaiting bridge ergonomics work.* |
+| `specimen_cpu_run` | Wrapper | Wrapper runner that re-executes any built comparison under N CPU-busy spinner threads; reports baseline vs contended wall-clock and exit status. *Pure subprocess driver; no Tina/Tokio code, no specimens rule applies.* |
+| `specimen_mem_run` | Wrapper | Wrapper runner that re-executes any built comparison under a series of `RLIMIT_AS` caps (Linux real, macOS best-effort no-op); reports per-tier duration and exit status. *Pure subprocess driver.* |
 
 **Status legend:**
 

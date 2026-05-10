@@ -34,7 +34,7 @@ This file records completed work.
   explicit note that `Display` output is pasteable as readable lines
   for bug reports while the `case()` function itself is what to copy
   for code.
-- Upgraded `examples/eiffel_replay_dst` to be the copyable specimen:
+- Upgraded `examples/specimen_replay_dst` to be the copyable specimen:
   one saved `ReplayCase` with `Tick`/`Drain` ops where every op is
   load-bearing (deleting one changes the trace hash), declared
   mailbox capacities, runner, sweep demo, shrink demo, and
@@ -81,7 +81,7 @@ This file records completed work.
   has not been harmonised yet.
 - Added `docs/tina-user-guide/19-tracing.md` with the field/level/reason
   vocabulary table for runtime and bridge events; one runnable example
-  (`eiffel_tracing_demo`) wires the live observer end-to-end.
+  (`specimen_tracing_demo`) wires the live observer end-to-end.
 - Left OpenTelemetry / Prometheus mappers, span timing for runtime
   calls, cross-bridge correlator alignment, and `tina-rpc-tokio`
   vocabulary harmonisation as future observability work.
@@ -100,7 +100,7 @@ This file records completed work.
 - Completed the first bridge tranche around Tina's bounded core:
   `tina-rpc-tokio`, `tina-tower-bridge`, and `tina-reqwest-bridge`, with
   `tina-tokio-bridge` kept as the generic host/lifecycle foundation.
-- Added bridge docs and Eiffel specimens that name the two-runtime shape,
+- Added bridge docs and specimens that name the two-runtime shape,
   preserve `Full`/`Closed`/`Timeout` outcomes, keep deadlines and ingress caps
   explicit, and document weakened DST/replay guarantees at the Tokio boundary.
 - Added bridge ergonomics polish: friendlier Tower service aliases, Tower
@@ -121,14 +121,14 @@ This file records completed work.
 - Tightened the public API so deferred reply capture derives its reply type
   from the running isolate context, with a runtime type guard retained at the
   erased boundary.
-- Added Eiffel scatter/fanout examples that use deferred replies as ordinary
+- Added Specimen scatter/fanout examples that use deferred replies as ordinary
   Tina state instead of side-channel host polling.
 
-### Phase 059 Eiffel Ergonomics Harvest
+### Phase 059 Specimen Ergonomics Harvest
 
 - Added typed isolate result waiters through `stop_with(...)` and
   `observe_result(...)`, retiring several `Arc<Mutex<_>>`/atomic host
-  side-channel patterns in Eiffel specimens.
+  side-channel patterns in specimens.
 - Added per-call reply aliases and first-form TCP loop helpers so common TCP
   continuation enums read closer to the runtime call that produced them.
 - Added capacity diagnostics and pressure-report conventions for examples and
@@ -143,7 +143,7 @@ This file records completed work.
   stubs, and a `#[tina_rpc::service]` authoring surface.
 - Added `tina-rpc-tokio` so Tokio callers can await Tina RPC calls through a
   bounded bridge without pretending cancellation, full, or timeout disappear.
-- Added RPC usability tests and Eiffel typed-RPC notes that keep capacity,
+- Added RPC usability tests and Specimen typed-RPC notes that keep capacity,
   serialization limits, local-vs-wire outcomes, and retry policy explicit.
 
 ### Phase 053 Sharded Service Primitives
@@ -164,7 +164,7 @@ This file records completed work.
   full/closed/timeout/error outcomes, client state machine, and registry.
 - Added simulator and live proofs for framed-call behavior, including visible
   overload and close/cancel semantics.
-- Added Eiffel RPC comparison coverage so the first-form RPC surface is tested
+- Added Specimen RPC comparison coverage so the first-form RPC surface is tested
   as code people actually read, not only as crate internals.
 
 ### Phase 048 Native HTTP Service Stack
@@ -177,14 +177,14 @@ This file records completed work.
 - Added parser-level DST and documented the remaining larger slices:
   production streaming bodies and full listener/connection simulator replay.
 
-### Phase 047 Eiffel Ergonomics Harvest
+### Phase 047 Specimen Ergonomics Harvest
 
-- Added the first Eiffel comparison suite discipline and harvested its obvious
+- Added the first Specimen comparison suite discipline and harvested its obvious
   Tina papercuts into primitives instead of leaving them as example folklore.
 - Added bounded observation handles, stable trace/fingerprint support, easier
   single-shard defaults, mailbox/reply-slot sizing guidance, sequenced-call/TCP
   helper docs, bridge lifecycle cleanup, and runtime surface alignment.
-- Updated Eiffel findings/READMEs so resolved pain moved out of the active
+- Updated Specimen findings/READMEs so resolved pain moved out of the active
   complaint list and remaining pain became future work.
 
 ### Runtime: TCP/UDP close cancels pending lanes instead of failing with `ResourceBusy`
@@ -265,10 +265,10 @@ This file records completed work.
   `drain(..count)` + `clone()` pattern (matching `tcp_echo.rs`) instead
   of slicing-with-offset, bounding total response-write copies to
   O(N) for an N-byte response.
-- Added an `eiffel_native_http` paired Tokio-vs-Tina comparison: axum
+- Added an `specimen_native_http` paired Tokio-vs-Tina comparison: axum
   on the Tokio side, `tina-http` on the Tina side, identical scripted
   client, asserts byte-equivalent outcomes. The Tina HTTP server runs
-  with no Tokio runtime in the process — first Eiffel comparison where
+  with no Tokio runtime in the process — first Specimen comparison where
   Tina speaks the wire protocol itself.
 - Added the 048 plan's "Slices", "User-Facing Shape (First Form)",
   "Crate Placement", and "Coordination With 047" sections, plus an
@@ -295,7 +295,7 @@ This file records completed work.
   integration (multi-read body with trace assertion, graceful
   shutdown, slow-loris timeout via deadline trace event, stop-race
   regression, wire-level 504 via a service that never replies); 1
-  happy-path smoke. Plus the paired `eiffel_native_http` comparison.
+  happy-path smoke. Plus the paired `specimen_native_http` comparison.
 
 ### Phase Baobab Production-Readiness Rails
 

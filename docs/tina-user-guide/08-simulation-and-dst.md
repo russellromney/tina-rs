@@ -301,7 +301,7 @@ Good Tina simulation targets:
 
 ## See Also
 
-- `examples/eiffel_replay_dst` — the copyable specimen.
+- `examples/specimen_replay_dst` — the copyable specimen.
 - `tina_sim::dst` module — `History`, `ReplayCase`, `ReplayReport`,
   `ReplayConfig`, `assert_replay_case`, `check_replay_case`,
   `sweep_seeds`, `shrink_replay_case`, `assert_replays`,

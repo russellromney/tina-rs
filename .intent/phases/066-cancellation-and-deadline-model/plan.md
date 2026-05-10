@@ -2,7 +2,7 @@
 
 ## Status
 
-- Done: design drafted from Eiffel cancellation/backpressure/pool findings.
+- Done: design drafted from Specimen cancellation/backpressure/pool findings.
 - In progress: none.
 - Open: implement the first cancellation primitive and deadline value.
 - Deferred: external `cancel_isolate`, resource-driver cancellation expansion,
@@ -354,18 +354,18 @@ Proof:
 - callers settle now, not at original timeout;
 - no stale cap after stop.
 
-## Rock 6: Eiffel Cancellation Chain
+## Rock 6: Specimen Cancellation Chain
 
-Update existing Eiffel specimens first. Do not create a new specimen unless the
+Update existing specimens first. Do not create a new specimen unless the
 existing ones cannot honestly show the new model.
 
 Primary target:
 
-- `examples/eiffel_cancellation_chain`
+- `examples/specimen_cancellation_chain`
 
 Secondary target if deadline propagation lands cleanly:
 
-- `examples/eiffel_backpressure_chain`
+- `examples/specimen_backpressure_chain`
 
 The specimen should show:
 
@@ -386,7 +386,7 @@ record that honestly and keep the domain `Stop` pattern.
 3. PendingCallSet.
 4. Owner-stop cleanup.
 5. Deadline value.
-6. Eiffel cancellation chain update.
+6. Specimen cancellation chain update.
 
 ## Done Means
 

@@ -16,15 +16,15 @@ use tina_rpc_tokio::{BridgeClient, BridgeError, RetryDelay, RetryPolicy, call_wi
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig};
 
 #[derive(Debug, Default, Clone)]
-struct EiffelShard;
+struct SpecimenShard;
 
-impl tina::Shard for EiffelShard {
+impl tina::Shard for SpecimenShard {
     fn id(&self) -> ShardId {
         ShardId::new(95)
     }
 }
 
-// Tiny VecDeque mailbox factory matching the eiffel example pattern.
+// Tiny VecDeque mailbox factory matching the specimen example pattern.
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -117,12 +117,12 @@ impl Isolate for ClientStub {
     type Send = Outbound<ClientResultMsg>;
     type Spawn = Infallible;
     type Call = RuntimeCall<ClientMsg>;
-    type Shard = EiffelShard;
+    type Shard = SpecimenShard;
 
     fn handle(
         &mut self,
         msg: ClientMsg,
-        _ctx: &mut Context<'_, EiffelShard, Self::Reply>,
+        _ctx: &mut Context<'_, SpecimenShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Request(req) => {
@@ -150,9 +150,9 @@ impl Isolate for ClientStub {
 // Test harness
 // ---------------------------------------------------------------------------
 
-fn build_runtime() -> Arc<ThreadedRuntime<EiffelShard, EFactory>> {
+fn build_runtime() -> Arc<ThreadedRuntime<SpecimenShard, EFactory>> {
     Arc::new(ThreadedRuntime::with_config(
-        EiffelShard,
+        SpecimenShard,
         EFactory,
         ThreadedRuntimeConfig {
             command_capacity: 32,
@@ -163,7 +163,7 @@ fn build_runtime() -> Arc<ThreadedRuntime<EiffelShard, EFactory>> {
 }
 
 fn register_stub(
-    runtime: &ThreadedRuntime<EiffelShard, EFactory>,
+    runtime: &ThreadedRuntime<SpecimenShard, EFactory>,
     behavior: StubBehavior,
 ) -> Address<ClientMsg> {
     let stub = ClientStub { behavior };
@@ -180,7 +180,7 @@ fn register_stub(
 async fn typed_call_round_trips_through_bridge_and_macro() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::Echo);
-    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 64).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 64).unwrap();
 
     // The stub echoes payload bytes; the macro encoded the args
     // tuple `(3, 4)` as `[3, 4]`. The macro decoder for `add` is
@@ -208,7 +208,7 @@ async fn typed_call_round_trips_through_bridge_and_macro() {
 async fn server_full_surfaces_as_bridge_full() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::AlwaysFull);
-    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 16).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 16).unwrap();
 
     let outcome = bridge
         .call(
@@ -223,7 +223,7 @@ async fn server_full_surfaces_as_bridge_full() {
 async fn retry_policy_eventually_surfaces_persistent_full() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::AlwaysFull);
-    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 16).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 16).unwrap();
 
     let policy = RetryPolicy {
         attempts: 3,
@@ -258,7 +258,7 @@ async fn admission_full_returns_synchronously_no_hang() {
     // for a reply slot that will never free.
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::NeverReply);
-    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 2).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 2).unwrap();
 
     // Hold both admission slots with calls that will never complete.
     let bridge_a = bridge.clone();
@@ -324,7 +324,7 @@ async fn cancelled_call_releases_slot_synchronously() {
     // discarded by the shim.
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::NeverReply);
-    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
 
     // Hold the only slot with a NeverReply call. If admission did
     // not release on cancel, the next call would be `Full` for the
@@ -378,7 +378,7 @@ async fn cancelled_call_releases_slot_synchronously() {
 async fn parallel_calls_demux_correctly() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::Echo);
-    let bridge = BridgeClient::<EiffelShard>::new(Arc::clone(&runtime), stub, 64).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 64).unwrap();
 
     // Fire many parallel calls; each gets its own correlator and
     // its own oneshot. The shim must demux every reply correctly.

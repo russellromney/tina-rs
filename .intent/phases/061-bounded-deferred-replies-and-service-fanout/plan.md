@@ -424,7 +424,7 @@ advanced escape hatch. Make the bounded helper the blessed user path.
    - first form is all-targets with bounded partial result;
    - no automatic retry.
 
-   Quorum and first-success are later policy work unless an Eiffel specimen
+   Quorum and first-success are later policy work unless a specimen
    immediately proves they are needed.
 
    This should align with 053 sharded service primitives.
@@ -473,7 +473,7 @@ advanced escape hatch. Make the bounded helper the blessed user path.
 
 10. **Docs And Examples**
 
-   Update the user guide and one or two Eiffel specimens.
+   Update the user guide and one or two specimens.
 
    Docs must show:
 
@@ -486,9 +486,9 @@ advanced escape hatch. Make the bounded helper the blessed user path.
 
    Candidate specimens:
 
-   - `eiffel_rpc` pooled service;
-   - `eiffel_mini_keyspace` sharded/fanout read;
-   - a tiny new `eiffel_service_pool` if existing examples are too noisy.
+   - `specimen_rpc` pooled service;
+   - `specimen_mini_keyspace` sharded/fanout read;
+   - a tiny new `specimen_service_pool` if existing examples are too noisy.
 
 ## Suggested Order
 
@@ -501,7 +501,7 @@ advanced escape hatch. Make the bounded helper the blessed user path.
 7. Simulator support.
 8. Pooled service proof.
 9. Small fanout/gather proof.
-10. Docs and Eiffel specimen rewrite.
+10. Docs and Specimen specimen rewrite.
 
 Reasoning:
 

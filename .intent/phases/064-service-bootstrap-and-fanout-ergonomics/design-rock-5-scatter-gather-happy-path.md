@@ -7,7 +7,7 @@ plus `register_reply_adapter_on` is the blessed shape.
 
 ## The Pain
 
-`eiffel_sharded_fanout_read` is ~80 lines for "fan a typed read
+`specimen_sharded_fanout_read` is ~80 lines for "fan a typed read
 out to three shards, sum the replies":
 
 - `ScatterCoord` isolate with `Bind`, `Start`, `Reply` variants;
@@ -87,7 +87,7 @@ clearly, leave it.
 
 ## Decision
 
-No helper. `eiffel_sharded_fanout_read` already migrated to
+No helper. `specimen_sharded_fanout_read` already migrated to
 `register_reply_adapter_on`. The remaining ceremony is part of
 the typed-pressure surface and stays explicit.
 

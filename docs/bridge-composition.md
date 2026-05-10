@@ -95,7 +95,7 @@ register process-global handlers via `signal-hook`. The chain coexists
 in the chain. Subsequent SIGINTs fire the now-orphaned Tokio handler too.
 
 **Mitigation:** in tests, run each side as a subprocess (this is what
-`eiffel_graceful_shutdown`'s `compare` mode does). In a real bridge app,
+`specimen_graceful_shutdown`'s `compare` mode does). In a real bridge app,
 pick one side to own signal handling — usually Tina (`signal_wait`)
 because it surfaces signals as ordinary later messages and integrates
 with the runtime's shutdown report. Document the choice loudly.

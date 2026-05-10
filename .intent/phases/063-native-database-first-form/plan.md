@@ -11,7 +11,7 @@
   worker results after a bridge timeout are observed via an
   abandoned-flag the worker thread checks before sending; they bump
   `late_results` and the per-outcome counter once each (no double
-  tally). Eiffel `eiffel_sqlite_counter` rewired to use the bridge;
+  tally). Specimen `specimen_sqlite_counter` rewired to use the bridge;
   both Tokio and Tina sides land on `final_value = 50`.
 - Done: typed-helper ergonomics polish — `execute_call`/`query_call`,
   `Row`/`SqliteRows` accessors, `From` impls for common Rust types
@@ -35,7 +35,7 @@ Tina services need a database path that does not block shard threads and does no
 drag unbounded Tokio-shaped pressure into the app.
 
 Start with `tina-sqlite-bridge`, backed by `rusqlite`. SQLite is small, sync,
-real, and already painful in Eiffel. Use it to settle the bridge rule:
+real, and already painful in Specimen. Use it to settle the bridge rule:
 
 ```text
 Tina isolate state is serial.
@@ -268,9 +268,9 @@ Proof:
 - caller timeout before query completion produces late-result truth, not fake
   cancellation.
 
-## Rock 5: Eiffel Rewrite
+## Rock 5: Specimen Rewrite
 
-Rewrite `examples/eiffel_sqlite_counter` to use the bridge.
+Rewrite `examples/specimen_sqlite_counter` to use the bridge.
 
 README must compare:
 
@@ -288,7 +288,7 @@ Do not implement here.
 Write the next plan slice after SQLite teaches the shape:
 
 - `tina-sqlx-bridge` for ecosystem adoption;
-- pooled SQLite with N independent connections if Eiffel asks for it;
+- pooled SQLite with N independent connections if Specimen asks for it;
 - later native Postgres wire over Tina TCP using `postgres-protocol`;
 - how cancellation maps when a query has reached the DB;
 - how pools report `Full`, `Closed`, timeout, and late result.
@@ -301,7 +301,7 @@ Write the next plan slice after SQLite teaches the shape:
 3. One-connection SQLite worker.
 4. Deferred reply + pending cap.
 5. Metrics/shutdown.
-6. Eiffel rewrite.
+6. Specimen rewrite.
 7. Postgres/SQLx follow-up design note.
 
 ## Required Proof
@@ -309,7 +309,7 @@ Write the next plan slice after SQLite teaches the shape:
 - `cargo fmt --all --check`.
 - `cargo test -p tina-sqlite-bridge`.
 - workspace clippy gate for touched crates.
-- Eiffel sqlite smoke test.
+- Specimen sqlite smoke test.
 - No hidden unbounded queue.
 - No shard-thread DB query in the bridge.
 
@@ -317,5 +317,5 @@ Write the next plan slice after SQLite teaches the shape:
 
 - Tina has a bounded SQLite bridge.
 - Bridge parallelism doctrine is documented.
-- Eiffel sqlite no longer teaches inline DB work as the Tina shape.
+- Specimen sqlite no longer teaches inline DB work as the Tina shape.
 - Postgres/SQLx next slice is clear.

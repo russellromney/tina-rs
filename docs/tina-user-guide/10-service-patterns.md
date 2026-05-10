@@ -163,7 +163,7 @@ These are local multi-shard patterns. They are **not** a distributed
 database, **not** consensus, **not** remoting, **not** automatic
 rebalancing.
 
-A worked example lives in `examples/eiffel_sharded_keyspace`: a paired
+A worked example lives in `examples/specimen_sharded_keyspace`: a paired
 Tokio (`Vec<Arc<Mutex<HashMap>>>` with hand-rolled FNV-1a placement) and
 Tina (`ShardPlacement` + `ShardServiceTable::try_from_placement(...)` +
 per-shard `Store` isolates with `placement.require_owner_str(...)`)

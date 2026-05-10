@@ -16,7 +16,7 @@ Tina is small machine:
 - overload should say `Full`, `Closed`, or `Timeout`
 - same isolate should run live and in simulation
 
-The rule: docs teach the Tina model. Eiffel examples test the model.
+The rule: docs teach the Tina model. Specimen examples test the model.
 
 If you are an LLM session, or reviewing code written by one, read
 [Agent Quickstart](00-agent-quickstart.md) first. It is the short checklist.

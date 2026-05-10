@@ -1,6 +1,6 @@
 //! Single-in-flight gate for timer-driven workers (Phase 062 Rock 5).
 //!
-//! The pattern in `eiffel_rate_limited_worker` and any
+//! The pattern in `specimen_rate_limited_worker` and any
 //! `sleep(window).reply(Tick)` rate-limited isolate is:
 //!
 //! - on submit: bump a `pending` counter; if it *was* zero, schedule

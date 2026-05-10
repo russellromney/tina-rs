@@ -223,7 +223,7 @@ fn different_seed_changes_fingerprint() {
 
     // Seed only changes the trace when there is some seed-driven
     // perturbation in play. Use the same fault shape as
-    // `eiffel_replay_dst`: 1-in-3 timer-wake delays, 1-in-4 local-send
+    // `specimen_replay_dst`: 1-in-3 timer-wake delays, 1-in-4 local-send
     // delays. With multi-peer concurrent traffic the seeded ordering
     // is observable.
     let make_config = |seed: u64| SimulatorConfig {

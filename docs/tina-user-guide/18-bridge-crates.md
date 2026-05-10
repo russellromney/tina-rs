@@ -213,8 +213,8 @@ list is the source of truth.
   the cancellation rule, and the metrics.
 - Look at the per-crate example (`tina-reqwest-bridge`'s `fetch_one`,
   `tina-tower-bridge`'s `axum_counter`).
-- Look at the Eiffel specimens (`eiffel_axum_counter`,
-  `eiffel_ws_room`) for tested call-site shapes.
+- Look at the bridge specimens (`specimen_axum_counter`,
+  `specimen_ws_room`) for tested call-site shapes.
 - The rule is "bridge may not lie." If a bridge looks like it would
   let a request disappear, smooth a typed error into a generic one,
   or grow an unbounded queue, that's a bug — file it as a paper cut
