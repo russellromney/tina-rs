@@ -77,28 +77,37 @@
 //! assert!(calls.is_empty());
 //! ```
 //!
-//! # Settled / cancelled slots are reclaimed on insert
+//! # Why insert does not auto-sweep
 //!
-//! [`PendingCallSet::insert`] sweeps any entries whose handle reports
-//! [`CallHandleState::Settled`] or [`CallHandleState::Cancelled`]
-//! before checking capacity. This matches the
-//! `tina_runtime::PendingReplies::try_insert` shape — the inverse
-//! helper for deferred reply slots, which sweeps `Closed` slots before
-//! admit — and means the set cannot become silently full just because
-//! a translator forgot to call [`PendingCallSet::remove`].
+//! [`PendingCallSet::insert`] does *not* auto-sweep settled or
+//! cancelled handles. An auto-sweep would create a silent ABA bug
+//! when a `Returned` continuation is queued in the user's mailbox
+//! between the call settling and the user processing the message:
 //!
-//! The sweep is foreground only: it runs when the user calls a method
-//! that asks "is there room?" Nothing sweeps in the background, no
-//! timer fires, no `Drop` magic touches the table. The contract
-//! "a stored handle becomes free space when the call settles" is
-//! visible: the runtime sets the handle's state on settle/cancel, and
-//! the next admission honors it.
+//! 1. user inserts `(k, A)`; A times out;
+//! 2. the runtime queues `Returned { key: k, outcome: Timeout }` for
+//!    the user;
+//! 3. before the user processes that message, the user's next handler
+//!    turn inserts `(k, B)`;
+//! 4. an auto-sweep would remove A and admit B under the same key;
+//! 5. the queued `Returned` for A then fires and calls `remove(&k)`,
+//!    silently removing B.
 //!
-//! Calling [`PendingCallSet::remove`] from a `Returned` translator is
-//! still recommended — it reclaims the slot eagerly and keeps the
-//! semantics aligned with the message the user just handled. But
-//! forgetting the `remove` no longer leaks the slot until the set is
-//! dropped.
+//! Instead, insert returns [`PendingCallSetInsertError::DuplicateKey`]
+//! whenever `key` is already present — pending or terminal. The
+//! diagnostic is loud, the user fixes the ordering bug, and B is
+//! never silently removed.
+//!
+//! For services with monotonic request ids the duplicate case never
+//! arises. For services with reused keys (worker indices, session
+//! ids), process the prior outcome first; or, when you know no late
+//! continuation can run (after `drain` + `cancel_call`, after owner
+//! stop), call [`PendingCallSet::sweep_terminal`] explicitly.
+//!
+//! Forgetting [`PendingCallSet::remove`] in a `Returned` translator
+//! therefore *does* leak slots until the set is dropped, drained, or
+//! `sweep_terminal`-pruned. That leak is loud — eventually `Full`. A
+//! silent ABA would not be.
 
 use crate::{CallHandle, CallHandleState};
 
@@ -183,28 +192,37 @@ where
 
     /// Inserts `handle` under `key`.
     ///
-    /// Sweeps any entries whose handle is `Settled` or `Cancelled`
-    /// before checking capacity, so a forgotten `remove` in a previous
-    /// `Returned` translator does not silently make the set full. This
-    /// matches the `tina_runtime::PendingReplies::try_insert` shape.
+    /// Returns `Ok(())` on success.
     ///
-    /// Returns `Ok(())` on success. Returns
-    /// [`PendingCallSetInsertError::Full`] when even after the sweep
-    /// no slot is free, and [`PendingCallSetInsertError::DuplicateKey`]
-    /// when `key` is already stored under a still-live handle. The
-    /// rejected `(key, handle)` is returned in the error variant so
-    /// the caller can cancel, store elsewhere, or drop it visibly.
+    /// Returns [`PendingCallSetInsertError::DuplicateKey`] when `key`
+    /// is already stored — *regardless of whether the prior handle is
+    /// still pending or has already settled*. This is deliberate: a
+    /// silent auto-sweep would create an ABA bug. Concrete scenario:
+    ///
+    /// 1. user inserts `(k, A)`; A times out; the runtime queues
+    ///    `Returned { key: k, outcome: Timeout }` to the user's
+    ///    mailbox;
+    /// 2. before the user processes that message, the user's next
+    ///    handler turn inserts `(k, B)`;
+    /// 3. an auto-sweep would remove the settled-A entry and admit B
+    ///    under the same key;
+    /// 4. the queued `Returned` for A finally fires and calls
+    ///    `remove(&k)` — silently removing B.
+    ///
+    /// `DuplicateKey` instead of auto-sweep makes that race a loud
+    /// runtime error, not silent corruption. If you really want
+    /// "reclaim before reinsert" — e.g. a periodic cleanup at a known
+    /// safe point — call [`PendingCallSet::sweep_terminal`] explicitly.
+    ///
+    /// Returns [`PendingCallSetInsertError::Full`] when the set is at
+    /// capacity. The rejected `(key, handle)` is returned in the
+    /// error variant so the caller can cancel it, store it elsewhere,
+    /// or drop it visibly.
     pub fn insert(
         &mut self,
         key: K,
         handle: CallHandle<R>,
     ) -> Result<(), PendingCallSetInsertError<K, R>> {
-        // Reclaim slots whose handles already settled or were
-        // cancelled. A `Returned` translator that forgot to call
-        // `remove` no longer leaks; the next admission honors the
-        // runtime's truth about each handle.
-        self.sweep_terminal();
-
         if self.contains_key(&key) {
             return Err(PendingCallSetInsertError::DuplicateKey { key, handle });
         }
@@ -304,85 +322,101 @@ mod tests {
         assert_eq!(set.len(), 2);
     }
 
-    /// User pattern that the sweep must rescue: every `Returned`
-    /// translator that should call `remove` forgot to. The handles
-    /// transition to `Settled` (the runtime sets that field on
-    /// settle/cancel). The next `insert` must reclaim those slots
-    /// rather than report a stale `Full`.
+    /// Codex P2 regression: insert must NOT silently reclaim a
+    /// terminal handle under the same key. An auto-sweep would let
+    /// `(k, A)` get replaced by `(k, B)` while `Returned { k, ... }`
+    /// for A is still in the user's mailbox, so the user's later
+    /// `remove(&k)` would silently remove B. Loud `DuplicateKey` is
+    /// the right answer.
     #[test]
-    fn settled_handles_are_reclaimed_on_next_insert() {
+    fn duplicate_key_is_rejected_even_when_prior_handle_is_settled() {
         let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(2);
         set.insert(1, make_handle()).map_err(|_| ()).unwrap();
-        set.insert(2, make_handle()).map_err(|_| ()).unwrap();
-        assert!(set.is_full());
+        runtime_internal::call_handle_shared(set.iter().next().unwrap().1)
+            .set_state(CallHandleState::Settled);
 
-        // Simulate the runtime settling both calls without the user
-        // ever calling `remove`.
-        for (_, handle) in set.iter() {
-            runtime_internal::call_handle_shared(handle).set_state(CallHandleState::Settled);
+        match set.insert(1, make_handle()) {
+            Err(PendingCallSetInsertError::DuplicateKey { key, handle: _ }) => {
+                assert_eq!(key, 1);
+            }
+            _ => panic!("expected DuplicateKey, not silent rescue"),
         }
-
-        // Inserting a new handle must succeed: the sweep reclaims the
-        // settled entries before checking capacity.
-        set.insert(3, make_handle()).map_err(|_| ()).unwrap();
-        // Both stale entries gone; only the fresh one remains.
+        // Set still holds the (settled) entry — no silent removal.
         assert_eq!(set.len(), 1);
-        assert!(set.contains_key(&3));
-        assert!(!set.contains_key(&1));
-        assert!(!set.contains_key(&2));
+        assert!(set.contains_key(&1));
     }
 
     #[test]
-    fn cancelled_handles_are_reclaimed_on_next_insert() {
+    fn duplicate_key_is_rejected_even_when_prior_handle_is_cancelled() {
         let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(2);
-        set.insert(1, make_handle()).map_err(|_| ()).unwrap();
-        set.insert(2, make_handle()).map_err(|_| ()).unwrap();
+        set.insert(7, make_handle()).map_err(|_| ()).unwrap();
+        runtime_internal::call_handle_shared(set.iter().next().unwrap().1)
+            .set_state(CallHandleState::Cancelled);
 
-        for (_, handle) in set.iter() {
-            runtime_internal::call_handle_shared(handle).set_state(CallHandleState::Cancelled);
+        match set.insert(7, make_handle()) {
+            Err(PendingCallSetInsertError::DuplicateKey { key, handle: _ }) => {
+                assert_eq!(key, 7)
+            }
+            _ => panic!("expected DuplicateKey for cancelled entry"),
         }
-
-        set.insert(3, make_handle()).map_err(|_| ()).unwrap();
-        assert_eq!(set.len(), 1);
-        assert!(set.contains_key(&3));
     }
 
-    /// Pending handles must NOT be swept — only terminal states. A
-    /// still-in-flight call would silently lose its slot if pending
-    /// were swept.
+    /// `sweep_terminal` is the explicit opt-in for "reclaim settled
+    /// entries now". Safe to call when the user knows no late
+    /// `Returned` continuation can fire — e.g. after `drain` +
+    /// `cancel_call` chains, after owner-stop, or in periodic
+    /// pre-snapshot cleanup. Pending handles must never be touched.
     #[test]
-    fn pending_handles_are_never_swept() {
-        let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(2);
-        set.insert(1, make_handle()).map_err(|_| ()).unwrap();
-        set.insert(2, make_handle()).map_err(|_| ()).unwrap();
-        // Both still Pending. A third insert must report Full —
-        // sweep reclaims zero, capacity is honest.
-        match set.insert(3, make_handle()) {
-            Err(PendingCallSetInsertError::Full { key, handle: _ }) => assert_eq!(key, 3),
-            _ => panic!("expected Full when no handles are terminal"),
-        }
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn explicit_sweep_terminal_returns_reclaimed_count() {
+    fn sweep_terminal_reclaims_settled_and_cancelled_only() {
         let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(4);
         for i in 0..4 {
             set.insert(i, make_handle()).map_err(|_| ()).unwrap();
         }
 
-        // Settle two of the four.
+        // Mark key=0 Settled, key=1 Cancelled, leave 2 and 3 Pending.
         for (key, handle) in set.iter() {
-            if *key < 2 {
-                runtime_internal::call_handle_shared(handle).set_state(CallHandleState::Settled);
+            match *key {
+                0 => {
+                    runtime_internal::call_handle_shared(handle).set_state(CallHandleState::Settled)
+                }
+                1 => runtime_internal::call_handle_shared(handle)
+                    .set_state(CallHandleState::Cancelled),
+                _ => {}
             }
         }
 
-        let reclaimed = set.sweep_terminal();
-        assert_eq!(reclaimed, 2);
+        assert_eq!(set.sweep_terminal(), 2);
         assert_eq!(set.len(), 2);
-        // A second sweep is a no-op; nothing has changed state.
+        assert!(!set.contains_key(&0));
+        assert!(!set.contains_key(&1));
+        assert!(set.contains_key(&2));
+        assert!(set.contains_key(&3));
+        // A second sweep is a no-op; the remaining entries are Pending.
         assert_eq!(set.sweep_terminal(), 0);
+    }
+
+    /// Post-`sweep_terminal`, a previously-rejected duplicate key
+    /// becomes admissible again. This is the "explicit reclaim then
+    /// reinsert" pattern callers should reach for when a user
+    /// genuinely wants to reuse a key after the prior call settled.
+    #[test]
+    fn sweep_terminal_then_reinsert_succeeds() {
+        let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(2);
+        set.insert(5, make_handle()).map_err(|_| ()).unwrap();
+        runtime_internal::call_handle_shared(set.iter().next().unwrap().1)
+            .set_state(CallHandleState::Settled);
+
+        // Without sweep: DuplicateKey.
+        assert!(matches!(
+            set.insert(5, make_handle()),
+            Err(PendingCallSetInsertError::DuplicateKey { .. }),
+        ));
+
+        // After explicit sweep: the slot is free, reinsert succeeds.
+        assert_eq!(set.sweep_terminal(), 1);
+        set.insert(5, make_handle()).map_err(|_| ()).unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains_key(&5));
     }
 
     #[test]

@@ -125,10 +125,11 @@ and its late reply becomes a typed `CallReplyRejected` event. There is
 no "kill this worker."
 
 Owners that hold many in-flight calls should store the handles in a
-bounded `PendingCallSet<K, R>` keyed by request id. The set sweeps
-settled / cancelled handles on the next `insert`, so a forgotten
-`remove(&key)` in a `Returned` translator does not leak slots until
-shutdown. See
+bounded `PendingCallSet<K, R>` keyed by request id. The set rejects
+duplicate keys loudly (it deliberately does **not** auto-sweep
+settled handles, to avoid an ABA bug when a stale `Returned`
+continuation can still fire); `sweep_terminal()` is the explicit
+opt-in for foreground reclaim at known-safe points. See
 [ergonomics-checklist § Bounded pending call handles](11-ergonomics-checklist.md#bounded-pending-call-handles)
 for the shape.
 

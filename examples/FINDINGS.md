@@ -128,14 +128,16 @@ fall-through is the generic `NoPendingCall` / `CallerClosed`.
 ships in `tina`. Specimens that previously hand-rolled
 `Vec<CallHandle<R>>` use it: `specimen_cancellation_chain` keys the
 table by worker index, `specimen_pool_cancel_reclaim` keys by waiter
-index. Insert returns `Full` / `DuplicateKey` as typed errors and
-sweeps `Settled` / `Cancelled` handles before the capacity check
-(matching `tina_runtime::PendingReplies::try_insert`), so a
-forgotten `remove(&key)` in a `Returned` translator does not leak
-slots. No `Drop` magic, no background timer; cleanup is foreground
-on insert. The drain-and-cancel pattern stays in user code — the
-helper does not own the workflow. End-to-end fill -> cancel ->
-refill and fill -> timeout -> refill proofs in
+index. Insert returns `Full` / `DuplicateKey` as typed errors —
+duplicate-key is rejected even when the prior handle has settled,
+because an auto-sweep would create a silent ABA bug if a `Returned`
+continuation for the prior call were already queued in the user's
+mailbox. Forgetting `remove(&key)` therefore *does* leak slots until
+the set is dropped, drained, or `sweep_terminal()`-pruned — that
+leak is loud (eventual `Full`); silent ABA would not be. No `Drop`
+magic, no background timer; the drain-and-cancel pattern stays in
+user code — the helper does not own the workflow. End-to-end fill
+-> cancel -> refill and fill -> timeout -> refill proofs in
 `tina-runtime/tests/pending_call_set.rs`.
 
 **Still open:** runtime-level `runtime.cancel_isolate(addr)` (third

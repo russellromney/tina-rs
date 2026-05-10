@@ -641,10 +641,26 @@ For the inverse — *outstanding `call_with_handle` calls you own as
 the caller* — use `tina::PendingCallSet::<K, R>::with_capacity(n)`.
 Same hard rules: bounded storage, typed `Full` / `DuplicateKey` on
 insert, explicit `remove(&key)` on each completion. No `Drop` magic
-and no background timer; `insert` sweeps `Settled` / `Cancelled`
-handles before the capacity check (the same shape as
-`PendingReplies::try_insert`), so a forgotten `remove` in a
-`Returned` translator does not leak slots.
+and no background timer.
+
+`insert` deliberately does **not** auto-sweep settled/cancelled
+handles, because doing so would create a silent ABA bug: if call A
+under key `k` settles while its `Returned { k, ... }` continuation
+is still queued in the user's mailbox, an auto-sweep on a fresh
+`insert(k, B)` would silently replace A — and the queued `Returned`
+for A would later call `remove(&k)`, taking B with it. So
+`DuplicateKey` is reported even when the prior handle is terminal.
+
+Reused-key services have two correct patterns:
+
+1. **Process the prior outcome first** — your `Returned` translator
+   calls `pending.remove(&k)`, then the next call dispatch is safe to
+   insert under the same key.
+2. **Explicit sweep at a known-safe point** —
+   `pending.sweep_terminal()` reclaims any settled/cancelled entries.
+   Use this after `drain` + `cancel_call` chains, after owner-stop,
+   or in a periodic pre-snapshot cleanup, where you know no late
+   `Returned` continuation can fire.
 
 ```rust
 let mut calls: PendingCallSet<RequestId, MyReply> =

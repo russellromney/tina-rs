@@ -107,13 +107,22 @@ where
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
     virtual_now: Duration,
-    /// Stable `Instant` anchor that pairs with `virtual_now` to give
-    /// the simulator a deterministic "now" the same shape as the live
-    /// runtime's `Clock`. Stamped once at construction and never
-    /// mutated; handlers see `virtual_anchor + virtual_now`. Replay
-    /// traces use the same anchor so a recorded run yields the same
-    /// `Context::now()` values, even though the wall-clock value of
-    /// `virtual_anchor` itself is implementation-private.
+    /// `Instant` anchor that pairs with `virtual_now` to give the
+    /// simulator a same-shape "now" as the live runtime's `Clock`.
+    /// Stamped once at construction (from `Instant::now()`) and never
+    /// mutated; handlers see `virtual_anchor + virtual_now`.
+    ///
+    /// **Determinism scope.** Within a single simulator run the anchor
+    /// is stable, so every `Context::now()` and every `Deadline` built
+    /// from it is deterministic. *Across* runs the anchor differs
+    /// (`Instant::now()` is wall-clock time at construction). Trace
+    /// events themselves never embed `Instant`s — they record
+    /// `Duration` deltas against `virtual_now`, which IS replay-stable
+    /// — so the DST trace-hash claim still holds. The cross-run
+    /// difference only matters if user code embeds raw `Instant`s in
+    /// `stop_with` payloads or other observed values; user code that
+    /// wants byte-identical replay should compare `virtual_now`
+    /// `Duration`s, not `Instant`s.
     virtual_anchor: std::time::Instant,
     step_ordinal: u64,
     timers: Vec<TimerEntry>,

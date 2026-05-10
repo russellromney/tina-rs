@@ -109,7 +109,6 @@ impl Driver {
                     // Bounded insert; FANOUT-sized table never overflows.
                     self.pending
                         .insert(key, handle)
-                        .map_err(|_| ())
                         .expect("pending set sized to FANOUT");
                     effects.push(effect);
                 }

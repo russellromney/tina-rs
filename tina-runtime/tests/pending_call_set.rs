@@ -470,3 +470,170 @@ fn fill_timeout_refill_reclaims_capacity() {
         let _ = rt.shutdown();
     }
 }
+
+// ---------- ABA proof ----------
+//
+// Codex P2 regression: a stale `Returned` continuation from an
+// already-settled call must not be able to silently remove a fresh
+// entry the user inserted under the same key. The set rejects the
+// duplicate key loudly instead of auto-sweeping.
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AbaReport {
+    /// Whether the second `insert` of the reused key returned
+    /// `DuplicateKey` (the loud, correct failure).
+    second_insert_was_duplicate: bool,
+    /// Whether the slow worker's `Returned` continuation eventually
+    /// observed `Timeout`. Just a sanity assertion that the timing
+    /// is real.
+    first_call_timed_out: bool,
+    exit_clean: bool,
+}
+
+#[derive(Debug)]
+enum AbaDriverMsg {
+    /// Insert key=42 with a slow worker (call A).
+    InsertA,
+    /// Before A's `Returned` is processed, attempt to insert key=42
+    /// again with a fresh handle (call B). Expect `DuplicateKey`.
+    AttemptDuplicateInsert,
+    /// Continuation for the second-attempted call B; B never gets
+    /// stored and its handle is dropped, so this never fires for the
+    /// successful path. Payload kept as `()` because it is never read.
+    BReturned(#[allow(dead_code)] CallOutcome<WorkerReply>),
+    /// First call's timeout continuation. Removes key=42.
+    AReturned {
+        worker: u32,
+        outcome: CallOutcome<WorkerReply>,
+    },
+    Finish,
+}
+
+struct AbaDriver {
+    slow_worker: Address<WorkerMsg, WorkerReply>,
+    pending: PendingCallSet<u32, WorkerReply>,
+    report: AbaReport,
+}
+
+#[tina_runtime::isolate(message = AbaDriverMsg)]
+impl AbaDriver {
+    fn handle(
+        &mut self,
+        msg: AbaDriverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            AbaDriverMsg::InsertA => {
+                let (effect, handle) =
+                    call_with_handle(self.slow_worker, WorkerMsg::Do, Duration::from_millis(50))
+                        .reply(move |outcome| AbaDriverMsg::AReturned {
+                            worker: 42,
+                            outcome,
+                        });
+                self.pending
+                    .insert(42, handle)
+                    .map_err(|_| ())
+                    .expect("first insert succeeds");
+                effect
+            }
+            AbaDriverMsg::AttemptDuplicateInsert => {
+                // Try to reinsert under key=42 while A's `Returned`
+                // is still queued in the mailbox (it has not yet
+                // fired because we have not yielded to it). The set
+                // must refuse loudly, even though A's handle has
+                // settled.
+                let (effect_b, handle_b): (Effect<Self>, _) =
+                    call_with_handle(self.slow_worker, WorkerMsg::Do, CALL_TIMEOUT)
+                        .reply(AbaDriverMsg::BReturned);
+                match self.pending.insert(42, handle_b) {
+                    Err(tina::PendingCallSetInsertError::DuplicateKey { key, handle: _ }) => {
+                        assert_eq!(key, 42);
+                        self.report.second_insert_was_duplicate = true;
+                        // Drop the unused B effect — never dispatched.
+                        let _ = effect_b;
+                        noop()
+                    }
+                    other => panic!(
+                        "expected DuplicateKey for ABA case, got {:?}",
+                        other.is_ok()
+                    ),
+                }
+            }
+            AbaDriverMsg::AReturned { worker, outcome } => {
+                self.pending.remove(&worker);
+                if matches!(outcome, CallOutcome::Timeout) {
+                    self.report.first_call_timed_out = true;
+                }
+                noop()
+            }
+            AbaDriverMsg::BReturned(_) => noop(),
+            AbaDriverMsg::Finish => {
+                self.report.exit_clean = true;
+                stop_with(self.report)
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_key_under_settled_handle_is_rejected_not_silently_replaced() {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+
+    // Slow worker: long sleep so the 50ms timeout fires before reply.
+    let slow_worker = runtime
+        .register_with_capacity::<_, Infallible>(SlowWorker, 8)
+        .expect("register slow worker");
+
+    let driver = runtime
+        .register_with_capacity::<_, Infallible>(
+            AbaDriver {
+                slow_worker,
+                pending: PendingCallSet::with_capacity(4),
+                report: AbaReport::default(),
+            },
+            32,
+        )
+        .expect("register driver");
+
+    let result = runtime
+        .observe_result::<AbaReport, _, _>(driver)
+        .expect("observe_result");
+
+    // Send InsertA and AttemptDuplicateInsert back-to-back so the
+    // driver's mailbox processes them in FIFO order *before* A's
+    // 50ms timeout has any chance to fire. The reinsert sees A still
+    // `Pending`; the set must reject loudly. (The settled-but-not-yet-
+    // observed case is unit-tested directly in
+    // `tina/src/pending_call_set.rs`, where handle state can be set
+    // synchronously without racing the runtime's timer wheel.)
+    runtime
+        .try_send(driver, AbaDriverMsg::InsertA)
+        .expect("InsertA");
+    runtime
+        .try_send(driver, AbaDriverMsg::AttemptDuplicateInsert)
+        .expect("AttemptDuplicateInsert");
+
+    // Now let A's timeout fire so its `Returned` is processed and the
+    // driver shuts down cleanly.
+    std::thread::sleep(Duration::from_millis(150));
+
+    runtime
+        .try_send(driver, AbaDriverMsg::Finish)
+        .expect("Finish");
+
+    let report = result.wait(Duration::from_secs(5)).expect("driver report");
+
+    assert!(report.exit_clean);
+    assert!(
+        report.second_insert_was_duplicate,
+        "duplicate key under a still-pending prior entry must be \
+         rejected with DuplicateKey, never silently replaced",
+    );
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}

@@ -83,7 +83,6 @@ impl Driver {
                         });
                     self.park_handles
                         .insert(key, handle)
-                        .map_err(|_| ())
                         .expect("park-handle table sized to WAITERS");
                     effects.push(effect);
                 }
