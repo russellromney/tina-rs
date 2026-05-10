@@ -5,7 +5,7 @@
 //! reads + closes per call, this isolate connects on first use and
 //! reuses the same transport until the peer closes or an error
 //! happens — at which point it drops the transport and reconnects
-//! transparently on the next [`KeepaliveCall::Request`].
+//! transparently on the next [`KeepaliveConnectionMsg::Request`].
 //!
 //! # Pool consumer pattern
 //!
