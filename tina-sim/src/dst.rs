@@ -1269,6 +1269,7 @@ where
 #[cfg(test)]
 mod replay_case_tests {
     use super::*;
+    use crate::{ScriptedStorageFaultConfig, ScriptedTcpConfig};
 
     fn fake_event(id: u64) -> RuntimeEvent {
         RuntimeEvent::new(
@@ -1377,10 +1378,43 @@ mod replay_case_tests {
     }
 
     #[test]
-    #[should_panic(expected = "ReplayConfig.mailboxes has no entry for role")]
+    #[should_panic(expected = "ReplayConfig.mailboxes has no entry for role \"missing-role\"")]
     fn replay_config_mailbox_panics_on_missing_role() {
+        // Pin the role name in the panic so a regression that drops
+        // the {role:?} interpolation breaks this test.
         let cfg = ReplayConfig::new();
-        let _ = cfg.mailbox("anything");
+        let _ = cfg.mailbox("missing-role");
+    }
+
+    #[test]
+    fn replay_config_with_faults_carries_faults_and_keeps_other_fields_default() {
+        let faults = FaultConfig {
+            local_send: crate::LocalSendFaultMode::DelayByRounds {
+                one_in: 3,
+                rounds: 1,
+            },
+            timer_wake: crate::FaultMode::DelayBy {
+                one_in: 5,
+                by: std::time::Duration::from_millis(2),
+            },
+            ..Default::default()
+        };
+        let cfg = ReplayConfig::with_faults(faults);
+        assert_eq!(cfg.simulator.faults, faults);
+        // Other simulator fields stay at default — sanity-check a couple
+        // so a regression that swaps the default for something else
+        // surfaces here rather than in distant integration tests.
+        assert_eq!(cfg.simulator.tcp, ScriptedTcpConfig::default());
+        assert_eq!(cfg.simulator.storage, ScriptedStorageFaultConfig::default());
+        assert!(cfg.mailboxes.is_empty());
+    }
+
+    #[test]
+    fn replay_config_with_mailbox_last_call_wins() {
+        let cfg = ReplayConfig::new()
+            .with_mailbox("sink", 4)
+            .with_mailbox("sink", 16);
+        assert_eq!(cfg.mailbox("sink"), 16);
     }
 
     #[test]
@@ -1398,9 +1432,46 @@ mod replay_case_tests {
         let report = observe_replay_case(&pending, run_three_events);
         assert_eq!(report.event_count, 3);
         assert_eq!(report.trace_hash, case().expected_trace_hash);
+        // Pin the exact paste-in format. Users copy this into
+        // `.expecting(...)`; a stray newline or rename would break
+        // every discovery workflow silently.
         let printed = report.pinned_constants();
-        assert!(printed.contains("expected_event_count: 3"));
-        assert!(printed.contains("expected_trace_hash: 0x"));
+        let expected = format!(
+            "expected_event_count: 3\nexpected_trace_hash: 0x{:016x}",
+            case().expected_trace_hash,
+        );
+        assert_eq!(printed, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "ReplayCase.seed and history.seed() drifted")]
+    fn observe_replay_case_debug_asserts_case_history_drift() {
+        // observe must run the same case-coherence guards as
+        // check_replay_case; a future refactor that drops the call
+        // must trip this test.
+        let mut bad = case();
+        bad.seed = 12345;
+        let _ = observe_replay_case(&bad, run_three_events);
+    }
+
+    #[test]
+    #[should_panic(expected = "runner returned report.name")]
+    fn observe_replay_case_debug_asserts_runner_identity() {
+        // observe must run the same runner-identity guards as
+        // check_replay_case.
+        fn lying_runner(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            ReplayReport {
+                name: "some other case",
+                seed: case.seed,
+                config: case.config.clone(),
+                scenario: case.scenario,
+                event_count: events.len(),
+                trace_hash: stable_trace_hash(events.iter()),
+                output: 0,
+            }
+        }
+        let _ = observe_replay_case(&case(), lying_runner);
     }
 
     #[test]
@@ -1418,11 +1489,53 @@ mod replay_case_tests {
     }
 
     #[test]
-    fn case_simulator_config_overrides_seed_from_case() {
+    fn replay_case_new_threads_name_and_seed_into_history() {
+        // Direct field check so a regression in `History::new(...)`
+        // wiring is caught locally, not only via the equality test.
+        let built = ReplayCase::<u32>::new(
+            "direct-check",
+            41,
+            ReplayConfig::new(),
+            "scenario",
+            vec![10, 20],
+            "invariant",
+        );
+        assert_eq!(built.name, "direct-check");
+        assert_eq!(built.seed, 41);
+        assert_eq!(built.history.name(), "direct-check");
+        assert_eq!(built.history.seed(), 41);
+        assert_eq!(built.history.operations(), &[10, 20]);
+        assert_eq!(built.expected_event_count, 0);
+        assert_eq!(built.expected_trace_hash, 0);
+    }
+
+    #[test]
+    fn case_simulator_config_overrides_seed_and_keeps_other_fields() {
+        // Build a case with non-default faults and a non-zero
+        // simulator.seed so we can prove (a) seed wins from the case
+        // and (b) faults carry through unchanged.
+        let faults = FaultConfig {
+            local_send: crate::LocalSendFaultMode::DelayByRounds {
+                one_in: 7,
+                rounds: 2,
+            },
+            ..Default::default()
+        };
+        let mut config = ReplayConfig::with_faults(faults);
+        config.simulator.seed = 0xdead;
         let mut c = case();
+        c.config = config;
         c.seed = 999;
+        c.history = History::new(c.name, 999, c.history.operations().to_vec());
+
         let sim_config = c.simulator_config();
-        assert_eq!(sim_config.seed, 999);
+        assert_eq!(
+            sim_config.seed, 999,
+            "case.seed wins over config.simulator.seed"
+        );
+        assert_eq!(sim_config.faults, faults, "faults carry through unchanged");
+        assert_eq!(sim_config.tcp, ScriptedTcpConfig::default());
+        assert_eq!(sim_config.storage, ScriptedStorageFaultConfig::default());
     }
 
     #[test]
