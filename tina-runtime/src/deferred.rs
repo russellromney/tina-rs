@@ -127,7 +127,14 @@ impl PromotedSlots {
 // Mailbox holds messages. Pending box holds promises. Both need caps.
 // ---------------------------------------------------------------------------
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tina::{DeferredReply, DeferredSlotState};
+
+fn mint_pending_replies_seq() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Bounded, named container for many in-flight deferred reply slots.
 ///
@@ -157,6 +164,8 @@ pub struct PendingReplies<K, R> {
     full_rejects: u64,
     reclaimed: u64,
     duplicate_keys: u64,
+    capacity_name: String,
+    capacity_mode: tina::capacity::CapacityMode,
 }
 
 impl<K, R> std::fmt::Debug for PendingReplies<K, R> {
@@ -219,6 +228,7 @@ where
         for _ in 0..capacity {
             slots.push(None);
         }
+        let seq = mint_pending_replies_seq();
         Self {
             capacity,
             slots,
@@ -226,7 +236,49 @@ where
             full_rejects: 0,
             reclaimed: 0,
             duplicate_keys: 0,
+            capacity_name: format!("pending_replies.{seq}"),
+            capacity_mode: tina::capacity::CapacityMode::Fixed,
         }
+    }
+
+    /// Override the surface's default capacity name.
+    ///
+    /// Default is `pending_replies.<auto_seq>` where `<auto_seq>` is
+    /// a process-wide monotonic counter. Pin an explicit name for
+    /// CI / DST assertions so a refactor that reorders construction
+    /// cannot silently retarget the assertion.
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.capacity_name = name.into();
+        self
+    }
+
+    /// Mark the slot cap as a tuning value.
+    ///
+    /// The cap is still a hard upper bound. `Tuning` only signals
+    /// that the number was chosen for discovery so reports surface
+    /// high water loudly.
+    pub fn with_capacity_mode(mut self, mode: tina::capacity::CapacityMode) -> Self {
+        self.capacity_mode = mode;
+        self
+    }
+
+    /// Stable name used in [`Self::capacity_report`].
+    pub fn capacity_name(&self) -> &str {
+        &self.capacity_name
+    }
+
+    /// Capacity-shaped snapshot of this pending-replies box. Maps
+    /// `len` to current, `high_water` to high-water, and
+    /// `full_rejects` to full count.
+    pub fn capacity_report(&self) -> tina::capacity::CapacitySurfaceReport {
+        tina::capacity::CapacitySurfaceReport::count(
+            self.capacity_name.clone(),
+            self.capacity_mode,
+            self.capacity,
+            self.len(),
+            self.high_water,
+            self.full_rejects,
+        )
     }
 
     /// Returns the maximum number of live promises this box may hold.
@@ -708,6 +760,65 @@ mod pending_replies_tests {
     #[should_panic]
     fn zero_capacity_panics() {
         let _ = PendingReplies::<u32, u32>::with_capacity(0);
+    }
+
+    #[test]
+    fn capacity_report_uses_default_name_when_unnamed() {
+        let box_ = PendingReplies::<u32, u32>::with_capacity(4);
+        let report = box_.capacity_report();
+        assert!(
+            report.name.starts_with("pending_replies."),
+            "default name should be dotted: {}",
+            report.name
+        );
+        assert_eq!(report.mode, tina::capacity::CapacityMode::Fixed);
+        assert_eq!(report.max_messages, Some(4));
+        assert_eq!(report.current_messages, 0);
+        assert_eq!(report.high_water_messages, 0);
+        assert_eq!(report.full_count, 0);
+    }
+
+    #[test]
+    fn capacity_report_named_overrides_default() {
+        let box_ = PendingReplies::<u32, u32>::with_capacity(2).named("orders.pending");
+        assert_eq!(box_.capacity_name(), "orders.pending");
+        assert_eq!(box_.capacity_report().name, "orders.pending");
+    }
+
+    #[test]
+    fn capacity_report_tracks_high_water_and_full() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2).named("p");
+        box_.try_insert(1, fake_slot(1)).unwrap();
+        box_.try_insert(2, fake_slot(2)).unwrap();
+        // High water hits 2, then we drop to 1 by taking, then push to
+        // capacity again — high water must stick at 2.
+        let _ = box_.take(&1);
+        box_.try_insert(3, fake_slot(3)).unwrap();
+        // 4th insert blocks — full.
+        match box_.try_insert(4, fake_slot(4)) {
+            Err(InsertError::Full(k, _)) => assert_eq!(k, 4),
+            other => panic!("expected Full, got {other:?}"),
+        }
+        let report = box_.capacity_report();
+        assert_eq!(report.current_messages, 2);
+        assert_eq!(report.high_water_messages, 2);
+        assert_eq!(report.full_count, 1);
+    }
+
+    #[test]
+    fn capacity_report_tuning_mode_still_has_hard_cap() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(1)
+            .with_capacity_mode(tina::capacity::CapacityMode::Tuning)
+            .named("discovery.box");
+        box_.try_insert(1, fake_slot(1)).unwrap();
+        // Tuning is "fixed-with-loud-flag" — the cap is real.
+        assert!(matches!(
+            box_.try_insert(2, fake_slot(2)),
+            Err(InsertError::Full(_, _))
+        ));
+        let report = box_.capacity_report();
+        assert_eq!(report.mode, tina::capacity::CapacityMode::Tuning);
+        assert_eq!(report.full_count, 1);
     }
 
     /// Minimal Isolate used to type-check effects produced by the

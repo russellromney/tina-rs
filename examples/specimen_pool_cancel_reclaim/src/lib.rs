@@ -22,7 +22,7 @@ pub mod tokio_impl;
 pub const WAITERS: usize = 4;
 pub const RETRY_BUDGET_MS: u64 = 250;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
     /// Cancelled waits, observed by counter on the pool side
     /// (tina) or by the cancel/abort signal count (tokio).
@@ -35,6 +35,15 @@ pub struct Report {
     /// One retry should win the resource after the original lease
     /// releases.
     pub retried_resourced: usize,
+    /// Highest live waiter count observed since pool construction
+    /// (tina-only — tokio's `Semaphore` does not expose this).
+    pub waiters_high_water: usize,
+    /// Configured waiter cap. Pair with `waiters_high_water` to
+    /// drive the `unknown -> measured -> fixed` capacity workflow.
+    pub waiters_max: usize,
+    /// One-line discovery output for the `pool.demo.waiters`
+    /// surface (tina-only). Empty for the tokio side.
+    pub discovery_line: String,
     pub exit_clean: bool,
 }
 
@@ -56,4 +65,40 @@ pub fn assert_report_invariants(side: &str, r: &Report) {
         "{side}: at least one retry should win the resource on release; {r:?}"
     );
     assert!(r.exit_clean, "{side}: {r:?}");
+}
+
+/// Tina-only capacity invariants. The pool surface should have
+/// observed every waiter as live before the cancel wave drained it,
+/// and the `unknown -> measured -> fixed` workflow should converge
+/// on a fixed cap one step looser than the high water.
+///
+/// `Surfaced by:` 071 capacity-modeling phase.
+pub fn assert_tina_capacity_invariants(r: &Report) {
+    assert_eq!(
+        r.waiters_max, WAITERS,
+        "tina: capacity_report must reflect configured cap; {r:?}"
+    );
+    assert!(
+        r.waiters_high_water >= WAITERS,
+        "tina: park-wave should have driven high water to WAITERS={WAITERS}; {r:?}"
+    );
+    assert!(
+        !r.discovery_line.is_empty(),
+        "tina: discovery line should be populated; {r:?}"
+    );
+    assert!(
+        r.discovery_line.contains("pool.demo.waiters"),
+        "tina: discovery line names the surface; got {:?}",
+        r.discovery_line
+    );
+    assert!(
+        r.discovery_line.contains(&format!("max={}", WAITERS)),
+        "tina: discovery line carries cap; got {:?}",
+        r.discovery_line
+    );
+    assert!(
+        r.discovery_line.contains(&format!("high={}", r.waiters_high_water)),
+        "tina: discovery line carries observed high water; got {:?}",
+        r.discovery_line
+    );
 }

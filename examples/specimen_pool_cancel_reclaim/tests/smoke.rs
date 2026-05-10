@@ -1,4 +1,6 @@
-use specimen_pool_cancel_reclaim::{assert_report_invariants, tina_impl, tokio_impl};
+use specimen_pool_cancel_reclaim::{
+    assert_report_invariants, assert_tina_capacity_invariants, tina_impl, tokio_impl,
+};
 
 #[test]
 fn tokio_smoke() {
@@ -7,5 +9,7 @@ fn tokio_smoke() {
 
 #[test]
 fn tina_smoke() {
-    assert_report_invariants("tina", &tina_impl::run().expect("tina"));
+    let report = tina_impl::run().expect("tina");
+    assert_report_invariants("tina", &report);
+    assert_tina_capacity_invariants(&report);
 }

@@ -142,6 +142,18 @@ impl Driver {
             DriverMsg::PressureReturned(outcome) => {
                 if let CallOutcome::Replied(WorkerPoolReply::Pressure(report)) = outcome {
                     self.report.cancelled = report.cancel_count as usize;
+                    self.report.waiters_high_water = report.high_water_waiters;
+                    self.report.waiters_max = report.max_waiters;
+                    // Project the pool report onto the generic
+                    // capacity surface and emit a discovery line.
+                    // Pin an explicit name so a CI assertion does not
+                    // silently retarget if the pool is renamed.
+                    let surface = report.to_waiters_capacity_report(
+                        "pool.demo.waiters",
+                        tina::capacity::CapacityMode::Tuning,
+                    );
+                    self.report.discovery_line =
+                        tina_runtime::format_discovery_line(&surface);
                 }
                 noop()
             }
@@ -161,7 +173,7 @@ impl Driver {
             DriverMsg::ReleaseReturned => noop(),
             DriverMsg::Finish => {
                 self.report.exit_clean = true;
-                stop_with(self.report)
+                stop_with(self.report.clone())
             }
         }
     }

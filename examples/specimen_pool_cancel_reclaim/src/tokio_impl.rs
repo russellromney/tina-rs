@@ -100,6 +100,14 @@ pub fn run() -> anyhow::Result<Report> {
             retried_admitted,
             retried_full,
             retried_resourced,
+            // Tokio's `Semaphore` does not expose live waiter
+            // counters or a high-water-mark; capacity discovery on
+            // this side requires hand-instrumentation. Leave the
+            // capacity-shaped fields empty so the tina/tokio diff
+            // makes the gap visible.
+            waiters_high_water: 0,
+            waiters_max: 0,
+            discovery_line: String::new(),
             exit_clean: true,
         }
     });

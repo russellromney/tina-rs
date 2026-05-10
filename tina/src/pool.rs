@@ -282,6 +282,10 @@ pub struct PoolPressureReport {
     pub waiters: usize,
     /// Configured waiter capacity.
     pub max_waiters: usize,
+    /// Highest live `waiters` value observed since pool construction.
+    /// Pair with `max_waiters` and `full_count` for a count-capacity
+    /// snapshot.
+    pub high_water_waiters: usize,
     /// Cumulative `Full` outcomes.
     pub full_count: u64,
     /// Cumulative `Closed` outcomes — both parked-waiter shutdowns
@@ -306,6 +310,27 @@ pub struct PoolPressureReport {
     pub dispatch_recovered: u64,
     /// True once a [`CloseMode`] has been applied.
     pub closed: bool,
+}
+
+impl PoolPressureReport {
+    /// Project this pool-shaped report onto a generic
+    /// [`crate::capacity::CapacitySurfaceReport`] for the *waiter*
+    /// surface. The resource surface is not count-capped (capacity is
+    /// fixed at construction); waiters are.
+    pub fn to_waiters_capacity_report(
+        &self,
+        name: impl Into<String>,
+        mode: crate::capacity::CapacityMode,
+    ) -> crate::capacity::CapacitySurfaceReport {
+        crate::capacity::CapacitySurfaceReport::count(
+            name,
+            mode,
+            self.max_waiters,
+            self.waiters,
+            self.high_water_waiters,
+            self.full_count,
+        )
+    }
 }
 
 /// Why an acquire did not yield a lease, after the bridge layer.

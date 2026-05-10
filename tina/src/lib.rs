@@ -1932,4 +1932,5 @@ pub mod prelude {
     };
 }
 
+pub mod capacity;
 pub mod pool;

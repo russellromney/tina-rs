@@ -29,6 +29,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::pool::{
     AcquireFailure, AcquireOutcome, CloseMode, PoolConfig, PoolId, PoolLease, PoolPressureReport,
     ReleaseDisposition, ReleaseFailure, ReleaseOutcome, runtime_internal as pool_internal,
@@ -149,6 +150,7 @@ struct PoolCounters {
     wrong_shard: u64,
     no_caller_drops: u64,
     dispatch_recovered: u64,
+    high_water_waiters: usize,
 }
 
 /// Bounded worker pool isolate.
@@ -178,6 +180,8 @@ where
     in_flight: Vec<InFlightDispatch>,
     counters: PoolCounters,
     closed: Option<CloseMode>,
+    capacity_name: String,
+    capacity_mode: CapacityMode,
     _shard: PhantomData<fn() -> S>,
 }
 
@@ -215,6 +219,7 @@ where
             waiter_slab.push(None);
         }
         let resources_opt: Vec<Option<H>> = resources.into_iter().map(Some).collect();
+        let capacity_name = format!("pool.{}.waiters", pool_id.get().get());
         Self {
             pool_id,
             config,
@@ -226,8 +231,48 @@ where
             in_flight: Vec::new(),
             counters: PoolCounters::default(),
             closed: None,
+            capacity_name,
+            capacity_mode: CapacityMode::Fixed,
             _shard: PhantomData,
         }
+    }
+
+    /// Override the surface's default capacity name.
+    ///
+    /// Default is `pool.<pool_id>.waiters`. Pin an explicit name when
+    /// CI / DST tests assert on this surface, so a refactor that
+    /// renames internals does not silently retarget the assertion.
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.capacity_name = name.into();
+        self
+    }
+
+    /// Mark the waiter cap as a tuning value.
+    ///
+    /// The cap is still hard. `Tuning` only signals that the number
+    /// was chosen for discovery so reports surface high water loudly.
+    pub fn with_capacity_mode(mut self, mode: CapacityMode) -> Self {
+        self.capacity_mode = mode;
+        self
+    }
+
+    /// Stable name used in [`Self::capacity_report`].
+    pub fn capacity_name(&self) -> &str {
+        &self.capacity_name
+    }
+
+    /// Capacity-shaped snapshot of the pool's waiter surface. Maps
+    /// `live waiters` to count, `high_water_waiters` to high-water,
+    /// and the existing `full` counter to `full_count`.
+    pub fn capacity_report(&self) -> CapacitySurfaceReport {
+        CapacitySurfaceReport::count(
+            self.capacity_name.clone(),
+            self.capacity_mode,
+            self.config.max_waiters,
+            self.live_waiter_count(),
+            self.counters.high_water_waiters,
+            self.counters.full,
+        )
     }
 
     /// This pool's identity. Useful for diagnostic logging.
@@ -252,6 +297,7 @@ where
             leased,
             waiters: self.live_waiter_count(),
             max_waiters: self.config.max_waiters,
+            high_water_waiters: self.counters.high_water_waiters,
             full_count: self.counters.full,
             closed_count: self.counters.closed,
             wrong_shard_count: self.counters.wrong_shard,
@@ -449,7 +495,15 @@ where
         let slab_idx = self.alloc_waiter_slot();
         self.waiter_slab[slab_idx as usize] = Some(Waiter { reply: slot });
         self.waiter_queue.push_back(slab_idx);
+        self.bump_waiter_high_water();
         noop()
+    }
+
+    fn bump_waiter_high_water(&mut self) {
+        let live = self.live_waiter_count();
+        if live > self.counters.high_water_waiters {
+            self.counters.high_water_waiters = live;
+        }
     }
 
     fn handle_release(
