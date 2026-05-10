@@ -14,7 +14,9 @@ use tina_runtime::{
     CallError, ListenerId, StreamId, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
 };
 
+use crate::body_metrics::BodyMetrics;
 use crate::connection::{HttpConnection, HttpConnectionMsg};
+use crate::transport::HttpTransport;
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
 
 /// Inbound message variants for [`HttpListener`].
@@ -50,6 +52,10 @@ pub struct HttpListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stati
     limits: HttpLimits,
     service_call_timeout: Duration,
     connection_mailbox_capacity: usize,
+    /// Optional shared body-pressure counters threaded into every
+    /// connection child. `None` means no metrics — same default
+    /// behaviour as before.
+    metrics: Option<BodyMetrics>,
     listener: Option<ListenerId>,
     /// Set on the first `Start`. Second Start is a no-op.
     started: bool,
@@ -81,11 +87,20 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, 
             limits,
             service_call_timeout,
             connection_mailbox_capacity,
+            metrics: None,
             listener: None,
             started: false,
             stopping: false,
             _shard: PhantomData,
         }
+    }
+
+    /// Attaches a [`BodyMetrics`] to this listener. Every connection
+    /// spawned by the listener will charge body bytes into the
+    /// metrics. Call before registering the listener.
+    pub fn with_metrics(mut self, metrics: BodyMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Convenience constructor that absorbs an [`HttpServerConfig`].
@@ -217,11 +232,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, M> {
     fn build_connection_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S, M>> {
         ChildDefinition::new(
-            HttpConnection::<S, M>::new(
-                stream,
+            HttpConnection::<S, M>::with_transport_and_metrics(
+                HttpTransport::Tcp(stream),
                 self.service,
                 self.limits,
                 self.service_call_timeout,
+                Duration::ZERO,
+                self.metrics.clone(),
             ),
             self.connection_mailbox_capacity,
         )

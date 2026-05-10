@@ -127,15 +127,32 @@ pub struct HttpResponse {
     pub body: HttpResponseBody,
 }
 
-/// Buffered response body or streaming source.
+/// Response body. Three variants because three things can be true
+/// about the body length:
+///
+/// - We have all the bytes in memory — `Buffered`.
+/// - We know the length but stream the bytes — `Stream`
+///   (`Content-Length` framing).
+/// - We do not know the length and stream the bytes —
+///   `ChunkedStream` (`Transfer-Encoding: chunked` framing).
+///
+/// Callers usually do not construct these variants directly. The
+/// loud-API constructors on [`HttpResponse`] — [`HttpResponse::with_body`]
+/// for buffered, [`HttpResponse::stream_known_length`] for
+/// `Content-Length`, and [`HttpResponse::stream_chunked`] for
+/// chunked — pick the variant for you.
 #[derive(Debug, Clone)]
 pub enum HttpResponseBody {
     /// All response bytes built up-front by the service.
     Buffered(Vec<u8>),
-    /// Streaming source: the connection isolate pulls chunks via
-    /// `call(stream.source, ResponseChunkMsg::Next, t).reply(...)`
-    /// until `ResponseChunkReply::Eof`.
+    /// Streaming source with declared length. The connection isolate
+    /// pulls chunks via `call(stream.source, ResponseChunkMsg::Next,
+    /// t).reply(...)` until `ResponseChunkReply::Eof`.
     Stream(crate::streaming::ResponseStream),
+    /// Streaming source with no declared length. Wire framing is
+    /// `Transfer-Encoding: chunked`. Same `Next`/`Chunk`/`Eof`
+    /// exchange as `Stream`; only the framing differs.
+    ChunkedStream(crate::streaming::ChunkedResponseStream),
 }
 
 impl HttpResponseBody {
@@ -143,16 +160,25 @@ impl HttpResponseBody {
     pub fn as_buffered(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(bytes) => Some(bytes),
-            Self::Stream(_) => None,
+            Self::Stream(_) | Self::ChunkedStream(_) => None,
         }
     }
 
-    /// Total declared body length: vec length for `Buffered`, declared
-    /// `content_length` for `Stream`.
-    pub fn declared_length(&self) -> usize {
+    /// Returns the declared body length when one is known. `None`
+    /// for `ChunkedStream` because chunked framing is precisely the
+    /// "no declared length" case.
+    ///
+    /// The `Option` is intentional: encoding callers should branch
+    /// on `Some(n)` → emit `Content-Length: n` vs `None` → emit
+    /// `Transfer-Encoding: chunked`. Returning a sentinel `0` for
+    /// chunked would confuse that branch with a genuine zero-length
+    /// body. If you only need the variant tag, match on `body`
+    /// directly.
+    pub fn declared_length(&self) -> Option<usize> {
         match self {
-            Self::Buffered(bytes) => bytes.len(),
-            Self::Stream(s) => s.content_length,
+            Self::Buffered(bytes) => Some(bytes.len()),
+            Self::Stream(s) => Some(s.content_length),
+            Self::ChunkedStream(_) => None,
         }
     }
 }
@@ -175,7 +201,7 @@ impl PartialEq<[u8]> for HttpResponseBody {
     fn eq(&self, other: &[u8]) -> bool {
         match self {
             Self::Buffered(bytes) => bytes == other,
-            Self::Stream(_) => false,
+            Self::Stream(_) | Self::ChunkedStream(_) => false,
         }
     }
 }
@@ -242,10 +268,53 @@ impl HttpResponse {
 
     /// Builds a response with a streaming body. The service must
     /// register the chunk source isolate separately and supply its
-    /// address.
+    /// address. The body is framed by `Content-Length`. For an
+    /// unknown-length body use [`Self::stream_chunked`].
     pub fn with_stream(status: StatusCode, stream: crate::streaming::ResponseStream) -> Self {
         let mut response = Self::with_status(status);
         response.body = HttpResponseBody::Stream(stream);
+        response
+    }
+
+    /// Loud-API constructor for a known-length streamed response.
+    /// Wire framing is `Content-Length: {content_length}`. Source
+    /// must deliver exactly `content_length` bytes across `Chunk`
+    /// replies before `Eof`. Equivalent to
+    /// `Self::with_stream(status, ResponseStream { content_length, source })`.
+    pub fn stream_known_length(
+        status: StatusCode,
+        content_length: usize,
+        source: tina::Address<
+            crate::streaming::ResponseChunkMsg,
+            crate::streaming::ResponseChunkReply,
+        >,
+    ) -> Self {
+        Self::with_stream(
+            status,
+            crate::streaming::ResponseStream {
+                content_length,
+                source,
+            },
+        )
+    }
+
+    /// Loud-API constructor for an unknown-length streamed response.
+    /// Wire framing is `Transfer-Encoding: chunked`. Source produces
+    /// chunks until it replies `Eof`; the connection writes the
+    /// chunked terminator on its own. Use this when the body length
+    /// is not known up front. If you do know the length, prefer
+    /// [`Self::stream_known_length`] so the client can size its
+    /// read buffer.
+    pub fn stream_chunked(
+        status: StatusCode,
+        source: tina::Address<
+            crate::streaming::ResponseChunkMsg,
+            crate::streaming::ResponseChunkReply,
+        >,
+    ) -> Self {
+        let mut response = Self::with_status(status);
+        response.body =
+            HttpResponseBody::ChunkedStream(crate::streaming::ChunkedResponseStream { source });
         response
     }
 
@@ -415,8 +484,18 @@ pub struct HttpLimits {
     /// .reply(...)`; each call returns a chunk of up to `chunk_size`
     /// bytes (or `Eof`). The connection only issues `tcp_read` when
     /// the buffer is empty and more body is owed, so a slow service
-    /// applies real backpressure to TCP reads and only the in-flight
-    /// chunk is resident.
+    /// applies real backpressure to TCP reads.
+    ///
+    /// **Resident-bytes caveat.** Subsequent socket reads are
+    /// capped by `chunk_size`, but the initial post-head residual
+    /// is bounded only by the per-syscall ceiling (`READ_CHUNK = 4096`
+    /// bytes). The first `tcp_read` is issued before we know the
+    /// `Content-Length` and pulls up to `READ_CHUNK` bytes; whatever
+    /// arrived past the head ends up resident in the chunk buffer
+    /// even if `chunk_size` is smaller. After that initial slice
+    /// drains, subsequent reads honor `chunk_size`. To bound the
+    /// peak honestly under `chunk_size`, send the head and body in
+    /// separate writes so the head-read returns no body bytes.
     ///
     /// When `None` (the default), the connection accumulates the full
     /// body up to `max_body_bytes` and dispatches a
