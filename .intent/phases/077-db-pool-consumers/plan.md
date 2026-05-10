@@ -42,6 +42,18 @@ do not confuse pool pressure with database pressure.
 - No unbounded query queue.
 - No multi-shard pool.
 - No fake "cancel means query died" guarantee.
+- No pool of whole bridge workers unless the audit proves one bridge
+  worker cannot express the needed pressure. Extra runtimes are cost,
+  not decoration.
+
+## Shape
+
+Two PRs max:
+
+1. Audit + one material DB consumer improvement.
+2. Specimen/docs cleanup if the first PR proves a new copied shape.
+
+Material improvement means code or tests, not just prose.
 
 ## Rock 0 — Audit Current DB Bridges
 
@@ -99,10 +111,13 @@ Acceptable alternative:
 
 ```text
 one PgWorker with max_in_flight=N already acts like the pool;
-then do not wrap it. Instead ship docs/tests proving the bridge is the pool.
+then do not wrap it. Instead ship docs/tests/specimen proving the bridge is the pool.
 ```
 
 Do the honest thing. Do not add a pool just because the phase says pool.
+Do not stop at "already fine" unless the PR still improves the copied
+surface: pressure report adapter, helper, test, specimen, or doc table
+that makes the existing pool shape obvious.
 
 Proof:
 
@@ -113,6 +128,14 @@ Proof:
 - SQL error does not retire the lane by default;
 - closed bridge/lane forces typed close/retire;
 - pressure report says capacity/current/high-water/full.
+
+If wrapping `PgWorker`, define exactly what the leased handle is:
+
+- lease token is pool-owned;
+- handle is a `PgAddress` or narrow `PgLane`;
+- release returns/records an outcome;
+- SQL errors do not retire by default;
+- transport/worker closed may retire.
 
 ## Rock 3 — SQLite Decision
 
@@ -150,4 +173,6 @@ README must say:
 - `Full`, `Timeout`, DB `Busy`, SQLx pool timeout, and SQL errors remain
   separate facts.
 - One specimen shows the copied shape.
+- If no wrapper ships, the bridge-as-pool decision is backed by tests
+  and docs good enough for an LLM to copy.
 - Roadmap/changelog updated.

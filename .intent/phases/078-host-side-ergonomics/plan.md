@@ -36,6 +36,16 @@ the model.
 - No helper that erases `Full`, `Closed`, `Timeout`, or typed reply
   shape.
 
+## Shape
+
+Prefer one PR:
+
+1. docs for `call_blocking`;
+2. trace query helpers;
+3. migrate obvious tests/specimens.
+
+Scenario runner is second PR only if the audit proves repeated pain.
+
 ## Rock 0 — Audit Current Host Scripts
 
 Read specimens/tests that recently paid host ceremony:
@@ -81,7 +91,9 @@ Update examples where the fake host Driver is still present.
 
 Tests repeat `trace.iter().filter(matches!(...)).count()`.
 
-Add small read-only helpers near `RuntimeEvent` / trace snapshot:
+Add small read-only helpers on the trace containers users already hold
+(`TraceSnapshot`, `Vec<RuntimeEvent>`, or a small extension trait over
+`[RuntimeEvent]`; choose one home and document it):
 
 ```rust
 trace.count_completed(CallKind::TcpAccept)
@@ -96,6 +108,8 @@ Keep it boring:
 - no allocation-heavy index;
 - no matcher framework unless two helpers prove insufficient;
 - helpers return counts/options over existing trace slices.
+- no semantic guesses. A helper can count events; it cannot infer
+  "service idle" or "work settled".
 
 Use them in HTTP/TLS/keepalive tests that currently hand-roll the same
 filter.
@@ -118,6 +132,7 @@ Rules:
 - explicit sleeps only;
 - no "wait until idle" lie;
 - no service-handler API.
+- no hidden trace polling.
 
 If not clearly pulled, document the pattern and stop.
 

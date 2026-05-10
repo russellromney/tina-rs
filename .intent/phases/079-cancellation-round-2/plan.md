@@ -42,10 +42,24 @@ late result is a trace fact, not a ghost.
 - No global cancel-all hammer without ownership.
 - No unbounded cancellation registry.
 - No fake "task abortion" story for work Tina does not own.
+- No generic `Cancelable` framework until three surfaces need the same
+  code. Two is still naming, not abstraction.
+
+## Shape
+
+Two PRs max:
+
+1. Response body source cancel + docs table.
+2. Pool/bridge audit fixes that are clearly pulled by code.
+
+If PR 1 gets large, stop there. The body-source leak is the concrete
+user-facing bug; bridge cancellation is allowed to remain documented
+truth if no boring fix exists.
 
 ## Rock 0 — Cancellation State Table
 
-Write and keep a small table in this plan/docs:
+Write and keep a small table in this plan/docs. Update the table when
+code changes:
 
 | Surface | Cancel can stop waiting? | Cancel can stop work? | Late result visible? |
 |---|---|---|---|
@@ -122,6 +136,9 @@ Implement only the boring wins:
 - Reqwest may need a future abort-handle design; do not improvise if
   it changes bridge shape.
 
+If the audit finds only docs mismatch, fix docs and stop. Do not invent
+new bridge machinery to satisfy the phase title.
+
 ## Rock 4 — Owner Stop Cleanup
 
 Services with stored `CallHandle`s should have one copied cleanup
@@ -132,8 +149,9 @@ let effects = self.pending.drain().map(cancel_call(...)).collect();
 Effect::Batch(effects plus stop)
 ```
 
-Do not hide cancel outcomes. A helper may collect effects, but user code
-must still decide what `CancelOutcome` means if it matters.
+Do not hide cancel outcomes. A helper may collect effects only if it
+returns/feeds every `CancelOutcome` visibly. If that makes the helper
+uglier than the loop, keep the loop.
 
 ## Rock 5 — Docs
 
