@@ -5,7 +5,8 @@ use std::time::Duration;
 use tina_runtime::CallOutcome;
 use tina_sqlx_bridge::{
     PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt, PgPoolConfig,
-    PgRequest, PgResponse, PgRow, PgTransientReason, PgValue, U64TooLarge,
+    PgRequest, PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome, PgTransientReason,
+    PgValue, U64TooLarge,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,6 +152,73 @@ fn pg_request_builder_params_replaces_vector() {
         panic!("expected FetchOne");
     };
     assert_eq!(params, vec![PgValue::Bool(true), PgValue::Null]);
+}
+
+#[test]
+fn pg_step_builder_param_and_replace() {
+    let step = PgStep::execute("UPDATE t SET v = $1 WHERE k = $2")
+        .param(7_i64)
+        .param("seven");
+    match step {
+        PgStep::Execute { params, .. } => {
+            assert_eq!(
+                params,
+                vec![PgValue::I64(7), PgValue::String("seven".into())]
+            );
+        }
+        _ => panic!("expected Execute"),
+    }
+    let replaced = PgStep::fetch_one("SELECT 1")
+        .param(1)
+        .params(vec![PgValue::Bool(false)]);
+    match replaced {
+        PgStep::FetchOne { params, .. } => {
+            assert_eq!(params, vec![PgValue::Bool(false)]);
+        }
+        _ => panic!("expected FetchOne"),
+    }
+}
+
+#[test]
+fn pg_request_transaction_carries_steps() {
+    let req = PgRequest::transaction(vec![
+        PgStep::execute("INSERT INTO t VALUES ($1)").param(1_i64),
+        PgStep::fetch_one("SELECT 1::INT8"),
+    ]);
+    match req {
+        PgRequest::Transaction { steps } => {
+            assert_eq!(steps.len(), 2);
+        }
+        _ => panic!("expected Transaction"),
+    }
+}
+
+#[test]
+fn pg_request_param_is_noop_on_transaction() {
+    // `.param(...)` on a Transaction is a no-op, not a panic. Steps
+    // carry their own parameters.
+    let req = PgRequest::transaction(vec![PgStep::execute("SELECT 1")])
+        .param(99_i64)
+        .params(vec![PgValue::Bool(true)]);
+    match req {
+        PgRequest::Transaction { steps } => assert_eq!(steps.len(), 1),
+        _ => panic!("expected Transaction"),
+    }
+}
+
+#[test]
+fn classify_committed_transaction_succeeds() {
+    use tina_sqlx_bridge::PgTransactionCallOutcome;
+    let outcome: PgTransactionCallOutcome =
+        CallOutcome::Replied(Ok(PgTransactionOutcome::Committed {
+            steps: vec![PgStepOk::Executed { rows_affected: 1 }],
+        }));
+    match outcome.classify() {
+        PgOutcomeClass::Succeeded(PgTransactionOutcome::Committed { steps }) => {
+            assert_eq!(steps.len(), 1);
+        }
+        other => panic!("expected Succeeded(Committed), got {other:?}"),
+    }
 }
 
 #[test]

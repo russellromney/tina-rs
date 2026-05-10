@@ -184,11 +184,12 @@ mod worker;
 pub use helpers::{
     ExecuteCall, FetchManyCall, FetchOneCall, PgAddress, PgCallOutcome, PgExecutedOutcome,
     PgFatalReason, PgFetchManyOutcome, PgFetchOneOutcome, PgOutcomeClass, PgOutcomeExt, PgResult,
-    PgRows, PgTransientReason, execute_call, fetch_many_call, fetch_one_call, send_request,
+    PgRows, PgTransactionCallOutcome, PgTransientReason, TransactionCall, execute_call,
+    fetch_many_call, fetch_one_call, send_request, transaction_call,
 };
 pub use metrics::{PgMetrics, PgMetricsHandle};
 pub use types::{
     InstallError, PgConfig, PgConfigError, PgError, PgPoolConfig, PgRequest, PgResponse, PgRow,
-    PgValue, U64TooLarge,
+    PgStep, PgStepOk, PgTransactionOutcome, PgValue, U64TooLarge,
 };
 pub use worker::{InstalledPgBridge, PgCloser, PgMsg, PgWorker};

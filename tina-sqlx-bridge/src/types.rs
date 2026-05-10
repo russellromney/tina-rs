@@ -271,6 +271,122 @@ pub enum PgRequest {
         /// [`PgConfig::max_response_rows`].
         max_rows: usize,
     },
+    /// Run an atomic script of [`PgStep`]s inside one transaction.
+    ///
+    /// Bridge takes one connection from the pool, opens a SQLx
+    /// `Transaction`, runs each step in order, and either commits
+    /// (all steps succeeded) or rolls back (first failing step). The
+    /// reply is a single [`PgResponse::Transaction`] carrying the
+    /// per-step outcomes plus commit/rollback truth. No nested
+    /// transactions; nesting is rejected at admission with
+    /// [`PgError::InvalidRequest`]. Empty `steps` is also rejected.
+    ///
+    /// Counts as one slot against `max_in_flight`, holds one
+    /// connection for the script's wall-clock duration. The bridge's
+    /// per-attempt deadline applies to the script as a whole.
+    Transaction {
+        /// Ordered list of statements. Must be non-empty.
+        steps: Vec<PgStep>,
+    },
+}
+
+/// One statement inside a [`PgRequest::Transaction`] script. The
+/// shapes mirror [`PgRequest`] minus `Transaction` — nested
+/// transactions are rejected at admission.
+#[derive(Debug, Clone)]
+pub enum PgStep {
+    /// Run one row-less statement.
+    Execute {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+    },
+    /// Run one query expected to return zero or one row.
+    FetchOne {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+    },
+    /// Run one query and stream rows up to a cap.
+    FetchMany {
+        /// SQL text.
+        sql: String,
+        /// Positional parameters bound in order.
+        params: Vec<PgValue>,
+        /// Caller's row cap; clamped by `PgConfig::max_response_rows`.
+        max_rows: usize,
+    },
+}
+
+impl PgStep {
+    /// `Execute` step with no parameters.
+    pub fn execute(sql: impl Into<String>) -> Self {
+        Self::Execute {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
+    }
+
+    /// `FetchOne` step with no parameters.
+    pub fn fetch_one(sql: impl Into<String>) -> Self {
+        Self::FetchOne {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
+    }
+
+    /// `FetchMany` step with no parameters and a per-step row cap.
+    pub fn fetch_many(sql: impl Into<String>, max_rows: usize) -> Self {
+        Self::FetchMany {
+            sql: sql.into(),
+            params: Vec::new(),
+            max_rows,
+        }
+    }
+
+    /// Append one parameter. Chainable.
+    pub fn param(mut self, value: impl Into<PgValue>) -> Self {
+        match &mut self {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
+                params.push(value.into());
+            }
+        }
+        self
+    }
+
+    /// Replace the parameter list.
+    pub fn params(mut self, values: Vec<PgValue>) -> Self {
+        match &mut self {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => {
+                *params = values;
+            }
+        }
+        self
+    }
+
+    /// Borrow the SQL text. Used by validation.
+    pub(crate) fn sql(&self) -> &str {
+        match self {
+            Self::Execute { sql, .. }
+            | Self::FetchOne { sql, .. }
+            | Self::FetchMany { sql, .. } => sql,
+        }
+    }
+
+    /// Borrow the parameter slice. Used by validation.
+    pub(crate) fn params_slice(&self) -> &[PgValue] {
+        match self {
+            Self::Execute { params, .. }
+            | Self::FetchOne { params, .. }
+            | Self::FetchMany { params, .. } => params,
+        }
+    }
 }
 
 impl PgRequest {
@@ -324,12 +440,16 @@ impl PgRequest {
             | Self::FetchMany { params, .. } => {
                 params.push(value.into());
             }
+            // Transaction has no top-level params; build steps with
+            // `PgStep::param` and pass them via `.steps(...)`.
+            Self::Transaction { .. } => {}
         }
         self
     }
 
     /// **Replace** the parameter list. Anything previously added by
-    /// [`Self::param`] is discarded.
+    /// [`Self::param`] is discarded. No-op on `Transaction` — build
+    /// steps and pass them via [`Self::steps`] instead.
     pub fn params(mut self, values: Vec<PgValue>) -> Self {
         match &mut self {
             Self::Execute { params, .. }
@@ -337,6 +457,21 @@ impl PgRequest {
             | Self::FetchMany { params, .. } => {
                 *params = values;
             }
+            Self::Transaction { .. } => {}
+        }
+        self
+    }
+
+    /// Build a transaction request from an ordered list of steps.
+    pub fn transaction(steps: Vec<PgStep>) -> Self {
+        Self::Transaction { steps }
+    }
+
+    /// Replace the steps of a `Transaction` request. No-op on
+    /// non-Transaction variants.
+    pub fn steps(mut self, new_steps: Vec<PgStep>) -> Self {
+        if let Self::Transaction { steps } = &mut self {
+            *steps = new_steps;
         }
         self
     }
@@ -362,6 +497,51 @@ pub enum PgResponse {
         rows: Vec<PgRow>,
         /// `true` if Postgres had more rows to send and the bridge
         /// hit its cap. The buffered rows are still valid.
+        truncated: bool,
+    },
+    /// `Transaction` outcome. Either every step committed or the
+    /// first failing step rolled the whole script back.
+    Transaction(PgTransactionOutcome),
+}
+
+/// Result of a transactional script.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PgTransactionOutcome {
+    /// All steps succeeded; the bridge ran `COMMIT`.
+    Committed {
+        /// Per-step outcomes in input order.
+        steps: Vec<PgStepOk>,
+    },
+    /// At least one step failed; the bridge ran `ROLLBACK`. Records
+    /// the steps that completed before the failure plus the failing
+    /// step's index and error.
+    RolledBack {
+        /// Per-step outcomes for steps before the failure.
+        completed: Vec<PgStepOk>,
+        /// Index into the original `steps` of the failing step.
+        failed_at: usize,
+        /// Error returned by the failing step.
+        error: PgError,
+    },
+}
+
+/// Successful outcome of a single [`PgStep`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PgStepOk {
+    /// `Execute` succeeded with this many rows affected.
+    Executed {
+        /// Rows affected, as reported by Postgres.
+        rows_affected: u64,
+    },
+    /// `FetchOne` returned exactly one row.
+    Row(PgRow),
+    /// `FetchOne` returned zero rows.
+    NoRows,
+    /// `FetchMany` returned a buffered set, possibly truncated.
+    Rows {
+        /// Buffered rows, in result order.
+        rows: Vec<PgRow>,
+        /// Set when the bridge hit its row cap.
         truncated: bool,
     },
 }

@@ -23,7 +23,7 @@ use tina_runtime::{
 };
 use tina_sqlx_bridge::{
     InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgPoolConfig, PgRequest,
-    PgResponse, PgRows, PgWorker, send_request,
+    PgResponse, PgRows, PgStep, PgStepOk, PgTransactionOutcome, PgWorker, send_request,
 };
 
 fn database_url() -> Option<String> {
@@ -753,6 +753,287 @@ fn pool_acquire_timeout_distinct_from_tina_full() {
 
     // Drain A so the runtime can shut down cleanly.
     let _ = sink_a.wait_one(Duration::from_secs(10));
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_commits_when_all_steps_succeed() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let table = unique_table();
+
+    // Create the table outside the transaction.
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!(
+            "CREATE TABLE {table} (id INT8 PRIMARY KEY, value INT8 NOT NULL)"
+        )),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    // Atomic script: insert two rows and read one back.
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::transaction(vec![
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (1, 100)")),
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (2, 200)")),
+            PgStep::fetch_one(format!("SELECT value FROM {table} WHERE id = 1")),
+        ]),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Transaction(PgTransactionOutcome::Committed {
+            steps,
+        }))) => {
+            assert_eq!(steps.len(), 3);
+            assert!(matches!(steps[0], PgStepOk::Executed { rows_affected: 1 }));
+            assert!(matches!(steps[1], PgStepOk::Executed { rows_affected: 1 }));
+            match &steps[2] {
+                PgStepOk::Row(row) => assert_eq!(row.get_i64(0), Some(100)),
+                other => panic!("step 2: expected Row, got {other:?}"),
+            }
+        }
+        other => panic!("transaction: {other:?}"),
+    }
+
+    // Verify both rows are visible after commit.
+    let count = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one(format!("SELECT count(*)::INT8 FROM {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match count {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.get_i64(0), Some(2));
+        }
+        other => panic!("count: {other:?}"),
+    }
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("DROP TABLE {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.transactions_committed, 1);
+    assert_eq!(m.transactions_rolled_back, 0);
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_rolls_back_on_step_failure() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+    let table = unique_table();
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!(
+            "CREATE TABLE {table} (id INT8 PRIMARY KEY, value INT8 NOT NULL)"
+        )),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    // Step 0 succeeds, step 1 violates the PK (id = 1 again),
+    // step 2 never runs. Whole script must roll back.
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::transaction(vec![
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (1, 100)")),
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (1, 200)")),
+            PgStep::execute(format!("INSERT INTO {table} (id, value) VALUES (2, 300)")),
+        ]),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Transaction(PgTransactionOutcome::RolledBack {
+            completed,
+            failed_at,
+            error,
+        }))) => {
+            assert_eq!(completed.len(), 1, "only step 0 ran before failure");
+            assert_eq!(failed_at, 1);
+            assert!(matches!(error, PgError::Sqlx(_)), "got {error:?}");
+        }
+        other => panic!("transaction: {other:?}"),
+    }
+
+    // Confirm rollback: no rows visible.
+    let count = one(
+        &runtime,
+        &bridge,
+        PgRequest::fetch_one(format!("SELECT count(*)::INT8 FROM {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match count {
+        CallOutcome::Replied(Ok(PgResponse::Row(row))) => {
+            assert_eq!(row.get_i64(0), Some(0), "rollback must hide all rows");
+        }
+        other => panic!("count: {other:?}"),
+    }
+
+    let _ = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute(format!("DROP TABLE {table}")),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.transactions_committed, 0);
+    assert_eq!(m.transactions_rolled_back, 1);
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_step_can_be_fetch_many_with_truncation() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::transaction(vec![PgStep::fetch_many(
+            "SELECT generate_series(1, 50)::INT8",
+            3,
+        )]),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Transaction(PgTransactionOutcome::Committed {
+            steps,
+        }))) => match &steps[0] {
+            PgStepOk::Rows { rows, truncated } => {
+                assert_eq!(rows.len(), 3);
+                assert!(truncated);
+            }
+            other => panic!("step 0: {other:?}"),
+        },
+        other => panic!("transaction: {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn transaction_typed_helper_returns_outcome() {
+    use tina_sqlx_bridge::transaction_call;
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    let bridge = install(&runtime, &url);
+
+    let result_slot: Arc<Mutex<Option<Result<PgTransactionOutcome, PgError>>>> =
+        Arc::new(Mutex::new(None));
+    let done = Arc::new(std::sync::Condvar::new());
+
+    #[derive(Debug)]
+    enum HelperMsg {
+        Run,
+        Done(tina_sqlx_bridge::PgTransactionCallOutcome),
+    }
+    struct HelperIsolate {
+        worker: PgAddress,
+        slot: Arc<Mutex<Option<Result<PgTransactionOutcome, PgError>>>>,
+        done: Arc<std::sync::Condvar>,
+    }
+    impl Isolate for HelperIsolate {
+        tina::isolate_types! {
+            message: HelperMsg,
+            reply: (),
+            send: tina::Outbound<Infallible>,
+            spawn: Infallible,
+            call: RuntimeCall<HelperMsg>,
+            shard: SingleShard,
+        }
+        fn handle(
+            &mut self,
+            msg: HelperMsg,
+            _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                HelperMsg::Run => transaction_call(
+                    self.worker,
+                    vec![
+                        PgStep::execute("SELECT 1::INT8"),
+                        PgStep::fetch_one("SELECT 2::INT8"),
+                    ],
+                    Duration::from_secs(5),
+                )
+                .reply(HelperMsg::Done),
+                HelperMsg::Done(outcome) => {
+                    let stored = match outcome {
+                        CallOutcome::Replied(r) => Some(r),
+                        _ => None,
+                    };
+                    *self.slot.lock().unwrap() = stored;
+                    self.done.notify_all();
+                    stop()
+                }
+            }
+        }
+    }
+    let isolate = HelperIsolate {
+        worker: bridge.address,
+        slot: Arc::clone(&result_slot),
+        done: Arc::clone(&done),
+    };
+    let addr = runtime
+        .register_with_capacity::<_, Infallible>(isolate, 4)
+        .expect("register");
+    runtime.try_send(addr, HelperMsg::Run).expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut guard = result_slot.lock().unwrap();
+    while guard.is_none() {
+        let now = Instant::now();
+        if now >= deadline {
+            panic!("helper never finished");
+        }
+        let (g, _) = done.wait_timeout(guard, deadline - now).unwrap();
+        guard = g;
+    }
+    let result = guard.take().unwrap();
+    drop(guard);
+
+    match result {
+        Ok(PgTransactionOutcome::Committed { steps }) => assert_eq!(steps.len(), 2),
+        other => panic!("typed helper: {other:?}"),
+    }
     shutdown(runtime);
 }
 

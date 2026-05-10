@@ -39,7 +39,7 @@ use tina::Effect;
 use tina::Isolate;
 use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call};
 
-use crate::types::{PgError, PgRequest, PgResponse, PgRow};
+use crate::types::{PgError, PgRequest, PgResponse, PgRow, PgStep, PgTransactionOutcome};
 use crate::worker::PgMsg;
 
 /// Worker reply type. Same as the inner `Result` carried inside a
@@ -68,6 +68,11 @@ pub type PgFetchOneOutcome = CallOutcome<Result<Option<PgRow>, PgError>>;
 /// gives the buffered rows and whether the bridge stopped pulling
 /// at its cap.
 pub type PgFetchManyOutcome = CallOutcome<Result<PgRows, PgError>>;
+
+/// Reply shape from [`transaction_call`]. The inner `Ok` carries a
+/// [`PgTransactionOutcome`] so callers see commit/rollback truth
+/// without losing the per-step record.
+pub type PgTransactionCallOutcome = CallOutcome<Result<PgTransactionOutcome, PgError>>;
 
 /// Buffered query result. Carried inside [`PgFetchManyOutcome`].
 #[derive(Debug, Clone, PartialEq)]
@@ -253,6 +258,40 @@ pub fn fetch_many_call(
     }
 }
 
+/// Prepared transaction call.
+pub struct TransactionCall {
+    inner: IsolateCall<PgMsg, PgResult>,
+}
+
+impl std::fmt::Debug for TransactionCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionCall").finish_non_exhaustive()
+    }
+}
+
+impl TransactionCall {
+    /// Turn this prepared call into one continuation message.
+    pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(PgTransactionCallOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.inner
+            .reply(move |raw| translator(project_transaction(raw)))
+    }
+}
+
+/// Build a `Transaction` call. The inner `Ok` carries a
+/// [`PgTransactionOutcome`] which itself names commit vs rollback.
+/// `Err` covers admission/timeout failures, COMMIT failures, and
+/// pool errors before the script ran.
+pub fn transaction_call(addr: PgAddress, steps: Vec<PgStep>, timeout: Duration) -> TransactionCall {
+    TransactionCall {
+        inner: send_request(addr, PgRequest::Transaction { steps }, timeout),
+    }
+}
+
 fn project_executed(outcome: PgCallOutcome) -> PgExecutedOutcome {
     match outcome {
         CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected })) => {
@@ -293,6 +332,19 @@ fn project_fetch_many(outcome: PgCallOutcome) -> PgFetchManyOutcome {
         }
         CallOutcome::Replied(Ok(_)) => CallOutcome::Replied(Err(PgError::Internal(
             "fetch_many_call: worker returned non-FetchMany response".into(),
+        ))),
+        CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
+        CallOutcome::Full => CallOutcome::Full,
+        CallOutcome::Closed => CallOutcome::Closed,
+        CallOutcome::Timeout => CallOutcome::Timeout,
+    }
+}
+
+fn project_transaction(outcome: PgCallOutcome) -> PgTransactionCallOutcome {
+    match outcome {
+        CallOutcome::Replied(Ok(PgResponse::Transaction(tx))) => CallOutcome::Replied(Ok(tx)),
+        CallOutcome::Replied(Ok(_)) => CallOutcome::Replied(Err(PgError::Internal(
+            "transaction_call: worker returned non-Transaction response".into(),
         ))),
         CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
         CallOutcome::Full => CallOutcome::Full,
@@ -413,6 +465,13 @@ impl PgOutcomeExt for PgFetchManyOutcome {
     type Success = PgRows;
     fn classify(self) -> PgOutcomeClass<PgRows> {
         classify_inner(self, |rows| rows)
+    }
+}
+
+impl PgOutcomeExt for PgTransactionCallOutcome {
+    type Success = PgTransactionOutcome;
+    fn classify(self) -> PgOutcomeClass<PgTransactionOutcome> {
+        classify_inner(self, |tx| tx)
     }
 }
 

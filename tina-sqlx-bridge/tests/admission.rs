@@ -13,7 +13,7 @@ use tina_runtime::{
 };
 use tina_sqlx_bridge::{
     InstallError, InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgRequest,
-    PgWorker, send_request,
+    PgStep, PgWorker, send_request,
 };
 
 #[derive(Default)]
@@ -250,6 +250,66 @@ fn empty_sql_replies_invalid_request() {
         other => panic!("expected InvalidRequest, got {other:?}"),
     }
     assert_eq!(bridge.metrics.snapshot().invalid, 1);
+    shutdown(runtime);
+}
+
+#[test]
+fn empty_transaction_replies_invalid_request() {
+    let runtime = make_runtime();
+    let (bridge, _tokio_rt) = install_lazy(&runtime, config_for_admission_tests());
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller, CallerMsg::Run(PgRequest::transaction(vec![])))
+        .expect("send");
+    let outcome = sink.wait_one(Duration::from_secs(3));
+    match outcome {
+        CallOutcome::Replied(Err(PgError::InvalidRequest(msg))) => {
+            assert!(msg.contains("no steps"), "got {msg}");
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+    shutdown(runtime);
+}
+
+#[test]
+fn transaction_with_empty_step_sql_replies_invalid_request_indexed() {
+    let runtime = make_runtime();
+    let (bridge, _tokio_rt) = install_lazy(&runtime, config_for_admission_tests());
+
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(PgRequest::transaction(vec![
+                PgStep::execute("SELECT 1"),
+                PgStep::execute("   "),
+            ])),
+        )
+        .expect("send");
+    let outcome = sink.wait_one(Duration::from_secs(3));
+    match outcome {
+        CallOutcome::Replied(Err(PgError::InvalidRequest(msg))) => {
+            assert!(
+                msg.contains("step 1"),
+                "expected indexed message, got {msg}"
+            );
+            assert!(msg.contains("empty"), "got {msg}");
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
     shutdown(runtime);
 }
 

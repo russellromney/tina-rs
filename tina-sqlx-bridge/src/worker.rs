@@ -28,7 +28,10 @@ use tokio::sync::oneshot;
 use tracing::{Level, event};
 
 use crate::metrics::{MetricsInner, PgMetricsHandle};
-use crate::types::{InstallError, PgConfig, PgError, PgRequest, PgResponse, PgRow, PgValue};
+use crate::types::{
+    InstallError, PgConfig, PgError, PgRequest, PgResponse, PgRow, PgStep, PgStepOk,
+    PgTransactionOutcome, PgValue,
+};
 
 /// `tracing` target for per-call events on the bridge isolate.
 #[cfg(feature = "tracing")]
@@ -46,6 +49,7 @@ fn request_kind_name(request: &PgRequest) -> &'static str {
         PgRequest::Execute { .. } => "execute",
         PgRequest::FetchOne { .. } => "fetch_one",
         PgRequest::FetchMany { .. } => "fetch_many",
+        PgRequest::Transaction { .. } => "transaction",
     }
 }
 
@@ -418,6 +422,27 @@ fn emit_replied(result: &PgResult, request_kind: &'static str) {
             row_count = rows.len() as u64,
             truncated = *truncated,
         ),
+        Ok(PgResponse::Transaction(outcome)) => match outcome {
+            PgTransactionOutcome::Committed { steps } => event!(
+                target: TRACE_TARGET_CALL,
+                Level::DEBUG,
+                kind = "replied",
+                outcome = "tx_committed",
+                request_kind,
+                step_count = steps.len() as u64,
+            ),
+            PgTransactionOutcome::RolledBack {
+                failed_at, error, ..
+            } => event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "replied",
+                outcome = "tx_rolled_back",
+                request_kind,
+                failed_at = *failed_at as u64,
+                detail = %error,
+            ),
+        },
         Err(err) => {
             let reason = pg_error_reason(err);
             let level = match err {
@@ -570,11 +595,28 @@ impl<S: Shard + 'static> Isolate for PgWorker<S> {
 
 /// Structural checks only. Database not touched.
 fn validate_request(request: &PgRequest, config: &PgConfig) -> Result<(), PgError> {
-    let (sql, params_len) = match request {
-        PgRequest::Execute { sql, params } => (sql, params.len()),
-        PgRequest::FetchOne { sql, params } => (sql, params.len()),
-        PgRequest::FetchMany { sql, params, .. } => (sql, params.len()),
-    };
+    match request {
+        PgRequest::Execute { sql, params } | PgRequest::FetchOne { sql, params } => {
+            check_sql_and_params(sql, params.len(), config)
+        }
+        PgRequest::FetchMany { sql, params, .. } => check_sql_and_params(sql, params.len(), config),
+        PgRequest::Transaction { steps } => {
+            if steps.is_empty() {
+                return Err(PgError::InvalidRequest("transaction has no steps".into()));
+            }
+            for (i, step) in steps.iter().enumerate() {
+                if let Err(PgError::InvalidRequest(msg)) =
+                    check_sql_and_params(step.sql(), step.params_slice().len(), config)
+                {
+                    return Err(PgError::InvalidRequest(format!("step {i}: {msg}")));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn check_sql_and_params(sql: &str, params_len: usize, config: &PgConfig) -> Result<(), PgError> {
     if sql.trim().is_empty() {
         return Err(PgError::InvalidRequest("empty sql".into()));
     }
@@ -608,6 +650,20 @@ fn tally_worker_terminal(metrics: &MetricsInner, result: &PgResult) {
                 metrics.responses_truncated.fetch_add(1, Ordering::Relaxed);
             }
         }
+        Ok(PgResponse::Transaction(outcome)) => match outcome {
+            PgTransactionOutcome::Committed { steps } => {
+                metrics
+                    .transactions_committed
+                    .fetch_add(1, Ordering::Relaxed);
+                tally_transaction_steps(metrics, steps);
+            }
+            PgTransactionOutcome::RolledBack { completed, .. } => {
+                metrics
+                    .transactions_rolled_back
+                    .fetch_add(1, Ordering::Relaxed);
+                tally_transaction_steps(metrics, completed);
+            }
+        },
         Err(PgError::PoolAcquireTimeout) => {
             metrics
                 .pool_acquire_timeouts
@@ -628,6 +684,32 @@ fn tally_worker_terminal(metrics: &MetricsInner, result: &PgResult) {
         // Admission-class errors are tallied at admission, not here;
         // and Timeout is tallied at the bridge poll site.
         Err(_) => {}
+    }
+}
+
+fn tally_transaction_steps(metrics: &MetricsInner, steps: &[PgStepOk]) {
+    for step in steps {
+        match step {
+            PgStepOk::Executed { .. } => {
+                metrics.responses_executed.fetch_add(1, Ordering::Relaxed);
+            }
+            PgStepOk::Row(_) => {
+                metrics.responses_row.fetch_add(1, Ordering::Relaxed);
+                metrics.rows_returned.fetch_add(1, Ordering::Relaxed);
+            }
+            PgStepOk::NoRows => {
+                metrics.responses_no_rows.fetch_add(1, Ordering::Relaxed);
+            }
+            PgStepOk::Rows { rows, truncated } => {
+                metrics.responses_rows.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .rows_returned
+                    .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                if *truncated {
+                    metrics.responses_truncated.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 
@@ -711,6 +793,124 @@ async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize
                 }
             }
             Ok(PgResponse::Rows { rows, truncated })
+        }
+        PgRequest::Transaction { steps } => {
+            // Validation guarantees `steps` is non-empty.
+            let mut tx = match pool.begin().await {
+                Ok(tx) => tx,
+                Err(e) => return Err(map_sqlx_error(e)),
+            };
+            let mut completed: Vec<PgStepOk> = Vec::with_capacity(steps.len());
+            let mut steps_iter = steps.into_iter().enumerate();
+            let rolled_back = loop {
+                let Some((i, step)) = steps_iter.next() else {
+                    break None;
+                };
+                match run_step(&mut tx, step, max_response_rows).await {
+                    Ok(ok) => completed.push(ok),
+                    Err(error) => break Some((i, error)),
+                }
+            };
+            if let Some((failed_at, error)) = rolled_back {
+                // Drop tx -> sqlx 0.8 issues ROLLBACK on the
+                // connection. Explicit `rollback().await` would be
+                // cleaner but that consumes `tx` and races with the
+                // generated drop guard; sqlx's drop path is the
+                // documented contract here.
+                drop(tx);
+                return Ok(PgResponse::Transaction(PgTransactionOutcome::RolledBack {
+                    completed,
+                    failed_at,
+                    error,
+                }));
+            }
+            if let Err(e) = tx.commit().await {
+                // COMMIT itself failed (deadlock, serialization
+                // failure, connection loss). The transaction is now
+                // in an indeterminate state from the caller's view;
+                // surface as a top-level Sqlx error rather than a
+                // RolledBack outcome we cannot honestly claim.
+                return Err(map_sqlx_error(e));
+            }
+            Ok(PgResponse::Transaction(PgTransactionOutcome::Committed {
+                steps: completed,
+            }))
+        }
+    }
+}
+
+async fn run_step<'a>(
+    tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    step: PgStep,
+    max_response_rows: usize,
+) -> Result<PgStepOk, PgError> {
+    match step {
+        PgStep::Execute { sql, params } => {
+            let mut q = sqlx::query(&sql);
+            for p in params {
+                q = bind_param(q, p);
+            }
+            match q.execute(&mut **tx).await {
+                Ok(r) => Ok(PgStepOk::Executed {
+                    rows_affected: r.rows_affected(),
+                }),
+                Err(e) => Err(map_sqlx_error(e)),
+            }
+        }
+        PgStep::FetchOne { sql, params } => {
+            let mut q = sqlx::query(&sql);
+            for p in params {
+                q = bind_param(q, p);
+            }
+            let mut stream = q.fetch(&mut **tx);
+            let first = match stream.try_next().await {
+                Ok(opt) => opt,
+                Err(e) => return Err(map_sqlx_error(e)),
+            };
+            let row = match first {
+                None => return Ok(PgStepOk::NoRows),
+                Some(row) => row,
+            };
+            match stream.try_next().await {
+                Ok(None) => decode_row(&row).map(PgStepOk::Row),
+                Ok(Some(_)) => Err(PgError::TooManyRows),
+                Err(e) => Err(map_sqlx_error(e)),
+            }
+        }
+        PgStep::FetchMany {
+            sql,
+            params,
+            max_rows,
+        } => {
+            let cap = core::cmp::min(max_rows, max_response_rows);
+            let mut q = sqlx::query(&sql);
+            for p in params {
+                q = bind_param(q, p);
+            }
+            let mut stream = q.fetch(&mut **tx);
+            let mut rows: Vec<PgRow> = Vec::with_capacity(cap.min(64));
+            let mut truncated = false;
+            loop {
+                if rows.len() == cap {
+                    match stream.try_next().await {
+                        Ok(None) => break,
+                        Ok(Some(_)) => {
+                            truncated = true;
+                            break;
+                        }
+                        Err(e) => return Err(map_sqlx_error(e)),
+                    }
+                }
+                match stream.try_next().await {
+                    Ok(None) => break,
+                    Ok(Some(row)) => match decode_row(&row) {
+                        Ok(decoded) => rows.push(decoded),
+                        Err(e) => return Err(e),
+                    },
+                    Err(e) => return Err(map_sqlx_error(e)),
+                }
+            }
+            Ok(PgStepOk::Rows { rows, truncated })
         }
     }
 }
