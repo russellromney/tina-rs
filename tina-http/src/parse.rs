@@ -314,12 +314,23 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
 
 /// Serialises a client-side request onto wire bytes.
 ///
-/// Always emits `Content-Length` (zero when no body). Emits
-/// `Connection: close` when `connection_close` is true; otherwise no
-/// `Connection` header is written and the wire defaults apply
-/// (HTTP/1.1 keep-alive). Caller-supplied `Connection` and
+/// Always emits `Content-Length` (zero when no body) and
+/// `Connection: close` — one request per connection, no keep-alive
+/// on the client. For the keepalive caller use
+/// [`encode_keepalive_request`]. Caller-supplied `Connection` and
 /// `Content-Length` headers are dropped — the encoder owns framing.
-pub fn encode_request(request: &HttpRequest, connection_close: bool) -> Vec<u8> {
+pub fn encode_request(request: &HttpRequest) -> Vec<u8> {
+    encode_request_internal(request, true)
+}
+
+/// Like [`encode_request`] but omits `Connection: close` so HTTP/1.1
+/// keep-alive defaults apply and the server holds the socket open
+/// for the next request. Used by [`crate::KeepaliveConnection`].
+pub fn encode_keepalive_request(request: &HttpRequest) -> Vec<u8> {
+    encode_request_internal(request, false)
+}
+
+fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec<u8> {
     let body_bytes: &[u8] = match &request.body {
         crate::types::HttpRequestBody::Buffered(bytes) => bytes,
         crate::types::HttpRequestBody::Stream(_) => {
@@ -810,7 +821,7 @@ mod tests {
             headers: HeaderMap::new(),
             body: crate::types::HttpRequestBody::Buffered(Vec::new()),
         };
-        let bytes = encode_request(&req, true);
+        let bytes = encode_request(&req);
         let text = std::str::from_utf8(&bytes).expect("utf8");
         assert!(text.starts_with("GET /x HTTP/1.1\r\n"));
         assert!(text.contains("Content-Length: 0\r\n"));
@@ -818,13 +829,12 @@ mod tests {
     }
 
     #[test]
-    fn encode_request_keepalive_omits_connection_header() {
-        // Keepalive callers (the pool consumer) pass `false` so the
-        // encoder does not emit `Connection: close`. HTTP/1.1 default
-        // is keep-alive, so the absence of the header lets the server
-        // hold the socket open for the next request.
+    fn encode_keepalive_request_omits_connection_header() {
+        // The keepalive caller (pool consumer) gets a wire body with
+        // no `Connection: close`; HTTP/1.1 default is keep-alive, so
+        // the server holds the socket open for the next request.
         let req = HttpRequest::get("/x").build();
-        let bytes = encode_request(&req, false);
+        let bytes = encode_keepalive_request(&req);
         let text = std::str::from_utf8(&bytes).expect("utf8");
         assert!(!text.contains("Connection: close"));
         assert!(text.contains("Content-Length: 0\r\n"));
@@ -833,14 +843,13 @@ mod tests {
     #[test]
     fn encode_request_overrides_user_keep_alive() {
         // Caller-supplied `Connection` is always dropped; framing is
-        // owned by the encoder and chosen by the `connection_close`
-        // flag. Caller-supplied `Content-Length` is also dropped in
-        // favour of the actual body length.
+        // owned by the encoder. Caller-supplied `Content-Length` is
+        // also dropped in favour of the actual body length.
         let req = HttpRequest::get("/x")
             .header("Connection", "keep-alive")
             .header("Content-Length", "999")
             .build();
-        let bytes = encode_request(&req, true);
+        let bytes = encode_request(&req);
         let text = std::str::from_utf8(&bytes).expect("utf8");
         assert!(text.contains("Connection: close\r\n"));
         assert!(!text.contains("keep-alive"));
@@ -856,7 +865,7 @@ mod tests {
             .header("Host", "example")
             .body(b"hello".to_vec())
             .build();
-        let bytes = encode_request(&req, true);
+        let bytes = encode_request(&req);
         let text = std::str::from_utf8(&bytes).expect("utf8");
         // `http` crate canonicalises header names to lowercase via
         // `HeaderName::as_str()`, mirroring `encode_response`. Wire format

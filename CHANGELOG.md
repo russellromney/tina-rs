@@ -12,48 +12,84 @@ sequential requests; the pool exposes acquire / release / retire /
 close and a pressure report.
 
 What got shorter:
-- A scripted client that issues N requests against the same origin
-  acquires the lease once per request and reuses one TCP connection
-  end-to-end. Pre-existing `HttpClient` connect-write-read-close per
-  call is still available; it stays the right tool for one-shot
-  outbound calls and remains how `HttpConnectionPool` is built.
+- An integration-test client that issues three requests against the
+  same origin shares one TCP accept on the server side. (The
+  user-facing wins of keepalive — fewer handshakes per workload —
+  apply when there is a keepalive-capable server to talk to. A
+  user-facing specimen is gated on the planned server-side keepalive
+  work.)
 
 What stayed explicit:
 - Origin keying. `OriginKey` carries scheme + `SocketAddr` + (HTTPS:
-  SNI server name + a stable hash of the configured DER trust
-  roots). A pool's connections are pre-bound to one `HttpTarget` at
-  registration so cross-origin reuse is impossible by construction.
-- Caps. `PoolConfig::new(capacity, max_waiters)` sizes resources and
-  parked callers; the pool isolate's mailbox size is a separate
+  SNI server name + the DER trust roots stored verbatim — no
+  fingerprint hash, no collision risk). A pool's connections are
+  pre-bound to one `HttpTarget` at registration so cross-origin
+  reuse is impossible at the connection-isolate level: the only
+  way to reach a different origin is to register a different pool.
+- Caps. `PoolConfig::new(capacity, max_waiters)` sizes resources
+  and parked callers; the pool isolate's mailbox size is a separate
   bound (size to `>= max_waiters + burst`). The connection isolate's
   mailbox sizes only its own continuations.
 - Reuse vs retire. The connection's `KeepaliveOutcome::Request`
   carries `must_retire`. Set when the server returned `Connection:
-  close`, the peer EOF'd, or any connect/write/read error fired. The
-  consumer chooses `ReleaseDisposition::Reuse` or `Retire`; the pool
-  does not override silently.
+  close`, the peer EOF'd, or any connect/write/read error fired.
+  **Recommended consumer pattern: always release `Reuse`.** The
+  connection isolate self-heals — it has already dropped the bad
+  transport and will reconnect on the next request. Releasing
+  `Retire` permanently removes the slot and drains pool capacity if
+  done on every must_retire; reserve it for the rare "the
+  connection isolate itself is suspect" case (panic, observed
+  protocol violation).
 - Deadlines. `KeepaliveConnectionMsg::Request { request_timeout }`
-  is the wall-clock budget enforced inside the connection. Pass
-  `Deadline::remaining_or_zero(now)` from a caller-owned deadline to
-  propagate budgets honestly across hops. No hidden retry, no hidden
-  queue.
+  is the wall-clock budget enforced inside the connection via a
+  generation-tagged `sleep`. Pass `Deadline::remaining_or_zero(now)`
+  from a caller-owned deadline to propagate budgets honestly across
+  hops. No hidden retry, no hidden queue.
 - Close modes. `CloseMode::Drain` blocks new acquires and lets
   outstanding leases return normally; `Force` retires outstanding
   leases — late releases get `PoolClosed`.
+- Shutdown. `WorkerPool` does not own connection-isolate lifetime.
+  `build_keepalive_pool` returns a `KeepalivePoolHandles` bundle
+  with the pool address *and* the connection addresses; send
+  `KeepaliveConnectionMsg::Stop` to each connection after pool
+  close so the underlying transports are closed and the isolates
+  exit. Without this, transports leak past pool close.
 
 New surface in `tina_http`:
 - `OriginKey`, `KeepaliveConnection`, `KeepaliveConnectionMsg`,
-  `KeepaliveOutcome`, `KeepaliveConnAddr`, `build_keepalive_pool`.
-- `encode_request` now takes a `connection_close: bool` parameter
-  so the keepalive path can omit `Connection: close`.
+  `KeepaliveOutcome`, `KeepaliveConnAddr`, `KeepalivePoolHandles`,
+  `build_keepalive_pool`.
+- `encode_keepalive_request` — sibling of the unchanged
+  `encode_request` for the keepalive caller (omits the
+  `Connection: close` header). The original `encode_request`
+  signature is unchanged; this is a pure addition.
 
-Eleven integration tests live in `tina-http/tests/keepalive_pool.rs`:
-sequential reuse counted via accept count, cross-origin isolation,
-stale server-close retirement, acquire `Full` / acquire-call timeout
-/ acquire cancel reclaim of waiter capacity, request timeout with
-must-retire honored on release, drain & force close visibility,
-HTTPS origin key includes SNI / trust identity, pressure report
-shape across capacity / `Full` / closed transitions.
+Sixteen integration tests live in `tina-http/tests/keepalive_pool.rs`,
+plus an HTTPS-keepalive smoke (`keepalive_tls_smoke.rs`) and an
+isolate-level DST replay (`dst_keepalive.rs`):
+
+- sequential reuse counted via TCP accept count
+- cross-origin isolation (two pools, two accept counts)
+- stale server-close → `must_retire = true`, reconnect on next call
+- acquire `Full`, acquire-call-timeout & acquire-cancel reclaim of
+  waiter capacity
+- request timeout marks must_retire; **always-Reuse** keeps pool
+  capacity stable; an explicit-Retire test shows the pool removes
+  the slot when asked
+- Drain blocks new acquires; Drain-with-parked-waiters settles
+  waiters as Closed; Force marks outstanding leases stale; Stop
+  after Force closes the underlying transport
+- HTTPS keepalive shares one TLS handshake across three sequential
+  requests
+- multi-slot pool (capacity 2) serves two concurrent acquires with
+  two TCP accepts; `available` returns to 2 after release
+- `OriginKey` distinguishes SNI / trust-root identity
+- `request_timeout` correlates with wall-clock duration (proves the
+  variable controls the failure)
+- `PoolPressureReport` shape across capacity / `Full` / closed
+  transitions
+- DST replay: two passes against the same scripted TCP config
+  produce identical trace fingerprints
 
 The legacy capacity-1 `HttpConnectionPool` is kept as the first
 form for one-request-per-connection admission; it remains useful

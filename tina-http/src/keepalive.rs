@@ -3,8 +3,9 @@
 //! [`KeepaliveConnection`] owns one TCP or TLS transport across many
 //! requests. Unlike [`crate::HttpClient`], which connects + sends +
 //! reads + closes per call, this isolate connects on first use and
-//! reuses the same transport until the consumer asks it to
-//! [`KeepaliveCall::Reset`] or the peer closes.
+//! reuses the same transport until the peer closes or an error
+//! happens — at which point it drops the transport and reconnects
+//! transparently on the next [`KeepaliveCall::Request`].
 //!
 //! # Pool consumer pattern
 //!
@@ -12,47 +13,63 @@
 //! fixed list of `Address<KeepaliveConnectionMsg, KeepaliveOutcome>`
 //! handles. Build one with [`build_keepalive_pool`].
 //!
+//! **Always release `Reuse`.** The connection isolate self-heals: on
+//! `must_retire = true` it drops the bad transport and reconnects on
+//! the next request automatically. Releasing `Retire` permanently
+//! removes that slot from the pool, draining capacity to zero over
+//! time if you do it on every must_retire. `Retire` is reserved for
+//! the rare "the connection isolate itself is suspect" case (panic,
+//! observed protocol violation) — most consumers never need it.
+//!
 //! ```text
 //! acquire lease (Address<KeepaliveConnectionMsg, KeepaliveOutcome>)
-//! call(*lease.handle(), KeepaliveCall::Request(req), deadline_remaining)
-//!   -> KeepaliveOutcome { result, must_retire }
-//! if outcome.must_retire {
-//!     call(*lease.handle(), KeepaliveCall::Reset, t).reply(...)
-//!     release(lease, Retire)
-//! } else {
-//!     release(lease, Reuse)
-//! }
+//! call(*lease.handle(), KeepaliveConnectionMsg::request(req, t),
+//!      deadline_remaining)
+//!   -> KeepaliveOutcome::Request { result, must_retire }
+//! release(lease, Reuse)   // always — the connection self-heals
 //! ```
 //!
-//! The consumer is responsible for honouring `must_retire`. The pool
-//! does not see the response and cannot override `Reuse` to `Retire`
-//! by itself; the connection isolate is the source of truth and signals
-//! retirement explicitly through its reply.
+//! The `must_retire` field is informational. Inspect it for tracing,
+//! metrics, or to decide whether to retry the request from the
+//! caller's side. The connection has already dropped the bad
+//! transport before it sent the reply.
+//!
+//! # Shutdown
+//!
+//! `WorkerPool` does not own the connection isolates' lifetime. After
+//! [`tina::pool::CloseMode::Drain`] or `Force`, the isolates keep
+//! running with their open transports until you stop them. Use the
+//! [`KeepaliveConnAddr`] handles returned from
+//! [`build_keepalive_pool`] to send [`KeepaliveConnectionMsg::Stop`]
+//! to each isolate; the isolate closes its transport (if any) and
+//! exits.
 //!
 //! # Origin keying
 //!
-//! [`OriginKey`] captures the identity that two requests must share to
-//! safely reuse a connection: scheme + `SocketAddr` + (for HTTPS)
-//! server name + a fingerprint of the configured trust roots. A
-//! pool's connections are pre-bound to one [`HttpTarget`] at registration,
-//! so cross-origin reuse is impossible by construction — the only way
-//! to send to a different origin is to register a different pool.
+//! [`OriginKey`] captures the identity that two requests must share
+//! to safely reuse a connection: scheme + `SocketAddr` + (for HTTPS)
+//! server name + the configured DER trust roots themselves (stored,
+//! not hashed — no collision risk). A pool's connections are
+//! pre-bound to one [`HttpTarget`] at registration, so cross-origin
+//! reuse is impossible at the connection-isolate level: the only
+//! way to send to a different origin is to register a different
+//! pool. `OriginKey` is the value type that names that identity for
+//! diagnostics and equality checks.
 //!
 //! # Out of scope (first form)
 //!
-//! - No idle-connection timeout. Connections sit `Disconnected` after
-//!   `Reset` and reconnect on next use. A long-idle stale socket is
+//! - No idle-connection timeout. A long-idle stale socket is
 //!   discovered on the next request via a write/read failure and
 //!   reported as `must_retire`.
 //! - No hidden retry. A `must_retire` reply is the consumer's signal
-//!   to choose whether to acquire another lease and retry, or surface
-//!   the failure.
+//!   to choose whether to acquire another lease and retry, or
+//!   surface the failure.
 //! - No HTTP/2, no chunked transfer, no expect-100-continue. Same
 //!   contract as [`crate::HttpClient`].
+//! - No HTTP `Upgrade` (e.g., to WebSocket). The connection assumes
+//!   the response framing remains HTTP/1.1.
 
-use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
-use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -67,7 +84,9 @@ use tina_runtime::{
     tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write,
 };
 
-use crate::parse::{HttpResponseHead, ResponseParseProgress, encode_request, parse_response_head};
+use crate::parse::{
+    HttpResponseHead, ResponseParseProgress, encode_keepalive_request, parse_response_head,
+};
 use crate::target::{HttpHostPolicy, HttpTarget};
 use crate::transport::HttpTransport;
 use crate::types::{
@@ -81,29 +100,32 @@ const READ_CHUNK: usize = 4096;
 /// Identity that two requests must share to safely reuse a keepalive
 /// connection.
 ///
-/// HTTPS variants fold the configured DER trust roots into a
-/// `trust_fingerprint` so two configs with different roots never
-/// collide, even when their server name and address agree.
+/// HTTPS variants store the configured DER trust roots verbatim so
+/// two configs with different roots never collide, even when their
+/// server name and address agree. The cost is one `Vec<Vec<u8>>`
+/// clone at construction time; the keys live for the pool's
+/// lifetime, not per-request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OriginKey {
     /// Plain HTTP keyed by socket address.
     Http {
         /// Peer socket address. The keepalive contract is "same TCP
-        /// peer"; two different IPs that happen to host the same site
-        /// must not share a connection.
+        /// peer"; two different IPs that happen to host the same
+        /// site must not share a connection.
         addr: SocketAddr,
     },
-    /// HTTPS keyed by socket address, SNI server name, and a
-    /// fingerprint of the trust roots.
+    /// HTTPS keyed by socket address, SNI server name, and the DER
+    /// trust roots themselves.
     Https {
         /// Peer socket address.
         addr: SocketAddr,
         /// SNI / certificate verification name used at handshake.
         server_name: String,
-        /// Stable hash of the configured DER trust roots. Two
-        /// configs whose roots differ produce different fingerprints
-        /// and never share connections.
-        trust_fingerprint: u64,
+        /// Configured DER trust roots, stored verbatim. Two configs
+        /// whose roots differ produce different keys; there is no
+        /// hashing step and therefore no collision risk for a
+        /// security-relevant identity comparison.
+        trust_roots_der: Vec<Vec<u8>>,
     },
 }
 
@@ -117,31 +139,24 @@ impl OriginKey {
                 server_name,
                 trust_roots,
                 ..
-            } => {
-                let mut hasher = DefaultHasher::new();
-                trust_roots.root_certificates_der.len().hash(&mut hasher);
-                for der in &trust_roots.root_certificates_der {
-                    der.hash(&mut hasher);
-                }
-                Self::Https {
-                    addr: *addr,
-                    server_name: server_name.clone(),
-                    trust_fingerprint: hasher.finish(),
-                }
-            }
+            } => Self::Https {
+                addr: *addr,
+                server_name: server_name.clone(),
+                trust_roots_der: trust_roots.root_certificates_der.clone(),
+            },
         }
     }
 }
 
 /// Inbound message variants for [`KeepaliveConnection`].
 ///
-/// `Request` and `Reset` are user-callable. The remaining variants are
+/// `Request` and `Stop` are user-callable. The remaining variants are
 /// continuations from runtime calls the connection issues itself.
 #[derive(Debug, Clone)]
 pub enum KeepaliveConnectionMsg {
     /// Run one request on this connection. The connection connects on
-    /// first use, then reuses the transport until [`Self::Reset`] or
-    /// the peer closes.
+    /// first use, then reuses the transport until the peer closes or
+    /// an error happens.
     ///
     /// `request_timeout` is the wall-clock budget for the entire
     /// request — connect (if needed), write, read head, read body.
@@ -151,20 +166,22 @@ pub enum KeepaliveConnectionMsg {
         request: Box<HttpRequest>,
         request_timeout: Duration,
     },
-    /// Drop the underlying transport. Replies once close completes.
-    /// The consumer sends this before releasing a lease with
-    /// [`tina::pool::ReleaseDisposition::Retire`] so the OS socket is
-    /// freed promptly and a stale connection cannot be served to the
-    /// next caller.
-    Reset,
+    /// Stop the isolate. Closes the underlying transport (if any),
+    /// then the isolate exits via [`tina::stop`]. Reply is sent
+    /// before the isolate stops; consumers waiting on the reply will
+    /// see `KeepaliveOutcome::Stopped`.
+    ///
+    /// Used during pool shutdown to avoid leaking transports past
+    /// pool close. See module docs for the recommended sequence.
+    Stop,
 
     Connected(Result<(tina_runtime::StreamId, SocketAddr, SocketAddr), CallError>),
     TlsConnected(Result<tina_runtime::TlsStreamId, CallError>),
     Wrote(Result<usize, CallError>),
     Read(Result<Vec<u8>, CallError>),
     Closed(Result<(), CallError>),
-    /// `generation` distinguishes the deadline for *this* request from
-    /// stale deadlines scheduled by prior requests on the same
+    /// `generation` distinguishes the deadline for *this* request
+    /// from stale deadlines scheduled by prior requests on the same
     /// (long-lived) connection isolate. Without it, a 2s deadline
     /// armed for request N would arrive during request N+1 and fail
     /// it spuriously.
@@ -185,35 +202,37 @@ impl KeepaliveConnectionMsg {
 }
 
 /// Reply payload from [`KeepaliveConnection`].
-///
-/// `Request` calls reply with a [`KeepaliveOutcome`]; `Reset` calls
-/// reply with [`KeepaliveOutcome::Reset`]. One reply enum keeps the
-/// runtime call-shape uniform.
 #[derive(Debug, Clone)]
 pub enum KeepaliveOutcome {
-    /// One request finished. `must_retire` is true when the connection
-    /// is no longer safe to reuse: error during connect/write/read,
-    /// the server returned `Connection: close`, or the peer closed
-    /// before the body completed.
+    /// One request finished. `must_retire` is true when the
+    /// connection just dropped its transport because it was no
+    /// longer safe to reuse: error during connect/write/read, the
+    /// server returned `Connection: close`, or the peer closed
+    /// before the body completed. The connection has already
+    /// reconnected-on-next-request semantics — the consumer can
+    /// safely release `Reuse` either way.
     Request {
         result: Result<HttpResponse, HttpClientError>,
         must_retire: bool,
     },
-    /// `Reset` completed (or there was nothing to close).
-    Reset,
+    /// The isolate received [`KeepaliveConnectionMsg::Stop`] and is
+    /// shutting down. Subsequent messages will fail with
+    /// `CallOutcome::Closed` once the runtime tears the address
+    /// down.
+    Stopped,
 }
 
 impl KeepaliveOutcome {
     /// Convenience: returns the request result if this is a `Request`
-    /// reply; panics otherwise. Tests use this; consumers should match
-    /// the variant explicitly.
+    /// reply; panics otherwise. Tests use this; consumers should
+    /// match the variant explicitly.
     pub fn into_request_result(self) -> (Result<HttpResponse, HttpClientError>, bool) {
         match self {
             Self::Request {
                 result,
                 must_retire,
             } => (result, must_retire),
-            Self::Reset => panic!("expected Request outcome, got Reset"),
+            Self::Stopped => panic!("expected Request outcome, got Stopped"),
         }
     }
 }
@@ -228,14 +247,16 @@ pub struct KeepaliveConnection<S: Shard + 'static> {
     config: HttpClientConfig,
     transport: Option<HttpTransport>,
     in_flight: Option<InFlight>,
+    /// Bytes for an in-flight request that is still waiting on
+    /// `tcp_connect` / `tls_connect`. Moved into `InFlight.pending_write`
+    /// when the `Connected` continuation fires; `None` outside the
+    /// cold-connect path.
+    pending_connect_bytes: Option<Vec<u8>>,
     /// Monotonic per-request counter. Bumped at the start of every
-    /// `handle_request`. Continuations that target a specific request
-    /// (today: `Deadline`) carry the generation in their payload; a
-    /// generation mismatch flags the message as stale and a no-op.
+    /// `handle_request`. The `Deadline` continuation carries the
+    /// generation in its payload; a generation mismatch flags the
+    /// message as stale and a no-op.
     request_generation: u64,
-    /// Set true while a `Reset` is in flight so the `Closed`
-    /// continuation knows to reply to the caller (not silently drop).
-    resetting: bool,
     _shard: PhantomData<S>,
 }
 
@@ -243,7 +264,6 @@ struct InFlight {
     /// Generation stamped at request start; used to ignore stale
     /// `Deadline` continuations from prior requests.
     generation: u64,
-    request_bytes: Vec<u8>,
     pending_write: Vec<u8>,
     read_buf: Vec<u8>,
     parsed_head: Option<HttpResponseHead>,
@@ -262,21 +282,23 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             config,
             transport: None,
             in_flight: None,
+            pending_connect_bytes: None,
             request_generation: 0,
-            resetting: false,
             _shard: PhantomData,
         }
     }
 
-    /// Origin this connection is bound to. Inspect to verify the
-    /// pool's slot serves the origin you expect.
+    /// Origin this connection is bound to. Useful for diagnostic
+    /// logging — pool slots are anonymous from the pool's
+    /// perspective; this accessor lets a debug formatter or trace
+    /// fact name the served origin.
     pub fn origin(&self) -> &OriginKey {
         &self.origin
     }
 }
 
-// Hand-rolled `Isolate`: macro requires a concrete shard, we want
-// `KeepaliveConnection` to work with any user shard.
+// Hand-rolled `Isolate`: the macro requires a concrete shard, we
+// want `KeepaliveConnection` to work with any user shard.
 impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
     tina::isolate_types! {
         message: KeepaliveConnectionMsg,
@@ -298,7 +320,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 request_timeout,
             } => self.handle_request(*request, request_timeout),
 
-            KeepaliveConnectionMsg::Reset => self.handle_reset(),
+            KeepaliveConnectionMsg::Stop => self.handle_stop(),
 
             KeepaliveConnectionMsg::Connected(Ok((stream, _local, _peer))) => {
                 if self.in_flight.is_none() {
@@ -306,11 +328,9 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 }
                 self.transport = Some(HttpTransport::Tcp(stream));
                 let bytes = self
-                    .in_flight
-                    .as_ref()
-                    .expect("in_flight set during connect")
-                    .request_bytes
-                    .clone();
+                    .pending_connect_bytes
+                    .take()
+                    .expect("pending_connect_bytes set during cold-connect path");
                 self.in_flight
                     .as_mut()
                     .expect("in_flight set during connect")
@@ -328,11 +348,9 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 }
                 self.transport = Some(HttpTransport::Tls(stream));
                 let bytes = self
-                    .in_flight
-                    .as_ref()
-                    .expect("in_flight set during connect")
-                    .request_bytes
-                    .clone();
+                    .pending_connect_bytes
+                    .take()
+                    .expect("pending_connect_bytes set during cold-connect path");
                 self.in_flight
                     .as_mut()
                     .expect("in_flight set during connect")
@@ -365,31 +383,20 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             }
 
             KeepaliveConnectionMsg::Deadline { generation, .. } => {
-                // Stale deadline from a prior request (in_flight is
+                // Stale deadline from a prior request: in_flight is
                 // None or this generation does not match the current
-                // request). Drop silently.
+                // request. Drop silently.
                 let current_gen = self.in_flight.as_ref().map(|f| f.generation);
                 if current_gen != Some(generation) {
                     return noop();
                 }
-                // Partial-state transport is no longer safe to reuse;
-                // surface Timeout and the caller should Retire.
+                // Partial-state transport is no longer safe to
+                // reuse; surface Timeout and the consumer treats it
+                // like any other must_retire reply.
                 self.fail_request(HttpClientError::Timeout, true)
             }
 
-            KeepaliveConnectionMsg::Closed(_) => {
-                // Two reasons we'd see Closed:
-                // - Resetting: reply Reset to the consumer.
-                // - Background close after a stale post-Connected
-                //   wakeup or a finished request that elected to
-                //   close: nothing to do.
-                if self.resetting {
-                    self.resetting = false;
-                    self.transport = None;
-                    return reply(KeepaliveOutcome::Reset);
-                }
-                noop()
-            }
+            KeepaliveConnectionMsg::Closed(_) => noop(),
         }
     }
 }
@@ -405,12 +412,6 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
                 must_retire: false,
             });
         }
-        if self.resetting {
-            return reply(KeepaliveOutcome::Request {
-                result: Err(HttpClientError::Busy),
-                must_retire: false,
-            });
-        }
         let request = match apply_host_policy(request, &self.target) {
             Ok(request) => request,
             Err(error) => {
@@ -420,15 +421,20 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
                 });
             }
         };
-        // Keepalive: omit `Connection: close`. Server then defaults
-        // to keep-alive on HTTP/1.1, leaving the socket reusable.
-        let request_bytes = encode_request(&request, false);
+        let request_bytes = encode_keepalive_request(&request);
 
-        self.request_generation = self.request_generation.saturating_add(1);
+        // Bound to u64::MAX overflow with a loud panic. 2^64 requests
+        // on one connection isolate is unreachable in practice;
+        // saturating would silently confuse the stale-deadline
+        // bookkeeping (every overflow request would share generation
+        // u64::MAX), so a panic is the safer failure mode.
+        self.request_generation = self
+            .request_generation
+            .checked_add(1)
+            .expect("KeepaliveConnection request_generation overflowed u64");
         let generation = self.request_generation;
         self.in_flight = Some(InFlight {
             generation,
-            request_bytes: request_bytes.clone(),
             pending_write: Vec::new(),
             read_buf: Vec::new(),
             parsed_head: None,
@@ -438,17 +444,17 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let deadline_effect: Effect<Self> = sleep(request_timeout)
             .reply(move |result| KeepaliveConnectionMsg::Deadline { generation, result });
 
-        if let Some(transport) = self.transport {
+        if self.transport.is_some() {
             // Reuse path: skip connect, queue the write directly.
             self.in_flight
                 .as_mut()
                 .expect("in_flight just set")
                 .pending_write = request_bytes;
-            let _ = transport;
             batch(vec![self.write_more(), deadline_effect])
         } else {
             // Cold path: connect first; the Connected continuation
             // installs the transport and starts writing.
+            self.pending_connect_bytes = Some(request_bytes);
             let connect_effect: Effect<Self> = match &self.target {
                 HttpTarget::Http { addr, .. } => {
                     tcp_connect(*addr).reply(KeepaliveConnectionMsg::Connected)
@@ -470,28 +476,17 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         }
     }
 
-    fn handle_reset(&mut self) -> Effect<Self> {
-        // Reset never runs concurrently with a Request: the consumer
-        // serialises (await Request reply, then send Reset, await
-        // Reset reply, then release with Retire). Defensive: if a
-        // request is somehow in flight, fail it before resetting.
-        if self.in_flight.is_some() {
-            // Drop the in-flight state; we won't reply for it because
-            // the consumer is asking us to reset, which means they've
-            // already received the Request reply (or aren't waiting).
-            self.in_flight = None;
-        }
-        let Some(transport) = self.transport.take() else {
-            return reply(KeepaliveOutcome::Reset);
-        };
-        self.resetting = true;
-        match transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_close_stream(stream).reply(KeepaliveConnectionMsg::Closed)
-            }
-            HttpTransport::Tls(stream) => {
-                tls_close(stream, self.config.request_timeout).reply(KeepaliveConnectionMsg::Closed)
-            }
+    fn handle_stop(&mut self) -> Effect<Self> {
+        // Drop any in-flight state; the consumer may have been
+        // waiting on a Request reply, but Stop wins.
+        let _ = self.in_flight.take();
+        let _ = self.pending_connect_bytes.take();
+        let close_effect = self.close_transport_fire_and_forget();
+        let reply_effect: Effect<Self> = reply(KeepaliveOutcome::Stopped);
+        let stop_effect: Effect<Self> = stop();
+        match close_effect {
+            Some(close) => batch(vec![reply_effect, close, stop_effect]),
+            None => batch(vec![reply_effect, stop_effect]),
         }
     }
 
@@ -602,8 +597,8 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         };
         if must_retire {
             // Drop the transport now; the next request on this slot
-            // will reconnect. Issue a fire-and-forget close so the FD
-            // is released; the Closed continuation no-ops.
+            // will reconnect. Issue a fire-and-forget close so the
+            // FD is released; the Closed continuation no-ops.
             let close_effect = self.close_transport_fire_and_forget();
             let reply_effect: Effect<Self> = reply(KeepaliveOutcome::Request {
                 result: Ok(response),
@@ -623,8 +618,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
 
     fn fail_request(&mut self, error: HttpClientError, must_retire: bool) -> Effect<Self> {
         // Take in_flight first so a duplicate continuation can't
-        // re-fire delivery.
+        // re-fire delivery. Also clear pending_connect_bytes — if we
+        // failed during the cold-connect path, the bytes are stale.
         let _ = self.in_flight.take();
+        let _ = self.pending_connect_bytes.take();
         let close_effect = if must_retire {
             self.close_transport_fire_and_forget()
         } else {
@@ -725,27 +722,38 @@ fn apply_host_policy(
 /// Type alias for the keepalive pool's resource handle.
 pub type KeepaliveConnAddr = Address<KeepaliveConnectionMsg, KeepaliveOutcome>;
 
-/// Type alias for the keepalive pool isolate's address.
-pub type KeepaliveWorkerPool = WorkerPool<KeepaliveConnAddr, ()>;
+/// Bundle returned from [`build_keepalive_pool`]: the pool address
+/// the consumer drives with [`tina_runtime::pool`] vocabulary, plus
+/// the addresses of the underlying connection isolates.
+///
+/// Hold on to `connections` for shutdown — `WorkerPool` does not
+/// own connection-isolate lifetime, and dropping the pool address
+/// alone leaves the isolates running with their open transports.
+/// Send [`KeepaliveConnectionMsg::Stop`] to each address after the
+/// pool itself has closed (Drain or Force).
+#[derive(Debug, Clone)]
+pub struct KeepalivePoolHandles {
+    /// The pool address. Use with `WorkerPoolMsg::Acquire` etc.
+    pub pool: Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>,
+    /// One address per pool slot. Send `Stop` to each on shutdown.
+    pub connections: Vec<KeepaliveConnAddr>,
+}
 
-/// Type alias for the keepalive pool's message and reply types.
-pub type KeepaliveWorkerPoolMsg = WorkerPoolMsg<KeepaliveConnAddr>;
-pub type KeepaliveWorkerPoolReply = WorkerPoolReply<KeepaliveConnAddr>;
-
-/// Builds and registers a keepalive pool plus its connection isolates.
+/// Builds and registers a keepalive pool plus its connection
+/// isolates.
 ///
 /// Pre-spawns `pool_config.capacity` [`KeepaliveConnection`] isolates
-/// bound to `target`, then registers a [`WorkerPool`] over them. Each
-/// connection isolate runs on the runtime's shard `S`. Returns the
-/// pool's address; the consumer drives it with the
-/// [`tina_runtime::pool`] vocabulary.
+/// bound to `target`, then registers a [`WorkerPool`] over them.
+/// Each connection isolate runs on the runtime's shard `S`. Returns
+/// a [`KeepalivePoolHandles`] bundle so the caller can drive the
+/// pool *and* explicitly stop the connection isolates on shutdown.
 ///
 /// `connection_mailbox_capacity` sizes each connection isolate's
 /// mailbox; one slot per outstanding request plus headroom for
 /// continuations is plenty (default suggestion: 16).
 ///
-/// `pool_mailbox_capacity` sizes the pool isolate's mailbox; size to
-/// `>= max_waiters + expected burst`.
+/// `pool_mailbox_capacity` sizes the pool isolate's mailbox; size
+/// to `>= max_waiters + expected burst`.
 pub fn build_keepalive_pool<S>(
     runtime: &ThreadedRuntime<S, tina_runtime::DefaultThreadedMailboxFactory>,
     target: HttpTarget,
@@ -753,22 +761,27 @@ pub fn build_keepalive_pool<S>(
     pool_config: PoolConfig,
     connection_mailbox_capacity: usize,
     pool_mailbox_capacity: usize,
-) -> Result<Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>, ThreadedRuntimeError>
+) -> Result<KeepalivePoolHandles, ThreadedRuntimeError>
 where
     S: Shard + Send + 'static,
 {
-    let mut handles: Vec<KeepaliveConnAddr> = Vec::with_capacity(pool_config.capacity);
+    let mut connections: Vec<KeepaliveConnAddr> = Vec::with_capacity(pool_config.capacity);
     for _ in 0..pool_config.capacity {
         let conn = KeepaliveConnection::<S>::new(target.clone(), client_config);
         let address = runtime.register_with_capacity::<KeepaliveConnection<S>, Infallible>(
             conn,
             connection_mailbox_capacity,
         )?;
-        handles.push(address);
+        connections.push(address);
     }
-    let pool: WorkerPool<KeepaliveConnAddr, S> = WorkerPool::new(pool_config, handles);
-    runtime.register_with_capacity::<WorkerPool<KeepaliveConnAddr, S>, Infallible>(
-        pool,
-        pool_mailbox_capacity,
-    )
+    let pool: WorkerPool<KeepaliveConnAddr, S> = WorkerPool::new(pool_config, connections.clone());
+    let pool_address = runtime
+        .register_with_capacity::<WorkerPool<KeepaliveConnAddr, S>, Infallible>(
+            pool,
+            pool_mailbox_capacity,
+        )?;
+    Ok(KeepalivePoolHandles {
+        pool: pool_address,
+        connections,
+    })
 }

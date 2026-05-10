@@ -13,14 +13,20 @@ If you can use a native Tina crate, do. Native HTTPS/1.1 lives in
 `tina-http`'s `HttpsListener` and `HttpClient` — explicit DER cert
 config, typed startup, matchable TLS errors. For repeated outbound
 requests against the same origin, `tina_http::build_keepalive_pool`
-hands you a `WorkerPool<KeepaliveConnAddr>`: one TCP (or TLS)
-connection serves many requests, with `acquire` / `release` /
-`retire` / `close` and a pressure report. Origins are keyed by
-scheme + `SocketAddr` + (HTTPS) SNI + trust-root fingerprint, so
-two pools never share a connection unintentionally. Reach for a
-bridge when you need HTTP/2, ALPN, system trust roots,
-redirects/cookies, an existing Axum app, or a third-party SDK that
-only ships a Tokio client.
+hands you a `KeepalivePoolHandles { pool, connections }`: one TCP
+(or TLS) connection per pool slot serves many requests, with
+`acquire` / `release` / `retire` / `close` and a pressure report.
+Each connection isolate is bound to one origin at construction —
+scheme + `SocketAddr` + (HTTPS) SNI + the configured DER trust
+roots themselves — so cross-origin reuse cannot happen at the
+connection-isolate level. The recommended consumer pattern is
+always release `Reuse`; the connection self-heals on
+`must_retire = true` (drops the bad transport, reconnects on the
+next request). Send `KeepaliveConnectionMsg::Stop` to each
+address in `handles.connections` on shutdown so transports close
+promptly. Reach for a bridge when you need HTTP/2, ALPN, system
+trust roots, redirects/cookies, an existing Axum app, or a
+third-party SDK that only ships a Tokio client.
 
 ## What ships today
 
