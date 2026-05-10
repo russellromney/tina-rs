@@ -59,7 +59,7 @@ pub use streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
 pub use target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
-pub use transport::{HttpTransport, TLS_DEADLINE_UNUSED};
+pub use transport::HttpTransport;
 pub use types::{
     HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody, HttpResponse,
     HttpResponseBody, HttpServerConfig, HttpTransportPhase, PoolConfig, RequestParseError,

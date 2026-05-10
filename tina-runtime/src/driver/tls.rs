@@ -956,6 +956,13 @@ pub(super) fn accept_tls(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(CallError::Timeout)?;
+    // Idle accept poll. `thread::yield_now()` would burn CPU on a
+    // bound-but-quiet listener; sleep a millisecond between polls
+    // so an HTTPS listener that nobody is calling stays cheap.
+    // 1ms is well below the typical accept-deadline grain
+    // (250ms in dev, 100ms in pressure) and short enough that
+    // accept latency stays imperceptible.
+    let poll_interval = Duration::from_millis(1);
     let (tcp, peer_addr) = loop {
         if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err(CallError::Timeout);
@@ -963,7 +970,7 @@ pub(super) fn accept_tls(
         match listener.accept() {
             Ok(accepted) => break accepted,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::yield_now();
+                thread::sleep(poll_interval);
             }
             Err(_) => return Err(CallError::Io),
         }

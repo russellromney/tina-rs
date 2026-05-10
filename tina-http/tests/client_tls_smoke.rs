@@ -15,8 +15,7 @@ use http::{HeaderValue, Method, StatusCode};
 use tina::prelude::*;
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpHostPolicy, HttpRequest,
-    HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, HttpTransportPhase,
-    TlsTrustRoots,
+    HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, HttpTransportPhase, TlsTrustRoots,
 };
 use tina_runtime::{
     CallError, CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
@@ -39,8 +38,8 @@ struct CertBundle {
 
 fn build_cert_bundle() -> CertBundle {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-sign");
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-sign");
     let cert_der = certified.cert.der().to_vec();
     let key_der = certified.key_pair.serialize_der();
     let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
@@ -84,7 +83,10 @@ fn spawn_one_shot_https_server(server_config: rustls::ServerConfig) -> SocketAdd
         let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
         let host = request
             .lines()
-            .find_map(|line| line.strip_prefix("Host: ").or_else(|| line.strip_prefix("host: ")))
+            .find_map(|line| {
+                line.strip_prefix("Host: ")
+                    .or_else(|| line.strip_prefix("host: "))
+            })
             .unwrap_or("")
             .trim_end_matches('\r');
         let body = host.as_bytes();

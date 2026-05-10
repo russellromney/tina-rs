@@ -147,8 +147,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // than starting the accept loop, otherwise the
                     // listener would leak until full shutdown.
                     let listener = self.listener.take().expect("set just above");
-                    return tcp_close_listener(listener)
-                        .reply(HttpListenerMsg::ListenerClosed);
+                    return tcp_close_listener(listener).reply(HttpListenerMsg::ListenerClosed);
                 }
                 tcp_accept(listener).reply(HttpListenerMsg::Accepted)
             }

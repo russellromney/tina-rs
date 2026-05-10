@@ -413,4 +413,3 @@ impl Isolate for NotifyingConsumer {
         }
     }
 }
-

@@ -24,13 +24,16 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
-use tina_runtime::{CallError, CallOutcome, call, sleep};
+use tina_runtime::{
+    CallError, CallOutcome, call, sleep, tcp_close_stream, tcp_read, tcp_write, tls_close,
+    tls_read, tls_write,
+};
 
 use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_request_head};
 use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
-use crate::transport::{HttpTransport, TLS_DEADLINE_UNUSED};
+use crate::transport::HttpTransport;
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError};
 
 /// Bytes the connection isolate asks for per `tcp_read`. Bounded so a
@@ -173,7 +176,8 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             service,
             limits,
             service_call_timeout,
-            TLS_DEADLINE_UNUSED,
+            // TLS-only deadline; ignored on the TCP branch.
+            Duration::ZERO,
         )
     }
 
@@ -274,9 +278,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn read_more(&mut self) -> Effect<Self> {
-        self.transport
-            .read_call(READ_CHUNK, self.tls_io_timeout)
-            .reply(HttpConnectionMsg::Read)
+        match self.transport {
+            HttpTransport::Tcp(stream) => {
+                tcp_read(stream, READ_CHUNK).reply(HttpConnectionMsg::Read)
+            }
+            HttpTransport::Tls(stream) => {
+                tls_read(stream, READ_CHUNK, self.tls_io_timeout).reply(HttpConnectionMsg::Read)
+            }
+        }
     }
 
     fn handle_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
@@ -469,9 +478,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             // via received bytes < expected.
             return reply(RequestChunkReply::Eof);
         }
-        self.transport
-            .read_call(want, self.tls_io_timeout)
-            .reply(HttpConnectionMsg::BodyChunkRead)
+        match self.transport {
+            HttpTransport::Tcp(stream) => {
+                tcp_read(stream, want).reply(HttpConnectionMsg::BodyChunkRead)
+            }
+            HttpTransport::Tls(stream) => {
+                tls_read(stream, want, self.tls_io_timeout).reply(HttpConnectionMsg::BodyChunkRead)
+            }
+        }
     }
 
     fn handle_body_chunk_read(&mut self, result: Result<Vec<u8>, CallError>) -> Effect<Self> {
@@ -552,9 +566,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     /// we know how many bytes the runtime accepted; we do not pre-copy
     /// the buffer with an offset.
     fn write_pending(&mut self) -> Effect<Self> {
-        self.transport
-            .write_call(self.pending_response.clone(), self.tls_io_timeout)
-            .reply(HttpConnectionMsg::Wrote)
+        let bytes = self.pending_response.clone();
+        match self.transport {
+            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).reply(HttpConnectionMsg::Wrote),
+            HttpTransport::Tls(stream) => {
+                tls_write(stream, bytes, self.tls_io_timeout).reply(HttpConnectionMsg::Wrote)
+            }
+        }
     }
 
     fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
@@ -626,9 +644,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn begin_close(&mut self) -> Effect<Self> {
-        self.transport
-            .close_call(self.tls_io_timeout)
-            .reply(HttpConnectionMsg::Closed)
+        match self.transport {
+            HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpConnectionMsg::Closed),
+            HttpTransport::Tls(stream) => {
+                tls_close(stream, self.tls_io_timeout).reply(HttpConnectionMsg::Closed)
+            }
+        }
     }
 }
 

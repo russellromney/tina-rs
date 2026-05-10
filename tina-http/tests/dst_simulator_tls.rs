@@ -109,7 +109,10 @@ fn dst_request() -> HttpRequest {
 
 fn build_sim_config(target: &HttpTarget, request: &HttpRequest) -> SimulatorConfig {
     let HttpTarget::Https {
-        addr, server_name, host, ..
+        addr,
+        server_name,
+        host,
+        ..
     } = target.clone()
     else {
         unreachable!("DST target is HTTPS by construction")
@@ -144,21 +147,15 @@ fn build_sim_config(target: &HttpTarget, request: &HttpRequest) -> SimulatorConf
     }
 }
 
-fn run_dst() -> (
-    u64,
-    usize,
-    Result<HttpResponse, HttpClientError>,
-) {
+fn run_dst() -> (u64, usize, Result<HttpResponse, HttpClientError>) {
     let target = https_target();
     let request = dst_request();
     let config = build_sim_config(&target, &request);
 
     let mut sim = Simulator::new(SimShard, config);
     let observed = Rc::new(RefCell::new(None));
-    let client = sim.register_with_mailbox_capacity(
-        HttpClient::<SimShard>::new(HttpClientConfig::dev()),
-        16,
-    );
+    let client = sim
+        .register_with_mailbox_capacity(HttpClient::<SimShard>::new(HttpClientConfig::dev()), 16);
     let driver = sim.register_with_mailbox_capacity(
         Driver {
             observed: Rc::clone(&observed),
@@ -237,10 +234,8 @@ fn run_dst_with_connect_failure(
 
     let mut sim = Simulator::new(SimShard, config);
     let observed = Rc::new(RefCell::new(None));
-    let client = sim.register_with_mailbox_capacity(
-        HttpClient::<SimShard>::new(HttpClientConfig::dev()),
-        16,
-    );
+    let client = sim
+        .register_with_mailbox_capacity(HttpClient::<SimShard>::new(HttpClientConfig::dev()), 16);
     let driver = sim.register_with_mailbox_capacity(
         Driver {
             observed: Rc::clone(&observed),
@@ -258,7 +253,10 @@ fn run_dst_with_connect_failure(
     )
     .expect("send Begin");
     sim.run_until_quiescent();
-    observed.borrow_mut().take().expect("driver observed result")
+    observed
+        .borrow_mut()
+        .take()
+        .expect("driver observed result")
 }
 
 #[test]

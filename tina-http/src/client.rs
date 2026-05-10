@@ -15,10 +15,13 @@
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
-use http::header::HOST;
 use http::HeaderValue;
+use http::header::HOST;
 use tina::prelude::*;
-use tina_runtime::{CallError, StreamId, TlsStreamId, sleep, tcp_connect, tls_connect};
+use tina_runtime::{
+    CallError, StreamId, TlsStreamId, sleep, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    tls_close, tls_connect, tls_read, tls_write,
+};
 
 use crate::parse::{HttpResponseHead, ResponseParseProgress, encode_request, parse_response_head};
 use crate::target::{HttpHostPolicy, HttpTarget};
@@ -122,27 +125,22 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
             HttpClientMsg::Call(call) => self.handle_call(*call),
 
             HttpClientMsg::Connected(Ok((stream, _local, _peer))) => {
-                let transport = HttpTransport::Tcp(stream);
                 let Some(state) = self.state.as_mut() else {
                     // Previous call already ended; close the dangling stream.
-                    return transport
-                        .close_call(self.config.request_timeout)
-                        .reply(HttpClientMsg::Closed);
+                    return tcp_close_stream(stream).reply(HttpClientMsg::Closed);
                 };
-                state.transport = Some(transport);
+                state.transport = Some(HttpTransport::Tcp(stream));
                 state.pending_write = state.request_bytes.clone();
                 self.write_more()
             }
             HttpClientMsg::Connected(Err(_)) => self.fail(HttpClientError::Connect),
 
             HttpClientMsg::TlsConnected(Ok(stream)) => {
-                let transport = HttpTransport::Tls(stream);
                 let Some(state) = self.state.as_mut() else {
-                    return transport
-                        .close_call(self.config.request_timeout)
+                    return tls_close(stream, self.config.request_timeout)
                         .reply(HttpClientMsg::Closed);
                 };
-                state.transport = Some(transport);
+                state.transport = Some(HttpTransport::Tls(stream));
                 state.pending_write = state.request_bytes.clone();
                 self.write_more()
             }
@@ -237,9 +235,13 @@ impl<S: Shard + 'static> HttpClient<S> {
     fn write_more(&mut self) -> Effect<Self> {
         let state = self.state.as_ref().expect("state present during write");
         let transport = state.transport.expect("transport set before write");
-        transport
-            .write_call(state.pending_write.clone(), self.config.request_timeout)
-            .reply(HttpClientMsg::Wrote)
+        let bytes = state.pending_write.clone();
+        match transport {
+            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).reply(HttpClientMsg::Wrote),
+            HttpTransport::Tls(stream) => {
+                tls_write(stream, bytes, self.config.request_timeout).reply(HttpClientMsg::Wrote)
+            }
+        }
     }
 
     fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
@@ -261,9 +263,12 @@ impl<S: Shard + 'static> HttpClient<S> {
     fn read_more(&mut self) -> Effect<Self> {
         let state = self.state.as_ref().expect("state present during read");
         let transport = state.transport.expect("transport set before read");
-        transport
-            .read_call(READ_CHUNK, self.config.request_timeout)
-            .reply(HttpClientMsg::Read)
+        match transport {
+            HttpTransport::Tcp(stream) => tcp_read(stream, READ_CHUNK).reply(HttpClientMsg::Read),
+            HttpTransport::Tls(stream) => {
+                tls_read(stream, READ_CHUNK, self.config.request_timeout).reply(HttpClientMsg::Read)
+            }
+        }
     }
 
     fn handle_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
@@ -326,14 +331,16 @@ impl<S: Shard + 'static> HttpClient<S> {
         transport: Option<HttpTransport>,
     ) -> Effect<Self> {
         let reply_effect: Effect<Self> = reply(result);
-        if let Some(transport) = transport {
-            let close_effect: Effect<Self> = transport
-                .close_call(self.config.request_timeout)
-                .reply(HttpClientMsg::Closed);
-            batch(vec![reply_effect, close_effect])
-        } else {
-            reply_effect
-        }
+        let Some(transport) = transport else {
+            return reply_effect;
+        };
+        let close_effect: Effect<Self> = match transport {
+            HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpClientMsg::Closed),
+            HttpTransport::Tls(stream) => {
+                tls_close(stream, self.config.request_timeout).reply(HttpClientMsg::Closed)
+            }
+        };
+        batch(vec![reply_effect, close_effect])
     }
 }
 
@@ -380,8 +387,8 @@ fn apply_host_policy(
     if request.headers.contains_key(HOST) {
         return Err(HttpClientError::DuplicateHostHeader);
     }
-    let value = HeaderValue::from_str(policy_value)
-        .map_err(|_| HttpClientError::InvalidHostHeaderValue)?;
+    let value =
+        HeaderValue::from_str(policy_value).map_err(|_| HttpClientError::InvalidHostHeaderValue)?;
     request.headers.insert(HOST, value);
     Ok(request)
 }

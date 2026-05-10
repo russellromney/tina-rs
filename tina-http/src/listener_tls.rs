@@ -188,18 +188,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // Stop arrived while bind was in flight. Close
                     // the just-bound listener; no reply.
                     let listener = self.listener.take().expect("set just above");
-                    return tls_close_listener(listener)
-                        .reply(HttpsListenerMsg::ListenerClosed);
+                    return tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed);
                 }
                 let ready_effect: Effect<Self> = reply(Ok(HttpsReady { local_addr }));
-                let accept_effect: Effect<Self> = tls_accept(listener, self.tls_accept_timeout)
-                    .reply(HttpsListenerMsg::Accepted);
+                let accept_effect: Effect<Self> =
+                    tls_accept(listener, self.tls_accept_timeout).reply(HttpsListenerMsg::Accepted);
                 batch(vec![ready_effect, accept_effect])
             }
-            HttpsListenerMsg::Bound(Err(source)) => batch(vec![
-                reply(Err(HttpsStartupError::Bind { source })),
-                stop(),
-            ]),
+            HttpsListenerMsg::Bound(Err(source)) => {
+                batch(vec![reply(Err(HttpsStartupError::Bind { source })), stop()])
+            }
 
             HttpsListenerMsg::Accepted(Ok((stream, _peer))) => {
                 if self.stopping {
@@ -216,8 +214,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 let child = self.build_connection_child(stream);
                 batch(vec![
                     spawn(child),
-                    tls_accept(listener, self.tls_accept_timeout)
-                        .reply(HttpsListenerMsg::Accepted),
+                    tls_accept(listener, self.tls_accept_timeout).reply(HttpsListenerMsg::Accepted),
                 ])
             }
             HttpsListenerMsg::Accepted(Err(error)) => {
@@ -268,10 +265,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 }
 
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpsListener<S, M> {
-    fn build_connection_child(
-        &self,
-        stream: TlsStreamId,
-    ) -> ChildDefinition<HttpConnection<S, M>> {
+    fn build_connection_child(&self, stream: TlsStreamId) -> ChildDefinition<HttpConnection<S, M>> {
         ChildDefinition::new(
             HttpConnection::<S, M>::with_transport(
                 HttpTransport::Tls(stream),

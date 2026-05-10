@@ -13,9 +13,9 @@ use std::time::Duration;
 use http::{HeaderMap, Method, StatusCode, Version};
 use tina::prelude::*;
 use tina_http::{
-    HttpClient, HttpClientConfig, HttpClientError, HttpConnectionPool, HttpPoolMsg,
-    HttpRequest, HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, OutboundCall,
-    PoolConfig, TlsTrustRoots,
+    HttpClient, HttpClientConfig, HttpClientError, HttpConnectionPool, HttpPoolMsg, HttpRequest,
+    HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, OutboundCall, PoolConfig,
+    TlsTrustRoots,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
@@ -33,8 +33,8 @@ impl Shard for TestShard {
 
 fn build_cert_bundle() -> (Vec<u8>, rustls::ServerConfig) {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-sign");
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-sign");
     let cert_der = certified.cert.der().to_vec();
     let key_der = certified.key_pair.serialize_der();
     let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
@@ -229,10 +229,7 @@ fn pool_refuses_with_full_when_https_slot_busy() {
             driver_b,
             DriverMsg::Begin {
                 pool,
-                outbound: OutboundCall {
-                    target,
-                    request,
-                },
+                outbound: OutboundCall { target, request },
                 timeout: Duration::from_secs(2),
             },
         )
@@ -280,11 +277,7 @@ fn pool_serial_admission_works_with_https_target() {
     let driver = runtime
         .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 8)
         .expect("register driver");
-    let target = HttpTarget::https(
-        addr,
-        "localhost",
-        TlsTrustRoots::from_der(vec![cert_der]),
-    );
+    let target = HttpTarget::https(addr, "localhost", TlsTrustRoots::from_der(vec![cert_der]));
     runtime
         .try_send(
             driver,

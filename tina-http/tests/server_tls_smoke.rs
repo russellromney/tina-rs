@@ -4,8 +4,8 @@
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use http::{Method, StatusCode};
@@ -283,7 +283,10 @@ fn observe_next_tls_bound_resolves_when_listener_binds() {
 
 #[test]
 fn second_start_returns_already_started_without_rebinding() {
-    let GeneratedIdentity { identity, cert_der: _ } = generate_identity();
+    let GeneratedIdentity {
+        identity,
+        cert_der: _,
+    } = generate_identity();
 
     let runtime = build_runtime();
     let counter = runtime
@@ -372,7 +375,10 @@ fn stop_with_pending_accept_closes_listener_cleanly() {
     // tls_close_listener. The fix defers the close until the
     // pending accept lands. The trace must show a clean
     // TlsListenerClose completion (not CallFailed).
-    let GeneratedIdentity { identity, cert_der: _ } = generate_identity();
+    let GeneratedIdentity {
+        identity,
+        cert_der: _,
+    } = generate_identity();
 
     let runtime = build_runtime();
     let counter = runtime
@@ -450,7 +456,10 @@ fn stop_before_bound_completes_does_not_leave_listener_held() {
     // or still pending (Stop landed first). Either way, the
     // listener isolate must close out cleanly without holding a
     // TlsListenerId.
-    let GeneratedIdentity { identity, cert_der: _ } = generate_identity();
+    let GeneratedIdentity {
+        identity,
+        cert_der: _,
+    } = generate_identity();
 
     let runtime = build_runtime();
     let counter = runtime

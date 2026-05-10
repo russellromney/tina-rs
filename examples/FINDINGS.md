@@ -310,6 +310,86 @@ constraint, or the example acquires a third role (proxy / mTLS).
 Until then, first-form HTTPS is honest about its single-lane
 bottleneck.
 
+### 17. Host-thread `call_blocking` for tests and specimens
+
+**Surfaced by:** `eiffel_native_https`,
+`tina-http/tests/{server,client,pool}_tls_smoke.rs`,
+`tina-http/tests/dst_simulator_tls.rs`, plus the existing
+`tina-http/tests/{client,pool}_smoke.rs`.
+
+Every test or specimen that needs a typed reply from a Tina
+isolate from the host thread reaches for the same boilerplate:
+a `Driver` isolate, a `DriverMsg::{Begin, Returned}` enum, an
+`mpsc::channel`, register Driver, send Begin, `recv_timeout`
+on the channel. ~50 lines per test. The native-HTTPS work
+wrote it six times.
+
+The ergonomic cost is visible in the eiffel comparison: the
+Tina HTTPS specimen is 26 lines longer than the Tokio one, and
+nearly all of the gap is the Driver isolate that gates startup
+on the call-shaped `HttpsListenerMsg::Start` reply. Tokio's
+equivalent is one `oneshot::channel()` plus `.await`.
+
+**Build:** a host-thread `runtime.call_blocking::<M, R>(addr, msg, timeout)
+-> CallOutcome<R>` helper on `ThreadedRuntime` (and the
+multi-shard variant). Bridge crates (`tina-tokio-bridge`)
+already implement exactly this pattern for cross-thread call;
+the runtime should expose it natively for tests and the
+host-driver pattern in eiffel specimens.
+
+Must keep typed `CallOutcome` so `Full`/`Closed`/`Timeout`
+stay distinguishable from `Replied`. A flatten helper can ride
+on top per the existing finding 7 pattern.
+
+**Revisit when:** any phase needs to land another Tina-as-server
+specimen with a host driver. The call_blocking helper would
+make those specimens 30+ lines shorter on the Tina side.
+
+### 18. Trace query helpers for assertions
+
+**Surfaced by:** `tina-http/tests/{server,server_tls}_smoke.rs`,
+`tina-runtime/tests/local_system.rs`.
+
+Every regression test that pins the trace shape writes the
+same shape of assertion:
+
+```rust
+let tls_bind_completions = trace
+    .iter()
+    .filter(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TlsBind,
+                ..
+            }
+        )
+    })
+    .count();
+```
+
+Across the HTTPS work this exact pattern landed three times
+(idempotency proof, stop-with-pending-accept, stop-before-bound).
+Each test pays 6+ lines of `matches!` boilerplate to make one
+assertion.
+
+**Build:** typed query helpers on a `&[RuntimeEvent]` slice or
+a wrapper view, e.g.:
+
+```rust
+trace.count_completed(CallKind::TlsBind)
+trace.any_failed(CallKind::TlsListenerClose)
+trace.completed_with(CallKind::TlsBind, |reason| ...)
+```
+
+Lives in `tina-runtime` next to `RuntimeEvent` /
+`RuntimeEventKind`. Keeps the trace as the source of truth;
+just shrinks the assertion site.
+
+**Revisit when:** the next phase that adds typed-startup or
+shutdown semantics writes another `count_completed`-shaped
+assertion by hand.
+
 ### 15. Deadline as first-class context
 
 **Surfaced by:** `eiffel_backpressure_chain`.
