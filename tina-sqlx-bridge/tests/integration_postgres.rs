@@ -1039,6 +1039,130 @@ fn transaction_typed_helper_returns_outcome() {
 
 #[test]
 #[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn cancel_on_timeout_actually_shortens_late_completion() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    // 100ms bridge timeout, query sleeps 5s. With cancel on, the
+    // detached SQLx future should return well under 5s once Postgres
+    // processes the pg_cancel_backend.
+    let cfg = PgConfig::new()
+        .with_pool(
+            PgPoolConfig::new(&url)
+                .with_max_connections(2)
+                .with_acquire_timeout(Duration::from_secs(2)),
+        )
+        .with_default_timeout(Duration::from_millis(100))
+        .with_poll_interval(Duration::from_millis(2))
+        .with_max_in_flight(2)
+        .with_cancel_on_timeout(1);
+    let bridge = PgWorker::<SingleShard>::install(&runtime, cfg).expect("install");
+
+    let started = Instant::now();
+    let outcome = one(
+        &runtime,
+        &bridge,
+        PgRequest::execute("SELECT pg_sleep(5)"),
+        Duration::from_secs(15),
+        Duration::from_secs(20),
+    );
+    assert!(
+        matches!(outcome, CallOutcome::Replied(Err(PgError::Timeout))),
+        "outcome: {outcome:?}",
+    );
+
+    // Wait for the late tally to fire (sqlx_errors should bump
+    // because pg_cancel_backend turns the running query into an
+    // error). Without cancel this would take ~5s; with cancel it
+    // should land within a couple hundred ms of the timeout.
+    let late_deadline = Instant::now() + Duration::from_secs(4);
+    while bridge.metrics.snapshot().late_results == 0 {
+        if Instant::now() >= late_deadline {
+            panic!(
+                "late_results never incremented: {:?}",
+                bridge.metrics.snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let total = started.elapsed();
+    let snap = bridge.metrics.snapshot();
+
+    assert!(snap.timeouts >= 1, "{snap:?}");
+    assert!(snap.late_results >= 1, "{snap:?}");
+    assert!(
+        snap.db_cancels_sent >= 1,
+        "expected cancel to fire: {snap:?}",
+    );
+    // Generous bound: even with cancel, the wall-clock end-to-end is
+    // dominated by the sleep + poll overhead; 4s is well below the
+    // uncancelled 5s and well above the cancelled latency on a slow
+    // CI box.
+    assert!(
+        total < Duration::from_secs(4),
+        "cancel should have shortened the wall clock; got {total:?}",
+    );
+    // Cancelled queries surface as Sqlx errors on the spawn side.
+    assert!(
+        snap.sqlx_errors >= 1,
+        "cancelled query should tally as sqlx_error: {snap:?}",
+    );
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
+fn cancel_on_timeout_disabled_by_default_no_cancels_sent() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => return,
+    };
+    let runtime = make_runtime();
+    // No `.with_cancel_on_timeout(...)` — default is off.
+    let cfg = PgConfig::new()
+        .with_pool(
+            PgPoolConfig::new(&url)
+                .with_max_connections(2)
+                .with_acquire_timeout(Duration::from_secs(2)),
+        )
+        .with_default_timeout(Duration::from_millis(100))
+        .with_poll_interval(Duration::from_millis(2))
+        .with_max_in_flight(2);
+    let bridge = PgWorker::<SingleShard>::install(&runtime, cfg).expect("install");
+
+    let outcome = one(
+        &runtime,
+        &bridge,
+        // Short sleep so the test does not hang on the late tally.
+        PgRequest::execute("SELECT pg_sleep(0.5)"),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    );
+    assert!(matches!(
+        outcome,
+        CallOutcome::Replied(Err(PgError::Timeout))
+    ));
+
+    // Wait for late tally so the assertion is stable.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while bridge.metrics.snapshot().late_results == 0 {
+        if Instant::now() >= deadline {
+            panic!("late_results never incremented");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snap = bridge.metrics.snapshot();
+    assert_eq!(
+        snap.db_cancels_sent, 0,
+        "cancel must stay off by default: {snap:?}",
+    );
+    shutdown(runtime);
+}
+
+#[test]
+#[ignore = "needs DATABASE_URL pointing at a real Postgres"]
 fn close_with_in_flight_runs_to_completion_then_closes() {
     let url = match database_url() {
         Some(u) => u,

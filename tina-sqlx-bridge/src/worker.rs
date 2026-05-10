@@ -14,12 +14,12 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
 use futures_util::TryStreamExt;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow as SqlxRow};
-use sqlx::{Column, Row as _, TypeInfo};
+use sqlx::{Column, Connection, Row as _, TypeInfo};
 use tina::prelude::*;
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
 use tokio::runtime::Handle;
@@ -84,6 +84,12 @@ struct InFlight {
     started_at: Instant,
     receiver: oneshot::Receiver<PgResult>,
     abandoned: Arc<AtomicBool>,
+    /// `Some` when DB-side cancel is enabled. The spawned task
+    /// stores `pg_backend_pid()` here right after it acquires a
+    /// connection and clears it back to 0 after the user's query
+    /// returns. The bridge's timeout path reads this; non-zero means
+    /// "fire `pg_cancel_backend` against this PID."
+    pid_slot: Option<Arc<AtomicI32>>,
     request_kind: &'static str,
 }
 
@@ -183,6 +189,10 @@ impl Drop for PoolHolder {
 pub struct PgWorker<S: Shard + 'static> {
     config: PgConfig,
     pool: PoolHolder,
+    /// Sidecar pool for `pg_cancel_backend(pid)`. Built only when
+    /// `config.cancel` is `Some` *and* the bridge built its own pool
+    /// (the `install` path).
+    cancel_pool: Option<PoolHolder>,
     runtime: Handle,
     in_flight: HashMap<u64, InFlight>,
     next_id: u64,
@@ -208,6 +218,7 @@ impl<S: Shard + 'static> PgWorker<S> {
     fn assemble(
         config: PgConfig,
         pool: PgPool,
+        cancel_pool: Option<PgPool>,
         runtime: Handle,
         owned_runtime: Option<OwnedRuntime>,
     ) -> (Self, PgMetricsHandle) {
@@ -216,9 +227,11 @@ impl<S: Shard + 'static> PgWorker<S> {
             inner: Arc::clone(&metrics_inner),
         };
         let pool = PoolHolder::new(pool, runtime.clone());
+        let cancel_pool = cancel_pool.map(|p| PoolHolder::new(p, runtime.clone()));
         let worker = Self {
             config,
             pool,
+            cancel_pool,
             runtime,
             in_flight: HashMap::new(),
             next_id: 1,
@@ -282,8 +295,19 @@ impl<S: Shard + 'static> PgWorker<S> {
         let abandoned_for_task = Arc::clone(&abandoned);
         let metrics_for_task = Arc::clone(&self.metrics);
         let max_response_rows = self.config.max_response_rows;
+        let pid_slot = self
+            .cancel_pool
+            .as_ref()
+            .map(|_| Arc::new(AtomicI32::new(0)));
+        let pid_slot_for_task = pid_slot.clone();
         self.runtime.spawn(async move {
-            let result = run_request(&pool, request, max_response_rows).await;
+            let result = run_request(
+                &pool,
+                request,
+                max_response_rows,
+                pid_slot_for_task.as_deref(),
+            )
+            .await;
             tally_worker_terminal(&metrics_for_task, &result);
             if abandoned_for_task.load(Ordering::Acquire) {
                 metrics_for_task
@@ -300,6 +324,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 started_at: Instant::now(),
                 receiver: rx,
                 abandoned,
+                pid_slot,
                 request_kind,
             },
         );
@@ -343,12 +368,33 @@ impl<S: Shard + 'static> PgWorker<S> {
                     // the actual outcome and `late_results`
                     // increments. We do not abort the task — abort
                     // would cancel SQLx at the next .await point and
-                    // skip the tally entirely, while doing nothing to
-                    // stop Postgres from finishing the query.
-                    // Postgres-side cancellation needs `CancelRequest`
-                    // and is a deferred follow-up.
+                    // skip the tally entirely.
                     in_flight.abandoned.store(true, Ordering::Release);
                     self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+
+                    // If cancel-on-timeout is enabled and the spawn
+                    // captured a backend PID, fire-and-forget a
+                    // sidecar query that asks Postgres to cancel
+                    // whatever is currently running on that backend.
+                    // Atomic swap-to-zero so a later `tx.send`-side
+                    // clear does not race; also so a duplicate poll
+                    // cannot fire a second cancel for the same id.
+                    if let (Some(pid_slot), Some(cancel_pool)) =
+                        (in_flight.pid_slot.as_ref(), self.cancel_pool.as_ref())
+                    {
+                        let pid = pid_slot.swap(0, Ordering::AcqRel);
+                        if pid != 0 {
+                            let pool = cancel_pool.pool().clone();
+                            self.metrics.db_cancels_sent.fetch_add(1, Ordering::Relaxed);
+                            self.runtime.spawn(async move {
+                                let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                                    .bind(pid)
+                                    .execute(&pool)
+                                    .await;
+                            });
+                        }
+                    }
+
                     self.note_terminal();
                     #[cfg(feature = "tracing")]
                     event!(
@@ -489,6 +535,7 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
     {
         config.validate()?;
         let pool_cfg = config.pool.clone().ok_or(InstallError::MissingPoolConfig)?;
+        let cancel_cfg = config.cancel.clone();
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
@@ -496,18 +543,29 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
             .build()
             .map_err(|e| InstallError::Runtime(format!("{e}")))?;
         let handle = tokio_rt.handle().clone();
-        let pool = handle
+        let (pool, cancel_pool) = handle
             .block_on(async {
-                PgPoolOptions::new()
+                let main = PgPoolOptions::new()
                     .max_connections(pool_cfg.max_connections)
                     .acquire_timeout(pool_cfg.acquire_timeout)
                     .connect(&pool_cfg.url)
-                    .await
+                    .await?;
+                let sidecar = match cancel_cfg {
+                    Some(cc) => Some(
+                        PgPoolOptions::new()
+                            .max_connections(cc.pool_size)
+                            .acquire_timeout(cc.acquire_timeout)
+                            .connect(&pool_cfg.url)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                Ok::<_, sqlx::Error>((main, sidecar))
             })
             .map_err(|e| InstallError::Pool(format!("{e}")))?;
         let owned = OwnedRuntime(Some(tokio_rt));
         let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::assemble(config, pool, handle, Some(owned));
+        let (worker, metrics) = Self::assemble(config, pool, cancel_pool, handle, Some(owned));
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
@@ -558,10 +616,12 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
         // Tina-only validation: `config.pool` is ignored on this path
         // because the supplied `PgPool` owns its SQLx settings.
         // Validating `config.pool` here would reject callers for
-        // fields the bridge promised not to apply.
+        // fields the bridge promised not to apply. `config.cancel`
+        // is also ignored — DB-side cancel is opt-in only on the
+        // config-built path.
         config.validate_tina()?;
         let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::assemble(config, pool, tokio_handle, None);
+        let (worker, metrics) = Self::assemble(config, pool, None, tokio_handle, None);
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
@@ -713,14 +773,52 @@ fn tally_transaction_steps(metrics: &MetricsInner, steps: &[PgStepOk]) {
     }
 }
 
-async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize) -> PgResult {
+async fn run_request(
+    pool: &PgPool,
+    request: PgRequest,
+    max_response_rows: usize,
+    pid_slot: Option<&AtomicI32>,
+) -> PgResult {
+    // Always acquire explicitly so we control the connection
+    // identity. When DB-side cancel is enabled we capture the
+    // backend PID on this exact connection; when it is not, the
+    // explicit acquire still costs the same as the implicit one
+    // `q.execute(pool)` would do internally.
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => return Err(map_sqlx_error(e)),
+    };
+    if let Some(slot) = pid_slot {
+        match sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+        {
+            Ok(pid) => slot.store(pid, Ordering::Release),
+            Err(e) => return Err(map_sqlx_error(e)),
+        }
+    }
+    let result = run_on_conn(&mut conn, request, max_response_rows).await;
+    if let Some(slot) = pid_slot {
+        // Clear so a late timeout poll cannot fire a cancel against
+        // a connection that has already been released to the pool
+        // and reused by another query.
+        slot.store(0, Ordering::Release);
+    }
+    result
+}
+
+async fn run_on_conn(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    request: PgRequest,
+    max_response_rows: usize,
+) -> PgResult {
     match request {
         PgRequest::Execute { sql, params } => {
             let mut q = sqlx::query(&sql);
             for p in params {
                 q = bind_param(q, p);
             }
-            match q.execute(pool).await {
+            match q.execute(&mut **conn).await {
                 Ok(r) => Ok(PgResponse::Executed {
                     rows_affected: r.rows_affected(),
                 }),
@@ -736,7 +834,7 @@ async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize
             // returns a large result set surfaces `TooManyRows`
             // without first buffering the whole thing in bridge
             // memory.
-            let mut stream = q.fetch(pool);
+            let mut stream = q.fetch(&mut **conn);
             let first = match stream.try_next().await {
                 Ok(opt) => opt,
                 Err(e) => return Err(map_sqlx_error(e)),
@@ -756,24 +854,16 @@ async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize
             params,
             max_rows,
         } => {
-            // Effective cap: caller's `max_rows` capped by the
-            // bridge's `max_response_rows` ceiling. We pull at most
-            // `cap + 1` rows so we can distinguish "exactly cap rows"
-            // from "Postgres had more." Either way we never grow the
-            // bridge's buffer past `cap`.
             let cap = core::cmp::min(max_rows, max_response_rows);
             let mut q = sqlx::query(&sql);
             for p in params {
                 q = bind_param(q, p);
             }
-            let mut stream = q.fetch(pool);
+            let mut stream = q.fetch(&mut **conn);
             let mut rows: Vec<PgRow> = Vec::with_capacity(cap.min(64));
             let mut truncated = false;
             loop {
                 if rows.len() == cap {
-                    // Pull one more to discriminate "exactly cap" vs
-                    // "more on the wire"; if there's another row, we
-                    // drop it on the floor and set truncated.
                     match stream.try_next().await {
                         Ok(None) => break,
                         Ok(Some(_)) => {
@@ -796,27 +886,23 @@ async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize
         }
         PgRequest::Transaction { steps } => {
             // Validation guarantees `steps` is non-empty.
-            let mut tx = match pool.begin().await {
+            let mut tx = match conn.begin().await {
                 Ok(tx) => tx,
                 Err(e) => return Err(map_sqlx_error(e)),
             };
             let mut completed: Vec<PgStepOk> = Vec::with_capacity(steps.len());
-            let mut steps_iter = steps.into_iter().enumerate();
-            let rolled_back = loop {
-                let Some((i, step)) = steps_iter.next() else {
-                    break None;
-                };
+            let mut rolled_back: Option<(usize, PgError)> = None;
+            for (i, step) in steps.into_iter().enumerate() {
                 match run_step(&mut tx, step, max_response_rows).await {
                     Ok(ok) => completed.push(ok),
-                    Err(error) => break Some((i, error)),
+                    Err(error) => {
+                        rolled_back = Some((i, error));
+                        break;
+                    }
                 }
-            };
+            }
             if let Some((failed_at, error)) = rolled_back {
-                // Drop tx -> sqlx 0.8 issues ROLLBACK on the
-                // connection. Explicit `rollback().await` would be
-                // cleaner but that consumes `tx` and races with the
-                // generated drop guard; sqlx's drop path is the
-                // documented contract here.
+                // Drop tx -> sqlx 0.8 issues ROLLBACK.
                 drop(tx);
                 return Ok(PgResponse::Transaction(PgTransactionOutcome::RolledBack {
                     completed,
@@ -826,8 +912,8 @@ async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize
             }
             if let Err(e) = tx.commit().await {
                 // COMMIT itself failed (deadlock, serialization
-                // failure, connection loss). The transaction is now
-                // in an indeterminate state from the caller's view;
+                // failure, connection loss). The transaction is in
+                // an indeterminate state from the caller's view;
                 // surface as a top-level Sqlx error rather than a
                 // RolledBack outcome we cannot honestly claim.
                 return Err(map_sqlx_error(e));

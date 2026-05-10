@@ -702,6 +702,12 @@ pub enum PgConfigError {
     /// `max_response_rows == 0`. Use a request `max_rows` of `0` for
     /// "no rows expected"; the config ceiling must be `>= 1`.
     ZeroMaxResponseRows,
+    /// `cancel.pool_size == 0`. The cancel sidecar needs at least one
+    /// connection to fire `pg_cancel_backend`.
+    ZeroCancelPoolSize,
+    /// `cancel.acquire_timeout == 0`. SQLx would reject every cancel
+    /// acquire immediately.
+    ZeroCancelAcquireTimeout,
     /// SQLx pool config requested zero connections. SQLx requires at
     /// least one. Distinct from a "no public cap" error: pool size is
     /// caller-owned.
@@ -724,6 +730,8 @@ impl std::fmt::Display for PgConfigError {
             Self::ZeroPollInterval => f.write_str("poll_interval must be > 0"),
             Self::ZeroMaxRequestParams => f.write_str("max_request_params must be >= 1"),
             Self::ZeroMaxResponseRows => f.write_str("max_response_rows must be >= 1"),
+            Self::ZeroCancelPoolSize => f.write_str("cancel.pool_size must be >= 1"),
+            Self::ZeroCancelAcquireTimeout => f.write_str("cancel.acquire_timeout must be > 0"),
             Self::ZeroPoolMaxConnections => f.write_str("pool max_connections must be >= 1"),
             Self::ZeroPoolAcquireTimeout => f.write_str("pool acquire_timeout must be > 0"),
         }
@@ -731,6 +739,59 @@ impl std::fmt::Display for PgConfigError {
 }
 
 impl std::error::Error for PgConfigError {}
+
+/// Sidecar cancel-pool settings.
+///
+/// When set, the bridge builds a small `sqlx::PgPool` from the same
+/// URL as the main pool and uses it to fire `pg_cancel_backend(pid)`
+/// when the per-attempt timeout fires on a request whose backend PID
+/// has been captured. Only available on the [`crate::PgWorker::install`]
+/// path (config-built pool); the supplied-pool path leaves DB
+/// cancellation to the caller.
+///
+/// Cost: one extra round trip per admitted request to capture
+/// `pg_backend_pid()` before running the user's query. Default off
+/// keeps that opt-in.
+#[derive(Debug, Clone)]
+pub struct PgCancelConfig {
+    /// Sidecar pool size. Tiny by default — cancel calls are short
+    /// and rare.
+    pub pool_size: u32,
+    /// SQLx `acquire_timeout` for the sidecar pool. The bridge does
+    /// not wait on the cancel's own deadline directly; this just
+    /// bounds how long the sidecar will hold a fire-and-forget cancel
+    /// task.
+    pub acquire_timeout: Duration,
+}
+
+impl PgCancelConfig {
+    /// Cancel sidecar with conservative defaults (`pool_size = 1`,
+    /// `acquire_timeout = 2s`).
+    pub fn new() -> Self {
+        Self {
+            pool_size: 1,
+            acquire_timeout: Duration::from_secs(2),
+        }
+    }
+
+    /// Sidecar pool size.
+    pub fn with_pool_size(mut self, n: u32) -> Self {
+        self.pool_size = n;
+        self
+    }
+
+    /// Sidecar acquire timeout.
+    pub fn with_acquire_timeout(mut self, t: Duration) -> Self {
+        self.acquire_timeout = t;
+        self
+    }
+}
+
+impl Default for PgCancelConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// SQLx pool settings the bridge will apply when it builds its own
 /// pool. Ignored when the bridge is given a caller-supplied
@@ -821,6 +882,13 @@ pub struct PgConfig {
     /// further capped to this value, so a caller cannot ask for
     /// `usize::MAX` and force unbounded buffering.
     pub max_response_rows: usize,
+    /// Optional DB-side cancel sidecar. When `Some`, the bridge fires
+    /// `pg_cancel_backend(pid)` from a small dedicated pool when the
+    /// per-attempt timeout elapses on a request whose backend PID
+    /// was captured. Default `None` — opt in via
+    /// [`Self::with_cancel_on_timeout`]. Only honored on the
+    /// `install` path; ignored on `install_with_pool`.
+    pub cancel: Option<PgCancelConfig>,
 }
 
 impl PgConfig {
@@ -836,6 +904,7 @@ impl PgConfig {
             poll_interval: Duration::from_millis(2),
             max_request_params: 64,
             max_response_rows: 4096,
+            cancel: None,
         }
     }
 
@@ -893,6 +962,26 @@ impl PgConfig {
         self
     }
 
+    /// Enables DB-side cancellation with a sidecar pool of `pool_size`.
+    ///
+    /// When the bridge per-attempt timeout fires, the bridge runs
+    /// `pg_cancel_backend($1)` against the captured backend PID via
+    /// the sidecar pool. Adds one round trip per admitted request to
+    /// capture `pg_backend_pid()` before running the user's query.
+    ///
+    /// Only honored on [`crate::PgWorker::install`]; the
+    /// supplied-pool path ignores it (caller owns the pool).
+    pub fn with_cancel_on_timeout(mut self, pool_size: u32) -> Self {
+        self.cancel = Some(PgCancelConfig::new().with_pool_size(pool_size));
+        self
+    }
+
+    /// Sets the full cancel config explicitly.
+    pub fn with_cancel(mut self, cancel: PgCancelConfig) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
     /// Validates the full config — Tina-side fields plus the
     /// embedded `pool` config when it is `Some`. Used by
     /// [`crate::PgWorker::install`] (config-built pool path).
@@ -938,6 +1027,14 @@ impl PgConfig {
         }
         if self.max_response_rows == 0 {
             return Err(PgConfigError::ZeroMaxResponseRows);
+        }
+        if let Some(cancel) = &self.cancel {
+            if cancel.pool_size == 0 {
+                return Err(PgConfigError::ZeroCancelPoolSize);
+            }
+            if cancel.acquire_timeout.is_zero() {
+                return Err(PgConfigError::ZeroCancelAcquireTimeout);
+            }
         }
         Ok(())
     }

@@ -189,7 +189,7 @@ pub use helpers::{
 };
 pub use metrics::{PgMetrics, PgMetricsHandle};
 pub use types::{
-    InstallError, PgConfig, PgConfigError, PgError, PgPoolConfig, PgRequest, PgResponse, PgRow,
-    PgStep, PgStepOk, PgTransactionOutcome, PgValue, U64TooLarge,
+    InstallError, PgCancelConfig, PgConfig, PgConfigError, PgError, PgPoolConfig, PgRequest,
+    PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome, PgValue, U64TooLarge,
 };
 pub use worker::{InstalledPgBridge, PgCloser, PgMsg, PgWorker};

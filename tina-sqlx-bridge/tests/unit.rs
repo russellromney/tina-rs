@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use tina_runtime::CallOutcome;
 use tina_sqlx_bridge::{
-    PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt, PgPoolConfig,
-    PgRequest, PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome, PgTransientReason,
-    PgValue, U64TooLarge,
+    PgCancelConfig, PgConfig, PgConfigError, PgError, PgFatalReason, PgOutcomeClass, PgOutcomeExt,
+    PgPoolConfig, PgRequest, PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome,
+    PgTransientReason, PgValue, U64TooLarge,
 };
 
 // ---------------------------------------------------------------------------
@@ -301,6 +301,27 @@ fn config_rejects_zero_pool_acquire_timeout() {
     let cfg = good_config()
         .with_pool(PgPoolConfig::new("postgres://invalid/").with_acquire_timeout(Duration::ZERO));
     assert_eq!(cfg.validate(), Err(PgConfigError::ZeroPoolAcquireTimeout));
+}
+
+#[test]
+fn config_rejects_zero_cancel_pool_size() {
+    let cfg = good_config().with_cancel(PgCancelConfig::new().with_pool_size(0));
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroCancelPoolSize));
+}
+
+#[test]
+fn config_rejects_zero_cancel_acquire_timeout() {
+    let cfg = good_config().with_cancel(PgCancelConfig::new().with_acquire_timeout(Duration::ZERO));
+    assert_eq!(cfg.validate(), Err(PgConfigError::ZeroCancelAcquireTimeout));
+}
+
+#[test]
+fn with_cancel_on_timeout_sets_default_acquire_timeout() {
+    let cfg = good_config().with_cancel_on_timeout(2);
+    assert!(cfg.cancel.is_some());
+    let cancel = cfg.cancel.as_ref().unwrap();
+    assert_eq!(cancel.pool_size, 2);
+    assert!(cancel.acquire_timeout > Duration::ZERO);
 }
 
 #[test]

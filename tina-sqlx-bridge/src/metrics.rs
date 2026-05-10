@@ -59,6 +59,10 @@ pub struct PgMetrics {
     /// Does not count COMMITs that themselves failed (those land as
     /// `sqlx_errors`).
     pub transactions_rolled_back: u64,
+    /// Number of `pg_cancel_backend(pid)` cancellations the bridge
+    /// fired against the sidecar pool. Counts the *attempt*, not
+    /// whether Postgres honored it.
+    pub db_cancels_sent: u64,
     /// Row decode failed.
     pub decode_errors: u64,
     /// Worker terminal that landed after the bridge surfaced
@@ -90,6 +94,7 @@ pub(crate) struct MetricsInner {
     pub(crate) rows_returned: AtomicU64,
     pub(crate) transactions_committed: AtomicU64,
     pub(crate) transactions_rolled_back: AtomicU64,
+    pub(crate) db_cancels_sent: AtomicU64,
     pub(crate) decode_errors: AtomicU64,
     pub(crate) late_results: AtomicU64,
     pub(crate) in_flight_current: AtomicU64,
@@ -116,6 +121,7 @@ impl MetricsInner {
             rows_returned: self.rows_returned.load(Ordering::Relaxed),
             transactions_committed: self.transactions_committed.load(Ordering::Relaxed),
             transactions_rolled_back: self.transactions_rolled_back.load(Ordering::Relaxed),
+            db_cancels_sent: self.db_cancels_sent.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             late_results: self.late_results.load(Ordering::Relaxed),
             in_flight_current: self.in_flight_current.load(Ordering::Relaxed),
