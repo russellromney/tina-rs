@@ -9,10 +9,22 @@ use tina_runtime::{
     CallError, CallOutcome, RuntimeEventKind, SendOutcome, SendRejectedReason, call,
     journal_append, send_observed,
 };
-use tina_sim::dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink};
+use tina_sim::dst::{
+    DstRun, History, InvariantSuite, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig,
+    assert_replay_case, delete_shrink,
+};
 use tina_sim::{MultiShardReplayArtifact, MultiShardSimulator, MultiShardSimulatorConfig};
 
 const PORTABLE_SERVICE_SEED: u64 = 45_001;
+
+const EVEN_AUDIT_ROLE: &str = "even-audit";
+const ODD_AUDIT_ROLE: &str = "odd-audit";
+
+fn default_service_config() -> ReplayConfig {
+    ReplayConfig::default()
+        .with_mailbox(EVEN_AUDIT_ROLE, 8)
+        .with_mailbox(ODD_AUDIT_ROLE, 8)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct DstShard(u32);
@@ -219,11 +231,33 @@ fn portable_service_history() -> History<ServiceOp> {
 fn run_service_history(
     history: &History<ServiceOp>,
 ) -> DstRun<ServiceProjection, MultiShardReplayArtifact> {
-    run_service_history_with_audit_capacity(history, 8, 8)
+    let sim_config = tina_sim::SimulatorConfig {
+        seed: history.seed(),
+        ..tina_sim::SimulatorConfig::default()
+    };
+    run_service_history_with_audit_capacity(history, sim_config, 8, 8)
+}
+
+/// `ReplayCase`-shaped runner. Reads simulator config and audit
+/// mailbox capacities from `case.config`; delegates to
+/// `run_service_history_with_audit_capacity` so the legacy
+/// `History`-shaped runner stays available for the shrink tests.
+fn run_service_case(case: &ReplayCase<ServiceOp>) -> ReplayReport<ServiceProjection> {
+    let even_cap = case.config.mailbox(EVEN_AUDIT_ROLE);
+    let odd_cap = case.config.mailbox(ODD_AUDIT_ROLE);
+    let dst_run = run_service_history_with_audit_capacity(
+        &case.history,
+        case.simulator_config(),
+        even_cap,
+        odd_cap,
+    );
+    let (projection, artifact) = dst_run.into_parts();
+    ReplayReport::from_case_and_events(case, artifact.event_record(), projection)
 }
 
 fn run_service_history_with_audit_capacity(
     history: &History<ServiceOp>,
+    sim_config: tina_sim::SimulatorConfig,
     even_audit_capacity: usize,
     odd_audit_capacity: usize,
 ) -> DstRun<ServiceProjection, MultiShardReplayArtifact> {
@@ -234,10 +268,7 @@ fn run_service_history_with_audit_capacity(
     let audit_stored = Rc::new(RefCell::new(Vec::new()));
     let mut sim = MultiShardSimulator::with_config(
         [DstShard(1), DstShard(2), DstShard(3)],
-        tina_sim::SimulatorConfig {
-            seed: history.seed(),
-            ..tina_sim::SimulatorConfig::default()
-        },
+        sim_config,
         MultiShardSimulatorConfig {
             shard_pair_capacity: 2,
         },
@@ -369,18 +400,87 @@ fn deterministic_path(seed: u64, suffix: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/tina-portable-service-dst-{seed}-{suffix}"))
 }
 
+// Saved-replay regression cases. Each pins the trace shape via
+// expected_event_count + expected_trace_hash AND the
+// ServiceProjection counts that name the invariant.
+
+fn portable_service_case() -> ReplayCase<ServiceOp> {
+    let history = portable_service_history();
+    ReplayCase::new(
+        "portable service dst",
+        history.seed(),
+        default_service_config(),
+        "even/odd routing across three shards with mid-stream worker stops",
+        history.operations().to_vec(),
+        "accepted/closed/journal_appended/audit_stored shape stays pinned",
+    )
+    .expecting(PORTABLE_SERVICE_EVENT_COUNT, PORTABLE_SERVICE_TRACE_HASH)
+}
+
+fn audit_full_case() -> ReplayCase<ServiceOp> {
+    let config = ReplayConfig::default()
+        .with_mailbox(EVEN_AUDIT_ROLE, 0) // forces observed-send Full
+        .with_mailbox(ODD_AUDIT_ROLE, 8);
+    ReplayCase::new(
+        "portable service audit full dst",
+        PORTABLE_SERVICE_SEED + 1,
+        config,
+        "single SubmitEven against a zero-capacity even-audit sink",
+        vec![ServiceOp::SubmitEven(2)],
+        "even-audit observed-send Full happens before persistence completes",
+    )
+    .expecting(AUDIT_FULL_EVENT_COUNT, AUDIT_FULL_TRACE_HASH)
+}
+
+fn requester_stop_case() -> ReplayCase<ServiceOp> {
+    ReplayCase::new(
+        "baobab observed-send persistence requester stop dst",
+        PORTABLE_SERVICE_SEED + 2,
+        default_service_config(),
+        "submit-then-stop: persistence completes after the requester is gone",
+        vec![ServiceOp::SubmitEvenThenStopRouter(8)],
+        "audit_stored receives the value even after the requester stops",
+    )
+    .expecting(REQUESTER_STOP_EVENT_COUNT, REQUESTER_STOP_TRACE_HASH)
+}
+
+fn shard_failure_case() -> ReplayCase<ServiceOp> {
+    ReplayCase::new(
+        "baobab pressure shard failure topology dst",
+        PORTABLE_SERVICE_SEED + 3,
+        default_service_config(),
+        "even-shard panic followed by both even and odd submits",
+        vec![
+            ServiceOp::PanicEven,
+            ServiceOp::SubmitEven(10),
+            ServiceOp::SubmitOdd(11),
+        ],
+        "panicked even-worker closes the shard while odd-shard keeps accepting",
+    )
+    .expecting(SHARD_FAILURE_EVENT_COUNT, SHARD_FAILURE_TRACE_HASH)
+}
+
+// Saved constants. Refresh only after a conscious trace-shape review.
+const PORTABLE_SERVICE_EVENT_COUNT: usize = 128;
+const PORTABLE_SERVICE_TRACE_HASH: u64 = 0x3d79_b063_5b08_cc75;
+const AUDIT_FULL_EVENT_COUNT: usize = 22;
+const AUDIT_FULL_TRACE_HASH: u64 = 0x73e4_304f_3390_e1bd;
+const REQUESTER_STOP_EVENT_COUNT: usize = 32;
+const REQUESTER_STOP_TRACE_HASH: u64 = 0x5e62_bef9_9f06_2ce9;
+const SHARD_FAILURE_EVENT_COUNT: usize = 48;
+const SHARD_FAILURE_TRACE_HASH: u64 = 0x390e_3a0f_ef2f_1cdc;
+
 #[test]
 fn portable_service_dst_replays_whole_service_history() {
-    let history = portable_service_history();
-    let run = assert_replays(&history, run_service_history);
+    let report = assert_replay_case(&portable_service_case(), run_service_case);
 
-    assert_eq!(run.output().accepted, vec![2, 3, 5]);
-    assert_eq!(run.output().closed, 2);
-    assert_eq!(run.output().timeouts, 0);
-    assert_eq!(run.output().journal_appended, 3);
-    assert_eq!(run.output().audit_stored, vec![2, 3, 5]);
-    assert_eq!(run.output().reply_rejected, 0);
-    assert_eq!(run.output().panicked, 0);
+    assert_eq!(report.output.accepted, vec![2, 3, 5]);
+    assert_eq!(report.output.closed, 2);
+    assert_eq!(report.output.timeouts, 0);
+    assert_eq!(report.output.journal_appended, 3);
+    assert_eq!(report.output.audit_stored, vec![2, 3, 5]);
+    assert_eq!(report.output.reply_rejected, 0);
+    assert_eq!(report.output.panicked, 0);
 }
 
 #[test]
@@ -399,57 +499,36 @@ fn portable_service_dst_shrinks_to_closed_worker_history() {
 
 #[test]
 fn portable_service_dst_replays_observed_send_full_before_persistence() {
-    let history = History::new(
-        "portable service audit full dst",
-        PORTABLE_SERVICE_SEED + 1,
-        vec![ServiceOp::SubmitEven(2)],
-    );
-    let run = assert_replays(&history, |candidate| {
-        run_service_history_with_audit_capacity(candidate, 0, 8)
-    });
+    let report = assert_replay_case(&audit_full_case(), run_service_case);
 
-    assert!(run.output().accepted.is_empty());
-    assert_eq!(run.output().audit_stored, Vec::<u64>::new());
-    assert_eq!(run.output().journal_appended, 0);
-    assert_eq!(run.output().full, 1);
-    assert_eq!(run.output().reply_rejected, 0);
-    assert_eq!(run.output().panicked, 0);
+    assert!(report.output.accepted.is_empty());
+    assert_eq!(report.output.audit_stored, Vec::<u64>::new());
+    assert_eq!(report.output.journal_appended, 0);
+    assert_eq!(report.output.full, 1);
+    assert_eq!(report.output.reply_rejected, 0);
+    assert_eq!(report.output.panicked, 0);
 }
 
 #[test]
 fn baobab_dst_replays_observed_send_persistence_and_requester_stop() {
-    let history = History::new(
-        "baobab observed-send persistence requester stop dst",
-        PORTABLE_SERVICE_SEED + 2,
-        vec![ServiceOp::SubmitEvenThenStopRouter(8)],
-    );
-    let run = assert_replays(&history, run_service_history);
+    let report = assert_replay_case(&requester_stop_case(), run_service_case);
 
-    assert!(run.output().accepted.is_empty());
-    assert_eq!(run.output().audit_stored, vec![8]);
-    assert_eq!(run.output().journal_appended, 1);
-    assert_eq!(run.output().reply_rejected, 0);
-    assert_eq!(run.output().panicked, 0);
+    assert!(report.output.accepted.is_empty());
+    assert_eq!(report.output.audit_stored, vec![8]);
+    assert_eq!(report.output.journal_appended, 1);
+    assert_eq!(report.output.reply_rejected, 0);
+    assert_eq!(report.output.panicked, 0);
 }
 
 #[test]
 fn baobab_dst_replays_pressure_shard_failure_and_topology_truth() {
-    let history = History::new(
-        "baobab pressure shard failure topology dst",
-        PORTABLE_SERVICE_SEED + 3,
-        vec![
-            ServiceOp::PanicEven,
-            ServiceOp::SubmitEven(10),
-            ServiceOp::SubmitOdd(11),
-        ],
-    );
-    let run = assert_replays(&history, run_service_history);
+    let report = assert_replay_case(&shard_failure_case(), run_service_case);
 
-    assert_eq!(run.output().panicked, 1);
-    assert_eq!(run.output().closed, 1);
-    assert_eq!(run.output().accepted, vec![11]);
-    assert_eq!(run.output().journal_appended, 1);
-    assert_eq!(run.output().reply_rejected, 0);
+    assert_eq!(report.output.panicked, 1);
+    assert_eq!(report.output.closed, 1);
+    assert_eq!(report.output.accepted, vec![11]);
+    assert_eq!(report.output.journal_appended, 1);
+    assert_eq!(report.output.reply_rejected, 0);
 }
 
 #[test]

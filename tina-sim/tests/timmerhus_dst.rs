@@ -14,7 +14,7 @@ use tina_runtime::{
 };
 use tina_sim::dst::{
     DstRun, History, InvariantSuite, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig,
-    assert_replay_case, assert_replays, delete_shrink,
+    assert_replay_case, delete_shrink,
 };
 use tina_sim::{
     MultiShardReplayArtifact, MultiShardSimulator, MultiShardSimulatorConfig, SimulatorConfig,
@@ -421,13 +421,35 @@ fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
     assert!(predicate(), "{label} did not settle before timeout");
 }
 
+fn topology_failure_case() -> ReplayCase<TopologyOp> {
+    let history = topology_failure_history();
+    ReplayCase::new(
+        "timmerhus topology failure",
+        history.seed(),
+        ReplayConfig::default(),
+        "direct send + stop + three cross-shard sends after the target stops",
+        history.operations().to_vec(),
+        "first cross-shard send after stop is rejected closed; values stay frozen",
+    )
+    .expecting(TOPOLOGY_FAILURE_EVENT_COUNT, TOPOLOGY_FAILURE_TRACE_HASH)
+}
+
+fn run_topology_failure_case(case: &ReplayCase<TopologyOp>) -> ReplayReport<TopologyProjection> {
+    let dst_run = run_topology_history(&case.history);
+    let (projection, artifact) = dst_run.into_parts();
+    ReplayReport::from_case_and_events(case, artifact.event_record(), projection)
+}
+
+const TOPOLOGY_FAILURE_EVENT_COUNT: usize = 26;
+const TOPOLOGY_FAILURE_TRACE_HASH: u64 = 0xa52d_ae66_f333_cc48;
+
 #[test]
 fn live_sim_projection_matches_topology_failure_history() {
-    let history = topology_failure_history();
-    let sim = assert_replays(&history, run_topology_history);
-    let live = run_live_topology_history(&history);
+    let case = topology_failure_case();
+    let report = assert_replay_case(&case, run_topology_failure_case);
+    let live = run_live_topology_history(&case.history);
 
-    tina_sim::dst::assert_projection_eq("sim", sim.output(), "live", &live);
+    tina_sim::dst::assert_projection_eq("sim", &report.output, "live", &live);
     assert_eq!(live.values, vec![1]);
     assert_eq!(live.rejected_closed, 3);
     assert_eq!(live.rejected_full, 0);
