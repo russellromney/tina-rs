@@ -261,11 +261,13 @@ where
     /// ([`CallHandleState::Settled`] or [`CallHandleState::Cancelled`])
     /// and returns the number of slots reclaimed.
     ///
-    /// [`PendingCallSet::insert`] runs this automatically before
-    /// checking capacity, so callers do not need to invoke it for the
-    /// "next insert sees room again" guarantee. Call it explicitly
-    /// when you want a fresh `len()` / `is_full()` reading without
-    /// inserting first — e.g. before a pressure-report snapshot.
+    /// [`PendingCallSet::insert`] does **not** call this automatically
+    /// — see the module-level "Why insert does not auto-sweep"
+    /// section for the ABA reasoning. Call it explicitly at points
+    /// where you know no late `Returned` continuation can fire and
+    /// silently remove the wrong entry: after a `drain` +
+    /// `cancel_call` cycle, after owner-stop, or in periodic
+    /// pre-snapshot cleanup before reading `len()` / `is_full()`.
     pub fn sweep_terminal(&mut self) -> usize {
         let before = self.entries.len();
         self.entries

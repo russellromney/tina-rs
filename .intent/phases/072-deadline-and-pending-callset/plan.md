@@ -85,22 +85,35 @@ explicit.
 Do not freeze a live-only `Instant` API unless it clearly says
 "live-only, no simulator/replay claim."
 
-Preferred first form:
+Shipped first form (matches the implementation under `tina::Deadline`):
 
 ```rust
-let deadline = Deadline::after(Duration::from_secs(2));
-let left = deadline.remaining_or_zero();
+// Inside a handler — runtime/sim-aware sugar.
+let deadline = ctx.deadline_after(Duration::from_secs(2));
+let left = deadline.remaining_or_zero(ctx.now());
+
+// Outside a handler (host code, tests) — explicit `now`.
+let deadline = Deadline::from_instant(now, Duration::from_secs(2));
+let left = deadline.remaining_or_zero(now);
 ```
 
-But the hard part is the clock:
+There is no `Deadline::after(Duration)` shortcut: it would have to
+call `Instant::now()` internally and silently break DST/replay. Every
+accessor takes an explicit `now: Instant`; `Context::now()` /
+`Context::deadline_after(after)` are the runtime/sim-aware sugar.
 
-- live runtime and simulator must agree on what "now" means;
-- replay must not depend on wall-clock time;
-- DST cases must be able to materialize deadline decisions;
-- docs must say whether a deadline is live-only or sim-backed.
+Clock rules satisfied:
 
-If the clock abstraction is not ready, this rock may land as a design
-note and no public `Deadline`.
+- live runtime and simulator agree on `Context::now()` shape (both
+  return an `Instant`, runtime stamps from its `Clock`, simulator
+  stamps from `virtual_anchor + virtual_now`);
+- replay does not depend on wall-clock time — sim trace events
+  record `Duration` deltas, not raw `Instant`s;
+- DST cases materialize deadline decisions deterministically (sim
+  test in `tina-sim/tests/deadline.rs` asserts exact 150ms virtual
+  delta);
+- docs say "no `Deadline::after`" loudly — both in the type
+  rustdoc and in the user-guide § Deadlines.
 
 ## Rock 2 — Timeout and Cancel Share Cleanup Truth
 
@@ -131,46 +144,68 @@ Each state needs:
 
 Small helper for isolates that own many outstanding calls.
 
-Shape:
+Shipped shape (matches `tina::PendingCallSet`):
 
 ```rust
 let mut pending = PendingCallSet::<RequestId, Reply>::with_capacity(64);
-pending.insert(id, handle)?;
-pending.complete(&id);
-pending.cancel_all(ctx)?;
+pending.insert(id, handle)?;       // Result<(), PendingCallSetInsertError>
+let _ = pending.remove(&id);       // explicit completion cleanup
+for (_, h) in pending.drain() {    // cancel-all drains the set
+    effects.push(cancel_call(h).reply(|_| Msg::Cancelled));
+}
+let reclaimed = pending.sweep_terminal();  // opt-in foreground sweep
 ```
 
 Rules:
 
 - fixed-capacity table/slab/ring; no growing `HashMap`;
-- insert returns `Full`;
-- completion removes the entry;
-- explicit cancel removes the entry;
-- timeout cleanup is explicit and blessed;
+- insert returns typed `Full` / `DuplicateKey` (the rejected
+  `(key, handle)` is returned in the error so the caller handles
+  it visibly);
+- completion removes the entry via explicit `remove(&key)` from a
+  `Returned` translator;
+- explicit cancel drains the set and pairs each handle with a
+  `cancel_call(handle).reply(...)` effect in user code (the helper
+  does not own the workflow);
+- timeout cleanup is explicit and blessed: every stored handle must
+  have a completion / cancel / timeout continuation that removes the
+  key;
+- insert deliberately does **not** auto-sweep terminal handles — see
+  the module's "Why insert does not auto-sweep" section. An
+  auto-sweep would create a silent ABA bug if a `Returned`
+  continuation queued for a settled call were processed after a
+  reinsert under the same key. `sweep_terminal()` is the explicit
+  opt-in for known-safe reclaim points;
 - owner stop drains or cancels all owned calls;
-- fill, cancel/timeout, refill proof required.
-
-Timeout cleanup should stay Tina-shaped: every call has a visible
-completion, cancel, or timeout continuation that removes the key. Do not
-hide a background sweeper unless the runtime already owns the timeout
-event.
+- fill, cancel/timeout, refill proof required (shipped:
+  `tina-runtime/tests/pending_call_set.rs`,
+  `tina-sim/tests/pending_call_set.rs`).
 
 ## Rock 4 — Deadline Propagation Helper
 
-Make the copied pattern short but still visible:
+The copied pattern stays short but visible — accessors take an
+explicit `now`:
 
 ```rust
-call(addr, msg, deadline.remaining_or_zero()).reply(Msg::Returned)
+call(addr, msg, deadline.remaining_or_zero(ctx.now())).reply(Msg::Returned)
 ```
 
-Useful helper methods are fine:
+Shipped helper methods on `tina::Deadline`:
 
-- `Deadline::remaining_or_zero()`;
-- `Deadline::expired()`;
-- `Deadline::split_for_next_call(min_remaining)` only if it does not
-  hide policy.
+- `remaining(now: Instant) -> Option<Duration>`;
+- `remaining_or_zero(now: Instant) -> Duration` — zero on expired,
+  the right shape to pass straight to a call timeout;
+- `expired(now: Instant) -> bool`;
+- `instant() -> Instant` — escape hatch for code that wants its own
+  arithmetic.
 
-No helper should retry or extend time. Deadline is budget, not a wish.
+Deferred (Rock 4 originally proposed):
+
+- `Deadline::split_for_next_call(min_remaining)` — only ship when a
+  consumer asks for it; raw `remaining_or_zero(now)` is enough in
+  the shipped specimens.
+
+No helper retries or extends time. Deadline is a budget, not a wish.
 
 ## Rock 5 — Bridge and External Work Rule
 
