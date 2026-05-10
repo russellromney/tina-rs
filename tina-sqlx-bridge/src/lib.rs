@@ -65,7 +65,7 @@
 //! When Postgres can't infer (a positional NULL bind into a
 //! non-INT8 column without surrounding type hints), use
 //! [`PgValue::TypedNull`] — or one of the `null_*()` shorthands
-//! ([`PgValue::null_text`], [`PgValue::null_uuid`], …) — to send a
+//! (`PgValue::null_text()`, `PgValue::null_uuid()`, …) — to send a
 //! NULL with the right wire-level type oid:
 //!
 //! ```ignore
