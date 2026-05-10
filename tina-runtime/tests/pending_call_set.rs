@@ -91,9 +91,6 @@ struct Driver {
     workers: Vec<Address<WorkerMsg, WorkerReply>>,
     pending: PendingCallSet<u32, WorkerReply>,
     report: Report,
-    /// Active batch tag; lets the test prove the *second* batch ran
-    /// without confusing it with stragglers from the first.
-    current_batch: u8,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -142,7 +139,6 @@ impl Driver {
 
 impl Driver {
     fn fill(&mut self, batch: u8) -> Effect<Self> {
-        self.current_batch = batch;
         let mut effects = Vec::with_capacity(PENDING_CAPACITY);
         for (idx, worker) in self.workers.iter().enumerate() {
             let key = idx as u32;
@@ -187,7 +183,6 @@ fn fill_cancel_refill_reclaims_capacity() {
                 workers,
                 pending: PendingCallSet::with_capacity(PENDING_CAPACITY),
                 report: Report::default(),
-                current_batch: 0,
             },
             32,
         )
@@ -235,6 +230,240 @@ fn fill_cancel_refill_reclaims_capacity() {
     assert_eq!(
         report.replied_after_refill as usize, PENDING_CAPACITY,
         "second batch should run to completion, proving slot reuse",
+    );
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+// ---------- Timeout-driven cleanup proof ----------
+//
+// 072 plan rule: "every stored handle must have a completion,
+// cancellation, or *timeout* continuation that removes its key."
+// The cancel path is exercised above. This test pins the timeout path:
+// the driver fires calls with a short call timeout against a worker
+// that will not finish in time, the runtime delivers
+// `CallOutcome::Timeout` to the translator, the translator removes the
+// slot, and the set refills cleanly.
+
+const TIMEOUT_BUDGET_MS: u64 = 50;
+const SLOW_WORK_MS: u64 = 250;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TimeoutReport {
+    timed_out: u32,
+    inserted: u32,
+    replied_after_refill: u32,
+    exit_clean: bool,
+}
+
+#[derive(Debug)]
+enum TimeoutDriverMsg {
+    /// Fill with calls that will time out before the worker replies.
+    FillTimeoutBatch,
+    /// Refill batch — worker is fast this time, all replies land.
+    FillFastBatch,
+    Returned {
+        batch: u8,
+        worker: u32,
+        outcome: CallOutcome<WorkerReply>,
+    },
+    Finish,
+}
+
+struct SlowWorker;
+
+#[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply)]
+impl SlowWorker {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => sleep(Duration::from_millis(SLOW_WORK_MS)).reply(WorkerMsg::Done),
+            WorkerMsg::Done(Ok(())) => reply(WorkerReply),
+            WorkerMsg::Done(Err(_)) => stop(),
+        }
+    }
+}
+
+struct FastWorker;
+
+#[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply)]
+impl FastWorker {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => sleep(Duration::from_millis(5)).reply(WorkerMsg::Done),
+            WorkerMsg::Done(Ok(())) => reply(WorkerReply),
+            WorkerMsg::Done(Err(_)) => stop(),
+        }
+    }
+}
+
+struct TimeoutDriver {
+    slow_workers: Vec<Address<WorkerMsg, WorkerReply>>,
+    fast_workers: Vec<Address<WorkerMsg, WorkerReply>>,
+    pending: PendingCallSet<u32, WorkerReply>,
+    report: TimeoutReport,
+}
+
+#[tina_runtime::isolate(message = TimeoutDriverMsg)]
+impl TimeoutDriver {
+    fn handle(
+        &mut self,
+        msg: TimeoutDriverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TimeoutDriverMsg::FillTimeoutBatch => {
+                let mut effects = Vec::with_capacity(PENDING_CAPACITY);
+                for (idx, worker) in self.slow_workers.iter().enumerate() {
+                    let key = idx as u32;
+                    let (effect, handle) = call_with_handle(
+                        *worker,
+                        WorkerMsg::Do,
+                        Duration::from_millis(TIMEOUT_BUDGET_MS),
+                    )
+                    .reply(move |outcome| TimeoutDriverMsg::Returned {
+                        batch: 1,
+                        worker: key,
+                        outcome,
+                    });
+                    self.pending
+                        .insert(key, handle)
+                        .map_err(|_| ())
+                        .expect("first batch fits");
+                    self.report.inserted += 1;
+                    effects.push(effect);
+                }
+                Effect::Batch(effects)
+            }
+            TimeoutDriverMsg::FillFastBatch => {
+                let mut effects = Vec::with_capacity(PENDING_CAPACITY);
+                for (idx, worker) in self.fast_workers.iter().enumerate() {
+                    let key = idx as u32;
+                    let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, CALL_TIMEOUT)
+                        .reply(move |outcome| TimeoutDriverMsg::Returned {
+                            batch: 2,
+                            worker: key,
+                            outcome,
+                        });
+                    self.pending
+                        .insert(key, handle)
+                        .map_err(|_| ())
+                        .expect("refill must succeed if timeout cleanup reclaimed slots");
+                    self.report.inserted += 1;
+                    effects.push(effect);
+                }
+                Effect::Batch(effects)
+            }
+            TimeoutDriverMsg::Returned {
+                batch,
+                worker,
+                outcome,
+            } => {
+                // Explicit slot cleanup on every continuation —
+                // including the timeout one. This is the load-bearing
+                // step the test is proving.
+                self.pending.remove(&worker);
+                match (batch, outcome) {
+                    (1, CallOutcome::Timeout) => self.report.timed_out += 1,
+                    (2, CallOutcome::Replied(_)) => self.report.replied_after_refill += 1,
+                    _ => {}
+                }
+                noop()
+            }
+            TimeoutDriverMsg::Finish => {
+                self.report.exit_clean = true;
+                stop_with(self.report)
+            }
+        }
+    }
+}
+
+#[test]
+fn fill_timeout_refill_reclaims_capacity() {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+
+    let mut slow_workers = Vec::with_capacity(PENDING_CAPACITY);
+    for _ in 0..PENDING_CAPACITY {
+        slow_workers.push(
+            runtime
+                .register_with_capacity::<_, Infallible>(SlowWorker, 8)
+                .expect("register slow worker"),
+        );
+    }
+    let mut fast_workers = Vec::with_capacity(PENDING_CAPACITY);
+    for _ in 0..PENDING_CAPACITY {
+        fast_workers.push(
+            runtime
+                .register_with_capacity::<_, Infallible>(FastWorker, 8)
+                .expect("register fast worker"),
+        );
+    }
+
+    let driver = runtime
+        .register_with_capacity::<_, Infallible>(
+            TimeoutDriver {
+                slow_workers,
+                fast_workers,
+                pending: PendingCallSet::with_capacity(PENDING_CAPACITY),
+                report: TimeoutReport::default(),
+            },
+            32,
+        )
+        .expect("register driver");
+
+    let result = runtime
+        .observe_result::<TimeoutReport, _, _>(driver)
+        .expect("observe_result");
+
+    runtime
+        .try_send(driver, TimeoutDriverMsg::FillTimeoutBatch)
+        .expect("FillTimeoutBatch");
+
+    // Wait long enough for every TIMEOUT_BUDGET_MS budget to fire and
+    // its translator to remove the slot. Slow workers will still be
+    // sleeping when this returns; their late replies would be rejected
+    // as `CallReplyRejected { CallerTimedOut }`.
+    std::thread::sleep(Duration::from_millis(TIMEOUT_BUDGET_MS + 50));
+
+    runtime
+        .try_send(driver, TimeoutDriverMsg::FillFastBatch)
+        .expect("FillFastBatch");
+
+    // Fast workers reply quickly.
+    std::thread::sleep(Duration::from_millis(60));
+
+    runtime
+        .try_send(driver, TimeoutDriverMsg::Finish)
+        .expect("Finish");
+
+    let report = result.wait(Duration::from_secs(5)).expect("driver report");
+
+    assert!(report.exit_clean);
+    assert_eq!(
+        report.inserted as usize,
+        2 * PENDING_CAPACITY,
+        "refill after timeout must succeed without stale Full",
+    );
+    assert_eq!(
+        report.timed_out as usize, PENDING_CAPACITY,
+        "every first-batch call should report Timeout",
+    );
+    assert_eq!(
+        report.replied_after_refill as usize, PENDING_CAPACITY,
+        "second batch should run to completion, proving slot reuse \
+         after timeout-driven cleanup",
     );
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {

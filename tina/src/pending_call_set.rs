@@ -29,9 +29,11 @@
 //!
 //! The set deliberately does *not* know how to build a [`crate::Effect`]
 //! itself — that would force this crate to depend on the runtime's
-//! `cancel_call`. Instead, drain the set in user code:
+//! `cancel_call`. Instead, drain the set in user code and pair each
+//! handle with a `cancel_call(handle).reply(...)` effect (defined in
+//! `tina_runtime`, which this crate cannot import). The shape is:
 //!
-//! ```ignore
+//! ```text
 //! // Inside a handler:
 //! let mut effects = Vec::with_capacity(self.calls.len());
 //! for (_, handle) in self.calls.drain() {
@@ -40,11 +42,65 @@
 //! batch(effects)
 //! ```
 //!
-//! Reading the cancel-all-on-owner-stop case stays Tina-shaped: every
-//! cancelled call still reports a typed [`crate::CancelOutcome`] back
-//! through the user's translator.
+//! Every cancelled call still reports a typed [`crate::CancelOutcome`]
+//! back through the user's translator.
+//!
+//! The value-type API itself is runnable in isolation — this doctest
+//! compiles and runs without a runtime, exercising every `tina`-side
+//! method:
+//!
+//! ```
+//! use std::any::TypeId;
+//! use std::sync::Arc;
+//! use tina::{CallHandle, CallHandleShared, PendingCallSet, runtime_internal};
+//!
+//! fn make_handle<R: 'static>() -> CallHandle<R> {
+//!     // Runtime-internal mint; ordinary user code receives handles
+//!     // from `tina_runtime::call_with_handle(...).reply(...)`.
+//!     let shared = Arc::new(CallHandleShared::new(TypeId::of::<R>()));
+//!     runtime_internal::call_handle_from_shared::<R>(shared)
+//! }
+//!
+//! let mut calls: PendingCallSet<u32, ()> = PendingCallSet::with_capacity(4);
+//! calls.insert(1, make_handle()).map_err(|_| ()).unwrap();
+//! calls.insert(2, make_handle()).map_err(|_| ()).unwrap();
+//! assert_eq!(calls.len(), 2);
+//!
+//! // Completion path: explicit `remove`.
+//! let _settled = calls.remove(&1).expect("present");
+//! assert_eq!(calls.len(), 1);
+//!
+//! // Cancel-all path: `drain` empties the set; the user pairs each
+//! // handle with a `cancel_call(...).reply(...)` effect.
+//! let drained: Vec<_> = calls.drain().collect();
+//! assert_eq!(drained.len(), 1);
+//! assert!(calls.is_empty());
+//! ```
+//!
+//! # Settled / cancelled slots are reclaimed on insert
+//!
+//! [`PendingCallSet::insert`] sweeps any entries whose handle reports
+//! [`CallHandleState::Settled`] or [`CallHandleState::Cancelled`]
+//! before checking capacity. This matches the
+//! `tina_runtime::PendingReplies::try_insert` shape — the inverse
+//! helper for deferred reply slots, which sweeps `Closed` slots before
+//! admit — and means the set cannot become silently full just because
+//! a translator forgot to call [`PendingCallSet::remove`].
+//!
+//! The sweep is foreground only: it runs when the user calls a method
+//! that asks "is there room?" Nothing sweeps in the background, no
+//! timer fires, no `Drop` magic touches the table. The contract
+//! "a stored handle becomes free space when the call settles" is
+//! visible: the runtime sets the handle's state on settle/cancel, and
+//! the next admission honors it.
+//!
+//! Calling [`PendingCallSet::remove`] from a `Returned` translator is
+//! still recommended — it reclaims the slot eagerly and keeps the
+//! semantics aligned with the message the user just handled. But
+//! forgetting the `remove` no longer leaks the slot until the set is
+//! dropped.
 
-use crate::CallHandle;
+use crate::{CallHandle, CallHandleState};
 
 /// Bounded slab of [`CallHandle`]s keyed by a user-chosen `RequestId`.
 ///
@@ -127,17 +183,28 @@ where
 
     /// Inserts `handle` under `key`.
     ///
+    /// Sweeps any entries whose handle is `Settled` or `Cancelled`
+    /// before checking capacity, so a forgotten `remove` in a previous
+    /// `Returned` translator does not silently make the set full. This
+    /// matches the `tina_runtime::PendingReplies::try_insert` shape.
+    ///
     /// Returns `Ok(())` on success. Returns
-    /// [`PendingCallSetInsertError::Full`] when the set is at capacity
-    /// and [`PendingCallSetInsertError::DuplicateKey`] when `key` is
-    /// already stored. The rejected `(key, handle)` is returned in the
-    /// error variant so the caller can cancel, store elsewhere, or
-    /// drop it visibly.
+    /// [`PendingCallSetInsertError::Full`] when even after the sweep
+    /// no slot is free, and [`PendingCallSetInsertError::DuplicateKey`]
+    /// when `key` is already stored under a still-live handle. The
+    /// rejected `(key, handle)` is returned in the error variant so
+    /// the caller can cancel, store elsewhere, or drop it visibly.
     pub fn insert(
         &mut self,
         key: K,
         handle: CallHandle<R>,
     ) -> Result<(), PendingCallSetInsertError<K, R>> {
+        // Reclaim slots whose handles already settled or were
+        // cancelled. A `Returned` translator that forgot to call
+        // `remove` no longer leaks; the next admission honors the
+        // runtime's truth about each handle.
+        self.sweep_terminal();
+
         if self.contains_key(&key) {
             return Err(PendingCallSetInsertError::DuplicateKey { key, handle });
         }
@@ -170,6 +237,22 @@ where
     /// Iterates over the stored `(key, handle)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &CallHandle<R>)> {
         self.entries.iter().map(|(k, h)| (k, h))
+    }
+
+    /// Drops every entry whose handle is in a terminal state
+    /// ([`CallHandleState::Settled`] or [`CallHandleState::Cancelled`])
+    /// and returns the number of slots reclaimed.
+    ///
+    /// [`PendingCallSet::insert`] runs this automatically before
+    /// checking capacity, so callers do not need to invoke it for the
+    /// "next insert sees room again" guarantee. Call it explicitly
+    /// when you want a fresh `len()` / `is_full()` reading without
+    /// inserting first — e.g. before a pressure-report snapshot.
+    pub fn sweep_terminal(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|(_, handle)| matches!(handle.state(), CallHandleState::Pending));
+        before - self.entries.len()
     }
 }
 
@@ -219,6 +302,87 @@ mod tests {
             _ => panic!("expected Full"),
         }
         assert_eq!(set.len(), 2);
+    }
+
+    /// User pattern that the sweep must rescue: every `Returned`
+    /// translator that should call `remove` forgot to. The handles
+    /// transition to `Settled` (the runtime sets that field on
+    /// settle/cancel). The next `insert` must reclaim those slots
+    /// rather than report a stale `Full`.
+    #[test]
+    fn settled_handles_are_reclaimed_on_next_insert() {
+        let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(2);
+        set.insert(1, make_handle()).map_err(|_| ()).unwrap();
+        set.insert(2, make_handle()).map_err(|_| ()).unwrap();
+        assert!(set.is_full());
+
+        // Simulate the runtime settling both calls without the user
+        // ever calling `remove`.
+        for (_, handle) in set.iter() {
+            runtime_internal::call_handle_shared(handle).set_state(CallHandleState::Settled);
+        }
+
+        // Inserting a new handle must succeed: the sweep reclaims the
+        // settled entries before checking capacity.
+        set.insert(3, make_handle()).map_err(|_| ()).unwrap();
+        // Both stale entries gone; only the fresh one remains.
+        assert_eq!(set.len(), 1);
+        assert!(set.contains_key(&3));
+        assert!(!set.contains_key(&1));
+        assert!(!set.contains_key(&2));
+    }
+
+    #[test]
+    fn cancelled_handles_are_reclaimed_on_next_insert() {
+        let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(2);
+        set.insert(1, make_handle()).map_err(|_| ()).unwrap();
+        set.insert(2, make_handle()).map_err(|_| ()).unwrap();
+
+        for (_, handle) in set.iter() {
+            runtime_internal::call_handle_shared(handle).set_state(CallHandleState::Cancelled);
+        }
+
+        set.insert(3, make_handle()).map_err(|_| ()).unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains_key(&3));
+    }
+
+    /// Pending handles must NOT be swept — only terminal states. A
+    /// still-in-flight call would silently lose its slot if pending
+    /// were swept.
+    #[test]
+    fn pending_handles_are_never_swept() {
+        let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(2);
+        set.insert(1, make_handle()).map_err(|_| ()).unwrap();
+        set.insert(2, make_handle()).map_err(|_| ()).unwrap();
+        // Both still Pending. A third insert must report Full —
+        // sweep reclaims zero, capacity is honest.
+        match set.insert(3, make_handle()) {
+            Err(PendingCallSetInsertError::Full { key, handle: _ }) => assert_eq!(key, 3),
+            _ => panic!("expected Full when no handles are terminal"),
+        }
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn explicit_sweep_terminal_returns_reclaimed_count() {
+        let mut set: PendingCallSet<u64, ()> = PendingCallSet::with_capacity(4);
+        for i in 0..4 {
+            set.insert(i, make_handle()).map_err(|_| ()).unwrap();
+        }
+
+        // Settle two of the four.
+        for (key, handle) in set.iter() {
+            if *key < 2 {
+                runtime_internal::call_handle_shared(handle).set_state(CallHandleState::Settled);
+            }
+        }
+
+        let reclaimed = set.sweep_terminal();
+        assert_eq!(reclaimed, 2);
+        assert_eq!(set.len(), 2);
+        // A second sweep is a no-op; nothing has changed state.
+        assert_eq!(set.sweep_terminal(), 0);
     }
 
     #[test]

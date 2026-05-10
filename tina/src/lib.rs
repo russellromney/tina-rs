@@ -1779,6 +1779,11 @@ pub struct Deadline {
     deadline: Instant,
 }
 
+/// One century, used as the saturating ceiling when `now + after`
+/// would overflow `Instant`. Far above any sane budget and far below
+/// the `Instant` overflow threshold on every supported platform.
+const DEADLINE_SATURATION_CEILING: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 100);
+
 impl Deadline {
     /// Builds a deadline anchored at `now + after`.
     ///
@@ -1787,15 +1792,18 @@ impl Deadline {
     /// prefer [`Context::deadline_after`]; outside (host code, tests,
     /// simulator drivers), pass an `Instant` you control.
     ///
-    /// `after.checked_add` overflow saturates at `Instant::now() + ~292
-    /// years`, which the standard library treats as a never-expiring
-    /// deadline; this matches the fact that overflow at the runtime
-    /// boundary already maps to a saturating timer. The accessors
-    /// stay honest under saturation.
+    /// **Overflow.** If `now + after` overflows `Instant`, the deadline
+    /// saturates to `now + 100 years` rather than expiring immediately.
+    /// "Effectively never" is the right answer for absurd budgets like
+    /// `Duration::MAX`; "expires now" would silently break callers that
+    /// pass an unchecked configured value. If the saturation ceiling
+    /// itself overflows on a hostile platform, the deadline collapses
+    /// to `now`, which the accessors then report as already-expired.
     pub fn from_instant(now: Instant, after: Duration) -> Self {
-        Self {
-            deadline: now.checked_add(after).unwrap_or(now),
-        }
+        let deadline = now
+            .checked_add(after)
+            .unwrap_or_else(|| now.checked_add(DEADLINE_SATURATION_CEILING).unwrap_or(now));
+        Self { deadline }
     }
 
     /// Returns the absolute deadline `Instant` for code that wants to

@@ -147,3 +147,30 @@ fn deadline_value_type_unit_invariants() {
     assert_eq!(deadline.remaining_or_zero(expired), Duration::ZERO);
     assert!(deadline.remaining(expired).is_none());
 }
+
+/// Regression: `Duration::MAX` once made the deadline expire
+/// immediately because `checked_add` returned `None` and the constructor
+/// fell back to `now`. The fix saturates to ~100 years from now, which
+/// is "effectively never" for any sane caller.
+#[test]
+fn deadline_saturates_on_overflow_instead_of_expiring_now() {
+    use std::time::Instant;
+
+    let now = Instant::now();
+    let deadline = Deadline::from_instant(now, Duration::MAX);
+
+    assert!(
+        !deadline.expired(now),
+        "overflowed deadline must not expire immediately at `now`",
+    );
+    // A whole year later is still well inside the 100-year ceiling.
+    let one_year_later = now + Duration::from_secs(60 * 60 * 24 * 365);
+    assert!(
+        !deadline.expired(one_year_later),
+        "overflowed deadline should still be live a year out",
+    );
+    assert!(
+        deadline.remaining_or_zero(now) > Duration::from_secs(60 * 60 * 24 * 365 * 50),
+        "saturated deadline should report at least 50 years remaining",
+    );
+}

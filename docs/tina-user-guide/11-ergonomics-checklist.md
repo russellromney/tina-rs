@@ -640,7 +640,11 @@ slots eat capacity forever.
 For the inverse — *outstanding `call_with_handle` calls you own as
 the caller* — use `tina::PendingCallSet::<K, R>::with_capacity(n)`.
 Same hard rules: bounded storage, typed `Full` / `DuplicateKey` on
-insert, explicit `remove(&key)` on each completion (no `Drop` magic).
+insert, explicit `remove(&key)` on each completion. No `Drop` magic
+and no background timer; `insert` sweeps `Settled` / `Cancelled`
+handles before the capacity check (the same shape as
+`PendingReplies::try_insert`), so a forgotten `remove` in a
+`Returned` translator does not leak slots.
 
 ```rust
 let mut calls: PendingCallSet<RequestId, MyReply> =
