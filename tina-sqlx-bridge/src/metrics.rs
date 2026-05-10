@@ -45,6 +45,24 @@ pub struct PgMetrics {
     pub responses_no_rows: u64,
     /// `FetchOne` matched more than one row.
     pub too_many_rows: u64,
+    /// `FetchMany` produced a (possibly empty) row buffer.
+    pub responses_rows: u64,
+    /// `FetchMany` had to truncate at the row cap. Subset of
+    /// `responses_rows`.
+    pub responses_truncated: u64,
+    /// Cumulative count of rows actually returned to callers across
+    /// all successful `FetchOne` and `FetchMany` responses.
+    pub rows_returned: u64,
+    /// Transaction scripts that committed.
+    pub transactions_committed: u64,
+    /// Transaction scripts that rolled back because a step failed.
+    /// Does not count COMMITs that themselves failed (those land as
+    /// `sqlx_errors`).
+    pub transactions_rolled_back: u64,
+    /// Number of `pg_cancel_backend(pid)` cancellations the bridge
+    /// fired against the sidecar pool. Counts the *attempt*, not
+    /// whether Postgres honored it.
+    pub db_cancels_sent: u64,
     /// Row decode failed.
     pub decode_errors: u64,
     /// Worker terminal that landed after the bridge surfaced
@@ -71,6 +89,12 @@ pub(crate) struct MetricsInner {
     pub(crate) responses_row: AtomicU64,
     pub(crate) responses_no_rows: AtomicU64,
     pub(crate) too_many_rows: AtomicU64,
+    pub(crate) responses_rows: AtomicU64,
+    pub(crate) responses_truncated: AtomicU64,
+    pub(crate) rows_returned: AtomicU64,
+    pub(crate) transactions_committed: AtomicU64,
+    pub(crate) transactions_rolled_back: AtomicU64,
+    pub(crate) db_cancels_sent: AtomicU64,
     pub(crate) decode_errors: AtomicU64,
     pub(crate) late_results: AtomicU64,
     pub(crate) in_flight_current: AtomicU64,
@@ -92,6 +116,12 @@ impl MetricsInner {
             responses_row: self.responses_row.load(Ordering::Relaxed),
             responses_no_rows: self.responses_no_rows.load(Ordering::Relaxed),
             too_many_rows: self.too_many_rows.load(Ordering::Relaxed),
+            responses_rows: self.responses_rows.load(Ordering::Relaxed),
+            responses_truncated: self.responses_truncated.load(Ordering::Relaxed),
+            rows_returned: self.rows_returned.load(Ordering::Relaxed),
+            transactions_committed: self.transactions_committed.load(Ordering::Relaxed),
+            transactions_rolled_back: self.transactions_rolled_back.load(Ordering::Relaxed),
+            db_cancels_sent: self.db_cancels_sent.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             late_results: self.late_results.load(Ordering::Relaxed),
             in_flight_current: self.in_flight_current.load(Ordering::Relaxed),

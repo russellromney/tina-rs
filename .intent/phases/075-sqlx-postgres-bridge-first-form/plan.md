@@ -403,3 +403,253 @@ Update bridge guide:
 - Ergonomic helpers/accessors ship with the first form.
 - Generic SQLx, transactions, streaming rows, and DB cancellation remain
   explicit future work.
+
+## Follow-Ups
+
+Two buckets:
+
+- **shipping** — A, B, C in one PR after the first-form lands;
+- **declined** — not coming, reason stays loud.
+
+The original plan said C waits on B and B is independent of A. After
+landing the first-form and re-reading the cancel/tx interaction, B is
+still independent of A and C still depends on B — but the dependency
+is small. SQLx 0.8's `Transaction` rolls back on drop, so a mid-tx
+cancel is just a normal sqlx error from the cancelled statement and
+the spawn's drop path handles cleanup. No new tx-aware cancel logic
+needed. So all three ship in one slice.
+
+### Shipping
+
+#### A. FetchMany
+
+Smallest. Land first commit.
+
+Streaming peek already works for FetchOne. Same shape, larger cap.
+
+```text
+PgRequest::fetch_many(sql, max_rows)
+  -> PgResponse::Rows { rows: Vec<PgRow>, truncated: bool }
+```
+
+Rules:
+
+- read at most `max_rows + 1` rows from the SQLx stream;
+- past `max_rows`: stop pulling, set `truncated = true`;
+- bridge config keeps `max_response_rows` ceiling; caller cannot ask
+  for `usize::MAX`;
+- helper: `fetch_many_call`;
+- per-row / per-cell byte caps deferred; first form caps row count.
+
+Open: truncated success vs hard `ResponseTooLarge` error?
+
+Pick `truncated = true`. Rows are still useful. Caller who wants strict
+fail-past-N sets `max_rows + 1` and checks `truncated`.
+
+#### B. Transactions
+
+Two shapes considered. Picked.
+
+**Shape 1 — atomic script.** Caller sends ordered list of requests.
+Bridge runs them in one transaction. COMMIT on all-OK. ROLLBACK on
+first error. Reply with per-step outcomes.
+
+```text
+PgTransaction::new()
+    .step(PgRequest::execute("UPDATE ... -100 ..."))
+    .step(PgRequest::execute("UPDATE ... +100 ..."))
+    .commit_call(addr, timeout)
+    .reply(AppMsg::Transferred)
+```
+
+Good:
+
+- one Tina admission;
+- one pool acquire;
+- no tx-id threading;
+- no long-lived bridge state.
+
+Bad:
+
+- cannot rollback based on app logic between steps.
+
+**Shape 2 — transaction handle.** `Begin -> TxId`. Subsequent
+`Execute(TxId, ...)` runs on the pinned connection. `Commit(TxId)` /
+`Rollback(TxId)` close it. Bridge holds `HashMap<TxId, PoolConnection>`
+plus idle timeout so a forgotten handle does not leak a connection.
+
+Good:
+
+- full flexibility.
+
+Bad:
+
+- long-lived per-call state;
+- tx-id threading;
+- idle / leak policy is a real choice;
+- unhappy paths multiply: caller drop, bridge close, runtime drop.
+
+Ship Shape 1. Covers most real transactions. No state machine surprises.
+Add Shape 2 only when Specimen or a real user pushes.
+
+Concrete shape:
+
+```rust
+pub enum PgRequest {
+    Execute { sql, params },
+    FetchOne { sql, params },
+    FetchMany { sql, params, max_rows },
+    Transaction { steps: Vec<PgStep> },
+}
+
+pub enum PgStep {  // no nested Transaction
+    Execute { sql, params },
+    FetchOne { sql, params },
+    FetchMany { sql, params, max_rows },
+}
+
+pub enum PgResponse {
+    Executed { rows_affected },
+    Row(PgRow),
+    NoRows,
+    Rows { rows: Vec<PgRow>, truncated: bool },
+    Transaction(PgTransactionOutcome),
+}
+
+pub enum PgTransactionOutcome {
+    Committed { steps: Vec<PgStepOk> },
+    RolledBack {
+        completed: Vec<PgStepOk>,
+        failed_at: usize,
+        error: PgError,
+    },
+}
+
+pub enum PgStepOk {
+    Executed(u64),
+    Row(PgRow),
+    NoRows,
+    Rows { rows: Vec<PgRow>, truncated: bool },
+}
+```
+
+Validation:
+
+- nested `PgRequest::Transaction` inside a step is `InvalidRequest`;
+- empty `steps` is `InvalidRequest`;
+- `max_in_flight` cap counts a Transaction as one slot, not N.
+
+Cancel/timeout interaction:
+
+- per-attempt timeout still fires;
+- spawn's `sqlx::Transaction` drops on early return — sqlx ROLLBACKs;
+- caller sees `PgError::Timeout`;
+- late `tx.send` is best-effort; tally records the eventual outcome
+  (most likely a `Sqlx` error from the cancelled statement);
+- one `tx_timeout` knob distinct from `default_timeout`. When unset
+  on a Transaction request, fall back to `default_timeout` so users
+  who do not care don't have to think about it.
+
+#### C. DB-side CancelRequest
+
+Highest payoff for late-result truth. Hardest protocol work.
+
+Postgres `CancelRequest`:
+
+- separate TCP connection;
+- carries target backend `(pid, secret_key)`;
+- best effort — Postgres may ignore mid-flight.
+
+Two paths:
+
+1. **`pg_cancel_backend(pid)` via sidecar pool.** Portable. No protocol
+   work. Capture PID once via `SELECT pg_backend_pid()`; store on the
+   in-flight slot. On timeout, spawn a sidecar task: `SELECT
+   pg_cancel_backend($1)`.
+
+2. **Raw cancel connection.** Lower level. Needs `(pid, secret)` from
+   SQLx startup negotiation. Check current SQLx 0.8 API surface
+   (`PgConnection::pg_id()` etc.) before committing.
+
+Ship path 1. Correct, boring, drives `late_results` toward zero in
+normal operation. Move to path 2 only if sidecar overhead becomes a
+real complaint.
+
+Shape:
+
+- opt-in via config: `PgConfig::with_cancel_on_timeout(pool_size)`;
+  default off (0). When on, bridge builds a sidecar `PgPool` from the
+  same URL with `pool_size` connections;
+- supplied-pool path (`install_with_pool`) does not auto-build a
+  sidecar — caller passes one separately if they want cancellation;
+- when admit runs, spawn does one extra round trip:
+  `SELECT pg_backend_pid()`, write to `Arc<AtomicI32>` on the slot,
+  then run the user's request;
+- when bridge per-attempt timeout fires and the atomic PID is
+  non-zero, fire-and-forget `tokio::spawn(sidecar.execute("SELECT
+  pg_cancel_backend($1)"))`;
+- if PID is still zero at timeout (admit is still in pool acquire),
+  no cancel — there's nothing to cancel yet;
+- spawn clears the atomic to zero after the user's query returns so
+  a late timeout does not target a freed connection.
+
+New metric: `db_cancels_sent`. Not the same as `late_results`. One
+counts Tina firing a cancel; the other counts SQLx eventually
+returning. Doc: a successful cancel does not kill every query;
+some operations are not cancellable mid-flight.
+
+Cost: one extra round trip per admitted request when cancel is on.
+Default off keeps that opt-in.
+
+### Commit order
+
+One PR. Three commits, in order. Each commit is fully tested before
+the next lands on top.
+
+```text
+1. FetchMany       -> small surface, reuses streaming peek
+2. Transactions    -> atomic script (Shape 1), no nesting
+3. CancelRequest   -> opt-in sidecar pool, default off
+```
+
+Why one PR not three: B is small (atomic script over existing
+primitives, no long-lived state); C is small if path 1 is picked
+(sidecar pool + one atomic + fire-and-forget). The total surface is
+under 1k new lines and the integration tests share a real Postgres.
+Splitting to three PRs trades CI cost for review granularity that does
+not pay back here.
+
+### Declined
+
+Two original non-goals get no follow-up. Reasons stay loud so a future
+contributor does not quietly add them.
+
+#### D. Generic `sqlx::Database`
+
+Generic over `sqlx::Database` needs its own decode trait, its own value
+enum (or generic `Encode + Decode`), per-database error mapping. Type
+soup. One concrete bridge per backend is the boring answer.
+
+If MySQL or another SQLx backend earns adoption, ship
+`tina-mysql-bridge` (or similar) as a *separate crate* with the same
+shape. Do not generalize this crate.
+
+051E said no. Same call here.
+
+#### E. ORM, migrations, schema discovery, user-struct row mapping
+
+Different products from "bounded ingress around a SQL pool."
+
+User-struct mapping alone needs a derive macro, type-level column
+matching, and a nullable/missing-column story. Each of the four items
+would dwarf the bridge they live next to.
+
+Existing answers are better:
+
+- `sqlx`'s own `query_as!` for struct mapping (when offline metadata
+  is acceptable);
+- `sqlx-migrate` / `refinery` for migrations;
+- domain-specific SQL builders for query construction;
+- application code on top of `PgRow` for ad-hoc decode.
+
+Bridge job: bounded admission and visible pressure. Not modeling.
