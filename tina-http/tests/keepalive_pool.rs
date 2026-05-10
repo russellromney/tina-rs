@@ -1,0 +1,1278 @@
+//! Integration tests for the HTTP/1.1 keepalive pool.
+//!
+//! Drives a hand-rolled scripted server (not [`tina_http::HttpListener`])
+//! so the test can count *accepts* — the unambiguous proof that
+//! sequential requests reuse one TCP connection. The scripted server
+//! supports keepalive and exposes knobs for the stale-close case.
+
+#![allow(dead_code)]
+
+mod common;
+
+use std::convert::Infallible;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use tina::pool::{
+    AcquireOutcome, CloseMode, PoolConfig, PoolLease, PoolPressureReport, ReleaseDisposition,
+    ReleaseOutcome,
+};
+use tina::prelude::*;
+use tina_http::{
+    HttpClientConfig, HttpRequest, HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg,
+    KeepaliveOutcome, OriginKey, TlsTrustRoots, build_keepalive_pool,
+};
+use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+    ThreadedRuntimeConfig, call, call_with_handle, cancel_call,
+};
+
+use common::TestShard;
+
+// =====================================================================
+// Scripted keepalive server
+// =====================================================================
+
+#[derive(Debug, Clone, Copy)]
+enum ServerPolicy {
+    /// Serve as many requests on each accepted connection as the
+    /// client cares to send. Closes when the client closes.
+    Keepalive,
+    /// Serve one request per accept; emit `Connection: close` and
+    /// drop the socket after the response.
+    CloseAfterFirst,
+    /// Accept the connection, serve one request, then close the
+    /// socket without writing `Connection: close`. Mimics a server
+    /// that decided to close mid-keepalive.
+    SilentlyCloseAfterFirst,
+}
+
+struct ScriptedServer {
+    addr: SocketAddr,
+    accepts: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ScriptedServer {
+    fn start(policy: ServerPolicy) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted server");
+        listener
+            .set_nonblocking(false)
+            .expect("blocking listener mode");
+        let addr = listener.local_addr().expect("local addr");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        // Set a short accept timeout so the server thread polls `stop`
+        // and exits cleanly. accept() itself has no timeout, so we use
+        // SO_RCVTIMEO via set_nonblocking-and-poll. Simpler: configure
+        // the listener as nonblocking and sleep-poll.
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let accepts_t = accepts.clone();
+        let requests_t = requests.clone();
+        let stop_t = stop.clone();
+        let handle = thread::spawn(move || {
+            while !stop_t.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _peer)) => {
+                        accepts_t.fetch_add(1, Ordering::Relaxed);
+                        let req_counter = requests_t.clone();
+                        let stop_inner = stop_t.clone();
+                        thread::spawn(move || {
+                            handle_connection(stream, policy, req_counter, stop_inner);
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            accepts,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::Relaxed)
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ScriptedServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    policy: ServerPolicy,
+    requests: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+) {
+    // Accepted streams may inherit O_NONBLOCK from the listener on
+    // some platforms; flip back to blocking so `Read::read` blocks
+    // until the next request bytes arrive.
+    stream.set_nonblocking(false).expect("blocking stream");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .expect("write timeout");
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let head_end = loop {
+            if let Some(pos) = find_double_crlf(&buf) {
+                break pos;
+            }
+            let mut chunk = [0u8; 1024];
+            let n = match stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        // Parse content-length from head.
+        let head_str = std::str::from_utf8(&buf[..head_end]).unwrap_or("");
+        let content_length = parse_content_length(head_str);
+        let body_start = head_end;
+        let body_end = body_start + content_length;
+        while buf.len() < body_end {
+            let mut chunk = [0u8; 1024];
+            let n = match stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        requests.fetch_add(1, Ordering::Relaxed);
+
+        // Build response.
+        let close_after = matches!(policy, ServerPolicy::CloseAfterFirst);
+        let body = b"ok";
+        let mut response = Vec::with_capacity(128);
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        response.extend_from_slice(b"Content-Length: 2\r\n");
+        if close_after {
+            response.extend_from_slice(b"Connection: close\r\n");
+        }
+        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(body);
+        if stream.write_all(&response).is_err() {
+            return;
+        }
+        let _ = stream.flush();
+
+        // Drain the consumed request bytes.
+        buf.drain(..body_end);
+
+        match policy {
+            ServerPolicy::Keepalive => {}
+            ServerPolicy::CloseAfterFirst | ServerPolicy::SilentlyCloseAfterFirst => return,
+        }
+    }
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+fn parse_content_length(head: &str) -> usize {
+    for line in head.split("\r\n") {
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("content-length:") {
+            if let Ok(n) = rest.trim().parse::<usize>() {
+                return n;
+            }
+        }
+    }
+    0
+}
+
+// =====================================================================
+// Driver isolate — exercises the keepalive pool from the runtime side
+// =====================================================================
+
+type PoolAddr = Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DriverEvent {
+    Acquired { id: u32, generation: u64 },
+    AcquireFull { id: u32 },
+    AcquireClosed { id: u32 },
+    AcquireCallTimeout { id: u32 },
+    AcquireCallFull { id: u32 },
+    AcquireCallClosed { id: u32 },
+    Request { id: u32, status: u16, must_retire: bool },
+    RequestErr { id: u32, message: String },
+    Released { id: u32, outcome: ReleaseOutcome },
+    Reset { id: u32 },
+    Cancelled,
+    PoolClosed,
+    Pressure(PoolPressureReport),
+}
+
+#[derive(Default)]
+struct DriverState {
+    events: Vec<DriverEvent>,
+    leases: Vec<(u32, PoolLease<KeepaliveConnAddr>)>,
+    handles: Vec<(u32, tina::CallHandle<WorkerPoolReply<KeepaliveConnAddr>>)>,
+}
+
+enum DriverMsg {
+    Acquire {
+        id: u32,
+        timeout: Duration,
+    },
+    AcquireWithHandle {
+        id: u32,
+        timeout: Duration,
+    },
+    Cancel {
+        id: u32,
+    },
+    Request {
+        id: u32,
+        request: HttpRequest,
+        /// Wall-clock budget the keepalive connection enforces
+        /// internally via its `sleep`-armed deadline.
+        request_timeout: Duration,
+        /// Driver-side `call` timeout. Must be `>= request_timeout`
+        /// or the runtime layer will time out before the connection
+        /// can surface its typed `Timeout` reply.
+        call_timeout: Duration,
+    },
+    Reset {
+        id: u32,
+        timeout: Duration,
+    },
+    Release {
+        id: u32,
+        disposition: ReleaseDisposition,
+    },
+    Close {
+        mode: CloseMode,
+        timeout: Duration,
+    },
+    Pressure {
+        timeout: Duration,
+    },
+    PressureReturned(CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>),
+    AcquireReturned {
+        id: u32,
+        outcome: CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
+    },
+    RequestReturned {
+        id: u32,
+        outcome: CallOutcome<KeepaliveOutcome>,
+    },
+    ResetReturned {
+        id: u32,
+        outcome: CallOutcome<KeepaliveOutcome>,
+    },
+    ReleaseReturned {
+        id: u32,
+        outcome: CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
+    },
+    CloseReturned(CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>),
+    CancelReturned(tina::CancelOutcome),
+}
+
+impl std::fmt::Debug for DriverMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acquire { id, .. } => write!(f, "Acquire({id})"),
+            Self::AcquireWithHandle { id, .. } => write!(f, "AcquireWithHandle({id})"),
+            Self::Cancel { id } => write!(f, "Cancel({id})"),
+            Self::Request { id, .. } => write!(f, "Request({id})"),
+            Self::Reset { id, .. } => write!(f, "Reset({id})"),
+            Self::Release { id, .. } => write!(f, "Release({id})"),
+            Self::Close { .. } => f.write_str("Close"),
+            Self::Pressure { .. } => f.write_str("Pressure"),
+            Self::PressureReturned(_) => f.write_str("PressureReturned"),
+            Self::AcquireReturned { id, .. } => write!(f, "AcquireReturned({id})"),
+            Self::RequestReturned { id, .. } => write!(f, "RequestReturned({id})"),
+            Self::ResetReturned { id, .. } => write!(f, "ResetReturned({id})"),
+            Self::ReleaseReturned { id, .. } => write!(f, "ReleaseReturned({id})"),
+            Self::CloseReturned(_) => f.write_str("CloseReturned"),
+            Self::CancelReturned(_) => f.write_str("CancelReturned"),
+        }
+    }
+}
+
+struct Driver {
+    pool: PoolAddr,
+    state: Arc<Mutex<DriverState>>,
+    notify: mpsc::Sender<DriverEvent>,
+}
+
+impl Isolate for Driver {
+    tina::isolate_types! {
+        message: DriverMsg,
+        reply: (),
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<DriverMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            DriverMsg::Acquire { id, timeout } => call(self.pool, WorkerPoolMsg::Acquire, timeout)
+                .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome }),
+            DriverMsg::AcquireWithHandle { id, timeout } => {
+                let (effect, handle) = call_with_handle(self.pool, WorkerPoolMsg::Acquire, timeout)
+                    .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome });
+                self.state
+                    .lock()
+                    .expect("state")
+                    .handles
+                    .push((id, handle));
+                effect
+            }
+            DriverMsg::Cancel { id } => {
+                let mut st = self.state.lock().expect("state");
+                let pos = st.handles.iter().position(|(hid, _)| *hid == id);
+                if let Some(pos) = pos {
+                    let (_, handle) = st.handles.remove(pos);
+                    drop(st);
+                    cancel_call(handle).reply(DriverMsg::CancelReturned)
+                } else {
+                    noop()
+                }
+            }
+            DriverMsg::Request {
+                id,
+                request,
+                request_timeout,
+                call_timeout,
+            } => {
+                let leases = self.state.lock().expect("state");
+                let addr = *leases
+                    .leases
+                    .iter()
+                    .find(|(lid, _)| *lid == id)
+                    .map(|(_, lease)| lease.handle())
+                    .expect("lease for id");
+                drop(leases);
+                call(
+                    addr,
+                    KeepaliveConnectionMsg::request(request, request_timeout),
+                    call_timeout,
+                )
+                .reply(move |outcome| DriverMsg::RequestReturned { id, outcome })
+            }
+            DriverMsg::Reset { id, timeout } => {
+                let leases = self.state.lock().expect("state");
+                let addr = *leases
+                    .leases
+                    .iter()
+                    .find(|(lid, _)| *lid == id)
+                    .map(|(_, lease)| lease.handle())
+                    .expect("lease for id");
+                drop(leases);
+                call(addr, KeepaliveConnectionMsg::Reset, timeout)
+                    .reply(move |outcome| DriverMsg::ResetReturned { id, outcome })
+            }
+            DriverMsg::Release { id, disposition } => {
+                let mut st = self.state.lock().expect("state");
+                let pos = st
+                    .leases
+                    .iter()
+                    .position(|(lid, _)| *lid == id)
+                    .expect("lease for id");
+                let (_, lease) = st.leases.remove(pos);
+                drop(st);
+                tina_runtime::pool::release_effect(
+                    lease,
+                    self.pool,
+                    disposition,
+                    Duration::from_secs(2),
+                    move |outcome| DriverMsg::ReleaseReturned { id, outcome },
+                )
+            }
+            DriverMsg::Close { mode, timeout } => {
+                call(self.pool, WorkerPoolMsg::Close(mode), timeout).reply(DriverMsg::CloseReturned)
+            }
+            DriverMsg::Pressure { timeout } => {
+                call(self.pool, WorkerPoolMsg::PressureReport, timeout)
+                    .reply(DriverMsg::PressureReturned)
+            }
+            DriverMsg::PressureReturned(outcome) => {
+                let report = match outcome {
+                    CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => report,
+                    _ => PoolPressureReport::default(),
+                };
+                let event = DriverEvent::Pressure(report);
+                self.state.lock().expect("state").events.push(event.clone());
+                let _ = self.notify.send(event);
+                noop()
+            }
+
+            DriverMsg::AcquireReturned { id, outcome } => {
+                let event = match outcome {
+                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(
+                        lease,
+                    ))) => {
+                        let generation = lease.generation();
+                        self.state.lock().expect("state").leases.push((id, lease));
+                        DriverEvent::Acquired { id, generation }
+                    }
+                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Full)) => {
+                        DriverEvent::AcquireFull { id }
+                    }
+                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Closed)) => {
+                        DriverEvent::AcquireClosed { id }
+                    }
+                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::WrongShard)) => {
+                        panic!("WrongShard not expected on TestShard")
+                    }
+                    CallOutcome::Replied(_) => panic!("unexpected reply variant"),
+                    CallOutcome::Timeout => DriverEvent::AcquireCallTimeout { id },
+                    CallOutcome::Full => DriverEvent::AcquireCallFull { id },
+                    CallOutcome::Closed => DriverEvent::AcquireCallClosed { id },
+                };
+                self.state.lock().expect("state").events.push(event.clone());
+                let _ = self.notify.send(event);
+                noop()
+            }
+            DriverMsg::RequestReturned { id, outcome } => {
+                let event = match outcome {
+                    CallOutcome::Replied(KeepaliveOutcome::Request {
+                        result,
+                        must_retire,
+                    }) => match result {
+                        Ok(response) => DriverEvent::Request {
+                            id,
+                            status: response.status.as_u16(),
+                            must_retire,
+                        },
+                        Err(err) => DriverEvent::RequestErr {
+                            id,
+                            message: format!("{err:?} (must_retire={must_retire})"),
+                        },
+                    },
+                    CallOutcome::Replied(KeepaliveOutcome::Reset) => {
+                        panic!("Reset reply on Request call")
+                    }
+                    other => DriverEvent::RequestErr {
+                        id,
+                        message: format!("call outcome: {other:?}"),
+                    },
+                };
+                self.state.lock().expect("state").events.push(event.clone());
+                let _ = self.notify.send(event);
+                noop()
+            }
+            DriverMsg::ResetReturned { id, .. } => {
+                let event = DriverEvent::Reset { id };
+                self.state.lock().expect("state").events.push(event.clone());
+                let _ = self.notify.send(event);
+                noop()
+            }
+            DriverMsg::ReleaseReturned { id, outcome } => {
+                let event = match outcome {
+                    CallOutcome::Replied(WorkerPoolReply::Release(o)) => {
+                        DriverEvent::Released { id, outcome: o }
+                    }
+                    _ => DriverEvent::Released {
+                        id,
+                        outcome: ReleaseOutcome::StaleLease,
+                    },
+                };
+                self.state.lock().expect("state").events.push(event.clone());
+                let _ = self.notify.send(event);
+                noop()
+            }
+            DriverMsg::CloseReturned(_) => {
+                self.state
+                    .lock()
+                    .expect("state")
+                    .events
+                    .push(DriverEvent::PoolClosed);
+                let _ = self.notify.send(DriverEvent::PoolClosed);
+                noop()
+            }
+            DriverMsg::CancelReturned(_) => {
+                let _ = self.notify.send(DriverEvent::Cancelled);
+                noop()
+            }
+        }
+    }
+}
+
+// =====================================================================
+// Test harness
+// =====================================================================
+
+struct TestRig {
+    runtime: Option<ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>>,
+}
+
+impl TestRig {
+    fn start() -> Self {
+        let runtime = ThreadedRuntime::with_config(
+            TestShard,
+            DefaultThreadedMailboxFactory,
+            ThreadedRuntimeConfig {
+                command_capacity: 64,
+                idle_wait: Duration::from_millis(1),
+                ..Default::default()
+            },
+        );
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    fn rt(&self) -> &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> {
+        self.runtime.as_ref().expect("runtime live")
+    }
+
+    fn build_pool(
+        &self,
+        target: HttpTarget,
+        capacity: usize,
+        max_waiters: usize,
+    ) -> PoolAddr {
+        build_keepalive_pool(
+            self.rt(),
+            target,
+            HttpClientConfig::dev(),
+            PoolConfig::new(capacity, max_waiters),
+            16,
+            32,
+        )
+        .expect("register pool")
+    }
+
+    fn driver(
+        &self,
+        pool: PoolAddr,
+    ) -> (Address<DriverMsg>, Arc<Mutex<DriverState>>, mpsc::Receiver<DriverEvent>) {
+        let state = Arc::new(Mutex::new(DriverState::default()));
+        let (tx, rx) = mpsc::channel();
+        let driver = Driver {
+            pool,
+            state: state.clone(),
+            notify: tx,
+        };
+        let address = self
+            .rt()
+            .register_with_capacity::<Driver, Infallible>(driver, 32)
+            .expect("register driver");
+        (address, state, rx)
+    }
+
+    fn shutdown(mut self) {
+        if let Some(rt) = self.runtime.take() {
+            let _ = rt.shutdown();
+        }
+    }
+}
+
+fn wait_for_event(
+    rx: &mpsc::Receiver<DriverEvent>,
+    mut p: impl FnMut(&DriverEvent) -> bool,
+) -> DriverEvent {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut seen: Vec<DriverEvent> = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or(Duration::from_millis(1));
+        match rx.recv_timeout(remaining) {
+            Ok(event) => {
+                if p(&event) {
+                    return event;
+                }
+                seen.push(event);
+            }
+            Err(_) => panic!("timed out waiting for event; seen so far: {seen:?}"),
+        }
+    }
+}
+
+fn req() -> HttpRequest {
+    HttpRequest::get("/").header("Host", "x").build()
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
+
+#[test]
+fn sequential_requests_reuse_one_connection() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    for id in 0..3 {
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Acquire {
+                id,
+                timeout: Duration::from_secs(2),
+            },
+        );
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id));
+
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Request {
+                id,
+                request: req(),
+                request_timeout: Duration::from_secs(2),
+                call_timeout: Duration::from_secs(2),
+            },
+        );
+        let event =
+            wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id));
+        match event {
+            DriverEvent::Request {
+                status, must_retire, ..
+            } => {
+                assert_eq!(status, 200);
+                assert!(!must_retire, "keepalive server: response should be reusable");
+            }
+            _ => unreachable!(),
+        }
+
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Release {
+                id,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        );
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id));
+    }
+
+    assert_eq!(
+        server.requests(),
+        3,
+        "scripted server should have served 3 requests"
+    );
+    assert_eq!(
+        server.accepts(),
+        1,
+        "all three requests should ride one TCP connection"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn different_origin_pools_do_not_share_connections() {
+    let server_a = ScriptedServer::start(ServerPolicy::Keepalive);
+    let server_b = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool_a = rig.build_pool(HttpTarget::http(server_a.addr), 1, 4);
+    let pool_b = rig.build_pool(HttpTarget::http(server_b.addr), 1, 4);
+
+    let (driver_a, _, rx_a) = rig.driver(pool_a);
+    let (driver_b, _, rx_b) = rig.driver(pool_b);
+
+    for &(driver, ref rx) in &[(driver_a, &rx_a), (driver_b, &rx_b)] {
+        for id in 0..2 {
+            let _ = rig.rt().try_send(
+                driver,
+                DriverMsg::Acquire {
+                    id,
+                    timeout: Duration::from_secs(2),
+                },
+            );
+            wait_for_event(rx, |e| matches!(e, DriverEvent::Acquired { .. }));
+            let _ = rig.rt().try_send(
+                driver,
+                DriverMsg::Request {
+                    id,
+                    request: req(),
+                    request_timeout: Duration::from_secs(2),
+                    call_timeout: Duration::from_secs(2),
+                },
+            );
+            wait_for_event(rx, |e| matches!(e, DriverEvent::Request { .. }));
+            let _ = rig.rt().try_send(
+                driver,
+                DriverMsg::Release {
+                    id,
+                    disposition: ReleaseDisposition::Reuse,
+                },
+            );
+            wait_for_event(rx, |e| matches!(e, DriverEvent::Released { .. }));
+        }
+    }
+
+    assert_eq!(server_a.accepts(), 1, "server A used one TCP connection");
+    assert_eq!(server_b.accepts(), 1, "server B used one TCP connection");
+    assert_eq!(server_a.requests(), 2);
+    assert_eq!(server_b.requests(), 2);
+
+    rig.shutdown();
+    server_a.stop();
+    server_b.stop();
+}
+
+#[test]
+fn server_close_after_first_response_marks_must_retire_and_reconnects() {
+    let server = ScriptedServer::start(ServerPolicy::CloseAfterFirst);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    for id in 0..2 {
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Acquire {
+                id,
+                timeout: Duration::from_secs(2),
+            },
+        );
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { .. }));
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Request {
+                id,
+                request: req(),
+                request_timeout: Duration::from_secs(2),
+                call_timeout: Duration::from_secs(2),
+            },
+        );
+        let event =
+            wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id));
+        match event {
+            DriverEvent::Request {
+                status, must_retire, ..
+            } => {
+                assert_eq!(status, 200);
+                assert!(
+                    must_retire,
+                    "server sent Connection: close — connection must retire"
+                );
+            }
+            _ => unreachable!(),
+        }
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Release {
+                id,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        );
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { .. }));
+    }
+
+    assert_eq!(server.requests(), 2);
+    assert_eq!(
+        server.accepts(),
+        2,
+        "stale-close should force a reconnect for request 2"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn acquire_full_visible_when_capacity_busy_and_no_waiter_slots() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    // capacity 1, max_waiters 0 → second Acquire must come back Full
+    // immediately.
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 0);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 2,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    let event = wait_for_event(&rx, |e| {
+        matches!(e, DriverEvent::AcquireFull { id: 2 } | DriverEvent::Acquired { id: 2, .. })
+    });
+    assert!(
+        matches!(event, DriverEvent::AcquireFull { id: 2 }),
+        "expected AcquireFull, got {event:?}"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn acquire_call_timeout_reclaims_waiter_capacity() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 1);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    // Holder takes the only resource and never releases.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+
+    // Waiter parks then call-times-out.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 2,
+            timeout: Duration::from_millis(150),
+        },
+    );
+    let event =
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireCallTimeout { id: 2 }));
+    assert!(matches!(event, DriverEvent::AcquireCallTimeout { id: 2 }));
+
+    // Third waiter must succeed in parking — capacity reclaimed.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 3,
+            timeout: Duration::from_millis(100),
+        },
+    );
+    let event =
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireCallTimeout { id: 3 }));
+    assert!(
+        matches!(event, DriverEvent::AcquireCallTimeout { id: 3 }),
+        "third waiter parked then timed out, proving the second waiter's slot was reclaimed"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn acquire_cancel_reclaims_waiter_capacity() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 1);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    // Holder.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+
+    // Waiter (with cancel handle).
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::AcquireWithHandle {
+            id: 2,
+            timeout: Duration::from_secs(5),
+        },
+    );
+    // Give the pool a moment to enqueue the waiter.
+    thread::sleep(Duration::from_millis(50));
+
+    let _ = rig.rt().try_send(driver, DriverMsg::Cancel { id: 2 });
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Cancelled));
+
+    // Third waiter parks fine — capacity reclaimed.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 3,
+            timeout: Duration::from_millis(100),
+        },
+    );
+    let event =
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireCallTimeout { id: 3 }));
+    assert!(matches!(event, DriverEvent::AcquireCallTimeout { id: 3 }));
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn drain_close_blocks_new_acquires_and_lets_outstanding_release() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+
+    // Drain.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Close {
+            mode: CloseMode::Drain,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::PoolClosed));
+
+    // Outstanding release: drain accepts as Released; resource sits idle but
+    // the pool will not re-hand it out.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Release {
+            id: 1,
+            disposition: ReleaseDisposition::Reuse,
+        },
+    );
+    let event =
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: 1, .. }));
+    if let DriverEvent::Released { outcome, .. } = event {
+        assert_eq!(outcome, ReleaseOutcome::Released);
+    }
+
+    // New acquire should reply Closed.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 2,
+            timeout: Duration::from_secs(1),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireClosed { id: 2 }));
+    assert!(matches!(event, DriverEvent::AcquireClosed { id: 2 }));
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn force_close_marks_outstanding_lease_stale_on_release() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Close {
+            mode: CloseMode::Force,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::PoolClosed));
+
+    // Late release of the outstanding lease — Force says PoolClosed.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Release {
+            id: 1,
+            disposition: ReleaseDisposition::Reuse,
+        },
+    );
+    let event =
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: 1, .. }));
+    if let DriverEvent::Released { outcome, .. } = event {
+        assert_eq!(outcome, ReleaseOutcome::PoolClosed);
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn https_origin_key_includes_sni_and_trust_identity() {
+    // We don't run HTTPS traffic here — that's covered elsewhere. We
+    // just prove the key fingerprint changes when SNI or trust roots
+    // change. The rest is a structural assertion.
+    let addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let target_a = HttpTarget::https(
+        addr,
+        "alpha.example",
+        TlsTrustRoots::from_der(vec![vec![1, 2, 3]]),
+    );
+    let target_b = HttpTarget::https(
+        addr,
+        "beta.example",
+        TlsTrustRoots::from_der(vec![vec![1, 2, 3]]),
+    );
+    let target_c = HttpTarget::https(
+        addr,
+        "alpha.example",
+        TlsTrustRoots::from_der(vec![vec![9, 9, 9]]),
+    );
+
+    let key_a = OriginKey::from_target(&target_a);
+    let key_b = OriginKey::from_target(&target_b);
+    let key_c = OriginKey::from_target(&target_c);
+
+    assert_ne!(key_a, key_b, "different SNI must produce a different key");
+    assert_ne!(
+        key_a, key_c,
+        "different trust roots must produce a different key"
+    );
+
+    // HTTP keys differ from HTTPS keys at the same address.
+    let http_target = HttpTarget::http(addr);
+    let http_key = OriginKey::from_target(&http_target);
+    assert_ne!(http_key, key_a);
+}
+
+/// Black-hole TCP server: accepts connections, never reads or writes,
+/// holds them open until the test drops it. Used to drive the keepalive
+/// connection's request_timeout path without ambiguity.
+struct BlackHole {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    holders: Arc<Mutex<Vec<TcpStream>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BlackHole {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind black hole");
+        let addr = listener.local_addr().expect("local addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let holders = Arc::new(Mutex::new(Vec::new()));
+        let stop_t = stop.clone();
+        let holders_t = holders.clone();
+        let handle = thread::spawn(move || {
+            while !stop_t.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        holders_t.lock().expect("holders").push(stream);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            stop,
+            holders,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for BlackHole {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.holders.lock().expect("holders").clear();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[test]
+fn request_timeout_marks_must_retire_and_consumer_can_release_retire() {
+    let server = BlackHole::start();
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+
+    // Tight request timeout — server never replies, so the
+    // connection's deadline fires.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Request {
+            id: 1,
+            request: req(),
+            request_timeout: Duration::from_millis(150),
+            call_timeout: Duration::from_secs(2),
+        },
+    );
+    let event = wait_for_event(&rx, |e| {
+        matches!(
+            e,
+            DriverEvent::Request { id: 1, .. } | DriverEvent::RequestErr { id: 1, .. }
+        )
+    });
+    match event {
+        DriverEvent::RequestErr { message, .. } => {
+            assert!(
+                message.contains("Timeout") && message.contains("must_retire=true"),
+                "expected Timeout with must_retire=true; got {message}"
+            );
+        }
+        other => panic!("expected RequestErr (Timeout), got {other:?}"),
+    }
+
+    // Consumer chooses Retire; the pool acks Retired and the slot is
+    // dropped from circulation.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Release {
+            id: 1,
+            disposition: ReleaseDisposition::Retire,
+        },
+    );
+    let event =
+        wait_for_event(&rx, |e| matches!(e, DriverEvent::Released { id: 1, .. }));
+    if let DriverEvent::Released { outcome, .. } = event {
+        assert_eq!(outcome, ReleaseOutcome::Retired);
+    }
+
+    rig.shutdown();
+}
+
+#[test]
+fn pressure_report_surfaces_capacity_full_count_and_close_state() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 0);
+    let (driver, _state, rx) = rig.driver(pool);
+
+    // Initial snapshot: capacity 1, available 1, no Full count yet.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Pressure {
+            timeout: Duration::from_secs(1),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Pressure(_)));
+    if let DriverEvent::Pressure(report) = event {
+        assert_eq!(report.capacity, 1);
+        assert_eq!(report.available, 1);
+        assert_eq!(report.leased, 0);
+        assert_eq!(report.full_count, 0);
+        assert!(!report.closed);
+    }
+
+    // Consume the only slot, then provoke a Full and snapshot again.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(1),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 2,
+            timeout: Duration::from_secs(1),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::AcquireFull { id: 2 }));
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Pressure {
+            timeout: Duration::from_secs(1),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Pressure(_)));
+    if let DriverEvent::Pressure(report) = event {
+        assert_eq!(report.leased, 1);
+        assert_eq!(report.available, 0);
+        assert!(report.full_count >= 1, "Full was emitted");
+        assert!(!report.closed);
+    }
+
+    // Close (Drain) and snapshot once more.
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Close {
+            mode: CloseMode::Drain,
+            timeout: Duration::from_secs(1),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::PoolClosed));
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Pressure {
+            timeout: Duration::from_secs(1),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Pressure(_)));
+    if let DriverEvent::Pressure(report) = event {
+        assert!(report.closed, "pool should report closed=true after Drain");
+    }
+
+    rig.shutdown();
+    server.stop();
+}

@@ -4,6 +4,61 @@ This file records completed work.
 
 ## Unreleased
 
+### HTTP/1.1 keepalive pool
+
+`tina-http` now ships a real keepalive pool consumer of the
+`WorkerPool` vocabulary. One TCP (or TLS) connection serves many
+sequential requests; the pool exposes acquire / release / retire /
+close and a pressure report.
+
+What got shorter:
+- A scripted client that issues N requests against the same origin
+  acquires the lease once per request and reuses one TCP connection
+  end-to-end. Pre-existing `HttpClient` connect-write-read-close per
+  call is still available; it stays the right tool for one-shot
+  outbound calls and remains how `HttpConnectionPool` is built.
+
+What stayed explicit:
+- Origin keying. `OriginKey` carries scheme + `SocketAddr` + (HTTPS:
+  SNI server name + a stable hash of the configured DER trust
+  roots). A pool's connections are pre-bound to one `HttpTarget` at
+  registration so cross-origin reuse is impossible by construction.
+- Caps. `PoolConfig::new(capacity, max_waiters)` sizes resources and
+  parked callers; the pool isolate's mailbox size is a separate
+  bound (size to `>= max_waiters + burst`). The connection isolate's
+  mailbox sizes only its own continuations.
+- Reuse vs retire. The connection's `KeepaliveOutcome::Request`
+  carries `must_retire`. Set when the server returned `Connection:
+  close`, the peer EOF'd, or any connect/write/read error fired. The
+  consumer chooses `ReleaseDisposition::Reuse` or `Retire`; the pool
+  does not override silently.
+- Deadlines. `KeepaliveConnectionMsg::Request { request_timeout }`
+  is the wall-clock budget enforced inside the connection. Pass
+  `Deadline::remaining_or_zero(now)` from a caller-owned deadline to
+  propagate budgets honestly across hops. No hidden retry, no hidden
+  queue.
+- Close modes. `CloseMode::Drain` blocks new acquires and lets
+  outstanding leases return normally; `Force` retires outstanding
+  leases — late releases get `PoolClosed`.
+
+New surface in `tina_http`:
+- `OriginKey`, `KeepaliveConnection`, `KeepaliveConnectionMsg`,
+  `KeepaliveOutcome`, `KeepaliveConnAddr`, `build_keepalive_pool`.
+- `encode_request` now takes a `connection_close: bool` parameter
+  so the keepalive path can omit `Connection: close`.
+
+Eleven integration tests live in `tina-http/tests/keepalive_pool.rs`:
+sequential reuse counted via accept count, cross-origin isolation,
+stale server-close retirement, acquire `Full` / acquire-call timeout
+/ acquire cancel reclaim of waiter capacity, request timeout with
+must-retire honored on release, drain & force close visibility,
+HTTPS origin key includes SNI / trust identity, pressure report
+shape across capacity / `Full` / closed transitions.
+
+The legacy capacity-1 `HttpConnectionPool` is kept as the first
+form for one-request-per-connection admission; it remains useful
+for callers that do not need keepalive.
+
 ### 066A hostile-review fixes
 
 Round of correctness, vocabulary, and proof fixes on top of 066A

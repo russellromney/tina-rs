@@ -189,7 +189,7 @@ impl<S: Shard + 'static> HttpClient<S> {
             Ok(request) => request,
             Err(error) => return reply(Err(error)),
         };
-        let request_bytes = encode_request(&request);
+        let request_bytes = encode_request(&request, true);
         self.state = Some(ActiveCall {
             request_bytes,
             transport: None,

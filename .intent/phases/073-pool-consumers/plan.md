@@ -2,10 +2,17 @@
 
 ## Status
 
-- Done: plan drafted from 067 worker-pool findings.
+- Done: plan drafted from 067 worker-pool findings; Rock 1 HTTP/1.1
+  keepalive pool landed (`tina_http::KeepaliveConnection` plus
+  `build_keepalive_pool`). Eleven integration tests cover reuse,
+  cross-origin isolation, stale retirement, capacity / waiter
+  reclaim, deadline propagation, drain & force close, HTTPS origin
+  identity, pressure report.
 - In progress: none.
-- Open: run after 072 Deadline + PendingCallSet lands.
-- Deferred: multi-shard pool, keyed cluster pool, automatic lease reclaim.
+- Open: Rocks 2–4 (SQLite check, bridge audit, additional
+  specimens). Rock 5 multi-shard memo waits for a second consumer.
+- Deferred: multi-shard pool, keyed cluster pool, automatic lease
+  reclaim.
 
 ## Goal
 

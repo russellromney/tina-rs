@@ -30,6 +30,7 @@
 
 pub mod client;
 pub mod connection;
+pub mod keepalive;
 pub mod listener;
 pub mod listener_tls;
 pub mod parse;
@@ -51,6 +52,11 @@ pub use listener_tls::{
 pub use parse::{
     HttpResponseHead, ParseProgress, ResponseParseProgress, encode_request, encode_response,
     parse_request_head, parse_response_head,
+};
+pub use keepalive::{
+    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveOutcome,
+    KeepaliveWorkerPool, KeepaliveWorkerPoolMsg, KeepaliveWorkerPoolReply, OriginKey,
+    build_keepalive_pool,
 };
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;

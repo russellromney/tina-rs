@@ -128,7 +128,7 @@ fn build_sim_config(target: &HttpTarget, request: &HttpRequest) -> SimulatorConf
         http::header::HOST,
         http::HeaderValue::from_str(&policy_value).expect("ascii host"),
     );
-    let request_bytes = encode_request(&planned);
+    let request_bytes = encode_request(&planned, true);
 
     SimulatorConfig {
         tls: ScriptedTlsConfig {

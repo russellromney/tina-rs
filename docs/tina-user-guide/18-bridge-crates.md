@@ -11,10 +11,16 @@ The rule:
 
 If you can use a native Tina crate, do. Native HTTPS/1.1 lives in
 `tina-http`'s `HttpsListener` and `HttpClient` — explicit DER cert
-config, typed startup, matchable TLS errors. Reach for a bridge
-when you need HTTP/2, ALPN, system trust roots, redirects/cookies,
-an existing Axum app, or a third-party SDK that only ships a Tokio
-client.
+config, typed startup, matchable TLS errors. For repeated outbound
+requests against the same origin, `tina_http::build_keepalive_pool`
+hands you a `WorkerPool<KeepaliveConnAddr>`: one TCP (or TLS)
+connection serves many requests, with `acquire` / `release` /
+`retire` / `close` and a pressure report. Origins are keyed by
+scheme + `SocketAddr` + (HTTPS) SNI + trust-root fingerprint, so
+two pools never share a connection unintentionally. Reach for a
+bridge when you need HTTP/2, ALPN, system trust roots,
+redirects/cookies, an existing Axum app, or a third-party SDK that
+only ships a Tokio client.
 
 ## What ships today
 
