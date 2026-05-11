@@ -140,8 +140,13 @@ pub enum RequestChunkReply {
 /// chunk pulls from a single mailbox.
 #[derive(Debug, Clone)]
 pub struct RequestStream {
-    /// Declared `Content-Length` from the wire.
+    /// Declared `Content-Length` from the wire. Meaningless when
+    /// `chunked` is `true`.
     pub content_length: usize,
+    /// `true` when the request used `Transfer-Encoding: chunked`.
+    /// There is no declared length; the service pulls chunks until
+    /// `Eof`.
+    pub chunked: bool,
     /// Chunk source — the connection isolate.
     pub source: Address<crate::HttpConnectionMsg, RequestChunkReply>,
 }
