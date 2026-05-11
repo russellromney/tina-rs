@@ -1155,6 +1155,26 @@ where
             // stray Effect::Reply does not also fire on the captured
             // call.
             let captured_any = self.promote_captures(isolate_id, handler_finished.into());
+
+            // If the handler had a caller but did not capture it and
+            // does not reply in this turn, the caller is abandoned.
+            // Remember the call id so we can close it after the effect
+            // runs (the effect may batch a nested reply).
+            //
+            // Skip the guard when the effect is a runtime call or batch:
+            // the handler may be delegating to a continuation that will
+            // reply later. This keeps the guard conservative — it only
+            // fires when the handler clearly does nothing with the caller.
+            let may_reply_later = matches!(effect_kind, EffectKind::Call | EffectKind::Batch);
+            let abandoned_call_id = if !captured_any && !may_reply_later {
+                message.call_context.as_ref().map(|ctx| match *ctx {
+                    MessageCallContext::Local { call_id } => call_id,
+                    MessageCallContext::Remote { call_id, .. } => call_id,
+                })
+            } else {
+                None
+            };
+
             let effective_context = if captured_any {
                 None
             } else {
@@ -1169,6 +1189,24 @@ where
                 &mut round_messages,
                 route_remote,
             );
+
+            // If the call is still pending after the effect, the handler
+            // returned without replying and without capturing. Abandon
+            // the caller immediately so it does not wait for timeout.
+            if let Some(call_id) = abandoned_call_id {
+                if self
+                    .pending_isolate_calls
+                    .iter()
+                    .any(|p| p.call_id == call_id)
+                {
+                    let abandoned = self.push_event(
+                        isolate_id,
+                        Some(handler_finished.into()),
+                        RuntimeEventKind::CallReplyAbandoned { call_id },
+                    );
+                    self.complete_isolate_call(call_id, abandoned.into(), CallOutcome::Closed);
+                }
+            }
         }
 
         round_messages.clear();

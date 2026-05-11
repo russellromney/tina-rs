@@ -2084,6 +2084,28 @@ where
             translator,
         ))
     }
+
+    /// Like [`reply`](Self::reply), but also carries the caller's
+    /// [`RequestContext`] into the continuation message so a multi-turn
+    /// service can still answer the original caller after the observed
+    /// send resolves.
+    pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        tina::Effect::Call(RuntimeCall::observed_send(
+            self.destination,
+            self.message,
+            move |outcome| translator(req, outcome),
+        ))
+    }
 }
 
 /// Returns a helper that attempts one send and later reports its outcome.
@@ -2128,6 +2150,29 @@ where
             translator,
         ))
     }
+
+    /// Like [`reply`](Self::reply), but also carries the caller's
+    /// [`RequestContext`] into the continuation message so a multi-turn
+    /// service can still answer the original caller after the child call
+    /// resolves.
+    pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        tina::Effect::Call(RuntimeCall::isolate_call(
+            self.destination,
+            self.message,
+            self.timeout,
+            move |outcome| translator(req, outcome),
+        ))
+    }
 }
 
 /// Prepared isolate-call helper that also produces a caller-owned
@@ -2168,6 +2213,31 @@ where
             self.message,
             self.timeout,
             translator,
+            shared.clone(),
+        ));
+        let handle = tina::runtime_internal::call_handle_from_shared::<R>(shared);
+        (effect, handle)
+    }
+
+    /// Like [`reply`](Self::reply), but also carries the caller's
+    /// [`RequestContext`] into the continuation message.
+    pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> (tina::Effect<I>, tina::CallHandle<R>)
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        let shared = Arc::new(CallHandleShared::new(std::any::TypeId::of::<R>()));
+        let effect = tina::Effect::Call(RuntimeCall::isolate_call_with_handle(
+            self.destination,
+            self.message,
+            self.timeout,
+            move |outcome| translator(req, outcome),
             shared.clone(),
         ));
         let handle = tina::runtime_internal::call_handle_from_shared::<R>(shared);
@@ -2327,6 +2397,26 @@ impl<T> TypedCall<T> {
         let decode = self.decode;
         tina::Effect::Call(RuntimeCall::new(self.request, move |output| {
             translator(decode(output))
+        }))
+    }
+
+    /// Like [`reply`](Self::reply), but also carries the caller's
+    /// [`RequestContext`] into the continuation message.
+    pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        T: 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        let decode = self.decode;
+        tina::Effect::Call(RuntimeCall::new(self.request, move |output| {
+            translator(req, decode(output))
         }))
     }
 }
