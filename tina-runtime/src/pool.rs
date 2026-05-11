@@ -22,6 +22,18 @@
 //! the pool returns the resource to Idle and bumps
 //! `dispatch_recovered`. Without this back-channel a cancel race
 //! would leak the resource forever.
+//!
+//! # Owner-stop behaviour
+//!
+//! When the pool's owner stops, the runtime cancels every pending
+//! isolate call and delivers `CallCompletionRejected` to the caller.
+//! The pool's deferred slots become `Closed`, but the pool itself
+//! may not receive another handler turn before being dropped. This is
+//! harmless: the waiter slab and counters are deallocated with the
+//! isolate, and `live_waiter_count()` drops to zero. The
+//! `cancel_count` may not increment for these unreclaimed slots,
+//! so metrics read during shutdown should be treated as conservative
+//! ("at most this many") rather than exact.
 
 use std::convert::Infallible;
 use std::marker::PhantomData;
