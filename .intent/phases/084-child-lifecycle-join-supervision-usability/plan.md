@@ -3,8 +3,8 @@
 ## Status
 
 - Done: plan + review.
-- Open: child refs, `spawn_observed`, specimen/docs cleanup.
-- Maybe: child join/stop/restart polish if the shape is obvious.
+- Open: child refs, `spawn_observed`, child join/stop/restart polish
+  only where obvious, specimen/docs cleanup.
 - Deferred: cross-shard child ownership, distributed supervision,
   supervisor strategy matrix, timed restart windows.
 
@@ -38,12 +38,11 @@ old address stale.
 
 ## Shape
 
-Two PRs max.
+One PR.
 
-1. `ChildRef` + `spawn_observed` + docs/specimen proof.
-2. Join/stop/restart polish only if PR 1 proves the exact shape.
-
-If PR 2 gets fuzzy, stop. Record the follow-up.
+Ship `ChildRef` + `spawn_observed` + docs/specimen proof. Add
+join/stop/restart polish in the same PR only if the shape is already
+boring. If it gets fuzzy, defer it.
 
 ## Rock 0 — Read First
 
@@ -102,7 +101,7 @@ Use `Effect::SpawnObserved` if that is the clean shape.
 
 ## Rock 3 — Join / Stop Child
 
-Only ship if obvious after Rock 2.
+Only ship if obvious in this PR.
 
 Candidate:
 
@@ -155,7 +154,7 @@ Remove Boot/self-address workaround where `spawn_observed` replaces it.
 
 ## Proof
 
-PR 1:
+Required:
 
 - parent gets `ChildRef` as message;
 - parent sends follow-up to child;
@@ -163,7 +162,7 @@ PR 1:
 - sim mirrors live, or records explicit follow-up;
 - old `spawn` still works.
 
-PR 2, only if shipped:
+If join/stop/restart ships:
 
 - parent observes child stop/result;
 - stale generation does not silently deliver;

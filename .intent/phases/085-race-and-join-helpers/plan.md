@@ -3,8 +3,8 @@
 ## Status
 
 - Done: plan + review.
-- Open: bounded named call group, first-success race, one specimen.
-- Maybe: join-all partial report if PR 1 stays small.
+- Open: bounded named call group, first-success race, join-all partial
+  report if small, one specimen.
 - Deferred: macros, fake `select!`, hidden retry, stream select,
   policy framework, heterogeneous reply groups.
 
@@ -38,13 +38,12 @@ partial is still truth.
 
 ## Shape
 
-Two PRs max.
+One PR.
 
-1. `CallGroup<K, R>` + first-success race + one specimen.
-2. Join-all / partial-deadline report + `RequestContext` / child-ref
-   integration if still small.
-
-If PR 1 smells wrong, stop and document the manual pattern.
+Ship `CallGroup<K, R>` + first-success race + one specimen. Add
+join-all / partial-deadline report and `RequestContext` / child-ref
+integration in the same PR only if still boring. If it smells wrong,
+stop and document the manual pattern.
 
 ## Rock 0 — Read First
 
@@ -112,7 +111,7 @@ No "reply winner now, cancel later" first form.
 
 ## Rock 3 — Join-All
 
-Ship only if PR 1 stays simple.
+Ship only if the first-success shape stays simple.
 
 Join:
 
@@ -172,7 +171,7 @@ Do not update ordered pipelines unless stage truth stays visible.
 
 ## Proof
 
-PR 1:
+Required:
 
 - fill group, next insert returns `Full`;
 - duplicate key is typed error;
@@ -182,7 +181,7 @@ PR 1:
 - fill -> cancel/complete -> refill works;
 - no hidden retry/idempotency.
 
-PR 2, only if shipped:
+If join-all ships:
 
 - join-all returns all replies;
 - deadline returns partial report;
