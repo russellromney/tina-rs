@@ -531,6 +531,208 @@ fn chunked_round_trip_property_across_random_payloads() {
 // Gap-fill tests added after the second hostile review.
 // ---------------------------------------------------------------
 
+/// Source that records whether it received `Cancel`.
+struct CancelRecordingSource {
+    chunk: Vec<u8>,
+    received_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Isolate for CancelRecordingSource {
+    tina::isolate_types! {
+        message: tina_http::ResponseChunkMsg,
+        reply: tina_http::ResponseChunkReply,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: tina_http::ResponseChunkMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            tina_http::ResponseChunkMsg::Next => {
+                reply(tina_http::ResponseChunkReply::Chunk(self.chunk.clone()))
+            }
+            tina_http::ResponseChunkMsg::Cancel => {
+                self.received_cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+                stop()
+            }
+        }
+    }
+}
+
+/// Client drops the connection mid-known-length stream. The
+/// connection must send `Cancel` to the source so it can release
+/// state, and the truncation must still be visible in
+/// `body_io_error_count`.
+#[test]
+fn known_length_client_disconnect_sends_cancel_to_source() {
+    let metrics = BodyMetrics::new();
+    let runtime = build_runtime();
+
+    let received_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let known_source = runtime
+        .register_with_capacity::<CancelRecordingSource, Infallible>(
+            CancelRecordingSource {
+                chunk: vec![b'k'; 1024],
+                received_cancel: std::sync::Arc::clone(&received_cancel),
+            },
+            16,
+        )
+        .expect("register known source");
+    let chunked_source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(std::iter::empty::<Vec<u8>>()),
+            16,
+        )
+        .expect("register dummy chunked source");
+    let service = runtime
+        .register_with_capacity::<StreamRouter, Infallible>(
+            StreamRouter {
+                known_source,
+                chunked_source,
+                known_length: 1024 * 1024, // large so the source never finishes
+            },
+            16,
+        )
+        .expect("register service");
+
+    let listener_isolate = HttpListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    // Open connection, read the head, then drop — mid-stream.
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(b"GET /known HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).unwrap();
+    assert!(n > 0, "should read the response head");
+
+    // Drop the client socket. Give the server time to detect the
+    // close, send Cancel, and let the source process it.
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    assert!(
+        received_cancel.load(std::sync::atomic::Ordering::Acquire),
+        "source must receive Cancel when the wire is abandoned mid-stream"
+    );
+    let snap = metrics.snapshot();
+    assert!(
+        snap.drained(),
+        "metrics must drain after cancel; got {snap:?}"
+    );
+    assert!(
+        snap.body_io_error_count > 0,
+        "wire truncation must still be counted; got {snap:?}"
+    );
+}
+
+/// Client drops the connection mid-chunked stream. Same cancel
+/// contract as the known-length path.
+#[test]
+fn chunked_client_disconnect_sends_cancel_to_source() {
+    let metrics = BodyMetrics::new();
+    let runtime = build_runtime();
+
+    let received_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let known_source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(std::iter::empty::<Vec<u8>>()),
+            16,
+        )
+        .expect("register dummy known source");
+    let chunked_source = runtime
+        .register_with_capacity::<CancelRecordingSource, Infallible>(
+            CancelRecordingSource {
+                chunk: vec![b'c'; 1024],
+                received_cancel: std::sync::Arc::clone(&received_cancel),
+            },
+            16,
+        )
+        .expect("register chunked source");
+    let service = runtime
+        .register_with_capacity::<StreamRouter, Infallible>(
+            StreamRouter {
+                known_source,
+                chunked_source,
+                known_length: 0,
+            },
+            16,
+        )
+        .expect("register service");
+
+    let listener_isolate = HttpListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(b"GET /chunked HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).unwrap();
+    assert!(n > 0, "should read the response head");
+
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    assert!(
+        received_cancel.load(std::sync::atomic::Ordering::Acquire),
+        "chunked source must receive Cancel when the wire is abandoned"
+    );
+    let snap = metrics.snapshot();
+    assert!(snap.drained(), "metrics must drain; got {snap:?}");
+    assert!(
+        snap.body_io_error_count > 0,
+        "wire truncation must still be counted; got {snap:?}"
+    );
+}
+
 /// Edge: source replies `Eof` on the first `Next`. Wire should be
 /// just the head + `0\r\n\r\n` terminator. Body high-water = 0.
 #[test]

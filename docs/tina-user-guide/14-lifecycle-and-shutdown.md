@@ -124,6 +124,19 @@ the trace; if the callee already accepted the work, it may still finish
 and its late reply becomes a typed `CallReplyRejected` event. There is
 no "kill this worker."
 
+### Cancellation truth table
+
+| Surface | Cancel can stop waiting? | Cancel can stop work? | Late result visible? |
+|---|---|---|---|
+| isolate call before delivery | yes | yes | no |
+| isolate call after delivery | yes | no, unless callee cooperates | yes |
+| deferred reply slot | yes | callee owns cleanup | yes |
+| HTTP response body source | yes | yes — `ResponseChunkMsg::Cancel` tells source to release state | body metric + trace |
+| SQLx bridge | yes | best-effort via `pg_cancel_backend` if enabled | metrics/trace |
+| SQLite bridge | yes | no, blocking call runs to completion | metrics/trace |
+| reqwest bridge | yes | maybe future abort handle; today be honest | trace/metrics |
+| pool acquire waiter | yes | yes, reclaim waiter slot | no late work |
+
 Owners that hold many in-flight calls should store the handles in a
 bounded `PendingCallSet<K, R>` keyed by request id. The set rejects
 duplicate keys loudly (it deliberately does **not** auto-sweep

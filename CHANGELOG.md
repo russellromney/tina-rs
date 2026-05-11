@@ -17,7 +17,37 @@ This file records completed work.
   isolates to direct `call_blocking` calls, removing ~130 lines of
   ceremony while preserving `CallOutcome` visibility.
 
+### Response body source cancel (079 PR 1)
+
+`ResponseChunkMsg::Cancel` is a new typed variant sent to chunk sources
+when the HTTP connection abandons the wire mid-stream. Sources can
+release files, downstream calls, and pending slots. `IterBodySource`
+handles it with `stop()`.
+
+The connection isolate sends `Cancel` on every wire-death path:
+`Read(Err)`, `Wrote(Err)`, `handle_wrote(0)`,
+`handle_stream_chunk(Timeout|Full|Closed)`, peer EOF, and header
+deadline. It also defensively cancels in `begin_close()`. Duplicate
+cancels are harmless — the source either already stopped or drops the
+late message.
+
+`body_io_error_count` still increments on truncation; cancel is an
+additional typed signal, not a replacement for the metric. Integration
+tests prove both known-length and chunked paths.
+
+Added a cancellation truth table to
+`docs/tina-user-guide/14-lifecycle-and-shutdown.md` that names what
+cancel means on every surface Tina exposes.
+
 ### SQLx/Postgres bridge
+
+- Added `PgPressureReport` and `PgMetricsHandle::pressure_report` so
+  callers can observe the bridge as a pool: `capacity`, `leased`,
+  `available`, `waiters`, `full_count`, `timeout_count`, `high_water`.
+- Added admission tests proving distinct outcomes at each boundary:
+  `PgError::Full` (Tina admission), `PgError::PoolAcquireTimeout`
+  (SQLx pool pressure), `PgError::Timeout` (bridge deadline), and
+  SQL errors (lane stays held until completion).
 
 Added `tina-sqlx-bridge`, a bounded Postgres bridge around
 `sqlx::PgPool`. The bridge owns the Tokio/SQLx side; Tina callers see
@@ -58,6 +88,12 @@ Rust value conversions without silent `u64` wrapping, and a classifier
 for caller-owned retry. `specimen_sqlite_counter` now uses the bridge
 and the host `call_blocking` path; demo modes cover constraint,
 timeout, closed, invalid, and retry surfaces.
+
+- Added `SqlitePressureReport` and `SqliteMetricsHandle::pressure_report`
+  so callers can observe the bridge as a pool: `capacity`, `leased`,
+  `available`, `waiters`, `full_count`, `busy_count`, `high_water`.
+- Added admission test proving the serial pool shape:
+  `pressure_report_reflects_serial_pool_shape`.
 
 ### HTTP body streaming and backpressure
 

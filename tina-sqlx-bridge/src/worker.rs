@@ -225,6 +225,7 @@ impl<S: Shard + 'static> PgWorker<S> {
         let metrics_inner = Arc::new(MetricsInner::default());
         let metrics_handle = PgMetricsHandle {
             inner: Arc::clone(&metrics_inner),
+            capacity: config.max_in_flight,
         };
         let pool = PoolHolder::new(pool, runtime.clone());
         let cancel_pool = cancel_pool.map(|p| PoolHolder::new(p, runtime.clone()));

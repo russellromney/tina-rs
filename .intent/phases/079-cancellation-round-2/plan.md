@@ -4,8 +4,9 @@
 
 - Done: plan created after 066 cancellation, 072 deadlines, 074 body
   streaming, and DB/HTTP bridge work landed.
-- In progress: none.
-- Open: apply cancellation to resource-holding surfaces.
+- In progress: PR 1 — response body source cancel + cancellation truth
+  docs table.
+- Open: PR 2 — pool/bridge audit fixes that are clearly pulled by code.
 - Deferred: universal preemptive cancellation, OS-level kill semantics,
   exact DB cancellation guarantees.
 
@@ -66,7 +67,7 @@ code changes:
 | isolate call before delivery | yes | yes | no |
 | isolate call after delivery | yes | no, unless callee cooperates | yes |
 | deferred reply slot | yes | callee owns cleanup | yes |
-| HTTP response body source | yes | should send `Cancel` to source | body metric + trace |
+| HTTP response body source | yes | yes — `ResponseChunkMsg::Cancel` tells source to release state | body metric + trace |
 | SQLx bridge | yes | best-effort via `pg_cancel_backend` if enabled | metrics/trace |
 | SQLite bridge | yes | no, blocking call runs to completion | metrics/trace |
 | reqwest bridge | yes | maybe future abort handle; today be honest | trace/metrics |
@@ -74,26 +75,29 @@ code changes:
 
 This table prevents fake cancellation.
 
-## Rock 1 — Response Body Source Cancel
+## Rock 1 — Response Body Source Cancel ✅
 
 074 shipped response streaming. If the client disconnects mid-stream,
 the source can be left idle; failure is visible through
 `body_io_error_count`, but the source does not get a typed cancel.
 
-Build:
+Built:
 
-- `ResponseChunkMsg::Cancel` or equivalent;
-- connection isolate sends cancel when wire dies or response is
-  abandoned;
-- source can release files, downstream calls, and pending slots;
-- duplicate cancel is harmless/typed.
+- `ResponseChunkMsg::Cancel` — source receives typed cancel and can
+  release files, downstream calls, and pending slots;
+- `IterBodySource` handles `Cancel` with `stop()`;
+- connection isolate sends `Cancel` via `call` on every wire-death
+  path (`Read(Err)`, `Wrote(Err)`, `handle_wrote(0)`,
+  `handle_stream_chunk(Timeout|Full|Closed)`, peer EOF,
+  header deadline) and defensively in `begin_close()`;
+- duplicate cancel is harmless — the source either already stopped or
+  drops the late message.
 
 Proof:
 
-- source receives cancel on client disconnect;
-- source stops and releases its owned state;
-- body I/O error metric still increments;
-- known-length and chunked paths both covered.
+- `streaming_v2::known_length_client_disconnect_sends_cancel_to_source`
+- `streaming_v2::chunked_client_disconnect_sends_cancel_to_source`
+- both assert `received_cancel` is true and `body_io_error_count > 0`.
 
 ## Rock 2 — Pool Acquire Cancellation
 

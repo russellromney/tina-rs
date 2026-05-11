@@ -157,6 +157,25 @@ config knobs and typed errors, document a per-connection isolation
 rule (no shared `Arc<Mutex<Connection>>`), and add tests that prove
 the pool's `Full` boundary.
 
+To observe the pool shape today, call [`SqliteMetricsHandle::pressure_report`](../../tina-sqlite-bridge):
+
+```rust
+let report = bridge.metrics.pressure_report();
+// report.capacity   == config.max_in_flight (always 1)
+// report.leased     == 0 or 1
+// report.available  == 1 or 0
+// report.full_count == cumulative SqliteError::Full
+// report.busy_count == cumulative SQLITE_BUSY
+// report.high_water == peak in-flight observed (always 0 or 1)
+```
+
+`waiters` is always `0` because the bridge does not queue callers;
+it replies `SqliteError::Full` immediately. SQL errors (including
+`SqliteError::Busy`) do **not** retire the lane.
+
+This shape is proven in the bridge's own
+`pressure_report_reflects_serial_pool_shape` test.
+
 ## What this is not
 
 - Not a benchmark. `INCREMENTS = 50` is small enough to run in

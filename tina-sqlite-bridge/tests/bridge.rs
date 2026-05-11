@@ -1821,3 +1821,79 @@ fn value_from_extra_types() {
     let some_i: Option<i64> = Some(42);
     assert_eq!(SqliteValue::from(some_i), SqliteValue::Integer(42));
 }
+
+#[test]
+fn pressure_report_reflects_serial_pool_shape() {
+    let runtime = Arc::new(ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 32,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ));
+
+    let cfg = SqliteConfig::memory()
+        .with_default_timeout(Duration::from_secs(2))
+        .with_poll_interval(Duration::from_millis(1));
+    let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg.clone()).expect("install");
+
+    let r0 = bridge.metrics.pressure_report();
+    assert_eq!(r0.capacity, 1, "serial form pins max_in_flight to 1");
+    assert_eq!(r0.available, 1);
+    assert_eq!(r0.leased, 0);
+    assert!(!r0.is_full());
+
+    let sink1 = Arc::new(Sink::default());
+    let caller1 = runtime
+        .register_with_capacity::<_, Infallible>(
+            CallerIsolate {
+                worker: bridge.address,
+                timeout: Duration::from_secs(2),
+                sink: Arc::clone(&sink1),
+            },
+            8,
+        )
+        .expect("register caller 1");
+
+    let sink2 = Arc::new(Sink::default());
+    let caller2 = runtime
+        .register_with_capacity::<_, Infallible>(
+            CallerIsolate {
+                worker: bridge.address,
+                timeout: Duration::from_secs(2),
+                sink: Arc::clone(&sink2),
+            },
+            8,
+        )
+        .expect("register caller 2");
+
+    runtime
+        .try_send(caller1, CallerMsg::Run(SqliteRequest::execute("SELECT 1")))
+        .expect("send req1");
+    runtime
+        .try_send(caller2, CallerMsg::Run(SqliteRequest::execute("SELECT 2")))
+        .expect("send req2");
+
+    let out2 = sink2.wait_one(Duration::from_secs(3));
+    assert!(
+        matches!(out2, CallOutcome::Replied(Err(SqliteError::Full))),
+        "expected Full, got {out2:?}"
+    );
+
+    let r1 = bridge.metrics.pressure_report();
+    assert_eq!(r1.full_count, 1, "one Full recorded");
+    assert_eq!(r1.high_water, 1);
+
+    let _ = sink1.wait_one(Duration::from_secs(3));
+
+    let r2 = bridge.metrics.pressure_report();
+    assert_eq!(r2.leased, 0);
+    assert_eq!(r2.available, 1);
+    assert!(!r2.is_full());
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
