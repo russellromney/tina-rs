@@ -106,6 +106,46 @@ Do not:
   has its own failure and pressure story, each stage should stay named
   in the message enum.
 
+## Multi-turn reply through RequestContext
+
+When a service must reply after several turns, the caller's promise can be
+carried as `RequestContext<R>`. This is the same primitive as `DeferredReply`
+but the type name signals the multi-turn intent.
+
+```rust
+fn handle(&mut self, msg: SvcMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    match msg {
+        SvcMsg::Start => {
+            let req = ctx.take_request_context().unwrap();
+            call(self.probe, ProbeMsg, Duration::from_millis(50))
+                .reply_with_request(req, SvcMsg::ProbeResult)
+        }
+        SvcMsg::ProbeResult(req, CallOutcome::Replied(ProbeReply(v))) if v >= 10 => {
+            reply_to_request(req, SvcReply::Ready)
+        }
+        SvcMsg::ProbeResult(req, _) => {
+            reply_to_request(req, SvcReply::NotReady)
+        }
+    }
+}
+```
+
+Rules:
+
+- `take_request_context` consumes the caller in the first turn, same as
+  `take_reply_slot`;
+- `reply_with_request` boxes the translator so the continuation message
+  carries the context back to the service;
+- `reply_to_request` consumes the context and delivers the final reply;
+- the caller timeout still governs; the runtime still records `Timeout`
+  or `Closed` if the service forgets to reply.
+
+Do not:
+
+- use `RequestContext` when a single-turn `reply` suffices;
+- hide the context in a shared state or closure — it must move through
+  the message enum so every turn is a trace event.
+
 ## List-processing pattern
 
 A list-processing isolate runs the same call sequence over each item

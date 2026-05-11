@@ -313,6 +313,26 @@ struct Bad {
 No cap, no caller-liveness signal, no terminal trace, no sweep. Use
 `DeferredReply` + `PendingReplies`.
 
+### Request Context
+
+When the reply is intentionally multi-turn, use `RequestContext<R>` instead of
+`DeferredReply`. The name signals intent to readers.
+
+```rust
+let req: RequestContext<MyReply> = ctx.take_request_context()?;
+call(probe, ProbeMsg, timeout)
+    .reply_with_request(req, MyMsg::ProbeResult)
+```
+
+`reply_with_request` boxes a translator that carries the context into the
+continuation message. The caller timeout still governs. The service still
+answers later with `reply_to_request(req, MyReply)`. There is no hidden
+state preservation and no async-looking sugar.
+
+`RequestContext` is a real newtype over `DeferredReply`; it exists so that
+a handler signature can say "I carry the promise across turns" instead of
+"I hold an opaque slot." Use whichever spelling makes the code clearer.
+
 ## Macro Rule
 
 A future `#[service]` macro may hide byte encoding.

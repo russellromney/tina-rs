@@ -12,7 +12,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tina::{Outbound, batch, noop, send, spawn, stop};
+use tina::{DeferredReply, Outbound, batch, noop, send, spawn, stop};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -891,6 +891,7 @@ fn restart_children_can_restart_child_before_its_first_turn() {
 }
 
 mod deferred;
+mod request_context;
 mod supervision;
 
 #[test]
@@ -2676,7 +2677,9 @@ enum ManualCallRequest {
 struct ManualCallReply;
 
 #[derive(Debug)]
-struct ManualCallTarget;
+struct ManualCallTarget {
+    slot: Option<DeferredReply<ManualCallReply>>,
+}
 
 impl Isolate for ManualCallTarget {
     type Message = ManualCallRequest;
@@ -2689,10 +2692,17 @@ impl Isolate for ManualCallTarget {
     fn handle(
         &mut self,
         msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ManualCallRequest::NoReply => noop(),
+            ManualCallRequest::NoReply => {
+                // Hold the reply slot in isolate state so the call stays
+                // pending. The abandoned-caller guard closes uncaptured
+                // callers immediately; keeping the slot alive is the
+                // legitimate way to defer a reply.
+                self.slot = Some(ctx.take_reply_slot().unwrap());
+                noop()
+            }
         }
     }
 }
@@ -2740,7 +2750,7 @@ impl Isolate for ManualCallCaller {
 fn isolate_call_timeout_uses_manual_clock_without_wall_clock_sleep() {
     let (mut runtime, clock) = new_manual_runtime();
     let outcomes = Rc::new(RefCell::new(Vec::new()));
-    let target = runtime.register(ManualCallTarget, TestMailbox::new(8));
+    let target = runtime.register(ManualCallTarget { slot: None }, TestMailbox::new(8));
     let caller = runtime.register(
         ManualCallCaller {
             outcomes: Rc::clone(&outcomes),

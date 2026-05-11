@@ -1223,7 +1223,9 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
     let (mut runtime, clock) = new_manual_runtime();
     // Workers that never reply so callers stay in pending.
     #[derive(Debug)]
-    struct SilentWorker;
+    struct SilentWorker {
+        held: Vec<DeferredReply<WorkerReply>>,
+    }
     impl Isolate for SilentWorker {
         type Message = WorkerMsg;
         type Reply = WorkerReply;
@@ -1234,13 +1236,18 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
         fn handle(
             &mut self,
             _msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
+            // Hold the reply slot in isolate state so the call stays
+            // pending. The abandoned-caller guard closes uncaptured
+            // callers immediately; keeping the slot alive is the
+            // legitimate way to defer a reply.
+            self.held.push(ctx.take_reply_slot().unwrap());
             noop()
         }
     }
 
-    let w = runtime.register(SilentWorker, TestMailbox::new(4));
+    let w = runtime.register(SilentWorker { held: Vec::new() }, TestMailbox::new(4));
     let frontend = runtime.register(
         PoolFrontend {
             workers: vec![w],
