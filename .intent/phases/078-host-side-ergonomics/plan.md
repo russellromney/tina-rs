@@ -4,8 +4,8 @@
 
 - Done: plan created after `ThreadedRuntime::call_blocking` proved useful
   in HTTP and DB specimens.
-- In progress: none.
-- Open: implement host/test helpers.
+- Done: expanded `call_blocking` docs, added trace query helpers,
+  migrated `client_bad_input.rs` and `client_against_native.rs`.
 - Deferred: service-handler syntax sugar, pipeline macros, fake async.
 
 ## Goal

@@ -7,7 +7,6 @@
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -17,8 +16,7 @@ use tina_http::{
     ResponseParseError,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
 fn start_canned_server(canned_response: Vec<u8>) -> SocketAddr {
@@ -38,63 +36,8 @@ fn start_canned_server(canned_response: Vec<u8>) -> SocketAddr {
     addr
 }
 
-#[derive(Debug, Clone)]
-enum DriverMsg {
-    Begin {
-        client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
-        target: SocketAddr,
-        timeout: Duration,
-    },
-    Returned(CallOutcome<Result<HttpResponse, HttpClientError>>),
-}
-
-struct Driver {
-    sender: mpsc::Sender<Result<HttpResponse, HttpClientError>>,
-}
-
-impl Isolate for Driver {
-    tina::isolate_types! {
-        message: DriverMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
-        shard: SingleShard,
-    }
-
-    fn handle(
-        &mut self,
-        msg: DriverMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            DriverMsg::Begin {
-                client,
-                target,
-                timeout,
-            } => {
-                let request = HttpRequest::get("/").header("Host", "x").build();
-                call(client, HttpClientMsg::call(target, request), timeout)
-                    .reply(DriverMsg::Returned)
-            }
-            DriverMsg::Returned(outcome) => {
-                let result = match outcome {
-                    CallOutcome::Replied(inner) => inner,
-                    CallOutcome::Full => Err(HttpClientError::Busy),
-                    CallOutcome::Closed => Err(HttpClientError::Closed),
-                    CallOutcome::Timeout => Err(HttpClientError::Timeout),
-                };
-                let _ = self.sender.send(result);
-                stop()
-            }
-        }
-    }
-}
-
-fn run_one(canned: Vec<u8>) -> Result<HttpResponse, HttpClientError> {
-    let target = start_canned_server(canned);
-
-    let runtime = ThreadedRuntime::with_config(
+fn runtime() -> ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory> {
+    ThreadedRuntime::with_config(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -102,7 +45,23 @@ fn run_one(canned: Vec<u8>) -> Result<HttpResponse, HttpClientError> {
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },
-    );
+    )
+}
+
+fn map_outcome(
+    outcome: CallOutcome<Result<HttpResponse, HttpClientError>>,
+) -> Result<HttpResponse, HttpClientError> {
+    match outcome {
+        CallOutcome::Replied(inner) => inner,
+        CallOutcome::Full => Err(HttpClientError::Busy),
+        CallOutcome::Closed => Err(HttpClientError::Closed),
+        CallOutcome::Timeout => Err(HttpClientError::Timeout),
+    }
+}
+
+fn run_one(canned: Vec<u8>) -> Result<HttpResponse, HttpClientError> {
+    let target = start_canned_server(canned);
+    let runtime = runtime();
 
     let client = runtime
         .register_with_capacity::<HttpClient<SingleShard>, Infallible>(
@@ -111,25 +70,16 @@ fn run_one(canned: Vec<u8>) -> Result<HttpResponse, HttpClientError> {
         )
         .expect("register client");
 
-    let (tx, rx) = mpsc::channel();
-    let driver = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 16)
-        .expect("register driver");
-
-    runtime
-        .try_send(
-            driver,
-            DriverMsg::Begin {
+    let request = HttpRequest::get("/").header("Host", "x").build();
+    let result = map_outcome(
+        runtime
+            .call_blocking(
                 client,
-                target,
-                timeout: Duration::from_secs(2),
-            },
-        )
-        .expect("send Begin");
-
-    let result = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("driver delivers result");
+                HttpClientMsg::call(target, request),
+                Duration::from_secs(2),
+            )
+            .expect("call runs"),
+    );
 
     let _ = runtime.shutdown();
     result
@@ -222,25 +172,16 @@ fn timeout_fires_when_server_holds_connection_open() {
         )
         .expect("register client");
 
-    let (tx, rx) = mpsc::channel();
-    let driver = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 16)
-        .expect("register driver");
-
-    runtime
-        .try_send(
-            driver,
-            DriverMsg::Begin {
+    let request = HttpRequest::get("/").header("Host", "x").build();
+    let result = map_outcome(
+        runtime
+            .call_blocking(
                 client,
-                target: addr,
-                timeout: Duration::from_secs(2),
-            },
-        )
-        .expect("send Begin");
-
-    let result = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("driver delivers result");
+                HttpClientMsg::call(addr, request),
+                Duration::from_secs(2),
+            )
+            .expect("call runs"),
+    );
     let err = result.expect_err("client must time out");
     assert!(
         matches!(err, HttpClientError::Timeout),
