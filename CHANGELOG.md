@@ -4,6 +4,23 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 070 Small Sharded Ergonomics
+
+- Added `ShardBatch<T>` and `GroupByOwnerError::CapExceeded` to
+  `tina_runtime::sharded`.
+- Added `ShardPlacement::group_by_owner_bytes` and
+  `ShardPlacement::group_by_owner_str` for bounded grouping of keyed items by
+  owner shard. Output follows `placement.shards()` order; empty shards are
+  omitted; too many items returns a typed cap error.
+- Added integration tests proving placement-order preservation,
+  non-contiguous shard ids, empty input, cap exceeded, duplicate-key grouping,
+  and byte-identical live/sim mapping.
+- Added `hot_key_pressure_first_attempt_only_no_retry_loop` test to
+  `sharded_primitives.rs`, making explicit the first-attempt-only pressure
+  report shape when the caller does not retry.
+- Updated `docs/tina-user-guide/10-service-patterns.md` with group-by-owner
+  snippet, hot-key pressure paragraph, and caller-owned retry paragraph.
+
 ### Phase 078 Host-Side Ergonomics
 
 - Expanded docs for `ThreadedRuntime::call_blocking` with full example,

@@ -174,6 +174,11 @@ Use when state has a natural key.
   `impl From<M> for T`). Replaces the hand-written bridge isolate every
   scatter/gather coordinator used to need. Register it on a shard with
   explicit mailbox capacity; no hidden queue.
+- `ShardBatch<T>` — one shard's grouped items after
+  `placement.group_by_owner_str(...)` or `group_by_owner_bytes(...)`.
+  The output follows `placement.shards()` order. Empty shards are
+  omitted so a 256-shard placement with three items does not produce
+  253 empty batches.
 - `HotKeyAttemptReport` — caller-owned retry shape. The helpers never retry
   on your behalf; the report distinguishes first-attempt full, retry
   success, retry exhaustion, timeout, and closed.
@@ -192,6 +197,48 @@ and produces the same `Report`. The Tina side uses
 sequential per-shard fanout for `SUM`. The richer parallel
 scatter/gather form (with `send_observed` and a `ReplyAdapter`) is
 proven in `tina-runtime/tests/sharded_primitives.rs`.
+
+### Grouping items by owner shard
+
+Before fanning out, you may need to group a batch of keyed items so each
+shard receives its own sublist:
+
+```rust
+let batches = placement.group_by_owner_str(items, |i| &i.key, max_items)?;
+for batch in batches {
+    let addr = table.address_for(batch.shard)?;
+    send(addr, ShardMsg::Batch(batch.items));
+}
+```
+
+`group_by_owner_str` (and `group_by_owner_bytes`) returns `Vec<ShardBatch<T>>`
+in `placement.shards()` order. Empty shards are omitted. The input count is
+capped: too many items returns `GroupByOwnerError::CapExceeded`. The helper
+uses the same `owner_for_bytes` path live and simulated runtimes share, so the
+grouping is byte-identical across both.
+
+### Hot keys and caller-owned retry
+
+A hot key hashes to one owner shard. When that shard's mailbox is full, Tina
+reports `Full` on that shard. It does not smear the pressure across other
+shards or hide it in a global queue. The caller sees the hot-shard truth
+through `HotKeyAttemptReport`:
+
+```rust
+let mut report = HotKeyAttemptReport::default();
+match runtime.try_send(owner, msg) {
+    Ok(()) => report.record(HotKeyAttemptOutcome::Accepted),
+    Err(TrySendError::Full(_)) => report.record(HotKeyAttemptOutcome::FullFirstAttempt),
+    Err(TrySendError::Closed(_)) => report.record(HotKeyAttemptOutcome::Closed),
+}
+```
+
+If the caller retries, the retry loop is caller-owned. The runtime never
+retries on your behalf because the caller owns idempotency: a retry may mean
+"send the same message again", and only the caller knows whether that is safe.
+`HotKeyAttemptReport` records first-attempt `Full` separately from retry `Full`,
+`RetrySucceeded`, and `RetryExhausted` so the retry pressure stays visible in
+logs and metrics.
 
 ## Deferred Replies
 
