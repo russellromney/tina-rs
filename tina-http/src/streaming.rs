@@ -53,12 +53,15 @@ use std::marker::PhantomData;
 use tina::Address;
 use tina::prelude::*;
 
-/// Pulled by the consumer from a chunk source. Single-variant enum is
-/// future-proof for sugar like `NextWithHint(usize)` later.
+/// Pulled by the consumer from a chunk source.
 #[derive(Debug, Clone)]
 pub enum ResponseChunkMsg {
     /// Request the next chunk of response body bytes.
     Next,
+    /// The connection is abandoning the wire. The source should stop
+    /// producing and release any owned resources — files, downstream
+    /// calls, pending slots. Duplicate cancels are harmless.
+    Cancel,
 }
 
 /// Reply to [`ResponseChunkMsg::Next`].
@@ -255,14 +258,17 @@ impl<S: Shard + 'static> Isolate for IterBodySource<S> {
 
     fn handle(
         &mut self,
-        _msg: ResponseChunkMsg,
+        msg: ResponseChunkMsg,
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
-        match self.iter.next() {
-            Some(bytes) if !bytes.is_empty() => reply(ResponseChunkReply::Chunk(bytes)),
-            // Empty `Vec<u8>` is treated as `Eof` so the iterator
-            // can signal end-of-stream without an explicit option.
-            _ => reply(ResponseChunkReply::Eof),
+        match msg {
+            ResponseChunkMsg::Next => match self.iter.next() {
+                Some(bytes) if !bytes.is_empty() => reply(ResponseChunkReply::Chunk(bytes)),
+                // Empty `Vec<u8>` is treated as `Eof` so the iterator
+                // can signal end-of-stream without an explicit option.
+                _ => reply(ResponseChunkReply::Eof),
+            },
+            ResponseChunkMsg::Cancel => stop(),
         }
     }
 }
