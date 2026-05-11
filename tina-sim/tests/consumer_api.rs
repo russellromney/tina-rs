@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use tina::{
-    Address, Context, Effect, Isolate, Outbound, RestartBudget, RestartPolicy,
-    RestartableChildDefinition, Shard, ShardId,
+    Address, Context, DeferredReply, Effect, Isolate, Outbound, RestartBudget, RestartPolicy,
+    RestartableChildDefinition, Shard, ShardId, noop, reply, stop,
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
@@ -442,7 +442,9 @@ enum WorkerRequest {
 }
 
 #[derive(Debug)]
-struct ReplyWorker;
+struct ReplyWorker {
+    held: Option<DeferredReply<WorkerReply>>,
+}
 
 impl Isolate for ReplyWorker {
     type Message = WorkerRequest;
@@ -455,12 +457,19 @@ impl Isolate for ReplyWorker {
     fn handle(
         &mut self,
         msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerRequest::ReplyNow => Effect::Reply(WorkerReply("pong")),
-            WorkerRequest::DoNotReply => Effect::Noop,
-            WorkerRequest::Stop => Effect::Stop,
+            WorkerRequest::ReplyNow => reply(WorkerReply("pong")),
+            WorkerRequest::DoNotReply => {
+                // Hold the reply slot so the call stays pending until
+                // timeout. The abandoned-caller guard closes uncaptured
+                // callers immediately; keeping the slot alive is the
+                // legitimate way to defer a reply indefinitely.
+                self.held = Some(ctx.take_reply_slot().unwrap());
+                noop()
+            }
+            WorkerRequest::Stop => stop(),
         }
     }
 }
@@ -576,7 +585,7 @@ fn run_full_requester_mailbox_isolate_call_scenario()
 -> (Vec<CallOutcome<WorkerReply>>, tina_sim::ReplayArtifact) {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
-    let target = sim.register_with_mailbox_capacity(ReplyWorker, 8);
+    let target = sim.register_with_mailbox_capacity(ReplyWorker { held: None }, 8);
     let caller = sim.register_with_mailbox_capacity(
         CallerWorker {
             outcomes: Arc::clone(&outcomes),
@@ -705,7 +714,7 @@ fn run_stopped_requester_isolate_call_scenario()
 -> (Vec<CallOutcome<WorkerReply>>, tina_sim::ReplayArtifact) {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
-    let target = sim.register_with_mailbox_capacity(ReplyWorker, 8);
+    let target = sim.register_with_mailbox_capacity(ReplyWorker { held: None }, 8);
     let caller = sim.register_with_mailbox_capacity(
         CallerWorker {
             outcomes: Arc::clone(&outcomes),
@@ -731,7 +740,7 @@ fn run_isolate_call_scenario(
 ) -> (Vec<CallOutcome<WorkerReply>>, tina_sim::ReplayArtifact) {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(ConsumerShard, SimulatorConfig::default());
-    let target = sim.register_with_mailbox_capacity(ReplyWorker, target_capacity);
+    let target = sim.register_with_mailbox_capacity(ReplyWorker { held: None }, target_capacity);
     let caller = sim.register_with_mailbox_capacity(
         CallerWorker {
             outcomes: Arc::clone(&outcomes),
