@@ -103,6 +103,43 @@ impl ShardPlacementReport {
     }
 }
 
+/// One shard's batch after [`ShardPlacement::group_by_owner_bytes`].
+///
+/// `items` preserves the input order of the items that mapped to this
+/// shard, because the grouping append uses `Vec::push` in input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardBatch<T> {
+    /// The owner shard.
+    pub shard: ShardId,
+    /// Items whose key maps to this shard, in input order.
+    pub items: Vec<T>,
+}
+
+/// Errors from [`ShardPlacement::group_by_owner_bytes`] and
+/// [`ShardPlacement::group_by_owner_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupByOwnerError {
+    /// The input contained more items than the caller-supplied cap.
+    CapExceeded {
+        /// Number of items provided.
+        provided: usize,
+        /// Cap that was exceeded.
+        max: usize,
+    },
+}
+
+impl fmt::Display for GroupByOwnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapExceeded { provided, max } => {
+                write!(f, "group-by-owner cap exceeded: {provided} > {max}")
+            }
+        }
+    }
+}
+
+impl Error for GroupByOwnerError {}
+
 /// Deterministic key-to-shard map over an explicit ordered shard list.
 ///
 /// Placement is visible: the shard list, hash scheme, and version are part of
@@ -218,6 +255,62 @@ impl ShardPlacement {
             version: ShardHashScheme::VERSION,
             shards: self.shards.clone(),
         }
+    }
+
+    /// Groups `items` by owner shard using byte keys, returning batches
+    /// in `self.shards()` order.
+    ///
+    /// `key_fn` extracts the canonical key bytes for each item. `max_items`
+    /// bounds the total input count; exceeding it returns
+    /// [`GroupByOwnerError::CapExceeded`]. Additional grouping storage is
+    /// `O(max_items + shards.len())`.
+    ///
+    /// Empty input is fine: returns an empty `Vec`.
+    ///
+    /// There is no hidden retry, no hidden queue, and no `Hash` trait
+    /// involvement — the mapping uses the same `owner_for_bytes` path
+    /// live and simulated runtimes share.
+    pub fn group_by_owner_bytes<T>(
+        &self,
+        items: Vec<T>,
+        mut key_fn: impl FnMut(&T) -> &[u8],
+        max_items: usize,
+    ) -> Result<Vec<ShardBatch<T>>, GroupByOwnerError> {
+        if items.len() > max_items {
+            return Err(GroupByOwnerError::CapExceeded {
+                provided: items.len(),
+                max: max_items,
+            });
+        }
+        let mut map: BTreeMap<ShardId, Vec<T>> = BTreeMap::new();
+        for item in items {
+            let owner = self.owner_for_bytes(key_fn(&item));
+            map.entry(owner).or_default().push(item);
+        }
+        let mut result = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            if let Some(items) = map.remove(shard) {
+                result.push(ShardBatch {
+                    shard: *shard,
+                    items,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    /// Groups `items` by owner shard using string keys, returning batches
+    /// in `self.shards()` order.
+    ///
+    /// Convenience wrapper over [`Self::group_by_owner_bytes`] that calls
+    /// `key_fn` and converts the returned `&str` to bytes via `as_bytes()`.
+    pub fn group_by_owner_str<T>(
+        &self,
+        items: Vec<T>,
+        mut key_fn: impl FnMut(&T) -> &str,
+        max_items: usize,
+    ) -> Result<Vec<ShardBatch<T>>, GroupByOwnerError> {
+        self.group_by_owner_bytes(items, |t| key_fn(t).as_bytes(), max_items)
     }
 }
 
