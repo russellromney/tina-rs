@@ -4,8 +4,10 @@
 
 - Done: plan created after 067 pools, 072 deadlines, 073 HTTP pool,
   075 SQLx bridge, and 076 server keepalive landed.
-- In progress: none.
-- Open: build DB pool consumers.
+- In progress: PR #55 open; addressing review feedback (caller-supplied
+  capacity hole fixed for both bridges, plan status cleaned up).
+- Closed: audit, decision, material implementation, verification, commit,
+  PR opened.
 - Deferred: generic multi-shard pools, ORM/schema tooling, connection
   leak timers, and automatic retry.
 
@@ -78,21 +80,25 @@ Do not build before this audit.
 
 ## Rock 1 — Pick First Consumer Shape
 
-Prefer Postgres first if SQLx pool semantics make the win obvious:
+**Decision:**
 
-- SQLx already owns N DB connections;
-- Tina should bound admitted query work above that pool;
-- pool `Full` / `Timeout` must remain distinct from
-  `PgError::PoolAcquireTimeout`, `PgError::Timeout`, and SQL errors.
+- **Postgres:** `PgWorker` with `max_in_flight=N` already acts as the pool.
+  Do not wrap it. SQLx owns the connection pool; Tina's bridge bounds
+  admitted query work above it. The four pressure facts are already
+  distinct: `PgError::Full` (bridge admission), `PgError::PoolAcquireTimeout`
+  (SQLx pool), `PgError::Timeout` (bridge per-attempt deadline), and
+  `PgError::Sqlx` (SQL error). A wrapper would add runtime cost without
+  new semantics.
 
-SQLite first form may stay serial:
+- **SQLite:** Keep serial. `max_in_flight=1` is the pool. One
+  `rusqlite::Connection` is honest and simple. N SQLite connections
+  introduce WAL/busy semantics that distract from the pool lesson.
 
-- one `rusqlite::Connection` is honest and simple;
-- N SQLite connections can create WAL/busy semantics that distract from
-  the pool lesson;
-- only pool SQLite if a specimen proves serial hurts.
-
-Decision must be written in this plan before code.
+**Material improvement:** Add `PgPressureReport` and `SqlitePressureReport`
+helpers that map bridge metrics into pool vocabulary, making the
+bridge-as-pool shape obvious to callers and copyable by LLMs. Update docs
+and specimens with the mapping table. Add tests proving the distinct
+outcomes.
 
 ## Rock 2 — Postgres Pool Consumer
 

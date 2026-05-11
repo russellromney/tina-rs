@@ -82,8 +82,30 @@
 //! `mailbox_capacity` smooths ingress before the worker isolate
 //! observes messages; it is **not** an admission queue. Once one DB
 //! op is in flight, any later Send the worker observes returns
-//! [`SqliteError::Full`]. A pooled form would change that — first
-//! form is intentionally serial.
+//! [`SqliteError::Full`].
+//!
+//! # Bridge as pool
+//!
+//! `SqliteWorker` with `max_in_flight = 1` is the pool: one
+//! connection, one lane, serial admission. Both `external_pool_size`
+//! and `max_in_flight` are pinned to `1`. A pooled form would lift
+//! these pins and document per-connection isolation rules.
+//!
+//! To observe the pool shape, use [`SqliteMetricsHandle::pressure_report`]:
+//!
+//! ```ignore
+//! let report = bridge.metrics.pressure_report();
+//! // report.capacity   == config.max_in_flight (always 1)
+//! // report.leased     == 0 or 1
+//! // report.available  == 1 or 0
+//! // report.full_count == cumulative SqliteError::Full
+//! // report.busy_count == cumulative SQLITE_BUSY
+//! // report.high_water == peak in-flight observed (always 0 or 1)
+//! ```
+//!
+//! `waiters` is always `0` because the bridge does not queue callers;
+//! it replies [`SqliteError::Full`] immediately. SQL errors (including
+//! [`SqliteError::Busy`]) do **not** retire the lane.
 //!
 //! # Cancellation rule
 //!
@@ -128,7 +150,7 @@ pub use helpers::{
     SqliteFatalReason, SqliteOutcomeClass, SqliteOutcomeExt, SqliteResult, SqliteRows,
     SqliteRowsOutcome, SqliteTransientReason, execute_call, query_call, send_request,
 };
-pub use metrics::{SqliteMetrics, SqliteMetricsHandle};
+pub use metrics::{SqliteMetrics, SqliteMetricsHandle, SqlitePressureReport};
 pub use types::{
     InstallError, SqliteConfig, SqliteConfigError, SqliteError, SqlitePath, SqliteRequest,
     SqliteResponse, SqliteValue, U64TooLarge,

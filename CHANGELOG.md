@@ -6,6 +6,14 @@ This file records completed work.
 
 ### SQLx/Postgres bridge
 
+- Added `PgPressureReport` and `PgMetricsHandle::pressure_report` so
+  callers can observe the bridge as a pool: `capacity`, `leased`,
+  `available`, `waiters`, `full_count`, `timeout_count`, `high_water`.
+- Added admission tests proving distinct outcomes at each boundary:
+  `PgError::Full` (Tina admission), `PgError::PoolAcquireTimeout`
+  (SQLx pool pressure), `PgError::Timeout` (bridge deadline), and
+  SQL errors (lane stays held until completion).
+
 Added `tina-sqlx-bridge`, a bounded Postgres bridge around
 `sqlx::PgPool`. The bridge owns the Tokio/SQLx side; Tina callers see
 typed `Full`, `Closed`, per-attempt timeout, pool-acquire timeout,
@@ -45,6 +53,12 @@ Rust value conversions without silent `u64` wrapping, and a classifier
 for caller-owned retry. `specimen_sqlite_counter` now uses the bridge
 and the host `call_blocking` path; demo modes cover constraint,
 timeout, closed, invalid, and retry surfaces.
+
+- Added `SqlitePressureReport` and `SqliteMetricsHandle::pressure_report`
+  so callers can observe the bridge as a pool: `capacity`, `leased`,
+  `available`, `waiters`, `full_count`, `busy_count`, `high_water`.
+- Added admission test proving the serial pool shape:
+  `pressure_report_reflects_serial_pool_shape`.
 
 ### HTTP body streaming and backpressure
 

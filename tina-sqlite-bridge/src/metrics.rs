@@ -106,16 +106,86 @@ impl MetricsInner {
     }
 }
 
+/// Pressure report in pool vocabulary.
+///
+/// `SqliteWorker` with `max_in_flight = 1` is the pool: one
+/// connection, one lane, serial admission. This report maps bridge
+/// metrics into the same vocabulary as
+/// [`tina::pool::PoolPressureReport`] so the serial shape is
+/// copyable and comparable.
+///
+/// `waiters` is always `0` because the bridge does not queue
+/// callers — it replies `SqliteError::Full` immediately when
+/// `max_in_flight` is saturated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SqlitePressureReport {
+    /// Configured `max_in_flight` — pinned to `1` in first form.
+    pub capacity: usize,
+    /// Slots currently free (`capacity - leased`).
+    pub available: usize,
+    /// Operations currently in flight (`0` or `1`).
+    pub leased: usize,
+    /// Callers parked waiting for a slot. Always `0`.
+    pub waiters: usize,
+    /// Max waiters. Always `0`.
+    pub max_waiters: usize,
+    /// Cumulative `SqliteError::Full` outcomes.
+    pub full_count: u64,
+    /// Cumulative `SqliteError::Closed` outcomes.
+    pub closed_count: u64,
+    /// Cumulative bridge per-attempt timeouts (`SqliteError::Timeout`).
+    pub timeout_count: u64,
+    /// Cumulative SQLite `SQLITE_BUSY` / `SQLITE_LOCKED`.
+    pub busy_count: u64,
+    /// Cumulative constraint violations.
+    pub constraint_count: u64,
+    /// Cumulative late results — worker terminal after bridge timeout.
+    pub late_result_count: u64,
+    /// Highest in-flight count ever observed (`0` or `1`).
+    pub high_water: u64,
+}
+
+impl SqlitePressureReport {
+    /// `true` when the single slot is in use.
+    pub fn is_full(&self) -> bool {
+        self.leased >= self.capacity
+    }
+}
+
 /// Cloneable handle for inspecting bridge metrics from outside the
 /// hosting Tina runtime.
 #[derive(Debug, Clone)]
 pub struct SqliteMetricsHandle {
     pub(crate) inner: Arc<MetricsInner>,
+    pub(crate) capacity: usize,
 }
 
 impl SqliteMetricsHandle {
     /// Returns a fresh snapshot of counter values.
     pub fn snapshot(&self) -> SqliteMetrics {
         self.inner.snapshot()
+    }
+
+    /// Returns a pressure report mapped into pool vocabulary.
+    ///
+    /// `capacity` is the `max_in_flight` value captured at install time.
+    pub fn pressure_report(&self) -> SqlitePressureReport {
+        let m = self.inner.snapshot();
+        let capacity = self.capacity;
+        let leased = m.current_in_flight.min(capacity as u64) as usize;
+        SqlitePressureReport {
+            capacity,
+            available: capacity.saturating_sub(leased),
+            leased,
+            waiters: 0,
+            max_waiters: 0,
+            full_count: m.full,
+            closed_count: m.closed,
+            timeout_count: m.timeouts,
+            busy_count: m.worker_busy,
+            constraint_count: m.worker_constraint,
+            late_result_count: m.late_results,
+            high_water: m.in_flight_high_water,
+        }
     }
 }

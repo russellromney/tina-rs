@@ -168,6 +168,28 @@
 //! pressure are different bottlenecks; the bridge surfaces them
 //! separately.
 //!
+//! # Bridge as pool
+//!
+//! `PgWorker` with `max_in_flight = N` already acts as the pool.
+//! SQLx owns the connections; the bridge bounds admitted query work
+//! above that pool. There is no extra wrapper needed.
+//!
+//! To observe the pool shape, use [`PgMetricsHandle::pressure_report`]:
+//!
+//! ```ignore
+//! let report = bridge.metrics.pressure_report();
+//! // report.capacity      == config.max_in_flight
+//! // report.leased        == current in-flight count
+//! // report.available     == free slots
+//! // report.full_count    == cumulative PgError::Full
+//! // report.timeout_count == bridge deadlines fired
+//! // report.high_water    == peak in-flight observed
+//! ```
+//!
+//! `waiters` is always `0` because the bridge does not queue callers;
+//! it replies [`PgError::Full`] immediately. SQL errors (including
+//! [`PgError::PoolAcquireTimeout`]) do **not** retire the lane.
+//!
 //! # Cancellation rule
 //!
 //! Same as every Tina bridge: the bridge does not lie about the
@@ -276,7 +298,7 @@ pub use helpers::{
     PgRows, PgTransactionCallOutcome, PgTransientReason, TransactionCall, execute_call,
     fetch_many_call, fetch_one_call, send_request, transaction_call,
 };
-pub use metrics::{PgMetrics, PgMetricsHandle};
+pub use metrics::{PgMetrics, PgMetricsHandle, PgPressureReport};
 pub use types::{
     InstallError, PgCancelConfig, PgConfig, PgConfigError, PgError, PgPoolConfig, PgRequest,
     PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome, PgType, PgValue, U64TooLarge,

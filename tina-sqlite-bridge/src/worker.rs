@@ -264,6 +264,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
 
         let metrics_handle = SqliteMetricsHandle {
             inner: Arc::clone(&metrics_inner),
+            capacity: config.max_in_flight,
         };
 
         let worker = Self {
