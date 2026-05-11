@@ -2,27 +2,18 @@
 
 ## Status
 
-- Done: plan created after 072 `PendingCallSet`, 079 cancellation round
-  2, and the 084 child-lifecycle plan. 081 request context should land
-  first. 084 should land first if this phase races/joins child work.
-- In progress: none.
-- Open: implement bounded explicit race/join helpers and update one or
-  two specimens.
+- Done: plan + review.
+- Open: bounded named call group, first-success race, one specimen.
+- Maybe: join-all partial report if PR 1 stays small.
 - Deferred: macros, fake `select!`, hidden retry, stream select,
-  arbitrary policy framework, heterogeneous-reply race helpers.
+  policy framework, heterogeneous reply groups.
 
 ## Goal
 
-Give Tina an honest equivalent for the useful parts of:
+Tina needs honest `select!` / `join!` / `JoinSet` shapes.
 
-```text
-select!
-join!
-JoinSet
-```
-
-Not syntax cosplay. The Tina version should keep names, caps, deadlines,
-cancel outcomes, and partial results visible.
+Not syntax cosplay. Keep names, caps, deadlines, cancels, and partial
+results visible.
 
 Grug truth:
 
@@ -30,126 +21,108 @@ Grug truth:
 many waits.
 each wait has name.
 set has cap.
-first wins only if policy says first wins.
-losers cancel only if policy says cancel.
-partial result is still result.
+winner policy explicit.
+loser cancel explicit.
+partial is still truth.
 ```
 
 ## Non-Goals
 
 - No macro first form.
 - No hidden retry.
-- No hidden branch cancellation.
-- No unbounded result collection.
-- No anonymous branch outcomes.
-- No first-form heterogeneous reply set. Calls in one group share `R`;
-  wrap outcomes in a user enum when branches differ.
-- No pipeline sugar. A stage state machine is still the truth for
-  ordered pipelines.
+- No hidden loser cancel.
+- No unbounded result Vec.
+- No anonymous branch outcome.
+- No heterogeneous reply set; use a user enum.
+- No pipeline sugar.
 
 ## Shape
 
-Two PRs max:
+Two PRs max.
 
 1. `CallGroup<K, R>` + first-success race + one specimen.
-2. join-all/partial-deadline report + `RequestContext`/child integration
-   if the first PR stays small.
+2. Join-all / partial-deadline report + `RequestContext` / child-ref
+   integration if still small.
 
-If PR 1 already exposes a bad abstraction, stop and document the copied
-manual pattern instead of forcing PR 2.
+If PR 1 smells wrong, stop and document the manual pattern.
 
-## Rock 0 — Read Current Shapes
+## Rock 0 — Read First
 
-Read before code:
-
-- `tina::PendingCallSet`;
+- `PendingCallSet`;
 - `cancel_call`;
 - `Deadline`;
 - 081 `RequestContext` if landed;
 - `specimen_cancellation_chain`;
 - `specimen_pool_cancel_reclaim`;
-- `specimen_two_stage_pipeline` only as a "do not hide stage truth"
-  warning;
-- system specimen plans for `system_cache_with_fill`,
-  `system_job_queue`, `system_checkout_saga`, and `system_rpc_gateway`.
+- `specimen_two_stage_pipeline` as warning: do not hide stages.
 
-## Rock 1 — Name The Data Shape
+## Rock 1 — CallGroup
 
-Prefer a small state helper over a policy framework.
-
-Candidate:
+Prefer one small state helper:
 
 ```rust
 pub struct CallGroup<K, R> {
     pending: PendingCallSet<K, R>,
-    outcomes: Vec<NamedOutcome<K, R>>,
+    outcomes: capped storage,
 }
 ```
 
-Maybe split into `RaceGroup` and `JoinGroup` only if the single type
-gets fuzzy.
-
 Rules:
 
-- API home starts in `tina` only if it is runtime-agnostic over
-  `CallHandle` / `PendingCallSet`; runtime-specific call builders stay
-  in `tina-runtime`;
 - fixed capacity;
-- key type is user-owned and visible in outcomes;
-- stores `CallHandle<R>` for cancellation;
-- records outcomes by key;
-- outcome storage is capped by group capacity; no uncapped `Vec` growth;
+- one reply type `R`;
+- key names every branch;
+- stores `CallHandle<R>`;
+- outcome storage capped by group capacity;
+- duplicate key is typed error;
 - no background sweep;
-- caller removes keys explicitly on continuations;
-- capacity report if the underlying `PendingCallSet` exposes enough.
+- user removes on continuations.
+
+API home starts in `tina` only if runtime-agnostic. Runtime call-builder
+sugar stays in `tina-runtime`.
 
 ## Rock 2 — First-Success Race
 
-Ship one race helper:
+Ship one race:
 
 ```text
 start N calls
 first successful reply wins
-cancel remaining losers visibly
-return named result after loser-cancel outcomes settle
+cancel losers
+wait for loser cancel outcomes
+return named report
 ```
 
-Required output shape:
+Report must include:
 
-```rust
-RaceReport<K, R> {
-    winner: Option<(K, R)>,
-    failures: Vec<(K, CallOutcome<R>)>,
-    cancelled: Vec<(K, CancelOutcome)>,
-    timed_out: bool,
-}
-```
-
-The exact fields can change, but the facts cannot disappear.
+- winner key + reply;
+- failed branch outcomes;
+- loser cancel outcomes;
+- timeout / no winner.
 
 Rules:
 
-- caller chooses which outcomes count as success with an explicit
-  predicate/classifier;
-- loser cancellation is explicit in returned effects/messages;
-- first form replies after cancellation outcomes for losers are known.
-  If a caller wants "reply winner immediately, cancel losers in the
-  background," that is a different helper and must say its report is
-  incomplete at reply time;
-- late loser replies become trace facts;
-- branch key is in every report row.
+- caller supplies success classifier;
+- losers cancelled visibly;
+- report waits for cancel outcomes;
+- late loser replies are trace facts;
+- every row has branch key.
 
-## Rock 3 — Join-All With Partial Report
+No "reply winner now, cancel later" first form.
 
-Ship one join helper:
+## Rock 3 — Join-All
+
+Ship only if PR 1 stays simple.
+
+Join:
 
 ```text
 start N calls
-collect every terminal outcome until all done or deadline
-return partial report
+collect terminal outcomes
+deadline may produce partial report
 ```
 
-Required facts:
+Report facts:
 
 - replied;
 - full;
@@ -158,78 +131,67 @@ Required facts:
 - cancelled;
 - still pending at aggregate deadline.
 
-Use `Deadline`, not fresh relative duration arithmetic at every branch.
+Use `Deadline`.
 
-## Rock 4 — RequestContext Integration
+## Rock 4 — RequestContext
 
-If 081 has landed, show the normal service shape:
+If 081 landed, prove:
 
 ```text
-capture RequestContext
+take RequestContext
 start race/join
-store group in state
-reply_to_request when policy resolves
+store group
+reply_to_request once
+owner stop cancels/drains group
 ```
 
-If 081 is not landed, block this rock or use the raw
-`DeferredReply` shape with a TODO pointing at 081. Do not invent a
-second request-context type.
+If 081 has not landed, do not invent a second request context.
 
-## Rock 5 — Child Work Integration
+## Rock 5 — Child Work
 
-If 084 has landed, prove a child-work shape:
+If 084 landed:
 
 - spawn N children with `spawn_observed`;
-- start N child calls;
-- join/race their replies;
-- stop/cancel losers or children according to policy;
-- no trace spelunking to discover addresses.
+- call children;
+- race/join replies;
+- cancel/stop losers by policy;
+- no trace spelunking.
 
-If 084 is not landed, keep this as docs/finding only.
+If 084 has not landed, leave this as docs/finding.
 
-## Rock 6 — Specimens
+## Specimens
 
-Update one or two high-signal specimens, not all of them.
+Pick one or two:
 
-Best candidates:
+- `specimen_cancellation_chain`;
+- `specimen_dynamic_worker_pool` if 084 landed;
+- `system_cache_with_fill` if systems work started;
+- `system_checkout_saga` if systems work started.
 
-- `specimen_cancellation_chain` — race/cancel losers;
-- `specimen_dynamic_worker_pool` — join child work if 084 landed;
-- `system_cache_with_fill` — single-flight waiters if systems work has
-  started;
-- `system_checkout_saga` — join/race branch work if systems work has
-  started.
+Do not update ordered pipelines unless stage truth stays visible.
 
-Do not update ordered pipelines unless the helper preserves named stage
-truth. Long pipeline code is acceptable.
+## Proof
 
-## Required Proof
+PR 1:
 
-PR 1 proof:
-
-- fill group to capacity, reject one more with typed `Full`;
-- first-success race cancels losers and records each cancel outcome;
-- late loser reply is rejected visibly in trace;
-- first-success report is not delivered until loser-cancel outcomes are
-  recorded;
-- duplicate key is typed error, not overwrite;
+- fill group, next insert returns `Full`;
+- duplicate key is typed error;
+- first-success cancels losers;
+- report waits for cancel outcomes;
+- late loser reply is traced/rejected;
 - fill -> cancel/complete -> refill works;
-- no helper hides retry or idempotency policy.
+- no hidden retry/idempotency.
 
-PR 2 proof, only if join-all lands:
+PR 2, only if shipped:
 
-- join-all returns all replies when all finish;
-- join-all returns partial report at deadline;
-- simulator proof for at least one race or join scenario;
-- `RequestContext` integration replies exactly once and drops/cancels
-  owned handles on owner stop.
+- join-all returns all replies;
+- deadline returns partial report;
+- sim proves one race/join scenario;
+- `RequestContext` replies once and drains on owner stop.
 
-## Done Means
+## Done
 
-- Tina has a copied pattern for `select!`/`join!`-shaped workflows that
-  keeps branch names and pressure visible;
-- users no longer hand-roll the same bounded map/report/cancel loop in
-  every race/join workflow;
-- docs say when not to use it: ordered pipelines and simple single calls
-  stay as ordinary message variants;
-- at least one real specimen gets smaller without losing semantic truth.
+- copied pattern for race/join workflows exists;
+- branch names and pressure stay visible;
+- at least one specimen gets smaller;
+- docs say when not to use it.

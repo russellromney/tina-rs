@@ -2,82 +2,63 @@
 
 ## Status
 
-- Done: plan created after 070 sharded ergonomics and 079 cancellation
-  round 2 landed. 081 multi-turn request context is in progress and
-  should land first if this phase needs request-shaped examples.
-- In progress: none.
-- Open: implement child-start observation inside the isolate model,
-  typed child refs, join/stop helpers, and specimen upgrades.
+- Done: plan + review.
+- Open: child refs, `spawn_observed`, specimen/docs cleanup.
+- Maybe: child join/stop/restart polish if the shape is obvious.
 - Deferred: cross-shard child ownership, distributed supervision,
-  full Erlang/OTP strategy matrix, timed restart-budget windows.
+  supervisor strategy matrix, timed restart windows.
 
 ## Goal
 
-Make parent/child ownership boring.
+Parent spawns child. Parent gets typed child address. Parent can use it.
 
-Current Tina can spawn and supervise children, and the host can observe
-supervised restarts. But a parent that spawns a child does not get the
-fresh typed child address as normal message data. Real services want to:
-
-```text
-spawn child
-get child's typed address
-send follow-up work
-observe child stopped/result
-replace child after restart
-stop children when owner stops
-```
+Today `spawn(...)` creates a child but does not hand the parent a typed
+address as message data. Users work around this with Boot messages and
+trace spelunking.
 
 Grug truth:
 
 ```text
 parent owns child.
-spawn creates address.
+spawn makes address.
 parent should see address.
-child stop is a fact.
-restart gives new generation.
-old address becomes stale.
+restart makes new generation.
+old address stale.
 ```
 
 ## Non-Goals
 
-- No host-side `observe_child_started::<M>()` unless spawn events carry
-  enough type truth. Caller-guessed address types are not OK.
+- No host `observe_child_started::<M>()` until spawn events carry type
+  truth.
+- No caller-guessed child address types.
 - No broad supervision rewrite.
-- No ambient child registry with hidden refresh.
 - No global kill-all.
-- No cross-shard child ownership in first form.
-- No restart strategy expansion unless required by the new address/result
-  surface.
-- No macro syntax.
+- No cross-shard child ownership.
+- No macro.
 
 ## Shape
 
-Two PRs max:
+Two PRs max.
 
-1. `ChildRef` + `spawn_observed` + specimen/docs updates. This is the
-   load-bearing user win.
-2. Child stop/join/restart polish only where PR 1 or existing specimens
-   prove the exact shape. If this gets fuzzy, stop after PR 1 and leave
-   the follow-up recorded.
+1. `ChildRef` + `spawn_observed` + docs/specimen proof.
+2. Join/stop/restart polish only if PR 1 proves the exact shape.
 
-## Rock 0 — Re-read Existing Truth
+If PR 2 gets fuzzy, stop. Record the follow-up.
 
-Read before code:
+## Rock 0 — Read First
 
-- `examples/FINDINGS.md` finding 14;
-- `.intent/phases/064-service-bootstrap-and-fanout-ergonomics/design-rock-2-initial-child-spawn-observation.md`;
-- `examples/specimen_supervised_worker`;
-- `examples/specimen_dynamic_worker_pool`;
-- current `observe_child_restarted` implementation/tests.
+- `examples/FINDINGS.md` finding 14.
+- `064 .../design-rock-2-initial-child-spawn-observation.md`.
+- `specimen_supervised_worker`.
+- `specimen_dynamic_worker_pool`.
+- current `observe_child_restarted` tests.
 
 Decision: first form is `spawn_observed`, not host
-`observe_child_started`. The typed address stays inside the isolate
-model.
+`observe_child_started`.
 
-## Rock 1 — Typed ChildRef
+## Rock 1 — ChildRef
 
-Add a tiny typed value:
+Add:
 
 ```rust
 pub struct ChildRef<M, R = ()> {
@@ -86,28 +67,23 @@ pub struct ChildRef<M, R = ()> {
 }
 ```
 
-Maybe include parent id if it is already cheap and true. Do not add
-fields just because they are interesting.
-
 Rules:
 
-- API home is the `tina` trait crate if the value is part of the
-  effect surface; runtime-only waiters stay in `tina-runtime`;
+- lives in `tina` if it is part of `Effect` surface;
 - typed by child message/reply;
-- copy/clone if `Address` shape allows it;
-- generation is visible;
-- no hidden liveness claim.
+- generation visible;
+- no liveness promise.
 
 ## Rock 2 — spawn_observed
 
-Add a new effect helper:
+Add:
 
 ```rust
 spawn_observed(ChildDefinition::new(child, cap))
     .reply(ParentMsg::ChildStarted)
 ```
 
-The continuation receives a typed outcome:
+Continuation gets:
 
 ```rust
 Result<ChildRef<ChildMsg, ChildReply>, SpawnObservedError>
@@ -115,116 +91,90 @@ Result<ChildRef<ChildMsg, ChildReply>, SpawnObservedError>
 
 Rules:
 
-- same runtime spawn semantics as `spawn`;
-- no child runs before the spawn effect is committed;
-- parent receives the typed child address as an ordinary later message;
-- if spawn fails or parent stops before delivery, outcome is typed and
-  trace-visible;
-- no hidden queue beyond existing child/message mailboxes.
-- type honesty comes from the typed child definition at the spawn site,
-  not from a host turbofish guessed after the fact.
+- same spawn semantics as `spawn`;
+- old `spawn(...)` unchanged;
+- child address type comes from the child definition at spawn site;
+- parent receives result as ordinary later message;
+- spawn failure / parent stopped before delivery is typed and traced;
+- no hidden queue beyond existing mailboxes.
 
-If implementing this as `Effect::SpawnObserved` is cleaner than
-bolting it onto `Effect::Spawn`, do that. Keep old `spawn(...)`.
+Use `Effect::SpawnObserved` if that is the clean shape.
 
-## Rock 3 — Join / Stop Specific Child
+## Rock 3 — Join / Stop Child
 
-Design and implement only if the shape is already obvious after Rock 2.
-Otherwise record the shape and defer.
+Only ship if obvious after Rock 2.
 
-Candidate shape:
+Candidate:
 
 ```rust
 observe_child_complete(child_ref).reply(ParentMsg::ChildDone)
 stop_child(child_ref).reply(ParentMsg::ChildStopped)
 ```
 
-Returned facts should distinguish:
+Must distinguish:
 
-- stopped normally;
+- stopped;
 - stopped with typed result;
-- panicked/stopped by supervisor if already represented;
-- wrong generation / stale address;
+- stale generation;
 - already stopped;
-- parent does not own this child.
+- not this parent's child.
 
-Do not overbuild. If result join already composes cleanly from
-`observe_result::<T>(child.address)` plus `observe_isolate_complete`,
-ship docs/helper only where repetition proves it.
+If existing `observe_result` + `observe_isolate_complete` is enough,
+document that and defer helper.
 
-## Rock 4 — Restart Replacement Address
+## Rock 4 — Restart Address
 
-Today `observe_child_restarted(parent)` exists. Make the replacement
-address easy to use from the parent/host story:
+`observe_child_restarted(parent)` exists. Make refresh easy:
 
-- restarted child carries generation;
-- parent can refresh its stored `ChildRef`;
-- stale old address gives `Closed`/typed stale outcome, not silent
-  delivery;
-- docs show "old child ref out, new child ref in".
+- new generation visible;
+- parent can replace stored `ChildRef`;
+- old ref is stale/closed visibly;
+- no type-guessing waiter unless event carries type truth.
 
-If the restart event needs child type identity to be honest, keep the
-host typed waiter deferred and make `spawn_observed` the shipped win.
+## Rock 5 — Parent Stop
 
-## Rock 5 — Owner Stop Cleanup
+Prove or document:
 
-Prove what happens when parent stops:
+- direct children stop, or they do not;
+- child waiters settle;
+- waiter/result capacity is reclaimed;
+- no hidden orphan claim.
 
-- direct children stop predictably, or docs say they are not stopped;
-- pending child joins/observations settle visibly;
-- no child result waiter leaks capacity;
-- no hidden orphan child continues unless that is the explicit policy.
+Do not claim tree shutdown unless runtime does tree shutdown.
 
-If current runtime behavior is weaker than desired, either fix it here
-or narrow the public claim loudly. Do not imply tree shutdown if the
-runtime only stops one isolate.
+## Specimens / Docs
 
-## Rock 6 — Specimens / Docs
-
-Update at least:
+Update:
 
 - `specimen_supervised_worker`;
-- `specimen_dynamic_worker_pool`;
-- user-guide supervision page;
-- `examples/FINDINGS.md` finding 14.
+- `specimen_dynamic_worker_pool` if it fits PR scope;
+- supervision guide;
+- finding 14.
 
-Remove Boot/self-address workarounds where `spawn_observed` makes them
-unnecessary. Leave a note where a workaround remains because the helper
-does not cover that shape.
+Remove Boot/self-address workaround where `spawn_observed` replaces it.
 
-System specimens that should use this once it lands:
+## Proof
 
-- `system_job_queue`;
-- `system_realtime_rooms`;
-- `system_media_ingest_pipeline` if process workers are child isolates.
+PR 1:
 
-## Required Proof
+- parent gets `ChildRef` as message;
+- parent sends follow-up to child;
+- spawn failure / abandoned parent path is typed and traced;
+- sim mirrors live, or records explicit follow-up;
+- old `spawn` still works.
 
-PR 1 proof:
-
-- parent spawns child and receives typed `ChildRef` via ordinary message;
-- parent sends a follow-up message to that child using the ref;
-- spawn failure / parent stopped before continuation is typed and
-  trace-visible, or the plan explains why current spawn has no such
-  failure path;
-- simulator mirrors `spawn_observed`, or the PR explicitly defers sim
-  with a follow-up finding;
-- old `spawn(...)` behavior remains unchanged.
-
-PR 2 proof, only if Rock 3/4/5 land:
+PR 2, only if shipped:
 
 - parent observes child stop/result;
-- stale generation does not deliver silently;
-- supervised restart produces a new generation and docs/test show refresh;
-- parent stop settles child lifecycle truth;
-- waiter/result capacity is reclaimed after child stop, parent stop, and
-  waiter timeout.
+- stale generation does not silently deliver;
+- restart gives new generation;
+- parent stop settles child truth;
+- waiter capacity is reclaimed.
 
-## Done Means
+## Done
 
-- parent no longer needs a child `Boot { self_addr }` message just to
-  learn the child's address in the common case;
-- child refs are typed, generation-aware, and trace-honest;
-- at least one existing specimen gets simpler; two if Rock 3/4 land;
+- common child-address Boot pattern is gone;
+- child refs are typed and generation-aware;
+- at least one specimen gets simpler;
 - docs teach spawn -> child ref -> follow-up -> join/stop;
-- no host-side typed child-start waiter ships unless it is type-honest.
+- no host child-start waiter ships unless type-honest.
