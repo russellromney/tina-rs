@@ -4,6 +4,28 @@ This file records completed work.
 
 ## Unreleased
 
+### Response body source cancel (079 PR 1)
+
+`ResponseChunkMsg::Cancel` is a new typed variant sent to chunk sources
+when the HTTP connection abandons the wire mid-stream. Sources can
+release files, downstream calls, and pending slots. `IterBodySource`
+handles it with `stop()`.
+
+The connection isolate sends `Cancel` on every wire-death path:
+`Read(Err)`, `Wrote(Err)`, `handle_wrote(0)`,
+`handle_stream_chunk(Timeout|Full|Closed)`, peer EOF, and header
+deadline. It also defensively cancels in `begin_close()`. Duplicate
+cancels are harmless — the source either already stopped or drops the
+late message.
+
+`body_io_error_count` still increments on truncation; cancel is an
+additional typed signal, not a replacement for the metric. Integration
+tests prove both known-length and chunked paths.
+
+Added a cancellation truth table to
+`docs/tina-user-guide/14-lifecycle-and-shutdown.md` that names what
+cancel means on every surface Tina exposes.
+
 ### SQLx/Postgres bridge
 
 Added `tina-sqlx-bridge`, a bounded Postgres bridge around

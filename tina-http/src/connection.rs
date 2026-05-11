@@ -93,6 +93,11 @@ pub enum HttpConnectionMsg {
     Closed(Result<(), CallError>),
     /// Streaming response: chunk source's reply to a pulled `Next`.
     StreamChunk(CallOutcome<ResponseChunkReply>),
+    /// Streaming response: reply from the `Cancel` call sent to the
+    /// source when the wire is abandoned. The connection only
+    /// needed to fire the message; the reply (or timeout/closed)
+    /// is not actionable.
+    StreamSourceCancelDone(CallOutcome<ResponseChunkReply>),
     /// Streaming request: service asks the connection for the next
     /// chunk of the inbound body. Replies with [`RequestChunkReply`].
     RequestBodyNext,
@@ -344,7 +349,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 if self.parsed_head.is_some() {
                     self.record_body_io_error();
                 }
-                self.begin_close()
+                let cancel = self.cancel_stream_source();
+                let close = self.begin_close();
+                match cancel {
+                    Some(c) => batch(vec![c, close]),
+                    None => close,
+                }
             }
 
             HttpConnectionMsg::HeaderDeadline { generation, .. } => {
@@ -362,10 +372,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 if self.has_pending_body() {
                     self.record_body_io_error();
                 }
-                self.begin_close()
+                let cancel = self.cancel_stream_source();
+                let close = self.begin_close();
+                match cancel {
+                    Some(c) => batch(vec![c, close]),
+                    None => close,
+                }
             }
 
             HttpConnectionMsg::StreamChunk(outcome) => self.handle_stream_chunk(outcome),
+            HttpConnectionMsg::StreamSourceCancelDone(_) => noop(),
 
             HttpConnectionMsg::RequestBodyNext => self.handle_request_body_next(),
 
@@ -418,6 +434,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         self.head_len = 0;
         self.pending_response.clear();
         self.pending_buffered_body = None;
+        // In normal flow the source is already cleared by
+        // finish_stream_eof or handle_wrote. If it is still Some
+        // here, the source is leaked; this method cannot issue
+        // effects so we just drop the address.
         self.stream_source = None;
         self.stream_bytes_remaining = 0;
         self.stream_chunked = false;
@@ -451,7 +471,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 // Distinct from a clean post-body close.
                 self.record_body_io_error();
             }
-            return self.begin_close();
+            let cancel = self.cancel_stream_source();
+            let close = self.begin_close();
+            return match cancel {
+                Some(c) => batch(vec![c, close]),
+                None => close,
+            };
         }
 
         let pre_len = self.read_buf.len();
@@ -530,7 +555,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         // affordance — `tcp_cancel_read` or "close cancels pending
         // lanes" — would let us write the 408 first; tracked as a
         // 047/runtime ergonomics note.
-        stop()
+        let cancel = self.cancel_stream_source();
+        let stop_effect = stop();
+        match cancel {
+            Some(c) => batch(vec![c, stop_effect]),
+            None => stop_effect,
+        }
     }
 
     fn maybe_dispatch_or_read_more(&mut self) -> Effect<Self> {
@@ -826,7 +856,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             if self.has_pending_body() {
                 self.record_body_io_error();
             }
-            return self.begin_close();
+            let cancel = self.cancel_stream_source();
+            let close = self.begin_close();
+            return match cancel {
+                Some(c) => batch(vec![c, close]),
+                None => close,
+            };
         }
         // `pending_response` only ever contains head bytes (no
         // charge) or body bytes (charged). So whatever we just
@@ -954,9 +989,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 // see both why and what.
                 self.record_body_timeout();
                 self.record_body_io_error();
-                self.stream_source = None;
+                let cancel = self.cancel_stream_source();
                 self.stream_chunked = false;
-                self.begin_close()
+                let close = self.begin_close();
+                match cancel {
+                    Some(c) => batch(vec![c, close]),
+                    None => close,
+                }
             }
             CallOutcome::Full | CallOutcome::Closed => {
                 // Source died mid-stream. Close the wire — the
@@ -964,9 +1003,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 // framing. We do not try to inject an error
                 // response on top of an already-emitted head.
                 self.record_body_io_error();
-                self.stream_source = None;
+                let cancel = self.cancel_stream_source();
                 self.stream_chunked = false;
-                self.begin_close()
+                let close = self.begin_close();
+                match cancel {
+                    Some(c) => batch(vec![c, close]),
+                    None => close,
+                }
             }
         }
     }
@@ -1026,17 +1069,46 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
     }
 
+    /// Sends `Cancel` to the response body source if one is still
+    /// referenced, then clears the reference. Called before the
+    /// connection abandons the wire so the source can release files,
+    /// downstream calls, and pending slots. Duplicate cancels are
+    /// harmless — the source either already stopped or will drop the
+    /// message after it finishes draining.
+    fn cancel_stream_source(&mut self) -> Option<Effect<Self>> {
+        let source = self.stream_source.take()?;
+        Some(
+            call(
+                source,
+                crate::streaming::ResponseChunkMsg::Cancel,
+                // Short timeout: the message is queued immediately; we
+                // only need the reply slot to close quickly so the
+                // connection can stop without leaking the call.
+                Duration::from_millis(1),
+            )
+            .reply(HttpConnectionMsg::StreamSourceCancelDone),
+        )
+    }
+
     fn begin_close(&mut self) -> Effect<Self> {
         // Any body bytes still resident in this isolate are about to
         // be dropped; release them so the metrics' `current` returns
         // to zero on a clean shutdown sequence.
         self.release_request_all();
         self.release_response_all();
-        match self.transport {
+        // Defensive: if a stream source is still referenced, tell it
+        // to release state. Most callers already sent cancel on the
+        // specific error path; duplicating here is harmless.
+        let cancel = self.cancel_stream_source();
+        let close = match self.transport {
             HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpConnectionMsg::Closed),
             HttpTransport::Tls(stream) => {
                 tls_close(stream, self.tls_io_timeout).reply(HttpConnectionMsg::Closed)
             }
+        };
+        match cancel {
+            Some(c) => batch(vec![c, close]),
+            None => close,
         }
     }
 
