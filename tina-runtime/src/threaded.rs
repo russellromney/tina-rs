@@ -899,6 +899,42 @@ where
     /// Tina call path internally: `Full`, `Closed`, and `Timeout` stay visible
     /// as [`CallOutcome`] values, and accepted work is not cancelled by
     /// dropping the host-side wait.
+    ///
+    /// # When to use
+    ///
+    /// - **Tests and specimens** that need to drive one call and inspect the
+    ///   result.
+    /// - **Setup code** that registers a service and then sends an initial
+    ///   message before handing control to a larger system.
+    ///
+    /// **Do not call from inside an isolate handler.** Handlers must stay
+    /// synchronous and non-blocking; use `call(...).reply(...)` instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use tina::prelude::*;
+    /// use tina_runtime::{CallOutcome, ThreadedRuntime, ThreadedRuntimeConfig};
+    ///
+    /// # fn example<M, R>(runtime: &ThreadedRuntime<SingleShard, tina_runtime::DefaultThreadedMailboxFactory>, addr: Address<M, R>, msg: M)
+    /// # where M: Send + 'static, R: Send + 'static,
+    /// # {
+    /// let outcome = runtime.call_blocking(addr, msg, Duration::from_secs(2));
+    /// match outcome {
+    ///     Ok(CallOutcome::Replied(reply)) => { /* use reply */ }
+    ///     Ok(CallOutcome::Full) => { /* target mailbox was full */ }
+    ///     Ok(CallOutcome::Closed) => { /* target isolate had stopped */ }
+    ///     Ok(CallOutcome::Timeout) => { /* call deadline fired */ }
+    ///     Err(_) => { /* worker thread stopped or command queue was full */ }
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// The `timeout` argument is the *call* timeout (how long the target
+    /// isolate has to reply). The host-side wait uses the same timeout
+    /// value so the host thread does not block forever if the worker
+    /// stops mid-call.
     pub fn call_blocking<M, R>(
         &self,
         address: Address<M, R>,

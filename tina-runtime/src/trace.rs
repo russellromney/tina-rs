@@ -810,6 +810,32 @@ pub trait RuntimeTraceExt {
     fn any_completion_rejected(&self, call_kind: CallKind) -> bool {
         self.count_completion_rejected(call_kind) > 0
     }
+
+    /// Counts events whose kind satisfies `predicate`.
+    fn count_matching(&self, predicate: impl FnMut(RuntimeEventKind) -> bool) -> usize;
+
+    /// Returns true when any event's kind satisfies `predicate`.
+    fn any_matching(&self, predicate: impl FnMut(RuntimeEventKind) -> bool) -> bool {
+        self.count_matching(predicate) > 0
+    }
+
+    /// Counts `Spawned` events.
+    fn count_spawned(&self) -> usize;
+
+    /// Returns true when any isolate was spawned.
+    fn any_spawned(&self) -> bool {
+        self.count_spawned() > 0
+    }
+
+    /// Counts runtime-owned calls of `call_kind` that were dispatched to
+    /// the driver lane.
+    fn count_call_dispatched(&self, call_kind: CallKind) -> usize;
+
+    /// Returns true when any runtime-owned call of `call_kind` was
+    /// dispatched to the driver lane.
+    fn any_call_dispatched(&self, call_kind: CallKind) -> bool {
+        self.count_call_dispatched(call_kind) > 0
+    }
 }
 
 impl RuntimeTraceExt for [RuntimeEvent] {
@@ -870,6 +896,34 @@ impl RuntimeTraceExt for [RuntimeEvent] {
                 )
             })
             .count()
+    }
+
+    fn count_matching(&self, mut predicate: impl FnMut(RuntimeEventKind) -> bool) -> usize {
+        self.iter().filter(|event| predicate(event.kind())).count()
+    }
+
+    fn count_spawned(&self) -> usize {
+        self.iter()
+            .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+            .count()
+    }
+
+    fn count_call_dispatched(&self, call_kind: CallKind) -> usize {
+        self.iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallDispatchAttempted {
+                        call_kind: actual,
+                        ..
+                    } if actual == call_kind
+                )
+            })
+            .count()
+    }
+
+    fn any_matching(&self, mut predicate: impl FnMut(RuntimeEventKind) -> bool) -> bool {
+        self.iter().any(|event| predicate(event.kind()))
     }
 }
 
@@ -1445,5 +1499,66 @@ mod stable_hash_tests {
         }));
         assert_eq!(trace.count_completion_rejected(CallKind::TlsRead), 1);
         assert!(!trace.any_failed(CallKind::TlsRead));
+    }
+
+    #[test]
+    fn trace_query_helpers_count_spawned_and_dispatched() {
+        let trace = [
+            RuntimeEvent::new(
+                EventId::new(1),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::Spawned {
+                    child_isolate: IsolateId::new(2),
+                },
+            ),
+            RuntimeEvent::new(
+                EventId::new(2),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::CallDispatchAttempted {
+                    call_id: CallId::new(1),
+                    call_kind: CallKind::Sleep,
+                },
+            ),
+        ];
+
+        assert_eq!(trace.count_spawned(), 1);
+        assert!(trace.any_spawned());
+        assert_eq!(trace.count_call_dispatched(CallKind::Sleep), 1);
+        assert!(trace.any_call_dispatched(CallKind::Sleep));
+        assert_eq!(trace.count_call_dispatched(CallKind::TcpRead), 0);
+        assert!(!trace.any_call_dispatched(CallKind::TcpRead));
+    }
+
+    #[test]
+    fn trace_query_helpers_count_matching() {
+        let trace = [
+            RuntimeEvent::new(
+                EventId::new(1),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::HandlerStarted,
+            ),
+            RuntimeEvent::new(
+                EventId::new(2),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::HandlerFinished {
+                    effect: EffectKind::Noop,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            trace.count_matching(|kind| matches!(kind, RuntimeEventKind::HandlerStarted)),
+            1
+        );
+        assert!(trace.any_matching(|kind| matches!(kind, RuntimeEventKind::HandlerStarted)));
+        assert!(!trace.any_matching(|kind| matches!(kind, RuntimeEventKind::Spawned { .. })));
     }
 }

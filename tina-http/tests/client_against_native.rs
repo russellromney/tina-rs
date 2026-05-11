@@ -11,7 +11,6 @@ mod common;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use http::StatusCode;
@@ -19,61 +18,18 @@ use tina::prelude::*;
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpRequest, HttpResponse,
 };
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, call,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
 
 use common::TestShard;
 
-#[derive(Debug, Clone)]
-enum DriverMsg {
-    Begin {
-        client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,
-        target: SocketAddr,
-        request: HttpRequest,
-        timeout: Duration,
-    },
-    Returned(CallOutcome<Result<HttpResponse, HttpClientError>>),
-}
-
-struct Driver {
-    sender: mpsc::Sender<Result<HttpResponse, HttpClientError>>,
-}
-
-impl Isolate for Driver {
-    tina::isolate_types! {
-        message: DriverMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
-        shard: TestShard,
-    }
-
-    fn handle(
-        &mut self,
-        msg: DriverMsg,
-        _ctx: &mut Context<'_, TestShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            DriverMsg::Begin {
-                client,
-                target,
-                request,
-                timeout,
-            } => call(client, HttpClientMsg::call(target, request), timeout)
-                .reply(DriverMsg::Returned),
-            DriverMsg::Returned(outcome) => {
-                let result = match outcome {
-                    CallOutcome::Replied(inner) => inner,
-                    CallOutcome::Full => Err(HttpClientError::Busy),
-                    CallOutcome::Closed => Err(HttpClientError::Closed),
-                    CallOutcome::Timeout => Err(HttpClientError::Timeout),
-                };
-                let _ = self.sender.send(result);
-                stop()
-            }
-        }
+fn map_outcome(
+    outcome: CallOutcome<Result<HttpResponse, HttpClientError>>,
+) -> Result<HttpResponse, HttpClientError> {
+    match outcome {
+        CallOutcome::Replied(inner) => inner,
+        CallOutcome::Full => Err(HttpClientError::Busy),
+        CallOutcome::Closed => Err(HttpClientError::Closed),
+        CallOutcome::Timeout => Err(HttpClientError::Timeout),
     }
 }
 
@@ -83,23 +39,15 @@ fn run_request(
     target: SocketAddr,
     request: HttpRequest,
 ) -> Result<HttpResponse, HttpClientError> {
-    let (tx, rx) = mpsc::channel();
-    let driver = runtime
-        .register_with_capacity::<Driver, Infallible>(Driver { sender: tx }, 16)
-        .expect("register driver");
-    runtime
-        .try_send(
-            driver,
-            DriverMsg::Begin {
+    map_outcome(
+        runtime
+            .call_blocking(
                 client,
-                target,
-                request,
-                timeout: Duration::from_secs(2),
-            },
-        )
-        .expect("send Begin");
-    rx.recv_timeout(Duration::from_secs(5))
-        .expect("driver delivers result")
+                HttpClientMsg::call(target, request),
+                Duration::from_secs(5),
+            )
+            .expect("call runs"),
+    )
 }
 
 #[test]

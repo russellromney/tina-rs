@@ -4,6 +4,19 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 078 Host-Side Ergonomics
+
+- Expanded docs for `ThreadedRuntime::call_blocking` with full example,
+  usage guidance, and a warning that it is host/test only and must never
+  be called from inside an isolate handler.
+- Added trace query helpers to `RuntimeTraceExt`:
+  `count_matching` / `any_matching`, `count_spawned` / `any_spawned`,
+  `count_call_dispatched` / `any_call_dispatched`.
+- Migrated `tina-http/tests/client_bad_input.rs` and
+  `tina-http/tests/client_against_native.rs` from fake host Driver
+  isolates to direct `call_blocking` calls, removing ~130 lines of
+  ceremony while preserving `CallOutcome` visibility.
+
 ### SQLx/Postgres bridge
 
 Added `tina-sqlx-bridge`, a bounded Postgres bridge around
