@@ -53,6 +53,32 @@ DATABASE_URL=postgres://postgres@127.0.0.1:5499/postgres \
 docker stop pg_specimen
 ```
 
+## Bridge as pool
+
+`PgWorker` with `max_in_flight = N` already acts as the pool. SQLx owns
+connections; Tina's bridge bounds admitted query work above that pool.
+There is no extra wrapper needed.
+
+To observe the pool shape, call [`PgMetricsHandle::pressure_report`](../../tina-sqlx-bridge):
+
+```rust
+let report = bridge.metrics.pressure_report();
+// report.capacity   == config.max_in_flight
+// report.leased     == current in-flight count
+// report.available  == free slots
+// report.full_count == cumulative PgError::Full
+// report.timeout_count == bridge deadlines fired
+// report.high_water == peak in-flight observed
+```
+
+`waiters` is always `0` because the bridge does not queue callers; it
+replies `PgError::Full` immediately. SQL errors (including
+`PgError::PoolAcquireTimeout`) do **not** retire the lane.
+
+This shape is proven in the bridge's own admission tests:
+`full_is_distinct_from_pool_acquire_timeout`, `timeout_frees_capacity`,
+`error_does_not_retire_lane`, and `pressure_report_reflects_capacity_and_high_water`.
+
 ## Read
 
 - [`src/tokio_impl.rs`](src/tokio_impl.rs)

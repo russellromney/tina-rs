@@ -149,16 +149,93 @@ impl MetricsInner {
     }
 }
 
+/// Pressure report in pool vocabulary.
+///
+/// `PgWorker` with `max_in_flight = N` already acts as the pool:
+/// SQLx owns the connections; the bridge bounds admitted query work
+/// above that pool. This report maps bridge metrics into the same
+/// vocabulary as [`tina::pool::PoolPressureReport`] so callers can
+/// observe capacity, current load, and high-water mark through one
+/// typed surface.
+///
+/// `waiters` is always `0` because the bridge does not queue
+/// callers — it replies `PgError::Full` immediately when
+/// `max_in_flight` is saturated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PgPressureReport {
+    /// Configured `max_in_flight` — the bridge's pool capacity.
+    pub capacity: usize,
+    /// Slots currently free (`capacity - leased`).
+    pub available: usize,
+    /// Operations currently in flight.
+    pub leased: usize,
+    /// Callers parked waiting for a slot. Always `0` for the bridge;
+    /// present so the shape matches [`tina::pool::PoolPressureReport`].
+    pub waiters: usize,
+    /// Max waiters the bridge accepts. Always `0`; present for shape
+    /// parity.
+    pub max_waiters: usize,
+    /// Cumulative `PgError::Full` outcomes.
+    pub full_count: u64,
+    /// Cumulative `PgError::Closed` outcomes.
+    pub closed_count: u64,
+    /// Cumulative bridge per-attempt timeouts (`PgError::Timeout`).
+    pub timeout_count: u64,
+    /// Cumulative SQLx pool acquire timeouts
+    /// (`PgError::PoolAcquireTimeout`).
+    pub pool_acquire_timeout_count: u64,
+    /// Cumulative SQL errors (`PgError::Sqlx`).
+    pub sql_error_count: u64,
+    /// Cumulative decode errors (`PgError::Decode`).
+    pub decode_error_count: u64,
+    /// Cumulative late results — worker terminal after bridge timeout.
+    pub late_result_count: u64,
+    /// Highest in-flight count ever observed.
+    pub high_water: u64,
+}
+
+impl PgPressureReport {
+    /// `true` when every slot is in use.
+    pub fn is_full(&self) -> bool {
+        self.leased >= self.capacity
+    }
+}
+
 /// Cloneable handle for inspecting bridge metrics from outside the
 /// hosting Tina runtime.
 #[derive(Debug, Clone)]
 pub struct PgMetricsHandle {
     pub(crate) inner: Arc<MetricsInner>,
+    pub(crate) capacity: usize,
 }
 
 impl PgMetricsHandle {
     /// Returns a fresh snapshot of counter values.
     pub fn snapshot(&self) -> PgMetrics {
         self.inner.snapshot()
+    }
+
+    /// Returns a pressure report mapped into pool vocabulary.
+    ///
+    /// `capacity` is the `max_in_flight` value captured at install time.
+    pub fn pressure_report(&self) -> PgPressureReport {
+        let m = self.inner.snapshot();
+        let capacity = self.capacity;
+        let leased = m.in_flight_current.min(capacity as u64) as usize;
+        PgPressureReport {
+            capacity,
+            available: capacity.saturating_sub(leased),
+            leased,
+            waiters: 0,
+            max_waiters: 0,
+            full_count: m.full,
+            closed_count: m.closed,
+            timeout_count: m.timeouts,
+            pool_acquire_timeout_count: m.pool_acquire_timeouts,
+            sql_error_count: m.sqlx_errors,
+            decode_error_count: m.decode_errors,
+            late_result_count: m.late_results,
+            high_water: m.in_flight_high_water,
+        }
     }
 }

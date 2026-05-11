@@ -212,6 +212,243 @@ fn install_with_invalid_config_errors_with_config() {
 }
 
 // ---------------------------------------------------------------------------
+// Pool consumer shape: bridge-as-pool proofs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn full_is_distinct_from_pool_acquire_timeout() {
+    let runtime = make_runtime();
+    let cfg = PgConfig::bridge_only()
+        .with_default_timeout(Duration::from_secs(2))
+        .with_poll_interval(Duration::from_millis(1))
+        .with_max_in_flight(1);
+    let (bridge, _tokio_rt) = install_lazy(&runtime, cfg);
+
+    let sink1 = Arc::new(Sink::default());
+    let caller1 = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink1),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller1, CallerMsg::Run(PgRequest::execute("SELECT 1")))
+        .expect("send req1");
+
+    let sink2 = Arc::new(Sink::default());
+    let caller2 = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink2),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller2, CallerMsg::Run(PgRequest::execute("SELECT 2")))
+        .expect("send req2");
+
+    let out2 = sink2.wait_one(Duration::from_secs(3));
+    assert!(
+        matches!(out2, CallOutcome::Replied(Err(PgError::Full))),
+        "expected Full, got {out2:?}"
+    );
+
+    let out1 = sink1.wait_one(Duration::from_secs(3));
+    assert!(
+        matches!(out1, CallOutcome::Replied(Err(PgError::PoolAcquireTimeout))),
+        "expected PoolAcquireTimeout, got {out1:?}"
+    );
+
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.full, 1);
+    assert_eq!(m.pool_acquire_timeouts, 1);
+    shutdown(runtime);
+}
+
+#[test]
+fn timeout_frees_capacity() {
+    let runtime = make_runtime();
+    let cfg = PgConfig::bridge_only()
+        .with_default_timeout(Duration::from_millis(30))
+        .with_poll_interval(Duration::from_millis(1))
+        .with_max_in_flight(1);
+    let (bridge, _tokio_rt) = install_lazy(&runtime, cfg);
+
+    let sink1 = Arc::new(Sink::default());
+    let caller1 = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink1),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller1, CallerMsg::Run(PgRequest::execute("SELECT 1")))
+        .expect("send req1");
+
+    let out1 = sink1.wait_one(Duration::from_secs(3));
+    assert!(
+        matches!(out1, CallOutcome::Replied(Err(PgError::Timeout))),
+        "expected Timeout, got {out1:?}"
+    );
+
+    let sink2 = Arc::new(Sink::default());
+    let caller2 = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink2),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller2, CallerMsg::Run(PgRequest::execute("SELECT 2")))
+        .expect("send req2");
+
+    let out2 = sink2.wait_one(Duration::from_secs(3));
+    assert!(
+        matches!(
+            out2,
+            CallOutcome::Replied(Err(PgError::Timeout | PgError::PoolAcquireTimeout))
+        ),
+        "expected Timeout or PoolAcquireTimeout, got {out2:?}"
+    );
+
+    let m = bridge.metrics.snapshot();
+    assert!(
+        m.timeouts >= 1,
+        "at least one timeout; bridge timeout fires before pool acquire"
+    );
+    assert_eq!(
+        m.admitted, 2,
+        "second request was admitted after timeout freed capacity"
+    );
+    shutdown(runtime);
+}
+
+#[test]
+fn error_does_not_retire_lane() {
+    let runtime = make_runtime();
+    let cfg = PgConfig::bridge_only()
+        .with_default_timeout(Duration::from_secs(2))
+        .with_poll_interval(Duration::from_millis(1))
+        .with_max_in_flight(1);
+    let (bridge, _tokio_rt) = install_lazy(&runtime, cfg);
+
+    let sink1 = Arc::new(Sink::default());
+    let caller1 = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink1),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller1, CallerMsg::Run(PgRequest::execute("SELECT 1")))
+        .expect("send req1");
+    let out1 = sink1.wait_one(Duration::from_secs(3));
+    assert!(
+        matches!(out1, CallOutcome::Replied(Err(PgError::PoolAcquireTimeout))),
+        "expected PoolAcquireTimeout, got {out1:?}"
+    );
+
+    let sink2 = Arc::new(Sink::default());
+    let caller2 = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink2),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(caller2, CallerMsg::Run(PgRequest::execute("SELECT 2")))
+        .expect("send req2");
+    let out2 = sink2.wait_one(Duration::from_secs(3));
+    assert!(
+        matches!(out2, CallOutcome::Replied(Err(PgError::PoolAcquireTimeout))),
+        "expected PoolAcquireTimeout, got {out2:?}"
+    );
+
+    let m = bridge.metrics.snapshot();
+    assert_eq!(m.pool_acquire_timeouts, 2);
+    assert_eq!(m.full, 0, "no Full because lane was reused after error");
+    shutdown(runtime);
+}
+
+#[test]
+fn pressure_report_reflects_capacity_and_high_water() {
+    let runtime = make_runtime();
+    let cfg = PgConfig::bridge_only()
+        .with_default_timeout(Duration::from_secs(2))
+        .with_poll_interval(Duration::from_millis(1))
+        .with_max_in_flight(3);
+    let (bridge, _tokio_rt) = install_lazy(&runtime, cfg.clone());
+
+    let r0 = bridge.metrics.pressure_report();
+    assert_eq!(r0.capacity, 3);
+    assert_eq!(r0.available, 3);
+    assert_eq!(r0.leased, 0);
+    assert_eq!(r0.high_water, 0);
+    assert!(!r0.is_full());
+
+    // Send 3 requests. The lazy pool times out quickly (50 ms), so each
+    // request cycles fast. We wait for completion and check accumulated
+    // metrics — no race on concurrent state.
+    let sinks: Vec<_> = (0..3)
+        .map(|_| {
+            let s = Arc::new(Sink::default());
+            let c = register_caller(
+                &runtime,
+                bridge.address,
+                Arc::clone(&s),
+                Duration::from_secs(5),
+            );
+            runtime
+                .try_send(c, CallerMsg::Run(PgRequest::execute("SELECT 1")))
+                .expect("send");
+            s
+        })
+        .collect();
+
+    for s in &sinks {
+        let _ = s.wait_one(Duration::from_secs(5));
+    }
+
+    let r1 = bridge.metrics.pressure_report();
+    assert_eq!(r1.capacity, 3);
+    assert_eq!(r1.leased, 0, "all done");
+    assert_eq!(r1.available, 3);
+    assert_eq!(r1.high_water, 3, "peak was 3 concurrent");
+    assert!(!r1.is_full());
+
+    // Send 4 more requests; at least one sees Full.
+    let sinks2: Vec<_> = (0..4)
+        .map(|_| {
+            let s = Arc::new(Sink::default());
+            let c = register_caller(
+                &runtime,
+                bridge.address,
+                Arc::clone(&s),
+                Duration::from_secs(5),
+            );
+            runtime
+                .try_send(c, CallerMsg::Run(PgRequest::execute("SELECT 1")))
+                .expect("send");
+            s
+        })
+        .collect();
+
+    for s in &sinks2 {
+        let _ = s.wait_one(Duration::from_secs(5));
+    }
+
+    let r2 = bridge.metrics.pressure_report();
+    assert_eq!(r2.high_water, 3, "peak stays at 3");
+    assert_eq!(r2.full_count, 1, "one request was rejected");
+    assert_eq!(r2.leased, 0);
+    assert_eq!(r2.available, 3);
+    assert!(!r2.is_full());
+
+    shutdown(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// install/install_with_pool ownership rules
+// ---------------------------------------------------------------------------
 // Admission rejection
 // ---------------------------------------------------------------------------
 
