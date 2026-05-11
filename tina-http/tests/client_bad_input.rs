@@ -99,17 +99,12 @@ fn missing_content_length_surfaces_parse_error() {
 }
 
 #[test]
-fn chunked_transfer_encoding_surfaces_parse_error() {
+fn chunked_transfer_encoding_decoded_successfully() {
     let canned =
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n".to_vec();
-    let err = run_one(canned).expect_err("client must reject chunked");
-    assert!(
-        matches!(
-            err,
-            HttpClientError::Parse(ResponseParseError::UnsupportedTransferEncoding)
-        ),
-        "expected UnsupportedTransferEncoding, got {err:?}"
-    );
+    let response = run_one(canned).expect("client must accept and decode chunked");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body.as_buffered(), Some(b"hello" as &[u8]));
 }
 
 #[test]

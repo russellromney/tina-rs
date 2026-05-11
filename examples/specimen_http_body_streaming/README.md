@@ -163,8 +163,9 @@ What this suggests:
 - Wall-clock numbers are noisy on a single machine. The
   `tina_response_high_water` line is the property worth pinning,
   not the milliseconds.
-- The chunked path is response-only. Tina's HTTP/1 client does
-  not currently decode chunked responses (still a parser-level
-  `UnsupportedTransferEncoding`). Real chunked clients exist
-  elsewhere; the point of this slice is the server-side framing
-  choice.
+- Chunked responses are decoded by both the HTTP and HTTPS
+  client paths. The specimen exercises the server-emitting path;
+  integration tests in `tina-http/tests/client_chunked_response.rs`
+  and `tina-http/tests/body_parity_tls.rs` cover the client decode
+  side. Chunked *request* bodies are accepted via the same
+  streaming pull model when `inbound_stream_chunk_size` is set.

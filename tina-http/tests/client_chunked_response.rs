@@ -1,0 +1,198 @@
+//! Integration test: [`HttpClient`] decodes chunked responses from a
+//! native [`HttpListener`] that emits [`HttpResponse::stream_chunked`].
+//!
+//! Proves the client-side decoder works end-to-end over real loopback
+//! against the same server that the specimen uses.
+
+mod common;
+
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use http::StatusCode;
+use tina::prelude::*;
+use tina_http::{
+    HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpLimits, HttpListener,
+    HttpListenerMsg, HttpRequest, HttpResponse, IterBodySource,
+};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+};
+
+use common::TestShard;
+
+struct ChunkedEchoService {
+    source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
+}
+
+impl Isolate for ChunkedEchoService {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        let response = if request.path == "/chunked" {
+            HttpResponse::stream_chunked(StatusCode::OK, self.source)
+        } else {
+            HttpResponse::not_found()
+        };
+        reply(response)
+    }
+}
+
+fn map_outcome(
+    outcome: CallOutcome<Result<HttpResponse, HttpClientError>>,
+) -> Result<HttpResponse, HttpClientError> {
+    match outcome {
+        CallOutcome::Replied(inner) => inner,
+        CallOutcome::Full => Err(HttpClientError::Busy),
+        CallOutcome::Closed => Err(HttpClientError::Closed),
+        CallOutcome::Timeout => Err(HttpClientError::Timeout),
+    }
+}
+
+#[test]
+fn client_decodes_chunked_response_from_native_server() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let chunks: Vec<Vec<u8>> = vec![b"hello, ".to_vec(), b"chunked ".to_vec(), b"world".to_vec()];
+    let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+
+    let source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(chunks.into_iter()),
+            16,
+        )
+        .expect("register source");
+
+    let service = runtime
+        .register_with_capacity::<ChunkedEchoService, Infallible>(ChunkedEchoService { source }, 16)
+        .expect("register service");
+
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener_isolate = HttpListener::<TestShard>::new(
+        bind,
+        service,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let client = runtime
+        .register_with_capacity::<HttpClient<TestShard>, Infallible>(
+            HttpClient::<TestShard>::new(HttpClientConfig::dev()),
+            16,
+        )
+        .expect("register client");
+
+    let request = HttpRequest::get("/chunked").header("Host", "x").build();
+    let result = map_outcome(
+        runtime
+            .call_blocking(
+                client,
+                HttpClientMsg::call(addr, request),
+                Duration::from_secs(5),
+            )
+            .expect("call runs"),
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let response = result.expect("client must succeed");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body.as_buffered(), Some(expected.as_slice()));
+}
+
+/// Edge: the terminator arrives in a separate read from the last data
+/// chunk. The client's decoder must handle the split correctly.
+#[test]
+fn client_decodes_chunked_response_with_split_terminator() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let chunks: Vec<Vec<u8>> = vec![b"single chunk".to_vec()];
+    let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+
+    let source = runtime
+        .register_with_capacity::<IterBodySource<TestShard>, Infallible>(
+            IterBodySource::new(chunks.into_iter()),
+            16,
+        )
+        .expect("register source");
+
+    let service = runtime
+        .register_with_capacity::<ChunkedEchoService, Infallible>(ChunkedEchoService { source }, 16)
+        .expect("register service");
+
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener_isolate = HttpListener::<TestShard>::new(
+        bind,
+        service,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let client = runtime
+        .register_with_capacity::<HttpClient<TestShard>, Infallible>(
+            HttpClient::<TestShard>::new(HttpClientConfig::dev()),
+            16,
+        )
+        .expect("register client");
+
+    let request = HttpRequest::get("/chunked").header("Host", "x").build();
+    let result = map_outcome(
+        runtime
+            .call_blocking(
+                client,
+                HttpClientMsg::call(addr, request),
+                Duration::from_secs(5),
+            )
+            .expect("call runs"),
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let response = result.expect("client must succeed on split terminator");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body.as_buffered(), Some(expected.as_slice()));
+}

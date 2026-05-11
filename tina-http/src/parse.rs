@@ -55,6 +55,8 @@ pub struct HttpRequestHead {
     pub headers: HeaderMap,
     /// Declared body length from `Content-Length`, or zero if absent.
     pub content_length: usize,
+    /// `true` when `Transfer-Encoding: chunked` was present and accepted.
+    pub chunked: bool,
     /// Whether the connection should be closed after this response (per
     /// `Connection: close` header or HTTP/1.0 default).
     pub connection_close: bool,
@@ -160,7 +162,8 @@ fn build_head(
 
     let mut headers = HeaderMap::with_capacity(parsed.headers.len());
     let mut content_length: Option<usize> = None;
-    let mut transfer_encoding_invalid = false;
+    let mut transfer_encoding_chunked = false;
+    let mut transfer_encoding_unsupported = false;
     let mut connection_close = matches!(version, Version::HTTP_10);
 
     for header in parsed.headers.iter() {
@@ -192,18 +195,14 @@ fn build_head(
             }
             content_length = Some(parsed_len);
         } else if name == http::header::TRANSFER_ENCODING {
-            // First form: only `identity` is permitted; anything else
-            // (including `chunked`) is rejected as unsupported.
             let value_str = std::str::from_utf8(header.value).unwrap_or("");
-            if !value_str.eq_ignore_ascii_case("identity") {
-                transfer_encoding_invalid = true;
+            if value_str.eq_ignore_ascii_case("chunked") {
+                transfer_encoding_chunked = true;
+            } else if !value_str.eq_ignore_ascii_case("identity") {
+                transfer_encoding_unsupported = true;
             }
         } else if name == http::header::CONNECTION {
             let value_str = std::str::from_utf8(header.value).unwrap_or("");
-            // RFC 7230 §6.1: a `close` token anywhere in the
-            // Connection header field commits the sender to closing
-            // after the current response. `keep-alive` cannot override
-            // it, even if it appears later in the same header value.
             let has_close = value_str
                 .split(',')
                 .any(|token| token.trim().eq_ignore_ascii_case("close"));
@@ -222,7 +221,15 @@ fn build_head(
         headers.append(name, value);
     }
 
-    if transfer_encoding_invalid {
+    if transfer_encoding_unsupported {
+        return Err(RequestParseError::UnsupportedTransferEncoding);
+    }
+
+    if transfer_encoding_chunked && content_length.is_some() {
+        return Err(RequestParseError::InvalidContentLength);
+    }
+
+    if transfer_encoding_chunked && limits.inbound_stream_chunk_size.is_none() {
         return Err(RequestParseError::UnsupportedTransferEncoding);
     }
 
@@ -232,6 +239,7 @@ fn build_head(
         version,
         headers,
         content_length: content_length.unwrap_or(0),
+        chunked: transfer_encoding_chunked,
         connection_close,
     })
 }
@@ -426,6 +434,8 @@ pub struct HttpResponseHead {
     /// Declared body length from `Content-Length`. The first-form client
     /// requires this for any response that frames a body.
     pub content_length: usize,
+    /// `true` when `Transfer-Encoding: chunked` was present.
+    pub chunked: bool,
 }
 
 /// Attempts to parse an HTTP/1.x response head out of `buffer`.
@@ -485,7 +495,8 @@ fn build_response_head(
 
     let mut headers = HeaderMap::with_capacity(parsed.headers.len());
     let mut content_length: Option<usize> = None;
-    let mut transfer_encoding_invalid = false;
+    let mut transfer_encoding_chunked = false;
+    let mut transfer_encoding_unsupported = false;
 
     for header in parsed.headers.iter() {
         if header.name.is_empty() {
@@ -517,24 +528,28 @@ fn build_response_head(
             content_length = Some(parsed_len);
         } else if name == http::header::TRANSFER_ENCODING {
             let value_str = std::str::from_utf8(header.value).unwrap_or("");
-            if !value_str.eq_ignore_ascii_case("identity") {
-                transfer_encoding_invalid = true;
+            if value_str.eq_ignore_ascii_case("chunked") {
+                transfer_encoding_chunked = true;
+            } else if !value_str.eq_ignore_ascii_case("identity") {
+                transfer_encoding_unsupported = true;
             }
         }
 
         headers.append(name, value);
     }
 
-    if transfer_encoding_invalid {
+    if transfer_encoding_unsupported {
         return Err(ResponseParseError::UnsupportedTransferEncoding);
     }
 
-    // First-form client: a body-bearing response must declare its length.
-    // Status codes that never carry a body (1xx, 204, 304) are exempt.
+    if transfer_encoding_chunked && content_length.is_some() {
+        return Err(ResponseParseError::InvalidContentLength);
+    }
+
     let body_forbidden = matches!(status.as_u16(), 100..=199 | 204 | 304);
     let content_length = match content_length {
         Some(n) => n,
-        None if body_forbidden => 0,
+        None if body_forbidden || transfer_encoding_chunked => 0,
         None => return Err(ResponseParseError::MissingContentLength),
     };
 
@@ -544,6 +559,7 @@ fn build_response_head(
         reason,
         headers,
         content_length,
+        chunked: transfer_encoding_chunked,
     })
 }
 
@@ -619,11 +635,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_chunked_request_body_in_first_form() {
+    fn rejects_chunked_request_body_when_streaming_disabled() {
         let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
-        match parse_request_head(buf, &limits()) {
+        let limits = HttpLimits::default(); // inbound_stream_chunk_size = None
+        match parse_request_head(buf, &limits) {
             ParseProgress::Failed(RequestParseError::UnsupportedTransferEncoding) => {}
             other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_chunked_request_body_when_streaming_enabled() {
+        let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Complete { head, head_len } => {
+                assert!(head.chunked);
+                assert_eq!(head.content_length, 0);
+                assert_eq!(head_len, buf.len());
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_content_length_plus_transfer_encoding() {
+        let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Failed(RequestParseError::InvalidContentLength) => {}
+            other => panic!("expected InvalidContentLength, got {other:?}"),
         }
     }
 
@@ -947,11 +994,24 @@ mod tests {
     }
 
     #[test]
-    fn response_chunked_transfer_encoding_rejected() {
+    fn response_chunked_transfer_encoding_accepted() {
         let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         match parse_response_head(buf, &limits()) {
-            ResponseParseProgress::Failed(ResponseParseError::UnsupportedTransferEncoding) => {}
-            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+            ResponseParseProgress::Complete { head, head_len } => {
+                assert!(head.chunked);
+                assert_eq!(head.content_length, 0);
+                assert_eq!(head_len, buf.len());
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_content_length_plus_transfer_encoding_rejected() {
+        let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::InvalidContentLength) => {}
+            other => panic!("expected InvalidContentLength, got {other:?}"),
         }
     }
 
