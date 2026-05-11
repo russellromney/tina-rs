@@ -107,16 +107,10 @@ spawn_observed(ChildDefinition::new(child, cap))
     .reply(ParentMsg::ChildStarted)
 ```
 
-The continuation receives:
+The continuation receives a typed outcome:
 
 ```rust
-ChildStarted<ChildMsg, ChildReply>
-```
-
-or directly:
-
-```rust
-ChildRef<ChildMsg, ChildReply>
+Result<ChildRef<ChildMsg, ChildReply>, SpawnObservedError>
 ```
 
 Rules:
@@ -127,6 +121,8 @@ Rules:
 - if spawn fails or parent stops before delivery, outcome is typed and
   trace-visible;
 - no hidden queue beyond existing child/message mailboxes.
+- type honesty comes from the typed child definition at the spawn site,
+  not from a host turbofish guessed after the fact.
 
 If implementing this as `Effect::SpawnObserved` is cleaner than
 bolting it onto `Effect::Spawn`, do that. Keep old `spawn(...)`.
@@ -204,15 +200,25 @@ System specimens that should use this once it lands:
 
 ## Required Proof
 
+PR 1 proof:
+
 - parent spawns child and receives typed `ChildRef` via ordinary message;
 - parent sends a follow-up message to that child using the ref;
+- spawn failure / parent stopped before continuation is typed and
+  trace-visible, or the plan explains why current spawn has no such
+  failure path;
+- simulator mirrors `spawn_observed`, or the PR explicitly defers sim
+  with a follow-up finding;
+- old `spawn(...)` behavior remains unchanged.
+
+PR 2 proof, only if Rock 3/4/5 land:
+
 - parent observes child stop/result;
 - stale generation does not deliver silently;
 - supervised restart produces a new generation and docs/test show refresh;
 - parent stop settles child lifecycle truth;
-- simulator mirrors live semantics, or the plan documents why a sim proof
-  is out of scope and adds it to the next sim phase;
-- old `spawn(...)` behavior remains unchanged.
+- waiter/result capacity is reclaimed after child stop, parent stop, and
+  waiter timeout.
 
 ## Done Means
 

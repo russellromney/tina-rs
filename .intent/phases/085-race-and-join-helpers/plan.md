@@ -111,7 +111,7 @@ Ship one race helper:
 start N calls
 first successful reply wins
 cancel remaining losers visibly
-return named result
+return named result after loser-cancel outcomes settle
 ```
 
 Required output shape:
@@ -132,6 +132,10 @@ Rules:
 - caller chooses which outcomes count as success with an explicit
   predicate/classifier;
 - loser cancellation is explicit in returned effects/messages;
+- first form replies after cancellation outcomes for losers are known.
+  If a caller wants "reply winner immediately, cancel losers in the
+  background," that is a different helper and must say its report is
+  incomplete at reply time;
 - late loser replies become trace facts;
 - branch key is in every report row.
 
@@ -201,15 +205,24 @@ truth. Long pipeline code is acceptable.
 
 ## Required Proof
 
+PR 1 proof:
+
 - fill group to capacity, reject one more with typed `Full`;
 - first-success race cancels losers and records each cancel outcome;
 - late loser reply is rejected visibly in trace;
-- join-all returns all replies when all finish;
-- join-all returns partial report at deadline;
+- first-success report is not delivered until loser-cancel outcomes are
+  recorded;
 - duplicate key is typed error, not overwrite;
 - fill -> cancel/complete -> refill works;
-- simulator proof for at least one race or join scenario;
 - no helper hides retry or idempotency policy.
+
+PR 2 proof, only if join-all lands:
+
+- join-all returns all replies when all finish;
+- join-all returns partial report at deadline;
+- simulator proof for at least one race or join scenario;
+- `RequestContext` integration replies exactly once and drops/cancels
+  owned handles on owner stop.
 
 ## Done Means
 
