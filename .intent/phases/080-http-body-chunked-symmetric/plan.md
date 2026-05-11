@@ -2,67 +2,70 @@
 
 ## Status
 
-- Done: plan created after 074 body streaming, 076 server keepalive,
-  079 response-source cancel, and the SQL/DB pool tranche.
+- Done: plan exists.
 - In progress: not started.
-- Open: implementation, proofs, docs, specimen updates.
+- Open: code, tests, docs, specimen.
 - Deferred: HTTP/2, gRPC, trailers, compression, proxies, redirects,
-  cookies, broad framework surface.
+  cookies, broad web framework surface.
 
 ## Goal
 
-Finish honest HTTP/1 body semantics.
+Finish HTTP/1 body truth.
 
-Tina can already emit chunked responses. The missing half is:
+Already shipped:
 
-```text
-client can read chunked response.
-server can accept chunked request.
-decoder does not buffer whole body.
-bad chunks fail loudly.
-pressure stays bounded.
-```
+- server can send chunked responses;
+- known-length request/response streaming exists;
+- body metrics exist;
+- response-source cancel exists.
+
+Still missing:
+
+- client can read chunked responses;
+- server can accept chunked requests.
 
 Grug truth:
 
 ```text
 chunk says size.
-read at most that much.
+read size bytes.
+then CRLF.
 zero chunk means done.
 bad chunk means error.
-no secret unbounded Vec.
+do not store whole body unless bounded API already says so.
 ```
 
-## Non-Goals
+## Hard Rules
 
 - No HTTP/2.
 - No gRPC.
-- No trailers in first form. If trailers appear, reject or ignore only
-  if the rule is documented and tested. Prefer reject.
-- No chunk extensions unless the implementation explicitly parses and
-  ignores them. Do not silently accept malformed size lines.
-- No transparent gzip/deflate.
-- No request pipelining upgrade.
-- No unbounded whole-body buffering just to make chunked easier. The
-  existing client may still return a buffered decoded body, but that
-  buffer is bounded by `max_body_bytes`.
+- No trailers. Reject them unless this phase explicitly decides and
+  tests another rule.
+- No gzip/deflate.
+- No request pipelining.
+- No hidden unbounded `Vec`.
+- No "unknown length means 0".
+- No clean EOF for malformed chunked wire.
+- No docs that say "chunked works" without saying which side.
 
-## Shape
+The existing client may still return a buffered decoded body. That is
+okay only because `max_body_bytes` bounds it.
 
-One PR if it stays boring. Two PRs if shared decoder + one side already
-gets large.
+## PR Shape
 
-Preferred split if needed:
+One PR if boring.
 
-1. Shared chunked decoder and client-side chunked response decode.
-2. Server-side chunked request bodies plus specimen/docs.
+Split into two PRs if it grows:
 
-Do not start HTTP/2 because chunked feels close to framing. It is not
-the same product.
+1. shared chunked decoder + client response decode;
+2. server chunked request bodies + specimen/docs.
 
-## Rock 0 — Audit Current HTTP Body Paths
+Do not wander into HTTP/2 because "frames feel related." Different
+thing.
 
-Read first:
+## Rock 0 — Read Current Code
+
+Read before editing:
 
 - `tina-http/src/parse.rs`
 - `tina-http/src/connection.rs`
@@ -71,190 +74,195 @@ Read first:
 - `tina-http/tests/streaming_v2.rs`
 - `examples/specimen_http_body_streaming`
 
-Record what changes in this plan before code:
+Then write a short status note in this plan:
 
-- current rejection paths for `Transfer-Encoding: chunked`;
-- current body caps;
-- current body metrics;
-- current client response buffering shape;
-- whether server request streaming already has enough pull surface.
+- where chunked is rejected today;
+- which caps apply today;
+- which metrics apply today;
+- which request-stream type changes, if any, are needed.
 
-## Rock 1 — Shared Chunked Decoder
+## Rock 1 — One Chunked Decoder
 
-Add a small HTTP/1 chunked state machine.
+Build one small incremental decoder.
 
-It must be incremental:
+Do not copy little decoders into tests/specimens.
 
-- accepts bytes as they arrive;
-- returns decoded data chunks as they become available;
-- keeps partial size/data/CRLF state between reads;
-- never needs the whole wire body resident;
-- enforces configured body caps;
-- distinguishes incomplete input from malformed input.
+It must:
 
-First-form accepted wire:
+- accept partial bytes;
+- keep state between calls;
+- emit decoded data chunks;
+- enforce decoded-body cap;
+- track partial size line, data, and CRLF;
+- return "need more bytes" vs "bad wire";
+- finish only after final `0\r\n\r\n`.
+
+Accepted first-form wire:
 
 ```text
 HEX\r\n
-bytes\r\n
-...
+DATA\r\n
+HEX\r\n
+DATA\r\n
 0\r\n
 \r\n
 ```
 
 Reject:
 
-- invalid hex size;
-- chunk larger than configured cap / remaining body cap;
-- missing CRLF after size or data;
+- bad hex;
+- missing CRLF after size;
+- missing CRLF after data;
 - EOF before final zero chunk;
-- trailers, unless this phase deliberately implements a tiny
-  documented trailer rule.
+- decoded body over cap;
+- unknown transfer codings;
+- `Content-Length` plus `Transfer-Encoding`;
+- trailers unless this phase explicitly changes that rule.
 
-If chunk extensions are accepted, they must be parsed as
-`size;extension...` and ignored deliberately. If not, test that they
-are rejected.
+Chunk extensions:
 
-Header matching rule:
+- Either reject `4;foo=bar`.
+- Or parse `size;...` and ignore extensions on purpose.
+- Pick one. Test it.
 
-- `Transfer-Encoding` matching is case-insensitive;
-- `chunked` must be the only/final coding Tina accepts in first form;
-- unknown transfer codings are rejected;
-- `Content-Length` plus `Transfer-Encoding` is rejected unless this
-  phase writes a different explicit rule and proves it.
+Header rule:
 
-## Rock 2 — Client-Side Chunked Response Decode
+- header names are case-insensitive;
+- transfer coding values are case-insensitive;
+- Tina accepts only `Transfer-Encoding: chunked` in first form;
+- `gzip, chunked`, `chunked, gzip`, and unknown codings are rejected.
 
-Today the client rejects chunked responses.
+## Rock 2 — Client Reads Chunked Responses
 
-Change it so `Transfer-Encoding: chunked` decodes to the existing
-client response body shape, under the same body cap rules as
-`Content-Length`.
+Today client rejects chunked.
+
+Change client so chunked response becomes the same user body bytes as
+Content-Length response.
 
 Rules:
 
-- decoded body bytes count toward `max_body_bytes`;
-- wire framing bytes do not count as app body;
-- malformed chunked body returns a typed parse/body error;
-- missing terminator is an error, not clean EOF;
-- `Content-Length` + `Transfer-Encoding: chunked` follows the shared
-  header rule above.
+- count decoded bytes against `max_body_bytes`;
+- do not count chunk framing as app body;
+- missing final zero chunk is error;
+- malformed chunk is typed error;
+- `Content-Length` plus `Transfer-Encoding` follows Rock 1 rule;
+- keep client response buffered for now; do not invent streaming client
+  API here.
 
-This is still a buffered client response unless a streaming client body
-surface already exists. Do not invent a new client streaming API in
-this rock.
+Tests:
 
-Proof:
-
-- happy chunked response from a native server;
-- fragmented chunk headers and fragmented data;
-- malformed size;
-- missing data CRLF;
+- happy chunked response;
+- chunk header split across reads;
+- chunk data split across reads;
+- bad hex;
+- missing CRLF;
 - missing final zero chunk;
-- body cap exceeded by decoded bytes;
-- `Content-Length` plus `Transfer-Encoding` behavior pinned.
+- decoded body cap exceeded;
+- `Content-Length` plus `Transfer-Encoding` rejected.
 
-## Rock 3 — Server-Side Chunked Request Bodies
+## Rock 3 — Server Accepts Chunked Requests
 
-Today the server rejects chunked requests.
+Today server rejects chunked requests.
 
-Change it so services can receive chunked uploads through the existing
-request-stream pull model.
+Change server so service pulls decoded chunks.
+
+Preferred shape:
+
+```text
+HttpRequestBody::Stream(RequestStream)
+service calls body_next()
+body_next replies Chunk(bytes) / Eof / Error
+```
 
 Rules:
 
-- `HttpRequestBody::Stream(RequestStream)` is the preferred shape for
-  chunked requests;
-- there is no declared `content_length`; add an explicit unknown-length
-  representation if needed;
-- chunked requests require request streaming to be enabled. If
-  `HttpLimits::inbound_stream_chunk_size` is `None`, reject the request
-  loudly instead of buffering it all;
-- each `body_next()` yields decoded app bytes, not wire framing;
-- resident bytes are bounded by `inbound_stream_chunk_size` and body
-  caps;
-- parse/truncation errors surface as `RequestChunkReply::Error(...)`;
-- final zero chunk surfaces as `RequestChunkReply::Eof`;
-- malformed chunks close the connection after the service observes the
-  error, or before dispatch if no service owns the stream yet. Pick one
-  rule and test it.
+- chunked requests require `HttpLimits::inbound_stream_chunk_size =
+  Some(n)`;
+- if streaming is disabled, reject chunked request loudly;
+- each `body_next()` returns decoded bytes, not wire bytes;
+- resident decoded bytes are bounded by `inbound_stream_chunk_size`;
+- decoded total is bounded by `max_body_bytes`;
+- bad wire becomes `RequestChunkReply::Error(...)` if service owns the
+  stream;
+- bad wire before dispatch becomes parser error response;
+- final zero chunk becomes `RequestChunkReply::Eof`.
 
-If the existing `RequestStream { content_length }` cannot represent
-unknown length honestly, change the type. Do not encode unknown as `0`.
+Important type rule:
 
-Proof:
+- Current `RequestStream` has `content_length`.
+- Chunked request has unknown length.
+- If needed, change the type to make known vs unknown explicit.
+- Do not encode unknown as `0`.
 
-- happy chunked upload, service pulls all chunks;
-- fragmented chunk headers/data;
-- slow service applies backpressure;
-- malformed size;
-- missing terminator;
-- body cap exceeded;
-- metrics drain after close/cancel.
+Tests:
 
-## Rock 4 — HTTP/HTTPS Parity
+- happy chunked upload;
+- chunk header split across reads;
+- chunk data split across reads;
+- slow service pull shows backpressure;
+- bad hex;
+- missing CRLF;
+- missing final zero chunk;
+- decoded body cap exceeded;
+- metrics drain after success and error.
 
-Chunked semantics must be transport-independent.
+## Rock 4 — HTTPS Parity
 
-At least one proof should run through TLS:
+One TLS proof is required.
 
-- chunked response decode over HTTPS client path, or
-- chunked request upload to `HttpsListener`.
+Pick one:
 
-Do not duplicate every HTTP test over HTTPS. One parity proof is enough
-unless the TLS path needs different code.
+- client decodes chunked response over HTTPS; or
+- server accepts chunked request over HTTPS.
 
-## Rock 5 — Metrics And Capacity Truth
+Do not duplicate every HTTP test over HTTPS. One parity test is enough
+unless TLS needs special code.
 
-Body metrics must stay honest:
+## Rock 5 — Metrics Stay True
 
-- high-water counts decoded body bytes resident in Tina, not chunk
-  framing;
-- body timeout/full/io-error counters still mean the same thing;
-- malformed chunked body increments the right error counter;
-- all charges drain after success, parse error, peer close, timeout,
-  and cancel.
+Body metrics count app bytes, not framing bytes.
 
-Do not migrate to 082 capacity-scope machinery here. If the existing
-body report needs one new field for chunked, add it. Otherwise keep the
-surface boring.
+Must prove:
+
+- high-water is decoded bytes resident in Tina;
+- malformed chunk increments body error counter;
+- body cap/full/timeout counters keep old meaning;
+- all charges drain after success;
+- all charges drain after parse error;
+- all charges drain after peer close/cancel.
+
+Do not migrate to 082 capacity reports here. If one field is needed,
+add one field. Otherwise leave metrics boring.
 
 ## Rock 6 — Specimen And Docs
 
-Update the HTTP body specimen so it shows both directions:
+Update `specimen_http_body_streaming`.
 
-- streaming download with known length;
-- streaming download with chunked response;
-- streaming upload with chunked request.
+It should show:
 
-The README should name the lesson:
+- known-length streaming download;
+- chunked streaming download;
+- chunked streaming upload.
+
+README lesson:
 
 ```text
 unknown length uses chunked.
 service still pulls chunks.
 Tina still bounds resident bytes.
+bad chunk is error.
 ```
 
-Update user guide / crate docs:
+Update docs/crate docs:
 
-- request body shapes;
-- response body shapes;
-- what chunked supports;
-- what is still deferred: trailers, compression, HTTP/2.
+- client chunked response support;
+- server chunked request support;
+- known vs unknown request body length;
+- deferred: trailers, compression, HTTP/2.
 
 ## Required Tests
 
-Minimum tests before merge:
-
-- shared decoder unit tests for happy, fragmented, malformed, cap
-  exceeded, missing terminator;
-- client chunked response integration test;
-- server chunked upload integration test;
-- body metrics drain/high-water test;
-- one HTTP/HTTPS parity test;
-- specimen smoke test.
-
-Run:
+Before PR:
 
 ```text
 cargo fmt --all --check
@@ -268,24 +276,32 @@ If docs changed:
 RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
 ```
 
+Minimum coverage:
+
+- decoder unit tests;
+- client integration tests;
+- server integration tests;
+- body metrics test;
+- one HTTPS parity test;
+- specimen smoke test.
+
 ## Hostile Review Checklist
 
-Ask before PR:
+Ask:
 
-- Did any path buffer the whole chunked body secretly?
-- Can malformed chunk input look like clean EOF?
-- Does unknown request length use an honest type, not `0`?
-- Do body metrics drain on every error path?
-- Does the client count decoded bytes, not wire bytes, against body
-  cap?
-- Did we accidentally accept trailers/extensions without deciding?
-- Are docs/specimen teaching the copied path?
+- Did any path buffer unbounded body bytes?
+- Can bad chunk input become clean EOF?
+- Did unknown length become `0` anywhere?
+- Are metrics counting decoded bytes, not framing bytes?
+- Do metrics drain on every error path?
+- Did we accept trailers/extensions by accident?
+- Does the specimen teach the copied path?
 
 ## Done Means
 
-- Tina HTTP client can consume chunked responses.
-- Tina HTTP server can receive chunked requests.
-- Chunked decoding is incremental and bounded.
-- Bad chunked wire shapes are typed failures.
-- Metrics and tests prove resident body pressure stays bounded.
-- HTTP/1 body docs no longer say chunked is one-sided.
+- Client consumes chunked responses.
+- Server accepts chunked requests.
+- Decoder is shared, incremental, and bounded.
+- Bad chunked wire is a typed failure.
+- Metrics prove bounded resident body bytes.
+- Docs no longer say chunked is one-sided.
