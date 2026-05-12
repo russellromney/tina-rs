@@ -35,6 +35,9 @@ Ship:
 
 Keep it boring. Do not build a global memory manager.
 
+One PR is preferred. Split only if public capacity names need review before
+the bigger wiring lands.
+
 ## Non-Goals
 
 - exact heap measurement;
@@ -61,9 +64,18 @@ Write a tiny status note at the top of this file before coding:
 - which surface will get weight;
 - which two surfaces will share one scope.
 
+API home:
+
+- pure vocabulary in `tina::capacity`;
+- runtime collection/scope machinery in `tina-runtime::capacity`;
+- sim assertions in `tina-sim` only for sim-backed surfaces;
+- bridge/specimen code only adapts into shared report types.
+
+Do not invent a second capacity dialect.
+
 ## Rock 1: Weight Vocabulary
 
-Add a small public vocabulary, likely in `tina::capacity`.
+Add a small public vocabulary in `tina::capacity`.
 
 Shape:
 
@@ -78,7 +90,8 @@ Rules:
 - no automatic `size_of::<T>()` fallback;
 - weight means user-defined cost, often bytes;
 - reports call it weight, not memory;
-- weight full is distinct from count full.
+- weight full is distinct from count full;
+- zero weight is allowed only when documented.
 
 ## Rock 2: One Weighted Surface
 
@@ -90,13 +103,16 @@ real and user-visible.
 Acceptable alternative: bridge response/request payloads if HTTP is too
 messy.
 
+Do not pick a toy-only surface.
+
 Proof:
 
 - small payload fits;
 - oversized payload rejects with weight reason;
 - high-water weight is reported;
 - current weight returns to zero after read/drop/cancel/close;
-- count full and weight full are separate facts.
+- count full and weight full are separate facts;
+- report says which surface filled.
 
 ## Rock 3: Shard-Local Shared Scope
 
@@ -115,16 +131,19 @@ Rules:
 
 - no cross-shard scope;
 - no hidden global;
+- scope id/handle is runtime-issued, not user-forgeable;
 - scope has name, shard, max, current, high-water, full count;
 - claim/release is owned by the runtime/bridge/surface, not user memory;
-- release happens on dequeue/drop/cancel/close.
+- release happens on dequeue/drop/cancel/close;
+- close/shutdown releases outstanding claims or reports the leak.
 
 Proof:
 
 - two surfaces are each under local cap;
 - combined weight fills shared scope;
 - rejection names shared scope;
-- after release, new work admits.
+- after release, new work admits;
+- stale or unknown scope handles reject visibly if handles are public.
 
 ## Rock 4: Unbounded For Now
 
@@ -134,6 +153,8 @@ Required:
 
 - reason string;
 - default live expiry: 1 hour;
+- live expiry uses `Instant`;
+- sim expiry uses simulated time or steps, but is deterministic;
 - tests use tiny expiry;
 - appears in capacity summary;
 - production policy rejects;
@@ -149,7 +170,8 @@ Rules:
 
 - rejected by test/prod by default;
 - warning/event always visible where validation/reporting exists;
-- searchable ugly name is intentional.
+- searchable ugly name is intentional;
+- no-expiry mode is never the default constructor.
 
 Do not spread unbounded everywhere. One surface is enough.
 
@@ -177,6 +199,8 @@ Discovery formatter should show:
 - weight cap/current/high/full;
 - suggested next action.
 
+Failure messages name the surface/scope and observed numbers.
+
 ## Rock 6: Sim/DST Proof If Touched Surface Has Sim
 
 If the chosen weighted/shared surface exists in `tina-sim`, add replay
@@ -188,6 +212,7 @@ Minimum:
 - changed cap changes failure or report intentionally.
 
 If live-only, say so in this plan and add normal runtime tests instead.
+Do not claim DST proof for live-only code.
 
 ## Rock 7: Docs And One Specimen
 
@@ -212,13 +237,24 @@ Update one specimen that naturally shows this:
 
 The specimen should emit or assert a capacity summary.
 
+The README must show the copied path:
+
+```text
+run tuning load
+read high water
+choose fixed cap
+assert fixed cap in test
+```
+
 ## Proof Targets
 
 - weight trait/report unit tests;
 - weighted surface small/too-heavy/high-water/reclaim tests;
 - shared-scope aggregate-full/release/refill tests;
+- stale/unknown scope handle rejection if handles are public;
 - unbounded expiry test;
 - policy rejects unbounded in prod;
+- test/prod reject no-expiry escape by default;
 - assertion helper tests;
 - sim/DST capacity test if available;
 - one specimen smoke test.
@@ -231,7 +267,8 @@ Stop and report before broadening scope if:
 - exact heap memory measurement appears;
 - every surface needs conversion to prove one idea;
 - user-owned manual release becomes the common path;
-- `Full` gets hidden behind automatic retry.
+- `Full` gets hidden behind automatic retry;
+- sim proof starts requiring a fake live-clock rewrite.
 
 ## Landing Criteria
 
@@ -239,6 +276,20 @@ Stop and report before broadening scope if:
 - One shared shard-local scope works.
 - Unbounded is explicit, expiring, and policy-rejected.
 - Reports distinguish count, local weight, and shared weight.
+- `Full` names surface/scope and pressure kind.
 - Capacity current returns to zero after cancellation/close/drop for touched
   surfaces.
 - Docs teach how to tune from evidence.
+
+## Hostile Review Notes
+
+- Risk: fake memory accounting. Guardrail: say weight, never memory; require
+  user-declared weight.
+- Risk: shared scopes leak claims. Guardrail: prove release on
+  dequeue/drop/cancel/close and refill after release.
+- Risk: unbounded becomes normal. Guardrail: reason + expiry + policy reject +
+  ugly no-expiry name.
+- Risk: live-only HTTP work pretends to be DST. Guardrail: sim proof only for
+  sim-backed surfaces; otherwise say live-only.
+- Risk: scope creep. Guardrail: one weighted surface, one shared scope, one
+  specimen.
