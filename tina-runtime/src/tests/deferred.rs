@@ -63,6 +63,7 @@ impl Isolate for DeferredSvc {
     type Reply = SvcReply;
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -118,6 +119,7 @@ impl Isolate for DeferredCaller {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CallerMsg>;
     type Shard = TestShard;
 
@@ -266,6 +268,7 @@ fn panic_after_capture_drops_slot_and_closes_caller() {
         type Reply = SvcReply;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 
@@ -382,6 +385,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         type Reply = u32;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 
@@ -414,6 +418,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<LocalCallerMsg>;
         type Shard = TestShard;
 
@@ -493,6 +498,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         type Reply = FrontendReply;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 
@@ -539,6 +545,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<FCallerMsg>;
         type Shard = TestShard;
 
@@ -649,6 +656,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         type Reply = FanReply;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 
@@ -703,6 +711,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<FanCallerMsg>;
         type Shard = TestShard;
 
@@ -801,6 +810,7 @@ impl Isolate for Worker {
     type Reply = WorkerReply;
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -843,6 +853,7 @@ impl Isolate for PoolFrontend {
     type Reply = FrontendReply;
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<FrontendMsg>;
     type Shard = TestShard;
 
@@ -908,6 +919,7 @@ impl Isolate for PoolCaller {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PoolCallerMsg>;
     type Shard = TestShard;
 
@@ -1027,6 +1039,7 @@ impl Isolate for FanoutTarget {
     type Reply = FanoutTargetReply;
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -1075,6 +1088,7 @@ impl Isolate for Coordinator {
     type Reply = AggregateReport;
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CoordMsg>;
     type Shard = TestShard;
 
@@ -1145,6 +1159,7 @@ impl Isolate for FanoutCaller {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<FanoutCallerMsg>;
     type Shard = TestShard;
 
@@ -1231,6 +1246,7 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
         type Reply = WorkerReply;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
         fn handle(
@@ -1323,6 +1339,7 @@ fn service_stop_drops_pending_promises_visibly() {
         type Reply = StopReply;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 
@@ -1360,6 +1377,7 @@ fn service_stop_drops_pending_promises_visibly() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<CallerStopMsg>;
         type Shard = TestShard;
 
@@ -1508,6 +1526,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         type Reply = HelpReply;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 
@@ -1550,6 +1569,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HelpCallerMsg>;
         type Shard = TestShard;
 
@@ -1623,6 +1643,7 @@ impl Isolate for BridgeWorker {
     type Reply = BridgeReply;
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -1671,6 +1692,7 @@ fn bridge_worker_routes_out_of_order_external_completions_to_callers() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<BCallerMsg>;
         type Shard = TestShard;
         fn handle(
@@ -1757,6 +1779,7 @@ fn bridge_worker_cancelled_caller_does_not_leak_slot() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<BCallerMsg2>;
         type Shard = TestShard;
         fn handle(
@@ -1852,6 +1875,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         type Reply = ActualReply;
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 
@@ -1912,6 +1936,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<WrongCallerMsg>;
         type Shard = TestShard;
         fn handle(

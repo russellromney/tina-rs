@@ -33,6 +33,7 @@ impl Isolate for Probe {
     type Reply = ProbeReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = tina::SingleShard;
 
@@ -69,6 +70,7 @@ impl Isolate for Db {
     type Reply = DbReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<DbMsg>;
     type Shard = tina::SingleShard;
 
@@ -110,6 +112,7 @@ impl Isolate for Service {
     type Reply = ServiceReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ServiceMsg>;
     type Shard = tina::SingleShard;
 
@@ -156,6 +159,7 @@ impl Isolate for Client {
     type Reply = ClientReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = tina::SingleShard;
 

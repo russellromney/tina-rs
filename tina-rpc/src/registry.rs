@@ -349,6 +349,7 @@ where
     type Reply = RouterReply;
     type Send = Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<RegistryMsg>;
     type Shard = S;
 

@@ -221,6 +221,7 @@ macro_rules! isolate_types {
         reply: $reply:ty,
         send: $send:ty,
         spawn: $spawn:ty,
+        spawn_observed: $spawn_observed:ty,
         call: $call:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -228,8 +229,27 @@ macro_rules! isolate_types {
         type Reply = $reply;
         type Send = $send;
         type Spawn = $spawn;
+        type SpawnObserved = $spawn_observed;
         type Call = $call;
         type Shard = $shard;
+    };
+    (
+        message: $message:ty,
+        reply: $reply:ty,
+        send: $send:ty,
+        spawn: $spawn:ty,
+        call: $call:ty,
+        shard: $shard:ty $(,)?
+    ) => {
+        $crate::isolate_types! {
+            message: $message,
+            reply: $reply,
+            send: $send,
+            spawn: $spawn,
+            spawn_observed: ::std::convert::Infallible,
+            call: $call,
+            shard: $shard,
+        }
     };
 }
 
@@ -259,6 +279,9 @@ pub trait Isolate: Sized {
     /// [`RestartableChildDefinition`] adds a repeatable factory for children
     /// that a runtime may restart later.
     type Spawn;
+
+    /// The payload produced by [`Effect::SpawnObserved`].
+    type SpawnObserved;
 
     /// The payload produced by [`Effect::Call`].
     ///
@@ -306,6 +329,10 @@ where
 
     /// Start a new isolate instance.
     Spawn(I::Spawn),
+
+    /// Start a new isolate instance and report the typed child reference back
+    /// to the parent as an ordinary later message.
+    SpawnObserved(I::SpawnObserved),
 
     /// Stop the current isolate.
     Stop,
@@ -394,6 +421,23 @@ where
     Effect::Spawn(child)
 }
 
+/// Returns a builder for a spawn request that reports the typed child
+/// reference back to the spawning parent as an ordinary later message.
+///
+/// Spawn construction rejections that can be known before a child exists are
+/// delivered through the continuation as [`SpawnObservedError`]. Delivery
+/// rejection for the continuation itself is traced like any other send
+/// rejection; the runtime does not create a hidden queue or bypass the
+/// parent's bounded mailbox to force that message through.
+pub fn spawn_observed<S>(
+    child: S,
+) -> SpawnObservedBuilder<S, <S as SpawnAddress>::Message, <S as SpawnAddress>::Reply>
+where
+    S: SpawnAddress,
+{
+    SpawnObservedBuilder::new(child)
+}
+
 /// Returns an effect that stops the current isolate.
 pub fn stop<I>() -> Effect<I>
 where
@@ -447,6 +491,7 @@ where
 /// #     type Message = (); type Reply = u32;
 /// #     type Send = Outbound<std::convert::Infallible>;
 /// #     type Spawn = std::convert::Infallible;
+/// #     type SpawnObserved = std::convert::Infallible;
 /// #     type Call = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
 /// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
@@ -1201,6 +1246,131 @@ where
     }
 }
 
+/// Typed reference to one child incarnation.
+///
+/// A `ChildRef` is not a liveness promise. It names the address and generation
+/// the runtime created for one child spawn. If the child restarts, this value is
+/// stale and sends through the old address close/reject like any stale address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChildRef<M, R = ()> {
+    /// Typed address for this child incarnation.
+    pub address: Address<M, R>,
+    /// Address generation for this child incarnation.
+    pub generation: AddressGeneration,
+}
+
+impl<M, R> ChildRef<M, R> {
+    /// Creates a child reference from a runtime-issued address.
+    pub const fn new(address: Address<M, R>) -> Self {
+        Self {
+            address,
+            generation: address.generation(),
+        }
+    }
+}
+
+/// Spawn-construction error delivered to a
+/// `spawn_observed(...).reply(...)` continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SpawnObservedError {
+    /// The child requested a zero-capacity mailbox.
+    ///
+    /// Plain [`spawn`] keeps its existing panic-on-zero behavior. The observed
+    /// form can report the rejection through its continuation before any child
+    /// is recorded.
+    ZeroMailboxCapacity,
+}
+
+/// Type-level child address information carried by supported spawn requests.
+pub trait SpawnAddress {
+    /// Child message type accepted by the spawned isolate.
+    type Message;
+    /// Child reply type produced by the spawned isolate.
+    type Reply;
+}
+
+impl SpawnAddress for std::convert::Infallible {
+    type Message = std::convert::Infallible;
+    type Reply = ();
+}
+
+impl<I> SpawnAddress for ChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}
+
+/// Result delivered by `spawn_observed(...).reply(...)`.
+pub type SpawnObservedResult<M, R = ()> = Result<ChildRef<M, R>, SpawnObservedError>;
+
+/// Continuation invoked by the runtime after an observed spawn is processed.
+pub type SpawnObservedContinuation<P, M, R = ()> = Box<dyn FnOnce(SpawnObservedResult<M, R>) -> P>;
+
+/// Parts consumed by runtime adapters that understand observed spawn.
+pub type SpawnObservedParts<S, P, M, R = ()> = (S, SpawnObservedContinuation<P, M, R>);
+
+type SpawnObservedMarker<M, R> = PhantomData<fn() -> (M, R)>;
+
+/// Builder returned by [`spawn_observed`].
+#[must_use = "a spawn_observed request has no effect until returned as an Effect"]
+#[derive(Debug)]
+pub struct SpawnObservedBuilder<S, M, R = ()> {
+    spawn: S,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, M, R> SpawnObservedBuilder<S, M, R> {
+    const fn new(spawn: S) -> Self {
+        Self {
+            spawn,
+            marker: PhantomData,
+        }
+    }
+
+    /// Maps the runtime's later child-start result into a parent message.
+    pub fn reply<I, P, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+    {
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(continuation),
+            marker: PhantomData,
+        })
+    }
+}
+
+/// Spawn request plus continuation for delivering a typed child reference.
+#[must_use = "a spawn_observed request has no effect until returned as an Effect"]
+pub struct SpawnObserved<S, P, M, R = ()> {
+    spawn: S,
+    continuation: SpawnObservedContinuation<P, M, R>,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, P, M, R> std::fmt::Debug for SpawnObserved<S, P, M, R>
+where
+    S: std::fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnObserved")
+            .field("spawn", &self.spawn)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, P, M, R> SpawnObserved<S, P, M, R> {
+    /// Consumes this request into its spawn payload and continuation.
+    pub fn into_parts(self) -> SpawnObservedParts<S, P, M, R> {
+        (self.spawn, self.continuation)
+    }
+}
+
 /// A restartable spawn request backed by a repeatable isolate factory.
 ///
 /// Use [`ChildDefinition`] when a child only needs to be created once. Use
@@ -1278,6 +1448,14 @@ pub type RestartableChildParts<I> = (
     usize,
     Option<Box<dyn Fn() -> <I as Isolate>::Message>>,
 );
+
+impl<I> SpawnAddress for RestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}
 
 /// Logical identifier for a shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1564,6 +1742,7 @@ pub enum DeferredSlotState {
 /// #     type Message = (); type Reply = u32;
 /// #     type Send = Outbound<std::convert::Infallible>;
 /// #     type Spawn = std::convert::Infallible;
+/// #     type SpawnObserved = std::convert::Infallible;
 /// #     type Call = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
 /// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
@@ -2181,11 +2360,12 @@ pub mod runtime_internal {
 /// Common imports for ordinary Tina application code.
 pub mod prelude {
     pub use crate::{
-        Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition, Context,
-        Deadline, DeferredReply, Effect, Isolate, IsolateId, Outbound, PendingCallSet,
-        PendingCallSetInsertError, RequestContext, RestartableChildDefinition, Shard, ShardId,
-        SingleShard, batch, isolate, isolate_types, noop, reply, reply_to, reply_to_request,
-        restart_children, send, sequence, spawn, stop, stop_with,
+        Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition,
+        ChildRef, Context, Deadline, DeferredReply, Effect, Isolate, IsolateId, Outbound,
+        PendingCallSet, PendingCallSetInsertError, RequestContext, RestartableChildDefinition,
+        Shard, ShardId, SingleShard, SpawnObservedError, batch, isolate, isolate_types, noop,
+        reply, reply_to, reply_to_request, restart_children, send, sequence, spawn, spawn_observed,
+        stop, stop_with,
     };
 }
 

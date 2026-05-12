@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tina::{
     AddressGeneration, Context, DeferredReplyHandle, Effect, Isolate, IsolateId, MessageCaller,
-    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, TrySendError,
+    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, SpawnObservedError, TrySendError,
 };
 use tina_runtime::{
     CallId, CallInput, CallKind, CallOutcome, CallOutput, EffectKind, ListenerId,
@@ -388,6 +388,14 @@ where
     S: Shard,
 {
     fn spawn(self: Box<Self>, sim: &mut Simulator<S>, parent: IsolateId) -> SpawnOutcome<S>;
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S>, SpawnObservedError> {
+        Ok(self.spawn(sim, parent))
+    }
 }
 
 pub(crate) trait ErasedRestartRecipe<S>
@@ -404,6 +412,24 @@ where
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S>>;
 }
 
+pub(crate) trait ErasedSpawnObserved<S>
+where
+    S: Shard,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S>;
+}
+
+pub(crate) trait IntoErasedSpawnObserved<S, ParentMessage>
+where
+    S: Shard,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S>>;
+}
+
 pub(crate) struct HandlerAdapter<I, Outbound>
 where
     I: Isolate,
@@ -417,6 +443,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -451,6 +478,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -469,6 +497,9 @@ where
             })
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::SpawnObserved(spawn) => {
+            ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
         // Sim has no host result waiter surface; StopWith stops the isolate
         // and drops the value. Trace still distinguishes via EffectKind.
@@ -595,6 +626,7 @@ where
     Reply(Box<dyn Any>),
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S>>),
+    SpawnObserved(Box<dyn ErasedSpawnObserved<S>>),
     Stop,
     StopWith,
     RestartChildren,
@@ -616,6 +648,7 @@ where
             Self::Reply(_) => EffectKind::Reply,
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
+            Self::SpawnObserved(_) => EffectKind::SpawnObserved,
             Self::Stop => EffectKind::Stop,
             Self::StopWith => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
@@ -720,6 +753,14 @@ where
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S>>>,
     pub(crate) bootstrap_message: Option<Box<dyn Any>>,
+}
+
+pub(crate) struct SpawnObservedOutcome<S>
+where
+    S: Shard,
+{
+    pub(crate) spawn: Option<SpawnOutcome<S>>,
+    pub(crate) continuation: Option<Box<dyn Any>>,
 }
 
 pub(crate) struct ChildRecord<S>

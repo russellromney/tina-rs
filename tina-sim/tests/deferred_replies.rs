@@ -49,6 +49,7 @@ impl Isolate for DeferredSvc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SvcMsg>;
     type Shard = DefShard;
 
@@ -91,6 +92,7 @@ impl Isolate for Caller {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CallerMsg>;
     type Shard = DefShard;
 
@@ -234,6 +236,7 @@ fn sim_panic_after_capture_drops_slot_and_closes_caller() {
         type Reply = SvcReply;
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SvcMsg>;
         type Shard = DefShard;
 
@@ -296,6 +299,7 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Reply = HaltReply;
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HaltMsg>;
         type Shard = DefShard;
 
@@ -329,6 +333,7 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HCallerMsg>;
         type Shard = DefShard;
         fn handle(

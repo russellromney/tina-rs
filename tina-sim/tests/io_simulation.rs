@@ -62,6 +62,7 @@ impl Isolate for Connection {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = TestShard;
 
@@ -116,6 +117,7 @@ impl Isolate for Client {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = TestShard;
 
@@ -225,6 +227,7 @@ impl Isolate for FileClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<FileClientMsg>;
     type Shard = TestShard;
 
@@ -363,6 +366,7 @@ impl Isolate for UdpClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<UdpClientMsg>;
     type Shard = TestShard;
 
@@ -445,6 +449,7 @@ impl Isolate for DnsProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<DnsProbeMsg>;
     type Shard = TestShard;
 
@@ -504,6 +509,7 @@ impl Isolate for TlsProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TlsProbeMsg>;
     type Shard = TestShard;
 
@@ -589,6 +595,7 @@ impl Isolate for TlsServerProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TlsServerProbeMsg>;
     type Shard = TestShard;
 
@@ -661,6 +668,7 @@ impl Isolate for PathProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PathProbeMsg>;
     type Shard = TestShard;
 
@@ -749,6 +757,7 @@ impl Isolate for SignalProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SignalProbeMsg>;
     type Shard = TestShard;
 
@@ -798,6 +807,7 @@ impl Isolate for ProcessProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProcessProbeMsg>;
     type Shard = TestShard;
 
@@ -846,6 +856,7 @@ impl Isolate for UdpProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<UdpProbeMsg>;
     type Shard = TestShard;
 
@@ -967,6 +978,7 @@ impl Isolate for Listener {
     type Reply = ();
     type Send = Outbound<ListenerMsg>;
     type Spawn = RestartableChildDefinition<Connection>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ListenerMsg>;
     type Shard = TestShard;
 
@@ -1080,6 +1092,7 @@ impl Isolate for Binder {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BinderMsg>;
     type Shard = TestShard;
 
@@ -1133,6 +1146,7 @@ impl Isolate for Probe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = TestShard;
 
@@ -1214,6 +1228,7 @@ impl Isolate for Waiter {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WaiterMsg>;
     type Shard = TestShard;
 
@@ -1269,6 +1284,7 @@ impl Isolate for PeerAwareAcceptor {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PeerAwareAcceptMsg>;
     type Shard = TestShard;
 
@@ -1320,6 +1336,7 @@ impl Isolate for ReadProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ReadProbeMsg>;
     type Shard = TestShard;
 
@@ -1375,6 +1392,7 @@ impl Isolate for WriteProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WriteProbeMsg>;
     type Shard = TestShard;
 
@@ -1427,6 +1445,7 @@ impl Isolate for ListenerCloser {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
@@ -1464,6 +1483,7 @@ impl Isolate for StreamCloser {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 

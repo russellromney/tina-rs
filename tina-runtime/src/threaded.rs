@@ -35,7 +35,10 @@ use crate::mailbox::MailboxFactory;
 use crate::observation::{self, BoundAddressWaiter};
 use crate::observer::TraceObserver;
 use crate::trace::{CallKind, RuntimeEvent};
-use crate::{IdSource, IntoErasedSpawn, PreallocationConfig, Runtime, TraceRetention};
+use crate::{
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, PreallocationConfig, Runtime,
+    TraceRetention,
+};
 
 /// Configuration for [`ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +329,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -352,6 +356,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,

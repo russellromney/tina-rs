@@ -844,6 +844,7 @@ where
     type Reply = WorkerPoolReply<H>;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = Infallible;
     type Call = RuntimeCall<WorkerPoolMsg<H>>;
     type Shard = S;
 

@@ -36,6 +36,7 @@ impl Isolate for Driver {
     type Reply = ();
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
@@ -64,6 +65,7 @@ impl Isolate for Protocol {
     type Reply = ();
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
@@ -89,6 +91,7 @@ impl Isolate for Trigger {
     type Reply = ();
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
@@ -116,6 +119,7 @@ impl Isolate for Watcher {
     type Reply = ();
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
@@ -150,6 +154,7 @@ impl Isolate for Sink {
     type Reply = ();
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SimMsg>;
     type Shard = TestShard;
 
