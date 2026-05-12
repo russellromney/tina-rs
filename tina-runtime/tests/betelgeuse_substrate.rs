@@ -1441,6 +1441,7 @@ enum CallObservation {
     Replied,
     Full,
     Closed,
+    Rejected,
     Timeout,
 }
 
@@ -1473,6 +1474,7 @@ impl Isolate for CallClient {
                     CallOutcome::Replied(_) => CallObservation::Replied,
                     CallOutcome::Full => CallObservation::Full,
                     CallOutcome::Closed => CallObservation::Closed,
+                    CallOutcome::Rejected(_) => CallObservation::Rejected,
                     CallOutcome::Timeout => CallObservation::Timeout,
                 };
                 self.observations

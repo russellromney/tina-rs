@@ -181,6 +181,7 @@ impl Router {
                     }
                     CallOutcome::Full => self.rejected.borrow_mut().push("full"),
                     CallOutcome::Closed => self.rejected.borrow_mut().push("closed"),
+                    CallOutcome::Rejected(_) => self.rejected.borrow_mut().push("rejected"),
                     CallOutcome::Timeout => self.rejected.borrow_mut().push("timeout"),
                 }
                 noop()

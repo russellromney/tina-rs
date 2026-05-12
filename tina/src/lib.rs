@@ -282,6 +282,20 @@ pub trait Isolate: Sized {
         msg: Self::Message,
         ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self>;
+
+    /// Handles one inbound call message and returns the next runtime effect.
+    ///
+    /// Plain sends enter [`handle`](Self::handle). Calls enter this method
+    /// with an explicit [`CallContext`], which must be consumed by replying,
+    /// rejecting, or promoting it into a [`RequestContext`]. The default
+    /// rejects callable traffic so a missing implementation never leaves the
+    /// caller waiting for a timeout.
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self>
+    where
+        Self::Reply: 'static,
+    {
+        call.reject(CallRejectedReason::UnsupportedMessage)
+    }
 }
 
 /// A closed set of actions that an [`Isolate`] may request from the runtime.
@@ -300,6 +314,9 @@ where
 
     /// Return a response to the current caller.
     Reply(I::Reply),
+
+    /// Reject the current call without an application reply.
+    Reject(CallRejectedReason),
 
     /// Deliver a typed message to another isolate.
     Send(I::Send),
@@ -376,6 +393,14 @@ where
     I: Isolate,
 {
     Effect::Reply(value)
+}
+
+/// Returns an effect that rejects the current call.
+pub fn reject<I>(reason: CallRejectedReason) -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Reject(reason)
 }
 
 /// Returns an effect that sends one typed message to another isolate.
@@ -869,11 +894,6 @@ where
     ///
     /// - [`TakeReplySlotError::NoCaller`]: the current message was a
     ///   plain send, or the slot was already taken on this turn.
-    /// - [`TakeReplySlotError::CrossShardUnsupported`]: the current
-    ///   call came from another shard. First-form deferred reply
-    ///   slots only support same-shard callers because caller-liveness
-    ///   sweep depends on the local pending-isolate-call table.
-    ///
     /// Capturing is irreversible: once taken, the runtime will not also
     /// honor an [`Effect::Reply`] for the same call. Returning
     /// `Effect::Reply` after `take_reply_slot` is a no-op against the
@@ -902,13 +922,8 @@ where
     where
         R: 'static,
     {
-        // Peek routing first so a Remote refusal does not consume the caller.
-        match self.caller.as_ref().map(|c| c.routing()) {
-            None => return Err(TakeReplySlotError::NoCaller),
-            Some(CallRouting::Remote { .. }) => {
-                return Err(TakeReplySlotError::CrossShardUnsupported);
-            }
-            Some(CallRouting::Local) => {}
+        if self.caller.is_none() {
+            return Err(TakeReplySlotError::NoCaller);
         }
         let caller = self.caller.take().expect("checked above");
         let handle = caller.capture();
@@ -1017,6 +1032,85 @@ where
     {
         Effect::Send(Outbound::new(self.me(), message))
     }
+}
+
+/// The explicit reply authority for one call handler turn.
+///
+/// A send handler receives only [`Context`]. A call handler receives a
+/// `CallContext`, making the caller authority visible at the type boundary.
+/// Consume it with [`reply`](Self::reply), [`reject`](Self::reject), or
+/// [`into_request_context`](Self::into_request_context).
+#[must_use = "a CallContext must be replied, rejected, or promoted into RequestContext"]
+#[derive(Debug)]
+pub struct CallContext<'a, I>
+where
+    I: Isolate,
+{
+    ctx: Context<'a, I::Shard, I::Reply>,
+    _isolate: PhantomData<fn(I) -> I>,
+}
+
+impl<'a, I> CallContext<'a, I>
+where
+    I: Isolate,
+{
+    /// Runtime-only constructor.
+    #[doc(hidden)]
+    pub fn new(ctx: Context<'a, I::Shard, I::Reply>) -> Self {
+        Self {
+            ctx,
+            _isolate: PhantomData,
+        }
+    }
+
+    /// Replies to the caller.
+    pub fn reply(self, value: I::Reply) -> Effect<I> {
+        Effect::Reply(value)
+    }
+
+    /// Rejects the caller with a runtime-level reason.
+    pub fn reject(self, reason: CallRejectedReason) -> Effect<I> {
+        Effect::Reject(reason)
+    }
+
+    /// Carries the caller authority into a later handler turn.
+    pub fn into_request_context(mut self) -> RequestContext<I::Reply>
+    where
+        I::Reply: 'static,
+    {
+        self.ctx
+            .take_request_context()
+            .expect("CallContext always carries a caller authority")
+    }
+
+    /// Returns the identifier of the shard currently executing the handler.
+    pub fn shard_id(&self) -> ShardId {
+        self.ctx.shard_id()
+    }
+
+    /// Builds an [`Address`] for the currently executing isolate.
+    pub fn me(&self) -> Address<I::Message, I::Reply> {
+        Address::new(self.shard_id(), self.ctx.isolate_id()).with_reply::<I::Reply>()
+    }
+
+    /// Returns an effect that sends one message back to the current isolate.
+    pub fn send_self<M>(&self, message: M) -> Effect<I>
+    where
+        I: Isolate<Message = M, Send = Outbound<M>>,
+    {
+        Effect::Send(Outbound::new(self.me(), message))
+    }
+}
+
+/// Runtime-level reason a call was rejected without an application reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallRejectedReason {
+    /// The callee returned without consuming the call authority.
+    ReplyAbandoned,
+    /// The callee panicked before consuming the call authority.
+    HandlerPanicked,
+    /// The callee has no call handler for this message shape.
+    UnsupportedMessage,
 }
 
 /// Typed address for one isolate mailbox incarnation.
@@ -1396,8 +1490,7 @@ impl<R> DeferredReply<R> {
 /// or keep using [`Context::take_reply_slot`] for the same underlying
 /// slot. Both return the same primitive; the name signals intent.
 ///
-/// Cross-shard request context is unsupported in the first form; see
-/// [`TakeReplySlotError::CrossShardUnsupported`].
+#[must_use = "a RequestContext must eventually be replied to or intentionally dropped"]
 #[derive(Debug)]
 pub struct RequestContext<R>(DeferredReply<R>);
 
@@ -1918,10 +2011,8 @@ pub enum TakeReplySlotError {
     /// The current message has no caller, or the slot was already taken
     /// on this turn.
     NoCaller,
-    /// The current call came from a different shard. First-form
-    /// deferred reply slots only support same-shard callers because
-    /// caller-liveness sweep depends on the local pending-isolate-call
-    /// table.
+    /// Reserved for runtimes that cannot carry a remote caller as a
+    /// deferred reply slot.
     CrossShardUnsupported,
 }
 
@@ -1963,8 +2054,7 @@ impl MessageCaller {
         }
     }
 
-    /// Returns the current call's routing kind. Used by
-    /// [`Context::take_reply_slot`] to refuse cross-shard captures.
+    /// Returns the current call's routing kind.
     pub fn routing(&self) -> CallRouting {
         self.routing
     }

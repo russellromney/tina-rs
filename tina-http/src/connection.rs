@@ -1074,7 +1074,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                     None => close,
                 }
             }
-            CallOutcome::Full | CallOutcome::Closed => {
+            CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
                 // Source died mid-stream. Close the wire — the
                 // client sees a truncated body relative to the
                 // framing. We do not try to inject an error
@@ -1353,7 +1353,8 @@ fn response_for_call_error(error: &CallError) -> HttpResponse {
         | CallError::SignalClosed
         | CallError::ProcessFull
         | CallError::ProcessClosed
-        | CallError::KillUncertain => StatusCode::INTERNAL_SERVER_ERROR,
+        | CallError::KillUncertain
+        | CallError::Rejected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     HttpResponse::with_status(status)
 }
@@ -1374,6 +1375,9 @@ pub fn response_for_call_outcome(outcome: &CallOutcome<HttpResponse>) -> Option<
         CallOutcome::Full => Some(HttpResponse::with_status(StatusCode::SERVICE_UNAVAILABLE)),
         CallOutcome::Closed => Some(HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR)),
         CallOutcome::Timeout => Some(HttpResponse::with_status(StatusCode::GATEWAY_TIMEOUT)),
+        CallOutcome::Rejected(_) => {
+            Some(HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR))
+        }
     }
 }
 

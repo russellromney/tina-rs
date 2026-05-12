@@ -782,6 +782,7 @@ where
         CallOutcome::Timeout => Err(AcquireFailure::CallTimeout),
         CallOutcome::Full => Err(AcquireFailure::CallFull),
         CallOutcome::Closed => Err(AcquireFailure::CallClosed),
+        CallOutcome::Rejected(reason) => Err(AcquireFailure::CallRejected(reason)),
     }
 }
 
@@ -814,6 +815,7 @@ where
         CallOutcome::Timeout => Err(ReleaseFailure::CallTimeout),
         CallOutcome::Full => Err(ReleaseFailure::CallFull),
         CallOutcome::Closed => Err(ReleaseFailure::CallClosed),
+        CallOutcome::Rejected(reason) => Err(ReleaseFailure::CallRejected(reason)),
     }
 }
 

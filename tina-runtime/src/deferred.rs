@@ -24,12 +24,6 @@ pub(crate) enum DeferredRouting {
     /// Caller lives on another shard. Reply travels through the remote
     /// reply path.
     ///
-    /// Reserved: first form refuses cross-shard captures at
-    /// `Context::take_reply_slot`, so this variant is currently
-    /// unreachable from user code. The runtime keeps the shape so a
-    /// later phase can lift the restriction without churning the
-    /// type vocabulary.
-    #[allow(dead_code)]
     Remote {
         requester: crate::RegisteredAddress,
         cause: crate::CauseId,

@@ -99,6 +99,7 @@ impl Isolate for Proxy {
                     CallOutcome::Replied(Err(_)) => HttpResponse::bad_gateway(),
                     CallOutcome::Full => HttpResponse::service_unavailable(),
                     CallOutcome::Closed => HttpResponse::internal_error(),
+                    CallOutcome::Rejected(_) => HttpResponse::internal_error(),
                     CallOutcome::Timeout => HttpResponse::gateway_timeout(),
                 };
                 reply(response)

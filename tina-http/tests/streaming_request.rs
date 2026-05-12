@@ -107,7 +107,10 @@ impl Isolate for Consumer {
                     self.pending_source = None;
                     reply(HttpResponse::internal_error())
                 }
-                CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => {
+                CallOutcome::Full
+                | CallOutcome::Closed
+                | CallOutcome::Rejected(_)
+                | CallOutcome::Timeout => {
                     self.pending_source = None;
                     reply(HttpResponse::internal_error())
                 }
@@ -567,7 +570,10 @@ impl Isolate for NotifyingConsumer {
                     self.pending_source = None;
                     reply(HttpResponse::internal_error())
                 }
-                CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => {
+                CallOutcome::Full
+                | CallOutcome::Closed
+                | CallOutcome::Rejected(_)
+                | CallOutcome::Timeout => {
                     self.pending_source = None;
                     reply(HttpResponse::internal_error())
                 }

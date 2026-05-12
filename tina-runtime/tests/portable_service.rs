@@ -241,6 +241,15 @@ impl Router {
                     );
                     noop()
                 }
+                CallOutcome::Rejected(reason) => {
+                    self.observed.lock().expect("router observed lock").push(
+                        ServiceObservation::Rejected {
+                            key: request.key,
+                            reason: format!("rejected:{reason:?}"),
+                        },
+                    );
+                    noop()
+                }
                 CallOutcome::Timeout => {
                     self.observed.lock().expect("router observed lock").push(
                         ServiceObservation::Rejected {
@@ -542,6 +551,10 @@ impl ReadinessService {
                 self.record_rejection(50, "worker-closed");
                 noop()
             }
+            ReadinessMsg::Worker(CallOutcome::Rejected(reason)) => {
+                self.record_rejection(50, format!("worker-rejected:{reason:?}"));
+                noop()
+            }
             ReadinessMsg::Worker(CallOutcome::Timeout) => {
                 self.record_rejection(50, "worker-timeout");
                 noop()
@@ -691,6 +704,10 @@ impl AuditedClient {
                     CallOutcome::Closed => ServiceObservation::Rejected {
                         key: request.key,
                         reason: "worker-closed".to_string(),
+                    },
+                    CallOutcome::Rejected(reason) => ServiceObservation::Rejected {
+                        key: request.key,
+                        reason: format!("worker-rejected:{reason:?}"),
                     },
                     CallOutcome::Timeout => ServiceObservation::Rejected {
                         key: request.key,

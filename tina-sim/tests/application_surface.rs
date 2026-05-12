@@ -237,6 +237,7 @@ impl Connection {
                         b"worker-full".to_vec()
                     }
                     CallOutcome::Closed => b"worker-closed".to_vec(),
+                    CallOutcome::Rejected(_) => b"worker-rejected".to_vec(),
                     CallOutcome::Timeout => {
                         self.observations.borrow_mut().push(Observation::Timeout);
                         b"worker-timeout".to_vec()

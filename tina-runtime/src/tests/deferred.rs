@@ -1105,6 +1105,7 @@ impl Isolate for Coordinator {
                     CallOutcome::Timeout => TargetOutcome::Timeout,
                     CallOutcome::Closed => TargetOutcome::Closed,
                     CallOutcome::Full => TargetOutcome::Full,
+                    CallOutcome::Rejected(_) => TargetOutcome::Closed,
                 };
                 if self.collected[idx].is_none() {
                     self.collected[idx] = Some(mapped);

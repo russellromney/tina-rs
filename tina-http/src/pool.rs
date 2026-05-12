@@ -112,6 +112,7 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                    CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
                 reply(result)
             }

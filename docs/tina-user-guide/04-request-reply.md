@@ -78,13 +78,15 @@ caller handles timeout
 > a hidden async stack, and it does not automatically carry the original caller
 > into later handler turns.
 >
-> If a service must call something else before answering its caller, capture the
-> caller first:
+> If a service must call something else before answering its caller, consume the
+> call authority by promoting it first:
 >
 > ```rust
-> let request = ctx.take_request_context().expect("message came from call");
+> fn handle_call(&mut self, msg: ServiceMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+>     let request = call_ctx.into_request_context();
 > call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
 >     .reply_with_request(request, ServiceMsg::WorkerReturned)
+> }
 > ```
 >
 > Then consume that request context in the final turn:
@@ -95,9 +97,10 @@ caller handles timeout
 > }
 > ```
 >
-> If the handler just returns a runtime call and later does `reply(...)` from
-> the continuation message, the original caller is not there. The caller will
-> wait until timeout, and Tina will emit a diagnostic abandoned-call trace event.
+> If a call handler ignores its `CallContext`, Tina immediately completes the
+> caller with `CallOutcome::Rejected(CallRejectedReason::ReplyAbandoned)`.
+> The handler's returned effect still runs; it just no longer has caller
+> authority.
 
 ## Deferred Reply
 
@@ -106,7 +109,7 @@ A service can reply after more than one handler turn.
 Common shape:
 
 ```rust
-use tina::{RequestContext, reply_to_request};
+use tina::{CallContext, CallRejectedReason, RequestContext, noop, reply_to_request};
 
 #[derive(Debug, Clone)]
 enum ServiceMsg {
@@ -116,15 +119,9 @@ enum ServiceMsg {
 
 #[tina_runtime::isolate(message = ServiceMsg, reply = StoreReply, shard = AppShard)]
 impl StoreService {
-    fn handle(&mut self, msg: ServiceMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ServiceMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ServiceMsg::Store(req) => {
-                let request = ctx.take_request_context().expect("Store is call-shaped");
-                journal_append(self.journal.clone(), req.bytes.clone())
-                    .reply_with_request(request, |request, result| {
-                        ServiceMsg::Journaled(request, result, req)
-                    })
-            }
+            ServiceMsg::Store(_) => noop(),
 
             ServiceMsg::Journaled(request, Ok(()), req) => {
                 self.apply(req);
@@ -133,6 +130,21 @@ impl StoreService {
 
             ServiceMsg::Journaled(request, Err(_), _req) => {
                 reply_to_request(request, StoreReply::Failed)
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: ServiceMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ServiceMsg::Store(req) => {
+                let request = call_ctx.into_request_context();
+                journal_append(self.journal.clone(), req.bytes.clone())
+                    .reply_with_request(request, |request, result| {
+                        ServiceMsg::Journaled(request, result, req)
+                    })
+            }
+            ServiceMsg::Journaled(_, _, _) => {
+                call_ctx.reject(CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -162,7 +174,7 @@ It is the same primitive as `DeferredReply` but the type name tells readers
 what to expect.
 
 ```rust
-use tina::{Context, Effect, Isolate, noop, reply_to_request};
+use tina::{CallContext, CallRejectedReason, Context, Effect, Isolate, noop, reply_to_request};
 use tina_runtime::{call, CallOutcome};
 
 #[derive(Debug, Clone)]
@@ -175,19 +187,25 @@ enum SvcMsg {
 # impl Isolate for Svc {
 #   type Message = SvcMsg;
 #   type Reply = SvcReply;
-#   fn handle(&mut self, msg: SvcMsg, ctx: &mut Context) -> Effect<Self> {
+#   fn handle(&mut self, msg: SvcMsg, _ctx: &mut Context) -> Effect<Self> {
 #     match msg {
-#       SvcMsg::Start => {
-#         let req = ctx.take_request_context().unwrap();
-#         call(self.probe, ProbeMsg, Duration::from_millis(50))
-#             .reply_with_request(req, SvcMsg::ProbeResult)
-#       }
+#       SvcMsg::Start => noop(),
 #       SvcMsg::ProbeResult(req, outcome) => {
 #         match outcome {
 #           CallOutcome::Replied(ProbeReply(v)) if v >= 10 => reply_to_request(req, SvcReply::Ready),
 #           _ => reply_to_request(req, SvcReply::NotReady),
 #         }
 #       }
+#     }
+#   }
+#   fn handle_call(&mut self, msg: SvcMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+#     match msg {
+#       SvcMsg::Start => {
+#         let req = call_ctx.into_request_context();
+#         call(self.probe, ProbeMsg, Duration::from_millis(50))
+#             .reply_with_request(req, SvcMsg::ProbeResult)
+#       }
+#       SvcMsg::ProbeResult(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
 #     }
 #   }
 # }

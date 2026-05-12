@@ -796,6 +796,7 @@ fn seeded_random_cross_shard_call_histories_replay_and_cover_reply_paths() {
                 CallOutcome::Timeout => saw_timeout = true,
                 CallOutcome::Full => saw_full = true,
                 CallOutcome::Closed => saw_closed = true,
+                CallOutcome::Rejected(_) => saw_closed = true,
             }
         }
 

@@ -272,6 +272,7 @@ impl Isolate for StreamingConsumer {
                 CallOutcome::Replied(RequestChunkReply::Error(_))
                 | CallOutcome::Full
                 | CallOutcome::Closed
+                | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
                     reply(HttpResponse::internal_error())

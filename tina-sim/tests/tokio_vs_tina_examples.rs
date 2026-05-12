@@ -310,7 +310,8 @@ impl Client {
                         | CallError::TlsHandshake
                         | CallError::ProcessFull
                         | CallError::ProcessClosed
-                        | CallError::KillUncertain,
+                        | CallError::KillUncertain
+                        | CallError::Rejected(_),
                     ) => push(&self.events, "unexpected_call_error"),
                 }
                 noop()
