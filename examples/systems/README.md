@@ -31,6 +31,9 @@ cheap stress stories for the framework.
 - Prefer one readable app over perfect feature parity.
 - Every queue, pool, body, pending set, and bridge needs a cap.
 - Every cap should be reported or easy to inspect.
+- Every completed system needs at least one smoke test that actually
+  runs.
+- Each system README must show the exact smoke-test command.
 - README is where feelings go.
 - If a needed Tina feature does not exist, do not build it inside the
   system. Use the smallest stand-in, or stop and write the finding.
@@ -154,6 +157,8 @@ Then pick based on pain:
 - Do not hide bad Tina code in helper modules before writing the
   finding down.
 - Do not claim production readiness from a passing smoke test.
+- Do not merge a completed system with only prose and no runnable
+  proof.
 
 System specimens exist to make Tina complain loudly while the code is
 still cheap to change.
