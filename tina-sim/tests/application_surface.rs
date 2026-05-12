@@ -105,6 +105,17 @@ impl Worker {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Boot => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            WorkerMsg::Echo(bytes) => call.reply(WorkerReply(bytes)),
+            WorkerMsg::NoReply => {
+                self.held = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

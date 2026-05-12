@@ -92,6 +92,15 @@ struct Slot {
     method: String,
 }
 
+struct Delivery {
+    request_context: Option<RequestContext<ReqwestResult>>,
+    per_attempt_timeout: Duration,
+    attempts_remaining: u8,
+    retry_delay: Duration,
+    saved_request: Option<ReqwestRequest>,
+    method: String,
+}
+
 /// Bounded outbound HTTP worker around reqwest.
 ///
 /// Owns a [`reqwest::Client`] and a [`tokio::runtime::Handle`]. The
@@ -481,12 +490,14 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 abort,
             } => match receiver.try_recv() {
                 Ok(result) => self.deliver(
-                    request_context,
-                    per_attempt_timeout,
-                    attempts_remaining,
-                    retry_delay,
-                    saved_request,
-                    method,
+                    Delivery {
+                        request_context,
+                        per_attempt_timeout,
+                        attempts_remaining,
+                        retry_delay,
+                        saved_request,
+                        method,
+                    },
                     result,
                 ),
                 Err(oneshot::error::TryRecvError::Empty) => {
@@ -623,14 +634,18 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
 
     fn deliver(
         &mut self,
-        request_context: Option<RequestContext<ReqwestResult>>,
-        per_attempt_timeout: Duration,
-        attempts_remaining: u8,
-        retry_delay: Duration,
-        saved_request: Option<ReqwestRequest>,
-        method: String,
+        delivery: Delivery,
         result: Result<ReqwestResponse, ReqwestError>,
     ) -> Effect<Self> {
+        let Delivery {
+            request_context,
+            per_attempt_timeout,
+            attempts_remaining,
+            retry_delay,
+            saved_request,
+            method,
+        } = delivery;
+
         if let Err(err) = &result {
             if attempts_remaining > 0 {
                 if let (Some(saved), true) = (

@@ -75,6 +75,7 @@ struct Report {
 enum WorkerMsg {
     Do,
     Done(SleepReply),
+    DoneForCall(tina::RequestContext<WorkerReply>, SleepReply),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +94,21 @@ impl Worker {
             WorkerMsg::Do => sleep(Duration::from_millis(WORK_MS)).reply(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => {
+                let req = call.into_request_context();
+                sleep(Duration::from_millis(WORK_MS))
+                    .reply_with_request(req, WorkerMsg::DoneForCall)
+            }
+            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -352,6 +368,21 @@ impl SlowWorker {
             WorkerMsg::Do => sleep(Duration::from_millis(SLOW_WORK_MS)).reply(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => {
+                let req = call.into_request_context();
+                sleep(Duration::from_millis(SLOW_WORK_MS))
+                    .reply_with_request(req, WorkerMsg::DoneForCall)
+            }
+            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -369,6 +400,20 @@ impl FastWorker {
             WorkerMsg::Do => sleep(Duration::from_millis(5)).reply(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => {
+                let req = call.into_request_context();
+                sleep(Duration::from_millis(5)).reply_with_request(req, WorkerMsg::DoneForCall)
+            }
+            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }

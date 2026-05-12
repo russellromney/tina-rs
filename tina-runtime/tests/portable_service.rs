@@ -97,10 +97,16 @@ struct ServiceRequest {
     body: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum WorkerMsg {
     Work(ServiceRequest),
     Journaled(Result<(), CallError>, ServiceRequest, u64),
+    JournaledForCall(
+        tina::RequestContext<WorkerReply>,
+        Result<(), CallError>,
+        ServiceRequest,
+        u64,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +156,41 @@ impl DurableWorker {
                 })
             }
             WorkerMsg::Journaled(Err(error), _, _) => reply(WorkerReply::DurableFailure(error)),
+            WorkerMsg::JournaledForCall(req, Ok(()), request, index) => {
+                self.next_index = index + 1;
+                self.observed
+                    .lock()
+                    .expect("worker observed lock")
+                    .push(ServiceObservation::WorkerStored(request.key));
+                tina::reply_to_request(
+                    req,
+                    WorkerReply::Stored {
+                        key: request.key,
+                        body: request.body,
+                    },
+                )
+            }
+            WorkerMsg::JournaledForCall(req, Err(error), _, _) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(error))
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Work(request) => {
+                let req = call.into_request_context();
+                let index = self.next_index;
+                journal_append(
+                    self.journal_path.clone(),
+                    index,
+                    format!("{}:{}", request.key, request.body).into_bytes(),
+                )
+                .reply(move |result| WorkerMsg::JournaledForCall(req, result, request, index))
+            }
+            WorkerMsg::Journaled(_, _, _) | WorkerMsg::JournaledForCall(_, _, _, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -604,10 +645,15 @@ impl AuditSink {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum AuditedWorkerMsg {
     Work(ServiceRequest),
     AuditResult(ServiceRequest, SendOutcome),
+    AuditResultForCall(
+        tina::RequestContext<WorkerReply>,
+        ServiceRequest,
+        SendOutcome,
+    ),
 }
 
 #[derive(Debug)]
@@ -648,6 +694,43 @@ impl AuditedWorker {
             }
             AuditedWorkerMsg::AuditResult(_, SendOutcome::Closed) => {
                 reply(WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
+            AuditedWorkerMsg::AuditResultForCall(req, request, SendOutcome::Accepted) => {
+                self.observed
+                    .lock()
+                    .expect("audited worker observed lock")
+                    .push(ServiceObservation::WorkerStored(request.key));
+                tina::reply_to_request(
+                    req,
+                    WorkerReply::Stored {
+                        key: request.key,
+                        body: request.body,
+                    },
+                )
+            }
+            AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Full) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetFull))
+            }
+            AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Closed) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: AuditedWorkerMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            AuditedWorkerMsg::Work(request) => {
+                let req = call.into_request_context();
+                send_observed(self.audit, AuditMsg::Record(request.key)).reply(move |outcome| {
+                    AuditedWorkerMsg::AuditResultForCall(req, request, outcome)
+                })
+            }
+            AuditedWorkerMsg::AuditResult(_, _) | AuditedWorkerMsg::AuditResultForCall(_, _, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }

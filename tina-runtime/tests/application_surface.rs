@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use betelgeuse::IOLoop;
 use betelgeuse::io::simulated::{SimulatedConfig, SimulatedDelay, SimulatedIO};
-use tina::{Address, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
+use tina::{
+    Address, CallRejectedReason, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*,
+};
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallKind, CallOutcome, ListenerId, MailboxFactory,
     Runtime, RuntimeEvent, RuntimeEventKind, SendOutcome, SendRejectedReason, StreamId,
@@ -138,6 +140,7 @@ struct WorkerReply(Vec<u8>);
 struct Worker {
     observations: Observations,
     addresses: WorkerAddresses,
+    held_requests: Vec<RequestContext<WorkerReply>>,
 }
 
 #[tina_runtime::isolate(
@@ -165,6 +168,18 @@ impl Worker {
             }
             WorkerMsg::Echo(bytes) => reply(WorkerReply(bytes)),
             WorkerMsg::NoReply => noop(),
+            WorkerMsg::Panic => panic!("test worker panic"),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Boot => call.reject(CallRejectedReason::UnsupportedMessage),
+            WorkerMsg::Echo(bytes) => call.reply(WorkerReply(bytes)),
+            WorkerMsg::NoReply => {
+                self.held_requests.push(call.into_request_context());
+                noop()
+            }
             WorkerMsg::Panic => panic!("test worker panic"),
         }
     }
@@ -202,6 +217,7 @@ impl WorkerParent {
                         move || Worker {
                             observations: Arc::clone(&observations),
                             addresses: Arc::clone(&addresses),
+                            held_requests: Vec::new(),
                         },
                         self.capacities.worker_mailbox,
                     )

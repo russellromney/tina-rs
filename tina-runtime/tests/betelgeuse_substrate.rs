@@ -15,7 +15,7 @@ use betelgeuse::{
     AcceptCompletion, AcceptOp, ConnectCompletion, IO, IOFile, IOLoop, IOLoopHandle, IOSocket,
     OpenOptions, Operation, RecvCompletion, SendCompletion, io::simulated::SimulatedIO,
 };
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::{CallContext, Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallCompletionRejectedReason, CallInput, CallKind, CallOutcome, CallOutput,
     DriverRuntimeRequirement, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
@@ -1425,6 +1425,15 @@ impl Isolate for CallTarget {
             CallTargetMsg::Ask => {
                 *self.hits.lock().expect("hits mutex") += 1;
                 reply(CallReply)
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            CallTargetMsg::Ask => {
+                *self.hits.lock().expect("hits mutex") += 1;
+                call.reply(CallReply)
             }
         }
     }
