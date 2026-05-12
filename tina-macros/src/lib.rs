@@ -171,9 +171,34 @@ fn build_isolate(
     };
 
     let (msg_name, ctx_name) = validate_handle(&handle)?;
+    let handle_call_index = item.items.iter().position(
+        |candidate| matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_call"),
+    );
+    let handle_call = if let Some(index) = handle_call_index {
+        let ImplItem::Fn(method) = item.items.remove(index) else {
+            unreachable!("handle_call_index only matches functions")
+        };
+        Some(validate_handle_call(&method)?)
+    } else {
+        None
+    };
 
     let attrs = &handle.attrs;
     let body = &handle.block;
+    let handle_call_tokens = if let Some((attrs, msg_name, call_name, body)) = handle_call {
+        quote! {
+            #(#attrs)*
+            fn handle_call(
+                &mut self,
+                #msg_name: Self::Message,
+                #call_name: ::tina::CallContext<'_, Self>,
+            ) -> ::tina::Effect<Self> {
+                #body
+            }
+        }
+    } else {
+        quote! {}
+    };
     let remaining_impl = if item.items.is_empty() {
         quote! {}
     } else {
@@ -200,6 +225,8 @@ fn build_isolate(
             ) -> ::tina::Effect<Self> {
                 #body
             }
+
+            #handle_call_tokens
         }
     })
 }
@@ -255,6 +282,67 @@ fn validate_handle(handle: &ImplItemFn) -> Result<(syn::Ident, syn::Ident)> {
     Err(Error::new_spanned(
         &handle.sig,
         "handle must return `tina::Effect<Self>`",
+    ))
+}
+
+fn validate_handle_call(
+    handle_call: &ImplItemFn,
+) -> Result<(Vec<syn::Attribute>, syn::Ident, syn::Ident, Box<syn::Block>)> {
+    if handle_call.sig.asyncness.is_some() {
+        return Err(Error::new_spanned(
+            handle_call.sig.asyncness,
+            "Tina call handlers are synchronous; return an Effect instead of `async fn`",
+        ));
+    }
+
+    if handle_call.sig.constness.is_some() {
+        return Err(Error::new_spanned(
+            handle_call.sig.constness,
+            "Tina call handlers cannot be const",
+        ));
+    }
+
+    let inputs = &handle_call.sig.inputs;
+    if inputs.len() != 3 {
+        return Err(Error::new_spanned(
+            &handle_call.sig,
+            "expected `fn handle_call(&mut self, msg, call) -> Effect<Self>`",
+        ));
+    }
+
+    match inputs.first() {
+        Some(FnArg::Receiver(receiver))
+            if receiver.reference.is_some() && receiver.mutability.is_some() => {}
+        _ => {
+            return Err(Error::new_spanned(
+                &handle_call.sig,
+                "first handle_call argument must be `&mut self`",
+            ));
+        }
+    }
+
+    let msg_name = simple_argument_name(handle_call, 1, "msg")?;
+    let call_name = simple_argument_name(handle_call, 2, "call")?;
+
+    if handle_call.sig.generics.lt_token.is_some() {
+        return Err(Error::new_spanned(
+            &handle_call.sig.generics,
+            "handle_call cannot have its own generic parameters",
+        ));
+    }
+
+    if matches!(handle_call.sig.output, ReturnType::Default) {
+        return Err(Error::new_spanned(
+            &handle_call.sig,
+            "handle_call must return `tina::Effect<Self>`",
+        ));
+    }
+
+    Ok((
+        handle_call.attrs.clone(),
+        msg_name,
+        call_name,
+        Box::new(handle_call.block.clone()),
     ))
 }
 

@@ -2,9 +2,9 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{RequestContext, reply_to_request};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -23,15 +23,8 @@ enum EchoMsg {
 
 struct Echo;
 
-impl Isolate for Echo {
-    type Message = EchoMsg;
-    type Reply = u32;
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
-
+#[tina_runtime::isolate(message = EchoMsg, reply = u32, shard = TestShard)]
+impl Echo {
     fn handle(&mut self, msg: EchoMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
             EchoMsg::AddOne(value) => reply(value + 1),
@@ -53,15 +46,8 @@ enum SilentMsg {
 
 struct Silent;
 
-impl Isolate for Silent {
-    type Message = SilentMsg;
-    type Reply = u32;
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Call = RuntimeCall<SilentMsg>;
-    type Shard = TestShard;
-
+#[tina_runtime::isolate(message = SilentMsg, reply = u32, shard = TestShard)]
+impl Silent {
     fn handle(&mut self, msg: SilentMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
             SilentMsg::Start => noop(),
@@ -88,15 +74,8 @@ enum StopperMsg {
 
 struct Stopper;
 
-impl Isolate for Stopper {
-    type Message = StopperMsg;
-    type Reply = u32;
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Call = Infallible;
-    type Shard = TestShard;
-
+#[tina_runtime::isolate(message = StopperMsg, reply = u32, shard = TestShard)]
+impl Stopper {
     fn handle(&mut self, msg: StopperMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
             StopperMsg::Stop => stop(),
