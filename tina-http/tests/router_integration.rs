@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use http::{Method, StatusCode};
+use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, Router};
 use tina_runtime::{
@@ -48,6 +49,10 @@ impl Isolate for Service {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         reply(self.router.dispatch(&request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.router.dispatch(&request))
     }
 }
 

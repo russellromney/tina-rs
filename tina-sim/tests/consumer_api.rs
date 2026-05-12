@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tina::{
     Address, Context, DeferredReply, Effect, Isolate, Outbound, RestartBudget, RestartPolicy,
-    RestartableChildDefinition, Shard, ShardId, noop, reply, stop,
+    RestartableChildDefinition, Shard, ShardId, noop, stop,
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
@@ -459,21 +459,32 @@ impl Isolate for ReplyWorker {
     type Call = RuntimeCall<WorkerRequest>;
     type Shard = ConsumerShard;
 
+    fn handle_call(
+        &mut self,
+        msg: Self::Message,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            WorkerRequest::ReplyNow => call.reply(WorkerReply("pong")),
+            WorkerRequest::DoNotReply => {
+                // Hold the reply authority so the call stays pending
+                // until timeout. The abandoned-caller guard closes
+                // uncaptured callers immediately; keeping an explicit
+                // request context alive is the legitimate deferred path.
+                self.held = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+            WorkerRequest::Stop => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerRequest::ReplyNow => reply(WorkerReply("pong")),
-            WorkerRequest::DoNotReply => {
-                // Hold the reply slot so the call stays pending until
-                // timeout. The abandoned-caller guard closes uncaptured
-                // callers immediately; keeping the slot alive is the
-                // legitimate way to defer a reply indefinitely.
-                self.held = Some(ctx.take_reply_slot().unwrap());
-                noop()
-            }
+            WorkerRequest::ReplyNow | WorkerRequest::DoNotReply => noop(),
             WorkerRequest::Stop => stop(),
         }
     }

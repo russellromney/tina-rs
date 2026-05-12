@@ -12,7 +12,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tina::{DeferredReply, Outbound, batch, noop, send, spawn, stop};
+use tina::{CallContext, DeferredReply, Outbound, batch, noop, send, spawn, stop};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -2716,6 +2716,21 @@ impl Isolate for ManualCallTarget {
                 // callers immediately; keeping the slot alive is the
                 // legitimate way to defer a reply.
                 self.slot = Some(ctx.take_reply_slot().unwrap());
+                noop()
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ManualCallRequest::NoReply => {
+                // Hold the reply slot in isolate state so the call stays
+                // pending. The abandoned-caller guard closes uncaptured
+                // callers immediately; keeping the slot alive is the
+                // legitimate way to defer a reply.
+                self.slot = Some(tina::runtime_internal::request_context_into_deferred(
+                    call.into_request_context(),
+                ));
                 noop()
             }
         }

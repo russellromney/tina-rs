@@ -64,6 +64,7 @@ where
         CallOutcome::Full => translator(CallOutcome::Full),
         CallOutcome::Closed => translator(CallOutcome::Closed),
         CallOutcome::Timeout => translator(CallOutcome::Timeout),
+        CallOutcome::Rejected(reason) => translator(CallOutcome::Rejected(reason)),
     })
 }
 
@@ -1030,6 +1031,9 @@ pub enum CallError {
     /// The target isolate did not reply before the caller's timeout elapsed.
     Timeout,
 
+    /// The target isolate rejected the call without an application reply.
+    Rejected(tina::CallRejectedReason),
+
     /// The bounded DNS lane was full when the runtime tried to submit a lookup.
     DnsFull,
 
@@ -1103,6 +1107,9 @@ pub enum CallOutcome<T> {
 
     /// The target isolate did not reply before the timeout elapsed.
     Timeout,
+
+    /// The target isolate rejected the call without an application reply.
+    Rejected(tina::CallRejectedReason),
 }
 
 impl SendOutcome {
@@ -2361,6 +2368,7 @@ impl<T> CallOutcome<T> {
             Self::Full => Err(CallError::TargetFull),
             Self::Closed => Err(CallError::TargetClosed),
             Self::Timeout => Err(CallError::Timeout),
+            Self::Rejected(reason) => Err(CallError::Rejected(reason)),
         }
     }
 }

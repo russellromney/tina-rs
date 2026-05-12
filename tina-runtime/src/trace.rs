@@ -1,4 +1,4 @@
-use tina::{AddressGeneration, IsolateId, RestartPolicy, ShardId};
+use tina::{AddressGeneration, CallRejectedReason, IsolateId, RestartPolicy, ShardId};
 
 pub use crate::call::{CallError, CallId};
 
@@ -48,6 +48,9 @@ pub enum EffectKind {
 
     /// The handler returned [`tina::Effect::Reply`].
     Reply,
+
+    /// The handler returned [`tina::Effect::Reject`].
+    Reject,
 
     /// The handler returned [`tina::Effect::Send`].
     Send,
@@ -564,12 +567,21 @@ pub enum RuntimeEventKind {
 
     /// The runtime detected that a called handler returned without
     /// replying and without capturing the caller as a deferred reply
-    /// slot. This is a diagnostic warning only: the caller-side wait
-    /// remains pending and will still settle by its normal timeout or
-    /// lifecycle path.
+    /// slot. The caller-side wait is rejected immediately with
+    /// `ReplyAbandoned`.
     CallReplyAbandoned {
         /// The runtime-assigned identifier for the abandoned call.
         call_id: CallId,
+    },
+
+    /// The runtime rejected a call-side reply obligation for a reason
+    /// other than unused authority.
+    CallRejected {
+        /// The runtime-assigned identifier for the rejected call.
+        call_id: CallId,
+
+        /// Why the call was rejected.
+        reason: CallRejectedReason,
     },
 
     /// The runtime closed the caller-side wait of an in-flight isolate
@@ -1004,6 +1016,7 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::StopWith => 9,
         EffectKind::ReplyTo => 10,
         EffectKind::SpawnObserved => 11,
+        EffectKind::Reject => 12,
     }
 }
 
@@ -1094,6 +1107,11 @@ fn call_error_tag(error: CallError) -> u8 {
         CallError::ProcessFull => 22,
         CallError::ProcessClosed => 23,
         CallError::KillUncertain => 24,
+        CallError::Rejected(reason) => match reason {
+            tina::CallRejectedReason::ReplyAbandoned => 25,
+            tina::CallRejectedReason::HandlerPanicked => 26,
+            tina::CallRejectedReason::UnsupportedMessage => 27,
+        },
     }
 }
 
@@ -1150,6 +1168,14 @@ fn cancel_cause_tag(cause: tina::CancelCause) -> u8 {
         tina::CancelCause::CallerTimedOut => 2,
         tina::CancelCause::OwnerStopped => 3,
         tina::CancelCause::RuntimeStopped => 4,
+    }
+}
+
+fn call_rejected_reason_tag(reason: CallRejectedReason) -> u8 {
+    match reason {
+        CallRejectedReason::ReplyAbandoned => 1,
+        CallRejectedReason::HandlerPanicked => 2,
+        CallRejectedReason::UnsupportedMessage => 3,
     }
 }
 
@@ -1351,6 +1377,11 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::CallReplyAbandoned { call_id } => {
             hasher.write_u8(34);
             hasher.write_u64(call_id.get());
+        }
+        RuntimeEventKind::CallRejected { call_id, reason } => {
+            hasher.write_u8(35);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_rejected_reason_tag(reason));
         }
     }
 }

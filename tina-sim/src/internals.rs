@@ -18,8 +18,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    AddressGeneration, Context, DeferredReplyHandle, Effect, Isolate, IsolateId, MessageCaller,
-    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, SpawnObservedError, TrySendError,
+    AddressGeneration, CallContext, CallRejectedReason, Context, DeferredReplyHandle, Effect,
+    Isolate, IsolateId, MessageCaller, Outbound as TinaOutbound, RestartBudgetState, Shard,
+    ShardId, SpawnObservedError, TrySendError,
 };
 use tina_runtime::{
     CallId, CallInput, CallKind, CallOutcome, CallOutput, EffectKind, ListenerId,
@@ -117,6 +118,7 @@ pub(crate) enum MessageCallContext {
         call_id: CallId,
         requester: RegisteredAddress,
         cause: tina_runtime::CauseId,
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 
@@ -381,6 +383,15 @@ where
         caller: Option<MessageCaller>,
         now: std::time::Instant,
     ) -> ErasedEffect<S>;
+
+    fn handle_call_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+        caller: MessageCaller,
+        now: std::time::Instant,
+    ) -> ErasedEffect<S>;
 }
 
 pub(crate) trait ErasedSpawn<S>
@@ -471,6 +482,28 @@ where
 
         erase_effect::<I, S, Msg, Outbound>(effect)
     }
+
+    fn handle_call_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+        caller: MessageCaller,
+        now: std::time::Instant,
+    ) -> ErasedEffect<S> {
+        let message = message.downcast::<Msg>().unwrap_or_else(|_| {
+            panic!("simulator attempted to deliver a call handler message with the wrong type")
+        });
+
+        let effect = {
+            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_now(now)
+                .with_caller(caller);
+            self.isolate.handle_call(*message, CallContext::new(ctx))
+        };
+
+        erase_effect::<I, S, Msg, Outbound>(effect)
+    }
 }
 
 pub(crate) fn erase_effect<I, S, Msg, Outbound>(effect: Effect<I>) -> ErasedEffect<S>
@@ -487,6 +520,7 @@ where
     match effect {
         Effect::Noop => ErasedEffect::Noop,
         Effect::Reply(reply) => ErasedEffect::Reply(Box::new(reply)),
+        Effect::Reject(reason) => ErasedEffect::Reject(reason),
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
@@ -624,6 +658,7 @@ where
 {
     Noop,
     Reply(Box<dyn Any>),
+    Reject(CallRejectedReason),
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S>>),
     SpawnObserved(Box<dyn ErasedSpawnObserved<S>>),
@@ -646,6 +681,7 @@ where
         match self {
             Self::Noop => EffectKind::Noop,
             Self::Reply(_) => EffectKind::Reply,
+            Self::Reject(_) => EffectKind::Reject,
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
             Self::SpawnObserved(_) => EffectKind::SpawnObserved,
@@ -655,6 +691,43 @@ where
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
+        }
+    }
+
+    pub(crate) fn consumes_call_context(&self) -> bool {
+        match self {
+            Self::Reply(_) | Self::Reject(_) => true,
+            Self::Batch(effects) => {
+                for effect in effects {
+                    if effect.consumes_call_context() {
+                        return true;
+                    }
+                    if effect.stops_before_consuming_call_context() {
+                        return false;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn stops_before_consuming_call_context(&self) -> bool {
+        match self {
+            Self::Stop | Self::StopWith => true,
+            Self::Reply(_) | Self::Reject(_) => false,
+            Self::Batch(effects) => {
+                for effect in effects {
+                    if effect.consumes_call_context() {
+                        return false;
+                    }
+                    if effect.stops_before_consuming_call_context() {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 }
@@ -694,6 +767,7 @@ pub(crate) fn remote_call_outcome_envelope(
         call_id,
         requester,
         cause,
+        ..
     }) = context
     else {
         return None;
@@ -717,6 +791,7 @@ pub(crate) enum RemoteCallOutcome {
     Replied(Box<dyn Any>),
     Full,
     Closed,
+    Rejected(CallRejectedReason),
 }
 
 pub(crate) struct ErasedCall {

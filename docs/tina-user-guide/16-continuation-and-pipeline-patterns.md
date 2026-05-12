@@ -113,13 +113,20 @@ carried as `RequestContext<R>`. This is the same primitive as `DeferredReply`
 but the type name signals the multi-turn intent.
 
 ```rust
-fn handle(&mut self, msg: SvcMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+fn handle_call(&mut self, msg: SvcMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
     match msg {
         SvcMsg::Start => {
-            let req = ctx.take_request_context().unwrap();
+            let req = call_ctx.into_request_context();
             call(self.probe, ProbeMsg, Duration::from_millis(50))
                 .reply_with_request(req, SvcMsg::ProbeResult)
         }
+        SvcMsg::ProbeResult(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
+    }
+}
+
+fn handle(&mut self, msg: SvcMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    match msg {
+        SvcMsg::Start => noop(),
         SvcMsg::ProbeResult(req, CallOutcome::Replied(ProbeReply(v))) if v >= 10 => {
             reply_to_request(req, SvcReply::Ready)
         }
@@ -132,7 +139,7 @@ fn handle(&mut self, msg: SvcMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<
 
 Rules:
 
-- `take_request_context` consumes the caller in the first turn, same as
+- `CallContext::into_request_context` consumes the caller in the first turn, same as
   `take_reply_slot`;
 - `reply_with_request` boxes the translator so the continuation message
   carries the context back to the service;

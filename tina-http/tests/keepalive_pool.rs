@@ -525,6 +525,7 @@ impl Isolate for Driver {
                     CallOutcome::Timeout => DriverEvent::AcquireCallTimeout { id },
                     CallOutcome::Full => DriverEvent::AcquireCallFull { id },
                     CallOutcome::Closed => DriverEvent::AcquireCallClosed { id },
+                    CallOutcome::Rejected(_) => DriverEvent::AcquireCallClosed { id },
                 };
                 self.state.lock().expect("state").events.push(event.clone());
                 let _ = self.notify.send(event);

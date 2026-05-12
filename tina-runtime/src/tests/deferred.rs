@@ -11,7 +11,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, Context, DeferredReply, Effect, Isolate, Outbound, TakeReplySlotError, noop, reply_to,
+    Address, CallContext, Context, DeferredReply, Effect, Isolate, Outbound, TakeReplySlotError,
+    noop, reply_to,
 };
 
 use super::*;
@@ -100,6 +101,19 @@ impl Isolate for DeferredSvc {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SvcRequest::Capture(payload) => {
+                self.payload = payload;
+                self.slot = Some(slot_from_call(call));
+                noop()
+            }
+            SvcRequest::ReplyStored | SvcRequest::DropStored | SvcRequest::TakeWithoutCaller => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -177,6 +191,14 @@ fn build_world() -> World {
 
 fn count_kind(events: &[RuntimeEvent], pred: impl Fn(&RuntimeEventKind) -> bool) -> usize {
     events.iter().filter(|e| pred(&e.kind())).count()
+}
+
+fn slot_from_call<I>(call: CallContext<'_, I>) -> DeferredReply<I::Reply>
+where
+    I: Isolate,
+    I::Reply: 'static,
+{
+    tina::runtime_internal::request_context_into_deferred(call.into_request_context())
 }
 
 #[test]
@@ -278,6 +300,15 @@ fn panic_after_capture_drops_slot_and_closes_caller() {
             ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             let _slot = ctx.take_reply_slot().unwrap();
+            panic!("boom after deferred capture");
+        }
+
+        fn handle_call(
+            &mut self,
+            _msg: Self::Message,
+            call: CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            let _slot = slot_from_call(call);
             panic!("boom after deferred capture");
         }
     }
@@ -400,6 +431,18 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
             // and Effect::Reply has no caller anymore.
             tina::reply(99)
         }
+
+        fn handle_call(
+            &mut self,
+            _msg: Self::Message,
+            call: CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            let _slot = slot_from_call(call);
+            // Drop the slot immediately and try to reply normally —
+            // the captured slot's Drop will surface as Dropped event,
+            // and Effect::Reply has no caller anymore.
+            tina::reply(99)
+        }
     }
 
     #[derive(Debug)]
@@ -512,6 +555,22 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
                     let slot = ctx.take_reply_slot().unwrap();
                     if let Err(err) = self.pending.try_insert(key, slot) {
                         // Slot drops on err; surfaces as Dropped event.
+                        let _ = err;
+                    }
+                    noop()
+                }
+            }
+        }
+
+        fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+            match msg {
+                FrontendMsg::Capture(key) => {
+                    self.pending.sweep();
+                    if self.pending.len() >= 2 {
+                        return call.reject(tina::CallRejectedReason::UnsupportedMessage);
+                    }
+                    let slot = slot_from_call(call);
+                    if let Err(err) = self.pending.try_insert(key, slot) {
                         let _ = err;
                     }
                     noop()
@@ -684,6 +743,19 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
                 }
             }
         }
+
+        fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+            match msg {
+                FanSvcMsg::Capture => {
+                    self.next_id += 1;
+                    self.ids.push(self.next_id);
+                    let slot = slot_from_call(call);
+                    self.slots.push(slot);
+                    noop()
+                }
+                FanSvcMsg::Drain => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            }
+        }
     }
 
     let svc = runtime.register(
@@ -823,6 +895,12 @@ impl Isolate for Worker {
             WorkerMsg::Do(id, payload) => tina::reply(WorkerReply::Echo(id, payload)),
         }
     }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do(id, payload) => call.reply(WorkerReply::Echo(id, payload)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -897,6 +975,34 @@ impl Isolate for PoolFrontend {
                     _ => FrontendReply::WorkerClosed,
                 };
                 reply_to(slot, reply_val)
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            FrontendMsg::Client(payload) => {
+                self.pending.sweep();
+                if self.pending.len() >= self.config.max_pending {
+                    return call.reply(FrontendReply::Full);
+                }
+                let slot = slot_from_call(call);
+                let req_id = self.next_req;
+                self.next_req += 1;
+                self.pending
+                    .try_insert(req_id, slot)
+                    .unwrap_or_else(|_| panic!("admission must succeed after sweep"));
+                let worker_idx = self.next_worker % self.workers.len();
+                self.next_worker += 1;
+                Effect::Call(RuntimeCall::isolate_call(
+                    self.workers[worker_idx],
+                    WorkerMsg::Do(req_id, payload),
+                    self.config.worker_call_timeout,
+                    move |outcome| FrontendMsg::WorkerDone(req_id, outcome),
+                ))
+            }
+            FrontendMsg::WorkerDone(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -1052,6 +1158,12 @@ impl Isolate for FanoutTarget {
             FanoutTargetMsg::Echo(v) => tina::reply(FanoutTargetReply(v)),
         }
     }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            FanoutTargetMsg::Echo(v) => call.reply(FanoutTargetReply(v)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1119,6 +1231,7 @@ impl Isolate for Coordinator {
                     CallOutcome::Timeout => TargetOutcome::Timeout,
                     CallOutcome::Closed => TargetOutcome::Closed,
                     CallOutcome::Full => TargetOutcome::Full,
+                    CallOutcome::Rejected(_) => TargetOutcome::Closed,
                 };
                 if self.collected[idx].is_none() {
                     self.collected[idx] = Some(mapped);
@@ -1138,6 +1251,27 @@ impl Isolate for Coordinator {
                 }
                 noop()
             }
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            CoordMsg::Start(payload) => {
+                self.slot = Some(slot_from_call(call));
+                self.collected = vec![None; self.targets.len()];
+                self.remaining = self.targets.len();
+                let mut subcalls = Vec::with_capacity(self.targets.len());
+                for (idx, target) in self.targets.iter().enumerate() {
+                    subcalls.push(Effect::Call(RuntimeCall::isolate_call(
+                        *target,
+                        FanoutTargetMsg::Echo(payload + idx as u64),
+                        self.target_timeout,
+                        move |outcome| CoordMsg::TargetDone(idx, outcome),
+                    )));
+                }
+                Effect::Batch(subcalls)
+            }
+            CoordMsg::TargetDone(_, _) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -1261,6 +1395,19 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
             self.held.push(ctx.take_reply_slot().unwrap());
             noop()
         }
+
+        fn handle_call(
+            &mut self,
+            _msg: Self::Message,
+            call: CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            // Hold the reply slot in isolate state so the call stays
+            // pending. The abandoned-caller guard closes uncaptured
+            // callers immediately; keeping the slot alive is the
+            // legitimate way to defer a reply.
+            self.held.push(slot_from_call(call));
+            noop()
+        }
     }
 
     let w = runtime.register(SilentWorker { held: Vec::new() }, TestMailbox::new(4));
@@ -1354,6 +1501,16 @@ fn service_stop_drops_pending_promises_visibly() {
                     noop()
                 }
                 SvcStopMsg::Halt => Effect::Stop,
+            }
+        }
+
+        fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+            match msg {
+                SvcStopMsg::Capture => {
+                    self.slots.push(slot_from_call(call));
+                    noop()
+                }
+                SvcStopMsg::Halt => call.reject(tina::CallRejectedReason::UnsupportedMessage),
             }
         }
     }
@@ -1543,6 +1700,29 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
                 },
             }
         }
+
+        fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+            match msg {
+                HelpMsg::Capture(id) => {
+                    self.pending.sweep();
+                    if self.pending.len() >= 2 {
+                        return call.reply(HelpReply::Full);
+                    }
+                    let slot = slot_from_call(call);
+                    match self.pending.try_insert(id, slot) {
+                        Ok(()) => noop(),
+                        Err(crate::deferred::InsertError::Full(_, slot)) => {
+                            drop(slot);
+                            tina::reply(HelpReply::Full)
+                        }
+                        Err(crate::deferred::InsertError::DuplicateKey(_, slot)) => {
+                            drop(slot);
+                            panic!("unexpected duplicate key")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let (mut runtime, _clock) = new_manual_runtime();
@@ -1665,6 +1845,32 @@ impl Isolate for BridgeWorker {
                     // Caller already gone; external work landed late.
                     noop()
                 }
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            BridgeMsg::Submit(id) => {
+                self.pending.sweep();
+                if self.pending.len() >= 8 {
+                    return call.reply(BridgeReply::Full);
+                }
+                let slot = slot_from_call(call);
+                match self.pending.try_insert(id, slot) {
+                    Ok(()) => noop(),
+                    Err(crate::deferred::InsertError::Full(_, slot)) => {
+                        drop(slot);
+                        tina::reply(BridgeReply::Full)
+                    }
+                    Err(crate::deferred::InsertError::DuplicateKey(_, slot)) => {
+                        drop(slot);
+                        panic!("unexpected duplicate key")
+                    }
+                }
+            }
+            BridgeMsg::ExternalDone(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -1916,6 +2122,24 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
                     drop(bad);
                     noop()
                 }
+            }
+        }
+
+        fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+            match msg {
+                WrongMsg::Capture => {
+                    // Capture for ActualReply via CallContext.
+                    let real = slot_from_call(call);
+                    // Escape via runtime_internal: rebuild as
+                    // DeferredReply<WrongReply>. This is exactly the
+                    // pattern codex called out.
+                    let handle = tina::runtime_internal::deferred_into_handle(real);
+                    let bad: DeferredReply<WrongReply> =
+                        tina::runtime_internal::deferred_from_handle(handle);
+                    self.bad_slot = Some(bad);
+                    noop()
+                }
+                WrongMsg::ReplyWrong => call.reject(tina::CallRejectedReason::UnsupportedMessage),
             }
         }
     }

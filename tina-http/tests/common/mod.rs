@@ -15,6 +15,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use http::{Method, StatusCode};
+use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
 use tina_runtime::{
@@ -57,7 +58,17 @@ impl Isolate for Counter {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = match (request.method.clone(), request.path.as_str()) {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl Counter {
+    fn response_for(&mut self, request: HttpRequest) -> HttpResponse {
+        match (request.method.clone(), request.path.as_str()) {
             (Method::GET, "/counter") => HttpResponse::text(self.value.to_string()),
             (Method::POST, "/counter") => {
                 self.value += 1;
@@ -71,8 +82,7 @@ impl Isolate for Counter {
                 HttpResponse::with_body(StatusCode::OK, body_bytes)
             }
             _ => HttpResponse::with_status(StatusCode::NOT_FOUND),
-        };
-        reply(response)
+        }
     }
 }
 

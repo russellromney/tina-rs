@@ -21,6 +21,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use http::{Method, StatusCode};
+use tina::CallContext;
 use tina::ShardId;
 use tina::prelude::*;
 use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
@@ -63,15 +64,24 @@ impl Isolate for Counter {
         request: HttpRequest,
         _ctx: &mut Context<'_, SimShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = match (request.method.clone(), request.path.as_str()) {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl Counter {
+    fn response_for(&mut self, request: HttpRequest) -> HttpResponse {
+        match (request.method.clone(), request.path.as_str()) {
             (Method::GET, "/counter") => HttpResponse::text(self.value.to_string()),
             (Method::POST, "/counter") => {
                 self.value += 1;
                 HttpResponse::text(self.value.to_string())
             }
             _ => HttpResponse::with_status(StatusCode::NOT_FOUND),
-        };
-        reply(response)
+        }
     }
 }
 
@@ -493,12 +503,21 @@ impl Isolate for ChunkedDemoService {
         request: HttpRequest,
         _ctx: &mut Context<'_, SimShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = if request.path == "/big-chunked" {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl ChunkedDemoService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        if request.path == "/big-chunked" {
             HttpResponse::stream_chunked(StatusCode::OK, self.source)
         } else {
             HttpResponse::not_found()
-        };
-        reply(response)
+        }
     }
 }
 

@@ -120,6 +120,7 @@ impl Isolate for Driver {
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                    CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
                 let _ = self.sender.send(result);
                 stop()

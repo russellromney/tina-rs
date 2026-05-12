@@ -1,6 +1,10 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{Address, Context, Effect, Isolate, RequestContext, noop, reply, reply_to_request};
+use tina::{
+    Address, CallContext, Context, Effect, Isolate, RequestContext, noop, reply_to_request,
+};
 use tina_runtime::{CallOutcome, RuntimeCall, call, sleep};
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -20,7 +24,7 @@ struct ProbeReply;
 #[derive(Debug)]
 enum ProbeMsg {
     Request,
-    SleepDone,
+    SleepDone(RequestContext<ProbeReply>),
 }
 
 #[derive(Debug)]
@@ -44,9 +48,19 @@ impl Isolate for Probe {
     ) -> Effect<Self> {
         match msg {
             ProbeMsg::Request => {
-                sleep(Duration::from_millis(self.delay_ms)).reply(|_| ProbeMsg::SleepDone)
+                noop()
             }
-            ProbeMsg::SleepDone => reply(ProbeReply),
+            ProbeMsg::SleepDone(req) => reply_to_request(req, ProbeReply),
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ProbeMsg::Request => {
+                let req = call.into_request_context();
+                sleep(Duration::from_millis(self.delay_ms)).reply(move |_| ProbeMsg::SleepDone(req))
+            }
+            ProbeMsg::SleepDone(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -57,7 +71,7 @@ struct DbReply;
 #[derive(Debug)]
 enum DbMsg {
     Request,
-    SleepDone,
+    SleepDone(RequestContext<DbReply>),
 }
 
 #[derive(Debug)]
@@ -81,9 +95,19 @@ impl Isolate for Db {
     ) -> Effect<Self> {
         match msg {
             DbMsg::Request => {
-                sleep(Duration::from_millis(self.delay_ms)).reply(|_| DbMsg::SleepDone)
+                noop()
             }
-            DbMsg::SleepDone => reply(DbReply),
+            DbMsg::SleepDone(req) => reply_to_request(req, DbReply),
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            DbMsg::Request => {
+                let req = call.into_request_context();
+                sleep(Duration::from_millis(self.delay_ms)).reply(move |_| DbMsg::SleepDone(req))
+            }
+            DbMsg::SleepDone(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -119,14 +143,10 @@ impl Isolate for Service {
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ServiceMsg::Start => {
-                let req = ctx.take_request_context().unwrap();
-                call(self.probe, ProbeMsg::Request, Duration::from_millis(50))
-                    .reply_with_request(req, ServiceMsg::ProbeResult)
-            }
+            ServiceMsg::Start => noop(),
             ServiceMsg::ProbeResult(req, CallOutcome::Replied(_)) => {
                 call(self.db, DbMsg::Request, Duration::from_millis(50))
                     .reply_with_request(req, ServiceMsg::DbResult)
@@ -136,6 +156,19 @@ impl Isolate for Service {
                 reply_to_request(req, ServiceReply::Ready)
             }
             ServiceMsg::DbResult(req, _) => reply_to_request(req, ServiceReply::NotReady),
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ServiceMsg::Start => {
+                let req = call_ctx.into_request_context();
+                call(self.probe, ProbeMsg::Request, Duration::from_millis(50))
+                    .reply_with_request(req, ServiceMsg::ProbeResult)
+            }
+            ServiceMsg::ProbeResult(_, _) | ServiceMsg::DbResult(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -151,7 +184,7 @@ enum ClientMsg {
 
 #[derive(Debug)]
 struct Client {
-    replies: Vec<String>,
+    replies: Rc<RefCell<Vec<String>>>,
 }
 
 impl Isolate for Client {
@@ -174,23 +207,29 @@ impl Isolate for Client {
                     .reply(ClientMsg::Returned)
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::Ready)) => {
-                self.replies.push(String::from("ready"));
+                self.replies.borrow_mut().push(String::from("ready"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::NotReady)) => {
-                self.replies.push(String::from("not_ready"));
+                self.replies.borrow_mut().push(String::from("not_ready"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Timeout) => {
-                self.replies.push(String::from("timeout"));
+                self.replies.borrow_mut().push(String::from("timeout"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Full) => {
-                self.replies.push(String::from("full"));
+                self.replies.borrow_mut().push(String::from("full"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Closed) => {
-                self.replies.push(String::from("closed"));
+                self.replies.borrow_mut().push(String::from("closed"));
+                noop()
+            }
+            ClientMsg::Returned(CallOutcome::Rejected(reason)) => {
+                self.replies
+                    .borrow_mut()
+                    .push(format!("rejected:{reason:?}"));
                 noop()
             }
         }
@@ -206,28 +245,16 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         delay_ms: config.db_delay_ms,
     });
     let service = sim.register(Service { probe, db });
-    let client = sim.register(Client { replies: Vec::new() });
+    let replies = Rc::new(RefCell::new(Vec::new()));
+    let client = sim.register(Client {
+        replies: Rc::clone(&replies),
+    });
 
     sim.try_send(client, ClientMsg::Start(service))
         .map_err(|e| anyhow::anyhow!("client send failed: {:?}", e))?;
     sim.run_until_quiescent();
 
-    // In a real runtime, events would live in the isolate state.
-    // In simulation, extract via the trace.
-    let replies: Vec<String> = sim
-        .trace()
-        .iter()
-        .filter_map(|event| {
-            if matches!(
-                event.kind(),
-                tina_runtime::RuntimeEventKind::DeferredReplySent { .. }
-            ) {
-                Some(String::from("ready"))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    Ok(RunReport { replies })
+    Ok(RunReport {
+        replies: replies.borrow().clone(),
+    })
 }

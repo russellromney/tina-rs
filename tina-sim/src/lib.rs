@@ -51,8 +51,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tina::{
-    Address, AddressGeneration, CallRouting, ChildDefinition, ChildRef, ChildRelation,
-    DeferredReplyHandle, DeferredSlotRegistry, Isolate, IsolateId, MessageCaller,
+    Address, AddressGeneration, CallRejectedReason, CallRouting, ChildDefinition, ChildRef,
+    ChildRelation, DeferredReplyHandle, DeferredSlotRegistry, Isolate, IsolateId, MessageCaller,
     Outbound as TinaOutbound, RestartableChildDefinition, Shard, ShardId, SpawnObservedError,
     TrySendError,
 };
@@ -490,13 +490,27 @@ where
                 RuntimeEventKind::HandlerStarted,
             );
 
-            let caller = self.build_message_caller(message.call_context, isolate_id);
+            let incoming_call_context = message.call_context;
+            let caller = self.build_message_caller(incoming_call_context, isolate_id);
             let now = self.virtual_anchor + self.virtual_now;
 
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
-                catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller, now)
+                catch_unwind(AssertUnwindSafe(|| match caller {
+                    Some(caller) => handler.handle_call_boxed(
+                        message.message,
+                        &mut self.shard,
+                        isolate_id,
+                        caller,
+                        now,
+                    ),
+                    None => handler.handle_boxed(
+                        message.message,
+                        &mut self.shard,
+                        isolate_id,
+                        None,
+                        now,
+                    ),
                 }))
             };
 
@@ -508,7 +522,18 @@ where
                         Some(handler_started.into()),
                         RuntimeEventKind::HandlerPanicked,
                     );
-                    self.drop_pending_deferred_captures(panicked.into());
+                    let captured_any = self.drop_pending_deferred_captures(panicked.into());
+                    if !captured_any {
+                        if let Some(context) = incoming_call_context {
+                            self.reject_call_context(
+                                isolate_id,
+                                panicked.into(),
+                                context,
+                                CallRejectedReason::HandlerPanicked,
+                                route_remote,
+                            );
+                        }
+                    }
                     self.stop_entry(index, isolate_id, panicked.into());
                     self.supervise_panic(
                         RegisteredAddress {
@@ -534,23 +559,23 @@ where
 
             let captured_any = self.promote_captures(isolate_id, handler_finished.into());
 
-            // Skip the guard when the effect is a runtime call or batch:
-            // the handler may be delegating to a continuation that will
-            // reply later. This keeps the guard conservative.
-            let may_reply_later = matches!(
-                effect_kind,
-                tina_runtime::EffectKind::Call | tina_runtime::EffectKind::Batch
-            );
-            let abandoned_call_id = if !captured_any && !may_reply_later {
-                message.call_context.as_ref().map(|ctx| match *ctx {
-                    MessageCallContext::Local { call_id } => call_id,
-                    MessageCallContext::Remote { call_id, .. } => call_id,
-                })
+            let consumed_by_effect = effect.consumes_call_context();
+            let abandoned_context = if !captured_any && !consumed_by_effect {
+                message.call_context
             } else {
                 None
             };
+            if let Some(context) = abandoned_context {
+                self.reject_call_context(
+                    isolate_id,
+                    handler_finished.into(),
+                    context,
+                    CallRejectedReason::ReplyAbandoned,
+                    route_remote,
+                );
+            }
 
-            let effective_context = if captured_any {
+            let effective_context = if captured_any || abandoned_context.is_some() {
                 None
             } else {
                 message.call_context
@@ -564,20 +589,6 @@ where
                 &mut round_messages,
                 route_remote,
             );
-
-            if let Some(call_id) = abandoned_call_id {
-                if self
-                    .pending_isolate_calls
-                    .iter()
-                    .any(|p| p.call_id == call_id)
-                {
-                    self.push_event(
-                        isolate_id,
-                        Some(handler_finished.into()),
-                        RuntimeEventKind::CallReplyAbandoned { call_id },
-                    );
-                }
-            }
         }
 
         round_messages.clear();
@@ -881,6 +892,7 @@ where
                             call_id,
                             requester,
                             cause: call_cause,
+                            ..
                         } => {
                             let remote_reply = RemoteCallReply {
                                 call_id,
@@ -919,21 +931,40 @@ where
                 }
                 false
             }
+            ErasedEffect::Reject(reason) => {
+                if let Some(context) = call_context {
+                    self.reject_call_context(isolate_id, cause, context, reason, route_remote);
+                } else {
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::EffectObserved {
+                            effect: EffectKind::Reject,
+                        },
+                    );
+                }
+                false
+            }
             ErasedEffect::RestartChildren => {
                 self.restart_children(isolate_id, cause, round_messages);
                 false
             }
             ErasedEffect::Batch(effects) => {
+                let mut batch_context = call_context;
                 for subeffect in effects {
+                    let consumes_context = subeffect.consumes_call_context();
                     if self.execute_effect(
                         index,
                         cause,
                         subeffect,
-                        call_context,
+                        batch_context,
                         round_messages,
                         route_remote,
                     ) {
                         return true;
+                    }
+                    if consumes_context {
+                        batch_context = None;
                     }
                 }
                 false
@@ -943,6 +974,76 @@ where
                 false
             }
         }
+    }
+
+    fn reject_call_context(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+        context: MessageCallContext,
+        reason: CallRejectedReason,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        match context {
+            MessageCallContext::Local { call_id } => {
+                self.push_call_rejected_event(isolate_id, cause, call_id, reason);
+                if !self.complete_isolate_call(call_id, cause, CallOutcome::Rejected(reason)) {
+                    let reason = match self.recently_cancelled_cause(call_id) {
+                        Some(c) => tina_runtime::call_reply_reason_for_cause(c),
+                        None => CallReplyRejectedReason::NoPendingCall,
+                    };
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::CallReplyRejected { call_id, reason },
+                    );
+                }
+            }
+            MessageCallContext::Remote {
+                call_id,
+                requester,
+                cause: call_cause,
+                ..
+            } => {
+                self.push_call_rejected_event(isolate_id, cause, call_id, reason);
+                let remote_reply = RemoteCallReply {
+                    call_id,
+                    requester,
+                    reply: RemoteCallOutcome::Rejected(reason),
+                    cause: call_cause,
+                };
+                if let Err(rejected) = route_remote(
+                    self.shard.id(),
+                    QueuedRemoteEnvelope::CallReply(remote_reply),
+                ) {
+                    let reason = match rejected {
+                        SendRejectedReason::Full => CallReplyRejectedReason::ReplyPathFull,
+                        SendRejectedReason::Closed => CallReplyRejectedReason::RequesterShardClosed,
+                    };
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::CallReplyRejected { call_id, reason },
+                    );
+                }
+            }
+        }
+    }
+
+    fn push_call_rejected_event(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+        call_id: CallId,
+        reason: CallRejectedReason,
+    ) {
+        let kind = match reason {
+            CallRejectedReason::ReplyAbandoned => RuntimeEventKind::CallReplyAbandoned { call_id },
+            CallRejectedReason::HandlerPanicked | CallRejectedReason::UnsupportedMessage => {
+                RuntimeEventKind::CallRejected { call_id, reason }
+            }
+        };
+        self.push_event(isolate_id, Some(cause), kind);
     }
 
     fn execute_reply_to(
@@ -1708,6 +1809,7 @@ where
                 call_id: context.call_id,
                 requester: context.requester,
                 cause: context.cause,
+                expected_reply_type_id,
             };
             match route_remote(
                 self.shard.id(),
@@ -4083,12 +4185,13 @@ where
         isolate_id: IsolateId,
     ) -> Option<MessageCaller> {
         let ctx = call_context?;
-        let (call_id, routing) = match ctx {
-            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local),
+        let (call_id, routing, remote_expected_reply_type_id) = match ctx {
+            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local, None),
             MessageCallContext::Remote {
                 call_id,
                 requester,
                 cause,
+                expected_reply_type_id,
             } => (
                 call_id,
                 CallRouting::Remote {
@@ -4097,6 +4200,7 @@ where
                     requester_generation: requester.generation,
                     cause: cause.event().get(),
                 },
+                Some(expected_reply_type_id),
             ),
         };
         let expected_reply_type_id = match routing {
@@ -4106,7 +4210,8 @@ where
                 .find(|p| p.call_id == call_id)
                 .map(|p| p.expected_reply_type_id)
                 .unwrap_or_else(std::any::TypeId::of::<()>),
-            CallRouting::Remote { .. } => std::any::TypeId::of::<()>(),
+            CallRouting::Remote { .. } => remote_expected_reply_type_id
+                .expect("remote call context carries the expected reply type"),
         };
         Some(MessageCaller::new(
             std::rc::Rc::clone(&self.deferred_registry),
@@ -4164,8 +4269,10 @@ where
         }
     }
 
-    fn drop_pending_deferred_captures(&mut self, cause: tina_runtime::CauseId) {
-        for capture in self.deferred_registry.drain_pending() {
+    fn drop_pending_deferred_captures(&mut self, cause: tina_runtime::CauseId) -> bool {
+        let captures = self.deferred_registry.drain_pending();
+        let captured_any = !captures.is_empty();
+        for capture in captures {
             capture.shared.set_state(tina::DeferredSlotState::Closed);
             let slot_id = tina_runtime::DeferredSlotId::new(capture.slot_id);
             let call_id = CallId::new(capture.call_id);
@@ -4181,6 +4288,7 @@ where
             );
             self.complete_isolate_call(call_id, dropped.into(), CallOutcome::Closed);
         }
+        captured_any
     }
 
     fn drop_promoted_deferred_slot(
@@ -4330,6 +4438,7 @@ where
             CallOutcome::Full => Some(CallError::TargetFull),
             CallOutcome::Closed => Some(CallError::TargetClosed),
             CallOutcome::Timeout => Some(CallError::Timeout),
+            CallOutcome::Rejected(reason) => Some(CallError::Rejected(*reason)),
         };
 
         if let Some(reason) = failure_reason {
@@ -4726,6 +4835,7 @@ where
             RemoteCallOutcome::Replied(reply) => CallOutcome::Replied(reply),
             RemoteCallOutcome::Full => CallOutcome::Full,
             RemoteCallOutcome::Closed => CallOutcome::Closed,
+            RemoteCallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
         };
         if !self.complete_isolate_call(reply.call_id, reply.cause, outcome) {
             let reason = match self.recently_cancelled_cause(reply.call_id) {

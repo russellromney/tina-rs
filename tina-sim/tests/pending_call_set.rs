@@ -67,6 +67,7 @@ const WORK_BUDGET_MS: u64 = 200;
 enum WorkerMsg {
     Do,
     Done(SleepReply),
+    DoneForCall(tina::RequestContext<WorkerReply>, SleepReply),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +79,19 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply, shard = SimShard)]
 impl Worker {
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => {
+                let req = call.into_request_context();
+                sleep(Duration::from_millis(self.sleep_ms))
+                    .reply_with_request(req, WorkerMsg::DoneForCall)
+            }
+            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
+
     fn handle(
         &mut self,
         msg: WorkerMsg,
@@ -87,6 +101,8 @@ impl Worker {
             WorkerMsg::Do => sleep(Duration::from_millis(self.sleep_ms)).reply(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
     }
 }

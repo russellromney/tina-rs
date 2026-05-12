@@ -430,6 +430,7 @@ where
     match effect {
         tina::Effect::Noop => tina::Effect::Noop,
         tina::Effect::Reply(reply) => tina::Effect::Reply(reply),
+        tina::Effect::Reject(reason) => tina::Effect::Reject(reason),
         tina::Effect::Send(send) => tina::Effect::Send(send),
         tina::Effect::Spawn(spawn) => tina::Effect::Spawn(spawn),
         tina::Effect::SpawnObserved(spawn) => match spawn {},

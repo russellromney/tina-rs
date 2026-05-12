@@ -53,16 +53,29 @@ impl Isolate for DeferredSvc {
     type Call = RuntimeCall<SvcMsg>;
     type Shard = DefShard;
 
-    fn handle(
+    fn handle_call(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        call: tina::CallContext<'_, Self>,
     ) -> Effect<Self> {
         match msg {
             SvcMsg::Capture => {
-                self.slot = Some(ctx.take_reply_slot().unwrap());
+                self.slot = Some(call.into_request_context().into_deferred());
                 noop()
             }
+            SvcMsg::ReplyStored | SvcMsg::DropStored => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            SvcMsg::Capture => noop(),
             SvcMsg::ReplyStored => {
                 let slot = self.slot.take().expect("slot stored");
                 reply_to(slot, SvcReply(self.payload))
@@ -240,13 +253,21 @@ fn sim_panic_after_capture_drops_slot_and_closes_caller() {
         type Call = RuntimeCall<SvcMsg>;
         type Shard = DefShard;
 
+        fn handle_call(
+            &mut self,
+            _msg: Self::Message,
+            call: tina::CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            let _slot = call.into_request_context().into_deferred();
+            panic!("boom after deferred capture");
+        }
+
         fn handle(
             &mut self,
             _msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot().unwrap();
-            panic!("boom after deferred capture");
+            noop()
         }
     }
 
@@ -303,16 +324,27 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Call = RuntimeCall<HaltMsg>;
         type Shard = DefShard;
 
-        fn handle(
+        fn handle_call(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+            call: tina::CallContext<'_, Self>,
         ) -> Effect<Self> {
             match msg {
                 HaltMsg::Capture => {
-                    self.slots.push(ctx.take_reply_slot().unwrap());
+                    self.slots.push(call.into_request_context().into_deferred());
                     noop()
                 }
+                HaltMsg::Halt => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            }
+        }
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                HaltMsg::Capture => noop(),
                 HaltMsg::Halt => Effect::Stop,
             }
         }

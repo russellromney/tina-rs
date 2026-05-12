@@ -66,17 +66,23 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply, shard = SimShard)]
 impl Worker {
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Hold => {
+                self.held = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+            WorkerMsg::Release => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(
         &mut self,
         msg: WorkerMsg,
-        ctx: &mut Context<'_, SimShard, Self::Reply>,
+        _ctx: &mut Context<'_, SimShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Hold => {
-                let slot = ctx.take_reply_slot().expect("slot");
-                self.held = Some(slot);
-                noop()
-            }
+            WorkerMsg::Hold => noop(),
             WorkerMsg::Release => {
                 if let Some(slot) = self.held.take() {
                     tina::reply_to(slot, WorkerReply)

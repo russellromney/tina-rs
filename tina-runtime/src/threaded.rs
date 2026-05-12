@@ -931,6 +931,7 @@ where
     ///     Ok(CallOutcome::Full) => { /* target mailbox was full */ }
     ///     Ok(CallOutcome::Closed) => { /* target isolate had stopped */ }
     ///     Ok(CallOutcome::Timeout) => { /* call deadline fired */ }
+    ///     Ok(CallOutcome::Rejected(_)) => { /* target rejected this call shape */ }
     ///     Err(_) => { /* worker thread stopped or command queue was full */ }
     /// }
     /// # }
