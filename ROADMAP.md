@@ -115,6 +115,96 @@ Current future proof gaps to keep visible:
 - Real substrate peer/shard liveness, shard-restart propagation, and
   cross-shard child ownership remain future work.
 
+## Testing infrastructure roadmap
+
+Orthogonal to feature phases but necessary before public release claims.
+
+- **Miri expansion.** Current Miri coverage is narrow: `tina-mailbox-spsc` only.
+  Every crate touching `unsafe` should run under Miri in CI. `tina-runtime`
+  denies `unsafe_code` at the crate root, which is honest, but bridge crates
+  and substrate adapters may add `unsafe`. Miri gating should catch any new
+  `unsafe` block, not just the mailbox ring buffer.
+
+- **`tina-test` dev-dependency crate.** Users today hand-roll simulator setup,
+  config, and step loops. A `tina-test` crate should provide:
+  - `SimulatorBuilder` presets for common test shapes (single isolate,
+    pair, service-with-client).
+  - Assertion helpers: `assert_effect_eq`, `assert_trace_contains`,
+    `assert_mailbox_full`.
+  - A `#[tina_sim::test(seed = 42)]` proc macro that sets up a simulator,
+    runs the body, and asserts no panics / expected trace fingerprint.
+  This is the Tina equivalent of `tokio_test` and `#[tokio::test]`. The
+  simulator stays visible; the goal is removing ceremony so every user writes
+  DST tests as easily as unit tests.
+
+- **Loom expansion beyond mailbox.** Loom covers `tina-mailbox-spsc`. It should
+  also cover shard-pair queues, runtime internal task lists, and effect
+  batching atomics. These are the real concurrency hazards. If a bounded
+  multi-producer mailbox (`tina-mailbox-mpsc`) ships, it must have loom
+  coverage before the crate is usable.
+
+- **Property-based and generative testing.** `tina-sim` generates interleavings
+  from a seed, but not random message sequences, fault configurations, or
+  topology mutations. `proptest` or `quickcheck` over the simulator would let
+  us state invariants like "for any send sequence to a bounded queue, `Full`
+  outcomes never exceed capacity" and have the generator hunt for violations.
+  Fuzz targets for the HTTP parser and router are worth adding once the wire
+  format is stable.
+
+- **Soak and stress testing.** Not urgent pre-release, but needed before
+  production claims. A 10M-step simulation stress test hammering
+  `send`/`reply`/`call` across many isolates would catch trace hash drift,
+  memory leaks in simulator bookkeeping, and counter overflow. Live stress
+  tests under `ThreadedRuntime` would catch substrate resource leaks and
+  queue-pressure growth that short tests miss.
+
+- **Model checking / exhaustive exploration.** `tina-sim` is randomized
+  simulation. A second `tina-model-check` back-end could do bounded exhaustive
+  exploration of all message delivery orderings within a step limit. This is
+  research, not a release blocker. It would let us check LTL properties on
+  small bounded instances. State-space explosion is managed by capping mailbox
+  depth, active isolates, and steps.
+
+- **Testing philosophy and user-guide doc.** A `docs/tina-user-guide/16-testing.md`
+  should cover: when to use unit tests vs simulator tests vs live tests; how to
+  write a loom test for a new concurrent structure; how to choose a DST seed;
+  how to debug a failing trace fingerprint; what "same seed same failure"
+  means and what it does not mean. Keep it fresh — the philosophy should evolve
+  with user experience, not be frozen early.
+
+- **Code coverage reporting.** `cargo-llvm-cov` on the workspace would show
+  whether DST paths, fault-injection paths, and error-handling branches are
+  actually exercised. Currently we know tests pass but not which branches they
+  hit.
+
+- **CI test matrix.** `make verify` runs locally. A public framework needs this
+  in CI on at least Linux and macOS, debug and release, with loom and miri
+  gates. The matrix should also test each specimen example independently so
+  workspace-only changes cannot silently break downstream specimens.
+
+### Other gaps to keep visible
+
+- **Compile-fail / doc tests for `tina` trait crate.** The proc-macro surface
+  (`#[tina::isolate]`, `#[tina_runtime::isolate]`) should have tests that
+  assert malformed definitions fail at compile time. This is standard for
+  macro-heavy crates.
+
+- **Benchmark / performance regression framework.** The current cost-smoke
+  (`portable_runtime_cost`) is a smoke test, not a benchmark. Before
+  production claims we need a `criterion`-based regression suite with
+  historical tracking, not just one-shot local runs.
+
+- **HTTP/1 parser conformance suite.** Beyond our own DST, we should run an
+  established HTTP parser test corpus (e.g., `httparse` test vectors, or a
+  subset of `h2spec` for HTTP/1) to catch wire-format edge cases our
+  hand-authored tests miss.
+
+- **Bridge convention test harness.** The bridge crates (`tokio`, `tower`,
+  `reqwest`, `sqlx`) share setup patterns but have no shared test utilities.
+  A `tina-bridge-test` crate with mock substrate adapters would let each
+  bridge prove its bounded-outcome contract without spinning up real
+  databases or HTTP servers. This is a convenience, not a blocker.
+
 ## Roadmap discipline
 
 Completed work belongs in `CHANGELOG.md`, not as long phase bodies here.
@@ -246,6 +336,7 @@ framework before public release-story work.
 | **084 child lifecycle / join / supervision usability** | Make parent/child ownership boring: `spawn_observed` returns a typed child ref to the parent as ordinary message data, child stop/result observation is generation-aware, supervised restarts refresh replacement addresses without trace spelunking, and parent stop has documented/proven child cleanup truth. First form stays local-shard and typed; host-side `observe_child_started` waits until spawn events carry enough type truth. |
 | **085 race / join helpers** | Tina-shaped equivalents for the useful parts of `select!`, `join!`, and `JoinSet`: bounded named call groups, first-success race with visible loser cancellation, join-all with partial deadline report, `CallContext`/`RequestContext` integration, and no hidden retry or anonymous branch outcomes. This builds on 086 call contexts, 072 pending call sets, 079 cancellation, and ideally 084 child refs. |
 | **086 call context reply obligation** | Replace warning-only `CallReplyAbandoned` with the real Tina contract: send handlers have no caller, call handlers receive a typed `CallContext`, and that reply authority must be replied, rejected, or carried forward as `RequestContext`. Returning unused authority rejects immediately and reclaims capacity. This is project-wide API work, not helper polish. |
+| **087 testing infrastructure** | `tina-test` dev-dependency crate: simulator presets, assertion helpers, `#[tina_sim::test]` macro. Expand Miri to all `unsafe`-touching crates; Loom to shard-pair queues and runtime atomics; `proptest`/`quickcheck` over simulator; `cargo-llvm-cov` in CI; compile-fail tests for proc macros. Soak/stress and model-checking are tracked but not pre-release blockers. |
 | **RequestContext helper polish** | Tiny helper after 086, no full phase unless it grows: add `reply_with_current_request(call, f)` on call/observed-call builders as sugar for `call.into_request_context()` plus `reply_with_request(...)`. The helper consumes explicit call authority, not generic `Context`. Docs should still show the expanded form once so users know where caller authority lives. |
 | **056 native HTTP/2 service stack** | Second-form HTTP after HTTP/1 body/chunked/cancellation semantics are boring. Adopt sync codec crates where they exist; Tina owns sockets, flow control, stream state, bounded queues, DST, and trace. Not a full RFC/tonic clone. |
 | **057 native gRPC service stack** | Third-form RPC after 056 HTTP/2 lands. Small layer on top: `prost`, generated Tina-shaped service trait template, typed status, unary and server-streaming first form, client and server, DST for status/cancel. Bidirectional streaming and interceptor feature-parity are later. |
