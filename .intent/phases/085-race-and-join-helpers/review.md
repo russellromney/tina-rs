@@ -78,3 +78,30 @@ No `Drop` cancel was added. The owner-stop proof sends a stop message,
 drains the group into named cancel requests, returns visible
 `cancel_call` effects, waits for cancel outcomes, then stops with a
 report.
+
+## Follow-Up Hostile Fixes
+
+### Finding 6 — Forged cancel acknowledgements completed reports
+
+`record_cancel` originally counted cancel outcomes without proving they
+matched the losers returned for cancellation. Fixed by retaining the
+expected `(key, token)` rows and removing them one by one. Unknown or
+duplicate cancel completions now return `UnexpectedCancel` and cannot
+make the report complete.
+
+### Finding 7 — Reserved tokens were reusable by hostile callers
+
+`insert_reserved` originally trusted any copied `CallGroupToken`. Fixed
+by tracking reserved tokens as bounded slot reservations. A token must
+come from `reserve_token`, consumes group capacity while reserved, and
+is removed on first successful `insert_reserved`. Reusing an old or
+already-consumed token is a typed `UnknownReservedToken` error. A
+validated reserved token is also released on typed insert failure, so
+`DuplicateKey` does not leak capacity.
+
+### Finding 8 — Specimen swallowed group errors
+
+The cancellation-chain specimen no longer drops `record_reply` /
+`record_cancel` errors. It records a group error and reports
+`exit_clean = false`, making the typed helper failure visible in the
+specimen result.

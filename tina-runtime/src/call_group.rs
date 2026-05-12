@@ -48,10 +48,18 @@ struct Entry<K, R> {
     handle: CallHandle<R>,
 }
 
+#[derive(Debug)]
+struct ExpectedCancel<K> {
+    key: K,
+    token: CallGroupToken,
+}
+
 /// Fixed-capacity group of named in-flight calls.
 #[derive(Debug)]
 pub struct CallGroup<K, R> {
     entries: Vec<Entry<K, R>>,
+    reserved_tokens: Vec<CallGroupToken>,
+    expected_cancels: Vec<ExpectedCancel<K>>,
     capacity: usize,
     next_generation: u64,
     branch_outcomes: Vec<CallGroupBranchOutcome<K, R>>,
@@ -62,8 +70,15 @@ pub struct CallGroup<K, R> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RaceState {
     Collecting,
-    CancellingLosers { expected: usize },
+    CancellingLosers,
     Complete,
+}
+
+/// Reasons token reservation can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallGroupReserveError {
+    /// Every slot is already live or reserved.
+    Full,
 }
 
 /// Reasons a branch insert can fail.
@@ -81,6 +96,25 @@ pub enum CallGroupInsertError<K, R> {
     DuplicateKey {
         /// Rejected branch key.
         key: K,
+        /// Rejected call handle.
+        handle: CallHandle<R>,
+    },
+    /// The token was not produced by `reserve_token`, or it was
+    /// already consumed by a prior insert.
+    UnknownReservedToken {
+        /// Rejected branch key.
+        key: K,
+        /// Rejected branch token.
+        token: CallGroupToken,
+        /// Rejected call handle.
+        handle: CallHandle<R>,
+    },
+    /// A live branch already uses this token.
+    DuplicateToken {
+        /// Rejected branch key.
+        key: K,
+        /// Rejected branch token.
+        token: CallGroupToken,
         /// Rejected call handle.
         handle: CallHandle<R>,
     },
@@ -201,6 +235,16 @@ pub enum CallGroupRecordReplyError<K, R> {
 /// Reasons recording a cancel outcome can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallGroupRecordCancelError<K> {
+    /// No loser cancel is expected for this key/token pair, or the
+    /// outcome was already recorded.
+    UnexpectedCancel {
+        /// Branch key carried by the cancel continuation.
+        key: K,
+        /// Branch token carried by the cancel continuation.
+        token: CallGroupToken,
+        /// Outcome that could not be recorded.
+        outcome: CancelOutcome,
+    },
     /// The bounded cancel-outcome storage is already full.
     StorageFull {
         /// Branch key carried by the cancel continuation.
@@ -226,6 +270,8 @@ where
         );
         Self {
             entries: Vec::with_capacity(capacity),
+            reserved_tokens: Vec::with_capacity(capacity),
+            expected_cancels: Vec::with_capacity(capacity),
             capacity,
             next_generation: 1,
             branch_outcomes: Vec::with_capacity(capacity),
@@ -251,7 +297,7 @@ where
 
     /// Returns true when the next insert would return `Full`.
     pub fn is_full(&self) -> bool {
-        self.entries.len() >= self.capacity
+        self.entries.len() + self.reserved_tokens.len() >= self.capacity
     }
 
     /// Inserts one named branch and returns its generation token.
@@ -260,8 +306,20 @@ where
         key: K,
         handle: CallHandle<R>,
     ) -> Result<CallGroupToken, CallGroupInsertError<K, R>> {
-        let token = self.reserve_token();
-        self.insert_reserved(key, token, handle)?;
+        if self.entries.is_empty() && matches!(self.race_state, RaceState::Complete) {
+            self.branch_outcomes.clear();
+            self.cancel_outcomes.clear();
+            self.expected_cancels.clear();
+            self.race_state = RaceState::Collecting;
+        }
+        if self.entries.iter().any(|entry| entry.key == key) {
+            return Err(CallGroupInsertError::DuplicateKey { key, handle });
+        }
+        if self.is_full() {
+            return Err(CallGroupInsertError::Full { key, handle });
+        }
+        let token = self.next_token();
+        self.entries.push(Entry { key, token, handle });
         Ok(token)
     }
 
@@ -270,7 +328,16 @@ where
     /// Use this with [`insert_reserved`](Self::insert_reserved) when
     /// the continuation message must contain the token that will later
     /// be used to record the reply.
-    pub fn reserve_token(&mut self) -> CallGroupToken {
+    pub fn reserve_token(&mut self) -> Result<CallGroupToken, CallGroupReserveError> {
+        if self.entries.len() + self.reserved_tokens.len() >= self.capacity {
+            return Err(CallGroupReserveError::Full);
+        }
+        let token = self.next_token();
+        self.reserved_tokens.push(token);
+        Ok(token)
+    }
+
+    fn next_token(&mut self) -> CallGroupToken {
         let token = CallGroupToken {
             generation: self.next_generation,
         };
@@ -292,14 +359,25 @@ where
         if self.entries.is_empty() && matches!(self.race_state, RaceState::Complete) {
             self.branch_outcomes.clear();
             self.cancel_outcomes.clear();
+            self.expected_cancels.clear();
             self.race_state = RaceState::Collecting;
         }
+        let Some(reserved_pos) = self
+            .reserved_tokens
+            .iter()
+            .position(|reserved| *reserved == token)
+        else {
+            return Err(CallGroupInsertError::UnknownReservedToken { key, token, handle });
+        };
         if self.entries.iter().any(|entry| entry.key == key) {
+            let _ = self.reserved_tokens.swap_remove(reserved_pos);
             return Err(CallGroupInsertError::DuplicateKey { key, handle });
         }
-        if self.is_full() {
-            return Err(CallGroupInsertError::Full { key, handle });
+        if self.entries.iter().any(|entry| entry.token == token) {
+            let _ = self.reserved_tokens.swap_remove(reserved_pos);
+            return Err(CallGroupInsertError::DuplicateToken { key, token, handle });
         }
+        let _ = self.reserved_tokens.swap_remove(reserved_pos);
         self.entries.push(Entry { key, token, handle });
         Ok(())
     }
@@ -319,6 +397,7 @@ where
         is_success: F,
     ) -> Result<CallGroupReplyStep<K, R>, CallGroupRecordReplyError<K, R>>
     where
+        K: Clone,
         F: FnOnce(&R) -> bool,
     {
         if !matches!(self.race_state, RaceState::Collecting) {
@@ -365,7 +444,7 @@ where
             self.race_state = if expected == 0 {
                 RaceState::Complete
             } else {
-                RaceState::CancellingLosers { expected }
+                RaceState::CancellingLosers
             };
             return Ok(CallGroupReplyStep {
                 cancel_losers,
@@ -389,6 +468,17 @@ where
         token: CallGroupToken,
         outcome: CancelOutcome,
     ) -> Result<bool, CallGroupRecordCancelError<K>> {
+        let Some(expected_pos) = self
+            .expected_cancels
+            .iter()
+            .position(|expected| expected.key == key && expected.token == token)
+        else {
+            return Err(CallGroupRecordCancelError::UnexpectedCancel {
+                key,
+                token,
+                outcome,
+            });
+        };
         if self.cancel_outcomes.len() >= self.capacity {
             return Err(CallGroupRecordCancelError::StorageFull {
                 key,
@@ -396,28 +486,30 @@ where
                 outcome,
             });
         }
+        self.expected_cancels.swap_remove(expected_pos);
         self.cancel_outcomes.push(CallGroupCancelOutcome {
             key,
             token,
             outcome,
         });
-        if let RaceState::CancellingLosers { expected } = self.race_state {
-            if self.cancel_outcomes.len() >= expected {
-                self.race_state = RaceState::Complete;
-            }
+        if matches!(self.race_state, RaceState::CancellingLosers)
+            && self.expected_cancels.is_empty()
+        {
+            self.race_state = RaceState::Complete;
         }
         Ok(self.report_ready())
     }
 
     /// Drains every live branch for explicit owner-stop cancellation.
-    pub fn drain_pending_for_cancel(&mut self) -> Vec<CallGroupCancelRequest<K, R>> {
+    pub fn drain_pending_for_cancel(&mut self) -> Vec<CallGroupCancelRequest<K, R>>
+    where
+        K: Clone,
+    {
         let drained = self.drain_entries_for_cancel();
         if drained.is_empty() {
             self.race_state = RaceState::Complete;
         } else {
-            self.race_state = RaceState::CancellingLosers {
-                expected: drained.len(),
-            };
+            self.race_state = RaceState::CancellingLosers;
         }
         drained
     }
@@ -447,9 +539,17 @@ where
         }
     }
 
-    fn drain_entries_for_cancel(&mut self) -> Vec<CallGroupCancelRequest<K, R>> {
+    fn drain_entries_for_cancel(&mut self) -> Vec<CallGroupCancelRequest<K, R>>
+    where
+        K: Clone,
+    {
         let mut requests = Vec::with_capacity(self.entries.len());
+        self.expected_cancels.clear();
         for entry in self.entries.drain(..) {
+            self.expected_cancels.push(ExpectedCancel {
+                key: entry.key.clone(),
+                token: entry.token,
+            });
             requests.push(CallGroupCancelRequest {
                 key: entry.key,
                 token: entry.token,
@@ -512,6 +612,80 @@ mod tests {
     }
 
     #[test]
+    fn reserved_token_holds_capacity_and_is_one_shot() {
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(1);
+        let token = group.reserve_token().unwrap();
+        assert!(group.reserve_token().is_err());
+        assert!(group.is_full());
+
+        group
+            .insert_reserved(1, token, make_handle())
+            .map_err(|_| ())
+            .unwrap();
+        match group.insert_reserved(2, token, make_handle()) {
+            Err(CallGroupInsertError::UnknownReservedToken {
+                key,
+                token: rejected,
+                handle: _,
+            }) => {
+                assert_eq!(key, 2);
+                assert_eq!(rejected, token);
+            }
+            _ => panic!("expected consumed token to be rejected"),
+        }
+    }
+
+    #[test]
+    fn failed_reserved_insert_does_not_leak_capacity() {
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(2);
+        let _ = group.insert(1, make_handle()).unwrap();
+        let token = group.reserve_token().unwrap();
+
+        match group.insert_reserved(1, token, make_handle()) {
+            Err(CallGroupInsertError::DuplicateKey { key, handle: _ }) => assert_eq!(key, 1),
+            _ => panic!("expected DuplicateKey"),
+        }
+        assert!(!group.is_full());
+        let fresh = group.reserve_token().unwrap();
+        group
+            .insert_reserved(2, fresh, make_handle())
+            .map_err(|_| ())
+            .unwrap();
+    }
+
+    #[test]
+    fn old_token_cannot_be_reused_after_refill() {
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(1);
+        let old = group.reserve_token().unwrap();
+        group
+            .insert_reserved(1, old, make_handle())
+            .map_err(|_| ())
+            .unwrap();
+        let step = group
+            .record_reply(1, old, CallOutcome::Replied(Reply(1)), |_| false)
+            .unwrap();
+        assert!(step.report_ready);
+
+        match group.insert_reserved(1, old, make_handle()) {
+            Err(CallGroupInsertError::UnknownReservedToken {
+                key,
+                token,
+                handle: _,
+            }) => {
+                assert_eq!(key, 1);
+                assert_eq!(token, old);
+            }
+            _ => panic!("expected old token reuse to be rejected"),
+        }
+        let new = group.reserve_token().unwrap();
+        assert_ne!(old, new);
+        group
+            .insert_reserved(1, new, make_handle())
+            .map_err(|_| ())
+            .unwrap();
+    }
+
+    #[test]
     fn token_prevents_key_aba_after_refill() {
         let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(1);
         let old = group.insert(9, make_handle()).unwrap();
@@ -571,6 +745,54 @@ mod tests {
         assert!(report.complete);
         assert_eq!(report.winner, Some(b));
         assert_eq!(report.cancel_outcomes.len(), 1);
+    }
+
+    #[test]
+    fn forged_and_duplicate_cancel_outcomes_do_not_complete_report() {
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(3);
+        let winner = group.insert(1, make_handle()).unwrap();
+        let loser_a = group.insert(2, make_handle()).unwrap();
+        let loser_b = group.insert(3, make_handle()).unwrap();
+
+        let won = group
+            .record_reply(1, winner, CallOutcome::Replied(Reply(10)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap();
+        assert_eq!(won.cancel_losers.len(), 2);
+        assert!(!won.report_ready);
+
+        match group.record_cancel(99, loser_a, CancelOutcome::Cancelled) {
+            Err(CallGroupRecordCancelError::UnexpectedCancel { key, token, .. }) => {
+                assert_eq!(key, 99);
+                assert_eq!(token, loser_a);
+            }
+            _ => panic!("expected forged cancel key to be rejected"),
+        }
+        assert!(!group.report_ready());
+
+        assert!(
+            !group
+                .record_cancel(2, loser_a, CancelOutcome::Cancelled)
+                .unwrap()
+        );
+        match group.record_cancel(2, loser_a, CancelOutcome::Cancelled) {
+            Err(CallGroupRecordCancelError::UnexpectedCancel { key, token, .. }) => {
+                assert_eq!(key, 2);
+                assert_eq!(token, loser_a);
+            }
+            _ => panic!("expected duplicate cancel to be rejected"),
+        }
+        assert!(!group.report_ready());
+
+        assert!(
+            group
+                .record_cancel(3, loser_b, CancelOutcome::Cancelled)
+                .unwrap()
+        );
+        let report = group.into_report();
+        assert!(report.complete);
+        assert_eq!(report.cancel_outcomes.len(), 2);
     }
 
     #[test]

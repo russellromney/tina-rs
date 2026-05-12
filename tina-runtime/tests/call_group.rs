@@ -102,7 +102,7 @@ impl Svc {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
-                    let token = group.reserve_token();
+                    let token = group.reserve_token().expect("group sized to workers");
                     let (effect, handle) =
                         call_with_handle(*worker, WorkerMsg::Do, Duration::from_secs(2)).reply(
                             move |outcome| SvcMsg::Returned {
@@ -337,7 +337,7 @@ impl OwnerDriver {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
-                    let token = self.group.reserve_token();
+                    let token = self.group.reserve_token().expect("group sized to workers");
                     let (effect, handle) =
                         call_with_handle(*worker, WorkerMsg::Do, Duration::from_secs(2)).reply(
                             move |outcome| OwnerMsg::Returned {

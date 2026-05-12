@@ -95,6 +95,7 @@ struct Driver {
     group: CallGroup<u32, WorkerReply>,
     replies_before_cancel: u32,
     cancel_observed: bool,
+    group_error: bool,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -109,7 +110,7 @@ impl Driver {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
-                    let token = self.group.reserve_token();
+                    let token = self.group.reserve_token().expect("group sized to FANOUT");
                     let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, CALL_TIMEOUT)
                         .reply(move |outcome| DriverMsg::Returned {
                             worker: key,
@@ -132,7 +133,13 @@ impl Driver {
                 // CallGroup has no Drop magic. A normal reply settled
                 // the call; the slot is reusable.
                 let replied = matches!(outcome, CallOutcome::Replied(_));
-                let _ = self.group.record_reply(worker, token, outcome, |_| false);
+                if self
+                    .group
+                    .record_reply(worker, token, outcome, |_| false)
+                    .is_err()
+                {
+                    self.group_error = true;
+                }
                 if replied {
                     self.replies_before_cancel += 1;
                 }
@@ -161,14 +168,16 @@ impl Driver {
                 token,
                 outcome,
             } => {
-                let _ = self.group.record_cancel(worker, token, outcome);
+                if self.group.record_cancel(worker, token, outcome).is_err() {
+                    self.group_error = true;
+                }
                 noop()
             }
             DriverMsg::Finish => stop_with(Report {
                 replies_before_cancel: self.replies_before_cancel,
                 replies_after_cancel: 0,
                 cancel_observed: self.cancel_observed,
-                exit_clean: true,
+                exit_clean: !self.group_error,
             }),
         }
     }
@@ -203,6 +212,7 @@ pub fn run() -> anyhow::Result<Report> {
                 group: CallGroup::with_capacity(FANOUT as usize),
                 replies_before_cancel: 0,
                 cancel_observed: false,
+                group_error: false,
             },
             32,
         )

@@ -133,7 +133,7 @@ pub use call::{
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
     CallGroupInsertError, CallGroupRecordCancelError, CallGroupRecordReplyError,
-    CallGroupReplyStep, CallGroupReport, CallGroupToken,
+    CallGroupReplyStep, CallGroupReport, CallGroupReserveError, CallGroupToken,
 };
 pub use capacity::{
     CapacityAssertError, CapacityNameError, CapacitySummary, SurfaceAssertion,
