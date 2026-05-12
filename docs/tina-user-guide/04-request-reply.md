@@ -72,6 +72,33 @@ timeout is normal outcome
 caller handles timeout
 ```
 
+> **Multi-turn reply rule**
+>
+> `call(...).reply(...)` creates a continuation message. It does not create
+> a hidden async stack, and it does not automatically carry the original caller
+> into later handler turns.
+>
+> If a service must call something else before answering its caller, capture the
+> caller first:
+>
+> ```rust
+> let request = ctx.take_request_context().expect("message came from call");
+> call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
+>     .reply_with_request(request, ServiceMsg::WorkerReturned)
+> ```
+>
+> Then consume that request context in the final turn:
+>
+> ```rust
+> ServiceMsg::WorkerReturned(request, CallOutcome::Replied(reply)) => {
+>     reply_to_request(request, ServiceReply::Done(reply))
+> }
+> ```
+>
+> If the handler just returns a runtime call and later does `reply(...)` from
+> the continuation message, the original caller is not there. The caller will
+> wait until timeout, and Tina will emit a diagnostic abandoned-call trace event.
+
 ## Deferred Reply
 
 A service can reply after more than one handler turn.
