@@ -38,3 +38,43 @@ Proceed with 085 only after 081, and preferably after 084 if child work
 is the chosen specimen. The first implementation should prefer one boring
 `CallGroup` helper plus a first-success race. Do not build a policy
 framework or macro.
+
+## Implementation Hostile Review
+
+### Finding 1 — Token must exist before the call effect is built
+
+The first draft shape returned the generation token from `insert`, but
+`call_with_handle(...).reply(...)` needs to close over the token before
+the helper can store the returned handle. That circular API would push
+users toward key-only continuations and reopen ABA. Fixed by adding the
+explicit `reserve_token` / `insert_reserved` path. `insert` remains for
+tests or manual code that can route the token separately.
+
+### Finding 2 — `Vec::with_capacity` is not itself a cap
+
+The helper uses fixed-cap vectors, but hostile grug notes that ordinary
+`push` can still grow. Branch outcomes are bounded by live branch count;
+cancel outcomes now return a typed `StorageFull` error instead of
+growing past capacity. Tests cover fill/full and fill/cancel/refill.
+
+### Finding 3 — Report-before-cancel would lie
+
+The runtime proof waits for `cancel_call` outcomes before the service
+replies through `RequestContext`. The report is not considered complete
+until loser cancel outcomes have been recorded. Late loser replies are
+not delivered to the group; they remain runtime trace facts as
+`CallerCancelled` rejections.
+
+### Finding 4 — Join-all stayed out
+
+Join-all was not small enough to add honestly in the same slice without
+turning the helper into a policy surface. First-success shipped; join-all
+remains deferred until it can use the same bounded report vocabulary
+without hiding deadlines or partial truth.
+
+### Finding 5 — Owner stop must be user-visible work
+
+No `Drop` cancel was added. The owner-stop proof sends a stop message,
+drains the group into named cancel requests, returns visible
+`cancel_call` effects, waits for cancel outcomes, then stops with a
+report.

@@ -2,11 +2,21 @@
 
 ## Status
 
-- Done: plan + review.
-- Open: bounded named call group, first-success race, join-all partial
-  report if small, one specimen.
-- Deferred: macros, fake `select!`, hidden retry, stream select,
-  policy framework, heterogeneous reply groups.
+- Phase 085 start note:
+  - chosen API home: `tina-runtime`, because first-success reports speak
+    `CallOutcome` plus visible `cancel_call` outcomes.
+  - chosen bounded storage shape: fixed-cap `Vec` entries with a
+    per-branch generation token; no growing `HashMap`.
+  - chosen specimen: `specimen_cancellation_chain`, because it already
+    exposes cancel truth without hiding pipeline stages.
+- Done: bounded named `CallGroup`, generation-token ABA guard,
+  first-success race report vocabulary, explicit loser cancel requests,
+  cancel-outcome-complete reports, RequestContext proof, owner-stop
+  drain proof, `specimen_cancellation_chain` update, tests, clippy.
+- Open: none for first-success first form.
+- Deferred: join-all helper, macros, fake `select!`, hidden retry,
+  stream select, policy framework, heterogeneous reply groups,
+  child-ref sugar.
 
 ## Goal
 
