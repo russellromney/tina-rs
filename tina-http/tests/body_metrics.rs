@@ -638,6 +638,100 @@ fn streaming_response_charges_per_chunk_and_releases_after_write() {
 }
 
 #[test]
+fn chunked_request_charges_decoded_bytes_and_drains() {
+    let metrics = BodyMetrics::new();
+    let chunk_size = 512;
+    let body: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let consumer = runtime
+        .register_with_capacity::<StreamingConsumer, Infallible>(
+            StreamingConsumer {
+                chunk_call_timeout: Duration::from_secs(2),
+                pending_source: None,
+                total: 0,
+            },
+            32,
+        )
+        .expect("register consumer");
+
+    let limits = HttpLimits {
+        inbound_stream_chunk_size: Some(chunk_size),
+        ..HttpLimits::default()
+    };
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener_isolate = HttpListener::<TestShard, StreamMsg>::new(
+        bind,
+        consumer,
+        limits,
+        Duration::from_secs(5),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard, StreamMsg>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let mut chunked_body = Vec::new();
+    for chunk in body.chunks(1024) {
+        chunked_body.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        chunked_body.extend_from_slice(chunk);
+        chunked_body.extend_from_slice(b"\r\n");
+    }
+    chunked_body.extend_from_slice(b"0\r\n\r\n");
+
+    let mut request =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            .to_string()
+            .into_bytes();
+    request.extend_from_slice(&chunked_body);
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(&request).unwrap();
+    stream.flush().unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let text = std::str::from_utf8(&response).unwrap();
+    assert!(text.starts_with("HTTP/1.1 200"), "got {text:?}");
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let snap = metrics.snapshot();
+    assert!(
+        snap.request_body_high_water > 0,
+        "must have charged at least one chunk's worth"
+    );
+    assert!(
+        snap.request_body_high_water <= 4096,
+        "high water bounded by per-syscall ceiling READ_CHUNK; got {}",
+        snap.request_body_high_water
+    );
+    assert!(
+        snap.drained(),
+        "every charge must release after stream completes; got {snap:?}"
+    );
+    assert_eq!(snap.body_io_error_count, 0, "happy path: no IO error");
+    assert_eq!(snap.body_full_count, 0);
+    assert_eq!(snap.body_timeout_count, 0);
+}
+
+#[test]
 fn streaming_response_under_produces_records_io_error() {
     // Source declares 4 chunks but only yields 2 then Eof. The wire
     // body is shorter than declared Content-Length — that is a

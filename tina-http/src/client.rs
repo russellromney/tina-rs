@@ -28,6 +28,7 @@ use crate::target::{HttpHostPolicy, HttpTarget};
 use crate::transport::HttpTransport;
 use crate::types::{
     HttpClientConfig, HttpClientError, HttpRequest, HttpResponse, HttpTransportPhase,
+    ResponseParseError,
 };
 
 /// Bytes the client asks for per `tcp_read`. Matches the server side.
@@ -86,6 +87,14 @@ struct ActiveCall {
     read_buf: Vec<u8>,
     parsed_head: Option<HttpResponseHead>,
     head_len: usize,
+    chunked_decoder: Option<crate::chunked_decoder::ChunkedDecoder>,
+    body_buf: Vec<u8>,
+}
+
+enum Decision {
+    Deliver,
+    Fail,
+    NeedMore(usize),
 }
 
 impl<S: Shard + 'static> HttpClient<S> {
@@ -197,6 +206,8 @@ impl<S: Shard + 'static> HttpClient<S> {
             read_buf: Vec::new(),
             parsed_head: None,
             head_len: 0,
+            chunked_decoder: None,
+            body_buf: Vec::new(),
         });
         let connect_effect: Effect<Self> = match target {
             HttpTarget::Http { addr, .. } => tcp_connect(addr).reply(HttpClientMsg::Connected),
@@ -299,7 +310,34 @@ impl<S: Shard + 'static> HttpClient<S> {
         }
 
         if body_complete(state) {
-            self.deliver_success()
+            return self.deliver_success();
+        }
+
+        let head = state.parsed_head.as_ref().expect("head parsed");
+        if head.chunked {
+            let decoder = state.chunked_decoder.get_or_insert_with(|| {
+                crate::chunked_decoder::ChunkedDecoder::new(self.config.limits.max_body_bytes)
+            });
+            let body_start = state.head_len;
+            let decision = {
+                let raw = &state.read_buf[body_start..];
+                let (result, consumed) = decoder.feed_all(raw, &mut state.body_buf);
+                match result {
+                    crate::chunked_decoder::FeedAllResult::Complete => Decision::Deliver,
+                    crate::chunked_decoder::FeedAllResult::Failed(_) => Decision::Fail,
+                    crate::chunked_decoder::FeedAllResult::NeedMore => Decision::NeedMore(consumed),
+                }
+            };
+            match decision {
+                Decision::Deliver => self.deliver_success(),
+                Decision::Fail => self.fail(HttpClientError::Parse(
+                    ResponseParseError::MalformedChunkedBody,
+                )),
+                Decision::NeedMore(consumed) => {
+                    state.read_buf.drain(body_start..body_start + consumed);
+                    self.read_more()
+                }
+            }
         } else {
             self.read_more()
         }
@@ -308,8 +346,12 @@ impl<S: Shard + 'static> HttpClient<S> {
     fn deliver_success(&mut self) -> Effect<Self> {
         let state = self.state.take().expect("state present at delivery");
         let head = state.parsed_head.expect("head parsed before delivery");
-        let body_end = state.head_len + head.content_length;
-        let body = state.read_buf[state.head_len..body_end].to_vec();
+        let body = if head.chunked {
+            state.body_buf
+        } else {
+            let body_end = state.head_len + head.content_length;
+            state.read_buf[state.head_len..body_end].to_vec()
+        };
         let response = HttpResponse {
             status: head.status,
             version: head.version,
@@ -348,8 +390,12 @@ fn body_complete(state: &ActiveCall) -> bool {
     let Some(head) = state.parsed_head.as_ref() else {
         return false;
     };
-    let needed = state.head_len + head.content_length;
-    state.read_buf.len() >= needed
+    if head.chunked {
+        false
+    } else {
+        let needed = state.head_len + head.content_length;
+        state.read_buf.len() >= needed
+    }
 }
 
 /// Resolves the wire `Host:` from the target's host policy.

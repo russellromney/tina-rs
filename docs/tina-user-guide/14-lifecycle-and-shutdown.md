@@ -137,6 +137,34 @@ no "kill this worker."
 | reqwest bridge | yes | maybe future abort handle; today be honest | trace/metrics |
 | pool acquire waiter | yes | yes, reclaim waiter slot | no late work |
 
+### Examples
+
+**Isolate call cancel.** Call with `call_with_handle` so the caller
+owns a [`CallHandle`]. Later, `cancel_call(handle)` reclaims the
+waiter slot and records `CallCancelled` in the trace. If the callee
+already accepted the work, the late reply becomes
+`CallReplyRejected` — visible, not a ghost.
+
+**Response streaming cancel.** If the client drops the connection
+mid-stream, the connection isolate sends
+[`ResponseChunkMsg::Cancel`](../../tina-http/src/streaming.rs) to the
+body source. The source can release files, downstream calls, and
+pending slots. `body_io_error_count` still increments so the
+truncation is visible.
+
+**SQLx best-effort DB cancel.** Opt-in via
+`PgConfig::with_cancel_on_timeout`. When the bridge per-attempt
+timeout fires, a sidecar pool fires `pg_cancel_backend(pid)`. Postgres
+may or may not honor it, and a small race exists between cancel firing
+and the connection returning to the pool. `db_cancels_sent` counts
+attempts, not guaranteed query deaths.
+
+**SQLite no-cancel late result.** `rusqlite` work runs on a blocking
+std thread. If the caller times out, the worker thread runs to
+completion. The terminal outcome is recorded and the dropped reply
+shows up as `CallReplyRejected` in the trace, incrementing
+`late_results`. No hidden work, no fake kill.
+
 Owners that hold many in-flight calls should store the handles in a
 bounded `PendingCallSet<K, R>` keyed by request id. The set rejects
 duplicate keys loudly (it deliberately does **not** auto-sweep

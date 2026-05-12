@@ -56,10 +56,23 @@ impl HttpRequestBody {
 
     /// Returns total declared body length. For `Buffered` this is the
     /// vec length; for `Stream` it is the declared `Content-Length`.
-    pub fn declared_length(&self) -> usize {
+    pub fn declared_length(&self) -> Option<usize> {
         match self {
-            Self::Buffered(bytes) => bytes.len(),
-            Self::Stream(s) => s.content_length,
+            Self::Buffered(bytes) => Some(bytes.len()),
+            Self::Stream(s) => {
+                if s.chunked {
+                    None
+                } else {
+                    Some(s.content_length)
+                }
+            }
+        }
+    }
+
+    pub fn has_body(&self) -> bool {
+        match self {
+            Self::Buffered(bytes) => !bytes.is_empty(),
+            Self::Stream(s) => s.chunked || s.content_length > 0,
         }
     }
 }
@@ -367,10 +380,8 @@ impl HttpRequest {
         self.body.as_buffered().map(std::str::from_utf8)
     }
 
-    /// Returns `true` if the request carries any body bytes (either
-    /// buffered non-empty, or a stream with non-zero declared length).
     pub fn has_body(&self) -> bool {
-        self.body.declared_length() > 0
+        self.body.has_body()
     }
 }
 
@@ -393,6 +404,8 @@ pub enum ResponseParseError {
     MissingContentLength,
     /// Declared body length exceeded the configured byte limit.
     BodyTooLarge,
+    /// Chunked transfer encoding produced malformed wire bytes.
+    MalformedChunkedBody,
     /// The HTTP version on the wire was neither `HTTP/1.0` nor
     /// `HTTP/1.1`.
     UnsupportedHttpVersion,
@@ -412,9 +425,9 @@ pub enum RequestParseError {
     /// The header section exceeded the configured byte limit.
     /// Maps to `431 Request Header Fields Too Large`.
     HeadersTooLarge,
-    /// `Transfer-Encoding` was set to a value other than `identity`.
-    /// First form only supports `Content-Length`. Maps to `501 Not
-    /// Implemented`.
+    /// `Transfer-Encoding` was unsupported, or chunked request
+    /// decoding was disabled by [`HttpLimits::inbound_stream_chunk_size`].
+    /// Maps to `501 Not Implemented`.
     UnsupportedTransferEncoding,
     /// `Content-Length` failed to parse, was negative, or had two
     /// conflicting values. Maps to `400 Bad Request` per RFC 7230 §3.3.2.
@@ -422,6 +435,9 @@ pub enum RequestParseError {
     /// The declared body length exceeded the configured byte limit.
     /// Maps to `413 Payload Too Large`.
     BodyTooLarge,
+    /// Chunked transfer encoding produced malformed wire bytes.
+    /// Maps to `400 Bad Request`.
+    MalformedChunkedBody,
     /// The request line used an unsupported request-target form (e.g.
     /// absolute-form, authority-form, asterisk-form). Maps to `400 Bad
     /// Request`.
@@ -450,6 +466,7 @@ impl RequestParseError {
             // 400 Bad Request, not a 411 Length Required.
             Self::InvalidContentLength => StatusCode::BAD_REQUEST,
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::MalformedChunkedBody => StatusCode::BAD_REQUEST,
             Self::UnsupportedRequestTarget => StatusCode::BAD_REQUEST,
             Self::UnsupportedHttpVersion => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
             Self::HeaderReadTimeout => StatusCode::REQUEST_TIMEOUT,
@@ -675,6 +692,15 @@ pub enum HttpTransportPhase {
     Read,
     Write,
     Close,
+}
+
+/// Error during chunked transfer decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkedError {
+    BadChunkSize,
+    MissingCrlf,
+    BodyTooLarge,
+    TrailersNotSupported,
 }
 
 /// Outbound call failed before producing a parsed [`HttpResponse`].

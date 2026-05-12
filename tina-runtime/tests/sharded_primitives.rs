@@ -14,13 +14,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
+use std::error::Error;
 use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
 use tina_runtime::sharded::{
-    MissingShard, ScatterGatherConfig, ScatterGatherConfigError, ScatterGatherReport,
-    ScatterGatherTargetOutcome, ShardPlacement, ShardServiceTable, WrongShard,
+    GroupByOwnerError, MissingShard, ScatterGatherConfig, ScatterGatherConfigError,
+    ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement, ShardServiceTable, WrongShard,
 };
 use tina_runtime::{MailboxFactory, MultiShardRuntime, RuntimeCall, SendOutcome, send_observed};
 
@@ -1671,4 +1672,189 @@ fn register_reply_adapter_on_returns_address_on_chosen_shard_and_translates() {
     run_until_idle(&mut runtime);
 
     assert_eq!(*seen.borrow(), 12);
+}
+
+// ---------- Group-by-owner helper ----------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyedItem {
+    key: String,
+    value: u32,
+}
+
+fn keyed(key: &str, value: u32) -> KeyedItem {
+    KeyedItem {
+        key: key.to_string(),
+        value,
+    }
+}
+
+fn shards(raws: &[u32]) -> Vec<ShardId> {
+    raws.iter().copied().map(ShardId::new).collect()
+}
+
+const FROZEN_DST_KEYS: &[&str] = &[
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+    "lambda", "mu",
+];
+const FROZEN_DST_SHARDS: [u32; 3] = [11, 22, 33];
+const FROZEN_DST_OWNERS: [u32; 12] = [11, 33, 33, 22, 33, 33, 11, 11, 11, 33, 33, 11];
+
+#[test]
+fn group_by_owner_preserves_placement_shard_order() {
+    let p = ShardPlacement::new("p", shards(&[3, 17, 91])).unwrap();
+    let items = vec![
+        keyed("alpha", 1),
+        keyed("beta", 2),
+        keyed("gamma", 3),
+        keyed("delta", 4),
+    ];
+    let batches = p.group_by_owner_str(items, |i| &i.key, 16).unwrap();
+    let batch_shards: Vec<u32> = batches.iter().map(|b| b.shard.get()).collect();
+    assert_eq!(batch_shards, vec![3, 17, 91]);
+    let all_values: Vec<u32> = batches
+        .iter()
+        .flat_map(|b| b.items.iter().map(|i| i.value))
+        .collect();
+    assert_eq!(all_values, vec![1, 4, 2, 3]);
+}
+
+#[test]
+fn group_by_owner_with_non_contiguous_shard_ids() {
+    let p = ShardPlacement::new("p", shards(&[100, 7, 250])).unwrap();
+    let alpha_to_100 = keyed("alpha", 1);
+    let delta_to_7 = keyed("delta", 2);
+    let beta_to_250 = keyed("beta", 3);
+    let items = vec![alpha_to_100, delta_to_7, beta_to_250];
+    let batches = p.group_by_owner_str(items, |i| &i.key, 16).unwrap();
+    let batch_shards: Vec<u32> = batches.iter().map(|b| b.shard.get()).collect();
+    assert_eq!(batch_shards, vec![100, 7, 250]);
+}
+
+#[test]
+fn group_by_owner_empty_input_is_ok() {
+    let p = ShardPlacement::new("p", shards(&[1, 2])).unwrap();
+    let items: Vec<KeyedItem> = vec![];
+    let batches = p.group_by_owner_str(items, |i| &i.key, 16).unwrap();
+    assert!(batches.is_empty());
+}
+
+#[test]
+fn group_by_owner_cap_exceeded_returns_typed_error() {
+    let p = ShardPlacement::new("p", shards(&[1])).unwrap();
+    let items = vec![keyed("a", 1), keyed("b", 2)];
+    let err = p.group_by_owner_str(items, |i| &i.key, 1).unwrap_err();
+    assert_eq!(
+        err,
+        GroupByOwnerError::CapExceeded {
+            provided: 2,
+            max: 1,
+        }
+    );
+}
+
+#[test]
+fn group_by_owner_duplicate_keys_land_together() {
+    let p = ShardPlacement::new("p", shards(&[1, 2])).unwrap();
+    // Under v1 FNV-1a, "same" and "same" obviously hash to the same shard.
+    let items = vec![keyed("same", 10), keyed("same", 20), keyed("same", 30)];
+    let batches = p.group_by_owner_str(items, |i| &i.key, 16).unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].items.len(), 3);
+    let values: Vec<u32> = batches[0].items.iter().map(|i| i.value).collect();
+    assert_eq!(values, vec![10, 20, 30]);
+}
+
+#[test]
+fn group_by_owner_bytes_matches_live_sim_owner_mapping() {
+    // Same frozen keys/shards/owners as the byte-identical placement test.
+    let p = ShardPlacement::new(
+        "dst-fanout",
+        FROZEN_DST_SHARDS
+            .iter()
+            .copied()
+            .map(ShardId::new)
+            .collect(),
+    )
+    .unwrap();
+    let items: Vec<KeyedItem> = FROZEN_DST_KEYS.iter().map(|k| keyed(k, 0)).collect();
+    let batches = p.group_by_owner_str(items, |i| &i.key, 64).unwrap();
+
+    // Build per-shard owner sets from the frozen mapping.
+    let mut expected_per_shard: BTreeMap<ShardId, Vec<String>> = BTreeMap::new();
+    for (key, owner_raw) in FROZEN_DST_KEYS.iter().zip(FROZEN_DST_OWNERS.iter()) {
+        expected_per_shard
+            .entry(ShardId::new(*owner_raw))
+            .or_default()
+            .push(key.to_string());
+    }
+
+    assert_eq!(batches.len(), FROZEN_DST_SHARDS.len());
+    for batch in &batches {
+        let expected_keys = expected_per_shard
+            .get(&batch.shard)
+            .expect("shard in expected map");
+        let got_keys: Vec<String> = batch.items.iter().map(|i| i.key.clone()).collect();
+        assert_eq!(&got_keys, expected_keys);
+    }
+}
+
+#[test]
+fn group_by_owner_error_implements_std_error() {
+    let p = ShardPlacement::new("p", shards(&[1])).unwrap();
+    let items = vec![keyed("a", 1)];
+    let err: Box<dyn Error> = Box::new(p.group_by_owner_str(items, |i| &i.key, 0).unwrap_err());
+    assert!(err.to_string().contains("cap exceeded"));
+}
+
+// ---------- Hot-key pressure: first-attempt only (no retry loop) ----------
+
+#[test]
+fn hot_key_pressure_first_attempt_only_no_retry_loop() {
+    use tina_runtime::sharded::{HotKeyAttemptOutcome, HotKeyAttemptReport};
+
+    let mut runtime = MultiShardRuntime::new([AppShard(7), AppShard(31)], TestMailboxFactory);
+    let placement =
+        ShardPlacement::new("hot-keys", vec![ShardId::new(7), ShardId::new(31)]).unwrap();
+    let tracker_state = CounterTracker::default();
+    let tracker = runtime.register_with_capacity_on::<CounterTracker, Infallible>(
+        ShardId::new(7),
+        tracker_state,
+        64,
+    );
+    // cap=2: first two sends fit, the rest come back Full immediately.
+    let owner = register_hot_key_owner(&mut runtime, &placement, 2);
+    let make_msg = || CounterMsg::Inc {
+        key: "hot-key".to_string(),
+        reply_to: tracker,
+    };
+
+    let mut report = HotKeyAttemptReport::default();
+    const BURST: usize = 5;
+
+    // No retry loop: every attempt is terminal on first try.
+    for _ in 0..BURST {
+        match runtime.try_send(owner, make_msg()) {
+            Ok(()) => report.record(HotKeyAttemptOutcome::Accepted),
+            Err(TrySendError::Full(_)) => report.record(HotKeyAttemptOutcome::FullFirstAttempt),
+            Err(TrySendError::Closed(_)) => report.record(HotKeyAttemptOutcome::Closed),
+        }
+    }
+    run_until_idle(&mut runtime);
+
+    assert_eq!(report.accepted_first_attempt, 2, "cap=2 admits exactly two");
+    assert_eq!(
+        report.full_first_attempt, 3,
+        "remaining three are Full on first attempt"
+    );
+    assert_eq!(
+        report.accepted_first_attempt + report.full_first_attempt,
+        BURST as u32,
+        "every attempt produced exactly one record"
+    );
+    assert_eq!(report.retry_succeeded, 0, "no retry loop was used");
+    assert_eq!(report.retry_exhausted, 0, "no retry loop was used");
+    assert_eq!(report.full_retry_total, 0, "no retry loop was used");
+    assert_eq!(report.timeout, 0);
+    assert_eq!(report.closed, 0);
 }

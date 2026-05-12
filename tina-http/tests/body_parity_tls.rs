@@ -15,12 +15,13 @@ use http::StatusCode;
 use rustls::pki_types::ServerName;
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg, HttpsReady,
-    HttpsServerConfig, HttpsStartupError, IterBodySource, ResponseChunkMsg, ResponseChunkReply,
-    ResponseStream, TlsServerIdentity,
+    BodyMetrics, HttpConnectionMsg, HttpRequest, HttpRequestBody, HttpResponse, HttpsListener,
+    HttpsListenerMsg, HttpsReady, HttpsServerConfig, HttpsStartupError, IterBodySource,
+    RequestChunkReply, ResponseChunkMsg, ResponseChunkReply, ResponseStream, TlsServerIdentity,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+    ThreadedRuntimeConfig, call,
 };
 
 #[derive(Debug, Default)]
@@ -409,5 +410,214 @@ fn chunked_response_over_https_matches_http_shape() {
     assert_eq!(
         snap.body_io_error_count, 0,
         "happy path: chunked-over-HTTPS records no IO errors"
+    );
+}
+
+/// HTTPS parity for chunked *request* acceptance. A raw rustls client
+/// sends a chunked POST; the server decodes it via the same streaming
+/// pull model used for plain HTTP. The response echoes the total decoded
+/// bytes so the test can verify end-to-end correctness.
+#[derive(Debug, Clone)]
+enum ChunkedRequestMsg {
+    Inbound(HttpRequest),
+    ChunkArrived(CallOutcome<RequestChunkReply>),
+}
+
+impl From<HttpRequest> for ChunkedRequestMsg {
+    fn from(req: HttpRequest) -> Self {
+        Self::Inbound(req)
+    }
+}
+
+struct ChunkedRequestConsumer {
+    pending_source: Option<Address<HttpConnectionMsg, RequestChunkReply>>,
+    accumulated: Vec<u8>,
+}
+
+impl Isolate for ChunkedRequestConsumer {
+    tina::isolate_types! {
+        message: ChunkedRequestMsg,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<ChunkedRequestMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: ChunkedRequestMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ChunkedRequestMsg::Inbound(req) => match req.body {
+                HttpRequestBody::Buffered(bytes) => reply(HttpResponse::with_text(
+                    StatusCode::OK,
+                    format!("buffered:{}", bytes.len()),
+                )),
+                HttpRequestBody::Stream(stream) => {
+                    self.accumulated.clear();
+                    self.pending_source = Some(stream.source);
+                    call(
+                        stream.source,
+                        HttpConnectionMsg::body_next(),
+                        Duration::from_secs(2),
+                    )
+                    .reply(ChunkedRequestMsg::ChunkArrived)
+                }
+            },
+            ChunkedRequestMsg::ChunkArrived(outcome) => match outcome {
+                CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
+                    self.accumulated.extend_from_slice(&bytes);
+                    let source = self.pending_source.expect("source set");
+                    call(
+                        source,
+                        HttpConnectionMsg::body_next(),
+                        Duration::from_secs(2),
+                    )
+                    .reply(ChunkedRequestMsg::ChunkArrived)
+                }
+                CallOutcome::Replied(RequestChunkReply::Eof) => {
+                    let total = self.accumulated.len();
+                    self.pending_source = None;
+                    self.accumulated.clear();
+                    reply(HttpResponse::with_text(
+                        StatusCode::OK,
+                        format!("stream:{total}"),
+                    ))
+                }
+                CallOutcome::Replied(RequestChunkReply::Error(_))
+                | CallOutcome::Full
+                | CallOutcome::Closed
+                | CallOutcome::Timeout => {
+                    self.pending_source = None;
+                    reply(HttpResponse::internal_error())
+                }
+            },
+        }
+    }
+}
+
+fn send_chunked_request_over_rustls(
+    addr: SocketAddr,
+    root_cert_der: Vec<u8>,
+    path: &str,
+    chunked_body: &[u8],
+) -> Vec<u8> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(root_cert_der))
+        .expect("add self-signed root");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("localhost").expect("server name");
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), server_name).expect("client connection");
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("tcp connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+        .expect("write timeout");
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    while stream.conn.is_handshaking() {
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .expect("client handshake");
+    }
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).expect("write head");
+    stream.write_all(chunked_body).expect("write body");
+    stream.flush().expect("flush");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    response
+}
+
+#[test]
+fn chunked_request_over_https_matches_http_shape() {
+    let (identity, cert_der) = generate_identity();
+    let metrics = BodyMetrics::new();
+
+    let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let mut chunked_body = Vec::new();
+    for chunk in body.chunks(1024) {
+        chunked_body.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        chunked_body.extend_from_slice(chunk);
+        chunked_body.extend_from_slice(b"\r\n");
+    }
+    chunked_body.extend_from_slice(b"0\r\n\r\n");
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let consumer = runtime
+        .register_with_capacity::<ChunkedRequestConsumer, Infallible>(
+            ChunkedRequestConsumer {
+                pending_source: None,
+                accumulated: Vec::new(),
+            },
+            32,
+        )
+        .expect("register consumer");
+
+    let mut server_config = HttpsServerConfig::dev(identity);
+    server_config.http.limits.inbound_stream_chunk_size = Some(512);
+    let listener_isolate = HttpsListener::<TestShard, ChunkedRequestMsg>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        consumer,
+        server_config,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpsListener<TestShard, ChunkedRequestMsg>, _>(
+            listener_isolate,
+            8,
+        )
+        .expect("register listener");
+
+    type StartOutcome = CallOutcome<Result<HttpsReady, HttpsStartupError>>;
+    let outcome: StartOutcome = runtime
+        .call_blocking(listener, HttpsListenerMsg::Start, Duration::from_secs(5))
+        .expect("startup call runs");
+    let ready = match outcome {
+        CallOutcome::Replied(Ok(ready)) => ready,
+        other => panic!("expected ready, got {other:?}"),
+    };
+
+    let response =
+        send_chunked_request_over_rustls(ready.local_addr, cert_der, "/upload", &chunked_body);
+    let text = std::str::from_utf8(&response).expect("utf8 response");
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "expected 200 OK, got: {text:?}"
+    );
+    assert!(
+        text.ends_with(&format!("stream:{}", body.len())),
+        "decoded body length must match original; got: {text:?}"
+    );
+
+    let _ = runtime.try_send(listener, HttpsListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let snap = metrics.snapshot();
+    assert!(snap.drained(), "metrics drain on shutdown; got {snap:?}");
+    assert!(
+        snap.request_body_high_water > 0,
+        "chunked request over HTTPS must charge body bytes"
+    );
+    assert_eq!(
+        snap.body_io_error_count, 0,
+        "happy path: no IO errors on chunked request over HTTPS"
     );
 }
