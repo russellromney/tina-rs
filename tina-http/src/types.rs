@@ -425,9 +425,9 @@ pub enum RequestParseError {
     /// The header section exceeded the configured byte limit.
     /// Maps to `431 Request Header Fields Too Large`.
     HeadersTooLarge,
-    /// `Transfer-Encoding` was set to a value other than `identity`.
-    /// First form only supports `Content-Length`. Maps to `501 Not
-    /// Implemented`.
+    /// `Transfer-Encoding` was unsupported, or chunked request
+    /// decoding was disabled by [`HttpLimits::inbound_stream_chunk_size`].
+    /// Maps to `501 Not Implemented`.
     UnsupportedTransferEncoding,
     /// `Content-Length` failed to parse, was negative, or had two
     /// conflicting values. Maps to `400 Bad Request` per RFC 7230 §3.3.2.

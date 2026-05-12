@@ -36,9 +36,10 @@
 //! known up front. Use [`crate::HttpResponse::stream_chunked`] when
 //! it is not. There is no "guess a length" path.
 //!
-//! Request bodies remain `Content-Length` only; chunked request
-//! bodies are still rejected as
-//! [`crate::RequestParseError::UnsupportedTransferEncoding`].
+//! Request bodies may be `Content-Length` or chunked. Chunked request
+//! bodies require [`crate::HttpLimits::inbound_stream_chunk_size`] so
+//! the service pulls decoded chunks through the same
+//! [`RequestChunkReply`] path. Chunk trailers are rejected.
 //!
 //! # Backpressure
 //!

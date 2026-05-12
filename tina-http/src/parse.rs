@@ -196,11 +196,9 @@ fn build_head(
             content_length = Some(parsed_len);
         } else if name == http::header::TRANSFER_ENCODING {
             let value_str = std::str::from_utf8(header.value).unwrap_or("");
-            if value_str.eq_ignore_ascii_case("chunked") {
-                transfer_encoding_chunked = true;
-            } else if !value_str.eq_ignore_ascii_case("identity") {
-                transfer_encoding_unsupported = true;
-            }
+            let parsed = parse_transfer_encoding(value_str);
+            transfer_encoding_chunked |= parsed.chunked;
+            transfer_encoding_unsupported |= parsed.unsupported;
         } else if name == http::header::CONNECTION {
             let value_str = std::str::from_utf8(header.value).unwrap_or("");
             let has_close = value_str
@@ -249,6 +247,31 @@ fn is_origin_form(target: &str) -> bool {
     // it for first form). Authority-form (`example.com:80`) and
     // absolute-form (`http://example.com/`) are both rejected.
     target.starts_with('/')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransferEncodingFlags {
+    chunked: bool,
+    unsupported: bool,
+}
+
+fn parse_transfer_encoding(value: &str) -> TransferEncodingFlags {
+    let mut flags = TransferEncodingFlags {
+        chunked: false,
+        unsupported: false,
+    };
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() || token.eq_ignore_ascii_case("identity") {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("chunked") {
+            flags.chunked = true;
+        } else {
+            flags.unsupported = true;
+        }
+    }
+    flags
 }
 
 /// Serialises a response head onto a wire buffer using HTTP/1.1 framing.
@@ -528,11 +551,9 @@ fn build_response_head(
             content_length = Some(parsed_len);
         } else if name == http::header::TRANSFER_ENCODING {
             let value_str = std::str::from_utf8(header.value).unwrap_or("");
-            if value_str.eq_ignore_ascii_case("chunked") {
-                transfer_encoding_chunked = true;
-            } else if !value_str.eq_ignore_ascii_case("identity") {
-                transfer_encoding_unsupported = true;
-            }
+            let parsed = parse_transfer_encoding(value_str);
+            transfer_encoding_chunked |= parsed.chunked;
+            transfer_encoding_unsupported |= parsed.unsupported;
         }
 
         headers.append(name, value);
@@ -658,6 +679,33 @@ mod tests {
                 assert_eq!(head_len, buf.len());
             }
             other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_chunked_request_transfer_encoding_tokens() {
+        let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity, chunked \r\n\r\n";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Complete { head, .. } => assert!(head.chunked),
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_request_transfer_encoding_token() {
+        let buf =
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Failed(RequestParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
         }
     }
 
@@ -1003,6 +1051,24 @@ mod tests {
                 assert_eq!(head_len, buf.len());
             }
             other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_chunked_transfer_encoding_accepts_token_list() {
+        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity, chunked \r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Complete { head, .. } => assert!(head.chunked),
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_unsupported_transfer_encoding_token_rejected() {
+        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
         }
     }
 
