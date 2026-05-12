@@ -250,6 +250,35 @@ framework before public release-story work.
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
+## Capability layers still needed
+
+These are not planning phases. They are capability gaps to close as real
+implementation slices pull on them. Each entry should land as boring code,
+tests, and specimens when the adjacent work proves the shape.
+
+| Capability | Build | User outcome |
+|---|---|---|
+| Child lifecycle and join | Typed child-start observation, typed child address/result, join-many result collection, parent-stop child cleanup, and replacement-address refresh without trace spelunking. | A service can spawn workers/sessions, wait for them, stop them, and survive restarts without inventing a side registry. |
+| Stronger owned-work cancellation | Uniform cancel/close/drain rules for Tina-owned timer/TCP/TLS/process/file/DNS rails, with tombstoned late completions and prompt resource release where the backend can support it. | `cancel` stops waiting everywhere, and for Tina-owned work it also releases the owned resource as strongly as the rail allows. |
+| Capacity scopes | User-defined weight units, explicit unbounded-with-expiry escape hatch, shard-local shared capacity scopes, and capacity assertions usable in DST/CI. | Users tune from evidence instead of vibes, and related surfaces can share one visible budget. |
+| Live trace to sim replay | Capture live inputs/resource completions/topology facts into a replayable history, project them into `tina-sim`, and report exact divergence. | A production bug can become a small deterministic "bug in a box" instead of a log-reading séance. |
+| Race/join helpers | Honest `race`/`join`/`join set` helpers over messages/effects that preserve named suspension points, cancellation, capacity, and trace outcomes. | Common `select!` / `join!` Tokio shapes can be written in Tina without hiding which branch won or what got cancelled. |
+| Timer vocabulary | Replay-safe interval, backoff, jitter, debounce, throttle, and deadline propagation helpers built on runtime time, not ambient clocks. | Periodic and retrying services stop hand-rolling sleep loops and still replay deterministically. |
+| Production service skeleton | A small executable skeleton tying HTTP/HTTPS, routing, DB pool, outbound keepalive, graceful shutdown, tracing, capacity assertions, and DST seed capture together. | An LLM can copy one real-service shape and replace a moderate Tokio app without stitching ten specimens by hand. |
+| Protocol and client breadth | HTTP/2, gRPC, WebSocket, AWS bridge, and broader RPC hardening, using sync codecs where possible while Tina owns I/O/backpressure. | Common Tokio protocol workloads have native Tina paths instead of falling back to Tokio bridges at the first real boundary. |
+| Compile-time diagnostics | `#[diagnostic::on_unimplemented]` and macro error polish for `Isolate`, message/send/call bounds, non-`Send`, non-`'static`, wrong shard, and wrong reply shapes. | Humans and LLMs see "this message is not Send" instead of trait soup. |
+| Resource lifecycle unification | One boring vocabulary across runtime resources and bridges: open/start, ready, use, close, cancel, drain, terminal report, pressure report. | No stream/file/process/bridge worker can be stranded invisibly; every resource has the same mental model. |
+| Health and readiness | Runtime/service-level readiness and liveness surfaces, distinct from process alive, with typed reasons and optional HTTP/RPC exposure. | Deployments can stop sending traffic before shutdown and can report "not ready because DB pool closed" honestly. |
+| Shutdown orchestration graph | Ordered shutdown helpers: stop ingress, cancel/close pools, drain in-flight work, flush batchers, close bridges/resources, emit final report. | Graceful shutdown becomes a copied Tina program instead of bespoke stop-message choreography. |
+| Backpressure policies | Small explicit policy objects for shed, bounded wait, retry with backoff, degrade, and close, all returning typed outcomes. | Services choose pressure behavior at call sites without losing `Full`/`Closed`/`Timeout` truth. |
+| Runtime-owned recurring work | Local cron/periodic task patterns for compaction, health checks, token refresh, session expiry, and metric flush, with missed-tick policy. | Long-lived services get boring recurring work that is bounded and replayable. |
+| Config and budget manifest | A structured service config manifest for mailbox caps, pool caps, body caps, deadlines, retry budgets, and capacity policies; printable and diffable. | Operators and coding agents can see all knobs before the service runs and can include them in replay cases. |
+| Service topology report | A service-shaped topology report naming isolates, shards, addresses, mailboxes, pools, bridges, resources, capacities, and lifecycle states. | Users can ask "what is running?" and get a useful answer without scraping raw traces. |
+| Bounded event/log sink | Runtime-owned or specimen-proven bounded log/metric/event sinks with visible overflow/drop policy. | Observability does not become the first hidden unbounded queue in an otherwise bounded Tina service. |
+| State snapshot and restore | Blessed snapshot/journal/restore patterns for shard-owned state, including append-before-apply proofs and torn-write recovery specimens. | Ordinary services can restart with state safely, not only demos with in-memory maps. |
+| Saga / compensation pattern | Typed multi-step workflow pattern over DB, HTTP, pools, and services, with explicit compensation, timeout, cancellation, and partial-failure reports. | Multi-resource business workflows become readable Tina state machines instead of ad hoc async control flow. |
+| Load and soak harness | A reusable harness for long runs that records capacity high-water, full counts, latency-ish summaries, resource leaks, and trace fingerprints. | Teams can prove a Tina service stays bounded for an hour before claiming it is production-shaped. |
+
 Deferred from Phase 074 (HTTP body streaming, native HTTP/1):
 
 The 074 slice shipped server-side body streaming with pressure
