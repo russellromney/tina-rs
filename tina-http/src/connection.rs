@@ -195,6 +195,15 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     inbound_buffer: Vec<u8>,
     inbound_chunk_size: usize,
 
+    // Chunked inbound request state.
+    // `chunked_decoder` holds the incremental decoder while a chunked
+    // request body is being consumed. `chunked_raw_buffer` holds
+    // unconsumed raw bytes across `BodyChunkRead` continuations.
+    // `inbound_chunked` is true once dispatch chose the chunked path.
+    chunked_decoder: Option<crate::chunked_decoder::ChunkedDecoder>,
+    chunked_raw_buffer: Vec<u8>,
+    inbound_chunked: bool,
+
     // Captured at the first handler turn (`start()`), used to construct
     // the typed self-address for streaming-body dispatch.
     self_shard_id: Option<tina::ShardId>,
@@ -303,6 +312,9 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             inbound_delivered: 0,
             inbound_buffer: Vec::new(),
             inbound_chunk_size: 0,
+            chunked_decoder: None,
+            chunked_raw_buffer: Vec::new(),
+            inbound_chunked: false,
             self_shard_id: None,
             self_isolate_id: None,
             will_close: false,
@@ -446,6 +458,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         self.inbound_delivered = 0;
         self.inbound_buffer.clear();
         self.inbound_chunk_size = 0;
+        self.chunked_decoder = None;
+        self.chunked_raw_buffer.clear();
+        self.inbound_chunked = false;
         self.body_eof_replied = false;
         self.will_close = false;
     }
@@ -486,16 +501,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             match parse_request_head(&self.read_buf, &self.limits) {
                 ParseProgress::NeedMore => return self.read_more(),
                 ParseProgress::Complete { head, head_len } => {
-                    // Charge the body bytes already past head_len so
-                    // far. The post-head `read_more` path charges
-                    // subsequent reads via the else-branch below.
                     let body_already_in_buf = self.read_buf.len().saturating_sub(head_len);
                     self.parsed_head = Some(head);
                     self.head_len = head_len;
-                    self.charge_request(body_already_in_buf);
-                    // Disarm the slow-loris guard. The deadline message
-                    // may still arrive but `handle_header_deadline`
-                    // checks this flag and no-ops.
+                    if !self.parsed_head.as_ref().unwrap().chunked {
+                        self.charge_request(body_already_in_buf);
+                    }
                     self.head_deadline_armed = false;
                 }
                 ParseProgress::Failed(RequestParseError::BodyTooLarge) => {
@@ -568,11 +579,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .parsed_head
             .as_ref()
             .expect("head parsed before dispatch");
-        let streaming = self.limits.inbound_stream_chunk_size.is_some() && head.content_length > 0;
+        let streaming = self.limits.inbound_stream_chunk_size.is_some()
+            && (head.content_length > 0 || head.chunked);
         if streaming {
-            // Streaming: dispatch as soon as the head is parsed. Body
-            // bytes are pulled lazily from the socket on demand via
-            // `RequestBodyNext` calls from the service.
             return self.dispatch_to_service();
         }
         let needed = self.head_len + head.content_length;
@@ -604,33 +613,52 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
         // Decide buffered vs streaming dispatch based on the limits.
         let request = match self.limits.inbound_stream_chunk_size {
-            Some(chunk_size) if head.content_length > 0 => {
-                // Streaming: take whatever body bytes already arrived
-                // (the read-ahead from the head-parse rounds), park
-                // them in `inbound_buffer`, and hand the service a
-                // typed self-address. Subsequent body bytes are
-                // pulled from the socket lazily as the service calls
-                // `RequestBodyNext`.
-                // Reuse `read_buf`'s allocation as the inbound buffer:
-                // truncate to body_end, drain off the head, and keep
-                // the remaining body bytes. `read_buf` is replaced
-                // with an empty Vec so the per-connection memory
-                // story is just `inbound_buffer`.
-                let body_end = self.head_len + head.content_length;
+            Some(chunk_size) if head.content_length > 0 || head.chunked => {
                 let mut buf = std::mem::take(&mut self.read_buf);
-                let prebuf_end = buf.len().min(body_end);
-                buf.truncate(prebuf_end);
-                buf.drain(..self.head_len.min(buf.len()));
-                self.inbound_total = head.content_length;
-                self.inbound_received = buf.len();
-                self.inbound_delivered = 0;
-                let pre_buf_len = buf.len();
-                self.inbound_buffer = buf;
-                self.inbound_chunk_size = chunk_size.max(1);
-                // Streaming: charge the prefix bytes that just moved
-                // from `read_buf` into `inbound_buffer`. Subsequent
-                // body bytes are charged in `handle_body_chunk_read`.
-                self.charge_request(pre_buf_len);
+                if head.chunked {
+                    buf.drain(..self.head_len.min(buf.len()));
+                    let mut decoder =
+                        crate::chunked_decoder::ChunkedDecoder::new(self.limits.max_body_bytes);
+                    let mut decoded = Vec::new();
+                    let (progress, consumed) = {
+                        let raw = &buf[..];
+                        decoder.feed_all(raw, &mut decoded)
+                    };
+                    buf.drain(..consumed);
+                    self.chunked_raw_buffer = buf;
+                    self.inbound_total = 0;
+                    self.inbound_received = consumed;
+                    self.inbound_delivered = 0;
+                    self.inbound_buffer = decoded;
+                    self.inbound_chunk_size = chunk_size.max(1);
+                    self.charge_request(self.inbound_buffer.len());
+                    self.chunked_decoder = Some(decoder);
+                    self.inbound_chunked = true;
+                    match progress {
+                        crate::chunked_decoder::FeedAllResult::Complete => {}
+                        crate::chunked_decoder::FeedAllResult::Failed(_) => {
+                            self.record_body_io_error();
+                            self.will_close = true;
+                            let response = HttpResponse::with_status(
+                                crate::types::RequestParseError::MalformedChunkedBody.status(),
+                            );
+                            return self.start_writing(response);
+                        }
+                        crate::chunked_decoder::FeedAllResult::NeedMore => {}
+                    }
+                } else {
+                    let body_end = self.head_len + head.content_length;
+                    let prebuf_end = buf.len().min(body_end);
+                    buf.truncate(prebuf_end);
+                    buf.drain(..self.head_len.min(buf.len()));
+                    self.inbound_total = head.content_length;
+                    self.inbound_received = buf.len();
+                    self.inbound_delivered = 0;
+                    let pre_buf_len = buf.len();
+                    self.inbound_buffer = buf;
+                    self.inbound_chunk_size = chunk_size.max(1);
+                    self.charge_request(pre_buf_len);
+                }
                 let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
                     tina::Address::new_with_generation(
                         self.shard_id_for_self(),
@@ -639,6 +667,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                     );
                 let stream = RequestStream {
                     content_length: self.inbound_total,
+                    chunked: head.chunked,
                     source: me_chunk,
                 };
                 head.into_streaming_request(stream)
@@ -692,36 +721,35 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     ///   reply `Eof`.
     fn handle_request_body_next(&mut self) -> Effect<Self> {
         if self.body_eof_replied {
-            // Service already saw `Eof`/`Error` once. Don't re-issue
-            // socket reads or double-count metrics; just repeat Eof.
-            return reply(RequestChunkReply::Eof);
-        }
-        if self.inbound_delivered >= self.inbound_total {
-            self.body_eof_replied = true;
             return reply(RequestChunkReply::Eof);
         }
         if !self.inbound_buffer.is_empty() {
             return self.serve_chunk_from_buffer();
         }
-        // Need to pull more bytes from the socket. Cap the request at
-        // three independent limits and take the smallest:
-        //   1. Bytes still owed by `Content-Length`. We never want
-        //      to read past the body.
-        //   2. Per-syscall ceiling `READ_CHUNK`. Bounds any one
-        //      read regardless of declared length.
-        //   3. The user's configured `inbound_stream_chunk_size`.
-        //      Without this, a small chunk-size config would
-        //      still let `READ_CHUNK` body bytes sit resident,
-        //      defeating the body-pressure story.
-        let want = self
-            .inbound_total
-            .saturating_sub(self.inbound_received)
-            .min(READ_CHUNK)
-            .min(self.inbound_chunk_size.max(1));
+        if self.inbound_chunked {
+            if self
+                .chunked_decoder
+                .as_ref()
+                .is_some_and(|d| d.is_complete())
+            {
+                self.body_eof_replied = true;
+                return reply(RequestChunkReply::Eof);
+            }
+        } else {
+            if self.inbound_delivered >= self.inbound_total {
+                self.body_eof_replied = true;
+                return reply(RequestChunkReply::Eof);
+            }
+        }
+        let want = if self.inbound_chunked {
+            READ_CHUNK.min(self.inbound_chunk_size.max(1))
+        } else {
+            self.inbound_total
+                .saturating_sub(self.inbound_received)
+                .min(READ_CHUNK)
+                .min(self.inbound_chunk_size.max(1))
+        };
         if want == 0 {
-            // Defensive: nothing left to read but delivered != total.
-            // Treat as truncation — reply Eof so the service notices
-            // via received bytes < expected.
             self.body_eof_replied = true;
             return reply(RequestChunkReply::Eof);
         }
@@ -757,24 +785,73 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             // The wire was short, so this is a truncation event from a
             // metrics standpoint — the server cannot fulfil the
             // declared length.
-            if self.inbound_delivered + self.inbound_buffer.len() < self.inbound_total {
+            if self.inbound_chunked
+                || self.inbound_delivered + self.inbound_buffer.len() < self.inbound_total
+            {
                 self.record_body_io_error();
             }
             self.body_eof_replied = true;
             return reply(RequestChunkReply::Eof);
         }
-        self.inbound_received += bytes.len();
-        self.inbound_buffer.extend_from_slice(&bytes);
-        self.charge_request(bytes.len());
+        if self.inbound_chunked {
+            self.inbound_received += bytes.len();
+            self.chunked_raw_buffer.extend_from_slice(&bytes);
+            if let Some(ref mut decoder) = self.chunked_decoder {
+                let prev_len = self.inbound_buffer.len();
+                let (progress, consumed) = {
+                    let raw = &self.chunked_raw_buffer[..];
+                    decoder.feed_all(raw, &mut self.inbound_buffer)
+                };
+                self.chunked_raw_buffer.drain(..consumed);
+                let new_decoded = self.inbound_buffer.len() - prev_len;
+                self.charge_request(new_decoded);
+                match progress {
+                    crate::chunked_decoder::FeedAllResult::Complete => {
+                        if !self.inbound_buffer.is_empty() {
+                            return self.serve_chunk_from_buffer();
+                        }
+                        self.body_eof_replied = true;
+                        return reply(RequestChunkReply::Eof);
+                    }
+                    crate::chunked_decoder::FeedAllResult::Failed(_) => {
+                        self.record_body_io_error();
+                        self.body_eof_replied = true;
+                        return reply(RequestChunkReply::Error(CallError::Io));
+                    }
+                    crate::chunked_decoder::FeedAllResult::NeedMore => {
+                        if !self.inbound_buffer.is_empty() {
+                            return self.serve_chunk_from_buffer();
+                        }
+                        let want = READ_CHUNK.min(self.inbound_chunk_size.max(1));
+                        return match self.transport {
+                            HttpTransport::Tcp(stream) => {
+                                tcp_read(stream, want).reply(HttpConnectionMsg::BodyChunkRead)
+                            }
+                            HttpTransport::Tls(stream) => {
+                                tls_read(stream, want, self.tls_io_timeout)
+                                    .reply(HttpConnectionMsg::BodyChunkRead)
+                            }
+                        };
+                    }
+                }
+            }
+        } else {
+            self.inbound_received += bytes.len();
+            self.inbound_buffer.extend_from_slice(&bytes);
+            self.charge_request(bytes.len());
+        }
         self.serve_chunk_from_buffer()
     }
 
     fn serve_chunk_from_buffer(&mut self) -> Effect<Self> {
-        let remaining_total = self.inbound_total - self.inbound_delivered;
-        let take = self
-            .inbound_chunk_size
-            .min(self.inbound_buffer.len())
-            .min(remaining_total);
+        let take = if self.inbound_chunked {
+            self.inbound_chunk_size.min(self.inbound_buffer.len())
+        } else {
+            let remaining_total = self.inbound_total - self.inbound_delivered;
+            self.inbound_chunk_size
+                .min(self.inbound_buffer.len())
+                .min(remaining_total)
+        };
         let chunk: Vec<u8> = self.inbound_buffer.drain(..take).collect();
         self.inbound_delivered += take;
         // The chunk has left the connection; release its charge.

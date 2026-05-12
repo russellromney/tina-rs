@@ -198,6 +198,168 @@ fn streaming_request_consumed_chunk_by_chunk() {
     let _ = runtime.shutdown();
 }
 
+/// Server accepts a chunked request body via the streaming pull
+/// model. The connection dispatches as soon as the head parses, then
+/// decodes chunks on demand as the service pulls.
+#[test]
+fn streaming_request_accepts_chunked_encoding() {
+    let chunk_size = 256;
+    let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let expected_checksum: u64 = body.iter().fold(0u64, |a, b| a + *b as u64);
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let consumer = runtime
+        .register_with_capacity::<Consumer, Infallible>(
+            Consumer {
+                chunk_call_timeout: Duration::from_secs(2),
+                pending_source: None,
+                accumulated: Vec::new(),
+                expected_length: 0,
+            },
+            32,
+        )
+        .expect("register consumer");
+
+    let limits = HttpLimits {
+        inbound_stream_chunk_size: Some(chunk_size),
+        ..HttpLimits::default()
+    };
+    let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+    let listener_isolate = HttpListener::<TestShard, ConsumerMsg>::new(
+        bind,
+        consumer,
+        limits,
+        Duration::from_secs(5),
+        16,
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard, ConsumerMsg>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, HttpListenerMsg::Start)
+        .expect("send Start");
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let mut chunked_body = Vec::new();
+    for chunk in body.chunks(1024) {
+        chunked_body.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        chunked_body.extend_from_slice(chunk);
+        chunked_body.extend_from_slice(b"\r\n");
+    }
+    chunked_body.extend_from_slice(b"0\r\n\r\n");
+
+    let mut request =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            .to_string()
+            .into_bytes();
+    request.extend_from_slice(&chunked_body);
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream.write_all(&request).expect("write request");
+    stream.flush().expect("flush");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+
+    let text = std::str::from_utf8(&response).expect("utf8");
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "expected 200, got: {text}"
+    );
+    let body_part = text
+        .rsplit_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .expect("body separator");
+    let expected = format!("stream:{}:{}", body.len(), expected_checksum);
+    assert_eq!(
+        body_part, expected,
+        "consumer summary mismatch for chunked request"
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+/// Reject chunked request when streaming is disabled. The parser must
+/// refuse to dispatch a body it cannot frame.
+#[test]
+fn chunked_request_rejected_when_streaming_disabled() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let consumer = runtime
+        .register_with_capacity::<Consumer, Infallible>(
+            Consumer {
+                chunk_call_timeout: Duration::from_secs(2),
+                pending_source: None,
+                accumulated: Vec::new(),
+                expected_length: 0,
+            },
+            32,
+        )
+        .expect("register consumer");
+
+    let limits = HttpLimits {
+        inbound_stream_chunk_size: None,
+        ..HttpLimits::default()
+    };
+    let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+    let listener_isolate = HttpListener::<TestShard, ConsumerMsg>::new(
+        bind,
+        consumer,
+        limits,
+        Duration::from_secs(5),
+        16,
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard, ConsumerMsg>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, HttpListenerMsg::Start)
+        .expect("send Start");
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let request = b"POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream.write_all(request).expect("write request");
+    stream.flush().expect("flush");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+
+    let text = std::str::from_utf8(&response).expect("utf8");
+    assert!(
+        text.starts_with("HTTP/1.1 501"),
+        "chunked request without streaming must be rejected with 501; got: {text}"
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
 /// Test that dispatch happens *before* the full body lands on the
 /// wire — this is the real-streaming property. Sends the request head
 /// plus a small body prefix, waits for the service to mark itself

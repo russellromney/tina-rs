@@ -36,9 +36,10 @@
 //! known up front. Use [`crate::HttpResponse::stream_chunked`] when
 //! it is not. There is no "guess a length" path.
 //!
-//! Request bodies remain `Content-Length` only; chunked request
-//! bodies are still rejected as
-//! [`crate::RequestParseError::UnsupportedTransferEncoding`].
+//! Request bodies may be `Content-Length` or chunked. Chunked request
+//! bodies require [`crate::HttpLimits::inbound_stream_chunk_size`] so
+//! the service pulls decoded chunks through the same
+//! [`RequestChunkReply`] path. Chunk trailers are rejected.
 //!
 //! # Backpressure
 //!
@@ -140,8 +141,13 @@ pub enum RequestChunkReply {
 /// chunk pulls from a single mailbox.
 #[derive(Debug, Clone)]
 pub struct RequestStream {
-    /// Declared `Content-Length` from the wire.
+    /// Declared `Content-Length` from the wire. Meaningless when
+    /// `chunked` is `true`.
     pub content_length: usize,
+    /// `true` when the request used `Transfer-Encoding: chunked`.
+    /// There is no declared length; the service pulls chunks until
+    /// `Eof`.
+    pub chunked: bool,
     /// Chunk source — the connection isolate.
     pub source: Address<crate::HttpConnectionMsg, RequestChunkReply>,
 }

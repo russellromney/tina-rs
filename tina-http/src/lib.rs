@@ -9,13 +9,15 @@
 //!
 //! ## Request bodies
 //!
-//! `Content-Length` framing only. Streaming activates when
-//! [`HttpLimits::inbound_stream_chunk_size`] is `Some(N)` and the
-//! request declares a non-zero `Content-Length`. Dispatch happens
-//! as soon as the head parses; the service pulls body chunks via
+//! `Content-Length` or `Transfer-Encoding: chunked`. Streaming
+//! activates when [`HttpLimits::inbound_stream_chunk_size`] is
+//! `Some(N)` and the request declares a non-zero `Content-Length`
+//! or chunked encoding. Dispatch happens as soon as the head
+//! parses; the service pulls body chunks via
 //! `call(stream.source, HttpConnectionMsg::body_next(), timeout)`.
 //! Clean `Eof` and truncated [`RequestChunkReply::Error`] are
-//! distinct. Chunked request bodies are rejected as
+//! distinct. Chunked request bodies require streaming to be
+//! enabled; when disabled they are rejected as
 //! [`RequestParseError::UnsupportedTransferEncoding`].
 //!
 //! ## Response bodies
@@ -72,6 +74,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod body_metrics;
+pub mod chunked_decoder;
 pub mod client;
 pub mod connection;
 pub mod keepalive;
