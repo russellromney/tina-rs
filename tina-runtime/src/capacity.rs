@@ -72,11 +72,13 @@ pub enum CapacityAssertError {
         /// Observed high water.
         observed: usize,
     },
-    /// `no_full()` saw a non-zero `full_count`.
+    /// `no_full()` saw a non-zero full counter.
     Full {
         /// Surface name.
         surface: String,
-        /// Observed `full_count`.
+        /// What filled: `count`, `weight`, or `shared_weight`.
+        filled: &'static str,
+        /// Observed full counter.
         observed: u64,
     },
     /// `full_count_eq(expected)` saw a different value.
@@ -104,9 +106,13 @@ impl fmt::Display for CapacityAssertError {
                 f,
                 "surface {surface:?} high_water {observed} exceeds limit {limit}"
             ),
-            Self::Full { surface, observed } => write!(
+            Self::Full {
+                surface,
+                filled,
+                observed,
+            } => write!(
                 f,
-                "surface {surface:?} hit Full {observed} times (expected 0)"
+                "surface {surface:?} hit Full {observed} times on {filled} (expected 0)"
             ),
             Self::FullCountMismatch {
                 surface,
@@ -201,17 +207,31 @@ impl<'a> SurfaceAssertion<'a> {
             .ok_or_else(|| CapacityAssertError::UnknownSurface(self.name.clone()))
     }
 
-    /// `Ok(())` iff `full_count == 0`.
+    /// `Ok(())` iff every full counter is zero.
     pub fn no_full(&self) -> Result<(), CapacityAssertError> {
         let r = self.report()?;
-        if r.full_count == 0 {
-            Ok(())
-        } else {
-            Err(CapacityAssertError::Full {
+        if r.full_count > 0 {
+            return Err(CapacityAssertError::Full {
                 surface: r.name.clone(),
+                filled: "count",
                 observed: r.full_count,
-            })
+            });
         }
+        if r.weight_full_count > 0 {
+            return Err(CapacityAssertError::Full {
+                surface: r.name.clone(),
+                filled: "weight",
+                observed: r.weight_full_count,
+            });
+        }
+        if r.shared_weight_full_count > 0 {
+            return Err(CapacityAssertError::Full {
+                surface: r.name.clone(),
+                filled: "shared_weight",
+                observed: r.shared_weight_full_count,
+            });
+        }
+        Ok(())
     }
 
     /// `Ok(())` iff `high_water_messages <= limit`.
@@ -241,6 +261,49 @@ impl<'a> SurfaceAssertion<'a> {
             })
         }
     }
+
+    /// `Ok(())` iff weighted high-water is present and `<= limit`.
+    pub fn high_water_weight_at_most(&self, limit: usize) -> Result<(), CapacityAssertError> {
+        let r = self.report()?;
+        let observed = r.high_water_weight.unwrap_or(0);
+        if observed <= limit {
+            Ok(())
+        } else {
+            Err(CapacityAssertError::HighWaterAbove {
+                surface: r.name.clone(),
+                limit,
+                observed,
+            })
+        }
+    }
+
+    /// `Ok(())` iff `weight_full_count == expected`.
+    pub fn weight_full_count_eq(&self, expected: u64) -> Result<(), CapacityAssertError> {
+        let r = self.report()?;
+        if r.weight_full_count == expected {
+            Ok(())
+        } else {
+            Err(CapacityAssertError::FullCountMismatch {
+                surface: r.name.clone(),
+                expected,
+                observed: r.weight_full_count,
+            })
+        }
+    }
+
+    /// `Ok(())` iff shared-scope full count equals `expected`.
+    pub fn shared_weight_full_count_eq(&self, expected: u64) -> Result<(), CapacityAssertError> {
+        let r = self.report()?;
+        if r.shared_weight_full_count == expected {
+            Ok(())
+        } else {
+            Err(CapacityAssertError::FullCountMismatch {
+                surface: r.name.clone(),
+                expected,
+                observed: r.shared_weight_full_count,
+            })
+        }
+    }
 }
 
 /// Next-action hint for the discovery formatter.
@@ -252,26 +315,37 @@ impl<'a> SurfaceAssertion<'a> {
 /// - `Tuning` expects more headroom. Below 25% is very loose;
 ///   above 75% is tight enough to re-measure.
 fn suggest_next(report: &CapacitySurfaceReport) -> &'static str {
+    let fulls = report.full_count + report.weight_full_count + report.shared_weight_full_count;
     let max = match report.max_messages {
         Some(m) => m,
         // No reachable producer of `None` today. Future unbounded
         // modes will replace this hint.
-        None => return "no cap configured — pick a fixed cap",
+        None if fulls > 0 => return "saw Full — raise cap or shed earlier",
+        None => {
+            if report.max_weight.is_some() {
+                return "weighted cap fits";
+            }
+            return "no cap configured — pick a fixed cap";
+        }
     };
-    if report.full_count > 0 {
+    if fulls > 0 {
         return "saw Full — raise cap or shed earlier";
     }
     if max == 0 {
         return "cap is zero — increase or remove this surface";
     }
     let bp = (report.high_water_messages.saturating_mul(10_000)) / max;
-    match (report.mode, bp) {
+    match (&report.mode, bp) {
         (CapacityMode::Tuning, b) if b < 2_500 => "tuning cap is loose; freeze near 2x high water",
         (CapacityMode::Tuning, b) if b < 7_500 => "tuning cap fits; freeze near 1.5x high water",
         (CapacityMode::Tuning, _) => "tuning cap is tight; raise then re-measure",
         (CapacityMode::Fixed, b) if b < 2_500 => "fixed cap is loose; consider shrinking",
         (CapacityMode::Fixed, b) if b < 8_500 => "fixed cap fits",
         (CapacityMode::Fixed, _) => "fixed cap is tight; consider raising",
+        (CapacityMode::UnboundedForNow { .. }, _) => "unbounded-for-now is live; pick a fixed cap",
+        (CapacityMode::UnboundedWithoutExpiryIKnowThisIsBad { .. }, _) => {
+            "no-expiry unbounded escape is live; replace with a fixed cap"
+        }
     }
 }
 
@@ -288,7 +362,7 @@ pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
         Some(m) => m.to_string(),
         None => "-".to_string(),
     };
-    format!(
+    let mut line = format!(
         "capacity surface={name} mode={mode} max={max} cur={cur} high={high} full={full} suggest={hint:?}",
         name = report.name,
         mode = report.mode.label(),
@@ -297,7 +371,26 @@ pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
         high = report.high_water_messages,
         full = report.full_count,
         hint = suggest_next(report),
-    )
+    );
+    if let Some(max_weight) = report.max_weight {
+        line.push_str(&format!(
+            " weight_unit={unit} max_weight={max_weight} cur_weight={cur} high_weight={high} weight_full={full}",
+            unit = report.weight_unit.as_deref().unwrap_or("weight"),
+            cur = report.current_weight.unwrap_or(0),
+            high = report.high_water_weight.unwrap_or(0),
+            full = report.weight_full_count,
+        ));
+    }
+    if let Some(scope) = &report.shared_scope {
+        line.push_str(&format!(
+            " shared_scope={scope} shared_max_weight={max} shared_cur_weight={cur} shared_high_weight={high} shared_weight_full={full}",
+            max = report.shared_max_weight.unwrap_or(0),
+            cur = report.shared_current_weight.unwrap_or(0),
+            high = report.shared_high_water_weight.unwrap_or(0),
+            full = report.shared_weight_full_count,
+        ));
+    }
+    line
 }
 
 /// One discovery line per surface, joined with newlines.
@@ -386,7 +479,12 @@ mod tests {
         s.surface("a").no_full().unwrap();
         let err = s.surface("b").no_full().unwrap_err();
         match err {
-            CapacityAssertError::Full { observed, .. } => assert_eq!(observed, 3),
+            CapacityAssertError::Full {
+                filled, observed, ..
+            } => {
+                assert_eq!(filled, "count");
+                assert_eq!(observed, 3);
+            }
             _ => panic!("wrong error: {err:?}"),
         }
     }
@@ -406,6 +504,69 @@ mod tests {
         s.push(report("a", 4, 0, 4, 2)).unwrap();
         s.surface("a").full_count_eq(2).unwrap();
         s.surface("a").full_count_eq(0).unwrap_err();
+    }
+
+    #[test]
+    fn weight_assertions_compare_weight_fields() {
+        let mut s = CapacitySummary::new();
+        s.push(CapacitySurfaceReport::weighted(
+            "http.response",
+            CapacityMode::Fixed,
+            100,
+            0,
+            75,
+            2,
+            "bytes",
+        ))
+        .unwrap();
+        s.surface("http.response")
+            .high_water_weight_at_most(75)
+            .unwrap();
+        s.surface("http.response")
+            .high_water_weight_at_most(74)
+            .unwrap_err();
+        s.surface("http.response").weight_full_count_eq(2).unwrap();
+        let err = s.surface("http.response").no_full().unwrap_err();
+        match err {
+            CapacityAssertError::Full {
+                filled, observed, ..
+            } => {
+                assert_eq!(filled, "weight");
+                assert_eq!(observed, 2);
+            }
+            _ => panic!("wrong error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_weight_assertion_names_what_filled() {
+        let mut s = CapacitySummary::new();
+        s.push(
+            CapacitySurfaceReport::weighted(
+                "http.request",
+                CapacityMode::Fixed,
+                100,
+                0,
+                10,
+                0,
+                "bytes",
+            )
+            .with_shared_scope("http.bodies", 150, 0, 150, 1),
+        )
+        .unwrap();
+        s.surface("http.request")
+            .shared_weight_full_count_eq(1)
+            .unwrap();
+        let err = s.surface("http.request").no_full().unwrap_err();
+        match err {
+            CapacityAssertError::Full {
+                filled, observed, ..
+            } => {
+                assert_eq!(filled, "shared_weight");
+                assert_eq!(observed, 1);
+            }
+            _ => panic!("wrong error: {err:?}"),
+        }
     }
 
     #[test]
@@ -434,6 +595,27 @@ mod tests {
             line[suggest_idx..].starts_with("suggest=\""),
             "expected double-quoted suggest=, got {line}"
         );
+    }
+
+    #[test]
+    fn discovery_line_includes_weight_and_shared_scope() {
+        let r = CapacitySurfaceReport::weighted(
+            "http.response",
+            CapacityMode::Fixed,
+            4096,
+            0,
+            1024,
+            1,
+            "bytes",
+        )
+        .with_shared_scope("http.bodies", 8192, 0, 4096, 2);
+        let line = format_discovery_line(&r);
+        assert!(line.contains("weight_unit=bytes"), "{line}");
+        assert!(line.contains("max_weight=4096"), "{line}");
+        assert!(line.contains("weight_full=1"), "{line}");
+        assert!(line.contains("shared_scope=http.bodies"), "{line}");
+        assert!(line.contains("shared_weight_full=2"), "{line}");
+        assert!(line.contains("saw Full"), "{line}");
     }
 
     #[test]

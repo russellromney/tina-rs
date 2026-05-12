@@ -55,7 +55,7 @@ footprint numbers tell the real story:
   Hyper queues more bytes for its writer task — we do not see
   those.
 - Tina reports `tina_response_high_water=4096`. This is the
-  *exact peak* observed via `BodyMetrics`: at no point did the
+  *peak body-byte weight* observed via `BodyMetrics`: at no point did the
   connection isolate hold more than one chunk's worth of body.
   64× smaller than the body itself.
 
@@ -63,6 +63,18 @@ Both numbers are honest. Tokio's is "at least this much" because
 the body model has no per-chunk hook to measure through. Tina's
 is "exactly this much" because every chunk goes through a
 charge/release pair.
+
+The Tina run also prints a weighted capacity discovery line for
+the response-body surface:
+
+```text
+capacity surface=specimen_http_body_streaming.response_body mode=fixed ... weight_unit=bytes max_weight=4096 cur_weight=0 high_weight=4096 weight_full=0 shared_scope=http.bodies ...
+```
+
+That is the `unknown -> measured -> fixed` workflow in miniature:
+start with an unknown body-byte cap, measure `high_weight`, then
+pin a fixed cap. The weight is user-declared body bytes, not an
+exact heap memory claim.
 
 ## Read
 

@@ -9,37 +9,92 @@
 //! unknown -> measured -> fixed
 //! ```
 //!
-//! Count caps protect scheduler fairness. Future weight caps will
-//! protect memory-ish payload; future shared scopes will protect a
-//! group of queues.
+//! Count caps protect scheduler fairness. Weight caps protect
+//! user-declared payload cost. Shared scopes protect a group of
+//! surfaces on one shard.
 //!
 //! Today's vocabulary:
 //!
-//! - [`CapacityMode`]: `Fixed` (measured) or `Tuning` (discovery).
-//!   Tuning is still a hard cap; the flag just says "report high
-//!   water loudly".
-//! - [`CapacityPolicy`]: dev / test / prod stub. Both modes pass
-//!   everywhere today. Future unbounded modes plug in here.
+//! - [`CapacityMode`]: `Fixed` (measured), `Tuning` (discovery),
+//!   or explicit unbounded escape hatches.
+//! - [`CapacityPolicy`]: dev / test / prod validation for modes.
 //! - [`CapacitySurfaceReport`]: one snapshot per bounded surface.
 
 use core::fmt;
+use std::time::{Duration, SystemTime};
+
+/// User-declared payload cost for weighted capacity.
+///
+/// This is deliberately not heap measurement. A type that wants
+/// weighted admission states the cost it wants capacity accounting
+/// to use: bytes, rows, jobs, handles, or another local unit.
+pub trait CapacityWeight {
+    /// Cost charged against a weighted capacity surface.
+    fn capacity_weight(&self) -> usize;
+}
 
 /// How the cap was chosen. Cap is always a hard upper bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapacityMode {
     /// Measured cap. Use in production.
     Fixed,
     /// Discovery cap. Still hard. Reports surface high water so
     /// the user can pick a `Fixed` number.
     Tuning,
+    /// Temporarily unbounded. Loud, named, and expires under live
+    /// wall-clock time. Rejected by production policy.
+    UnboundedForNow {
+        /// Human reason. Keep it searchable.
+        reason: String,
+        /// Live expiry time. Validation rejects once this is in
+        /// the past.
+        expires_at: SystemTime,
+    },
+    /// Deliberately ugly no-expiry escape hatch. Development only
+    /// by default.
+    UnboundedWithoutExpiryIKnowThisIsBad {
+        /// Human reason. Keep it searchable.
+        reason: String,
+    },
 }
 
 impl CapacityMode {
+    /// Standard live expiry for [`Self::UnboundedForNow`].
+    pub const UNBOUNDED_FOR_NOW_LIVE_EXPIRY: Duration = Duration::from_secs(60 * 60);
+
+    /// Build an `UnboundedForNow` mode expiring one hour from now.
+    pub fn unbounded_for_now(reason: impl Into<String>) -> Self {
+        Self::unbounded_for_now_until(
+            reason,
+            SystemTime::now() + Self::UNBOUNDED_FOR_NOW_LIVE_EXPIRY,
+        )
+    }
+
+    /// Build an `UnboundedForNow` mode with an explicit expiry.
+    /// This exists so tests can use tiny expiries.
+    pub fn unbounded_for_now_until(reason: impl Into<String>, expires_at: SystemTime) -> Self {
+        Self::UnboundedForNow {
+            reason: reason.into(),
+            expires_at,
+        }
+    }
+
+    /// Build the intentionally ugly no-expiry escape hatch.
+    pub fn unbounded_without_expiry_i_know_this_is_bad(reason: impl Into<String>) -> Self {
+        Self::UnboundedWithoutExpiryIKnowThisIsBad {
+            reason: reason.into(),
+        }
+    }
+
     /// Short label for one-line reports.
-    pub const fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Fixed => "fixed",
             Self::Tuning => "tuning",
+            Self::UnboundedForNow { .. } => "unbounded_for_now",
+            Self::UnboundedWithoutExpiryIKnowThisIsBad { .. } => {
+                "unbounded_without_expiry_i_know_this_is_bad"
+            }
         }
     }
 }
@@ -78,6 +133,15 @@ pub enum CapacityPolicyError {
         /// The policy in effect.
         policy: CapacityPolicy,
     },
+    /// `UnboundedForNow` expired under live wall-clock time.
+    UnboundedExpired {
+        /// Surface whose mode failed validation.
+        surface: String,
+        /// Reason attached to the unbounded mode.
+        reason: String,
+        /// The expiry time that has passed.
+        expires_at: SystemTime,
+    },
 }
 
 impl fmt::Display for CapacityPolicyError {
@@ -91,6 +155,15 @@ impl fmt::Display for CapacityPolicyError {
                 f,
                 "capacity mode {mode} not allowed for surface {surface:?} under {policy:?}"
             ),
+            Self::UnboundedExpired {
+                surface,
+                reason,
+                expires_at,
+            } => write!(
+                f,
+                "capacity mode unbounded_for_now expired for surface {surface:?} \
+                 at {expires_at:?}; reason={reason:?}"
+            ),
         }
     }
 }
@@ -99,24 +172,45 @@ impl std::error::Error for CapacityPolicyError {}
 
 impl CapacityPolicy {
     /// Validate `mode` for `surface` under this policy.
-    ///
-    /// Today every `(policy, mode)` pair passes. The signature is
-    /// stable so call sites can pre-wire validation before
-    /// unbounded modes land.
     pub fn validate_mode(
-        self,
-        _surface: &str,
-        _mode: CapacityMode,
+        &self,
+        surface: &str,
+        mode: &CapacityMode,
     ) -> Result<(), CapacityPolicyError> {
-        Ok(())
+        match mode {
+            CapacityMode::Fixed | CapacityMode::Tuning => Ok(()),
+            CapacityMode::UnboundedForNow { reason, expires_at } => {
+                if SystemTime::now() >= *expires_at {
+                    return Err(CapacityPolicyError::UnboundedExpired {
+                        surface: surface.to_string(),
+                        reason: reason.clone(),
+                        expires_at: *expires_at,
+                    });
+                }
+                match self {
+                    CapacityPolicy::Development | CapacityPolicy::Test => Ok(()),
+                    CapacityPolicy::Production => Err(CapacityPolicyError::ModeNotAllowed {
+                        surface: surface.to_string(),
+                        mode: mode.clone(),
+                        policy: *self,
+                    }),
+                }
+            }
+            CapacityMode::UnboundedWithoutExpiryIKnowThisIsBad { .. } => match self {
+                CapacityPolicy::Development => Ok(()),
+                CapacityPolicy::Test | CapacityPolicy::Production => {
+                    Err(CapacityPolicyError::ModeNotAllowed {
+                        surface: surface.to_string(),
+                        mode: mode.clone(),
+                        policy: *self,
+                    })
+                }
+            },
+        }
     }
 }
 
-/// Snapshot of one bounded count surface.
-///
-/// Weight fields are reserved for future weighted surfaces. They
-/// are always `None` / `0` today; the shape carries them so adding
-/// weight later does not break readers.
+/// Snapshot of one bounded surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapacitySurfaceReport {
     /// Stable surface name. Use dotted form, e.g.
@@ -134,14 +228,26 @@ pub struct CapacitySurfaceReport {
     pub high_water_messages: usize,
     /// Cumulative count-cap `Full` rejections.
     pub full_count: u64,
-    /// Configured weight cap. Reserved.
+    /// Configured weight cap.
     pub max_weight: Option<usize>,
-    /// Live weight right now. Reserved.
+    /// Live weight right now.
     pub current_weight: Option<usize>,
-    /// High-water weight since construction. Reserved.
+    /// High-water weight since construction.
     pub high_water_weight: Option<usize>,
-    /// Cumulative weight-cap `Full` rejections. Reserved.
+    /// Cumulative weight-cap `Full` rejections.
     pub weight_full_count: u64,
+    /// Unit for weight fields, e.g. `bytes` or `rows`.
+    pub weight_unit: Option<String>,
+    /// Shard-local shared weight scope this surface charges.
+    pub shared_scope: Option<String>,
+    /// Configured shared-scope weight cap.
+    pub shared_max_weight: Option<usize>,
+    /// Current shared-scope weight.
+    pub shared_current_weight: Option<usize>,
+    /// Shared-scope high-water weight.
+    pub shared_high_water_weight: Option<usize>,
+    /// Cumulative shared-scope full rejections.
+    pub shared_weight_full_count: u64,
 }
 
 impl CapacitySurfaceReport {
@@ -165,12 +271,65 @@ impl CapacitySurfaceReport {
             current_weight: None,
             high_water_weight: None,
             weight_full_count: 0,
+            weight_unit: None,
+            shared_scope: None,
+            shared_max_weight: None,
+            shared_current_weight: None,
+            shared_high_water_weight: None,
+            shared_weight_full_count: 0,
         }
+    }
+
+    /// Build a weighted report with no message count cap.
+    pub fn weighted(
+        name: impl Into<String>,
+        mode: CapacityMode,
+        max_weight: usize,
+        current_weight: usize,
+        high_water_weight: usize,
+        weight_full_count: u64,
+        weight_unit: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            mode,
+            max_messages: None,
+            current_messages: 0,
+            high_water_messages: 0,
+            full_count: 0,
+            max_weight: Some(max_weight),
+            current_weight: Some(current_weight),
+            high_water_weight: Some(high_water_weight),
+            weight_full_count,
+            weight_unit: Some(weight_unit.into()),
+            shared_scope: None,
+            shared_max_weight: None,
+            shared_current_weight: None,
+            shared_high_water_weight: None,
+            shared_weight_full_count: 0,
+        }
+    }
+
+    /// Attach shard-local shared-scope weight fields to a report.
+    pub fn with_shared_scope(
+        mut self,
+        scope: impl Into<String>,
+        max_weight: usize,
+        current_weight: usize,
+        high_water_weight: usize,
+        weight_full_count: u64,
+    ) -> Self {
+        self.shared_scope = Some(scope.into());
+        self.shared_max_weight = Some(max_weight);
+        self.shared_current_weight = Some(current_weight);
+        self.shared_high_water_weight = Some(high_water_weight);
+        self.shared_weight_full_count = weight_full_count;
+        self
     }
 
     /// True if this surface ever hit `Full` (count or weight).
     pub fn ever_full(&self) -> bool {
-        self.full_count > 0 || self.weight_full_count > 0
+        self.full_count > 0 || self.weight_full_count > 0 || self.shared_weight_full_count > 0
     }
 }
 
@@ -187,7 +346,7 @@ mod tests {
         ] {
             for mode in [CapacityMode::Fixed, CapacityMode::Tuning] {
                 policy
-                    .validate_mode("any", mode)
+                    .validate_mode("any", &mode)
                     .expect("Fixed and Tuning pass everywhere today");
             }
         }
@@ -207,6 +366,69 @@ mod tests {
     fn ever_full_is_false_when_neither_counter_fired() {
         let r = CapacitySurfaceReport::count("p.waiters", CapacityMode::Tuning, 100, 0, 23, 0);
         assert!(!r.ever_full());
+    }
+
+    #[test]
+    fn weighted_constructor_populates_weight_fields() {
+        let r = CapacitySurfaceReport::weighted(
+            "http.response",
+            CapacityMode::Fixed,
+            100,
+            40,
+            70,
+            2,
+            "bytes",
+        )
+        .with_shared_scope("http.bodies", 150, 90, 120, 1);
+        assert_eq!(r.max_messages, None);
+        assert_eq!(r.max_weight, Some(100));
+        assert_eq!(r.current_weight, Some(40));
+        assert_eq!(r.high_water_weight, Some(70));
+        assert_eq!(r.weight_unit.as_deref(), Some("bytes"));
+        assert_eq!(r.shared_scope.as_deref(), Some("http.bodies"));
+        assert_eq!(r.shared_max_weight, Some(150));
+        assert!(r.ever_full());
+    }
+
+    #[test]
+    fn unbounded_for_now_expires_under_live_time() {
+        let mode = CapacityMode::unbounded_for_now_until(
+            "temporary import",
+            SystemTime::now() - Duration::from_millis(1),
+        );
+        let err = CapacityPolicy::Test
+            .validate_mode("import.queue", &mode)
+            .unwrap_err();
+        assert!(matches!(err, CapacityPolicyError::UnboundedExpired { .. }));
+    }
+
+    #[test]
+    fn production_rejects_unbounded_for_now() {
+        let mode = CapacityMode::unbounded_for_now("temporary import");
+        let err = CapacityPolicy::Production
+            .validate_mode("import.queue", &mode)
+            .unwrap_err();
+        assert!(matches!(err, CapacityPolicyError::ModeNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_and_production_reject_no_expiry_escape_by_default() {
+        let mode = CapacityMode::unbounded_without_expiry_i_know_this_is_bad("scratch");
+        assert!(
+            CapacityPolicy::Development
+                .validate_mode("scratch", &mode)
+                .is_ok()
+        );
+        assert!(
+            CapacityPolicy::Test
+                .validate_mode("scratch", &mode)
+                .is_err()
+        );
+        assert!(
+            CapacityPolicy::Production
+                .validate_mode("scratch", &mode)
+                .is_err()
+        );
     }
 
     #[test]

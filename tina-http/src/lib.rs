@@ -42,7 +42,10 @@
 //! Attach a [`BodyMetrics`] to either listener via
 //! `with_metrics(metrics.clone())` to record request/response
 //! bytes resident, peak high-water, body-cap full counts, and
-//! body IO/timeout error counts.
+//! body IO/timeout error counts. `BodyMetrics::with_body_capacity`
+//! additionally enables two weighted capacity surfaces
+//! (`request` and `response` body bytes) charged to one
+//! shard-local shared scope.
 //! [`BodyPressureReport::drained`] is the "no-leak" terminal
 //! assertion. A shared capacity-report shape lives in a separate
 //! slice; this report folds into it when that ships.
@@ -89,7 +92,7 @@ pub mod target;
 pub mod transport;
 pub mod types;
 
-pub use body_metrics::{BodyMetrics, BodyPressureReport};
+pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use keepalive::{
