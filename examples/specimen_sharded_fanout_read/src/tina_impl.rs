@@ -1,25 +1,20 @@
 //! Tina side. One `ShardCounter` isolate per shard owns its own
 //! `u64`. A `ScatterCoord` on shard 0 fans `Get` out to every shard
-//! through the `ShardServiceTable`. Replies flow through a
-//! `ReplyAdapter` that translates each shard's typed
-//! `ShardCounterReply` into the coord's own `ScatterCoordMsg::Reply`
-//! variant. When every target has either replied or been ruled out,
-//! the coord builds a `ScatterGatherReport<u64>` and publishes it.
+//! via `call`, collects `CallOutcome<ShardCounterReply>`, and builds
+//! a `ScatterGatherReport<u64>`.
 //!
 //! What this teaches:
 //!
 //! - **Placement is structural.** `ShardPlacement` and
 //!   `ShardServiceTable` make "which shard owns what" a typed thing.
 //!   The coord does not see raw indices.
-//! - **Per-target outcomes are typed.** Even when every reply lands
-//!   on the happy path, the report names the four overload outcomes
-//!   the runtime *would* surface
-//!   (`Full` / `Closed` / `Timeout` / `AggregateTimeout`) and the one
-//!   placement outcome (`MissingShard`). The richer pressure forms
-//!   live in `tina-runtime/tests/sharded_primitives.rs`.
-//! - **`ReplyAdapter` is shipped.** No hand-written translator
-//!   isolate. The user provides `impl From<ShardCounterReply> for
-//!   ScatterCoordMsg` and the adapter does the routing.
+//! - **`call` replaces send + reply adapter.** `ShardCounter` replies
+//!   to the caller directly via `reply(...)`. The coord fans out with
+//!   `call(address, ShardCounterMsg::Get, timeout).reply(...)`. No
+//!   `ReplyAdapter`, no `Bind` message, no chicken-and-egg.
+//! - **Per-target outcomes are typed.** `CallOutcome::Replied`,
+//!   `Timeout`, `Full`, `Closed` surface directly in the coord's
+//!   `CallResult` handler. No translation through an adapter.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -29,7 +24,7 @@ use tina_runtime::sharded::{
     ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement,
     ShardServiceTable,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, RuntimeCall, ThreadedMultiShardRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedMultiShardRuntime, call};
 
 use crate::{Report, SEED_VALUES, SHARD_RAW_IDS};
 
@@ -46,7 +41,7 @@ impl Shard for AppShard {
 
 #[derive(Debug, Clone)]
 enum ShardCounterMsg {
-    Get { reply_to: Address<ShardCounterReply> },
+    Get,
 }
 
 #[derive(Debug, Clone)]
@@ -62,8 +57,8 @@ struct ShardCounter {
 impl Isolate for ShardCounter {
     tina::isolate_types! {
         message: ShardCounterMsg,
-        reply: (),
-        send: Outbound<ShardCounterReply>,
+        reply: ShardCounterReply,
+        send: Outbound<Infallible>,
         spawn: Infallible,
         call: RuntimeCall<ShardCounterMsg>,
         shard: AppShard,
@@ -71,13 +66,10 @@ impl Isolate for ShardCounter {
 
     fn handle(&mut self, msg: ShardCounterMsg, ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            ShardCounterMsg::Get { reply_to } => send(
-                reply_to,
-                ShardCounterReply {
-                    shard: ctx.shard_id(),
-                    value: self.value,
-                },
-            ),
+            ShardCounterMsg::Get => reply(ShardCounterReply {
+                shard: ctx.shard_id(),
+                value: self.value,
+            }),
         }
     }
 }
@@ -86,27 +78,18 @@ impl Isolate for ShardCounter {
 
 #[derive(Debug, Clone)]
 enum ScatterCoordMsg {
-    Bind {
-        bridge: Address<ShardCounterReply>,
-    },
     Start,
-    Reply(ShardCounterReply),
-}
-
-// `ReplyAdapter<ShardCounterReply, ScatterCoordMsg, AppShard>` does
-// the translation; the user only provides this `From` impl.
-impl From<ShardCounterReply> for ScatterCoordMsg {
-    fn from(msg: ShardCounterReply) -> Self {
-        ScatterCoordMsg::Reply(msg)
-    }
+    CallResult {
+        shard: ShardId,
+        outcome: CallOutcome<ShardCounterReply>,
+    },
 }
 
 struct ScatterCoord {
-    table: ShardServiceTable<ShardCounterMsg>,
-    bridge: Option<Address<ShardCounterReply>>,
+    table: ShardServiceTable<ShardCounterMsg, ShardCounterReply>,
     config: ScatterGatherConfig,
     targets_in_order: Vec<ShardId>,
-    pending_targets: Vec<ShardId>,
+    pending: Vec<ShardId>,
     outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<u64>)>,
 }
 
@@ -114,9 +97,9 @@ impl Isolate for ScatterCoord {
     tina::isolate_types! {
         message: ScatterCoordMsg,
         reply: (),
-        send: Outbound<ShardCounterMsg>,
+        send: Outbound<()>,
         spawn: Infallible,
-        call: Infallible,
+        call: RuntimeCall<ScatterCoordMsg>,
         shard: AppShard,
     }
 
@@ -126,35 +109,40 @@ impl Isolate for ScatterCoord {
         _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ScatterCoordMsg::Bind { bridge } => {
-                self.bridge = Some(bridge);
-                noop()
-            }
             ScatterCoordMsg::Start => {
-                let bridge = self.bridge.expect("Bind must arrive before Start");
                 let mut effects = Vec::new();
                 self.targets_in_order = self.table.placement().shards().to_vec();
-                for shard in self.targets_in_order.iter().copied() {
-                    self.pending_targets.push(shard);
+                let timeout = self.config.per_target_timeout;
+                for &shard in &self.targets_in_order {
+                    self.pending.push(shard);
                     let address = self
                         .table
                         .address_for(shard)
                         .expect("shard came from placement.shards()");
-                    effects.push(send(
-                        address,
-                        ShardCounterMsg::Get { reply_to: bridge },
-                    ));
+                    effects.push(
+                        call(address, ShardCounterMsg::Get, timeout)
+                            .reply(move |outcome| ScatterCoordMsg::CallResult {
+                                shard,
+                                outcome,
+                            }),
+                    );
                 }
                 batch(effects)
             }
-            ScatterCoordMsg::Reply(reply) => {
-                let ShardCounterReply { shard, value } = reply;
-                if let Some(pos) = self.pending_targets.iter().position(|s| *s == shard) {
-                    self.pending_targets.swap_remove(pos);
-                    self.outcomes
-                        .push((shard, ScatterGatherTargetOutcome::Replied(value)));
+            ScatterCoordMsg::CallResult { shard, outcome } => {
+                if let Some(pos) = self.pending.iter().position(|s| *s == shard) {
+                    self.pending.swap_remove(pos);
                 }
-                if self.pending_targets.is_empty() {
+                let sg_outcome = match outcome {
+                    CallOutcome::Replied(ShardCounterReply { value, .. }) => {
+                        ScatterGatherTargetOutcome::Replied(value)
+                    }
+                    CallOutcome::Timeout => ScatterGatherTargetOutcome::Timeout,
+                    CallOutcome::Full => ScatterGatherTargetOutcome::Full,
+                    CallOutcome::Closed => ScatterGatherTargetOutcome::Closed,
+                };
+                self.outcomes.push((shard, sg_outcome));
+                if self.pending.is_empty() {
                     let outcomes = sort_outcomes_by_target_list(
                         std::mem::take(&mut self.outcomes),
                         &self.targets_in_order,
@@ -163,13 +151,10 @@ impl Isolate for ScatterCoord {
                         config: self.config,
                         outcomes,
                     };
-                    // Phase-062 Rock 1: the host reads the typed
-                    // `ScatterGatherReport<u64>` via
-                    // `runtime.observe_result::<...>` instead of polling
-                    // an `Arc<Mutex<Option<_>>>` slot.
-                    return stop_with(report);
+                    stop_with(report)
+                } else {
+                    noop()
                 }
-                noop()
             }
         }
     }
@@ -210,7 +195,7 @@ pub fn run() -> anyhow::Result<Report> {
             .position(|s| *s == shard)
             .expect("shard came from placement.shards()")];
         runtime
-            .register_with_capacity_on::<ShardCounter, ShardCounterReply>(shard, ShardCounter { value }, 8)
+            .register_with_capacity_on::<ShardCounter, _>(shard, ShardCounter { value }, 8)
     })
     .map_err(|e| anyhow::anyhow!("register shard counters: {e}"))?;
 
@@ -226,27 +211,18 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("scatter/gather config: {e}"))?;
 
     let coord = runtime
-        .register_with_capacity_on::<ScatterCoord, ShardCounterMsg>(
+        .register_with_capacity_on::<ScatterCoord, _>(
             coord_shard,
             ScatterCoord {
-                table: table.clone(),
-                bridge: None,
+                table,
                 config,
                 targets_in_order: Vec::new(),
-                pending_targets: Vec::new(),
+                pending: Vec::new(),
                 outcomes: Vec::with_capacity(config.max_targets),
             },
             config.collector_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register coord: {e:?}"))?;
-
-    let bridge = runtime
-        .register_reply_adapter_on::<ShardCounterReply, ScatterCoordMsg>(
-            coord_shard,
-            coord,
-            config.collector_capacity,
-        )
-        .map_err(|e| anyhow::anyhow!("register reply adapter: {e:?}"))?;
 
     // Phase-062 Rock 1: typed result waiter on the multi-shard runtime.
     // The coord publishes its `ScatterGatherReport<u64>` via
@@ -255,9 +231,6 @@ pub fn run() -> anyhow::Result<Report> {
         .observe_result::<ScatterGatherReport<u64>, _, _>(coord)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(coord, ScatterCoordMsg::Bind { bridge })
-        .map_err(|e| anyhow::anyhow!("send Bind: {e:?}"))?;
     runtime
         .try_send(coord, ScatterCoordMsg::Start)
         .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;

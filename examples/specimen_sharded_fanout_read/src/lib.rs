@@ -9,9 +9,9 @@
 //!   structurally prevents wrong-shard access.
 //! - Tina: per-shard `ShardCounter` isolate, `ShardPlacement` +
 //!   `ShardServiceTable`, a `ScatterCoord` that fans `Get` out to
-//!   every shard via `send` (with a `ReplyAdapter` translating the
-//!   shard's typed reply into the coord's own message), accumulates
-//!   into a `ScatterGatherReport<u64>`, and ends with `stop_with(report)`.
+//!   every shard via `call` (one request/reply per target), collects
+//!   `CallOutcome<ShardCounterReply>`, and builds a
+//!   `ScatterGatherReport<u64>`. No `ReplyAdapter`, no `Bind` message.
 //!
 //! Both sides produce the same [`Report`].
 

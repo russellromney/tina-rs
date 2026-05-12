@@ -1,7 +1,6 @@
 # specimen_sharded_fanout_read
 
-Tokio-vs-Tina sharded fanout read using the phase-053 sharded
-primitives.
+Tokio-vs-Tina sharded fanout read using the sharded primitives.
 
 Three shards each own a `u64` counter, seeded with `[100, 200, 300]`.
 Both sides issue a fanout read and aggregate `total_sum=600`.
@@ -40,7 +39,7 @@ aggregator is the only thing that knows it's "the sharded reader."
 
 ## Tina shape
 
-Three first-class pieces from `tina_runtime::sharded`:
+Three pieces from `tina_runtime::sharded`:
 
 - **`ShardPlacement`** — typed name + ordered shard list. Names the
   hash scheme version so a future placement change fails loudly.
@@ -49,38 +48,50 @@ Three first-class pieces from `tina_runtime::sharded`:
   `try_from_placement(...)`.
 - **`ScatterGatherConfig` / `ScatterGatherReport<u64>`** — partial-
   aggregate report shape. Covers `Replied`, `Full`, `Closed`,
-  `Timeout`, `AggregateTimeout`, `MissingShard`. The happy-path
-  specimen here only fills `Replied`, but the typed slots are
-  reserved.
+  `Timeout`, `AggregateTimeout`, `MissingShard`.
 
-The fanout itself is small:
+The fanout uses `call` — request/reply between isolates:
 
 ```rust
 ScatterCoordMsg::Start => {
     for shard in placement.shards() {
-        effects.push(send(table.address_for(shard), ShardCounterMsg::Get { reply_to: bridge }));
+        effects.push(
+            call(table.address_for(shard)?, ShardCounterMsg::Get, timeout)
+                .reply(|outcome| ScatterCoordMsg::CallResult { shard, outcome })
+        );
     }
     batch(effects)
 }
-ScatterCoordMsg::Reply(ShardCounterReply { shard, value }) => {
-    self.outcomes.push((shard, ScatterGatherTargetOutcome::Replied(value)));
-    if self.pending_targets.is_empty() {
-        publish_report(ScatterGatherReport { config, outcomes });
-        stop()
+ScatterCoordMsg::CallResult { shard, outcome } => {
+    let sg = match outcome {
+        CallOutcome::Replied(ShardCounterReply { value, .. }) => {
+            ScatterGatherTargetOutcome::Replied(value)
+        }
+        CallOutcome::Timeout => ScatterGatherTargetOutcome::Timeout,
+        CallOutcome::Full => ScatterGatherTargetOutcome::Full,
+        CallOutcome::Closed => ScatterGatherTargetOutcome::Closed,
+    };
+    self.outcomes.push((shard, sg));
+    if self.pending.is_empty() {
+        stop_with(ScatterGatherReport { config, outcomes })
     } else { noop() }
 }
 ```
 
-Replies translate through `ReplyAdapter<ShardCounterReply,
-ScatterCoordMsg, AppShard>`. The user provides one
-`impl From<ShardCounterReply> for ScatterCoordMsg`; the adapter is
-the shipped primitive that takes care of the address translation.
-Registration uses `runtime.register_reply_adapter_on(shard,
-target, capacity)`, which exists on the multi-shard runtimes
-(threaded, explicit-step, and the sim). The adapter still lives
-in its own bounded mailbox; the helper just removes the doubled
-turbofish — the adapter type and the outbound payload type —
-that registering by hand required.
+`ShardCounter` replies directly to the caller:
+
+```rust
+ShardCounterMsg::Get => reply(ShardCounterReply {
+    shard: ctx.shard_id(),
+    value: self.value,
+})
+```
+
+No `ReplyAdapter`, no `Bind` message, no chicken-and-egg. The coord
+tracks which shards have responded with a `Vec<ShardId>`; when every
+shard has replied or timed out, it publishes the report via
+`stop_with(...)` and the host reads it through
+`observe_result`.
 
 ## Discussion
 
@@ -94,8 +105,10 @@ What feels better:
   `ShardCounter` isolate registered on its shard. There is no
   shared `Arc<Mutex<u64>>` for the value, no second mutator
   squeezing into the same lock, no possibility of a wrong-shard
-  write going undetected (the shipped `placement.require_owner_*`
-  helper makes that a typed `WrongShard`).
+  write going undetected.
+- **`call` replaces send + reply adapter.** No extra isolate
+  registration, no `Bind` message, no `From` impl. The request/
+  reply path is one `call(...)` effect per target.
 - **Outcomes are typed for the bad case.** The happy-path here
   fills `Replied`; the typed report still reserves slots for
   `Full`, `Closed`, `Timeout`, `AggregateTimeout`,
@@ -104,23 +117,24 @@ What feels better:
 
 What feels worse:
 
-- **`ScatterCoord` is a lot of state.** `table`, `bridge`,
-  `targets_in_order`, `pending_targets`, `outcomes`, `report_into`,
-  plus a bind/start/reply variant trio. For a three-shard happy-path
-  read, that's heavier than `[shard.lock()? for shard in shards]`.
-  The richer pressure form (with `send_observed`, per-target timer,
-  aggregate timer) lives in `tina-runtime/tests/sharded_primitives.rs`
-  and is heavier still.
-- **`ReplyAdapter` is one isolate per fanout.** It's small and the
-  `From` impl is one line, but every fanout site registers an
-  adapter alongside the coord. A "use this address as the reply
-  channel and translate replies through `From`" sugar at registration
-  time would shrink the setup.
-- **`Bind` then `Start` is two messages.** The coord needs the
-  reply-adapter address, and the adapter needs the coord's address
-  — chicken-and-egg. The current shape sends `Bind { bridge }`
-  first, then `Start`. A `register_with_self_address` hook would
-  remove one variant.
+- **`ScatterCoord` state is still heavier than a lock array.**
+  `table`, `targets_in_order`, `pending`, `outcomes` — four
+  fields for a three-shard read. The state is real because each
+  target gets its own `call` with its own timeout; the aggregate
+  report must preserve target order and name partial outcomes.
+  Tokio's `map(lock).sum()` is shorter because it hides all of
+  that.
+- **No aggregate timeout enforcement.** The specimen uses
+  `per_target_timeout` on each `call`, but `aggregate_timeout` is
+  only a config field — the coord does not enforce it. The richer
+  pressure form (per-target timer + aggregate deadline via
+  `Deadline` / `PendingCallSet`) lives in
+  `tina-runtime/tests/sharded_primitives.rs`.
+- **`observe_result` on multi-shard runtimes.** The host waits for
+  the coord to `stop_with(report)`. This is correct but the
+  registration order matters: `observe_result` must be called
+  *before* sending `Start`, or the result may arrive before the
+  waiter is registered.
 
 ## What this is not
 
