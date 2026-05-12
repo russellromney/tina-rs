@@ -28,6 +28,7 @@
 use std::marker::PhantomData;
 
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{CallOutcome, RuntimeCall, call};
 
 use crate::client::{HttpClientMsg, OutboundCall};
@@ -38,7 +39,7 @@ use crate::types::{HttpClientError, HttpResponse, PoolConfig};
 /// `Submit` is the user-callable variant. `Returned` is an internal
 /// continuation produced by the pool's own `call(client, ...)`; user
 /// code never constructs it directly.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum HttpPoolMsg {
     /// User-side: run this outbound call through the pool. The reply
     /// (`Result<HttpResponse, HttpClientError>`) lands via the
@@ -46,7 +47,10 @@ pub enum HttpPoolMsg {
     Submit(OutboundCall),
     /// Internal: the underlying `HttpClient` returned for the in-flight
     /// Submit.
-    Returned(CallOutcome<Result<HttpResponse, HttpClientError>>),
+    Returned(
+        RequestContext<Result<HttpResponse, HttpClientError>>,
+        CallOutcome<Result<HttpResponse, HttpClientError>>,
+    ),
 }
 
 /// Service-shaped admission-controlled HTTP connection pool.
@@ -92,20 +96,8 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
 
     fn handle(&mut self, msg: HttpPoolMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
-            HttpPoolMsg::Submit(outbound) => {
-                if self.in_flight {
-                    return reply(Err(HttpClientError::PoolFull));
-                }
-                self.in_flight = true;
-                call(
-                    self.client,
-                    HttpClientMsg::Call(Box::new(outbound)),
-                    self.config.client_call_timeout,
-                )
-                .reply(HttpPoolMsg::Returned)
-            }
-
-            HttpPoolMsg::Returned(outcome) => {
+            HttpPoolMsg::Submit(_) => reply(Err(HttpClientError::Closed)),
+            HttpPoolMsg::Returned(request, outcome) => {
                 self.in_flight = false;
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,
@@ -114,7 +106,28 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
                     CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
-                reply(result)
+                reply_to_request(request, result)
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: HttpPoolMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            HttpPoolMsg::Submit(outbound) => {
+                if self.in_flight {
+                    return call_ctx.reply(Err(HttpClientError::PoolFull));
+                }
+                self.in_flight = true;
+                let request = call_ctx.into_request_context();
+                call(
+                    self.client,
+                    HttpClientMsg::Call(Box::new(outbound)),
+                    self.config.client_call_timeout,
+                )
+                .reply_with_request(request, HttpPoolMsg::Returned)
+            }
+            HttpPoolMsg::Returned(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }

@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use http::StatusCode;
+use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpLimits, HttpListener,
@@ -41,12 +42,21 @@ impl Isolate for ChunkedEchoService {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = if request.path == "/chunked" {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl ChunkedEchoService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        if request.path == "/chunked" {
             HttpResponse::stream_chunked(StatusCode::OK, self.source)
         } else {
             HttpResponse::not_found()
-        };
-        reply(response)
+        }
     }
 }
 

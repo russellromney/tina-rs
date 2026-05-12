@@ -78,6 +78,7 @@ use http::HeaderValue;
 use http::header::HOST;
 use tina::pool::PoolConfig;
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
     CallError, ThreadedRuntime, ThreadedRuntimeError, sleep, tcp_close_stream, tcp_connect,
@@ -268,6 +269,7 @@ struct InFlight {
     read_buf: Vec<u8>,
     parsed_head: Option<HttpResponseHead>,
     head_len: usize,
+    reply_to: Option<RequestContext<KeepaliveOutcome>>,
 }
 
 impl<S: Shard + 'static> KeepaliveConnection<S> {
@@ -318,7 +320,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             KeepaliveConnectionMsg::Request {
                 request,
                 request_timeout,
-            } => self.handle_request(*request, request_timeout),
+            } => self.handle_request(*request, request_timeout, None),
 
             KeepaliveConnectionMsg::Stop => self.handle_stop(),
 
@@ -399,26 +401,54 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             KeepaliveConnectionMsg::Closed(_) => noop(),
         }
     }
+
+    fn handle_call(
+        &mut self,
+        msg: KeepaliveConnectionMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            KeepaliveConnectionMsg::Request {
+                request,
+                request_timeout,
+            } => {
+                let reply_to = call.into_request_context();
+                self.handle_request(*request, request_timeout, Some(reply_to))
+            }
+            _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
 }
 
 impl<S: Shard + 'static> KeepaliveConnection<S> {
-    fn handle_request(&mut self, request: HttpRequest, request_timeout: Duration) -> Effect<Self> {
+    fn handle_request(
+        &mut self,
+        request: HttpRequest,
+        request_timeout: Duration,
+        reply_to: Option<RequestContext<KeepaliveOutcome>>,
+    ) -> Effect<Self> {
         if self.in_flight.is_some() {
-            return reply(KeepaliveOutcome::Request {
-                result: Err(HttpClientError::Busy),
-                // Busy is a programming error on the caller side, not
-                // a transport-health signal. The transport itself is
-                // fine; the pool slot is the thing that's busy.
-                must_retire: false,
-            });
+            return reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Request {
+                    result: Err(HttpClientError::Busy),
+                    // Busy is a programming error on the caller side, not
+                    // a transport-health signal. The transport itself is
+                    // fine; the pool slot is the thing that's busy.
+                    must_retire: false,
+                },
+            );
         }
         let request = match apply_host_policy(request, &self.target) {
             Ok(request) => request,
             Err(error) => {
-                return reply(KeepaliveOutcome::Request {
-                    result: Err(error),
-                    must_retire: false,
-                });
+                return reply_keepalive_outcome(
+                    reply_to,
+                    KeepaliveOutcome::Request {
+                        result: Err(error),
+                        must_retire: false,
+                    },
+                );
             }
         };
         let request_bytes = encode_keepalive_request(&request);
@@ -439,6 +469,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             read_buf: Vec::new(),
             parsed_head: None,
             head_len: 0,
+            reply_to,
         });
 
         let deadline_effect: Effect<Self> = sleep(request_timeout)
@@ -583,7 +614,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
     }
 
     fn deliver_success(&mut self, must_retire: bool) -> Effect<Self> {
-        let in_flight = self
+        let mut in_flight = self
             .in_flight
             .take()
             .expect("in_flight present at delivery");
@@ -596,24 +627,31 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             headers: head.headers,
             body: crate::HttpResponseBody::Buffered(body),
         };
+        let reply_to = in_flight.reply_to.take();
         if must_retire {
             // Drop the transport now; the next request on this slot
             // will reconnect. Issue a fire-and-forget close so the
             // FD is released; the Closed continuation no-ops.
             let close_effect = self.close_transport_fire_and_forget();
-            let reply_effect: Effect<Self> = reply(KeepaliveOutcome::Request {
-                result: Ok(response),
-                must_retire,
-            });
+            let reply_effect: Effect<Self> = reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Request {
+                    result: Ok(response),
+                    must_retire,
+                },
+            );
             match close_effect {
                 Some(close) => batch(vec![reply_effect, close]),
                 None => reply_effect,
             }
         } else {
-            reply(KeepaliveOutcome::Request {
-                result: Ok(response),
-                must_retire,
-            })
+            reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Request {
+                    result: Ok(response),
+                    must_retire,
+                },
+            )
         }
     }
 
@@ -621,17 +659,23 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         // Take in_flight first so a duplicate continuation can't
         // re-fire delivery. Also clear pending_connect_bytes — if we
         // failed during the cold-connect path, the bytes are stale.
-        let _ = self.in_flight.take();
+        let reply_to = self
+            .in_flight
+            .take()
+            .and_then(|in_flight| in_flight.reply_to);
         let _ = self.pending_connect_bytes.take();
         let close_effect = if must_retire {
             self.close_transport_fire_and_forget()
         } else {
             None
         };
-        let reply_effect: Effect<Self> = reply(KeepaliveOutcome::Request {
-            result: Err(error),
-            must_retire,
-        });
+        let reply_effect: Effect<Self> = reply_keepalive_outcome(
+            reply_to,
+            KeepaliveOutcome::Request {
+                result: Err(error),
+                must_retire,
+            },
+        );
         match close_effect {
             Some(close) => batch(vec![reply_effect, close]),
             None => reply_effect,
@@ -660,6 +704,16 @@ fn body_complete(state: &InFlight) -> bool {
     };
     let needed = state.head_len + head.content_length;
     state.read_buf.len() >= needed
+}
+
+fn reply_keepalive_outcome<S: Shard + 'static>(
+    reply_to: Option<RequestContext<KeepaliveOutcome>>,
+    outcome: KeepaliveOutcome,
+) -> Effect<KeepaliveConnection<S>> {
+    match reply_to {
+        Some(request) => reply_to_request(request, outcome),
+        None => reply(outcome),
+    }
 }
 
 fn response_says_close(state: &InFlight) -> bool {

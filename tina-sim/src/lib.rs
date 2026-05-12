@@ -883,16 +883,21 @@ where
                 false
             }
             ErasedEffect::Batch(effects) => {
+                let mut batch_context = call_context;
                 for subeffect in effects {
+                    let consumes_context = subeffect.consumes_call_context();
                     if self.execute_effect(
                         index,
                         cause,
                         subeffect,
-                        call_context,
+                        batch_context,
                         round_messages,
                         route_remote,
                     ) {
                         return true;
+                    }
+                    if consumes_context {
+                        batch_context = None;
                     }
                 }
                 false

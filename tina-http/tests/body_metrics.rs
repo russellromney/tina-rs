@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_http::{
     BodyMetrics, HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest,
     HttpRequestBody, HttpResponse, RequestChunkReply, ResponseChunkMsg, ResponseChunkReply,
@@ -47,11 +48,21 @@ impl Isolate for EchoLen {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(Self::response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(Self::response_for(request))
+    }
+}
+
+impl EchoLen {
+    fn response_for(request: HttpRequest) -> HttpResponse {
         let n = match request.body {
             HttpRequestBody::Buffered(b) => b.len(),
             HttpRequestBody::Stream(_) => 0,
         };
-        reply(HttpResponse::with_text(StatusCode::OK, n.to_string()))
+        HttpResponse::with_text(StatusCode::OK, n.to_string())
     }
 }
 
@@ -202,10 +213,10 @@ fn oversized_request_increments_body_full_count() {
 
 /// Streaming consumer that pulls every chunk and replies with the
 /// total length. Reused for the streaming-metrics test.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum StreamMsg {
     Inbound(HttpRequest),
-    ChunkArrived(CallOutcome<RequestChunkReply>),
+    ChunkArrived(RequestContext<HttpResponse>, CallOutcome<RequestChunkReply>),
 }
 
 impl From<HttpRequest> for StreamMsg {
@@ -240,18 +251,13 @@ impl Isolate for StreamingConsumer {
                 HttpRequestBody::Stream(stream) => {
                     self.total = 0;
                     self.pending_source = Some(stream.source);
-                    call(
-                        stream.source,
-                        HttpConnectionMsg::body_next(),
-                        self.chunk_call_timeout,
-                    )
-                    .reply(StreamMsg::ChunkArrived)
+                    reply(HttpResponse::internal_error())
                 }
                 HttpRequestBody::Buffered(b) => {
                     reply(HttpResponse::with_text(StatusCode::OK, b.len().to_string()))
                 }
             },
-            StreamMsg::ChunkArrived(outcome) => match outcome {
+            StreamMsg::ChunkArrived(request, outcome) => match outcome {
                 CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
                     self.total += bytes.len();
                     let source = self.pending_source.expect("source set");
@@ -260,14 +266,14 @@ impl Isolate for StreamingConsumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply(StreamMsg::ChunkArrived)
+                    .reply_with_request(request, StreamMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     self.pending_source = None;
-                    reply(HttpResponse::with_text(
-                        StatusCode::OK,
-                        self.total.to_string(),
-                    ))
+                    reply_to_request(
+                        request,
+                        HttpResponse::with_text(StatusCode::OK, self.total.to_string()),
+                    )
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
                 | CallOutcome::Full
@@ -275,9 +281,33 @@ impl Isolate for StreamingConsumer {
                 | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply(HttpResponse::internal_error())
+                    reply_to_request(request, HttpResponse::internal_error())
                 }
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: StreamMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            StreamMsg::Inbound(req) => match req.body {
+                HttpRequestBody::Stream(stream) => {
+                    self.total = 0;
+                    self.pending_source = Some(stream.source);
+                    let request = call_ctx.into_request_context();
+                    call(
+                        stream.source,
+                        HttpConnectionMsg::body_next(),
+                        self.chunk_call_timeout,
+                    )
+                    .reply_with_request(request, StreamMsg::ChunkArrived)
+                }
+                HttpRequestBody::Buffered(b) => {
+                    call_ctx.reply(HttpResponse::with_text(StatusCode::OK, b.len().to_string()))
+                }
+            },
+            StreamMsg::ChunkArrived(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -492,18 +522,25 @@ impl Isolate for ChunkProducer {
 
     fn handle(
         &mut self,
-        _msg: ResponseChunkMsg,
+        msg: ResponseChunkMsg,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(self.next_chunk(msg))
+    }
+
+    fn handle_call(&mut self, msg: ResponseChunkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.next_chunk(msg))
+    }
+}
+
+impl ChunkProducer {
+    fn next_chunk(&mut self, _msg: ResponseChunkMsg) -> ResponseChunkReply {
         if self.yielded >= self.total_chunks {
-            return reply(ResponseChunkReply::Eof);
+            return ResponseChunkReply::Eof;
         }
         let i = self.yielded;
         self.yielded += 1;
-        reply(ResponseChunkReply::Chunk(vec![
-            (i % 251) as u8;
-            self.chunk_size
-        ]))
+        ResponseChunkReply::Chunk(vec![(i % 251) as u8; self.chunk_size])
     }
 }
 
@@ -527,7 +564,17 @@ impl Isolate for StreamingService {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = if request.path == "/big" {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl StreamingService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        if request.path == "/big" {
             HttpResponse::with_stream(
                 StatusCode::OK,
                 ResponseStream {
@@ -537,8 +584,7 @@ impl Isolate for StreamingService {
             )
         } else {
             HttpResponse::not_found()
-        };
-        reply(response)
+        }
     }
 }
 

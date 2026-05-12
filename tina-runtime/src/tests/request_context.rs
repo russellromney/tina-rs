@@ -565,6 +565,7 @@ enum BatchMsg {
     BatchedReply,
     AbandonButSend,
     ExplicitReject,
+    ReplyThenReject,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +602,10 @@ impl Isolate for BatchSvc {
             ]),
             BatchMsg::AbandonButSend => tina::send(self.audit, AuditMsg("abandoned")),
             BatchMsg::ExplicitReject => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            BatchMsg::ReplyThenReject => batch([
+                call.reply(BatchReply::Ok),
+                tina::reject(tina::CallRejectedReason::UnsupportedMessage),
+            ]),
         }
     }
 }
@@ -766,6 +771,51 @@ fn explicit_reject_uses_rejected_trace_vocabulary() {
             ))
             .count(),
         1
+    );
+}
+
+#[test]
+fn batch_reply_consumes_authority_before_later_reject() {
+    let (mut runtime, _clock) = new_manual_runtime();
+    let audit = runtime.register(
+        Audit {
+            seen: Rc::new(RefCell::new(Vec::new())),
+        },
+        TestMailbox::new(4),
+    );
+    let svc = runtime.register(BatchSvc { audit }, TestMailbox::new(4));
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        BatchClient {
+            out: Rc::clone(&out),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime
+        .try_send(
+            caller,
+            BatchClientMsg::Start(svc, BatchMsg::ReplyThenReject),
+        )
+        .unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Replied(BatchReply::Ok)]
+    );
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|e| matches!(
+                e.kind(),
+                RuntimeEventKind::CallReplyRejected { .. }
+                    | RuntimeEventKind::CallRejected { .. }
+                    | RuntimeEventKind::CallReplyAbandoned { .. }
+            ))
+            .count(),
+        0
     );
 }
 

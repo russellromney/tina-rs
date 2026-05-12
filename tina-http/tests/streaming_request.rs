@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_http::{
     HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpRequestBody,
     HttpResponse, RequestChunkReply,
@@ -26,10 +27,10 @@ use tina_runtime::{
 
 use common::TestShard;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ConsumerMsg {
     Inbound(HttpRequest),
-    ChunkArrived(CallOutcome<RequestChunkReply>),
+    ChunkArrived(RequestContext<HttpResponse>, CallOutcome<RequestChunkReply>),
 }
 
 impl From<HttpRequest> for ConsumerMsg {
@@ -70,19 +71,9 @@ impl Isolate for Consumer {
                         format!("buffered:{}", bytes.iter().fold(0u64, |a, b| a + *b as u64));
                     reply(HttpResponse::with_text(StatusCode::OK, body_summary))
                 }
-                HttpRequestBody::Stream(stream) => {
-                    self.expected_length = stream.content_length;
-                    self.accumulated.clear();
-                    self.pending_source = Some(stream.source);
-                    call(
-                        stream.source,
-                        HttpConnectionMsg::body_next(),
-                        self.chunk_call_timeout,
-                    )
-                    .reply(ConsumerMsg::ChunkArrived)
-                }
+                HttpRequestBody::Stream(_) => reply(HttpResponse::internal_error()),
             },
-            ConsumerMsg::ChunkArrived(outcome) => match outcome {
+            ConsumerMsg::ChunkArrived(request, outcome) => match outcome {
                 CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
                     self.accumulated.extend_from_slice(&bytes);
                     let source = self
@@ -93,7 +84,7 @@ impl Isolate for Consumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply(ConsumerMsg::ChunkArrived)
+                    .reply_with_request(request, ConsumerMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     let total = self.accumulated.len();
@@ -101,20 +92,47 @@ impl Isolate for Consumer {
                     let body = format!("stream:{}:{}", total, checksum);
                     self.pending_source = None;
                     self.accumulated.clear();
-                    reply(HttpResponse::with_text(StatusCode::OK, body))
+                    reply_to_request(request, HttpResponse::with_text(StatusCode::OK, body))
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_)) => {
                     self.pending_source = None;
-                    reply(HttpResponse::internal_error())
+                    reply_to_request(request, HttpResponse::internal_error())
                 }
                 CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply(HttpResponse::internal_error())
+                    reply_to_request(request, HttpResponse::internal_error())
                 }
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: ConsumerMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ConsumerMsg::Inbound(req) => match req.body {
+                HttpRequestBody::Buffered(bytes) => {
+                    let body_summary =
+                        format!("buffered:{}", bytes.iter().fold(0u64, |a, b| a + *b as u64));
+                    call_ctx.reply(HttpResponse::with_text(StatusCode::OK, body_summary))
+                }
+                HttpRequestBody::Stream(stream) => {
+                    self.expected_length = stream.content_length;
+                    self.accumulated.clear();
+                    self.pending_source = Some(stream.source);
+                    let request = call_ctx.into_request_context();
+                    call(
+                        stream.source,
+                        HttpConnectionMsg::body_next(),
+                        self.chunk_call_timeout,
+                    )
+                    .reply_with_request(request, ConsumerMsg::ChunkArrived)
+                }
+            },
+            ConsumerMsg::ChunkArrived(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -487,10 +505,10 @@ fn streaming_request_dispatches_before_full_body_arrives() {
     let _ = runtime.shutdown();
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum NotifyingMsg {
     Inbound(HttpRequest),
-    ChunkArrived(CallOutcome<RequestChunkReply>),
+    ChunkArrived(RequestContext<HttpResponse>, CallOutcome<RequestChunkReply>),
 }
 
 impl From<HttpRequest> for NotifyingMsg {
@@ -532,20 +550,10 @@ impl Isolate for NotifyingConsumer {
                         // (test harness configured streaming on).
                         reply(HttpResponse::internal_error())
                     }
-                    HttpRequestBody::Stream(stream) => {
-                        self.expected_length = stream.content_length;
-                        self.accumulated.clear();
-                        self.pending_source = Some(stream.source);
-                        call(
-                            stream.source,
-                            HttpConnectionMsg::body_next(),
-                            self.chunk_call_timeout,
-                        )
-                        .reply(NotifyingMsg::ChunkArrived)
-                    }
+                    HttpRequestBody::Stream(_) => reply(HttpResponse::internal_error()),
                 }
             }
-            NotifyingMsg::ChunkArrived(outcome) => match outcome {
+            NotifyingMsg::ChunkArrived(request, outcome) => match outcome {
                 CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
                     self.accumulated.extend_from_slice(&bytes);
                     let source = self
@@ -556,7 +564,7 @@ impl Isolate for NotifyingConsumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply(NotifyingMsg::ChunkArrived)
+                    .reply_with_request(request, NotifyingMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     let total = self.accumulated.len();
@@ -564,20 +572,47 @@ impl Isolate for NotifyingConsumer {
                     let body = format!("stream:{total}:{checksum}");
                     self.pending_source = None;
                     self.accumulated.clear();
-                    reply(HttpResponse::with_text(StatusCode::OK, body))
+                    reply_to_request(request, HttpResponse::with_text(StatusCode::OK, body))
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_)) => {
                     self.pending_source = None;
-                    reply(HttpResponse::internal_error())
+                    reply_to_request(request, HttpResponse::internal_error())
                 }
                 CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply(HttpResponse::internal_error())
+                    reply_to_request(request, HttpResponse::internal_error())
                 }
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: NotifyingMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            NotifyingMsg::Inbound(req) => {
+                self.dispatched
+                    .store(true, std::sync::atomic::Ordering::Release);
+                match req.body {
+                    HttpRequestBody::Buffered(_) => call_ctx.reply(HttpResponse::internal_error()),
+                    HttpRequestBody::Stream(stream) => {
+                        self.expected_length = stream.content_length;
+                        self.accumulated.clear();
+                        self.pending_source = Some(stream.source);
+                        let request = call_ctx.into_request_context();
+                        call(
+                            stream.source,
+                            HttpConnectionMsg::body_next(),
+                            self.chunk_call_timeout,
+                        )
+                        .reply_with_request(request, NotifyingMsg::ChunkArrived)
+                    }
+                }
+            }
+            NotifyingMsg::ChunkArrived(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }

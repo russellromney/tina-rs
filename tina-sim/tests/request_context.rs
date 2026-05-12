@@ -439,6 +439,7 @@ enum BatchMsg {
     BatchedReply,
     AbandonButSend,
     ExplicitReject,
+    ReplyThenReject,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,6 +476,10 @@ impl Isolate for BatchSvc {
             ]),
             BatchMsg::AbandonButSend => tina::send(self.audit, AuditMsg("abandoned")),
             BatchMsg::ExplicitReject => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            BatchMsg::ReplyThenReject => batch([
+                call.reply(BatchReply::Ok),
+                tina::reject(tina::CallRejectedReason::UnsupportedMessage),
+            ]),
         }
     }
 }
@@ -613,6 +618,40 @@ fn sim_explicit_reject_uses_rejected_trace_vocabulary() {
             }
         )),
         1
+    );
+}
+
+#[test]
+fn sim_batch_reply_consumes_authority_before_later_reject() {
+    let mut sim = Simulator::new(DefShard, SimulatorConfig::default());
+    let audit = sim.register(Audit {
+        seen: Rc::new(RefCell::new(Vec::new())),
+    });
+    let svc = sim.register(BatchSvc { audit });
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register(BatchClient {
+        out: Rc::clone(&out),
+    });
+
+    sim.try_send(
+        caller,
+        BatchClientMsg::Start(svc, BatchMsg::ReplyThenReject),
+    )
+    .unwrap();
+    step_to_idle(&mut sim);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Replied(BatchReply::Ok)]
+    );
+    assert_eq!(
+        count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::CallReplyRejected { .. }
+                | RuntimeEventKind::CallRejected { .. }
+                | RuntimeEventKind::CallReplyAbandoned { .. }
+        )),
+        0
     );
 }
 

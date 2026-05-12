@@ -894,6 +894,7 @@ where
     ///
     /// - [`TakeReplySlotError::NoCaller`]: the current message was a
     ///   plain send, or the slot was already taken on this turn.
+    ///
     /// Capturing is irreversible: once taken, the runtime will not also
     /// honor an [`Effect::Reply`] for the same call. Returning
     /// `Effect::Reply` after `take_reply_slot` is a no-op against the
