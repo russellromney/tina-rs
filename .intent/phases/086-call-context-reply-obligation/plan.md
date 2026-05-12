@@ -3,50 +3,54 @@
 ## Status
 
 - Done: plan.
-- Open: implement typed call entry, migrate runtime/sim/tests/docs/specimens.
-- Target: one PR if small enough, two PRs max.
+- Open: implement, migrate runtime/sim/tests/docs/specimens.
+- Shape: one PR if sane, two PRs max.
 
 ## Goal
 
-Fix the real bug behind `CallReplyAbandoned`.
+Kill the `CallReplyAbandoned` footgun.
 
-Today a call-shaped message can return without replying and without
-capturing the caller. Tina emits a warning and the caller waits until
-timeout. That is a bandaid.
-
-The Tina rule should be simpler:
+Current bug:
 
 ```text
-send message: no reply authority exists.
-call message: reply authority exists.
-reply authority must be consumed.
+called handler returns no reply
+called handler captures no caller
+runtime warns
+caller waits until timeout
 ```
 
-A called handler must reply, reject, or carry the request forward.
+That is wrong.
+
+Tina rule:
+
+```text
+send message: no caller exists.
+call message: caller authority exists.
+caller authority must be replied, rejected, or carried forward.
+```
 
 No hidden async context. No timeout purgatory.
 
 ## Non-Goals
 
-- No magic caller context through `call(...).reply(...)`.
+- No magic caller carry through `call(...).reply(...)`.
 - No Go-style context bag.
-- No app storage or dependency injection in `Context`.
-- No fake compile-time linear type claim.
-- No broad workflow helper.
-- No pipeline sugar.
+- No app storage / DI in `Context`.
+- No fake Rust linear-type claim.
+- No workflow helper or pipeline sugar.
 
-## Core Design
+## Public Shape
 
-Add a typed call-entry context:
+Add `CallContext` to `tina`.
 
 ```rust
 pub struct CallContext<'a, I: Isolate> {
-    // runtime facts, same turn as Context
-    // one private call reply authority for I::Reply
+    // runtime facts for this turn
+    // one private reply authority for I::Reply
 }
 ```
 
-It exposes only runtime facts and one-shot reply authority:
+Methods:
 
 ```rust
 impl<'a, I: Isolate> CallContext<'a, I> {
@@ -57,43 +61,42 @@ impl<'a, I: Isolate> CallContext<'a, I> {
     pub fn shard_id(&self) -> I::Shard;
     pub fn me(&self) -> Address<I::Message, I::Reply>;
     pub fn send_self(&self, msg: I::Message) -> Effect<I>;
-    // only boring runtime-fact helpers copied from Context
 }
 ```
 
-The handler shape becomes visibly split:
+Handler shape:
 
 ```rust
-impl Store {
-    fn handle(
-        &mut self,
-        msg: StoreMsg,
-        ctx: &mut Context<'_, AppShard, StoreReply>,
-    ) -> Effect<Self> {
-        // send-shaped messages only
+fn handle(
+    &mut self,
+    msg: Msg,
+    ctx: &mut Context<'_, AppShard, Reply>,
+) -> Effect<Self>;
+
+fn handle_call(
+    &mut self,
+    msg: Msg,
+    call: CallContext<'_, Self>,
+) -> Effect<Self>;
+```
+
+Example:
+
+```rust
+match msg {
+    StoreMsg::Get(k) => call.reply(StoreReply::Found(self.get(k))),
+
+    StoreMsg::Put(req) => {
+        let request = call.into_request_context();
+        journal_append(self.journal, req.bytes)
+            .reply_with_request(request, StoreMsg::Journaled)
     }
 
-    fn handle_call(
-        &mut self,
-        msg: StoreMsg,
-        call: CallContext<'_, Store>,
-    ) -> Effect<Self> {
-        match msg {
-            StoreMsg::Get(k) => call.reply(StoreReply::Found(self.get(k))),
-
-            StoreMsg::Put(req) => {
-                let request = call.into_request_context();
-                journal_append(self.journal, req.bytes)
-                    .reply_with_request(request, StoreMsg::Journaled)
-            }
-
-            _ => call.reject(CallRejectedReason::UnsupportedMessage),
-        }
-    }
+    _ => call.reject(CallRejectedReason::UnsupportedMessage),
 }
 ```
 
-Final continuation stays explicit:
+Continuation stays explicit:
 
 ```rust
 StoreMsg::Journaled(request, outcome) => {
@@ -101,188 +104,74 @@ StoreMsg::Journaled(request, outcome) => {
 }
 ```
 
-## Authority Storage
+## Core Semantics
 
-`CallContext` must not allocate a deferred slot just by existing.
-
-First form:
+Storage:
 
 ```text
-call is admitted
+call admitted
 pending_isolate_calls owns caller capacity
-CallContext borrows/moves the pending call authority for this handler turn
+CallContext owns/borrows that authority for one handler turn
 ```
 
-Then:
+Outcomes:
 
-- `call.reply(value)` completes the pending call;
-- `call.reject(reason)` completes the pending call with
-  `CallOutcome::Rejected(reason)`;
-- `call.into_request_context()` promotes the authority into the existing
-  `RequestContext` / deferred-reply slot path and marks the call context
-  consumed;
-- after promotion, deferred/pending-reply capacity rules apply exactly as
-  they do today;
-- unused call authority completes the pending call with
-  `ReplyAbandoned`.
+- `call.reply(value)` completes the pending call.
+- `call.reject(reason)` completes with `CallOutcome::Rejected(reason)`.
+- `call.into_request_context()` promotes into the existing
+  `RequestContext` / deferred-reply path.
+- After promotion, existing deferred capacity rules apply.
+- Unused authority completes with `ReplyAbandoned`.
 
-No double-counting. No hidden extra pending table. No bypass around deferred
-reply caps.
+Must not happen:
 
-## Unused Fallback
+- no deferred slot just because `CallContext` exists;
+- no double-counting;
+- no hidden pending table;
+- no bypass around deferred caps.
 
-Rust will not force linear consumption. Dropping values is legal.
+## Unused Authority
 
-So the runtime still needs a fallback, but it must be terminal.
-Do not rely on Rust `Drop` doing runtime work. The implementation should
-track whether `CallContext` was consumed, then check after the handler
-returns and the effect is classified.
+Rust allows dropping values, so the runtime must check.
+
+Do not rely on `Drop` doing runtime work. Track consumed/not-consumed.
+After handler returns and effect is classified:
 
 ```text
-CallContext returned unused
-=> caller immediately receives CallOutcome::Rejected(ReplyAbandoned)
-=> capacity reclaimed now
-=> trace records the bug
+CallContext unused
+=> caller gets CallOutcome::Rejected(ReplyAbandoned)
+=> caller capacity reclaimed now
+=> trace records rejected call
+=> returned effect still runs
 ```
 
-This replaces "warn and wait until timeout".
-
-The returned effect still runs.
-
-Reason:
+Why effect still runs:
 
 ```text
-handler returned this effect.
-Tina should not hide or erase side effects.
-caller truth is rejected immediately.
-effect truth remains visible in trace.
+handler returned it.
+Tina does not erase side effects.
+caller truth is still immediate rejection.
+effect truth is still visible.
 ```
 
-So a bad multi-turn handler can still perform its nested runtime call, but
-the original caller is already rejected and capacity is already reclaimed.
-Any later continuation `reply(...)` has no caller and is a no-op/diagnostic.
+Later continuation `reply(...)` has no caller and stays no-op/diagnostic.
 
-`CallReplyAbandoned` should be removed or renamed. If it remains as trace
-vocabulary, it must describe a terminal rejected call. It must not mean
-"caller still waits".
+`CallReplyAbandoned` should be removed or renamed. If kept, it must mean
+terminal rejection, not "caller keeps waiting".
 
-## Rock 0 — Audit Current Paths
+## Public Outcomes
 
-Read before code:
-
-- `tina::Context`, `RequestContext`, `DeferredReply`;
-- `tina-runtime/src/lib.rs` call dispatch and abandoned guard;
-- `tina-sim/src/lib.rs` matching path;
-- `tina-runtime/src/call.rs` builders;
-- request-context tests in runtime and sim;
-- docs pages 04, 10, 16;
-- `specimen_multi_turn_request_context`.
-
-Write down every path that can deliver a call-shaped message:
-
-- local call;
-- cross-shard call;
-- sim local/remote call;
-- host `call_blocking`;
-- bridge/observed call if applicable.
-
-## Rock 1 — Public API Shape
-
-Add `CallContext` to `tina`.
-
-Use this trait/macro shape unless code proves it impossible:
-
-Current `Context` may keep its existing generics. `CallContext` is
-isolate-typed because it owns reply authority for `I::Reply`.
+Add:
 
 ```rust
-fn handle(
-    &mut self,
-    msg,
-    ctx: &mut Context<'_, I::Shard, I::Reply>,
-) -> Effect<Self>;
-
-fn handle_call(
-    &mut self,
-    msg,
-    call: CallContext<'_, Self>,
-) -> Effect<Self> {
-    call.reject(CallRejectedReason::UnsupportedMessage)
+pub enum CallOutcome<T> {
+    Replied(T),
+    Full,
+    Closed,
+    Timeout,
+    Rejected(CallRejectedReason),
 }
-```
 
-Macro rules:
-
-- if user writes `handle_call`, call-shaped messages use it;
-- send-shaped messages still use `handle`;
-- callable isolates should implement `handle_call`;
-- if `reply = ...` is non-unit and `handle_call` is missing, prefer a
-  macro/compile error that tells the user to add `handle_call` or mark
-  the isolate send-only;
-- if the macro cannot prove that, the runtime fallback rejects with
-  `UnsupportedMessage`, never timeout;
-- migration may temporarily allow delegation behind a named compat path,
-  but final docs should teach split entry.
-
-Send-only spelling should be explicit if needed:
-
-```rust
-#[tina_runtime::isolate(message = Msg, send_only, shard = AppShard)]
-```
-
-Exact attribute name may differ. The important rule: users should not
-accidentally publish a callable address whose calls all reject because
-`handle_call` was forgotten.
-
-Keep `Context` narrow:
-
-```text
-Context is runtime facts and one-shot capabilities.
-Context is not app state.
-Context is not dependency injection.
-Context is not arbitrary key/value storage.
-```
-
-## Rock 2 — Runtime Semantics
-
-Live runtime:
-
-- when an envelope has caller context, dispatch to `handle_call`;
-- construct `CallContext` with exactly one request authority;
-- `CallContext::reply` and `reply_to_request` complete the caller;
-- `CallContext::into_request_context` promotes/captures authority;
-- unused `CallContext` rejects the caller immediately;
-- rejection reason is typed and traced;
-- capacity is reclaimed immediately;
-- returned effects still execute after unused-context rejection;
-- late continuation `reply(...)` without caller remains no-op/diagnostic;
-- panic before consuming call authority rejects caller with
-  `CallOutcome::Rejected(CallRejectedReason::HandlerPanicked)`;
-- panic after `into_request_context()` follows the existing deferred slot
-  panic cleanup path and must not leak the promoted authority.
-
-Remote/cross-shard calls must preserve the same cause/rejection truth.
-Add a concrete remote outcome envelope for rejected call completion, not
-just replied/full/closed:
-
-```rust
-RemoteCallOutcome::Rejected(CallRejectedReason)
-```
-
-If the existing remote path uses a different enum name, add the same
-variant there. Test local->remote and remote->local when both paths exist.
-
-## Rock 3 — Outcome And Trace Vocabulary
-
-Use one visible caller outcome:
-
-```rust
-CallOutcome::Rejected(CallRejectedReason::ReplyAbandoned)
-```
-
-First-form reasons:
-
-```rust
 pub enum CallRejectedReason {
     ReplyAbandoned,
     HandlerPanicked,
@@ -290,62 +179,115 @@ pub enum CallRejectedReason {
 }
 ```
 
-Do not add broad user-defined rejection yet. If a service wants a domain
-rejection, put it in the service reply type.
-
-`CallError` projection maps this to a typed error:
+`CallError` projection:
 
 ```rust
-CallError::Rejected(CallRejectedReason::ReplyAbandoned)
+CallError::Rejected(CallRejectedReason)
 ```
 
-Do the broad migration. Do not collapse this into `Timeout`, `Closed`, or
-a stringly internal error.
+No user-defined rejection yet. Domain rejection belongs in the service
+reply type.
 
-Trace must say the same fact:
+Never collapse these into `Timeout`, `Closed`, or string errors.
+
+Trace must say:
 
 ```text
-call replied? no.
-caller captured? no.
-caller rejected now.
-reason: ReplyAbandoned.
+call replied? no
+caller captured? no
+caller rejected now
+reason: ReplyAbandoned
 ```
 
-No docs may say "caller keeps waiting".
+## Macro Rules
 
-## Rock 4 — Simulator Parity
+- If user writes `handle_call`, call-shaped messages use it.
+- Send-shaped messages still use `handle`.
+- Callable isolates should implement `handle_call`.
+- If `reply = ...` is non-unit and `handle_call` is missing, prefer a
+  macro/compile error.
+- If compile-time proof is not possible, runtime rejects with
+  `UnsupportedMessage`, never timeout.
+- If needed, add explicit send-only spelling:
 
-Mirror semantics in `tina-sim`.
+```rust
+#[tina_runtime::isolate(message = Msg, send_only, shard = AppShard)]
+```
 
-Same seed, same call path:
+Exact attribute name can change. The rule cannot: users should not
+accidentally publish callable addresses whose calls all reject.
+
+Keep `Context` narrow:
+
+```text
+runtime facts.
+one-shot capabilities.
+not app state.
+not dependency injection.
+not key/value storage.
+```
+
+## Runtime Work
+
+Audit every call-shaped entry:
+
+- local call;
+- cross-shard call;
+- sim local / remote call;
+- host `call_blocking`;
+- bridge / observed call if applicable.
+
+Live runtime must:
+
+- dispatch caller-context envelopes to `handle_call`;
+- construct exactly one `CallContext`;
+- complete/reject/promote authority exactly once;
+- reclaim capacity immediately on rejection;
+- still execute returned effects after unused-authority rejection;
+- keep late continuation `reply(...)` as no-op/diagnostic;
+- reject panic-before-consume as `HandlerPanicked`;
+- after `into_request_context()`, use existing deferred panic cleanup.
+
+Cross-shard needs a concrete rejected envelope:
+
+```rust
+RemoteCallOutcome::Rejected(CallRejectedReason)
+```
+
+Use the actual enum name if different, but the fact must cross shards.
+
+## Simulator Work
+
+Mirror live semantics in `tina-sim`.
+
+Must cover:
 
 - reply;
 - reject;
-- carry request forward;
-- drop unused context;
+- carry as `RequestContext`;
+- unused authority;
 - panic before consume;
 - panic after promote;
-- remote call drop.
+- remote rejected call.
 
-Trace vocabulary must match live names.
+Trace vocabulary must match live.
 
-## Rock 5 — Migrate Internal Tests And Specimens
+## Migration
 
-Update tests first. Then specimens.
+Update tests first, then specimens/docs.
 
-Expected changes:
+Expected edits:
 
-- single-turn called services use `call.reply(...)`;
-- multi-turn services use `call.into_request_context()`;
+- single-turn call service: `call.reply(value)`;
+- multi-turn call service: `call.into_request_context()`;
+- final continuation: `reply_to_request(request, value)`;
 - send-only messages stay in `handle`;
-- call-only request messages move to `handle_call`;
-- old abandoned-timeout tests become immediate rejection tests.
+- call request messages move to `handle_call`;
+- old abandoned-timeout tests become immediate-rejection tests.
 
-Do not "fix" examples by using hidden context.
+Do not hide caller authority to make examples shorter.
 
-## Rock 6 — Docs
-
-User guide must teach:
+Docs must teach:
 
 ```text
 send handler has no caller.
@@ -353,89 +295,59 @@ call handler has caller obligation.
 reply / reject / carry.
 ```
 
-Keep the expanded multi-turn example.
-
-Show the common helper only after the explicit truth:
+Show expanded form first. Helper may follow only if it consumes
+`CallContext` or a clearly named request authority:
 
 ```rust
 call(worker, msg, timeout)
     .reply_with_current_request(call, ServiceMsg::WorkerReturned)
 ```
 
-Only ship that helper if it consumes `CallContext` or a clearly named
-request capability. Do not accept a generic `reply_with_context`.
+No `reply_with_context`.
 
-## Rock 7 — Compatibility Decision
+## Compatibility
 
-This is a project-wide API change.
+Tina is pre-public. Prefer clean break.
 
-Because Tina is still pre-public, prefer the clean break.
+If migration is too wide, one temporary compat path is allowed, but:
 
-If breakage is too wide, use at most one temporary compat path:
-
-```rust
-fn handle_call_compat(...) {
-    // delegates to old handle and runtime fallback rejects if uncaptured
-}
-```
-
-The compat path must be documented as temporary and must not be the user
-guide shape.
+- named as compat;
+- documented temporary;
+- not the user-guide shape;
+- never waits until timeout.
 
 ## Required Proof
 
-Live runtime:
+Live:
 
-- call handler `call.reply(...)` replies immediately;
-- call handler `call.reject(...)` returns typed rejection;
-- call handler `into_request_context` plus later `reply_to_request`
-  replies to original caller;
-- call handler that does nothing rejects immediately, no timeout wait;
-- returned effect still runs after unused-context rejection;
-- capacity is reclaimed after abandoned rejection;
-- panic before consuming call authority rejects with `HandlerPanicked`
-  and reclaims;
-- panic after request promotion does not leak deferred capacity;
-- cross-shard abandoned call preserves rejection cause.
+- `call.reply(...)` replies.
+- `call.reject(...)` returns `CallOutcome::Rejected`.
+- `into_request_context()` + later `reply_to_request(...)` replies.
+- unused `CallContext` rejects immediately, no timeout wait.
+- returned effect still runs after unused rejection.
+- capacity is reclaimed after rejection.
+- panic before consume rejects with `HandlerPanicked`.
+- panic after promote does not leak deferred capacity.
+- cross-shard rejected call preserves reason.
 
-Simulator:
+Sim:
 
 - same cases as live;
-- trace names and event ordering stable enough for DST.
+- same trace vocabulary.
 
 Compile/doc:
 
-- `RequestContext` remains move-only;
-- examples compile;
-- old broken multi-turn shape is absent from docs;
-- docs say abandoned call is terminal rejection, not warning-only.
-
-## Ergonomic Impact
-
-Good:
-
-- new readers see call obligation at the function boundary;
-- simple replies are shorter and clearer: `call.reply(value)`;
-- multi-turn reply authority is explicit: `call.into_request_context()`;
-- forgotten replies fail now, not 30 seconds later;
-- `CallReplyAbandoned` stops feeling like a runtime bandaid.
-
-Cost:
-
-- many handlers/tests/specimens need migration;
-- message protocols may split send/call cases more honestly;
-- macro surface gets larger;
-- some old free `reply(...)` examples become `call.reply(...)`.
-
-This is worth it. It is core Tina semantics, not polish.
+- `RequestContext` remains move-only.
+- examples compile.
+- old broken multi-turn shape is gone.
+- docs say terminal rejection, not warning-only.
 
 ## Hostile Review Checklist
 
-- Does any call-shaped path still wait for timeout after handler drops
-  caller authority?
+- Does any call path still wait for timeout after unused authority?
 - Does any helper hide caller authority across turns?
 - Can app code store arbitrary values in `Context`?
-- Are live and sim semantics identical?
+- Are live and sim identical?
 - Are rejection reasons typed and visible?
-- Does capacity reclaim immediately after dropped obligation?
-- Does default `handle_call` reject instead of silently doing old magic?
+- Is capacity reclaimed immediately?
+- Is callable-without-`handle_call` loud enough?
