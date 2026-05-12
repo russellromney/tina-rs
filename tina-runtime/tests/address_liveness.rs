@@ -92,6 +92,7 @@ impl Isolate for Target {
     type Reply = Infallible;
     type Send = Outbound<DriverMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -117,6 +118,7 @@ impl Isolate for Driver {
     type Reply = Infallible;
     type Send = Outbound<TargetMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 

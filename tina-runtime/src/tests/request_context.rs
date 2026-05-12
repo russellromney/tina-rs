@@ -42,6 +42,7 @@ impl Isolate for Probe {
     type Reply = ProbeReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -84,6 +85,7 @@ impl Isolate for Svc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SvcMsg>;
     type Shard = TestShard;
 
@@ -133,6 +135,7 @@ impl Isolate for Client {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = TestShard;
 
@@ -212,6 +215,7 @@ impl Isolate for HandleSvc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<HandleSvcMsg>;
     type Shard = TestShard;
 
@@ -270,6 +274,7 @@ fn isolate_call_with_handle_reply_with_request_replies_to_original_caller() {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HClientMsg>;
         type Shard = TestShard;
 
@@ -329,6 +334,7 @@ impl Isolate for AbandonSvc {
     type Reply = AbandonReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -361,6 +367,7 @@ impl Isolate for AbandonClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AbandonClientMsg>;
     type Shard = TestShard;
 
@@ -447,6 +454,7 @@ impl Isolate for ImmediateSvc {
     type Reply = ImmediateReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -479,6 +487,7 @@ impl Isolate for ImmClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ImmClientMsg>;
     type Shard = TestShard;
 
@@ -547,6 +556,7 @@ impl Isolate for Audit {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -583,6 +593,7 @@ impl Isolate for BatchSvc {
     type Reply = BatchReply;
     type Send = Outbound<AuditMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -626,6 +637,7 @@ impl Isolate for BatchClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BatchClientMsg>;
     type Shard = TestShard;
 
@@ -834,6 +846,7 @@ impl Isolate for Sink {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -862,6 +875,7 @@ impl Isolate for ObsSvc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ObsSvcMsg>;
     type Shard = TestShard;
 
@@ -916,6 +930,7 @@ fn observed_send_reply_with_request_carries_request_context() {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<OClientMsg>;
         type Shard = TestShard;
 
@@ -966,6 +981,7 @@ fn observed_send_reply_with_request_carries_request_context() {
 ///     type Message = (); type Reply = u32;
 ///     type Send = Outbound<std::convert::Infallible>;
 ///     type Spawn = std::convert::Infallible;
+///     type SpawnObserved = std::convert::Infallible;
 ///     type Call = std::convert::Infallible;
 ///     type Shard = tina::SingleShard;
 ///     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {

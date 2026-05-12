@@ -548,6 +548,7 @@ pub fn effect_kind_name(kind: EffectKind) -> &'static str {
         EffectKind::Reply => "reply",
         EffectKind::Send => "send",
         EffectKind::Spawn => "spawn",
+        EffectKind::SpawnObserved => "spawn_observed",
         EffectKind::Stop => "stop",
         EffectKind::StopWith => "stop_with",
         EffectKind::RestartChildren => "restart_children",

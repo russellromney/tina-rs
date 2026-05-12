@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
@@ -35,6 +37,7 @@ impl Isolate for Probe {
     type Reply = ProbeReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = tina::SingleShard;
 
@@ -81,6 +84,7 @@ impl Isolate for Db {
     type Reply = DbReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<DbMsg>;
     type Shard = tina::SingleShard;
 
@@ -132,6 +136,7 @@ impl Isolate for Service {
     type Reply = ServiceReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ServiceMsg>;
     type Shard = tina::SingleShard;
 
@@ -179,7 +184,7 @@ enum ClientMsg {
 
 #[derive(Debug)]
 struct Client {
-    replies: Vec<String>,
+    replies: Rc<RefCell<Vec<String>>>,
 }
 
 impl Isolate for Client {
@@ -187,6 +192,7 @@ impl Isolate for Client {
     type Reply = ClientReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = tina::SingleShard;
 
@@ -201,27 +207,29 @@ impl Isolate for Client {
                     .reply(ClientMsg::Returned)
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::Ready)) => {
-                self.replies.push(String::from("ready"));
+                self.replies.borrow_mut().push(String::from("ready"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::NotReady)) => {
-                self.replies.push(String::from("not_ready"));
+                self.replies.borrow_mut().push(String::from("not_ready"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Timeout) => {
-                self.replies.push(String::from("timeout"));
+                self.replies.borrow_mut().push(String::from("timeout"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Full) => {
-                self.replies.push(String::from("full"));
+                self.replies.borrow_mut().push(String::from("full"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Closed) => {
-                self.replies.push(String::from("closed"));
+                self.replies.borrow_mut().push(String::from("closed"));
                 noop()
             }
             ClientMsg::Returned(CallOutcome::Rejected(reason)) => {
-                self.replies.push(format!("rejected:{reason:?}"));
+                self.replies
+                    .borrow_mut()
+                    .push(format!("rejected:{reason:?}"));
                 noop()
             }
         }
@@ -237,28 +245,16 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         delay_ms: config.db_delay_ms,
     });
     let service = sim.register(Service { probe, db });
-    let client = sim.register(Client { replies: Vec::new() });
+    let replies = Rc::new(RefCell::new(Vec::new()));
+    let client = sim.register(Client {
+        replies: Rc::clone(&replies),
+    });
 
     sim.try_send(client, ClientMsg::Start(service))
         .map_err(|e| anyhow::anyhow!("client send failed: {:?}", e))?;
     sim.run_until_quiescent();
 
-    // In a real runtime, events would live in the isolate state.
-    // In simulation, extract via the trace.
-    let replies: Vec<String> = sim
-        .trace()
-        .iter()
-        .filter_map(|event| {
-            if matches!(
-                event.kind(),
-                tina_runtime::RuntimeEventKind::DeferredReplySent { .. }
-            ) {
-                Some(String::from("ready"))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    Ok(RunReport { replies })
+    Ok(RunReport {
+        replies: replies.borrow().clone(),
+    })
 }

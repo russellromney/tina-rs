@@ -324,6 +324,7 @@ mod tests {
         type Reply = ();
         type Send = ();
         type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<Msg>;
         type Shard = tina::SingleShard;
 

@@ -163,6 +163,7 @@ impl Isolate for Probe {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = TestShard;
 
@@ -213,6 +214,7 @@ impl Isolate for Binder {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BinderMsg>;
     type Shard = TestShard;
 
@@ -282,6 +284,7 @@ impl Isolate for Waiter {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WaiterMsg>;
     type Shard = TestShard;
 
@@ -324,6 +327,7 @@ impl Isolate for StreamAcceptor {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AcceptStreamMsg>;
     type Shard = TestShard;
 
@@ -357,6 +361,7 @@ impl Isolate for Reader {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ReaderMsg>;
     type Shard = TestShard;
 
@@ -395,6 +400,7 @@ impl Isolate for Writer {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WriterMsg>;
     type Shard = TestShard;
 
@@ -433,6 +439,7 @@ impl Isolate for Closer {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
@@ -1611,6 +1618,7 @@ fn isolate_without_call_effects_compiles_with_infallible() {
         type Reply = ();
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
         type Shard = TestShard;
 

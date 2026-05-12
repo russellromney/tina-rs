@@ -37,3 +37,19 @@ supervision rewrite, and the shape says two PRs max.
 Proceed with 084 after 081 if current request-context examples need it.
 The first implementation should ship only `ChildRef`, `spawn_observed`,
 tests, docs, and specimen cleanup unless join/stop falls out naturally.
+
+## Implementation Review Follow-Up
+
+Hostile review found an important correction: parent-delivery failure for the
+`spawn_observed` continuation cannot itself always be reported by delivering a
+second message to that same parent mailbox. If the mailbox is full or closed,
+that second message would hit the same failure. The implementation therefore
+keeps typed `SpawnObservedError` for spawn construction rejection
+(`ZeroMailboxCapacity`) and records parent-delivery rejection through the
+existing `SendRejected` trace path. No hidden queue, no mailbox bypass.
+
+The macro surface also changed from implicit to opt-in. `#[tina::isolate]`
+and `#[tina_runtime::isolate]` default `SpawnObserved = Infallible`; isolates
+that use `spawn_observed` declare the associated type with
+`spawn_observed = tina::SpawnObserved<...>`. This avoids requiring every custom
+spawn payload to implement `SpawnAddress`.

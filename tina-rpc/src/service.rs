@@ -225,6 +225,7 @@ where
     type Reply = ServiceReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = Infallible;
     type Call = RuntimeCall<ServiceCall>;
     type Shard = S;
 

@@ -819,6 +819,7 @@ where
     type Reply = ();
     type Send = Outbound<ClientResultMsg>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = S;
 
