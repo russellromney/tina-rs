@@ -90,6 +90,11 @@ pub enum CapacityAssertError {
         /// Observed count.
         observed: u64,
     },
+    /// A weighted assertion targeted a surface with no weight data.
+    MissingWeight {
+        /// Surface name.
+        surface: String,
+    },
 }
 
 impl fmt::Display for CapacityAssertError {
@@ -122,6 +127,9 @@ impl fmt::Display for CapacityAssertError {
                 f,
                 "surface {surface:?} full_count {observed} != expected {expected}"
             ),
+            Self::MissingWeight { surface } => {
+                write!(f, "surface {surface:?} has no weight fields")
+            }
         }
     }
 }
@@ -265,7 +273,11 @@ impl<'a> SurfaceAssertion<'a> {
     /// `Ok(())` iff weighted high-water is present and `<= limit`.
     pub fn high_water_weight_at_most(&self, limit: usize) -> Result<(), CapacityAssertError> {
         let r = self.report()?;
-        let observed = r.high_water_weight.unwrap_or(0);
+        let observed = r
+            .high_water_weight
+            .ok_or_else(|| CapacityAssertError::MissingWeight {
+                surface: r.name.clone(),
+            })?;
         if observed <= limit {
             Ok(())
         } else {
@@ -280,6 +292,11 @@ impl<'a> SurfaceAssertion<'a> {
     /// `Ok(())` iff `weight_full_count == expected`.
     pub fn weight_full_count_eq(&self, expected: u64) -> Result<(), CapacityAssertError> {
         let r = self.report()?;
+        if r.max_weight.is_none() && r.high_water_weight.is_none() {
+            return Err(CapacityAssertError::MissingWeight {
+                surface: r.name.clone(),
+            });
+        }
         if r.weight_full_count == expected {
             Ok(())
         } else {
@@ -322,8 +339,34 @@ fn suggest_next(report: &CapacitySurfaceReport) -> &'static str {
         // modes will replace this hint.
         None if fulls > 0 => return "saw Full — raise cap or shed earlier",
         None => {
-            if report.max_weight.is_some() {
-                return "weighted cap fits";
+            if let Some(max_weight) = report.max_weight {
+                if max_weight == 0 {
+                    return "weighted cap is zero — increase or remove this surface";
+                }
+                let high = report.high_water_weight.unwrap_or(0);
+                let bp = (high.saturating_mul(10_000)) / max_weight;
+                return match (&report.mode, bp) {
+                    (CapacityMode::Tuning, b) if b < 2_500 => {
+                        "weighted tuning cap is loose; freeze near 2x high water"
+                    }
+                    (CapacityMode::Tuning, b) if b < 7_500 => {
+                        "weighted tuning cap fits; freeze near 1.5x high water"
+                    }
+                    (CapacityMode::Tuning, _) => {
+                        "weighted tuning cap is tight; raise then re-measure"
+                    }
+                    (CapacityMode::Fixed, b) if b < 2_500 => {
+                        "weighted fixed cap is loose; consider shrinking"
+                    }
+                    (CapacityMode::Fixed, b) if b < 8_500 => "weighted fixed cap fits",
+                    (CapacityMode::Fixed, _) => "weighted fixed cap is tight; consider raising",
+                    (CapacityMode::UnboundedForNow { .. }, _) => {
+                        "unbounded-for-now is live; pick a fixed weighted cap"
+                    }
+                    (CapacityMode::UnboundedWithoutExpiryIKnowThisIsBad { .. }, _) => {
+                        "no-expiry unbounded escape is live; replace with a fixed weighted cap"
+                    }
+                };
             }
             return "no cap configured — pick a fixed cap";
         }
@@ -539,6 +582,26 @@ mod tests {
     }
 
     #[test]
+    fn weight_assertions_reject_count_only_surfaces() {
+        let mut s = CapacitySummary::new();
+        s.push(report("pool.waiters", 4, 0, 0, 0)).unwrap();
+        let err = s
+            .surface("pool.waiters")
+            .high_water_weight_at_most(1)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CapacityAssertError::MissingWeight {
+                surface: "pool.waiters".to_string()
+            }
+        );
+        assert!(matches!(
+            s.surface("pool.waiters").weight_full_count_eq(0),
+            Err(CapacityAssertError::MissingWeight { .. })
+        ));
+    }
+
+    #[test]
     fn shared_weight_assertion_names_what_filled() {
         let mut s = CapacitySummary::new();
         s.push(
@@ -616,6 +679,31 @@ mod tests {
         assert!(line.contains("shared_scope=http.bodies"), "{line}");
         assert!(line.contains("shared_weight_full=2"), "{line}");
         assert!(line.contains("saw Full"), "{line}");
+    }
+
+    #[test]
+    fn weighted_discovery_hint_uses_weight_utilization() {
+        let loose = CapacitySurfaceReport::weighted(
+            "http.response",
+            CapacityMode::Fixed,
+            10_000,
+            0,
+            100,
+            0,
+            "bytes",
+        );
+        assert!(suggest_next(&loose).contains("loose"));
+
+        let tight = CapacitySurfaceReport::weighted(
+            "http.response",
+            CapacityMode::Fixed,
+            100,
+            0,
+            95,
+            0,
+            "bytes",
+        );
+        assert!(suggest_next(&tight).contains("tight"));
     }
 
     #[test]

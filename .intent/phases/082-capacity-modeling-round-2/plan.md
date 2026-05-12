@@ -47,13 +47,25 @@
   on explicit `try_charge_*` calls, while existing HTTP connection
   code uses `charge_*`; moved shared high-water updates into the
   common charge path so real HTTP traffic reports the shared scope.
-- Kept as intentional first-form scope: the existing HTTP connection
-  still uses `HttpLimits::max_body_bytes` for request rejection and
-  existing body-pressure charge/release for live traffic. The new
-  weighted admission rejection proof is on the `BodyMetrics`
-  weighted boundary (`try_charge_request` / `try_charge_response`),
-  which is the first real weighted surface and avoids inventing a
-  second HTTP body cap dialect in the connection state machine.
+- Fixed after hostile review: live HTTP connection traffic now uses
+  weighted admission (`try_charge_request` / `try_charge_response`)
+  on request and response body charge points. Request-side weighted
+  Full maps to the existing 413 shape before service dispatch;
+  response-side weighted Full closes/truncates because the response
+  head may already be on the wire. Both paths are covered by
+  integration tests that assert the user-visible outcome and the
+  weighted Full counters.
+- Fixed after hostile review: weighted assertion helpers now fail
+  loudly when pointed at count-only surfaces instead of treating
+  missing weight fields as zero.
+- Fixed after hostile review: weighted discovery hints now use
+  `high_weight / max_weight` instead of always saying the weighted
+  cap fits.
+- Fixed after hostile review: body metrics docs no longer make even
+  a lower-bound heap footprint claim; they describe body-byte weight
+  only.
+- Fixed while here: unbounded modes now reject empty reasons so
+  "loud and named" is enforced by policy validation.
 - No DST proof added: the weighted surface touched here is live
   HTTP metrics, not simulator-owned state. Adding fake DST state for
   live-only metrics would make the proof less honest.

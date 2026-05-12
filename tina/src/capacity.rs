@@ -142,6 +142,13 @@ pub enum CapacityPolicyError {
         /// The expiry time that has passed.
         expires_at: SystemTime,
     },
+    /// Unbounded modes must carry a searchable reason.
+    EmptyUnboundedReason {
+        /// Surface whose mode failed validation.
+        surface: String,
+        /// The mode label whose reason was empty.
+        mode: &'static str,
+    },
 }
 
 impl fmt::Display for CapacityPolicyError {
@@ -164,6 +171,12 @@ impl fmt::Display for CapacityPolicyError {
                 "capacity mode unbounded_for_now expired for surface {surface:?} \
                  at {expires_at:?}; reason={reason:?}"
             ),
+            Self::EmptyUnboundedReason { surface, mode } => {
+                write!(
+                    f,
+                    "capacity mode {mode} for surface {surface:?} needs a non-empty reason"
+                )
+            }
         }
     }
 }
@@ -180,6 +193,12 @@ impl CapacityPolicy {
         match mode {
             CapacityMode::Fixed | CapacityMode::Tuning => Ok(()),
             CapacityMode::UnboundedForNow { reason, expires_at } => {
+                if reason.trim().is_empty() {
+                    return Err(CapacityPolicyError::EmptyUnboundedReason {
+                        surface: surface.to_string(),
+                        mode: mode.label(),
+                    });
+                }
                 if SystemTime::now() >= *expires_at {
                     return Err(CapacityPolicyError::UnboundedExpired {
                         surface: surface.to_string(),
@@ -196,16 +215,24 @@ impl CapacityPolicy {
                     }),
                 }
             }
-            CapacityMode::UnboundedWithoutExpiryIKnowThisIsBad { .. } => match self {
-                CapacityPolicy::Development => Ok(()),
-                CapacityPolicy::Test | CapacityPolicy::Production => {
-                    Err(CapacityPolicyError::ModeNotAllowed {
+            CapacityMode::UnboundedWithoutExpiryIKnowThisIsBad { reason } => {
+                if reason.trim().is_empty() {
+                    return Err(CapacityPolicyError::EmptyUnboundedReason {
                         surface: surface.to_string(),
-                        mode: mode.clone(),
-                        policy: *self,
-                    })
+                        mode: mode.label(),
+                    });
                 }
-            },
+                match self {
+                    CapacityPolicy::Development => Ok(()),
+                    CapacityPolicy::Test | CapacityPolicy::Production => {
+                        Err(CapacityPolicyError::ModeNotAllowed {
+                            surface: surface.to_string(),
+                            mode: mode.clone(),
+                            policy: *self,
+                        })
+                    }
+                }
+            }
         }
     }
 }
@@ -429,6 +456,20 @@ mod tests {
                 .validate_mode("scratch", &mode)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn unbounded_modes_reject_empty_reasons() {
+        let expiring = CapacityMode::unbounded_for_now(" ");
+        assert!(matches!(
+            CapacityPolicy::Development.validate_mode("scratch", &expiring),
+            Err(CapacityPolicyError::EmptyUnboundedReason { .. })
+        ));
+        let no_expiry = CapacityMode::unbounded_without_expiry_i_know_this_is_bad("");
+        assert!(matches!(
+            CapacityPolicy::Development.validate_mode("scratch", &no_expiry),
+            Err(CapacityPolicyError::EmptyUnboundedReason { .. })
+        ));
     }
 
     #[test]

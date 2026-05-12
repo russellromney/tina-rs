@@ -26,13 +26,10 @@
 //!
 //! # What is not counted
 //!
-//! - Heap memory. "Current" is bytes the connection has admitted
-//!   into its own buffers, plus whatever sits inside the runtime
-//!   call payload. Real heap footprint is at least this much.
+//! - Heap memory. "Current" is body-byte weight the connection has
+//!   admitted into its body buffers. It is not allocator truth.
 //! - Cross-shard totals. One [`BodyMetrics`] is one shard. Multi
 //!   shard services register one per shard and merge snapshots.
-//! - Heap memory. Weight is body-byte cost declared by this HTTP
-//!   surface, not an allocator measurement.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
