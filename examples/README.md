@@ -12,6 +12,10 @@ comparison and the API/runtime suggestions they imply — live in
 archaeology live in [`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md).
 Per-comparison ergonomic notes stay in each comparison's own `README.md`.
 
+Larger app-shaped probes live in [`systems/`](systems/). These
+"system specimens" combine several Tina parts at once so cheap model
+work can pull on rough edges before they become design debt.
+
 Before writing or rewriting an example, check the
 [ergonomics checklist](../docs/tina-user-guide/11-ergonomics-checklist.md)
 for the primitives the runtime now ships (mailbox factory, single-shard
