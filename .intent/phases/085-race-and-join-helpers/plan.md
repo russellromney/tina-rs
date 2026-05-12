@@ -50,7 +50,8 @@ stop and document the manual pattern.
 - `PendingCallSet`;
 - `cancel_call`;
 - `Deadline`;
-- 081 `RequestContext` if landed;
+- 086 `CallContext` / reply obligation if landed; otherwise use the
+  current `RequestContext` shape and migrate after 086;
 - `specimen_cancellation_chain`;
 - `specimen_pool_cancel_reclaim`;
 - `specimen_two_stage_pipeline` as warning: do not hide stages.
@@ -132,19 +133,21 @@ Report facts:
 
 Use `Deadline`.
 
-## Rock 4 — RequestContext
+## Rock 4 — CallContext / RequestContext
 
-If 081 landed, prove:
+If 086 landed, prefer:
 
 ```text
-take RequestContext
+take CallContext
+convert to RequestContext if reply is later
 start race/join
 store group
 reply_to_request once
 owner stop cancels/drains group
 ```
 
-If 081 has not landed, do not invent a second request context.
+If 086 has not landed, use the current `RequestContext` shape. Do not
+invent a second request context.
 
 ## Rock 5 — Child Work
 

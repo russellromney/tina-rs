@@ -50,6 +50,15 @@ pub struct CallContext<'a, I: Isolate> {
 }
 ```
 
+Mark reply authority as `#[must_use]` where Rust allows it:
+
+- `CallContext`;
+- `RequestContext`;
+- any internal one-shot authority wrapper.
+
+The runtime still enforces unused authority. `#[must_use]` is only an
+early compiler nudge for humans and agents.
+
 Methods:
 
 ```rust
@@ -217,6 +226,13 @@ reason: ReplyAbandoned
 Exact attribute name can change. The rule cannot: users should not
 accidentally publish callable addresses whose calls all reject.
 
+Required compile/macro proof if possible:
+
+- callable isolate with `reply != ()` and no `handle_call` fails with a
+  useful message; or
+- if that cannot be proven yet, runtime rejection is tested and docs call
+  it a fallback, not the blessed path.
+
 Keep `Context` narrow:
 
 ```text
@@ -338,6 +354,8 @@ Sim:
 Compile/doc:
 
 - `RequestContext` remains move-only.
+- `CallContext` / `RequestContext` are `#[must_use]` where possible.
+- macro diagnostic or fallback test covers missing `handle_call`.
 - examples compile.
 - old broken multi-turn shape is gone.
 - docs say terminal rejection, not warning-only.
