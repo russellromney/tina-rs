@@ -55,6 +55,9 @@ pub enum EffectKind {
     /// The handler returned [`tina::Effect::Spawn`].
     Spawn,
 
+    /// The handler returned [`tina::Effect::SpawnObserved`].
+    SpawnObserved,
+
     /// The handler returned [`tina::Effect::Stop`].
     Stop,
 
@@ -1000,6 +1003,7 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::Batch => 8,
         EffectKind::StopWith => 9,
         EffectKind::ReplyTo => 10,
+        EffectKind::SpawnObserved => 11,
     }
 }
 

@@ -38,6 +38,7 @@ impl Isolate for Worker {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -61,6 +62,7 @@ impl Isolate for Session {
     type Reply = usize;
     type Send = Outbound<Infallible>;
     type Spawn = ChildDefinition<Worker>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 

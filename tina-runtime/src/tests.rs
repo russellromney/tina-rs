@@ -168,6 +168,7 @@ impl Isolate for RootIsolate {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::ChildDefinition<ChildIsolate>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
@@ -196,6 +197,7 @@ impl Isolate for RestartableRootIsolate {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::RestartableChildDefinition<ChildIsolate>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
@@ -231,6 +233,7 @@ impl Isolate for ChildIsolate {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::ChildDefinition<LeafIsolate>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
@@ -256,6 +259,7 @@ impl Isolate for LeafIsolate {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
     type Shard = TestShard;
 
@@ -949,6 +953,7 @@ impl Isolate for OverlapAcceptor {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<OverlapAcceptorMsg>;
     type Shard = TestShard;
 
@@ -1030,6 +1035,7 @@ impl Isolate for Reader {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ReaderMsg>;
     type Shard = TestShard;
 
@@ -1156,6 +1162,7 @@ impl Isolate for CooperativeFairness {
     type Reply = ();
     type Send = Outbound<FairMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -1184,6 +1191,7 @@ impl Isolate for Sleeper {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
     type Shard = TestShard;
 
@@ -1366,6 +1374,7 @@ where
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = S;
 
@@ -1388,6 +1397,7 @@ where
     type Reply = ();
     type Send = Outbound<RemoteEvent>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = S;
 
@@ -1421,6 +1431,7 @@ where
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = S;
 
@@ -1447,6 +1458,7 @@ where
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::RestartableChildDefinition<ShardLocalChild<S>>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = S;
 
@@ -1476,6 +1488,7 @@ where
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = S;
 
@@ -1499,6 +1512,7 @@ where
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
     type Shard = S;
 
@@ -2686,6 +2700,7 @@ impl Isolate for ManualCallTarget {
     type Reply = ManualCallReply;
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -2723,6 +2738,7 @@ impl Isolate for ManualCallCaller {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ManualCallCallerMsg>;
     type Shard = TestShard;
 
@@ -2829,6 +2845,7 @@ impl Isolate for RetryWorker {
     type Reply = ();
     type Send = Outbound<RetryMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<RetryMsg>;
     type Shard = TestShard;
 

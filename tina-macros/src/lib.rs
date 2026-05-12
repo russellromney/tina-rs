@@ -18,6 +18,7 @@ struct IsolateArgs {
     reply: Option<Type>,
     send: Option<Type>,
     spawn: Option<Type>,
+    spawn_observed: Option<Type>,
     call: Option<Type>,
     shard: Option<Type>,
 }
@@ -29,6 +30,7 @@ impl Parse for IsolateArgs {
             reply: None,
             send: None,
             spawn: None,
+            spawn_observed: None,
             call: None,
             shard: None,
         };
@@ -50,12 +52,13 @@ impl Parse for IsolateArgs {
                 "reply" => set_once(&mut args.reply, value, "reply")?,
                 "send" => set_once(&mut args.send, value, "send")?,
                 "spawn" => set_once(&mut args.spawn, value, "spawn")?,
+                "spawn_observed" => set_once(&mut args.spawn_observed, value, "spawn_observed")?,
                 "call" => set_once(&mut args.call, value, "call")?,
                 "shard" => set_once(&mut args.shard, value, "shard")?,
                 _ => {
                     return Err(Error::new_spanned(
                         key,
-                        "expected one of: message, reply, send, spawn, call, shard",
+                        "expected one of: message, reply, send, spawn, spawn_observed, call, shard",
                     ));
                 }
             }
@@ -140,6 +143,9 @@ fn build_isolate(
     let spawn = args
         .spawn
         .unwrap_or_else(|| syn::parse_quote!(::std::convert::Infallible));
+    let spawn_observed = args
+        .spawn_observed
+        .unwrap_or_else(|| syn::parse_quote!(::std::convert::Infallible));
     let call = match args.call {
         Some(call) => call,
         None => match call_default {
@@ -182,6 +188,7 @@ fn build_isolate(
             type Reply = #reply;
             type Send = #send;
             type Spawn = #spawn;
+            type SpawnObserved = #spawn_observed;
             type Call = #call;
             type Shard = #shard;
 

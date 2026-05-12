@@ -41,9 +41,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::{
-    Address, AddressGeneration, CallRouting, ChildRelation, Context, DeferredReplyHandle,
+    Address, AddressGeneration, CallRouting, ChildRef, ChildRelation, Context, DeferredReplyHandle,
     DeferredSlotRegistry, DeferredSlotState, Effect, Isolate, IsolateId, Mailbox, MessageCaller,
-    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, StopResult, TrySendError,
+    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, SpawnObservedError, StopResult,
+    TrySendError,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -807,6 +808,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
@@ -835,6 +837,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -883,6 +886,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
@@ -1438,6 +1442,70 @@ where
                 );
                 if let Some(message) = bootstrap_message {
                     self.enqueue_bootstrap_message(child, message, spawned.into());
+                }
+                false
+            }
+            ErasedEffect::SpawnObserved(spawn) => {
+                let mut outcome = spawn.spawn_observed(self, isolate_id);
+                let continuation = outcome.continuation.take();
+                let continuation_cause = if let Some(mut spawn_outcome) = outcome.spawn.take() {
+                    let child_isolate = spawn_outcome.child.isolate;
+                    let child = spawn_outcome.child;
+                    let bootstrap_message = spawn_outcome.bootstrap_message.take();
+                    self.record_child(isolate_id, spawn_outcome);
+                    let spawned = self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::Spawned { child_isolate },
+                    );
+                    if let Some(message) = bootstrap_message {
+                        self.enqueue_bootstrap_message(child, message, spawned.into());
+                    }
+                    spawned.into()
+                } else {
+                    cause
+                };
+                if let Some(message) = continuation {
+                    let send = ErasedSend {
+                        target_shard: self.shard.id(),
+                        target_isolate: isolate_id,
+                        target_generation: self.entries[index].generation,
+                        message,
+                    };
+                    let attempted = self.push_event(
+                        isolate_id,
+                        Some(continuation_cause),
+                        RuntimeEventKind::SendDispatchAttempted {
+                            target_shard: send.target_shard,
+                            target_isolate: send.target_isolate,
+                            target_generation: send.target_generation,
+                        },
+                    );
+                    match self.dispatch_local_send(send) {
+                        Ok(()) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendAccepted {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                },
+                            );
+                        }
+                        Err(reason) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendRejected {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                    reason,
+                                },
+                            );
+                        }
+                    }
                 }
                 false
             }
@@ -3314,6 +3382,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -3352,6 +3421,7 @@ where
         I::Message: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
     {
@@ -3379,6 +3449,7 @@ where
         I::Message: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
     {
@@ -3419,6 +3490,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -3582,6 +3654,15 @@ where
     bootstrap_message: Option<Box<dyn Any>>,
 }
 
+struct SpawnObservedOutcome<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    spawn: Option<SpawnOutcome<S, F>>,
+    continuation: Option<ErasedMessage>,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 struct ChildRecord<S, F>
 where
@@ -3643,6 +3724,14 @@ where
 {
     fn spawn(self: Box<Self>, runtime: &mut Runtime<S, F>, parent: IsolateId)
     -> SpawnOutcome<S, F>;
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S, F>, SpawnObservedError> {
+        Ok(self.spawn(runtime, parent))
+    }
 }
 
 trait ErasedRestartRecipe<S, F>
@@ -3661,6 +3750,26 @@ where
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>>;
 }
 
+trait ErasedSpawnObserved<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S, F>;
+}
+
+trait IntoErasedSpawnObserved<S, F, ParentMessage>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S, F>>;
+}
+
 struct HandlerAdapter<I, Outbound>
 where
     I: Isolate,
@@ -3675,6 +3784,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -3718,6 +3828,7 @@ where
     I::Message: 'static,
     I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: Send + 'static,
     S: Shard,
@@ -3753,6 +3864,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -3771,6 +3883,9 @@ where
             })
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::SpawnObserved(spawn) => {
+            ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
@@ -3794,6 +3909,7 @@ where
     I::Message: 'static,
     I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: Send + 'static,
     S: Shard,
@@ -3812,6 +3928,9 @@ where
             })
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::SpawnObserved(spawn) => {
+            ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
@@ -3854,6 +3973,7 @@ where
     Reply(ErasedMessage),
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S, F>>),
+    SpawnObserved(Box<dyn ErasedSpawnObserved<S, F>>),
     Stop,
     StopWith(StopResult),
     RestartChildren,
@@ -3876,6 +3996,7 @@ where
             Self::Reply(_) => EffectKind::Reply,
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
+            Self::SpawnObserved(_) => EffectKind::SpawnObserved,
             Self::Stop => EffectKind::Stop,
             Self::StopWith(_) => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
@@ -4104,6 +4225,80 @@ where
     }
 }
 
+impl<S, F, ParentMessage> IntoErasedSpawnObserved<S, F, ParentMessage> for std::convert::Infallible
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S, F>> {
+        match self {}
+    }
+}
+
+struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
+    inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S, F> ErasedSpawnObserved<S, F>
+    for SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S, F> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S, F> {
+        let (spawn, continuation) = self.inner.into_parts();
+        match spawn
+            .into_erased_spawn()
+            .try_spawn_observed(runtime, parent)
+        {
+            Ok(outcome) => {
+                let child_address = Address::<ChildMessage, ChildReply>::new_with_generation(
+                    outcome.child.shard,
+                    outcome.child.isolate,
+                    outcome.child.generation,
+                );
+                let child_ref = ChildRef::new(child_address);
+                let message = continuation(Ok(child_ref));
+                SpawnObservedOutcome {
+                    spawn: Some(outcome),
+                    continuation: Some(ErasedMessage::Local(Box::new(message))),
+                }
+            }
+            Err(error) => {
+                let message = continuation(Err(error));
+                SpawnObservedOutcome {
+                    spawn: None,
+                    continuation: Some(ErasedMessage::Local(Box::new(message))),
+                }
+            }
+        }
+    }
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S, F>
+    IntoErasedSpawnObserved<S, F, ParentMessage>
+    for tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S, F> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S, F>> {
+        Box::new(SpawnObservedAdapter { inner: self })
+    }
+}
+
 struct SpawnAdapter<I, Outbound>
 where
     I: Isolate,
@@ -4120,6 +4315,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -4137,6 +4333,17 @@ where
             self.bootstrap_message,
         )
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S, F>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(runtime, parent))
+    }
 }
 
 impl<I, S, F, OutboundMsg> IntoErasedSpawn<S, F> for tina::ChildDefinition<I>
@@ -4145,6 +4352,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     OutboundMsg: 'static,
     S: Shard,
@@ -4177,6 +4385,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -4200,6 +4409,17 @@ where
         outcome.restart_recipe = Some(adapter);
         outcome
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S, F>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(runtime, parent))
+    }
 }
 
 impl<I, S, F, Outbound> ErasedRestartRecipe<S, F> for RestartableSpawnAdapter<I, Outbound>
@@ -4208,6 +4428,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -4231,6 +4452,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     OutboundMsg: 'static,
     S: Shard,

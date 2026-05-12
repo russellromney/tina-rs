@@ -2,8 +2,10 @@
 //! `Worker` as a `RestartableChildDefinition`; the runtime
 //! supervisor restarts it on panic, charged against a typed
 //! `RestartBudget`. Each restart's correctness comes from
-//! `runtime.observe_child_restarted(parent).wait(...)` — no manual
-//! generation counter, no trace polling.
+//! `spawn_observed(...).reply(ParentMsg::ChildStarted)` for the initial
+//! typed child reference plus
+//! `runtime.observe_child_restarted(parent).wait(...)` for restart
+//! generations — no manual generation counter, no trace polling.
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -18,10 +20,7 @@ use crate::{Job, Report, job_script};
 
 type WorkerAddr = Address<WorkerMsg>;
 
-/// One-shot publish slot for the worker's address. Each restarted
-/// worker overwrites it on `Boot`. Until Tina ships an
-/// observe-child-spawned waiter, this is the documented pattern for
-/// "host needs to know the fresh worker's address" (FINDINGS.md).
+/// Host-visible slot for the worker address used by this comparison harness.
 #[derive(Default)]
 struct WorkerSlot {
     inner: Mutex<Option<WorkerAddr>>,
@@ -42,22 +41,15 @@ impl WorkerSlot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerMsg {
-    Boot,
     Process(Job),
 }
 
-struct Worker {
-    slot: Arc<WorkerSlot>,
-}
+struct Worker;
 
 #[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            WorkerMsg::Boot => {
-                self.slot.set(ctx.me());
-                noop()
-            }
             WorkerMsg::Process(Job::Work(_)) => noop(),
             WorkerMsg::Process(Job::Poison) => panic!("supervised worker hit a poison job"),
         }
@@ -67,6 +59,7 @@ impl Worker {
 #[derive(Debug, Clone, Copy)]
 enum ParentMsg {
     Spawn,
+    ChildStarted(Result<ChildRef<WorkerMsg>, SpawnObservedError>),
 }
 
 struct Parent {
@@ -77,22 +70,24 @@ struct Parent {
 #[tina_runtime::isolate(
     message = ParentMsg,
     spawn = RestartableChildDefinition<Worker>,
+    spawn_observed = tina::SpawnObserved<RestartableChildDefinition<Worker>, ParentMsg, WorkerMsg>,
 )]
 impl Parent {
     fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             ParentMsg::Spawn => {
-                let slot = Arc::clone(&self.slot);
                 let capacity = self.worker_capacity;
-                spawn(
-                    RestartableChildDefinition::new(
-                        move || Worker {
-                            slot: Arc::clone(&slot),
-                        },
-                        capacity,
-                    )
-                    .with_initial_message(|| WorkerMsg::Boot),
-                )
+                spawn_observed(RestartableChildDefinition::new(move || Worker, capacity))
+                    .reply(ParentMsg::ChildStarted)
+            }
+            ParentMsg::ChildStarted(Ok(child)) => {
+                self.slot.set(child.address);
+                noop()
+            }
+            ParentMsg::ChildStarted(Err(_)) => {
+                // The parent is still alive if this message was delivered;
+                // keep the example honest and stop instead of hiding failure.
+                stop()
             }
         }
     }
@@ -131,8 +126,8 @@ pub fn run() -> anyhow::Result<Report> {
         .try_send(parent, ParentMsg::Spawn)
         .map_err(|e| anyhow::anyhow!("send spawn: {e:?}"))?;
 
-    // Wait for the worker's first `Boot` to publish its address.
-    wait_until(Duration::from_secs(2), "first worker boot", || {
+    // Wait for the parent's spawn_observed continuation to publish its child ref.
+    wait_until(Duration::from_secs(2), "first worker child ref", || {
         slot.current().is_some()
     })?;
 
@@ -150,14 +145,15 @@ pub fn run() -> anyhow::Result<Report> {
                         WorkerMsg::Process(*job)
                     })
                     .map_err(|e| anyhow::anyhow!("send poison job: {e:?}"))?;
-                restart_waiter
+                let restarted = restart_waiter
                     .wait(Duration::from_secs(2))
                     .map_err(|e| anyhow::anyhow!("supervisor restart: {e:?}"))?;
                 restarts += 1;
-                // Wait for the fresh incarnation to publish its address.
-                wait_until(Duration::from_secs(2), "next worker boot", || {
-                    slot.current().map(|a| a != addr).unwrap_or(false)
-                })?;
+                slot.set(Address::new_with_generation(
+                    parent.shard(),
+                    restarted.new_isolate,
+                    restarted.new_generation,
+                ));
             }
             Job::Work(_) => {
                 let deadline = Instant::now() + Duration::from_secs(2);

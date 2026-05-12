@@ -51,9 +51,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tina::{
-    Address, AddressGeneration, CallRouting, ChildDefinition, ChildRelation, DeferredReplyHandle,
-    DeferredSlotRegistry, Isolate, IsolateId, MessageCaller, Outbound as TinaOutbound,
-    RestartableChildDefinition, Shard, ShardId, TrySendError,
+    Address, AddressGeneration, CallRouting, ChildDefinition, ChildRef, ChildRelation,
+    DeferredReplyHandle, DeferredSlotRegistry, Isolate, IsolateId, MessageCaller,
+    Outbound as TinaOutbound, RestartableChildDefinition, Shard, ShardId, SpawnObservedError,
+    TrySendError,
 };
 #[cfg(test)]
 use tina::{Context, Effect};
@@ -271,6 +272,7 @@ where
             > + 'static,
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -304,6 +306,7 @@ where
             > + 'static,
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -771,6 +774,70 @@ where
                 }
                 false
             }
+            ErasedEffect::SpawnObserved(spawn) => {
+                let mut outcome = spawn.spawn_observed(self, isolate_id);
+                let continuation = outcome.continuation.take();
+                let continuation_cause = if let Some(mut spawn_outcome) = outcome.spawn.take() {
+                    let child_isolate = spawn_outcome.child.isolate;
+                    let child = spawn_outcome.child;
+                    let bootstrap_message = spawn_outcome.bootstrap_message.take();
+                    self.record_child(isolate_id, spawn_outcome);
+                    let spawned = self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::Spawned { child_isolate },
+                    );
+                    if let Some(message) = bootstrap_message {
+                        self.enqueue_bootstrap_message(child, message, spawned.into());
+                    }
+                    spawned.into()
+                } else {
+                    cause
+                };
+                if let Some(message) = continuation {
+                    let send = ErasedSend {
+                        target_shard: self.shard.id(),
+                        target_isolate: isolate_id,
+                        target_generation: self.entries[index].generation,
+                        message,
+                    };
+                    let attempted = self.push_event(
+                        isolate_id,
+                        Some(continuation_cause),
+                        RuntimeEventKind::SendDispatchAttempted {
+                            target_shard: send.target_shard,
+                            target_isolate: send.target_isolate,
+                            target_generation: send.target_generation,
+                        },
+                    );
+                    match self.dispatch_local_send(send) {
+                        Ok(()) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendAccepted {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                },
+                            );
+                        }
+                        Err(reason) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendRejected {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                    reason,
+                                },
+                            );
+                        }
+                    }
+                }
+                false
+            }
             ErasedEffect::Call(call) => {
                 let requester = RegisteredAddress {
                     shard: self.shard.id(),
@@ -1002,6 +1069,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -1044,6 +1112,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -4981,6 +5050,72 @@ where
     }
 }
 
+impl<S, ParentMessage> IntoErasedSpawnObserved<S, ParentMessage> for Infallible
+where
+    S: Shard,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S>> {
+        match self {}
+    }
+}
+
+struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
+    inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S> ErasedSpawnObserved<S>
+    for SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S> {
+        let (spawn, continuation) = self.inner.into_parts();
+        match spawn.into_erased_spawn().try_spawn_observed(sim, parent) {
+            Ok(outcome) => {
+                let child_address = Address::<ChildMessage, ChildReply>::new_with_generation(
+                    outcome.child.shard,
+                    outcome.child.isolate,
+                    outcome.child.generation,
+                );
+                let message = continuation(Ok(ChildRef::new(child_address)));
+                SpawnObservedOutcome {
+                    spawn: Some(outcome),
+                    continuation: Some(Box::new(message)),
+                }
+            }
+            Err(error) => {
+                let message = continuation(Err(error));
+                SpawnObservedOutcome {
+                    spawn: None,
+                    continuation: Some(Box::new(message)),
+                }
+            }
+        }
+    }
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S> IntoErasedSpawnObserved<S, ParentMessage>
+    for tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S>> {
+        Box::new(SpawnObservedAdapter { inner: self })
+    }
+}
+
 struct SpawnAdapter<I, Outbound>
 where
     I: Isolate,
@@ -4996,6 +5131,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5009,6 +5145,17 @@ where
             self.bootstrap_message,
         )
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(sim, parent))
+    }
 }
 
 impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for ChildDefinition<I>
@@ -5016,6 +5163,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5047,6 +5195,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5066,6 +5215,17 @@ where
         outcome.restart_recipe = Some(adapter);
         outcome
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(sim, parent))
+    }
 }
 
 impl<I, S, Msg, Outbound> ErasedRestartRecipe<S> for RestartableSpawnAdapter<I, Outbound>
@@ -5073,6 +5233,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5095,6 +5256,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5114,8 +5276,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::convert::Infallible;
-    use tina::{Outbound, batch, noop, send, spawn, stop};
+    use std::rc::Rc;
+    use tina::{
+        ChildDefinition, ChildRef, Outbound, SpawnObservedError, batch, noop, send, spawn,
+        spawn_observed, stop,
+    };
 
     #[test]
     fn round_message_scratch_reserve_covers_more_than_initial_capacity() {
@@ -5125,6 +5292,77 @@ mod tests {
         assert!(
             scratch.capacity() >= INITIAL_ENTRY_CAPACITY + 4,
             "scratch reserve must cover the entry count before push-time growth"
+        );
+    }
+
+    #[test]
+    fn simulator_spawn_observed_delivers_child_ref_and_parent_uses_address() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let child_ref = Rc::new(RefCell::new(None));
+        let spawn_error = Rc::new(RefCell::new(None));
+        let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
+        let parent = sim.register_with_mailbox_capacity::<
+            SimObservedParent,
+            SimObservedParentMsg,
+            SimObservedChildMsg,
+        >(
+            SimObservedParent {
+                seen: Rc::clone(&seen),
+                child_ref: Rc::clone(&child_ref),
+                spawn_error,
+            },
+            8,
+        );
+
+        assert!(sim.try_send(parent, SimObservedParentMsg::Start).is_ok());
+        assert_eq!(sim.step(), 1);
+        assert!(child_ref.borrow().is_none());
+
+        assert_eq!(sim.step(), 1);
+        let child = (*child_ref.borrow()).expect("child ref delivered to parent");
+        assert_eq!(child.address.shard(), ShardId::new(9));
+        assert_eq!(child.generation, child.address.generation());
+
+        assert_eq!(sim.step(), 1);
+        assert_eq!(&*seen.borrow(), &[7]);
+    }
+
+    #[test]
+    fn simulator_spawn_observed_reports_zero_capacity_without_spawning_child() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let child_ref = Rc::new(RefCell::new(None));
+        let spawn_error = Rc::new(RefCell::new(None));
+        let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
+        let parent = sim.register_with_mailbox_capacity::<
+            SimObservedParent,
+            SimObservedParentMsg,
+            SimObservedChildMsg,
+        >(
+            SimObservedParent {
+                seen,
+                child_ref: Rc::clone(&child_ref),
+                spawn_error: Rc::clone(&spawn_error),
+            },
+            8,
+        );
+
+        assert!(
+            sim.try_send(parent, SimObservedParentMsg::StartInvalid)
+                .is_ok()
+        );
+        assert_eq!(sim.step(), 1);
+        assert!(child_ref.borrow().is_none());
+        assert!(spawn_error.borrow().is_none());
+        assert!(
+            !sim.trace()
+                .iter()
+                .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        );
+
+        assert_eq!(sim.step(), 1);
+        assert_eq!(
+            *spawn_error.borrow(),
+            Some(SpawnObservedError::ZeroMailboxCapacity)
         );
     }
 
@@ -5196,6 +5434,95 @@ mod tests {
         marker: PhantomData<S>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimObservedChildMsg {
+        Record(u8),
+    }
+
+    #[derive(Debug)]
+    enum SimObservedParentMsg {
+        Start,
+        StartInvalid,
+        ChildStarted(Result<ChildRef<SimObservedChildMsg>, SpawnObservedError>),
+    }
+
+    #[derive(Debug)]
+    struct SimObservedChild {
+        seen: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl Isolate for SimObservedChild {
+        type Message = SimObservedChildMsg;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type SpawnObserved = Infallible;
+        type Call = RuntimeCall<Self::Message>;
+        type Shard = NumberedShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SimObservedChildMsg::Record(value) => {
+                    self.seen.borrow_mut().push(value);
+                    noop()
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SimObservedParent {
+        seen: Rc<RefCell<Vec<u8>>>,
+        child_ref: Rc<RefCell<Option<ChildRef<SimObservedChildMsg>>>>,
+        spawn_error: Rc<RefCell<Option<SpawnObservedError>>>,
+    }
+
+    impl Isolate for SimObservedParent {
+        type Message = SimObservedParentMsg;
+        type Reply = ();
+        type Send = Outbound<SimObservedChildMsg>;
+        type Spawn = ChildDefinition<SimObservedChild>;
+        type SpawnObserved =
+            tina::SpawnObserved<Self::Spawn, Self::Message, SimObservedChildMsg, ()>;
+        type Call = RuntimeCall<Self::Message>;
+        type Shard = NumberedShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SimObservedParentMsg::Start => spawn_observed(ChildDefinition::new(
+                    SimObservedChild {
+                        seen: Rc::clone(&self.seen),
+                    },
+                    4,
+                ))
+                .reply(SimObservedParentMsg::ChildStarted),
+                SimObservedParentMsg::StartInvalid => spawn_observed(ChildDefinition::new(
+                    SimObservedChild {
+                        seen: Rc::clone(&self.seen),
+                    },
+                    0,
+                ))
+                .reply(SimObservedParentMsg::ChildStarted),
+                SimObservedParentMsg::ChildStarted(Ok(child)) => {
+                    *self.child_ref.borrow_mut() = Some(child);
+                    send(child.address, SimObservedChildMsg::Record(7))
+                }
+                SimObservedParentMsg::ChildStarted(Err(error)) => {
+                    *self.spawn_error.borrow_mut() = Some(error);
+                    noop()
+                }
+            }
+        }
+    }
+
     impl<S> Isolate for SimSleeper<S>
     where
         S: Shard + 'static,
@@ -5204,6 +5531,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimTimerMsg>;
         type Shard = S;
 
@@ -5233,6 +5561,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimStepEvent>;
         type Shard = S;
 
@@ -5255,6 +5584,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<SimRemoteEvent>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimRemoteEvent>;
         type Shard = S;
 
@@ -5288,6 +5618,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimRemoteEvent>;
         type Shard = S;
 
@@ -5314,6 +5645,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = tina::RestartableChildDefinition<SimShardLocalChild<S>>;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
         type Shard = S;
 
@@ -5347,6 +5679,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
         type Shard = S;
 

@@ -812,6 +812,7 @@ where
     type Reply = ();
     type Send = Outbound<CloseReason>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = S;
 
@@ -903,6 +904,7 @@ mod tests {
             Effect::Reply(_) => shape.reply += 1,
             Effect::Send(_) => shape.send += 1,
             Effect::Spawn(_) => shape.spawn += 1,
+            Effect::SpawnObserved(_) => shape.spawn_observed += 1,
             Effect::Stop => shape.stop += 1,
             Effect::StopWith(_) => shape.stop_with += 1,
             Effect::RestartChildren => shape.restart += 1,
@@ -922,6 +924,7 @@ mod tests {
         reply: usize,
         send: usize,
         spawn: usize,
+        spawn_observed: usize,
         stop: usize,
         stop_with: usize,
         restart: usize,

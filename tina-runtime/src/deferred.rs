@@ -869,6 +869,7 @@ mod pending_replies_tests {
         type Reply = u32;
         type Send = tina::Outbound<std::convert::Infallible>;
         type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = std::convert::Infallible;
         type Shard = tina::SingleShard;
 
