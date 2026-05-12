@@ -561,8 +561,9 @@ pub enum RuntimeEventKind {
 
     /// The runtime detected that a called handler returned without
     /// replying and without capturing the caller as a deferred reply
-    /// slot. The caller was settled immediately with `Closed` instead
-    /// of waiting for the timeout.
+    /// slot. This is a diagnostic warning only: the caller-side wait
+    /// remains pending and will still settle by its normal timeout or
+    /// lifecycle path.
     CallReplyAbandoned {
         /// The runtime-assigned identifier for the abandoned call.
         call_id: CallId,

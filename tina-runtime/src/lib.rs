@@ -1158,8 +1158,10 @@ where
 
             // If the handler had a caller but did not capture it and
             // does not reply in this turn, the caller is abandoned.
-            // Remember the call id so we can close it after the effect
-            // runs (the effect may batch a nested reply).
+            // Remember the call id so we can warn after the effect runs
+            // if the call is still pending (the effect may batch a
+            // nested reply). The warning does not settle the call; the
+            // caller's normal timeout/lifecycle path remains the truth.
             //
             // Skip the guard when the effect is a runtime call or batch:
             // the handler may be delegating to a continuation that will

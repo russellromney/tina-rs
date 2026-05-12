@@ -79,25 +79,34 @@ A service can reply after more than one handler turn.
 Common shape:
 
 ```rust
+use tina::{RequestContext, reply_to_request};
+
 #[derive(Debug, Clone)]
 enum ServiceMsg {
     Store(StoreRequest),
-    Journaled(Result<(), CallError>, StoreRequest),
+    Journaled(RequestContext<StoreReply>, Result<(), CallError>, StoreRequest),
 }
 
 #[tina_runtime::isolate(message = ServiceMsg, reply = StoreReply, shard = AppShard)]
 impl StoreService {
-    fn handle(&mut self, msg: ServiceMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ServiceMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ServiceMsg::Store(req) => journal_append(self.journal.clone(), req.bytes.clone())
-                .reply(|result| ServiceMsg::Journaled(result, req)),
-
-            ServiceMsg::Journaled(Ok(()), req) => {
-                self.apply(req);
-                reply(StoreReply::Stored)
+            ServiceMsg::Store(req) => {
+                let request = ctx.take_request_context().expect("Store is call-shaped");
+                journal_append(self.journal.clone(), req.bytes.clone())
+                    .reply_with_request(request, |request, result| {
+                        ServiceMsg::Journaled(request, result, req)
+                    })
             }
 
-            ServiceMsg::Journaled(Err(_), _req) => reply(StoreReply::Failed),
+            ServiceMsg::Journaled(request, Ok(()), req) => {
+                self.apply(req);
+                reply_to_request(request, StoreReply::Stored)
+            }
+
+            ServiceMsg::Journaled(request, Err(_), _req) => {
+                reply_to_request(request, StoreReply::Failed)
+            }
         }
     }
 }
@@ -110,7 +119,9 @@ call(store, ServiceMsg::Store(req), Duration::from_millis(50))
     .reply(ClientMsg::Stored)
 ```
 
-The service did a runtime call before replying. Tina kept the reply context.
+The service did a runtime call before replying. Tina did not keep hidden
+caller context. The handler captured a `RequestContext`, moved it through
+the continuation message, and consumed it at the final reply.
 
 This is the service pattern for HTTP clients, RPC clients, database clients, and
 other "takes several I/O turns before answering" code.
