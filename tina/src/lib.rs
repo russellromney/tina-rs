@@ -464,6 +464,19 @@ where
     Effect::ReplyTo(slot, value)
 }
 
+/// Replies to the caller through a [`RequestContext`].
+///
+/// This is the [`RequestContext`] spelling of [`reply_to`]. It consumes
+/// the context and produces a [`Effect::ReplyTo`] just like the
+/// underlying [`DeferredReply`] form.
+pub fn reply_to_request<I>(req: RequestContext<I::Reply>, value: I::Reply) -> Effect<I>
+where
+    I: Isolate,
+{
+    let slot = req.into_deferred();
+    Effect::ReplyTo(slot, value)
+}
+
 /// Documented sugar for ordered runtime-call sequences.
 ///
 /// `sequence(...)` is equivalent to [`batch`]: the runtime executes the
@@ -905,6 +918,29 @@ where
         })
     }
 
+    /// Captures the current caller as a [`RequestContext<R>`].
+    ///
+    /// This is the blessed app-facing name for the same primitive as
+    /// [`take_reply_slot`](Self::take_reply_slot). The name signals
+    /// intent: "I will reply later through a multi-turn workflow."
+    ///
+    /// The return type is a [`RequestContext`] so callers who see the
+    /// type know the handler means to carry the promise across turns.
+    /// Underneath it is the same move-only deferred reply slot.
+    ///
+    /// ```
+    /// # use tina::{Context, IsolateId, RequestContext, SingleShard};
+    /// let mut shard = SingleShard;
+    /// let mut ctx = Context::<_, u32>::new_typed(&mut shard, IsolateId::new(1));
+    /// let _req: Result<RequestContext<u32>, _> = ctx.take_request_context();
+    /// ```
+    pub fn take_request_context(&mut self) -> Result<RequestContext<R>, TakeReplySlotError>
+    where
+        R: 'static,
+    {
+        self.take_reply_slot().map(RequestContext)
+    }
+
     /// Returns true while the current message still has a caller available
     /// to capture (i.e. a deferred reply slot can still be taken this turn).
     pub fn has_caller(&self) -> bool {
@@ -1340,6 +1376,48 @@ impl<R> DeferredReply<R> {
     /// already replied to.
     pub fn is_open(&self) -> bool {
         self.state() == DeferredSlotState::Open
+    }
+}
+
+/// A caller promise explicitly carried across handler turns.
+///
+/// `RequestContext<R>` is the blessed vocabulary for multi-turn
+/// request/reply workflows. It is a thin newtype over
+/// [`DeferredReply<R>`] so the type system teaches the pattern: a
+/// handler that must reply later takes `RequestContext`, stores it in
+/// isolate state, and eventually passes it to [`reply_to_request`] or
+/// carries it into a continuation message.
+///
+/// Like [`DeferredReply`], it is move-only (`!Clone`). It does not
+/// auto-reply, auto-retry, or hide effects. It is typed so the reply
+/// payload must match the original caller's expected type.
+///
+/// Capture via [`Context::take_request_context`] (the app-facing name)
+/// or keep using [`Context::take_reply_slot`] for the same underlying
+/// slot. Both return the same primitive; the name signals intent.
+///
+/// Cross-shard request context is unsupported in the first form; see
+/// [`TakeReplySlotError::CrossShardUnsupported`].
+#[derive(Debug)]
+pub struct RequestContext<R>(DeferredReply<R>);
+
+impl<R> RequestContext<R> {
+    /// Returns the runtime-assigned slot identifier.
+    pub fn slot_id(&self) -> u64 {
+        self.0.slot_id()
+    }
+
+    /// Returns true while a reply through this context can still reach
+    /// the original caller.
+    pub fn is_open(&self) -> bool {
+        self.0.is_open()
+    }
+
+    /// Consumes the context and returns the underlying deferred reply
+    /// slot. This is an escape hatch for code that already speaks
+    /// [`DeferredReply`] and does not want to change.
+    pub fn into_deferred(self) -> DeferredReply<R> {
+        self.0
     }
 }
 
@@ -2025,7 +2103,7 @@ pub mod runtime_internal {
 
     use crate::{
         CallHandle, CallHandleInner, CallHandleShared, DeferredReply, DeferredReplyHandle,
-        DeferredSlotShared,
+        DeferredSlotShared, RequestContext,
     };
 
     /// Build a handle from a runtime-allocated shared slot.
@@ -2058,6 +2136,16 @@ pub mod runtime_internal {
     /// observer that survives `reply_to`.
     pub fn deferred_handle_ref<R>(slot: &DeferredReply<R>) -> &DeferredReplyHandle {
         &slot.handle
+    }
+
+    /// Move the deferred reply out of a [`RequestContext`].
+    pub fn request_context_into_deferred<R>(req: RequestContext<R>) -> DeferredReply<R> {
+        req.0
+    }
+
+    /// Wrap a deferred reply into a [`RequestContext`].
+    pub fn request_context_from_deferred<R>(slot: DeferredReply<R>) -> RequestContext<R> {
+        RequestContext(slot)
     }
 
     /// Build a typed [`CallHandle`] from a runtime-allocated shared cell.
@@ -2095,9 +2183,9 @@ pub mod prelude {
     pub use crate::{
         Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition, Context,
         Deadline, DeferredReply, Effect, Isolate, IsolateId, Outbound, PendingCallSet,
-        PendingCallSetInsertError, RestartableChildDefinition, Shard, ShardId, SingleShard, batch,
-        isolate, isolate_types, noop, reply, reply_to, restart_children, send, sequence, spawn,
-        stop, stop_with,
+        PendingCallSetInsertError, RequestContext, RestartableChildDefinition, Shard, ShardId,
+        SingleShard, batch, isolate, isolate_types, noop, reply, reply_to, reply_to_request,
+        restart_children, send, sequence, spawn, stop, stop_with,
     };
 }
 

@@ -229,18 +229,26 @@ enum WorkReq {
 struct WorkReply(&'static str);
 
 #[derive(Debug)]
-struct Worker;
+struct Worker {
+    held: Option<DeferredReply<WorkReply>>,
+}
 
 #[tina_runtime::isolate(message = WorkReq, reply = WorkReply, shard = ComparisonShard)]
 impl Worker {
     fn handle(
         &mut self,
         msg: WorkReq,
-        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
+        ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             WorkReq::Reply => reply(WorkReply("pong")),
-            WorkReq::NoReply => noop(),
+            WorkReq::NoReply => {
+                // Hold the reply slot so the call stays pending until
+                // timeout. The abandoned-caller guard closes uncaptured
+                // callers immediately.
+                self.held = Some(ctx.take_reply_slot().unwrap());
+                noop()
+            }
             WorkReq::Stop => stop(),
         }
     }
@@ -670,7 +678,7 @@ fn tina_stop_abandons_buffered_work() -> Vec<&'static str> {
 fn tina_call(target_capacity: usize, stop_first: bool, request: WorkReq) -> Vec<&'static str> {
     let events = events();
     let mut sim = simulator();
-    let worker = sim.register_with_mailbox_capacity(Worker, target_capacity);
+    let worker = sim.register_with_mailbox_capacity(Worker { held: None }, target_capacity);
     let client = sim.register_with_mailbox_capacity(
         Client {
             events: Arc::clone(&events),
@@ -693,7 +701,7 @@ fn tina_call(target_capacity: usize, stop_first: bool, request: WorkReq) -> Vec<
 fn tina_requester_stops() -> (Vec<&'static str>, bool) {
     let events = events();
     let mut sim = simulator();
-    let worker = sim.register_with_mailbox_capacity(Worker, 8);
+    let worker = sim.register_with_mailbox_capacity(Worker { held: None }, 8);
     let client = sim.register_with_mailbox_capacity(
         Client {
             events: Arc::clone(&events),
@@ -722,7 +730,7 @@ fn tina_requester_stops() -> (Vec<&'static str>, bool) {
 fn tina_late_reply_after_timeout() -> Vec<&'static str> {
     let events = events();
     let mut sim = simulator();
-    let worker = sim.register_with_mailbox_capacity(Worker, 8);
+    let worker = sim.register_with_mailbox_capacity(Worker { held: None }, 8);
     let client = sim.register_with_mailbox_capacity(
         Client {
             events: Arc::clone(&events),
@@ -756,7 +764,7 @@ fn tina_late_reply_after_timeout() -> Vec<&'static str> {
 fn tina_requester_mailbox_full_at_completion() -> (Vec<&'static str>, bool) {
     let events = events();
     let mut sim = simulator();
-    let worker = sim.register_with_mailbox_capacity(Worker, 8);
+    let worker = sim.register_with_mailbox_capacity(Worker { held: None }, 8);
     let client = sim.register_with_mailbox_capacity(
         Client {
             events: Arc::clone(&events),

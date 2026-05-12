@@ -559,6 +559,16 @@ pub enum RuntimeEventKind {
         reason: CallReplyRejectedReason,
     },
 
+    /// The runtime detected that a called handler returned without
+    /// replying and without capturing the caller as a deferred reply
+    /// slot. This is a diagnostic warning only: the caller-side wait
+    /// remains pending and will still settle by its normal timeout or
+    /// lifecycle path.
+    CallReplyAbandoned {
+        /// The runtime-assigned identifier for the abandoned call.
+        call_id: CallId,
+    },
+
     /// The runtime closed the caller-side wait of an in-flight isolate
     /// call because of an explicit cancel, owner stop, or other
     /// lifecycle event named by `cause`.
@@ -1333,6 +1343,10 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u8(33);
             hasher.write_u64(call_id.get());
             hasher.write_u8(cancel_cause_tag(cause));
+        }
+        RuntimeEventKind::CallReplyAbandoned { call_id } => {
+            hasher.write_u8(34);
+            hasher.write_u64(call_id.get());
         }
     }
 }

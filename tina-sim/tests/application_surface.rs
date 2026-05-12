@@ -70,6 +70,7 @@ struct WorkerReply(Vec<u8>);
 struct Worker {
     observations: Observations,
     addresses: WorkerAddresses,
+    held: Option<DeferredReply<WorkerReply>>,
 }
 
 #[tina_runtime::isolate(
@@ -94,7 +95,14 @@ impl Worker {
                 noop()
             }
             WorkerMsg::Echo(bytes) => reply(WorkerReply(bytes)),
-            WorkerMsg::NoReply => noop(),
+            WorkerMsg::NoReply => {
+                // Hold the reply slot so the call stays pending until
+                // timeout. The abandoned-caller guard closes uncaptured
+                // callers immediately; keeping the slot alive is the
+                // legitimate way to defer a reply indefinitely.
+                self.held = Some(ctx.take_reply_slot().unwrap());
+                noop()
+            }
         }
     }
 }
@@ -131,6 +139,7 @@ impl Parent {
                         move || Worker {
                             observations: Rc::clone(&observations),
                             addresses: Rc::clone(&addresses),
+                            held: None,
                         },
                         self.capacities.worker_mailbox,
                     )
@@ -609,7 +618,7 @@ fn llama_sim_dst_parity_service_replays_bounded_worker_pressure_and_partial_writ
         LocalServerOracleCost {
             parent_deliveries: 2,
             server_deliveries: 41,
-            event_count: 220,
+            event_count: 222,
             tcp_write_completions: 16,
             isolate_call_failures: 2,
         },

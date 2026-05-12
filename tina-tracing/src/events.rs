@@ -335,6 +335,16 @@ pub fn emit_event(event: &RuntimeEvent) {
             call_id = call_id.get(),
             reason = call_reply_rejected_reason_name(reason),
         ),
+        RuntimeEventKind::CallReplyAbandoned { call_id } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "call_reply_abandoned",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+        ),
         RuntimeEventKind::SnapshotCommitted => event!(
             target: RUNTIME_TRACE_TARGET,
             Level::TRACE,
