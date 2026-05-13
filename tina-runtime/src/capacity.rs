@@ -392,10 +392,19 @@ fn suggest_next(report: &CapacitySurfaceReport) -> &'static str {
     }
 }
 
+fn discovery_value(value: &str) -> String {
+    if name_is_valid(value) {
+        value.to_string()
+    } else {
+        format!("{value:?}")
+    }
+}
+
 /// One `key=value` line per surface. Matches
 /// [`format_pressure_line`](crate::format_pressure_line) so the
-/// same greppers work. The `suggest=` value is double-quoted
-/// because it contains spaces.
+/// same greppers work. Token-like values are printed bare when they
+/// are safe; values with whitespace or control characters are
+/// double-quoted.
 ///
 /// ```text
 /// capacity surface=pool.1.waiters mode=fixed max=4 cur=0 high=4 full=2 suggest="saw Full — raise cap or shed earlier"
@@ -407,7 +416,7 @@ pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
     };
     let mut line = format!(
         "capacity surface={name} mode={mode} max={max} cur={cur} high={high} full={full} suggest={hint:?}",
-        name = report.name,
+        name = discovery_value(&report.name),
         mode = report.mode.label(),
         max = max,
         cur = report.current_messages,
@@ -416,9 +425,10 @@ pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
         hint = suggest_next(report),
     );
     if let Some(max_weight) = report.max_weight {
+        let unit = report.weight_unit.as_deref().unwrap_or("weight");
         line.push_str(&format!(
             " weight_unit={unit} max_weight={max_weight} cur_weight={cur} high_weight={high} weight_full={full}",
-            unit = report.weight_unit.as_deref().unwrap_or("weight"),
+            unit = discovery_value(unit),
             cur = report.current_weight.unwrap_or(0),
             high = report.high_water_weight.unwrap_or(0),
             full = report.weight_full_count,
@@ -427,6 +437,7 @@ pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
     if let Some(scope) = &report.shared_scope {
         line.push_str(&format!(
             " shared_scope={scope} shared_max_weight={max} shared_cur_weight={cur} shared_high_weight={high} shared_weight_full={full}",
+            scope = discovery_value(scope),
             max = report.shared_max_weight.unwrap_or(0),
             cur = report.shared_current_weight.unwrap_or(0),
             high = report.shared_high_water_weight.unwrap_or(0),
@@ -679,6 +690,24 @@ mod tests {
         assert!(line.contains("shared_scope=http.bodies"), "{line}");
         assert!(line.contains("shared_weight_full=2"), "{line}");
         assert!(line.contains("saw Full"), "{line}");
+    }
+
+    #[test]
+    fn discovery_line_quotes_unsafe_token_fields() {
+        let r = CapacitySurfaceReport::weighted(
+            "http response",
+            CapacityMode::Fixed,
+            4096,
+            0,
+            1024,
+            1,
+            "body bytes",
+        )
+        .with_shared_scope("http bodies", 8192, 0, 4096, 2);
+        let line = format_discovery_line(&r);
+        assert!(line.contains("surface=\"http response\""), "{line}");
+        assert!(line.contains("weight_unit=\"body bytes\""), "{line}");
+        assert!(line.contains("shared_scope=\"http bodies\""), "{line}");
     }
 
     #[test]
