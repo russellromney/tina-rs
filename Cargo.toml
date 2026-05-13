@@ -16,6 +16,7 @@ members = [
     "tina-tokio-bridge",
     "tina-tower-bridge",
     "tina-tracing",
+    "tina-aws-bridge",
 ]
 exclude = [
     "examples/specimen_real_io_chat",

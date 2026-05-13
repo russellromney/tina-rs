@@ -2,9 +2,13 @@
 
 ## Status
 
-- Ready to implement.
+- In review in PR #73.
 - One PR. S3 only.
-- Can run beside 087/089. This owns a new bridge crate and bridge docs.
+- Implemented shape: `install_s3`, `S3Worker`, `S3Request`,
+  `S3Response`, `S3Error`, `S3Config`, `S3Metrics`, `S3Closer`, and
+  `S3DrainReport`.
+- Fake-local S3 tests only; no real AWS credentials in CI.
+- Remaining: review and CI.
 
 ## Grug Truth
 
@@ -195,7 +199,7 @@ Required tests:
 - close rejects new work;
 - drain waits for accepted work or reports remaining work;
 - caller timeout after admission records late/abandoned truth;
-- SDK/HTTP error maps to typed `AwsError`;
+- SDK/HTTP error maps to typed `S3Error`;
 - supplied-runtime/owned-runtime ownership docs match behavior if both ship.
 
 If supplied runtime/client support ships, guard the Tokio-context trap like the
