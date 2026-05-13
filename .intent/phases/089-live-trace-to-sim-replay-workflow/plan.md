@@ -2,10 +2,17 @@
 
 ## Status
 
-- Ready to implement.
-- One PR.
+- Implemented in PR #74.
+- One PR, kept intentionally small.
 - Can run beside 087/088. This owns replay tooling/docs/specimen, not protocol
   or bridge behavior.
+- Current implementation names the capture/report types directly:
+  `LiveReplayCapture`, `LiveReplayReport`, `TraceProjection`,
+  `UnsupportedLiveFact`, `SavedReplayCase`, and
+  `CapturedReplayMismatch`.
+- Projection and unsupported facts are fail-closed: replay cannot pass while
+  unsupported facts remain, and projected comparison rejects event kinds that
+  were not explicitly named included or ignored.
 
 ## Grug Truth
 

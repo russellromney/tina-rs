@@ -219,8 +219,12 @@ and reviews live under `.intent/phases/`.
   build/sweep/save/shrink workflow, an upgraded `specimen_replay_dst`
   specimen with load-bearing history ops, one service-shaped saved
   case pinning a real `SendRejected{ Full }` mailbox-pressure fact
-  with exact pressure counts, and a migrated `timmerhus_dst` saved
-  case so the new helpers are the way for new DST tests.
+  with exact pressure counts, live-capture-to-simulator helpers that
+  carry seed/config/history/expected trace shape plus typed
+  config/history/event/hash/invariant mismatch output, a tiny saved-case
+  reader/writer for materialized histories, and a migrated
+  `timmerhus_dst` saved case so the new helpers are the way for new DST
+  tests.
 - SQLite/Postgres bridge and HTTP maturity tranche: `tina-sqlite-bridge`,
   `tina-sqlx-bridge`, native HTTPS, response streaming, response/request
   chunked transfer, client chunked decode, HTTP keepalive pool, server-side
