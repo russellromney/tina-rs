@@ -50,7 +50,7 @@ ships a Tokio client.
 | `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; native HTTP/2 is server-side h2c first form only; reqwest covers everything else. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
 | `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
-| `tina-aws-bridge` | Tina caller → AWS SDK S3 | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. S3 first form only: `PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`. The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
+| `tina-aws-bridge` | Tina caller → AWS SDK S3/SQS | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. Ships S3 (`PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`) and SQS (`SendMessage`, `ReceiveMessage`, `DeleteMessage`). The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
 
 Each crate is small, opt-in, and bounded. Native Tina crates
 (`tina-http`, etc.) do not depend on any bridge; bridges do not leak
@@ -333,10 +333,10 @@ Non-goals: generic `sqlx::Database`, ORM, migrations, struct
 mapping, a transaction *handle* (vs. atomic script). See the
 phase plan for the why.
 
-### `tina-aws-bridge` — Tina → AWS SDK S3
+### `tina-aws-bridge` — Tina → AWS SDK S3/SQS
 
 Adoption bridge. The AWS Rust SDK owns AWS protocol behavior; Tina
-owns bounded admission, body caps, per-operation timeout truth,
+owns bounded admission, body/message caps, per-operation timeout truth,
 typed outcomes, and metrics.
 
 ```rust
@@ -435,6 +435,61 @@ reports terminal truth; then worker-terminal metrics are tallied and
 Owned install builds a private Tokio runtime for SDK work and drops it
 with the worker. The supplied-client path uses the caller's Tokio
 runtime handle and never shuts it down.
+
+SQS follows the same lifecycle vocabulary with SQS-shaped types:
+
+```rust
+use tina_aws_bridge::{
+    SqsConfig, SqsCredentials, SqsRequest, SqsSendMessage, install_sqs, send_sqs,
+};
+
+let cfg = SqsConfig::new()
+    .with_region("us-east-1")
+    .with_credentials(SqsCredentials::new("access-key-id", "secret-access-key"))
+    .with_message_body_limit(64 * 1024)
+    .with_max_receive_messages(10);
+let bridge = install_sqs(&runtime, cfg)?;
+
+send_sqs(
+    self.sqs,
+    SqsRequest::SendMessage(SqsSendMessage {
+        queue_url,
+        body: "hello".into(),
+        message_group_id: None,
+        message_deduplication_id: None,
+    }),
+    Duration::from_secs(2),
+)
+.reply(AppMsg::SqsSendDone);
+```
+
+SQS receive names visibility timeout explicitly and never auto-deletes:
+
+```rust
+SqsRequest::ReceiveMessage(SqsReceiveMessage {
+    queue_url,
+    max_messages: 5,
+    visibility_timeout_seconds: 30,
+    wait_time_seconds: 0,
+})
+```
+
+`SqsResponse::ReceivedMessages` may contain an empty vector; that is a
+successful empty receive, not an error. Each returned `SqsMessage`
+carries the `receipt_handle` the caller must pass to
+`SqsRequest::DeleteMessage` if the message should be deleted. The
+bridge does not retry sends or deletes and does not infer idempotency
+from FIFO deduplication fields; retry budget, backoff, and idempotency
+keys remain caller-owned.
+
+`SqsCloser::close()` stops new Tina-side admission.
+`SqsCloser::close_and_drain(timeout)` reports any accepted SQS work
+still in flight by operation kind, just like S3. If a bridge timeout
+fires after SDK acceptance, Tina stops waiting but SQS has not rolled
+back the send, receive visibility change, or delete. The SDK future is
+left to finish so late-result metrics and in-flight capacity remain
+honest. The supplied-client path uses the caller's Tokio runtime handle
+and never shuts it down.
 
 ## What bridges preserve and weaken
 

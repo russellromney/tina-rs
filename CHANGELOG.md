@@ -4,6 +4,21 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 092 AWS Bridge Follow-Ups
+
+- Extended `tina-aws-bridge` with a bounded SQS first follow-up:
+  `install_sqs`, `SqsWorker`, typed send/receive/delete requests,
+  typed responses/errors, message body and receive-count caps, explicit
+  visibility timeout, empty receive as success, metrics, pressure reports,
+  and close/drain lifecycle truth.
+- Kept retry and idempotency caller-owned. Bridge timeout still means Tina
+  stops waiting; already admitted SQS SDK work may finish late and continues
+  occupying bounded bridge capacity until terminal truth is observed.
+- Added fake-local SQS tests for happy send/receive/delete/empty receive,
+  cap rejection, full/closed pressure, timeout/late-result metrics,
+  close/drain operation kinds, typed SDK queue errors, supplied-client retry
+  ownership, and config validation.
+
 ### Phase 088 AWS Bridge First Form
 
 - Added `tina-aws-bridge`, an opt-in S3-only bridge around the AWS Rust SDK with explicit config, bounded mailbox and in-flight admission, capped `PutObject` / `GetObject`, `HeadObject`, `DeleteObject`, typed S3 request/response/error enums, metrics, and examples.
