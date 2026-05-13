@@ -16,7 +16,8 @@ use std::rc::Rc;
 use tina::prelude::*;
 use tina_runtime::{RuntimeEventKind, SendRejectedReason};
 use tina_sim::dst::{
-    ReplayCase, ReplayConfig, ReplayReport, assert_replay_case, check_replay_case,
+    LiveReplayCapture, ReplayCase, ReplayConfig, ReplayReport, assert_replay_case,
+    check_captured_replay, check_replay_case, discover_constants,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
@@ -239,4 +240,77 @@ fn check_replay_case_reports_drift_when_constants_are_stale() {
     let rendered = mismatch.to_string();
     assert!(rendered.contains("burst overflow"));
     assert!(rendered.contains("next step"));
+}
+
+fn capture_burst_overflow() -> LiveReplayCapture<Op> {
+    let case = burst_overflow_case();
+    let report = run_burst_overflow_case(&case);
+    LiveReplayCapture::from_case_and_report(
+        &case,
+        "simulated pressure capture shaped like a live export",
+        &report,
+    )
+}
+
+#[test]
+fn captured_pressure_case_replays_in_simulator() {
+    let capture = capture_burst_overflow();
+    let case = capture.to_replay_case();
+    let report = check_captured_replay(&capture, &case, run_burst_overflow_case)
+        .expect("captured pressure facts replay in sim");
+    assert_eq!(
+        report.output.full_rejections,
+        BURST_OVERFLOW_FULL_REJECTIONS
+    );
+    assert_eq!(report.event_count, capture.expected.event_count);
+    assert_eq!(report.trace_hash, capture.expected.trace_hash);
+}
+
+#[test]
+fn changed_config_invalidates_captured_pressure_replay() {
+    let capture = capture_burst_overflow();
+    let mut changed = capture.to_replay_case();
+    changed.config = changed.config.clone().with_mailbox(SINK_ROLE, 3);
+
+    let mismatch = check_captured_replay(&capture, &changed, run_burst_overflow_case)
+        .expect_err("changed mailbox capacity must invalidate captured replay");
+    let rendered = mismatch.to_string();
+    assert!(rendered.contains("changed:   config"));
+    assert!(rendered.contains("events:"));
+    assert!(rendered.contains("hash:"));
+    assert!(rendered.contains("invariant:"));
+}
+
+#[test]
+fn discover_constants_prints_multiple_pressure_cases() {
+    let baseline = burst_overflow_case();
+    let mut changed_seed = ReplayCase::new(
+        baseline.name,
+        baseline.seed + 1,
+        baseline.config.clone(),
+        baseline.scenario,
+        baseline.history.operations().to_vec(),
+        baseline.invariant,
+    );
+    changed_seed.expected_event_count = 0;
+    changed_seed.expected_trace_hash = 0;
+
+    let rows = discover_constants(
+        [
+            ("burst_overflow_seed_7", baseline),
+            ("burst_overflow_seed_8", changed_seed),
+        ],
+        run_burst_overflow_case,
+    );
+
+    assert_eq!(rows.len(), 2);
+    let printed = rows
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert!(printed.contains("// burst_overflow_seed_7"));
+    assert!(printed.contains("// burst_overflow_seed_8"));
+    assert!(printed.matches("expected_event_count:").count() == 2);
+    assert!(printed.matches("expected_trace_hash:").count() == 2);
 }

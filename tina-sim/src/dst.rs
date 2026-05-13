@@ -5,7 +5,9 @@
 //! invariants without becoming a general property-testing framework.
 
 use std::collections::BTreeMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Write};
+use std::io;
+use std::path::Path;
 
 use tina::{AddressGeneration, IsolateId, ShardId};
 use tina_runtime::{
@@ -777,6 +779,1126 @@ impl<Output> ReplayReport<Output> {
             "expected_event_count: {}\nexpected_trace_hash: 0x{:016x}",
             self.event_count, self.trace_hash,
         )
+    }
+}
+
+/// Stable, copyable shape of a trace run.
+///
+/// A `TraceShape` is deliberately smaller than a trace: it records the
+/// number of typed events and the canonical [`stable_trace_hash`]. That is
+/// enough to tell whether a simulator replay is still the same story while
+/// keeping live captures and bug reports compact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceShape {
+    /// Observed event count.
+    pub event_count: usize,
+    /// Observed `stable_trace_hash`.
+    pub trace_hash: u64,
+}
+
+impl TraceShape {
+    /// Builds a trace shape from runtime events.
+    pub fn from_events(events: &[RuntimeEvent]) -> Self {
+        Self {
+            event_count: events.len(),
+            trace_hash: stable_trace_hash(events.iter()),
+        }
+    }
+
+    /// Builds a trace shape from a replay report.
+    pub const fn from_report<Output>(report: &ReplayReport<Output>) -> Self {
+        Self {
+            event_count: report.event_count,
+            trace_hash: report.trace_hash,
+        }
+    }
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    // FNV-1a over UTF-8 bytes. This hash is for diagnostics and saved-case
+    // drift checks, not for trace identity; traces still use stable_trace_hash.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Diagnostic fingerprint of visible replay config.
+///
+/// This is intentionally separate from [`stable_trace_hash`]. The trace hash
+/// is the replay identity. The config hash is a small bug-report aid so a
+/// changed mailbox cap or fault knob is called out before anyone stares at
+/// event hashes.
+pub fn replay_config_hash(config: &ReplayConfig) -> u64 {
+    let mut encoded = String::new();
+    encode_replay_config(&mut encoded, config);
+    stable_text_hash(&encoded)
+}
+
+fn encode_string(out: &mut String, value: &str) {
+    let _ = write!(out, "{}:", value.len());
+    out.push_str(value);
+}
+
+fn encode_bytes(out: &mut String, bytes: &[u8]) {
+    let _ = write!(out, "{}:", bytes.len());
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+}
+
+fn encode_option_usize(out: &mut String, value: Option<usize>) {
+    match value {
+        Some(value) => {
+            let _ = write!(out, "some({value})");
+        }
+        None => out.push_str("none"),
+    }
+}
+
+fn encode_option_u64(out: &mut String, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            let _ = write!(out, "some({value})");
+        }
+        None => out.push_str("none"),
+    }
+}
+
+fn encode_option_i32(out: &mut String, value: Option<i32>) {
+    match value {
+        Some(value) => {
+            let _ = write!(out, "some({value})");
+        }
+        None => out.push_str("none"),
+    }
+}
+
+fn encode_socket_addr(out: &mut String, addr: std::net::SocketAddr) {
+    match addr {
+        std::net::SocketAddr::V4(addr) => {
+            let _ = write!(out, "v4({}:{})", addr.ip(), addr.port());
+        }
+        std::net::SocketAddr::V6(addr) => {
+            let _ = write!(
+                out,
+                "v6({}:{}:{}:{})",
+                addr.ip(),
+                addr.port(),
+                addr.flowinfo(),
+                addr.scope_id()
+            );
+        }
+    }
+}
+
+fn encode_replay_config(out: &mut String, config: &ReplayConfig) {
+    out.push_str("ReplayConfig/v1{sim=");
+    encode_simulator_config(out, &config.simulator);
+    out.push_str(";mailboxes=[");
+    for (role, capacity) in &config.mailboxes {
+        encode_string(out, role);
+        let _ = write!(out, "={capacity};");
+    }
+    out.push_str("]}");
+}
+
+fn encode_simulator_config(out: &mut String, config: &SimulatorConfig) {
+    let _ = write!(out, "{{seed={};faults=", config.seed);
+    encode_fault_config(out, config.faults);
+    out.push_str(";tcp=");
+    encode_tcp_config(out, &config.tcp);
+    out.push_str(";udp=");
+    encode_udp_config(out, &config.udp);
+    out.push_str(";dns=");
+    encode_dns_config(out, &config.dns);
+    out.push_str(";tls=");
+    encode_tls_config(out, &config.tls);
+    out.push_str(";signal=");
+    encode_signal_config(out, &config.signal);
+    out.push_str(";process=");
+    encode_process_config(out, &config.process);
+    out.push_str(";storage=");
+    encode_storage_config(out, config.storage);
+    out.push('}');
+}
+
+fn encode_fault_config(out: &mut String, faults: FaultConfig) {
+    out.push_str("{local=");
+    match faults.local_send {
+        crate::LocalSendFaultMode::None => out.push_str("none"),
+        crate::LocalSendFaultMode::DelayByRounds { one_in, rounds } => {
+            let _ = write!(out, "delay-rounds({one_in},{rounds})");
+        }
+    }
+    out.push_str(";timer=");
+    match faults.timer_wake {
+        crate::FaultMode::None => out.push_str("none"),
+        crate::FaultMode::DelayBy { one_in, by } => {
+            let _ = write!(out, "delay-by({one_in},{})", by.as_nanos());
+        }
+    }
+    out.push_str(";tcp=");
+    match faults.tcp_completion {
+        crate::TcpCompletionFaultMode::None => out.push_str("none"),
+        crate::TcpCompletionFaultMode::DelayBySteps { one_in, steps } => {
+            let _ = write!(out, "delay-steps({one_in},{steps})");
+        }
+        crate::TcpCompletionFaultMode::ReorderReady { one_in } => {
+            let _ = write!(out, "reorder-ready({one_in})");
+        }
+    }
+    out.push('}');
+}
+
+fn encode_tcp_config(out: &mut String, config: &crate::ScriptedTcpConfig) {
+    let _ = write!(
+        out,
+        "{{pending={};listeners=[",
+        config.pending_completion_capacity
+    );
+    for listener in &config.listeners {
+        out.push_str("{bind=");
+        encode_socket_addr(out, listener.bind_addr);
+        out.push_str(";local=");
+        encode_socket_addr(out, listener.local_addr);
+        let _ = write!(out, ";backlog={};peers=[", listener.backlog_capacity);
+        for peer in &listener.peers {
+            let _ = write!(out, "{{after={};peer=", peer.accept_after_step);
+            encode_socket_addr(out, peer.peer_addr);
+            out.push_str(";in=[");
+            for chunk in &peer.inbound_chunks {
+                encode_bytes(out, chunk);
+                out.push(';');
+            }
+            let _ = write!(out, "];in_cap={};read_cap=", peer.inbound_capacity);
+            encode_option_usize(out, peer.read_chunk_cap);
+            let _ = write!(
+                out,
+                ";write_cap={};out_cap={};}}",
+                peer.write_cap, peer.output_capacity
+            );
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+}
+
+fn encode_udp_config(out: &mut String, config: &crate::ScriptedUdpConfig) {
+    let _ = write!(
+        out,
+        "{{pending={};sockets=[",
+        config.pending_completion_capacity
+    );
+    for socket in &config.sockets {
+        out.push_str("{bind=");
+        encode_socket_addr(out, socket.bind_addr);
+        out.push_str(";local=");
+        encode_socket_addr(out, socket.local_addr);
+        let _ = write!(out, ";recv_cap={};datagrams=[", socket.recv_capacity);
+        for datagram in &socket.inbound_datagrams {
+            let _ = write!(out, "{{after={};peer=", datagram.deliver_after_step);
+            encode_socket_addr(out, datagram.peer_addr);
+            out.push_str(";bytes=");
+            encode_bytes(out, &datagram.bytes);
+            out.push('}');
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+}
+
+fn encode_dns_config(out: &mut String, config: &crate::ScriptedDnsConfig) {
+    let _ = write!(
+        out,
+        "{{pending={};lookups=[",
+        config.pending_completion_capacity
+    );
+    for lookup in &config.lookups {
+        out.push_str("{host=");
+        encode_string(out, &lookup.host);
+        let _ = write!(
+            out,
+            ";port={};after={};result=",
+            lookup.port, lookup.complete_after_step
+        );
+        match &lookup.result {
+            crate::ScriptedDnsResult::Resolved(addrs) => {
+                out.push_str("resolved[");
+                for addr in addrs {
+                    encode_socket_addr(out, *addr);
+                    out.push(';');
+                }
+                out.push(']');
+            }
+            crate::ScriptedDnsResult::Failed => out.push_str("failed"),
+            crate::ScriptedDnsResult::Timeout => out.push_str("timeout"),
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+}
+
+fn encode_tls_config(out: &mut String, config: &crate::ScriptedTlsConfig) {
+    let _ = write!(
+        out,
+        "{{pending={};connects=[",
+        config.pending_completion_capacity
+    );
+    for connect in &config.connects {
+        out.push_str("{addr=");
+        encode_socket_addr(out, connect.addr);
+        out.push_str(";server=");
+        encode_string(out, &connect.server_name);
+        let _ = write!(out, ";after={};result=", connect.complete_after_step);
+        match &connect.result {
+            crate::ScriptedTlsConnectResult::Connected { reads, writes } => {
+                out.push_str("connected{reads=[");
+                for read in reads {
+                    match read {
+                        crate::ScriptedTlsReadResult::Bytes(bytes) => {
+                            out.push_str("bytes(");
+                            encode_bytes(out, bytes);
+                            out.push(')');
+                        }
+                        crate::ScriptedTlsReadResult::Eof => out.push_str("eof"),
+                        crate::ScriptedTlsReadResult::Failed => out.push_str("failed"),
+                        crate::ScriptedTlsReadResult::Timeout => out.push_str("timeout"),
+                    }
+                    out.push(';');
+                }
+                out.push_str("];writes=[");
+                for write in writes {
+                    match write {
+                        crate::ScriptedTlsWriteResult::Wrote(bytes) => {
+                            let _ = write!(out, "wrote({bytes})");
+                        }
+                        crate::ScriptedTlsWriteResult::Failed => out.push_str("failed"),
+                        crate::ScriptedTlsWriteResult::Timeout => out.push_str("timeout"),
+                    }
+                    out.push(';');
+                }
+                out.push_str("]}");
+            }
+            crate::ScriptedTlsConnectResult::Failed => out.push_str("failed"),
+            crate::ScriptedTlsConnectResult::Certificate => out.push_str("certificate"),
+            crate::ScriptedTlsConnectResult::Name => out.push_str("name"),
+            crate::ScriptedTlsConnectResult::Timeout => out.push_str("timeout"),
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+}
+
+fn encode_signal_config(out: &mut String, config: &crate::ScriptedSignalConfig) {
+    let _ = write!(
+        out,
+        "{{pending={};events=[",
+        config.pending_completion_capacity
+    );
+    for event in &config.events {
+        out.push_str("{name=");
+        encode_string(out, &event.name);
+        let _ = write!(out, ";after={};result=", event.deliver_after_step);
+        match event.result {
+            crate::ScriptedSignalResult::Received => out.push_str("received"),
+            crate::ScriptedSignalResult::Failed => out.push_str("failed"),
+            crate::ScriptedSignalResult::Timeout => out.push_str("timeout"),
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+}
+
+fn encode_process_config(out: &mut String, config: &crate::ScriptedProcessConfig) {
+    let _ = write!(
+        out,
+        "{{pending={};runs=[",
+        config.pending_completion_capacity
+    );
+    for run in &config.runs {
+        out.push_str("{command=");
+        encode_string(out, &run.command);
+        out.push_str(";args=[");
+        for arg in &run.args {
+            encode_string(out, arg);
+            out.push(';');
+        }
+        let _ = write!(out, "];after={};result=", run.complete_after_step);
+        match &run.result {
+            crate::ScriptedProcessResult::Exited {
+                code,
+                stdout,
+                stderr,
+            } => {
+                out.push_str("exited(");
+                encode_option_i32(out, *code);
+                out.push(',');
+                encode_bytes(out, stdout);
+                out.push(',');
+                encode_bytes(out, stderr);
+                out.push(')');
+            }
+            crate::ScriptedProcessResult::Failed => out.push_str("failed"),
+            crate::ScriptedProcessResult::Timeout => out.push_str("timeout"),
+            crate::ScriptedProcessResult::KillUncertain => out.push_str("kill-uncertain"),
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+}
+
+fn encode_storage_config(out: &mut String, config: crate::ScriptedStorageFaultConfig) {
+    out.push_str("{fail_journal=");
+    encode_option_u64(out, config.fail_journal_append_at);
+    out.push_str(";fail_snapshot=");
+    encode_option_u64(out, config.fail_snapshot_commit_at);
+    out.push_str(";truncate_journal=");
+    encode_option_u64(out, config.truncate_journal_tail_at);
+    out.push_str(";corrupt_journal=");
+    encode_option_u64(out, config.corrupt_journal_record_at);
+    out.push_str(";uncertain_snapshot=");
+    encode_option_u64(out, config.commit_uncertain_snapshot_at);
+    out.push('}');
+}
+
+/// Facts captured from a live or simulator run that are sufficient to try a
+/// simulator replay.
+///
+/// The capture stores seed, full replay config, explicit history, invariant,
+/// and the expected trace shape. It does not pretend that arbitrary live I/O
+/// can be replayed. If the operation history does not contain enough facts,
+/// [`check_captured_replay`] returns a typed mismatch naming history and trace
+/// drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveReplayCapture<Op> {
+    /// Stable case name.
+    pub name: &'static str,
+    /// Replay seed.
+    pub seed: u64,
+    /// Visible simulator-replay knobs captured with the run.
+    pub config: ReplayConfig,
+    /// Diagnostic hash of `config`.
+    config_hash: u64,
+    /// One-line scenario description.
+    pub scenario: &'static str,
+    /// Materialized operation history.
+    pub history: History<Op>,
+    /// Expected trace shape captured from the source run.
+    pub expected: TraceShape,
+    /// Human-readable invariant being preserved.
+    pub invariant: &'static str,
+    /// Short note naming where the capture came from.
+    pub source: &'static str,
+}
+
+impl<Op> LiveReplayCapture<Op> {
+    /// Captures a replay attempt from explicit parts and runtime events.
+    pub fn from_events(
+        name: &'static str,
+        seed: u64,
+        config: ReplayConfig,
+        scenario: &'static str,
+        ops: Vec<Op>,
+        invariant: &'static str,
+        source: &'static str,
+        events: &[RuntimeEvent],
+    ) -> Self {
+        let config_hash = replay_config_hash(&config);
+        Self {
+            name,
+            seed,
+            config,
+            config_hash,
+            scenario,
+            history: History::new(name, seed, ops),
+            expected: TraceShape::from_events(events),
+            invariant,
+            source,
+        }
+    }
+
+    /// Captures the current shape of an existing replay case and event list.
+    pub fn from_case_and_events(
+        case: &ReplayCase<Op>,
+        source: &'static str,
+        events: &[RuntimeEvent],
+    ) -> Self
+    where
+        Op: Clone,
+    {
+        Self::from_events(
+            case.name,
+            case.seed,
+            case.config.clone(),
+            case.scenario,
+            case.history.operations().to_vec(),
+            case.invariant,
+            source,
+            events,
+        )
+    }
+
+    /// Captures the shape reported by a runner for an existing replay case.
+    pub fn from_case_and_report<Output>(
+        case: &ReplayCase<Op>,
+        source: &'static str,
+        report: &ReplayReport<Output>,
+    ) -> Self
+    where
+        Op: Clone,
+    {
+        let config = case.config.clone();
+        let config_hash = replay_config_hash(&config);
+        Self {
+            name: case.name,
+            seed: case.seed,
+            config,
+            config_hash,
+            scenario: case.scenario,
+            history: case.history.clone(),
+            expected: TraceShape::from_report(report),
+            invariant: case.invariant,
+            source,
+        }
+    }
+
+    /// Returns the diagnostic hash of the captured replay config.
+    pub const fn config_hash(&self) -> u64 {
+        self.config_hash
+    }
+
+    /// Converts the capture into a normal [`ReplayCase`] pinned to the
+    /// captured trace shape.
+    pub fn to_replay_case(&self) -> ReplayCase<Op>
+    where
+        Op: Clone,
+    {
+        ReplayCase {
+            name: self.name,
+            seed: self.seed,
+            config: self.config.clone(),
+            scenario: self.scenario,
+            history: self.history.clone(),
+            expected_event_count: self.expected.event_count,
+            expected_trace_hash: self.expected.trace_hash,
+            invariant: self.invariant,
+        }
+    }
+}
+
+/// A saved captured case with owned strings.
+///
+/// The file helper intentionally does not deserialize a full
+/// [`ReplayConfig`]. Tina has no serde dependency here, and config often
+/// contains service-owned role constants. Instead the saved file carries
+/// `config_debug` and `config_hash` for drift detection; the caller supplies
+/// the typed config when converting back into a [`ReplayCase`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedReplayCase<Op> {
+    /// Saved case name.
+    pub name: String,
+    /// Saved replay seed.
+    pub seed: u64,
+    /// Saved scenario text.
+    pub scenario: String,
+    /// Saved invariant text.
+    pub invariant: String,
+    /// Capture source label.
+    pub source: String,
+    /// Debug rendering of the replay config at capture time.
+    pub config_debug: String,
+    /// Diagnostic config hash at capture time.
+    pub config_hash: u64,
+    /// Captured expected trace shape.
+    pub expected: TraceShape,
+    /// Materialized operation history.
+    pub history: Vec<Op>,
+}
+
+impl<Op> SavedReplayCase<Op> {
+    /// Builds an owned saved-case view from a live replay capture.
+    pub fn from_capture<F>(
+        capture: &LiveReplayCapture<Op>,
+        mut encode_op: F,
+    ) -> SavedReplayCase<String>
+    where
+        F: FnMut(&Op) -> String,
+    {
+        SavedReplayCase {
+            name: capture.name.to_owned(),
+            seed: capture.seed,
+            scenario: capture.scenario.to_owned(),
+            invariant: capture.invariant.to_owned(),
+            source: capture.source.to_owned(),
+            config_debug: format!("{:?}", capture.config),
+            config_hash: capture.config_hash(),
+            expected: capture.expected,
+            history: capture
+                .history
+                .operations()
+                .iter()
+                .map(&mut encode_op)
+                .collect(),
+        }
+    }
+}
+
+impl<Op: Clone> SavedReplayCase<Op> {
+    /// Converts an owned saved case into a typed [`ReplayCase`].
+    ///
+    /// The caller supplies the static labels and typed config used by the
+    /// runner. The helper verifies the supplied config hash against the saved
+    /// one so config drift is reported before replay.
+    pub fn to_replay_case(
+        &self,
+        name: &'static str,
+        config: ReplayConfig,
+        scenario: &'static str,
+        invariant: &'static str,
+    ) -> Result<ReplayCase<Op>, SavedReplayCaseError> {
+        let actual_hash = replay_config_hash(&config);
+        if actual_hash != self.config_hash {
+            return Err(SavedReplayCaseError::ConfigHashMismatch {
+                expected: self.config_hash,
+                actual: actual_hash,
+            });
+        }
+        if self.name != name {
+            return Err(SavedReplayCaseError::FieldMismatch {
+                field: "name",
+                expected: self.name.clone(),
+                actual: name.to_owned(),
+            });
+        }
+        if self.scenario != scenario {
+            return Err(SavedReplayCaseError::FieldMismatch {
+                field: "scenario",
+                expected: self.scenario.clone(),
+                actual: scenario.to_owned(),
+            });
+        }
+        if self.invariant != invariant {
+            return Err(SavedReplayCaseError::FieldMismatch {
+                field: "invariant",
+                expected: self.invariant.clone(),
+                actual: invariant.to_owned(),
+            });
+        }
+        Ok(ReplayCase::new(
+            name,
+            self.seed,
+            config,
+            scenario,
+            self.history.clone(),
+            invariant,
+        )
+        .expecting(self.expected.event_count, self.expected.trace_hash))
+    }
+}
+
+/// Error from the tiny saved-case file helper.
+#[derive(Debug)]
+pub enum SavedReplayCaseError {
+    /// Filesystem I/O failed.
+    Io(io::Error),
+    /// The line-oriented file could not be decoded.
+    Decode {
+        /// One-based line number.
+        line: usize,
+        /// Human-readable decode failure.
+        reason: String,
+    },
+    /// A required field was absent.
+    MissingField(&'static str),
+    /// The caller supplied config whose diagnostic hash differs.
+    ConfigHashMismatch {
+        /// Hash recorded in the saved case.
+        expected: u64,
+        /// Hash of the caller-supplied config.
+        actual: u64,
+    },
+    /// A caller-supplied static field does not match the saved case.
+    FieldMismatch {
+        /// Field name.
+        field: &'static str,
+        /// Saved value.
+        expected: String,
+        /// Caller-supplied value.
+        actual: String,
+    },
+}
+
+impl std::fmt::Display for SavedReplayCaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "saved replay case I/O failed: {error}"),
+            Self::Decode { line, reason } => {
+                write!(
+                    f,
+                    "saved replay case decode failed on line {line}: {reason}"
+                )
+            }
+            Self::MissingField(field) => write!(f, "saved replay case missing field `{field}`"),
+            Self::ConfigHashMismatch { expected, actual } => write!(
+                f,
+                "saved replay case config changed: expected hash 0x{expected:016x}, got 0x{actual:016x}"
+            ),
+            Self::FieldMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "saved replay case field `{field}` changed: expected {expected:?}, got {actual:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SavedReplayCaseError {}
+
+impl From<io::Error> for SavedReplayCaseError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+fn reject_newline(field: &str, value: &str) -> Result<(), SavedReplayCaseError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(SavedReplayCaseError::Decode {
+            line: 0,
+            reason: format!("{field} may not contain a newline"),
+        });
+    }
+    Ok(())
+}
+
+/// Writes a small line-oriented saved replay capture.
+///
+/// Each operation is already materialized in the file as an `op=` line. The
+/// caller chooses the op encoding so domain-specific enums can stay copyable
+/// and tiny.
+pub fn write_saved_replay_case<Op, F>(
+    path: impl AsRef<Path>,
+    capture: &LiveReplayCapture<Op>,
+    mut encode_op: F,
+) -> Result<(), SavedReplayCaseError>
+where
+    F: FnMut(&Op) -> String,
+{
+    reject_newline("name", capture.name)?;
+    reject_newline("scenario", capture.scenario)?;
+    reject_newline("invariant", capture.invariant)?;
+    reject_newline("source", capture.source)?;
+
+    let mut body = String::new();
+    body.push_str("tina-replay-case-v1\n");
+    body.push_str(&format!("name={}\n", capture.name));
+    body.push_str(&format!("seed={}\n", capture.seed));
+    body.push_str(&format!("scenario={}\n", capture.scenario));
+    body.push_str(&format!("invariant={}\n", capture.invariant));
+    body.push_str(&format!("source={}\n", capture.source));
+    body.push_str(&format!("config_hash=0x{:016x}\n", capture.config_hash()));
+    body.push_str(&format!("config_debug={:?}\n", capture.config));
+    body.push_str(&format!(
+        "expected_event_count={}\n",
+        capture.expected.event_count
+    ));
+    body.push_str(&format!(
+        "expected_trace_hash=0x{:016x}\n",
+        capture.expected.trace_hash
+    ));
+    for op in capture.history.operations() {
+        let encoded = encode_op(op);
+        reject_newline("op", &encoded)?;
+        body.push_str("op=");
+        body.push_str(&encoded);
+        body.push('\n');
+    }
+    std::fs::write(path, body)?;
+    Ok(())
+}
+
+/// Reads a saved replay capture written by [`write_saved_replay_case`].
+pub fn read_saved_replay_case<Op, F>(
+    path: impl AsRef<Path>,
+    mut decode_op: F,
+) -> Result<SavedReplayCase<Op>, SavedReplayCaseError>
+where
+    F: FnMut(&str) -> Result<Op, String>,
+{
+    let text = std::fs::read_to_string(path)?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("tina-replay-case-v1") => {}
+        Some(other) => {
+            return Err(SavedReplayCaseError::Decode {
+                line: 1,
+                reason: format!("unknown header {other:?}"),
+            });
+        }
+        None => return Err(SavedReplayCaseError::MissingField("header")),
+    }
+
+    let mut name = None;
+    let mut seed = None;
+    let mut scenario = None;
+    let mut invariant = None;
+    let mut source = None;
+    let mut config_debug = None;
+    let mut config_hash = None;
+    let mut expected_event_count = None;
+    let mut expected_trace_hash = None;
+    let mut history = Vec::new();
+
+    for (index, line) in lines.enumerate() {
+        let line_no = index + 2;
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(SavedReplayCaseError::Decode {
+                line: line_no,
+                reason: "expected key=value".to_owned(),
+            });
+        };
+        match key {
+            "name" => name = Some(value.to_owned()),
+            "seed" => {
+                seed = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| SavedReplayCaseError::Decode {
+                            line: line_no,
+                            reason: format!("invalid seed: {error}"),
+                        })?,
+                )
+            }
+            "scenario" => scenario = Some(value.to_owned()),
+            "invariant" => invariant = Some(value.to_owned()),
+            "source" => source = Some(value.to_owned()),
+            "config_debug" => config_debug = Some(value.to_owned()),
+            "config_hash" => config_hash = Some(parse_hex_u64(value, line_no, "config_hash")?),
+            "expected_event_count" => {
+                expected_event_count =
+                    Some(
+                        value
+                            .parse::<usize>()
+                            .map_err(|error| SavedReplayCaseError::Decode {
+                                line: line_no,
+                                reason: format!("invalid expected_event_count: {error}"),
+                            })?,
+                    )
+            }
+            "expected_trace_hash" => {
+                expected_trace_hash = Some(parse_hex_u64(value, line_no, "expected_trace_hash")?)
+            }
+            "op" => {
+                history.push(
+                    decode_op(value).map_err(|reason| SavedReplayCaseError::Decode {
+                        line: line_no,
+                        reason,
+                    })?,
+                )
+            }
+            other => {
+                return Err(SavedReplayCaseError::Decode {
+                    line: line_no,
+                    reason: format!("unknown key {other:?}"),
+                });
+            }
+        }
+    }
+
+    Ok(SavedReplayCase {
+        name: name.ok_or(SavedReplayCaseError::MissingField("name"))?,
+        seed: seed.ok_or(SavedReplayCaseError::MissingField("seed"))?,
+        scenario: scenario.ok_or(SavedReplayCaseError::MissingField("scenario"))?,
+        invariant: invariant.ok_or(SavedReplayCaseError::MissingField("invariant"))?,
+        source: source.ok_or(SavedReplayCaseError::MissingField("source"))?,
+        config_debug: config_debug.ok_or(SavedReplayCaseError::MissingField("config_debug"))?,
+        config_hash: config_hash.ok_or(SavedReplayCaseError::MissingField("config_hash"))?,
+        expected: TraceShape {
+            event_count: expected_event_count
+                .ok_or(SavedReplayCaseError::MissingField("expected_event_count"))?,
+            trace_hash: expected_trace_hash
+                .ok_or(SavedReplayCaseError::MissingField("expected_trace_hash"))?,
+        },
+        history,
+    })
+}
+
+fn parse_hex_u64(
+    value: &str,
+    line: usize,
+    field: &'static str,
+) -> Result<u64, SavedReplayCaseError> {
+    let digits = value.strip_prefix("0x").unwrap_or(value);
+    u64::from_str_radix(digits, 16).map_err(|error| SavedReplayCaseError::Decode {
+        line,
+        reason: format!("invalid {field}: {error}"),
+    })
+}
+
+/// Which replay facts changed between a capture and a simulator attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedReplayChange {
+    /// Case name changed.
+    Name,
+    /// Replay seed changed.
+    Seed,
+    /// Scenario text changed.
+    Scenario,
+    /// Replay config changed.
+    Config,
+    /// Materialized operation history changed.
+    History,
+    /// Event count changed.
+    EventCount,
+    /// Trace hash changed.
+    Hash,
+    /// Invariant label changed.
+    Invariant,
+}
+
+/// Typed mismatch returned when a captured live story cannot be replayed
+/// exactly in the simulator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedReplayMismatch<Op> {
+    /// Captured case name.
+    pub name: &'static str,
+    /// Candidate replay case name.
+    pub actual_name: &'static str,
+    /// Captured replay seed.
+    pub seed: u64,
+    /// Candidate replay seed.
+    pub actual_seed: u64,
+    /// Capture source label.
+    pub source: &'static str,
+    /// Captured scenario.
+    pub scenario: &'static str,
+    /// Candidate replay scenario.
+    pub actual_scenario: &'static str,
+    /// Diagnostic config hash from the capture.
+    pub expected_config_hash: u64,
+    /// Diagnostic config hash from the candidate replay case.
+    pub actual_config_hash: u64,
+    /// Captured operation history.
+    pub expected_history: History<Op>,
+    /// Candidate replay operation history.
+    pub actual_history: History<Op>,
+    /// Captured trace shape.
+    pub expected: TraceShape,
+    /// Candidate replay trace shape.
+    pub actual: TraceShape,
+    /// Captured invariant.
+    pub expected_invariant: &'static str,
+    /// Candidate replay invariant.
+    pub actual_invariant: &'static str,
+    /// Changed fact categories.
+    pub changes: Vec<CapturedReplayChange>,
+}
+
+impl<Op> CapturedReplayMismatch<Op> {
+    /// Returns true when this mismatch includes `change`.
+    pub fn includes(&self, change: CapturedReplayChange) -> bool {
+        self.changes.contains(&change)
+    }
+}
+
+impl<Op: Debug> std::fmt::Display for CapturedReplayMismatch<Op> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "captured replay `{}` from {} did not replay exactly",
+            self.name, self.source
+        )?;
+        writeln!(f, "  seed:      {}", self.seed)?;
+        if self.includes(CapturedReplayChange::Name) {
+            writeln!(
+                f,
+                "  name:      expected {:?}, got {:?} (changed)",
+                self.name, self.actual_name
+            )?;
+        }
+        writeln!(
+            f,
+            "  seed:      expected {}, got {}{}",
+            self.seed,
+            self.actual_seed,
+            if self.includes(CapturedReplayChange::Seed) {
+                " (changed)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(
+            f,
+            "  scenario:  expected {:?}, got {:?}{}",
+            self.scenario,
+            self.actual_scenario,
+            if self.includes(CapturedReplayChange::Scenario) {
+                " (changed)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(
+            f,
+            "  changed:   {}",
+            self.changes
+                .iter()
+                .map(|change| match change {
+                    CapturedReplayChange::Name => "name",
+                    CapturedReplayChange::Seed => "seed",
+                    CapturedReplayChange::Scenario => "scenario",
+                    CapturedReplayChange::Config => "config",
+                    CapturedReplayChange::History => "history",
+                    CapturedReplayChange::EventCount => "event count",
+                    CapturedReplayChange::Hash => "hash",
+                    CapturedReplayChange::Invariant => "invariant",
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+        writeln!(
+            f,
+            "  config:    expected 0x{:016x}, got 0x{:016x}{}",
+            self.expected_config_hash,
+            self.actual_config_hash,
+            if self.includes(CapturedReplayChange::Config) {
+                " (changed)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(
+            f,
+            "  history:   expected {} ops, got {} ops{}",
+            self.expected_history.len(),
+            self.actual_history.len(),
+            if self.includes(CapturedReplayChange::History) {
+                " (changed)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(
+            f,
+            "  events:    expected {}, got {}{}",
+            self.expected.event_count,
+            self.actual.event_count,
+            if self.includes(CapturedReplayChange::EventCount) {
+                " (changed)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(
+            f,
+            "  hash:      expected 0x{:016x}, got 0x{:016x}{}",
+            self.expected.trace_hash,
+            self.actual.trace_hash,
+            if self.includes(CapturedReplayChange::Hash) {
+                " (changed)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(
+            f,
+            "  invariant: expected {:?}, got {:?}{}",
+            self.expected_invariant,
+            self.actual_invariant,
+            if self.includes(CapturedReplayChange::Invariant) {
+                " (changed)"
+            } else {
+                ""
+            },
+        )?;
+        writeln!(f, "  expected history:")?;
+        for op in self.expected_history.operations() {
+            writeln!(f, "      - {op:?}")?;
+        }
+        writeln!(f, "  actual history:")?;
+        for op in self.actual_history.operations() {
+            writeln!(f, "      - {op:?}")?;
+        }
+        write!(
+            f,
+            "  next step: if history lacks a live input or resource completion, \
+             materialize that fact as an op before treating the trace hash as a \
+             simulator regression."
+        )
+    }
+}
+
+/// Compares captured live facts against a simulator replay candidate.
+///
+/// The candidate case is supplied separately so tests can prove config or
+/// history drift. Use `capture.to_replay_case()` for the normal path.
+pub fn check_captured_replay<Op, Output, Runner>(
+    capture: &LiveReplayCapture<Op>,
+    candidate: &ReplayCase<Op>,
+    mut runner: Runner,
+) -> Result<ReplayReport<Output>, Box<CapturedReplayMismatch<Op>>>
+where
+    Op: Clone + PartialEq,
+    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+{
+    assert_case_history_coherent(candidate);
+    let report = runner(candidate);
+    assert_report_identity(candidate, &report);
+    let actual = TraceShape::from_report(&report);
+    let actual_config_hash = replay_config_hash(&candidate.config);
+    let expected_config_hash = replay_config_hash(&capture.config);
+    let mut changes = Vec::new();
+    if capture.name != candidate.name {
+        changes.push(CapturedReplayChange::Name);
+    }
+    if capture.seed != candidate.seed {
+        changes.push(CapturedReplayChange::Seed);
+    }
+    if capture.scenario != candidate.scenario {
+        changes.push(CapturedReplayChange::Scenario);
+    }
+    if expected_config_hash != actual_config_hash {
+        changes.push(CapturedReplayChange::Config);
+    }
+    if capture.history != candidate.history {
+        changes.push(CapturedReplayChange::History);
+    }
+    if capture.expected.event_count != actual.event_count {
+        changes.push(CapturedReplayChange::EventCount);
+    }
+    if capture.expected.trace_hash != actual.trace_hash {
+        changes.push(CapturedReplayChange::Hash);
+    }
+    if capture.invariant != candidate.invariant {
+        changes.push(CapturedReplayChange::Invariant);
+    }
+
+    if changes.is_empty() {
+        Ok(report)
+    } else {
+        Err(Box::new(CapturedReplayMismatch {
+            name: capture.name,
+            actual_name: candidate.name,
+            seed: capture.seed,
+            actual_seed: candidate.seed,
+            source: capture.source,
+            scenario: capture.scenario,
+            actual_scenario: candidate.scenario,
+            expected_config_hash,
+            actual_config_hash,
+            expected_history: capture.history.clone(),
+            actual_history: candidate.history.clone(),
+            expected: capture.expected,
+            actual,
+            expected_invariant: capture.invariant,
+            actual_invariant: candidate.invariant,
+            changes,
+        }))
     }
 }
 
@@ -1677,6 +2799,140 @@ mod replay_case_tests {
         let rendered = mismatch.to_string();
         assert!(rendered.contains("hash:      expected"));
         assert!(rendered.contains("(diverged)"));
+    }
+
+    #[test]
+    fn live_capture_replays_when_case_matches_captured_facts() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let capture =
+            LiveReplayCapture::from_case_and_events(&c, "threaded-runtime smoke", &events);
+        let replay_case = capture.to_replay_case();
+
+        let report = check_captured_replay(&capture, &replay_case, run_three_events)
+            .expect("captured facts replay");
+        assert_eq!(report.event_count, capture.expected.event_count);
+        assert_eq!(report.trace_hash, capture.expected.trace_hash);
+    }
+
+    #[test]
+    fn captured_replay_mismatch_names_every_changed_fact() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let capture = LiveReplayCapture::from_case_and_events(&c, "live-thread", &events);
+
+        let changed_config = ReplayConfig::new().with_mailbox("sink", 1);
+        let candidate = ReplayCase::new(
+            c.name,
+            c.seed,
+            changed_config,
+            c.scenario,
+            vec![1, 2],
+            "different invariant",
+        )
+        .expecting(c.expected_event_count, c.expected_trace_hash);
+
+        let mismatch = check_captured_replay(&capture, &candidate, run_full_history_case)
+            .expect_err("candidate should drift from capture");
+        assert!(mismatch.includes(CapturedReplayChange::Config));
+        assert!(mismatch.includes(CapturedReplayChange::History));
+        assert!(mismatch.includes(CapturedReplayChange::EventCount));
+        assert!(mismatch.includes(CapturedReplayChange::Hash));
+        assert!(mismatch.includes(CapturedReplayChange::Invariant));
+
+        let rendered = mismatch.to_string();
+        assert!(rendered.contains("changed:   config, history, event count, hash, invariant"));
+        assert!(rendered.contains("config:    expected"));
+        assert!(rendered.contains("history:   expected 3 ops, got 2"));
+        assert!(rendered.contains("events:    expected 3, got 2"));
+        assert!(rendered.contains("next step: if history lacks a live input"));
+    }
+
+    #[test]
+    fn captured_replay_mismatch_names_identity_drift() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let capture = LiveReplayCapture::from_case_and_events(&c, "live-thread", &events);
+        let candidate = ReplayCase::new(
+            "different replay case",
+            c.seed + 1,
+            c.config.clone(),
+            "different scenario",
+            c.history.operations().to_vec(),
+            c.invariant,
+        );
+
+        fn identity_ignoring_runner(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            ReplayReport::from_case_and_events(case, &events, 6)
+        }
+
+        let mismatch = check_captured_replay(&capture, &candidate, identity_ignoring_runner)
+            .expect_err("identity drift should invalidate capture replay");
+        assert!(mismatch.includes(CapturedReplayChange::Name));
+        assert!(mismatch.includes(CapturedReplayChange::Seed));
+        assert!(mismatch.includes(CapturedReplayChange::Scenario));
+
+        let rendered = mismatch.to_string();
+        assert!(rendered.contains("changed:   name, seed, scenario"));
+        assert!(rendered.contains("seed:      expected 7, got 8 (changed)"));
+        assert!(rendered.contains("scenario:  expected"));
+    }
+
+    #[test]
+    fn saved_replay_case_round_trips_history_and_constants() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let capture = LiveReplayCapture::from_case_and_events(&c, "live export", &events);
+        let path = std::env::temp_dir().join(format!(
+            "tina-saved-replay-{}-{}.case",
+            std::process::id(),
+            capture.expected.trace_hash
+        ));
+
+        write_saved_replay_case(&path, &capture, |op| op.to_string()).expect("write saved case");
+        let saved = read_saved_replay_case(&path, |text| {
+            text.parse::<u32>().map_err(|error| error.to_string())
+        })
+        .expect("read saved case");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(saved.name, c.name);
+        assert_eq!(saved.seed, c.seed);
+        assert_eq!(saved.expected, capture.expected);
+        assert_eq!(saved.history, c.history.operations());
+
+        let replay_case = saved
+            .to_replay_case(c.name, c.config.clone(), c.scenario, c.invariant)
+            .expect("typed config matches saved config hash");
+        assert_eq!(replay_case.expected_event_count, c.expected_event_count);
+        assert_eq!(replay_case.expected_trace_hash, c.expected_trace_hash);
+        assert_eq!(replay_case.history.operations(), c.history.operations());
+    }
+
+    #[test]
+    fn saved_replay_case_rejects_changed_config_before_replay() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let capture = LiveReplayCapture::from_case_and_events(&c, "live export", &events);
+        let saved = SavedReplayCase {
+            name: c.name.to_owned(),
+            seed: c.seed,
+            scenario: c.scenario.to_owned(),
+            invariant: c.invariant.to_owned(),
+            source: capture.source.to_owned(),
+            config_debug: format!("{:?}", c.config),
+            config_hash: capture.config_hash(),
+            expected: capture.expected,
+            history: c.history.operations().to_vec(),
+        };
+
+        let changed = ReplayConfig::new().with_mailbox("sink", 99);
+        let err = saved
+            .to_replay_case(c.name, changed, c.scenario, c.invariant)
+            .expect_err("config hash should change");
+        let rendered = err.to_string();
+        assert!(rendered.contains("config changed"));
     }
 
     fn make_seeded_case(seed: u64) -> ReplayCase<u32> {
