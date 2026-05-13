@@ -3,7 +3,7 @@
 
 //! Bounded AWS SDK bridge for Tina services.
 //!
-//! First form is intentionally S3-only. The AWS Rust SDK owns SigV4,
+//! First form started with S3. Phase 092 adds SQS. The AWS Rust SDK owns SigV4,
 //! credentials, endpoints, HTTP, TLS, and service protocol details.
 //! Tina owns bounded admission, per-operation deadline truth, visible
 //! pressure, typed request/response enums, and lifecycle handles.
@@ -83,14 +83,42 @@
 //! eventually finishes, worker-terminal metrics are tallied,
 //! `late_results` increments, and only then does the operation leave
 //! the bridge's in-flight capacity.
+//!
+//! # SQS truth
+//!
+//! SQS support keeps the service lifecycle explicit:
+//!
+//! - queue URL is supplied on every request;
+//! - `SendMessage` is capped by [`SqsConfig::message_body_limit`];
+//! - `ReceiveMessage` is capped by [`SqsConfig::max_receive_messages`]
+//!   and names `visibility_timeout_seconds`;
+//! - empty receive returns [`SqsResponse::ReceivedMessages`] with an
+//!   empty vector;
+//! - received messages carry a receipt handle, and delete is a
+//!   separate caller-owned request.
+//!
+//! The bridge does not retry, auto-delete after receive, or infer
+//! idempotency. It only bounds and observes admitted SDK work.
 
 mod helpers;
 mod metrics;
+mod sqs_metrics;
+mod sqs_types;
+mod sqs_worker;
 mod types;
 mod worker;
 
-pub use helpers::{S3Address, S3CallOutcome, send_s3};
+pub use helpers::{S3Address, S3CallOutcome, SqsAddress, SqsCallOutcome, send_s3, send_sqs};
 pub use metrics::{S3Metrics, S3MetricsHandle, S3PressureReport};
+pub use sqs_metrics::{SqsMetrics, SqsMetricsHandle, SqsPressureReport};
+pub use sqs_types::{
+    SqsConfig, SqsConfigError, SqsCredentials, SqsDeleteMessage, SqsDeletedMessage, SqsError,
+    SqsMessage, SqsReceiveMessage, SqsReceivedMessages, SqsRequest, SqsResponse, SqsSendMessage,
+    SqsSentMessage,
+};
+pub use sqs_worker::{
+    InstalledSqsBridge, SqsCloser, SqsDrainReport, SqsInstallError, SqsMsg, SqsWorker, install_sqs,
+};
 pub use types::{
     S3Config, S3ConfigError, S3Credentials, S3DeleteObject, S3DeletedObject, S3Error, S3GetObject,
     S3HeadObject, S3Object, S3ObjectHead, S3PutObject, S3PutObjectOk, S3Request, S3Response,

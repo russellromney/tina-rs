@@ -5,6 +5,12 @@
 - Ready to implement.
 - One PR if it stays narrow.
 - Can run beside HTTP/2 or timer work. Owns `tina-aws-bridge`.
+- Implementation note: this slice ships SQS first, with explicit
+  `SqsRequest` / `SqsResponse` / `SqsError` shapes, queue-url based
+  requests, message body and receive-count caps, named visibility timeout,
+  empty receive as a typed response, and the same timeout/late-result/
+  close-drain metrics truth as S3. Fake-local tests use a tiny localhost
+  HTTP endpoint with static dummy credentials and no real AWS account.
 
 ## Grug Truth
 
