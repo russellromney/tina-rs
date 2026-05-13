@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tina::{
     Address, Context, DeferredReply, Effect, Isolate, Outbound, RestartBudget, RestartPolicy,
-    RestartableChildDefinition, Shard, ShardId, noop, reply, stop,
+    RestartableChildDefinition, Shard, ShardId, noop, stop,
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutcome, CallOutput,
@@ -46,6 +46,7 @@ impl Isolate for EchoConnection {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = ConsumerShard;
 
@@ -145,6 +146,7 @@ impl Isolate for EchoListener {
     type Reply = ();
     type Send = Outbound<ListenerMsg>;
     type Spawn = RestartableChildDefinition<EchoConnection>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ListenerMsg>;
     type Shard = ConsumerShard;
 
@@ -328,6 +330,7 @@ impl Isolate for ObservedTarget {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ObservedTargetMsg>;
     type Shard = ConsumerShard;
 
@@ -359,6 +362,7 @@ impl Isolate for ObservedSender {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ObservedSenderMsg>;
     type Shard = ConsumerShard;
 
@@ -451,24 +455,36 @@ impl Isolate for ReplyWorker {
     type Reply = WorkerReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WorkerRequest>;
     type Shard = ConsumerShard;
+
+    fn handle_call(
+        &mut self,
+        msg: Self::Message,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            WorkerRequest::ReplyNow => call.reply(WorkerReply("pong")),
+            WorkerRequest::DoNotReply => {
+                // Hold the reply authority so the call stays pending
+                // until timeout. The abandoned-caller guard closes
+                // uncaptured callers immediately; keeping an explicit
+                // request context alive is the legitimate deferred path.
+                self.held = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+            WorkerRequest::Stop => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
 
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerRequest::ReplyNow => reply(WorkerReply("pong")),
-            WorkerRequest::DoNotReply => {
-                // Hold the reply slot so the call stays pending until
-                // timeout. The abandoned-caller guard closes uncaptured
-                // callers immediately; keeping the slot alive is the
-                // legitimate way to defer a reply indefinitely.
-                self.held = Some(ctx.take_reply_slot().unwrap());
-                noop()
-            }
+            WorkerRequest::ReplyNow | WorkerRequest::DoNotReply => noop(),
             WorkerRequest::Stop => stop(),
         }
     }
@@ -496,6 +512,7 @@ impl Isolate for CallerWorker {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CallerMsg>;
     type Shard = ConsumerShard;
 

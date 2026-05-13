@@ -21,6 +21,30 @@ spawn(ChildDefinition::new(Connection { stream }, 16))
 
 If it stops, it stops.
 
+When the parent needs to talk to the child after spawning it, use
+`spawn_observed`.
+
+```rust
+enum ParentMsg {
+    StartChild,
+    ChildStarted(Result<ChildRef<ChildMsg, ChildReply>, SpawnObservedError>),
+}
+
+spawn_observed(ChildDefinition::new(Child::default(), 16))
+    .reply(ParentMsg::ChildStarted)
+```
+
+The result is delivered as an ordinary later parent message. `ChildRef` carries
+the typed `Address<ChildMsg, ChildReply>` plus its generation. A restart creates
+a fresh child incarnation; the old address/ref is stale and sends through it
+close or reject like any stale address.
+
+`SpawnObservedError` is for spawn construction rejection, such as a zero
+mailbox capacity. If the parent mailbox itself is full or closed when the
+continuation should be delivered, Tina records the normal send rejection in
+the trace. It does not add a hidden queue or bypass the parent's mailbox to
+force the continuation through.
+
 ## Restartable Child
 
 Use `RestartableChildDefinition` when the child is part of service health.

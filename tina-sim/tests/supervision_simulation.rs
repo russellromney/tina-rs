@@ -50,6 +50,7 @@ impl Isolate for Worker {
     type Reply = ();
     type Send = Outbound<Never>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WorkerMsg>;
     type Shard = TestShard;
 
@@ -106,6 +107,7 @@ impl Isolate for RestartableParent {
     type Reply = ();
     type Send = Outbound<Never>;
     type Spawn = RestartableChildDefinition<Worker>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
@@ -135,6 +137,7 @@ impl Isolate for DynamicBootstrapParent {
     type Reply = ();
     type Send = Outbound<Never>;
     type Spawn = RestartableChildDefinition<Worker>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
@@ -177,6 +180,7 @@ impl Isolate for OneShotParent {
     type Reply = ();
     type Send = Outbound<Never>;
     type Spawn = ChildDefinition<Worker>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 
@@ -216,6 +220,7 @@ impl Isolate for StaleSender {
     type Reply = ();
     type Send = Outbound<WorkerMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SenderMsg>;
     type Shard = TestShard;
 
@@ -250,6 +255,7 @@ impl Isolate for Grandchild {
     type Reply = ();
     type Send = Outbound<Never>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<GrandchildMsg>;
     type Shard = TestShard;
 
@@ -277,6 +283,7 @@ impl Isolate for ChildSpawner {
     type Reply = ();
     type Send = Outbound<Never>;
     type Spawn = RestartableChildDefinition<Grandchild>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ChildMsg>;
     type Shard = TestShard;
 
@@ -312,6 +319,7 @@ impl Isolate for NestedParent {
     type Reply = ();
     type Send = Outbound<Never>;
     type Spawn = RestartableChildDefinition<ChildSpawner>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ParentMsg>;
     type Shard = TestShard;
 

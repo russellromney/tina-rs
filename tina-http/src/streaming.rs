@@ -51,8 +51,8 @@
 use std::convert::Infallible;
 use std::marker::PhantomData;
 
-use tina::Address;
 use tina::prelude::*;
+use tina::{Address, CallContext};
 
 /// Pulled by the consumer from a chunk source.
 #[derive(Debug, Clone)]
@@ -268,13 +268,29 @@ impl<S: Shard + 'static> Isolate for IterBodySource<S> {
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
+            ResponseChunkMsg::Cancel => stop(),
+            _ => reply(self.next_reply(msg)),
+        }
+    }
+
+    fn handle_call(&mut self, msg: ResponseChunkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => stop(),
+            _ => call.reply(self.next_reply(msg)),
+        }
+    }
+}
+
+impl<S: Shard + 'static> IterBodySource<S> {
+    fn next_reply(&mut self, msg: ResponseChunkMsg) -> ResponseChunkReply {
+        match msg {
             ResponseChunkMsg::Next => match self.iter.next() {
-                Some(bytes) if !bytes.is_empty() => reply(ResponseChunkReply::Chunk(bytes)),
+                Some(bytes) if !bytes.is_empty() => ResponseChunkReply::Chunk(bytes),
                 // Empty `Vec<u8>` is treated as `Eof` so the iterator
                 // can signal end-of-stream without an explicit option.
-                _ => reply(ResponseChunkReply::Eof),
+                _ => ResponseChunkReply::Eof,
             },
-            ResponseChunkMsg::Cancel => stop(),
+            ResponseChunkMsg::Cancel => ResponseChunkReply::Eof,
         }
     }
 }

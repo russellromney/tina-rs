@@ -251,6 +251,7 @@ fn service_call_timeout_returns_504_on_the_wire() {
 
     use http::StatusCode;
     use tina::prelude::*;
+    use tina::{CallContext, RequestContext};
     use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
     use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
@@ -267,7 +268,9 @@ fn service_call_timeout_returns_504_on_the_wire() {
     /// Service that never replies. The connection isolate's `call`
     /// will time out.
     #[derive(Debug, Default)]
-    struct DropService;
+    struct DropService {
+        pending: Vec<RequestContext<HttpResponse>>,
+    }
     impl Isolate for DropService {
         tina::isolate_types! {
             message: HttpRequest,
@@ -285,6 +288,17 @@ fn service_call_timeout_returns_504_on_the_wire() {
             // Never reply. The caller's call timeout fires.
             noop()
         }
+
+        fn handle_call(
+            &mut self,
+            _request: HttpRequest,
+            call: CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            // Carry the authority so the caller observes its timeout
+            // instead of the new unused-call-context rejection.
+            self.pending.push(call.into_request_context());
+            noop()
+        }
     }
 
     let runtime = ThreadedRuntime::with_config(
@@ -297,7 +311,12 @@ fn service_call_timeout_returns_504_on_the_wire() {
         },
     );
     let svc = runtime
-        .register_with_capacity::<DropService, Infallible>(DropService, 8)
+        .register_with_capacity::<DropService, Infallible>(
+            DropService {
+                pending: Vec::new(),
+            },
+            8,
+        )
         .expect("register service");
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");

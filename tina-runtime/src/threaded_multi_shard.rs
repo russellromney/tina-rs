@@ -35,7 +35,8 @@ use crate::sharded::ReplyAdapter;
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
-    IdSource, IntoErasedSpawn, QueuedRemoteEnvelope, Runtime, SendableQueuedRemoteEnvelope,
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, QueuedRemoteEnvelope, Runtime,
+    SendableQueuedRemoteEnvelope,
 };
 
 /// One live worker-per-shard runtime over a fixed shard set.
@@ -275,6 +276,7 @@ where
         I::Message: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
     {

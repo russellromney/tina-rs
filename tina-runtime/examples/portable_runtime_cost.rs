@@ -221,6 +221,12 @@ impl PingWorker {
             PingMsg::Ping => reply(PingReply::Pong),
         }
     }
+
+    fn handle_call(&mut self, msg: PingMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            PingMsg::Ping => call.reply(PingReply::Pong),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

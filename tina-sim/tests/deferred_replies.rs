@@ -49,19 +49,33 @@ impl Isolate for DeferredSvc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SvcMsg>;
     type Shard = DefShard;
+
+    fn handle_call(
+        &mut self,
+        msg: Self::Message,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            SvcMsg::Capture => {
+                self.slot = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+            SvcMsg::ReplyStored | SvcMsg::DropStored => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
 
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            SvcMsg::Capture => {
-                self.slot = Some(ctx.take_reply_slot().unwrap());
-                noop()
-            }
+            SvcMsg::Capture => noop(),
             SvcMsg::ReplyStored => {
                 let slot = self.slot.take().expect("slot stored");
                 reply_to(slot, SvcReply(self.payload))
@@ -91,6 +105,7 @@ impl Isolate for Caller {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CallerMsg>;
     type Shard = DefShard;
 
@@ -234,16 +249,25 @@ fn sim_panic_after_capture_drops_slot_and_closes_caller() {
         type Reply = SvcReply;
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SvcMsg>;
         type Shard = DefShard;
+
+        fn handle_call(
+            &mut self,
+            _msg: Self::Message,
+            call: tina::CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            let _slot = call.into_request_context().into_deferred();
+            panic!("boom after deferred capture");
+        }
 
         fn handle(
             &mut self,
             _msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot().unwrap();
-            panic!("boom after deferred capture");
+            noop()
         }
     }
 
@@ -296,19 +320,31 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Reply = HaltReply;
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HaltMsg>;
         type Shard = DefShard;
+
+        fn handle_call(
+            &mut self,
+            msg: Self::Message,
+            call: tina::CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            match msg {
+                HaltMsg::Capture => {
+                    self.slots.push(call.into_request_context().into_deferred());
+                    noop()
+                }
+                HaltMsg::Halt => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            }
+        }
 
         fn handle(
             &mut self,
             msg: Self::Message,
-            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                HaltMsg::Capture => {
-                    self.slots.push(ctx.take_reply_slot().unwrap());
-                    noop()
-                }
+                HaltMsg::Capture => noop(),
                 HaltMsg::Halt => Effect::Stop,
             }
         }
@@ -329,6 +365,7 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HCallerMsg>;
         type Shard = DefShard;
         fn handle(

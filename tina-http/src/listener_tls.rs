@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
     CallError, TlsListenerId, TlsStreamId, tls_accept, tls_bind, tls_close, tls_close_listener,
 };
@@ -125,6 +126,7 @@ pub struct HttpsListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stat
     /// connection child (parity with the plain HTTP listener).
     metrics: Option<BodyMetrics>,
     listener: Option<TlsListenerId>,
+    pending_start_reply: Option<RequestContext<Result<HttpsReady, HttpsStartupError>>>,
     /// Set on the first `Start`. Second Start replies `AlreadyStarted`.
     started: bool,
     stopping: bool,
@@ -151,6 +153,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpsListener<S,
             tls_io_timeout: config.tls_io_timeout,
             metrics: None,
             listener: None,
+            pending_start_reply: None,
             started: false,
             stopping: false,
             _shard: PhantomData,
@@ -199,17 +202,34 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 self.listener = Some(listener);
                 if self.stopping {
                     // Stop arrived while bind was in flight. Close
-                    // the just-bound listener; no reply.
+                    // the just-bound listener; fail any pending startup call.
                     let listener = self.listener.take().expect("set just above");
-                    return tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed);
+                    let close =
+                        tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed);
+                    return match self.pending_start_reply.take() {
+                        Some(request) => batch(vec![
+                            reply_to_request(request, Err(HttpsStartupError::AlreadyStarted)),
+                            close,
+                        ]),
+                        None => close,
+                    };
                 }
-                let ready_effect: Effect<Self> = reply(Ok(HttpsReady { local_addr }));
+                let ready = Ok(HttpsReady { local_addr });
+                let ready_effect: Effect<Self> = match self.pending_start_reply.take() {
+                    Some(request) => reply_to_request(request, ready),
+                    None => reply(ready),
+                };
                 let accept_effect: Effect<Self> =
                     tls_accept(listener, self.tls_accept_timeout).reply(HttpsListenerMsg::Accepted);
                 batch(vec![ready_effect, accept_effect])
             }
             HttpsListenerMsg::Bound(Err(source)) => {
-                batch(vec![reply(Err(HttpsStartupError::Bind { source })), stop()])
+                let error = Err(HttpsStartupError::Bind { source });
+                let reply_effect = match self.pending_start_reply.take() {
+                    Some(request) => reply_to_request(request, error),
+                    None => reply(error),
+                };
+                batch(vec![reply_effect, stop()])
             }
 
             HttpsListenerMsg::Accepted(Ok((stream, _peer))) => {
@@ -273,6 +293,25 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
             HttpsListenerMsg::ListenerClosed(_) => stop(),
             HttpsListenerMsg::StreamClosed(_) => noop(),
+        }
+    }
+
+    fn handle_call(&mut self, msg: HttpsListenerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            HttpsListenerMsg::Start => {
+                if self.started {
+                    return call.reply(Err(HttpsStartupError::AlreadyStarted));
+                }
+                self.started = true;
+                self.pending_start_reply = Some(call.into_request_context());
+                tls_bind(
+                    self.bind_addr,
+                    self.identity.certificate_chain_der.clone(),
+                    self.identity.private_key_der.clone(),
+                )
+                .reply(HttpsListenerMsg::Bound)
+            }
+            _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }

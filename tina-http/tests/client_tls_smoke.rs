@@ -132,6 +132,7 @@ fn run_one_fetch(
         CallOutcome::Full => Err(HttpClientError::Busy),
         CallOutcome::Closed => Err(HttpClientError::Closed),
         CallOutcome::Timeout => Err(HttpClientError::Timeout),
+        CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
     };
     let _ = runtime.shutdown();
     result

@@ -18,8 +18,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    AddressGeneration, Context, DeferredReplyHandle, Effect, Isolate, IsolateId, MessageCaller,
-    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, TrySendError,
+    AddressGeneration, CallContext, CallRejectedReason, Context, DeferredReplyHandle, Effect,
+    Isolate, IsolateId, MessageCaller, Outbound as TinaOutbound, RestartBudgetState, Shard,
+    ShardId, SpawnObservedError, TrySendError,
 };
 use tina_runtime::{
     CallId, CallInput, CallKind, CallOutcome, CallOutput, EffectKind, ListenerId,
@@ -117,6 +118,7 @@ pub(crate) enum MessageCallContext {
         call_id: CallId,
         requester: RegisteredAddress,
         cause: tina_runtime::CauseId,
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 
@@ -381,6 +383,15 @@ where
         caller: Option<MessageCaller>,
         now: std::time::Instant,
     ) -> ErasedEffect<S>;
+
+    fn handle_call_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+        caller: MessageCaller,
+        now: std::time::Instant,
+    ) -> ErasedEffect<S>;
 }
 
 pub(crate) trait ErasedSpawn<S>
@@ -388,6 +399,14 @@ where
     S: Shard,
 {
     fn spawn(self: Box<Self>, sim: &mut Simulator<S>, parent: IsolateId) -> SpawnOutcome<S>;
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S>, SpawnObservedError> {
+        Ok(self.spawn(sim, parent))
+    }
 }
 
 pub(crate) trait ErasedRestartRecipe<S>
@@ -404,6 +423,24 @@ where
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S>>;
 }
 
+pub(crate) trait ErasedSpawnObserved<S>
+where
+    S: Shard,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S>;
+}
+
+pub(crate) trait IntoErasedSpawnObserved<S, ParentMessage>
+where
+    S: Shard,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S>>;
+}
+
 pub(crate) struct HandlerAdapter<I, Outbound>
 where
     I: Isolate,
@@ -417,6 +454,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -444,6 +482,28 @@ where
 
         erase_effect::<I, S, Msg, Outbound>(effect)
     }
+
+    fn handle_call_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+        caller: MessageCaller,
+        now: std::time::Instant,
+    ) -> ErasedEffect<S> {
+        let message = message.downcast::<Msg>().unwrap_or_else(|_| {
+            panic!("simulator attempted to deliver a call handler message with the wrong type")
+        });
+
+        let effect = {
+            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_now(now)
+                .with_caller(caller);
+            self.isolate.handle_call(*message, CallContext::new(ctx))
+        };
+
+        erase_effect::<I, S, Msg, Outbound>(effect)
+    }
 }
 
 pub(crate) fn erase_effect<I, S, Msg, Outbound>(effect: Effect<I>) -> ErasedEffect<S>
@@ -451,6 +511,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -459,6 +520,7 @@ where
     match effect {
         Effect::Noop => ErasedEffect::Noop,
         Effect::Reply(reply) => ErasedEffect::Reply(Box::new(reply)),
+        Effect::Reject(reason) => ErasedEffect::Reject(reason),
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
@@ -469,6 +531,9 @@ where
             })
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::SpawnObserved(spawn) => {
+            ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
         // Sim has no host result waiter surface; StopWith stops the isolate
         // and drops the value. Trace still distinguishes via EffectKind.
@@ -593,8 +658,10 @@ where
 {
     Noop,
     Reply(Box<dyn Any>),
+    Reject(CallRejectedReason),
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S>>),
+    SpawnObserved(Box<dyn ErasedSpawnObserved<S>>),
     Stop,
     StopWith,
     RestartChildren,
@@ -614,14 +681,53 @@ where
         match self {
             Self::Noop => EffectKind::Noop,
             Self::Reply(_) => EffectKind::Reply,
+            Self::Reject(_) => EffectKind::Reject,
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
+            Self::SpawnObserved(_) => EffectKind::SpawnObserved,
             Self::Stop => EffectKind::Stop,
             Self::StopWith => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
+        }
+    }
+
+    pub(crate) fn consumes_call_context(&self) -> bool {
+        match self {
+            Self::Reply(_) | Self::Reject(_) => true,
+            Self::Batch(effects) => {
+                for effect in effects {
+                    if effect.consumes_call_context() {
+                        return true;
+                    }
+                    if effect.stops_before_consuming_call_context() {
+                        return false;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn stops_before_consuming_call_context(&self) -> bool {
+        match self {
+            Self::Stop | Self::StopWith => true,
+            Self::Reply(_) | Self::Reject(_) => false,
+            Self::Batch(effects) => {
+                for effect in effects {
+                    if effect.consumes_call_context() {
+                        return false;
+                    }
+                    if effect.stops_before_consuming_call_context() {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 }
@@ -661,6 +767,7 @@ pub(crate) fn remote_call_outcome_envelope(
         call_id,
         requester,
         cause,
+        ..
     }) = context
     else {
         return None;
@@ -684,6 +791,7 @@ pub(crate) enum RemoteCallOutcome {
     Replied(Box<dyn Any>),
     Full,
     Closed,
+    Rejected(CallRejectedReason),
 }
 
 pub(crate) struct ErasedCall {
@@ -720,6 +828,14 @@ where
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S>>>,
     pub(crate) bootstrap_message: Option<Box<dyn Any>>,
+}
+
+pub(crate) struct SpawnObservedOutcome<S>
+where
+    S: Shard,
+{
+    pub(crate) spawn: Option<SpawnOutcome<S>>,
+    pub(crate) continuation: Option<Box<dyn Any>>,
 }
 
 pub(crate) struct ChildRecord<S>

@@ -9,7 +9,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, Context, Effect, Isolate, Outbound, RequestContext, noop, reply, reply_to_request,
+    Address, CallContext, Context, Effect, Isolate, Outbound, RequestContext, batch, noop,
+    reply_to_request,
 };
 
 use super::*;
@@ -41,6 +42,7 @@ impl Isolate for Probe {
     type Reply = ProbeReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -49,7 +51,11 @@ impl Isolate for Probe {
         _msg: Self::Message,
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
-        reply(ProbeReply(42))
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(ProbeReply(42))
     }
 }
 
@@ -79,26 +85,36 @@ impl Isolate for Svc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SvcMsg>;
     type Shard = TestShard;
 
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            SvcMsg::Start => {
-                let req = ctx.take_request_context().unwrap();
-                call(self.probe, ProbeMsg, Duration::from_millis(50))
-                    .reply_with_request(req, SvcMsg::ProbeResult)
-            }
+            SvcMsg::Start => noop(),
             SvcMsg::ProbeResult(req, outcome) => match outcome {
                 CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
                     reply_to_request(req, SvcReply::Ready)
                 }
                 _ => reply_to_request(req, SvcReply::NotReady),
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SvcMsg::Start => {
+                let req = call_ctx.into_request_context();
+                call(self.probe, ProbeMsg, Duration::from_millis(50))
+                    .reply_with_request(req, SvcMsg::ProbeResult)
+            }
+            SvcMsg::ProbeResult(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -119,6 +135,7 @@ impl Isolate for Client {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = TestShard;
 
@@ -198,28 +215,38 @@ impl Isolate for HandleSvc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<HandleSvcMsg>;
     type Shard = TestShard;
 
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HandleSvcMsg::Start => {
-                let req = ctx.take_request_context().unwrap();
-                let (effect, _handle) =
-                    call_with_handle(self.probe, ProbeMsg, Duration::from_millis(50))
-                        .reply_with_request(req, HandleSvcMsg::ProbeResult);
-                effect
-            }
+            HandleSvcMsg::Start => noop(),
             HandleSvcMsg::ProbeResult(req, outcome) => match outcome {
                 CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
                     reply_to_request(req, SvcReply::Ready)
                 }
                 _ => reply_to_request(req, SvcReply::NotReady),
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            HandleSvcMsg::Start => {
+                let req = call_ctx.into_request_context();
+                let (effect, _handle) =
+                    call_with_handle(self.probe, ProbeMsg, Duration::from_millis(50))
+                        .reply_with_request(req, HandleSvcMsg::ProbeResult);
+                effect
+            }
+            HandleSvcMsg::ProbeResult(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -247,6 +274,7 @@ fn isolate_call_with_handle_reply_with_request_replies_to_original_caller() {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HClientMsg>;
         type Shard = TestShard;
 
@@ -287,7 +315,7 @@ fn isolate_call_with_handle_reply_with_request_replies_to_original_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// Abandoned caller settles with Closed + CallReplyAbandoned trace
+// Abandoned caller settles with ReplyAbandoned + CallReplyAbandoned trace
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -306,6 +334,7 @@ impl Isolate for AbandonSvc {
     type Reply = AbandonReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -314,6 +343,10 @@ impl Isolate for AbandonSvc {
         _msg: Self::Message,
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, _call: CallContext<'_, Self>) -> Effect<Self> {
         noop()
     }
 }
@@ -334,6 +367,7 @@ impl Isolate for AbandonClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AbandonClientMsg>;
     type Shard = TestShard;
 
@@ -358,8 +392,8 @@ impl Isolate for AbandonClient {
 }
 
 #[test]
-fn abandoned_caller_traces_warning_but_times_out() {
-    let (mut runtime, clock) = new_manual_runtime();
+fn abandoned_caller_rejects_immediately() {
+    let (mut runtime, _clock) = new_manual_runtime();
     let svc = runtime.register(AbandonSvc, TestMailbox::new(4));
     let out = Rc::new(RefCell::new(Vec::new()));
     let caller = runtime.register(
@@ -374,7 +408,6 @@ fn abandoned_caller_traces_warning_but_times_out() {
         .unwrap();
     step_to_idle(&mut runtime);
 
-    // Guard emitted trace warning but did not close the call.
     assert_eq!(
         runtime
             .trace()
@@ -384,11 +417,12 @@ fn abandoned_caller_traces_warning_but_times_out() {
         1
     );
 
-    // Advance clock past timeout to trigger the timeout.
-    clock.advance(Duration::from_secs(61));
-    step_to_idle(&mut runtime);
-
-    assert_eq!(out.borrow().as_slice(), [CallOutcome::Timeout]);
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Rejected(
+            tina::CallRejectedReason::ReplyAbandoned
+        )]
+    );
 
     let abandoned = runtime
         .trace()
@@ -420,6 +454,7 @@ impl Isolate for ImmediateSvc {
     type Reply = ImmediateReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -428,7 +463,11 @@ impl Isolate for ImmediateSvc {
         _msg: Self::Message,
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
-        reply(ImmediateReply::Pong)
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(ImmediateReply::Pong)
     }
 }
 
@@ -448,6 +487,7 @@ impl Isolate for ImmClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ImmClientMsg>;
     type Shard = TestShard;
 
@@ -500,6 +540,298 @@ fn immediate_reply_is_not_falsely_flagged_abandoned() {
 }
 
 // ---------------------------------------------------------------------------
+// Batched reply and abandoned-context returned effects
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct AuditMsg(&'static str);
+
+#[derive(Debug)]
+struct Audit {
+    seen: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl Isolate for Audit {
+    type Message = AuditMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        self.seen.borrow_mut().push(msg.0);
+        noop()
+    }
+}
+
+#[derive(Debug)]
+enum BatchMsg {
+    BatchedReply,
+    AbandonButSend,
+    ExplicitReject,
+    ReplyThenReject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchReply {
+    Ok,
+}
+
+#[derive(Debug)]
+struct BatchSvc {
+    audit: Address<AuditMsg>,
+}
+
+impl Isolate for BatchSvc {
+    type Message = BatchMsg;
+    type Reply = BatchReply;
+    type Send = Outbound<AuditMsg>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            BatchMsg::BatchedReply => batch([
+                call.reply(BatchReply::Ok),
+                tina::send(self.audit, AuditMsg("batched")),
+            ]),
+            BatchMsg::AbandonButSend => tina::send(self.audit, AuditMsg("abandoned")),
+            BatchMsg::ExplicitReject => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            BatchMsg::ReplyThenReject => batch([
+                call.reply(BatchReply::Ok),
+                tina::reject(tina::CallRejectedReason::UnsupportedMessage),
+            ]),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BatchClientMsg {
+    Start(Address<BatchMsg, BatchReply>, BatchMsg),
+    Returned(CallOutcome<BatchReply>),
+}
+
+#[derive(Debug)]
+struct BatchClient {
+    out: Rc<RefCell<Vec<CallOutcome<BatchReply>>>>,
+}
+
+impl Isolate for BatchClient {
+    type Message = BatchClientMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<BatchClientMsg>;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            BatchClientMsg::Start(svc, request) => Effect::Call(RuntimeCall::isolate_call(
+                svc,
+                request,
+                Duration::from_secs(60),
+                BatchClientMsg::Returned,
+            )),
+            BatchClientMsg::Returned(outcome) => {
+                self.out.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn batched_reply_consumes_call_authority_and_runs_later_effects() {
+    let (mut runtime, _clock) = new_manual_runtime();
+    let audit_seen = Rc::new(RefCell::new(Vec::new()));
+    let audit = runtime.register(
+        Audit {
+            seen: Rc::clone(&audit_seen),
+        },
+        TestMailbox::new(4),
+    );
+    let svc = runtime.register(BatchSvc { audit }, TestMailbox::new(4));
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        BatchClient {
+            out: Rc::clone(&out),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime
+        .try_send(caller, BatchClientMsg::Start(svc, BatchMsg::BatchedReply))
+        .unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Replied(BatchReply::Ok)]
+    );
+    assert_eq!(audit_seen.borrow().as_slice(), ["batched"]);
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|e| matches!(e.kind(), RuntimeEventKind::CallReplyAbandoned { .. }))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn unused_call_authority_rejects_but_returned_effect_still_runs() {
+    let (mut runtime, _clock) = new_manual_runtime();
+    let audit_seen = Rc::new(RefCell::new(Vec::new()));
+    let audit = runtime.register(
+        Audit {
+            seen: Rc::clone(&audit_seen),
+        },
+        TestMailbox::new(4),
+    );
+    let svc = runtime.register(BatchSvc { audit }, TestMailbox::new(4));
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        BatchClient {
+            out: Rc::clone(&out),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime
+        .try_send(caller, BatchClientMsg::Start(svc, BatchMsg::AbandonButSend))
+        .unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Rejected(
+            tina::CallRejectedReason::ReplyAbandoned
+        )]
+    );
+    assert_eq!(audit_seen.borrow().as_slice(), ["abandoned"]);
+}
+
+#[test]
+fn explicit_reject_uses_rejected_trace_vocabulary() {
+    let (mut runtime, _clock) = new_manual_runtime();
+    let audit = runtime.register(
+        Audit {
+            seen: Rc::new(RefCell::new(Vec::new())),
+        },
+        TestMailbox::new(4),
+    );
+    let svc = runtime.register(BatchSvc { audit }, TestMailbox::new(4));
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        BatchClient {
+            out: Rc::clone(&out),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime
+        .try_send(caller, BatchClientMsg::Start(svc, BatchMsg::ExplicitReject))
+        .unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Rejected(
+            tina::CallRejectedReason::UnsupportedMessage
+        )]
+    );
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|e| matches!(e.kind(), RuntimeEventKind::CallReplyAbandoned { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|e| matches!(
+                e.kind(),
+                RuntimeEventKind::CallRejected {
+                    reason: tina::CallRejectedReason::UnsupportedMessage,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn batch_reply_consumes_authority_before_later_reject() {
+    let (mut runtime, _clock) = new_manual_runtime();
+    let audit = runtime.register(
+        Audit {
+            seen: Rc::new(RefCell::new(Vec::new())),
+        },
+        TestMailbox::new(4),
+    );
+    let svc = runtime.register(BatchSvc { audit }, TestMailbox::new(4));
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        BatchClient {
+            out: Rc::clone(&out),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime
+        .try_send(
+            caller,
+            BatchClientMsg::Start(svc, BatchMsg::ReplyThenReject),
+        )
+        .unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Replied(BatchReply::Ok)]
+    );
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|e| matches!(
+                e.kind(),
+                RuntimeEventKind::CallReplyRejected { .. }
+                    | RuntimeEventKind::CallRejected { .. }
+                    | RuntimeEventKind::CallReplyAbandoned { .. }
+            ))
+            .count(),
+        0
+    );
+}
+
+// ---------------------------------------------------------------------------
 // ObservedSend reply_with_request helper
 // ---------------------------------------------------------------------------
 
@@ -514,6 +846,7 @@ impl Isolate for Sink {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -542,24 +875,34 @@ impl Isolate for ObsSvc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ObsSvcMsg>;
     type Shard = TestShard;
 
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ObsSvcMsg::Start => {
-                let req = ctx.take_request_context().unwrap();
-                crate::send_observed(self.sink, SinkMsg)
-                    .reply_with_request(req, ObsSvcMsg::SendResult)
-            }
+            ObsSvcMsg::Start => noop(),
             ObsSvcMsg::SendResult(req, outcome) => match outcome {
                 SendOutcome::Accepted => reply_to_request(req, SvcReply::Ready),
                 _ => reply_to_request(req, SvcReply::NotReady),
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ObsSvcMsg::Start => {
+                let req = call.into_request_context();
+                crate::send_observed(self.sink, SinkMsg)
+                    .reply_with_request(req, ObsSvcMsg::SendResult)
+            }
+            ObsSvcMsg::SendResult(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -587,6 +930,7 @@ fn observed_send_reply_with_request_carries_request_context() {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<OClientMsg>;
         type Shard = TestShard;
 
@@ -637,6 +981,7 @@ fn observed_send_reply_with_request_carries_request_context() {
 ///     type Message = (); type Reply = u32;
 ///     type Send = Outbound<std::convert::Infallible>;
 ///     type Spawn = std::convert::Infallible;
+///     type SpawnObserved = std::convert::Infallible;
 ///     type Call = std::convert::Infallible;
 ///     type Shard = tina::SingleShard;
 ///     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {

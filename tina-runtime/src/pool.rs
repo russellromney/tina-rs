@@ -47,8 +47,8 @@ use tina::pool::{
 };
 use tina::runtime_internal::{deferred_handle_ref, handle_shared};
 use tina::{
-    Context, DeferredReply, DeferredSlotShared, DeferredSlotState, Effect, Isolate, Outbound,
-    Shard, batch, noop, reply, reply_to,
+    CallContext, Context, DeferredReply, DeferredSlotShared, DeferredSlotState, Effect, Isolate,
+    Outbound, Shard, batch, noop, reply, reply_to,
 };
 
 use crate::call::RuntimeCall;
@@ -445,6 +445,10 @@ where
             }
         };
 
+        self.handle_acquire_slot(slot)
+    }
+
+    fn handle_acquire_slot(&mut self, slot: DeferredReply<WorkerPoolReply<H>>) -> Effect<Self> {
         if let Some(resource_id) = self.idle.pop_front() {
             let lease = self.mint_lease(resource_id);
             let generation = lease.generation();
@@ -782,6 +786,7 @@ where
         CallOutcome::Timeout => Err(AcquireFailure::CallTimeout),
         CallOutcome::Full => Err(AcquireFailure::CallFull),
         CallOutcome::Closed => Err(AcquireFailure::CallClosed),
+        CallOutcome::Rejected(reason) => Err(AcquireFailure::CallRejected(reason)),
     }
 }
 
@@ -814,6 +819,7 @@ where
         CallOutcome::Timeout => Err(ReleaseFailure::CallTimeout),
         CallOutcome::Full => Err(ReleaseFailure::CallFull),
         CallOutcome::Closed => Err(ReleaseFailure::CallClosed),
+        CallOutcome::Rejected(reason) => Err(ReleaseFailure::CallRejected(reason)),
     }
 }
 
@@ -844,6 +850,7 @@ where
     type Reply = WorkerPoolReply<H>;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = Infallible;
     type Call = RuntimeCall<WorkerPoolMsg<H>>;
     type Shard = S;
 
@@ -864,6 +871,33 @@ where
             }
             WorkerPoolMsg::Close(mode) => self.handle_close(mode),
             WorkerPoolMsg::PressureReport => reply(WorkerPoolReply::Pressure(self.pressure())),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerPoolMsg<H>, call: CallContext<'_, Self>) -> Effect<Self> {
+        // Always sweep first: cancelled waiters and rejected
+        // dispatches both need to be reclaimed before any state
+        // decision in this turn.
+        self.sweep_waiters();
+        self.sweep_in_flight();
+        match msg {
+            WorkerPoolMsg::Acquire => {
+                if self.closed.is_some() {
+                    self.counters.closed += 1;
+                    return call.reply(WorkerPoolReply::Acquire(AcquireOutcome::Closed));
+                }
+                let slot = call.into_request_context().into_deferred();
+                self.handle_acquire_slot(slot)
+            }
+            WorkerPoolMsg::Release { lease, disposition } => {
+                let _ = call;
+                self.handle_release(lease, disposition)
+            }
+            WorkerPoolMsg::Close(mode) => {
+                let _ = call;
+                self.handle_close(mode)
+            }
+            WorkerPoolMsg::PressureReport => call.reply(WorkerPoolReply::Pressure(self.pressure())),
         }
     }
 }

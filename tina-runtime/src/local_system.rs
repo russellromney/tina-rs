@@ -23,8 +23,9 @@ use crate::mailbox::MailboxFactory;
 use crate::observer::TraceObserver;
 use crate::trace::{RuntimeEvent, RuntimeEventKind};
 use crate::{
-    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, IntoErasedSpawn, PreallocationConfig, Runtime,
-    ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig, TraceRetention,
+    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, IntoErasedSpawn, IntoErasedSpawnObserved,
+    PreallocationConfig, Runtime, ThreadedMultiShardRuntime, ThreadedRuntime,
+    ThreadedRuntimeConfig, TraceRetention,
 };
 
 /// Preferred public bounded-shape config for local Tina systems.
@@ -703,6 +704,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -1128,6 +1130,7 @@ where
         I::Message: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
     {
