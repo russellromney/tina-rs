@@ -4,8 +4,8 @@
 
 - Ready to implement.
 - One PR.
-- Can run beside 088/089 because this owns `tina-http` WebSocket surface and
-  specimens, not bridges or replay tooling.
+- Do not run beside 057 gRPC or other broad `tina-http` protocol work unless
+  owners coordinate files. Can run beside replay/tooling-only work.
 
 ## Grug Truth
 
@@ -214,6 +214,8 @@ Update:
 - `cargo fmt --all --check`
 - `cargo test -p tina-http websocket --tests`
 - `cargo clippy -p tina-http --tests -- -D warnings`
+- `cargo test -p tina-http http2 --tests` if upgrade/listener/shared HTTP code
+  changes
 - specimen smoke test
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` if docs/rustdoc
   changed
