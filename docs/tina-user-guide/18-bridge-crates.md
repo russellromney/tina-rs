@@ -9,9 +9,16 @@ The rule:
 > Tokio may speak ecosystem. Tina owns state. Bridge shows pressure.
 > Bridge may adapt. Bridge may not lie.
 
-If you can use a native Tina crate, do. Native HTTPS/1.1 lives in
-`tina-http`'s `HttpsListener` and `HttpClient` — explicit DER cert
-config, typed startup, matchable TLS errors. For repeated outbound
+If you can use a native Tina crate, do. Native HTTP/2 now has a
+server-first h2c path in `tina-http::Http2Listener`: cleartext
+prior-knowledge transport, bounded stream table, explicit
+connection/stream flow-control windows, and ordinary `HttpRequest` /
+`HttpResponse` service dispatch. First-form bodies are buffered under
+explicit request/response caps; outbound responses blocked by flow
+control park behind one bounded pending response until `WINDOW_UPDATE`.
+It is not gRPC, not HTTPS/2 ALPN, and not a broad client. Native HTTPS/1.1 lives in `tina-http`'s
+`HttpsListener` and `HttpClient` — explicit DER cert config, typed
+startup, matchable TLS errors. For repeated outbound
 requests against the same origin, `tina_http::build_keepalive_pool`
 hands you a `KeepalivePoolHandles { pool, connections }`: one TCP
 (or TLS) connection per pool slot serves many requests, with
@@ -30,8 +37,9 @@ lease admission. With `CloseMode::Drain`, the helper waits for
 leased connections to return before stopping connection isolates;
 if that deadline fires, the report names the remaining leased count
 and leaves connections running. Reach for a bridge when you need
-HTTP/2, ALPN, system trust roots, redirects/cookies, an existing
-Axum app, or a third-party SDK that only ships a Tokio client.
+outbound HTTP/2 client behavior, HTTPS/2 ALPN, system trust roots,
+redirects/cookies, an existing Axum app, or a third-party SDK that only
+ships a Tokio client.
 
 ## What ships today
 
@@ -39,7 +47,7 @@ Axum app, or a third-party SDK that only ships a Tokio client.
 | --- | --- | --- |
 | `tina-tokio-bridge` | Tokio caller → Tina isolate | A Tokio handler needs a bounded request/reply path into a Tina service. |
 | `tina-tower-bridge` | `tower::Service` over a Tina bridge | An Axum/Hyper/Tower stack wants to call a Tina service through normal Tower middleware. |
-| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; reqwest covers everything else. |
+| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; native HTTP/2 is server-side h2c first form only; reqwest covers everything else. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
 | `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
 | `tina-aws-bridge` | Tina caller → AWS SDK S3/SQS | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. Ships S3 (`PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`) and SQS (`SendMessage`, `ReceiveMessage`, `DeleteMessage`). The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
