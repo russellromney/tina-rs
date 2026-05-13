@@ -369,11 +369,15 @@ completion, or topology fact matters, it must be an `Op` or part of
 
 ```rust
 use tina_sim::dst::{
-    LiveReplayCapture, check_captured_replay, read_saved_replay_case,
-    write_saved_replay_case,
+    LiveReplayCapture, LiveReplayReport, RuntimeEventKindName, TraceProjection,
+    check_captured_replay, read_saved_replay_case, write_saved_replay_case,
 };
 
-let capture = LiveReplayCapture::from_events(
+let projection = TraceProjection::Projected {
+    included: vec![RuntimeEventKindName::CallCancelled],
+    ignored: vec![RuntimeEventKindName::HandlerStarted],
+};
+let capture = LiveReplayCapture::from_events_with_options(
     "late reply after cancel",
     seed,
     replay_config.clone(),
@@ -382,7 +386,9 @@ let capture = LiveReplayCapture::from_events(
     "late reply is rejected as CallerCancelled",
     "threaded runtime staging run",
     &live_trace,
-);
+    projection,
+    Vec::new(),
+)?;
 
 write_saved_replay_case("cases/late-reply.case", &capture, |op| op.to_string())?;
 
@@ -393,15 +399,34 @@ let case = saved.to_replay_case(
     "caller cancels before the worker reply is delivered",
     "late reply is rejected as CallerCancelled",
 )?;
-check_captured_replay(&capture, &case, run_case)?;
+check_captured_replay(&capture, &case, |case| {
+    let events = run_case_events(case)?;
+    LiveReplayReport::from_case_and_events(case, &events, (), capture.projection.clone())
+})?;
 ```
 
 The saved-case file is intentionally small and line-oriented. It stores
-name, seed, scenario, invariant, source, config debug/hash, expected
-event count/hash, and one `op=` line per materialized operation. Tina
-does not deserialize arbitrary service config for you; the caller
-supplies the typed `ReplayConfig` when loading, and the helper checks
-the config hash before replay.
+name, seed, scenario, invariant, source, config debug/hash, topology
+roles, projection debug, unsupported facts, expected event count/hash,
+and one `op=` line per materialized operation. Tina does not
+deserialize arbitrary service config for you; the caller supplies the
+typed `ReplayConfig` when loading, and the helper checks the config hash
+before replay.
+
+Projection is part of the contract. Use the exact trace hash only when
+the history/config fully model the run. If live-only events need to be
+stripped, use `TraceProjection::Projected` and name every included and
+ignored event kind. An event kind that is not named fails closed with a
+typed projection mismatch. Unsupported facts are also fail-closed: they
+are saved and printed in the mismatch report until the history/config
+is rich enough to model them.
+
+```rust
+let capture = capture.with_unsupported_fact(
+    "external HTTP completion",
+    "history does not include the response body/status yet",
+);
+```
 
 If replay cannot match the capture, `CapturedReplayMismatch` says what
 changed:
@@ -411,6 +436,9 @@ changed:   name, seed, scenario, config, history, event count, hash, invariant
 seed:      expected 42, got 43 (changed)
 config:    expected 0x..., got 0x... (changed)
 history:   expected 8 ops, got 7 ops (changed)
+unsupported fact: external HTTP completion (...)
+projection: expected Projected { ... }, got Projected { ... }
+ignored event kinds: HandlerStarted
 events:    expected 54, got 49 (changed)
 hash:      expected 0x..., got 0x... (changed)
 invariant: expected "...", got "..." (changed)
@@ -426,7 +454,7 @@ The copied workflow:
 ```text
 1. run live code with trace capture enabled
 2. project live inputs/resource completions/topology facts into Op history
-3. build LiveReplayCapture with seed, ReplayConfig, history, invariant, TraceShape
+3. build LiveReplayCapture with seed, ReplayConfig, topology/mailboxes, history, invariant, projection, unsupported facts, TraceShape
 4. save it with write_saved_replay_case
 5. run check_captured_replay against the simulator runner
 6. when it fails for the expected bug, use shrink_replay_case on capture.to_replay_case()
@@ -473,9 +501,11 @@ Good Tina simulation targets:
   `expecting` / `simulator_config`), `ReplayReport` (with
   `from_case_and_events` / `pinned_constants`), `ReplayConfig` (with
   `with_faults` / `with_mailbox` / `mailbox`), `observe_replay_case`,
-  `discover_constants`, `LiveReplayCapture`, `TraceShape`,
+  `discover_constants`, `LiveReplayCapture`, `LiveReplayReport`,
+  `TraceShape`, `TraceProjection`, `UnsupportedLiveFact`,
   `write_saved_replay_case`, `read_saved_replay_case`,
-  `check_captured_replay`, `CapturedReplayMismatch`,
+  `check_captured_replay`, `assert_captured_replay`,
+  `CapturedReplayMismatch`,
   `assert_replay_case`, `check_replay_case`, `sweep_seeds`,
   `shrink_replay_case`, `assert_replays`, `delete_shrink`,
   `InvariantSuite`.

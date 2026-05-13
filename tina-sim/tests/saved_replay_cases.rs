@@ -14,15 +14,27 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use tina::prelude::*;
-use tina_runtime::{RuntimeEventKind, SendRejectedReason};
+use tina::{IsolateId, ShardId};
+use tina_runtime::{EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
 use tina_sim::dst::{
-    LiveReplayCapture, ReplayCase, ReplayConfig, ReplayReport, assert_replay_case,
-    check_captured_replay, check_replay_case, discover_constants,
+    LiveReplayCapture, LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport,
+    RuntimeEventKindName, ShrinkConfig, TraceProjection, assert_replay_case, check_captured_replay,
+    check_replay_case, discover_constants, shrink_replay_case,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
 const SOURCE_ROLE: &str = "source";
 const SINK_ROLE: &str = "sink";
+
+fn fake_event(id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
+    RuntimeEvent::new(
+        EventId::new(id),
+        None,
+        ShardId::new(0),
+        IsolateId::new(1),
+        kind,
+    )
+}
 
 /// Operation alphabet for the burst-overflow case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +165,12 @@ fn run_burst_overflow_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
     ReplayReport::from_case_and_events(case, trace, output)
 }
 
+fn run_burst_overflow_live_replay(
+    case: &ReplayCase<Op>,
+) -> Result<LiveReplayReport<Output>, tina_sim::dst::TraceProjectionError> {
+    Ok(LiveReplayReport::exact(run_burst_overflow_case(case)))
+}
+
 /// Two bursts of 4 messages into a sink with capacity 2 produce
 /// deterministic `SendRejected::Full` events. With 1-in-2 local-send
 /// delay perturbing delivery rounds, the trace has a stable shape but
@@ -256,14 +274,14 @@ fn capture_burst_overflow() -> LiveReplayCapture<Op> {
 fn captured_pressure_case_replays_in_simulator() {
     let capture = capture_burst_overflow();
     let case = capture.to_replay_case();
-    let report = check_captured_replay(&capture, &case, run_burst_overflow_case)
+    let report = check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
         .expect("captured pressure facts replay in sim");
     assert_eq!(
-        report.output.full_rejections,
+        report.replay.output.full_rejections,
         BURST_OVERFLOW_FULL_REJECTIONS
     );
-    assert_eq!(report.event_count, capture.expected.event_count);
-    assert_eq!(report.trace_hash, capture.expected.trace_hash);
+    assert_eq!(report.replay.event_count, capture.expected.event_count);
+    assert_eq!(report.replay.trace_hash, capture.expected.trace_hash);
 }
 
 #[test]
@@ -272,7 +290,7 @@ fn changed_config_invalidates_captured_pressure_replay() {
     let mut changed = capture.to_replay_case();
     changed.config = changed.config.clone().with_mailbox(SINK_ROLE, 3);
 
-    let mismatch = check_captured_replay(&capture, &changed, run_burst_overflow_case)
+    let mismatch = check_captured_replay(&capture, &changed, run_burst_overflow_live_replay)
         .expect_err("changed mailbox capacity must invalidate captured replay");
     let rendered = mismatch.to_string();
     assert!(rendered.contains("changed:   config"));
@@ -313,4 +331,135 @@ fn discover_constants_prints_multiple_pressure_cases() {
     assert!(printed.contains("// burst_overflow_seed_8"));
     assert!(printed.matches("expected_event_count:").count() == 2);
     assert!(printed.matches("expected_trace_hash:").count() == 2);
+}
+
+#[test]
+fn live_replay_capture_includes_config_topology_and_mailboxes() {
+    let capture = capture_burst_overflow();
+    assert_eq!(capture.config.mailbox(SOURCE_ROLE), 8);
+    assert_eq!(capture.config.mailbox(SINK_ROLE), 2);
+    assert!(capture.topology_roles.contains(&SOURCE_ROLE));
+    assert!(capture.topology_roles.contains(&SINK_ROLE));
+}
+
+#[test]
+fn live_replay_same_capture_converts_to_same_case_twice() {
+    let capture = capture_burst_overflow();
+    let first = capture.to_replay_case();
+    let second = capture.to_replay_case();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn live_replay_unsupported_fact_is_reported_fail_closed() {
+    let capture = capture_burst_overflow().with_unsupported_fact(
+        "reqwest completion body bytes",
+        "bridge did not materialize the body as a replay op",
+    );
+    let case = capture.to_replay_case();
+    let mismatch = check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
+        .expect_err("unsupported live facts must fail closed");
+    let rendered = mismatch.to_string();
+    assert!(rendered.contains("unsupported fact"));
+    assert!(rendered.contains("reqwest completion body bytes"));
+}
+
+#[test]
+fn live_replay_unknown_event_kind_fails_closed_when_not_named_by_projection() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event(1, RuntimeEventKind::HandlerStarted),
+        fake_event(
+            2,
+            RuntimeEventKind::SendRejected {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(2),
+                target_generation: tina::AddressGeneration::new(0),
+                reason: SendRejectedReason::Full,
+            },
+        ),
+    ];
+    let projection = TraceProjection::Projected {
+        included: vec![RuntimeEventKindName::SendRejected],
+        ignored: Vec::new(),
+    };
+
+    let err = LiveReplayCapture::from_events_with_options(
+        case.name,
+        case.seed,
+        case.config.clone(),
+        case.scenario,
+        case.history.operations().to_vec(),
+        case.invariant,
+        "live trace with unnamed event",
+        &events,
+        projection,
+        Vec::new(),
+    )
+    .expect_err("HandlerStarted was not named by projection");
+    assert!(err.to_string().contains("not named as included or ignored"));
+}
+
+#[test]
+fn live_replay_projected_comparison_names_ignored_event_kinds() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event(1, RuntimeEventKind::HandlerStarted),
+        fake_event(
+            2,
+            RuntimeEventKind::SendRejected {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(2),
+                target_generation: tina::AddressGeneration::new(0),
+                reason: SendRejectedReason::Full,
+            },
+        ),
+    ];
+    let projection = TraceProjection::Projected {
+        included: vec![RuntimeEventKindName::SendRejected],
+        ignored: vec![RuntimeEventKindName::HandlerStarted],
+    };
+    let capture = LiveReplayCapture::from_events_with_options(
+        case.name,
+        case.seed,
+        case.config.clone(),
+        case.scenario,
+        case.history.operations().to_vec(),
+        case.invariant,
+        "projected live trace",
+        &events,
+        projection.clone(),
+        Vec::new(),
+    )
+    .expect("projection names every event kind");
+    let replay_case = capture.to_replay_case();
+    let report = check_captured_replay(&capture, &replay_case, |_| {
+        LiveReplayReport::from_case_and_events(&replay_case, &events, (), projection.clone())
+    })
+    .expect("projected replay matches");
+    assert_eq!(
+        report.projection.ignored(),
+        &[RuntimeEventKindName::HandlerStarted]
+    );
+}
+
+#[test]
+fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
+    let capture = capture_burst_overflow();
+    let case = capture.to_replay_case();
+    let report = shrink_replay_case(
+        &case,
+        ShrinkConfig::default(),
+        "at least one full rejection remains",
+        run_burst_overflow_case,
+        |report| report.output.full_rejections >= 1,
+    );
+    assert_eq!(
+        report.shrunk_case.expected_event_count,
+        report.shrunk_report.event_count
+    );
+    assert_eq!(
+        report.shrunk_case.expected_trace_hash,
+        report.shrunk_report.trace_hash
+    );
 }

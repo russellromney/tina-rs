@@ -814,6 +814,229 @@ impl TraceShape {
     }
 }
 
+/// Runtime event kind names used by live-replay projection specs.
+///
+/// A projection must name every event kind it keeps or ignores. That makes
+/// live-vs-sim comparison fail closed when a trace contains an event kind the
+/// projection author did not account for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuntimeEventKindName {
+    /// [`RuntimeEventKind::MailboxAccepted`].
+    MailboxAccepted,
+    /// [`RuntimeEventKind::HandlerStarted`].
+    HandlerStarted,
+    /// [`RuntimeEventKind::HandlerPanicked`].
+    HandlerPanicked,
+    /// [`RuntimeEventKind::HandlerFinished`].
+    HandlerFinished,
+    /// [`RuntimeEventKind::EffectObserved`].
+    EffectObserved,
+    /// [`RuntimeEventKind::SendDispatchAttempted`].
+    SendDispatchAttempted,
+    /// [`RuntimeEventKind::SendAccepted`].
+    SendAccepted,
+    /// [`RuntimeEventKind::SendRejected`].
+    SendRejected,
+    /// [`RuntimeEventKind::Spawned`].
+    Spawned,
+    /// [`RuntimeEventKind::SupervisorRestartTriggered`].
+    SupervisorRestartTriggered,
+    /// [`RuntimeEventKind::SupervisorRestartRejected`].
+    SupervisorRestartRejected,
+    /// [`RuntimeEventKind::RestartChildAttempted`].
+    RestartChildAttempted,
+    /// [`RuntimeEventKind::RestartChildSkipped`].
+    RestartChildSkipped,
+    /// [`RuntimeEventKind::RestartChildCompleted`].
+    RestartChildCompleted,
+    /// [`RuntimeEventKind::IsolateStopped`].
+    IsolateStopped,
+    /// [`RuntimeEventKind::MessageAbandoned`].
+    MessageAbandoned,
+    /// [`RuntimeEventKind::CallDispatchAttempted`].
+    CallDispatchAttempted,
+    /// [`RuntimeEventKind::CallCompleted`].
+    CallCompleted,
+    /// [`RuntimeEventKind::CallFailed`].
+    CallFailed,
+    /// [`RuntimeEventKind::CallCompletionRejected`].
+    CallCompletionRejected,
+    /// [`RuntimeEventKind::CallReplyRejected`].
+    CallReplyRejected,
+    /// [`RuntimeEventKind::CallReplyAbandoned`].
+    CallReplyAbandoned,
+    /// [`RuntimeEventKind::CallCancelled`].
+    CallCancelled,
+    /// [`RuntimeEventKind::SnapshotCommitted`].
+    SnapshotCommitted,
+    /// [`RuntimeEventKind::SnapshotCommitFailed`].
+    SnapshotCommitFailed,
+    /// [`RuntimeEventKind::JournalAppended`].
+    JournalAppended,
+    /// [`RuntimeEventKind::JournalAppendFailed`].
+    JournalAppendFailed,
+    /// [`RuntimeEventKind::RecoveryStarted`].
+    RecoveryStarted,
+    /// [`RuntimeEventKind::RecoveryFinished`].
+    RecoveryFinished,
+    /// [`RuntimeEventKind::RecoveryFailed`].
+    RecoveryFailed,
+    /// [`RuntimeEventKind::DeferredReplyCaptured`].
+    DeferredReplyCaptured,
+    /// [`RuntimeEventKind::DeferredReplySent`].
+    DeferredReplySent,
+    /// [`RuntimeEventKind::DeferredReplyRejected`].
+    DeferredReplyRejected,
+    /// [`RuntimeEventKind::DeferredReplyDropped`].
+    DeferredReplyDropped,
+}
+
+fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindName> {
+    Some(match kind {
+        RuntimeEventKind::MailboxAccepted => RuntimeEventKindName::MailboxAccepted,
+        RuntimeEventKind::HandlerStarted => RuntimeEventKindName::HandlerStarted,
+        RuntimeEventKind::HandlerPanicked => RuntimeEventKindName::HandlerPanicked,
+        RuntimeEventKind::HandlerFinished { .. } => RuntimeEventKindName::HandlerFinished,
+        RuntimeEventKind::EffectObserved { .. } => RuntimeEventKindName::EffectObserved,
+        RuntimeEventKind::SendDispatchAttempted { .. } => {
+            RuntimeEventKindName::SendDispatchAttempted
+        }
+        RuntimeEventKind::SendAccepted { .. } => RuntimeEventKindName::SendAccepted,
+        RuntimeEventKind::SendRejected { .. } => RuntimeEventKindName::SendRejected,
+        RuntimeEventKind::Spawned { .. } => RuntimeEventKindName::Spawned,
+        RuntimeEventKind::SupervisorRestartTriggered { .. } => {
+            RuntimeEventKindName::SupervisorRestartTriggered
+        }
+        RuntimeEventKind::SupervisorRestartRejected { .. } => {
+            RuntimeEventKindName::SupervisorRestartRejected
+        }
+        RuntimeEventKind::RestartChildAttempted { .. } => {
+            RuntimeEventKindName::RestartChildAttempted
+        }
+        RuntimeEventKind::RestartChildSkipped { .. } => RuntimeEventKindName::RestartChildSkipped,
+        RuntimeEventKind::RestartChildCompleted { .. } => {
+            RuntimeEventKindName::RestartChildCompleted
+        }
+        RuntimeEventKind::IsolateStopped => RuntimeEventKindName::IsolateStopped,
+        RuntimeEventKind::MessageAbandoned => RuntimeEventKindName::MessageAbandoned,
+        RuntimeEventKind::CallDispatchAttempted { .. } => {
+            RuntimeEventKindName::CallDispatchAttempted
+        }
+        RuntimeEventKind::CallCompleted { .. } => RuntimeEventKindName::CallCompleted,
+        RuntimeEventKind::CallFailed { .. } => RuntimeEventKindName::CallFailed,
+        RuntimeEventKind::CallCompletionRejected { .. } => {
+            RuntimeEventKindName::CallCompletionRejected
+        }
+        RuntimeEventKind::CallReplyRejected { .. } => RuntimeEventKindName::CallReplyRejected,
+        RuntimeEventKind::CallReplyAbandoned { .. } => RuntimeEventKindName::CallReplyAbandoned,
+        RuntimeEventKind::CallCancelled { .. } => RuntimeEventKindName::CallCancelled,
+        RuntimeEventKind::SnapshotCommitted => RuntimeEventKindName::SnapshotCommitted,
+        RuntimeEventKind::SnapshotCommitFailed { .. } => RuntimeEventKindName::SnapshotCommitFailed,
+        RuntimeEventKind::JournalAppended { .. } => RuntimeEventKindName::JournalAppended,
+        RuntimeEventKind::JournalAppendFailed { .. } => RuntimeEventKindName::JournalAppendFailed,
+        RuntimeEventKind::RecoveryStarted => RuntimeEventKindName::RecoveryStarted,
+        RuntimeEventKind::RecoveryFinished => RuntimeEventKindName::RecoveryFinished,
+        RuntimeEventKind::RecoveryFailed { .. } => RuntimeEventKindName::RecoveryFailed,
+        RuntimeEventKind::DeferredReplyCaptured { .. } => {
+            RuntimeEventKindName::DeferredReplyCaptured
+        }
+        RuntimeEventKind::DeferredReplySent { .. } => RuntimeEventKindName::DeferredReplySent,
+        RuntimeEventKind::DeferredReplyRejected { .. } => {
+            RuntimeEventKindName::DeferredReplyRejected
+        }
+        RuntimeEventKind::DeferredReplyDropped { .. } => RuntimeEventKindName::DeferredReplyDropped,
+    })
+}
+
+/// Visible live-replay projection contract.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TraceProjection {
+    /// Compare the exact trace shape.
+    #[default]
+    Exact,
+    /// Compare only named included kinds; named ignored kinds are stripped.
+    ///
+    /// Every event kind in the trace must appear in `included` or `ignored`.
+    /// Anything unnamed fails closed as [`TraceProjectionError`].
+    Projected {
+        /// Event kinds that remain in the projected trace.
+        included: Vec<RuntimeEventKindName>,
+        /// Event kinds intentionally ignored by this projection.
+        ignored: Vec<RuntimeEventKindName>,
+    },
+}
+
+impl TraceProjection {
+    /// Returns the event kinds this projection intentionally ignores.
+    pub fn ignored(&self) -> &[RuntimeEventKindName] {
+        match self {
+            Self::Exact => &[],
+            Self::Projected { ignored, .. } => ignored,
+        }
+    }
+}
+
+/// Why a trace could not be projected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceProjectionError {
+    /// Event id closest to the unsupported fact.
+    pub event_id: EventId,
+    /// The event kind when Tina knows how to name it.
+    pub kind: Option<RuntimeEventKindName>,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+impl std::fmt::Display for TraceProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "trace projection unsupported at event {:?}: {}",
+            self.event_id, self.reason
+        )
+    }
+}
+
+impl std::error::Error for TraceProjectionError {}
+
+/// Applies a visible projection and returns the resulting trace shape.
+pub fn project_trace_shape(
+    events: &[RuntimeEvent],
+    projection: &TraceProjection,
+) -> Result<TraceShape, TraceProjectionError> {
+    match projection {
+        TraceProjection::Exact => Ok(TraceShape::from_events(events)),
+        TraceProjection::Projected { included, ignored } => {
+            let mut projected = Vec::new();
+            for event in events {
+                let Some(kind) = runtime_event_kind_name(event.kind()) else {
+                    return Err(TraceProjectionError {
+                        event_id: event.id(),
+                        kind: None,
+                        reason: "runtime event kind is unknown to this projection".into(),
+                    });
+                };
+                if ignored.contains(&kind) {
+                    continue;
+                }
+                if included.contains(&kind) {
+                    projected.push(event);
+                    continue;
+                }
+                return Err(TraceProjectionError {
+                    event_id: event.id(),
+                    kind: Some(kind),
+                    reason: format!("event kind {kind:?} was not named as included or ignored"),
+                });
+            }
+            Ok(TraceShape {
+                event_count: projected.len(),
+                trace_hash: stable_trace_hash(projected),
+            })
+        }
+    }
+}
+
 fn stable_text_hash(text: &str) -> u64 {
     // FNV-1a over UTF-8 bytes. This hash is for diagnostics and saved-case
     // drift checks, not for trace identity; traces still use stable_trace_hash.
@@ -1164,14 +1387,39 @@ fn encode_storage_config(out: &mut String, config: crate::ScriptedStorageFaultCo
     out.push('}');
 }
 
+/// A live fact the current replay operation alphabet cannot model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedLiveFact {
+    /// Short fact name.
+    pub fact: String,
+    /// Why this fact is not replayable with the current history/config.
+    pub reason: String,
+}
+
+impl UnsupportedLiveFact {
+    /// Creates an unsupported live fact record.
+    pub fn new(fact: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            fact: fact.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UnsupportedLiveFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.fact, self.reason)
+    }
+}
+
 /// Facts captured from a live or simulator run that are sufficient to try a
 /// simulator replay.
 ///
 /// The capture stores seed, full replay config, explicit history, invariant,
-/// and the expected trace shape. It does not pretend that arbitrary live I/O
-/// can be replayed. If the operation history does not contain enough facts,
-/// [`check_captured_replay`] returns a typed mismatch naming history and trace
-/// drift.
+/// expected projected trace shape, projection contract, and unsupported live
+/// facts. It does not pretend that arbitrary live I/O can be replayed. If the
+/// operation history does not contain enough facts, [`check_captured_replay`]
+/// returns a typed mismatch naming the missing facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveReplayCapture<Op> {
     /// Stable case name.
@@ -1180,8 +1428,12 @@ pub struct LiveReplayCapture<Op> {
     pub seed: u64,
     /// Visible simulator-replay knobs captured with the run.
     pub config: ReplayConfig,
+    /// Role/topology labels visible to the runner.
+    pub topology_roles: Vec<&'static str>,
     /// Diagnostic hash of `config`.
     config_hash: u64,
+    /// Visible trace comparison contract used to compute `expected`.
+    pub projection: TraceProjection,
     /// One-line scenario description.
     pub scenario: &'static str,
     /// Materialized operation history.
@@ -1192,10 +1444,13 @@ pub struct LiveReplayCapture<Op> {
     pub invariant: &'static str,
     /// Short note naming where the capture came from.
     pub source: &'static str,
+    /// Live facts not represented by the replay config/history.
+    pub unsupported_facts: Vec<UnsupportedLiveFact>,
 }
 
 impl<Op> LiveReplayCapture<Op> {
     /// Captures a replay attempt from explicit parts and runtime events.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_events(
         name: &'static str,
         seed: u64,
@@ -1206,18 +1461,53 @@ impl<Op> LiveReplayCapture<Op> {
         source: &'static str,
         events: &[RuntimeEvent],
     ) -> Self {
-        let config_hash = replay_config_hash(&config);
-        Self {
+        Self::from_events_with_options(
             name,
             seed,
             config,
-            config_hash,
             scenario,
-            history: History::new(name, seed, ops),
-            expected: TraceShape::from_events(events),
+            ops,
             invariant,
             source,
-        }
+            events,
+            TraceProjection::Exact,
+            Vec::new(),
+        )
+        .expect("exact projection cannot reject a runtime trace")
+    }
+
+    /// Captures a replay attempt with an explicit projection and unsupported
+    /// fact list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_events_with_options(
+        name: &'static str,
+        seed: u64,
+        config: ReplayConfig,
+        scenario: &'static str,
+        ops: Vec<Op>,
+        invariant: &'static str,
+        source: &'static str,
+        events: &[RuntimeEvent],
+        projection: TraceProjection,
+        unsupported_facts: Vec<UnsupportedLiveFact>,
+    ) -> Result<Self, TraceProjectionError> {
+        let config_hash = replay_config_hash(&config);
+        let topology_roles = config.mailboxes.keys().copied().collect();
+        let expected = project_trace_shape(events, &projection)?;
+        Ok(Self {
+            name,
+            seed,
+            config,
+            topology_roles,
+            config_hash,
+            projection,
+            scenario,
+            history: History::new(name, seed, ops),
+            expected,
+            invariant,
+            source,
+            unsupported_facts,
+        })
     }
 
     /// Captures the current shape of an existing replay case and event list.
@@ -1252,22 +1542,37 @@ impl<Op> LiveReplayCapture<Op> {
     {
         let config = case.config.clone();
         let config_hash = replay_config_hash(&config);
+        let topology_roles = config.mailboxes.keys().copied().collect();
         Self {
             name: case.name,
             seed: case.seed,
             config,
+            topology_roles,
             config_hash,
+            projection: TraceProjection::Exact,
             scenario: case.scenario,
             history: case.history.clone(),
             expected: TraceShape::from_report(report),
             invariant: case.invariant,
             source,
+            unsupported_facts: Vec::new(),
         }
     }
 
     /// Returns the diagnostic hash of the captured replay config.
     pub const fn config_hash(&self) -> u64 {
         self.config_hash
+    }
+
+    /// Adds one unsupported live fact and returns the capture.
+    pub fn with_unsupported_fact(
+        mut self,
+        fact: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        self.unsupported_facts
+            .push(UnsupportedLiveFact::new(fact, reason));
+        self
     }
 
     /// Converts the capture into a normal [`ReplayCase`] pinned to the
@@ -1312,6 +1617,12 @@ pub struct SavedReplayCase<Op> {
     pub config_debug: String,
     /// Diagnostic config hash at capture time.
     pub config_hash: u64,
+    /// Saved topology role labels.
+    pub topology_roles: Vec<String>,
+    /// Debug rendering of the trace projection contract.
+    pub projection_debug: String,
+    /// Unsupported live facts recorded with the capture.
+    pub unsupported_facts: Vec<UnsupportedLiveFact>,
     /// Captured expected trace shape.
     pub expected: TraceShape,
     /// Materialized operation history.
@@ -1335,6 +1646,13 @@ impl<Op> SavedReplayCase<Op> {
             source: capture.source.to_owned(),
             config_debug: format!("{:?}", capture.config),
             config_hash: capture.config_hash(),
+            topology_roles: capture
+                .topology_roles
+                .iter()
+                .map(|role| (*role).to_owned())
+                .collect(),
+            projection_debug: format!("{:?}", capture.projection),
+            unsupported_facts: capture.unsupported_facts.clone(),
             expected: capture.expected,
             history: capture
                 .history
@@ -1493,6 +1811,13 @@ where
     reject_newline("scenario", capture.scenario)?;
     reject_newline("invariant", capture.invariant)?;
     reject_newline("source", capture.source)?;
+    for role in &capture.topology_roles {
+        reject_newline("topology_role", role)?;
+    }
+    for fact in &capture.unsupported_facts {
+        reject_newline("unsupported_fact", &fact.fact)?;
+        reject_newline("unsupported_reason", &fact.reason)?;
+    }
 
     let mut body = String::new();
     body.push_str("tina-replay-case-v1\n");
@@ -1503,6 +1828,19 @@ where
     body.push_str(&format!("source={}\n", capture.source));
     body.push_str(&format!("config_hash=0x{:016x}\n", capture.config_hash()));
     body.push_str(&format!("config_debug={:?}\n", capture.config));
+    body.push_str(&format!("projection_debug={:?}\n", capture.projection));
+    for role in &capture.topology_roles {
+        body.push_str("topology_role=");
+        body.push_str(role);
+        body.push('\n');
+    }
+    for fact in &capture.unsupported_facts {
+        body.push_str("unsupported_fact=");
+        body.push_str(&fact.fact);
+        body.push_str(" | ");
+        body.push_str(&fact.reason);
+        body.push('\n');
+    }
     body.push_str(&format!(
         "expected_event_count={}\n",
         capture.expected.event_count
@@ -1550,6 +1888,9 @@ where
     let mut source = None;
     let mut config_debug = None;
     let mut config_hash = None;
+    let mut topology_roles = Vec::new();
+    let mut projection_debug = None;
+    let mut unsupported_facts = Vec::new();
     let mut expected_event_count = None;
     let mut expected_trace_hash = None;
     let mut history = Vec::new();
@@ -1579,6 +1920,17 @@ where
             "source" => source = Some(value.to_owned()),
             "config_debug" => config_debug = Some(value.to_owned()),
             "config_hash" => config_hash = Some(parse_hex_u64(value, line_no, "config_hash")?),
+            "projection_debug" => projection_debug = Some(value.to_owned()),
+            "topology_role" => topology_roles.push(value.to_owned()),
+            "unsupported_fact" => {
+                let Some((fact, reason)) = value.split_once(" | ") else {
+                    return Err(SavedReplayCaseError::Decode {
+                        line: line_no,
+                        reason: "unsupported_fact must be `fact | reason`".to_owned(),
+                    });
+                };
+                unsupported_facts.push(UnsupportedLiveFact::new(fact, reason));
+            }
             "expected_event_count" => {
                 expected_event_count =
                     Some(
@@ -1618,6 +1970,10 @@ where
         source: source.ok_or(SavedReplayCaseError::MissingField("source"))?,
         config_debug: config_debug.ok_or(SavedReplayCaseError::MissingField("config_debug"))?,
         config_hash: config_hash.ok_or(SavedReplayCaseError::MissingField("config_hash"))?,
+        topology_roles,
+        projection_debug: projection_debug
+            .ok_or(SavedReplayCaseError::MissingField("projection_debug"))?,
+        unsupported_facts,
         expected: TraceShape {
             event_count: expected_event_count
                 .ok_or(SavedReplayCaseError::MissingField("expected_event_count"))?,
@@ -1649,6 +2005,10 @@ pub enum CapturedReplayChange {
     Seed,
     /// Scenario text changed.
     Scenario,
+    /// Capture contains live facts that are not modeled by replay history/config.
+    UnsupportedFact,
+    /// Trace projection contract changed or could not be applied.
+    Projection,
     /// Replay config changed.
     Config,
     /// Materialized operation history changed.
@@ -1659,6 +2019,48 @@ pub enum CapturedReplayChange {
     Hash,
     /// Invariant label changed.
     Invariant,
+}
+
+/// Projected live-replay report returned by a simulator runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveReplayReport<Output> {
+    /// Underlying replay report using the projected trace shape.
+    pub replay: ReplayReport<Output>,
+    /// Projection contract used to compute `replay.event_count` and
+    /// `replay.trace_hash`.
+    pub projection: TraceProjection,
+}
+
+impl<Output> LiveReplayReport<Output> {
+    /// Builds a live-replay report from events and a visible projection.
+    pub fn from_case_and_events<Op>(
+        case: &ReplayCase<Op>,
+        events: &[RuntimeEvent],
+        output: Output,
+        projection: TraceProjection,
+    ) -> Result<Self, TraceProjectionError> {
+        let shape = project_trace_shape(events, &projection)?;
+        Ok(Self {
+            replay: ReplayReport {
+                name: case.name,
+                seed: case.seed,
+                config: case.config.clone(),
+                scenario: case.scenario,
+                event_count: shape.event_count,
+                trace_hash: shape.trace_hash,
+                output,
+            },
+            projection,
+        })
+    }
+
+    /// Wraps an existing exact [`ReplayReport`].
+    pub fn exact(replay: ReplayReport<Output>) -> Self {
+        Self {
+            replay,
+            projection: TraceProjection::Exact,
+        }
+    }
 }
 
 /// Typed mismatch returned when a captured live story cannot be replayed
@@ -1679,6 +2081,14 @@ pub struct CapturedReplayMismatch<Op> {
     pub scenario: &'static str,
     /// Candidate replay scenario.
     pub actual_scenario: &'static str,
+    /// Captured projection contract.
+    pub expected_projection: TraceProjection,
+    /// Candidate projection contract.
+    pub actual_projection: TraceProjection,
+    /// Unsupported live facts from the capture.
+    pub unsupported_facts: Vec<UnsupportedLiveFact>,
+    /// Projection error from the candidate runner, when projection failed.
+    pub projection_error: Option<TraceProjectionError>,
     /// Diagnostic config hash from the capture.
     pub expected_config_hash: u64,
     /// Diagnostic config hash from the candidate replay case.
@@ -1752,6 +2162,8 @@ impl<Op: Debug> std::fmt::Display for CapturedReplayMismatch<Op> {
                     CapturedReplayChange::Name => "name",
                     CapturedReplayChange::Seed => "seed",
                     CapturedReplayChange::Scenario => "scenario",
+                    CapturedReplayChange::UnsupportedFact => "unsupported fact",
+                    CapturedReplayChange::Projection => "projection",
                     CapturedReplayChange::Config => "config",
                     CapturedReplayChange::History => "history",
                     CapturedReplayChange::EventCount => "event count",
@@ -1761,6 +2173,29 @@ impl<Op: Debug> std::fmt::Display for CapturedReplayMismatch<Op> {
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
+        if !self.unsupported_facts.is_empty() {
+            writeln!(f, "  unsupported facts:")?;
+            for fact in &self.unsupported_facts {
+                writeln!(f, "      - {fact}")?;
+            }
+        }
+        if self.includes(CapturedReplayChange::Projection) {
+            writeln!(
+                f,
+                "  projection: expected {:?}, got {:?} (changed)",
+                self.expected_projection, self.actual_projection
+            )?;
+            if !self.expected_projection.ignored().is_empty() {
+                writeln!(
+                    f,
+                    "  ignored event kinds: {:?}",
+                    self.expected_projection.ignored()
+                )?;
+            }
+        }
+        if let Some(error) = &self.projection_error {
+            writeln!(f, "  projection error: {error}")?;
+        }
         writeln!(
             f,
             "  config:    expected 0x{:016x}, got 0x{:016x}{}",
@@ -1841,18 +2276,73 @@ pub fn check_captured_replay<Op, Output, Runner>(
     capture: &LiveReplayCapture<Op>,
     candidate: &ReplayCase<Op>,
     mut runner: Runner,
-) -> Result<ReplayReport<Output>, Box<CapturedReplayMismatch<Op>>>
+) -> Result<LiveReplayReport<Output>, Box<CapturedReplayMismatch<Op>>>
 where
     Op: Clone + PartialEq,
-    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
+    Runner: FnMut(&ReplayCase<Op>) -> Result<LiveReplayReport<Output>, TraceProjectionError>,
 {
-    assert_case_history_coherent(candidate);
-    let report = runner(candidate);
-    assert_report_identity(candidate, &report);
-    let actual = TraceShape::from_report(&report);
+    if let Some(error) = case_history_coherence_error(candidate) {
+        return Err(Box::new(captured_mismatch(
+            capture,
+            candidate,
+            TraceShape {
+                event_count: 0,
+                trace_hash: 0,
+            },
+            capture.projection.clone(),
+            Some(TraceProjectionError {
+                event_id: EventId::new(0),
+                kind: None,
+                reason: error,
+            }),
+            vec![CapturedReplayChange::Projection],
+        )));
+    }
+    let projection_result = runner(candidate);
+    let (report, actual, actual_projection, projection_error) = match projection_result {
+        Ok(report) => {
+            if let Some(error) = report_identity_error(candidate, &report.replay) {
+                let mismatch = captured_mismatch(
+                    capture,
+                    candidate,
+                    TraceShape {
+                        event_count: report.replay.event_count,
+                        trace_hash: report.replay.trace_hash,
+                    },
+                    report.projection.clone(),
+                    Some(TraceProjectionError {
+                        event_id: EventId::new(0),
+                        kind: None,
+                        reason: error,
+                    }),
+                    vec![CapturedReplayChange::Projection],
+                );
+                return Err(Box::new(mismatch));
+            }
+            let actual = TraceShape::from_report(&report.replay);
+            let projection = report.projection.clone();
+            (Some(report), actual, projection, None)
+        }
+        Err(error) => (
+            None,
+            TraceShape {
+                event_count: 0,
+                trace_hash: 0,
+            },
+            capture.projection.clone(),
+            Some(error),
+        ),
+    };
     let actual_config_hash = replay_config_hash(&candidate.config);
     let expected_config_hash = replay_config_hash(&capture.config);
     let mut changes = Vec::new();
+    if !capture.unsupported_facts.is_empty() {
+        changes.push(CapturedReplayChange::UnsupportedFact);
+    }
+    if let Some(error) = &projection_error {
+        let _ = error;
+        changes.push(CapturedReplayChange::Projection);
+    }
     if capture.name != candidate.name {
         changes.push(CapturedReplayChange::Name);
     }
@@ -1877,9 +2367,14 @@ where
     if capture.invariant != candidate.invariant {
         changes.push(CapturedReplayChange::Invariant);
     }
+    if let Some(report) = &report {
+        if capture.projection != report.projection {
+            changes.push(CapturedReplayChange::Projection);
+        }
+    }
 
     if changes.is_empty() {
-        Ok(report)
+        Ok(report.expect("report exists when there are no changes"))
     } else {
         Err(Box::new(CapturedReplayMismatch {
             name: capture.name,
@@ -1889,6 +2384,10 @@ where
             source: capture.source,
             scenario: capture.scenario,
             actual_scenario: candidate.scenario,
+            expected_projection: capture.projection.clone(),
+            actual_projection,
+            unsupported_facts: capture.unsupported_facts.clone(),
+            projection_error,
             expected_config_hash,
             actual_config_hash,
             expected_history: capture.history.clone(),
@@ -1902,41 +2401,101 @@ where
     }
 }
 
-fn assert_case_history_coherent<Op>(case: &ReplayCase<Op>) {
-    debug_assert_eq!(
-        case.name,
-        case.history.name(),
-        "ReplayCase.name and history.name() drifted",
-    );
-    debug_assert_eq!(
-        case.seed,
-        case.history.seed(),
-        "ReplayCase.seed and history.seed() drifted",
-    );
+fn captured_mismatch<Op: Clone>(
+    capture: &LiveReplayCapture<Op>,
+    candidate: &ReplayCase<Op>,
+    actual: TraceShape,
+    actual_projection: TraceProjection,
+    projection_error: Option<TraceProjectionError>,
+    changes: Vec<CapturedReplayChange>,
+) -> CapturedReplayMismatch<Op> {
+    CapturedReplayMismatch {
+        name: capture.name,
+        actual_name: candidate.name,
+        seed: capture.seed,
+        actual_seed: candidate.seed,
+        source: capture.source,
+        scenario: capture.scenario,
+        actual_scenario: candidate.scenario,
+        expected_projection: capture.projection.clone(),
+        actual_projection,
+        unsupported_facts: capture.unsupported_facts.clone(),
+        projection_error,
+        expected_config_hash: replay_config_hash(&capture.config),
+        actual_config_hash: replay_config_hash(&candidate.config),
+        expected_history: capture.history.clone(),
+        actual_history: candidate.history.clone(),
+        expected: capture.expected,
+        actual,
+        expected_invariant: capture.invariant,
+        actual_invariant: candidate.invariant,
+        changes,
+    }
 }
 
-fn assert_report_identity<Op, Output>(case: &ReplayCase<Op>, report: &ReplayReport<Output>) {
-    debug_assert_eq!(
-        report.name, case.name,
-        "runner returned report.name {:?} for case {:?}; \
-         build the report with ReplayReport::from_case_and_events",
-        report.name, case.name,
-    );
-    debug_assert_eq!(
-        report.seed, case.seed,
-        "runner returned report.seed {} for case {:?} (expected {})",
-        report.seed, case.name, case.seed,
-    );
-    debug_assert_eq!(
-        report.scenario, case.scenario,
-        "runner returned report.scenario for case {:?} that does not match the case",
-        case.name,
-    );
-    debug_assert!(
-        report.config == case.config,
-        "runner returned report.config for case {:?} that does not match the case",
-        case.name,
-    );
+/// Test sugar over [`check_captured_replay`].
+pub fn assert_captured_replay<Op, Output, Runner>(
+    capture: &LiveReplayCapture<Op>,
+    candidate: &ReplayCase<Op>,
+    runner: Runner,
+) -> LiveReplayReport<Output>
+where
+    Op: Clone + PartialEq + Debug,
+    Runner: FnMut(&ReplayCase<Op>) -> Result<LiveReplayReport<Output>, TraceProjectionError>,
+{
+    match check_captured_replay(capture, candidate, runner) {
+        Ok(report) => report,
+        Err(mismatch) => panic!("{mismatch}"),
+    }
+}
+
+fn case_history_coherence_error<Op>(case: &ReplayCase<Op>) -> Option<String> {
+    if case.name != case.history.name() {
+        return Some(format!(
+            "ReplayCase.name and history.name() drifted: {:?} != {:?}",
+            case.name,
+            case.history.name()
+        ));
+    }
+    if case.seed != case.history.seed() {
+        return Some(format!(
+            "ReplayCase.seed and history.seed() drifted: {} != {}",
+            case.seed,
+            case.history.seed()
+        ));
+    }
+    None
+}
+
+fn report_identity_error<Op, Output>(
+    case: &ReplayCase<Op>,
+    report: &ReplayReport<Output>,
+) -> Option<String> {
+    if report.name != case.name {
+        return Some(format!(
+            "runner returned report.name {:?} for case {:?}; build the report with ReplayReport::from_case_and_events",
+            report.name, case.name
+        ));
+    }
+    if report.seed != case.seed {
+        return Some(format!(
+            "runner returned report.seed {} for case {:?} (expected {})",
+            report.seed, case.name, case.seed
+        ));
+    }
+    if report.scenario != case.scenario {
+        return Some(format!(
+            "runner returned report.scenario for case {:?} that does not match the case",
+            case.name
+        ));
+    }
+    if report.config != case.config {
+        return Some(format!(
+            "runner returned report.config for case {:?} that does not match the case",
+            case.name
+        ));
+    }
+    None
 }
 
 /// Runs `runner` once and returns the observed [`ReplayReport`] without
@@ -1965,9 +2524,13 @@ where
     Op: Clone,
     Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
 {
-    assert_case_history_coherent(case);
+    if let Some(error) = case_history_coherence_error(case) {
+        panic!("{error}");
+    }
     let report = runner(case);
-    assert_report_identity(case, &report);
+    if let Some(error) = report_identity_error(case, &report) {
+        panic!("{error}");
+    }
     report
 }
 
@@ -2068,6 +2631,8 @@ pub struct ReplayMismatch<Op> {
     /// History from the case, included so the panic message is
     /// self-contained.
     pub history: History<Op>,
+    /// Case/runner identity failure, when replay could not be trusted.
+    pub identity_mismatch: Option<String>,
 }
 
 impl<Op> ReplayMismatch<Op> {
@@ -2092,6 +2657,9 @@ impl<Op: Debug> std::fmt::Display for ReplayMismatch<Op> {
         writeln!(f, "  seed:      {}", self.seed)?;
         writeln!(f, "  scenario:  {}", self.scenario)?;
         writeln!(f, "  invariant: {}", self.invariant)?;
+        if let Some(error) = &self.identity_mismatch {
+            writeln!(f, "  identity:  {error}")?;
+        }
         writeln!(f, "  config:    {:?}", self.config)?;
         writeln!(f, "  history ({} ops):", self.history.len())?;
         for op in self.history.operations() {
@@ -2159,9 +2727,37 @@ where
     Op: Clone,
     Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
 {
-    assert_case_history_coherent(case);
+    if let Some(error) = case_history_coherence_error(case) {
+        return Err(Box::new(ReplayMismatch {
+            name: case.name,
+            seed: case.seed,
+            config: case.config.clone(),
+            scenario: case.scenario,
+            invariant: case.invariant,
+            expected_event_count: case.expected_event_count,
+            actual_event_count: 0,
+            expected_trace_hash: case.expected_trace_hash,
+            actual_trace_hash: 0,
+            history: case.history.clone(),
+            identity_mismatch: Some(error),
+        }));
+    }
     let report = runner(case);
-    assert_report_identity(case, &report);
+    if let Some(error) = report_identity_error(case, &report) {
+        return Err(Box::new(ReplayMismatch {
+            name: case.name,
+            seed: case.seed,
+            config: case.config.clone(),
+            scenario: case.scenario,
+            invariant: case.invariant,
+            expected_event_count: case.expected_event_count,
+            actual_event_count: report.event_count,
+            expected_trace_hash: case.expected_trace_hash,
+            actual_trace_hash: report.trace_hash,
+            history: case.history.clone(),
+            identity_mismatch: Some(error),
+        }));
+    }
     if report.event_count != case.expected_event_count
         || report.trace_hash != case.expected_trace_hash
     {
@@ -2176,6 +2772,7 @@ where
             expected_trace_hash: case.expected_trace_hash,
             actual_trace_hash: report.trace_hash,
             history: case.history.clone(),
+            identity_mismatch: None,
         }));
     }
     Ok(report)
@@ -2493,6 +3090,12 @@ mod replay_case_tests {
         ReplayReport::from_case_and_events(case, &events, sum)
     }
 
+    fn run_three_events_live(
+        case: &ReplayCase<u32>,
+    ) -> Result<LiveReplayReport<u32>, TraceProjectionError> {
+        Ok(LiveReplayReport::exact(run_three_events(case)))
+    }
+
     #[test]
     fn assert_replay_case_passes_for_pinned_shape() {
         let report = assert_replay_case(&case(), run_three_events);
@@ -2524,24 +3127,31 @@ mod replay_case_tests {
     }
 
     #[test]
-    #[should_panic(expected = "ReplayCase.seed and history.seed() drifted")]
-    fn check_replay_case_debug_asserts_seed_drift() {
+    fn check_replay_case_rejects_seed_drift() {
         let mut bad = case();
         bad.seed = 999;
-        let _ = check_replay_case(&bad, run_three_events);
+        let mismatch = check_replay_case(&bad, run_three_events).expect_err("seed drift");
+        assert_eq!(
+            mismatch.identity_mismatch.as_deref(),
+            Some("ReplayCase.seed and history.seed() drifted: 999 != 7")
+        );
     }
 
     #[test]
-    #[should_panic(expected = "ReplayCase.name and history.name() drifted")]
-    fn check_replay_case_debug_asserts_name_drift() {
+    fn check_replay_case_rejects_name_drift() {
         let mut bad = case();
         bad.name = "drifted name";
-        let _ = check_replay_case(&bad, run_three_events);
+        let mismatch = check_replay_case(&bad, run_three_events).expect_err("name drift");
+        assert_eq!(
+            mismatch.identity_mismatch.as_deref(),
+            Some(
+                "ReplayCase.name and history.name() drifted: \"drifted name\" != \"fake replay case\""
+            )
+        );
     }
 
     #[test]
-    #[should_panic(expected = "runner returned report.name")]
-    fn check_replay_case_debug_asserts_report_identity_mismatch() {
+    fn check_replay_case_rejects_report_identity_mismatch() {
         // A misbehaving runner that hand-builds a report for the
         // wrong case must trip the identity guard, not slip through
         // because the count/hash happen to align.
@@ -2557,7 +3167,37 @@ mod replay_case_tests {
                 output: 0,
             }
         }
-        let _ = check_replay_case(&case(), lying_runner);
+        let mismatch =
+            check_replay_case(&case(), lying_runner).expect_err("report identity mismatch");
+        assert!(
+            mismatch
+                .identity_mismatch
+                .as_deref()
+                .is_some_and(|message| message.contains("runner returned report.name"))
+        );
+    }
+
+    #[test]
+    fn check_replay_case_rejects_report_config_mismatch() {
+        fn lying_runner(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            ReplayReport {
+                name: case.name,
+                seed: case.seed,
+                config: ReplayConfig::new().with_mailbox("forged", 1),
+                scenario: case.scenario,
+                event_count: events.len(),
+                trace_hash: stable_trace_hash(events.iter()),
+                output: 0,
+            }
+        }
+        let mismatch = check_replay_case(&case(), lying_runner).expect_err("report config forged");
+        assert!(
+            mismatch
+                .identity_mismatch
+                .as_deref()
+                .is_some_and(|message| message.contains("runner returned report.config"))
+        );
     }
 
     #[test]
@@ -2809,10 +3449,10 @@ mod replay_case_tests {
             LiveReplayCapture::from_case_and_events(&c, "threaded-runtime smoke", &events);
         let replay_case = capture.to_replay_case();
 
-        let report = check_captured_replay(&capture, &replay_case, run_three_events)
+        let report = check_captured_replay(&capture, &replay_case, run_three_events_live)
             .expect("captured facts replay");
-        assert_eq!(report.event_count, capture.expected.event_count);
-        assert_eq!(report.trace_hash, capture.expected.trace_hash);
+        assert_eq!(report.replay.event_count, capture.expected.event_count);
+        assert_eq!(report.replay.trace_hash, capture.expected.trace_hash);
     }
 
     #[test]
@@ -2832,7 +3472,7 @@ mod replay_case_tests {
         )
         .expecting(c.expected_event_count, c.expected_trace_hash);
 
-        let mismatch = check_captured_replay(&capture, &candidate, run_full_history_case)
+        let mismatch = check_captured_replay(&capture, &candidate, run_full_history_case_live)
             .expect_err("candidate should drift from capture");
         assert!(mismatch.includes(CapturedReplayChange::Config));
         assert!(mismatch.includes(CapturedReplayChange::History));
@@ -2862,9 +3502,13 @@ mod replay_case_tests {
             c.invariant,
         );
 
-        fn identity_ignoring_runner(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+        fn identity_ignoring_runner(
+            case: &ReplayCase<u32>,
+        ) -> Result<LiveReplayReport<u32>, TraceProjectionError> {
             let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
-            ReplayReport::from_case_and_events(case, &events, 6)
+            Ok(LiveReplayReport::exact(ReplayReport::from_case_and_events(
+                case, &events, 6,
+            )))
         }
 
         let mismatch = check_captured_replay(&capture, &candidate, identity_ignoring_runner)
@@ -2923,6 +3567,13 @@ mod replay_case_tests {
             source: capture.source.to_owned(),
             config_debug: format!("{:?}", c.config),
             config_hash: capture.config_hash(),
+            topology_roles: capture
+                .topology_roles
+                .iter()
+                .map(|role| (*role).to_owned())
+                .collect(),
+            projection_debug: format!("{:?}", capture.projection),
+            unsupported_facts: capture.unsupported_facts.clone(),
             expected: capture.expected,
             history: c.history.operations().to_vec(),
         };
@@ -3020,6 +3671,12 @@ mod replay_case_tests {
         let events: Vec<RuntimeEvent> = (1..=case.history.len() as u64).map(fake_event).collect();
         let sum: u32 = case.history.operations().iter().sum();
         ReplayReport::from_case_and_events(case, &events, sum)
+    }
+
+    fn run_full_history_case_live(
+        case: &ReplayCase<u32>,
+    ) -> Result<LiveReplayReport<u32>, TraceProjectionError> {
+        Ok(LiveReplayReport::exact(run_full_history_case(case)))
     }
 
     #[test]
