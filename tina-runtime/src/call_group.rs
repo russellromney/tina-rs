@@ -425,7 +425,10 @@ where
         let entry = self.entries.swap_remove(pos);
         let classified_success = match &outcome {
             CallOutcome::Replied(reply) => is_success(reply),
-            CallOutcome::Full | CallOutcome::Closed | CallOutcome::Timeout => false,
+            CallOutcome::Full
+            | CallOutcome::Closed
+            | CallOutcome::Timeout
+            | CallOutcome::Rejected(_) => false,
         };
         assert!(
             self.branch_outcomes.len() < self.capacity,

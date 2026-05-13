@@ -39,6 +39,7 @@ struct WorkerReply {
 enum WorkerMsg {
     Do,
     Done(SleepReply),
+    DoneForCall(RequestContext<WorkerReply>, SleepReply),
 }
 
 struct Worker {
@@ -57,6 +58,20 @@ impl Worker {
             WorkerMsg::Do => sleep(self.delay).reply(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply { score: self.score }),
             WorkerMsg::Done(Err(_)) => stop(),
+            WorkerMsg::DoneForCall(request, Ok(())) => {
+                tina::reply_to_request(request, WorkerReply { score: self.score })
+            }
+            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => sleep(self.delay)
+                .reply_with_request(call.into_request_context(), WorkerMsg::DoneForCall),
+            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -93,32 +108,10 @@ impl Svc {
     fn handle(
         &mut self,
         msg: SvcMsg,
-        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            SvcMsg::Start => {
-                self.request = Some(ctx.take_request_context().expect("request context"));
-                let mut group = CallGroup::with_capacity(self.workers.len());
-                let mut effects = Vec::with_capacity(self.workers.len());
-                for (idx, worker) in self.workers.iter().enumerate() {
-                    let key = idx as u32;
-                    let token = group.reserve_token().expect("group sized to workers");
-                    let (effect, handle) =
-                        call_with_handle(*worker, WorkerMsg::Do, Duration::from_secs(2)).reply(
-                            move |outcome| SvcMsg::Returned {
-                                worker: key,
-                                token,
-                                outcome,
-                            },
-                        );
-                    group
-                        .insert_reserved(key, token, handle)
-                        .expect("race group sized to workers");
-                    effects.push(effect);
-                }
-                self.group = Some(group);
-                Effect::Batch(effects)
-            }
+            SvcMsg::Start => noop(),
             SvcMsg::Returned {
                 worker,
                 token,
@@ -157,9 +150,42 @@ impl Svc {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: SvcMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SvcMsg::Start => {
+                self.request = Some(call.into_request_context());
+                self.start_group()
+            }
+            SvcMsg::Returned { .. } | SvcMsg::Cancelled { .. } => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
 }
 
 impl Svc {
+    fn start_group(&mut self) -> Effect<Self> {
+        let mut group = CallGroup::with_capacity(self.workers.len());
+        let mut effects = Vec::with_capacity(self.workers.len());
+        for (idx, worker) in self.workers.iter().enumerate() {
+            let key = idx as u32;
+            let token = group.reserve_token().expect("group sized to workers");
+            let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, Duration::from_secs(2))
+                .reply(move |outcome| SvcMsg::Returned {
+                    worker: key,
+                    token,
+                    outcome,
+                });
+            group
+                .insert_reserved(key, token, handle)
+                .expect("race group sized to workers");
+            effects.push(effect);
+        }
+        self.group = Some(group);
+        Effect::Batch(effects)
+    }
+
     fn finish(&mut self) -> Effect<Self> {
         let report = self.group.take().expect("group").into_report();
         let reply = match report.winner_outcome().map(|outcome| &outcome.outcome) {

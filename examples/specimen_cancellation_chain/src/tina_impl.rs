@@ -30,6 +30,8 @@ enum WorkerMsg {
     Do,
     /// Sleep continuation; reply to the caller now.
     Done(SleepReply),
+    /// Sleep continuation carrying a call request context.
+    DoneForCall(RequestContext<WorkerReply>, SleepReply),
 }
 
 /// Worker reply payload. Unit-sized — the specimen counts arrivals,
@@ -55,6 +57,18 @@ impl Worker {
             // same shape rather than panic.
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
+            WorkerMsg::DoneForCall(request, Ok(())) => tina::reply_to_request(request, WorkerReply),
+            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => sleep(self.work)
+                .reply_with_request(call.into_request_context(), WorkerMsg::DoneForCall),
+            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
