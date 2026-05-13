@@ -51,6 +51,7 @@ use tina_supervisor::SupervisorConfig;
 use betelgeuse::IOLoopHandle;
 
 mod call;
+mod call_group;
 mod capabilities;
 pub mod capacity;
 mod clock;
@@ -129,6 +130,11 @@ pub use call::{
     snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
     tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
     tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+};
+pub use call_group::{
+    CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
+    CallGroupInsertError, CallGroupRecordCancelError, CallGroupRecordReplyError,
+    CallGroupReplyStep, CallGroupReport, CallGroupReserveError, CallGroupToken,
 };
 pub use capacity::{
     CapacityAssertError, CapacityNameError, CapacitySummary, SurfaceAssertion,
