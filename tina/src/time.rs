@@ -218,36 +218,36 @@ impl TimerInterval {
             }
         };
 
-        let (delay, missed_ticks, next_due) =
-            if let Some(remaining) = scheduled_at.checked_duration_since(now) {
-                (remaining, 0, scheduled_at)
-            } else {
-                match self.policy {
-                    MissedTickPolicy::Delay => {
-                        let next_due = checked_add_or_max(now, self.period);
-                        (Duration::ZERO, 0, next_due)
-                    }
-                    MissedTickPolicy::Skip => {
-                        let overdue = now.saturating_duration_since(scheduled_at);
-                        let periods_due = overdue.as_nanos() / self.period.as_nanos() + 1;
-                        let missed_ticks =
-                            periods_due.saturating_sub(1).min(u128::from(u64::MAX)) as u64;
-                        let advance = duration_mul_saturating(self.period, periods_due);
-                        let next_due = scheduled_at
-                            .checked_add(advance)
-                            .filter(|deadline| *deadline > now)
-                            .unwrap_or_else(|| checked_add_or_max(now, self.period));
-                        (Duration::ZERO, missed_ticks, next_due)
-                    }
+        let (delay, missed_ticks, scheduled_at) = if scheduled_at > now {
+            (scheduled_at.duration_since(now), 0, scheduled_at)
+        } else {
+            match self.policy {
+                MissedTickPolicy::Delay => {
+                    let scheduled_at = checked_add_or_max(now, self.period);
+                    (self.period, 0, scheduled_at)
                 }
-            };
+                MissedTickPolicy::Skip => {
+                    let overdue = now.saturating_duration_since(scheduled_at);
+                    let periods_due = overdue.as_nanos() / self.period.as_nanos() + 1;
+                    let missed_ticks =
+                        periods_due.saturating_sub(1).min(u128::from(u64::MAX)) as u64;
+                    let advance = duration_mul_saturating(self.period, periods_due);
+                    let scheduled_at = scheduled_at
+                        .checked_add(advance)
+                        .filter(|deadline| *deadline > now)
+                        .unwrap_or_else(|| checked_add_or_max(now, self.period));
+                    (
+                        scheduled_at.saturating_duration_since(now),
+                        missed_ticks,
+                        scheduled_at,
+                    )
+                }
+            }
+        };
 
-        self.next_due = Some(next_due);
-        let tick_number = self.next_tick_number;
-        self.next_tick_number = self
-            .next_tick_number
-            .saturating_add(missed_ticks)
-            .saturating_add(1);
+        self.next_due = Some(scheduled_at);
+        let tick_number = self.next_tick_number.saturating_add(missed_ticks);
+        self.next_tick_number = tick_number.saturating_add(1);
 
         IntervalDelay {
             delay,
@@ -483,6 +483,26 @@ mod tests {
     }
 
     #[test]
+    fn interval_repeated_tick_math_preserves_schedule_and_tick_numbers() {
+        let now = Instant::now();
+        let mut interval = TimerInterval::every(Duration::from_millis(10)).unwrap();
+
+        let first = interval.next_delay(now);
+        let second = interval.next_delay(now + Duration::from_millis(10));
+        let third = interval.next_delay(now + Duration::from_millis(20));
+
+        assert_eq!(first.tick_number(), 1);
+        assert_eq!(first.scheduled_at(), now + Duration::from_millis(10));
+        assert_eq!(second.tick_number(), 2);
+        assert_eq!(second.scheduled_at(), now + Duration::from_millis(20));
+        assert_eq!(second.delay(), Duration::from_millis(10));
+        assert_eq!(interval.next_due(), Some(now + Duration::from_millis(30)));
+        assert_eq!(third.tick_number(), 3);
+        assert_eq!(third.scheduled_at(), now + Duration::from_millis(30));
+        assert_eq!(third.delay(), Duration::from_millis(10));
+    }
+
+    #[test]
     fn interval_skip_policy_reports_missed_ticks_without_catchup_loop() {
         let now = Instant::now();
         let mut interval = TimerInterval::every(Duration::from_millis(10))
@@ -492,8 +512,8 @@ mod tests {
 
         let late = interval.next_delay(now + Duration::from_millis(35));
 
-        assert_eq!(late.delay(), Duration::ZERO);
-        assert_eq!(late.tick_number(), 2);
+        assert_eq!(late.delay(), Duration::from_millis(5));
+        assert_eq!(late.tick_number(), 4);
         assert_eq!(late.missed_ticks(), 2);
         assert_eq!(interval.next_due(), Some(now + Duration::from_millis(40)));
 
@@ -510,7 +530,7 @@ mod tests {
 
         let late = interval.next_delay(now + Duration::from_millis(35));
 
-        assert_eq!(late.delay(), Duration::ZERO);
+        assert_eq!(late.delay(), Duration::from_millis(10));
         assert_eq!(late.missed_ticks(), 0);
         assert_eq!(interval.next_due(), Some(now + Duration::from_millis(45)));
     }
@@ -582,6 +602,30 @@ mod tests {
             ]
         );
         assert_eq!(backoff.next_delay(), TimerDecision::Exhausted);
+    }
+
+    #[test]
+    fn backoff_duration_math_saturates_before_max_cap() {
+        let mut backoff = Backoff::with_multiplier(
+            Duration::from_secs(u64::MAX / 4),
+            Duration::MAX,
+            u32::MAX,
+            2,
+        )
+        .unwrap();
+
+        match backoff.next_delay() {
+            TimerDecision::Sleep(delay) => {
+                assert_eq!(delay.delay(), Duration::from_secs(u64::MAX / 4));
+            }
+            other => panic!("expected sleep, got {other:?}"),
+        }
+        match backoff.next_delay() {
+            TimerDecision::Sleep(delay) => {
+                assert_eq!(delay.delay(), Duration::MAX);
+            }
+            other => panic!("expected saturated sleep, got {other:?}"),
+        }
     }
 
     #[test]
