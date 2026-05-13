@@ -2,7 +2,16 @@
 
 ## Status
 
-- Ready to implement.
+- Phase 091 start note:
+  - API home: pure helper state in `tina::time`; runtime-specific effect
+    builders stay where `sleep(...)` already lives.
+  - shipped helpers: interval and backoff only; retry-delay is the explicit
+    `Backoff` use case, jitter/debounce/throttle are deferred.
+  - specimen chosen: `specimen_periodic_batcher`, because it currently carries
+    manual timer-generation state around `sleep(...).reply(...)`.
+- Done: `tina::time` interval/backoff helper state, deadline-capped decisions,
+  pure math tests, simulator sleep-path proof, periodic batcher specimen update,
+  docs, fmt, tests, clippy.
 - One PR.
 - Can run beside HTTP/2 or AWS follow-ups if it only touches timer helper
   vocabulary, docs, and specimens.
