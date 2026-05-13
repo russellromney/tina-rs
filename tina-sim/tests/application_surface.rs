@@ -105,6 +105,17 @@ impl Worker {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Boot => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            WorkerMsg::Echo(bytes) => call.reply(WorkerReply(bytes)),
+            WorkerMsg::NoReply => {
+                self.held = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,6 +248,7 @@ impl Connection {
                         b"worker-full".to_vec()
                     }
                     CallOutcome::Closed => b"worker-closed".to_vec(),
+                    CallOutcome::Rejected(_) => b"worker-rejected".to_vec(),
                     CallOutcome::Timeout => {
                         self.observations.borrow_mut().push(Observation::Timeout);
                         b"worker-timeout".to_vec()

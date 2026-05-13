@@ -319,7 +319,7 @@ When the reply is intentionally multi-turn, use `RequestContext<R>` instead of
 `DeferredReply`. The name signals intent to readers.
 
 ```rust
-let req: RequestContext<MyReply> = ctx.take_request_context()?;
+let req: RequestContext<MyReply> = call_ctx.into_request_context();
 call(probe, ProbeMsg, timeout)
     .reply_with_request(req, MyMsg::ProbeResult)
 ```

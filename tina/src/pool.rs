@@ -355,6 +355,8 @@ pub enum AcquireFailure {
     CallFull,
     /// Pool isolate is gone.
     CallClosed,
+    /// Pool isolate rejected the call without a pool-level reply.
+    CallRejected(crate::CallRejectedReason),
     /// Reply variant was not `Acquire(...)` — protocol error.
     WrongReply,
 }
@@ -377,6 +379,8 @@ pub enum ReleaseFailure {
     CallFull,
     /// Pool isolate is gone.
     CallClosed,
+    /// Pool isolate rejected the call without a pool-level reply.
+    CallRejected(crate::CallRejectedReason),
     /// Reply variant was not `Release(...)` — protocol error.
     WrongReply,
 }

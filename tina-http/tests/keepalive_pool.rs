@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use tina::CallContext;
 use tina::pool::{
     AcquireOutcome, CloseMode, PoolConfig, PoolLease, PoolPressureReport, ReleaseDisposition,
     ReleaseOutcome,
@@ -25,7 +26,9 @@ use tina::pool::{
 use tina::prelude::*;
 use tina_http::{
     HttpClientConfig, HttpRequest, HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg,
-    KeepaliveOutcome, KeepalivePoolHandles, OriginKey, TlsTrustRoots, build_keepalive_pool,
+    KeepaliveConnectionStopFailure, KeepaliveConnectionStopOutcome, KeepaliveOutcome,
+    KeepalivePoolCloseOutcome, KeepalivePoolDrainOutcome, KeepalivePoolHandles, OriginKey,
+    TlsTrustRoots, build_keepalive_pool, shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
@@ -284,6 +287,10 @@ enum DriverEvent {
     Stopped {
         id: u32,
     },
+    StopFailed {
+        id: u32,
+        message: String,
+    },
     Cancelled,
     PoolClosed,
     Pressure(PoolPressureReport),
@@ -525,6 +532,7 @@ impl Isolate for Driver {
                     CallOutcome::Timeout => DriverEvent::AcquireCallTimeout { id },
                     CallOutcome::Full => DriverEvent::AcquireCallFull { id },
                     CallOutcome::Closed => DriverEvent::AcquireCallClosed { id },
+                    CallOutcome::Rejected(_) => DriverEvent::AcquireCallClosed { id },
                 };
                 self.state.lock().expect("state").events.push(event.clone());
                 let _ = self.notify.send(event);
@@ -558,8 +566,14 @@ impl Isolate for Driver {
                 let _ = self.notify.send(event);
                 noop()
             }
-            DriverMsg::StopReturned { id, .. } => {
-                let event = DriverEvent::Stopped { id };
+            DriverMsg::StopReturned { id, outcome } => {
+                let event = match outcome {
+                    CallOutcome::Replied(KeepaliveOutcome::Stopped) => DriverEvent::Stopped { id },
+                    other => DriverEvent::StopFailed {
+                        id,
+                        message: format!("{other:?}"),
+                    },
+                };
                 self.state.lock().expect("state").events.push(event.clone());
                 let _ = self.notify.send(event);
                 noop()
@@ -592,6 +606,35 @@ impl Isolate for Driver {
                 noop()
             }
         }
+    }
+}
+
+struct RejectingPool;
+
+impl Isolate for RejectingPool {
+    tina::isolate_types! {
+        message: WorkerPoolMsg<KeepaliveConnAddr>,
+        reply: WorkerPoolReply<KeepaliveConnAddr>,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<WorkerPoolMsg<KeepaliveConnAddr>>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        _msg: WorkerPoolMsg<KeepaliveConnAddr>,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(
+        &mut self,
+        _msg: WorkerPoolMsg<KeepaliveConnAddr>,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reject(tina::CallRejectedReason::UnsupportedMessage)
     }
 }
 
@@ -1679,6 +1722,260 @@ fn drain_with_parked_waiters_settles_waiters_as_closed() {
 // =====================================================================
 
 #[test]
+fn stop_accepts_call_and_reports_stopped_to_host_caller() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+
+    match rig
+        .rt()
+        .call_blocking(
+            pool.connections[0],
+            KeepaliveConnectionMsg::Stop,
+            Duration::from_secs(2),
+        )
+        .expect("host stop call")
+    {
+        CallOutcome::Replied(KeepaliveOutcome::Stopped) => {}
+        other => panic!("expected Stop to reply Stopped, got {other:?}"),
+    }
+
+    match rig
+        .rt()
+        .call_blocking(
+            pool.connections[0],
+            KeepaliveConnectionMsg::request(req(), Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("host request after stop call")
+    {
+        CallOutcome::Closed => {}
+        other => panic!("expected stopped connection address to be closed, got {other:?}"),
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn shutdown_helper_reports_pool_close_and_checked_connection_stops() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 2, 4);
+
+    let report = shutdown_keepalive_pool(rig.rt(), &pool, CloseMode::Drain, Duration::from_secs(2))
+        .expect("shutdown keepalive pool");
+
+    assert_eq!(report.pool_close, KeepalivePoolCloseOutcome::Closed);
+    assert_eq!(report.drain, KeepalivePoolDrainOutcome::Drained);
+    assert_eq!(report.requested, 2);
+    assert_eq!(report.stopped, 2);
+    assert_eq!(report.timed_out, 0);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.already_closed, 0);
+    assert_eq!(report.connection_failures, Vec::new());
+
+    match rig
+        .rt()
+        .call_blocking(pool.pool, WorkerPoolMsg::Acquire, Duration::from_secs(2))
+        .expect("acquire after helper shutdown")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Closed)) => {}
+        other => panic!("expected closed acquire after helper shutdown, got {other:?}"),
+    }
+
+    match rig
+        .rt()
+        .call_blocking(
+            pool.pool,
+            WorkerPoolMsg::PressureReport,
+            Duration::from_secs(2),
+        )
+        .expect("pressure after helper shutdown")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
+            assert_eq!(report.capacity, 2);
+            assert!(report.closed, "pool pressure must expose closed admission");
+        }
+        other => panic!("expected pressure report after helper shutdown, got {other:?}"),
+    }
+
+    for conn in pool.connections {
+        match rig
+            .rt()
+            .call_blocking(
+                conn,
+                KeepaliveConnectionMsg::request(req(), Duration::from_secs(2)),
+                Duration::from_secs(2),
+            )
+            .expect("request after helper shutdown")
+        {
+            CallOutcome::Closed => {}
+            other => panic!("expected stopped connection address to be closed, got {other:?}"),
+        }
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn drain_shutdown_helper_does_not_stop_leased_connection_on_timeout() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+
+    let lease = match rig
+        .rt()
+        .call_blocking(pool.pool, WorkerPoolMsg::Acquire, Duration::from_secs(2))
+        .expect("acquire lease")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => lease,
+        other => panic!("expected acquired lease, got {other:?}"),
+    };
+    let conn = *lease.handle();
+
+    let report =
+        shutdown_keepalive_pool(rig.rt(), &pool, CloseMode::Drain, Duration::from_millis(25))
+            .expect("drain shutdown with outstanding lease");
+    assert_eq!(report.pool_close, KeepalivePoolCloseOutcome::Closed);
+    assert_eq!(
+        report.drain,
+        KeepalivePoolDrainOutcome::TimedOut { leased: 1 }
+    );
+    assert_eq!(report.requested, 0);
+    assert_eq!(report.stopped, 0);
+    assert!(report.connection_failures.is_empty());
+
+    match rig
+        .rt()
+        .call_blocking(
+            conn,
+            KeepaliveConnectionMsg::request(req(), Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("leased request after drain timeout")
+    {
+        CallOutcome::Replied(KeepaliveOutcome::Request { result, .. }) => {
+            assert!(result.is_ok(), "leased connection must not be stopped");
+        }
+        other => panic!("expected leased connection to remain usable, got {other:?}"),
+    }
+
+    match rig
+        .rt()
+        .call_blocking(
+            pool.pool,
+            WorkerPoolMsg::Release {
+                lease,
+                disposition: ReleaseDisposition::Reuse,
+            },
+            Duration::from_secs(2),
+        )
+        .expect("release outstanding lease")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => {}
+        other => panic!("expected released lease, got {other:?}"),
+    }
+
+    let cleanup =
+        shutdown_keepalive_pool(rig.rt(), &pool, CloseMode::Drain, Duration::from_secs(2))
+            .expect("cleanup shutdown");
+    assert_eq!(cleanup.drain, KeepalivePoolDrainOutcome::Drained);
+    assert_eq!(cleanup.requested, 1);
+    assert_eq!(cleanup.stopped, 1);
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn shutdown_helper_does_not_stop_connections_when_pool_close_rejected() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let rejecting_pool = rig
+        .rt()
+        .register_with_capacity::<RejectingPool, Infallible>(RejectingPool, 4)
+        .expect("register rejecting pool");
+    let handles = KeepalivePoolHandles {
+        pool: rejecting_pool,
+        connections: pool.connections.clone(),
+    };
+
+    let report =
+        shutdown_keepalive_pool(rig.rt(), &handles, CloseMode::Force, Duration::from_secs(2))
+            .expect("shutdown with rejecting pool");
+    assert_eq!(
+        report.pool_close,
+        KeepalivePoolCloseOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage)
+    );
+    assert_eq!(
+        report.drain,
+        KeepalivePoolDrainOutcome::SkippedAdmissionNotClosed
+    );
+    assert_eq!(report.requested, 0);
+    assert_eq!(report.stopped, 0);
+    assert!(report.connection_failures.is_empty());
+
+    match rig
+        .rt()
+        .call_blocking(
+            pool.connections[0],
+            KeepaliveConnectionMsg::request(req(), Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("request after rejected pool close")
+    {
+        CallOutcome::Replied(KeepaliveOutcome::Request { result, .. }) => {
+            assert!(result.is_ok(), "connection must not be stopped");
+        }
+        other => panic!("expected connection to remain usable, got {other:?}"),
+    }
+
+    let cleanup =
+        shutdown_keepalive_pool(rig.rt(), &pool, CloseMode::Drain, Duration::from_secs(2))
+            .expect("cleanup shutdown");
+    assert_eq!(cleanup.drain, KeepalivePoolDrainOutcome::Drained);
+    assert_eq!(cleanup.stopped, 1);
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn repeated_shutdown_helper_names_already_closed_connections_by_slot() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+
+    let first = shutdown_keepalive_pool(rig.rt(), &pool, CloseMode::Drain, Duration::from_secs(2))
+        .expect("first shutdown keepalive pool");
+    assert_eq!(first.stopped, 1);
+    assert!(first.connection_failures.is_empty());
+
+    let second = shutdown_keepalive_pool(rig.rt(), &pool, CloseMode::Drain, Duration::from_secs(2))
+        .expect("second shutdown keepalive pool");
+    assert_eq!(second.pool_close, KeepalivePoolCloseOutcome::Closed);
+    assert_eq!(second.drain, KeepalivePoolDrainOutcome::Drained);
+    assert_eq!(second.requested, 1);
+    assert_eq!(second.stopped, 0);
+    assert_eq!(second.timed_out, 0);
+    assert_eq!(second.rejected, 0);
+    assert_eq!(second.already_closed, 1);
+    assert_eq!(
+        second.connection_failures,
+        vec![KeepaliveConnectionStopFailure {
+            index: 0,
+            outcome: KeepaliveConnectionStopOutcome::AlreadyClosed,
+        }]
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
 fn stop_after_force_close_drops_transport_and_closes_isolate() {
     // Force-close the pool. Without explicit Stop, the connection
     // isolate keeps its transport open — the pool no longer hands it
@@ -1741,11 +2038,18 @@ fn stop_after_force_close_drops_transport_and_closes_isolate() {
     );
     wait_for_event(&rx, |e| matches!(e, DriverEvent::Stopped { id: 99 }));
 
-    // Sending another Stop to the same address should now hit a
-    // closed isolate. We don't strictly need a separate assert here —
-    // the Stopped event was the proof. (Asserting CallOutcome::Closed
-    // on a follow-up call would be a stronger proof, but the pool
-    // address is gone too on Force, so we have no easy second target.)
+    match rig
+        .rt()
+        .call_blocking(
+            pool.connections[0],
+            KeepaliveConnectionMsg::request(req(), Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("request after stop")
+    {
+        CallOutcome::Closed => {}
+        other => panic!("expected stopped connection address to be closed, got {other:?}"),
+    }
 
     rig.shutdown();
     server.stop();

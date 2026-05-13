@@ -77,6 +77,7 @@ impl Isolate for Driver {
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                    CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
                 *self.observed.borrow_mut() = Some(result);
                 stop()

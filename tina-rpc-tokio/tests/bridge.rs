@@ -116,6 +116,7 @@ impl Isolate for ClientStub {
     type Reply = ();
     type Send = Outbound<ClientResultMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = SpecimenShard;
 

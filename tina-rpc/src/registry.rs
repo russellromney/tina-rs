@@ -332,6 +332,7 @@ where
             CallOutcome::Replied(ServiceReply::Internal) => RouterReply::Internal,
             CallOutcome::Full => RouterReply::Full,
             CallOutcome::Closed => RouterReply::Internal,
+            CallOutcome::Rejected(_) => RouterReply::Internal,
             // Wire-error invariant: server-side service timeout maps to
             // Internal on the wire, not Timeout. Timeout is a
             // client-observed condition only.
@@ -349,6 +350,7 @@ where
     type Reply = RouterReply;
     type Send = Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<RegistryMsg>;
     type Shard = S;
 

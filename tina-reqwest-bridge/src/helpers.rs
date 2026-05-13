@@ -107,6 +107,8 @@ pub enum BridgeFailure {
     /// worker may have seen the request and may still be processing
     /// it; this is a "stopped waiting" signal at the runtime layer.
     Timeout,
+    /// Target isolate rejected the call without a worker reply.
+    Rejected(tina::CallRejectedReason),
 }
 
 impl std::fmt::Display for BridgeFailure {
@@ -115,6 +117,7 @@ impl std::fmt::Display for BridgeFailure {
             Self::Full => f.write_str("reqwest bridge: ingress full"),
             Self::Closed => f.write_str("reqwest bridge: target closed"),
             Self::Timeout => f.write_str("reqwest bridge: call timed out"),
+            Self::Rejected(reason) => write!(f, "reqwest bridge: call rejected: {reason:?}"),
         }
     }
 }
@@ -191,6 +194,9 @@ pub fn flatten_outcome(outcome: ReqwestCallOutcome) -> Result<ReqwestResponse, R
         CallOutcome::Full => Err(ReqwestCallError::Bridge(BridgeFailure::Full)),
         CallOutcome::Closed => Err(ReqwestCallError::Bridge(BridgeFailure::Closed)),
         CallOutcome::Timeout => Err(ReqwestCallError::Bridge(BridgeFailure::Timeout)),
+        CallOutcome::Rejected(reason) => {
+            Err(ReqwestCallError::Bridge(BridgeFailure::Rejected(reason)))
+        }
     }
 }
 
@@ -277,6 +283,8 @@ pub enum ReqwestFatalReason {
     BridgeFull,
     /// Bridge ingress rejected admission: target stale or closed.
     BridgeClosed,
+    /// Bridge target rejected the call without a worker reply.
+    BridgeRejected(tina::CallRejectedReason),
     /// Worker rejected at the `max_in_flight` cap.
     WorkerFull,
     /// Worker has been closed.
@@ -351,6 +359,9 @@ impl ReqwestOutcomeExt for ReqwestCallOutcome {
             }
             CallOutcome::Full => ReqwestOutcomeClass::Fatal(ReqwestFatalReason::BridgeFull),
             CallOutcome::Closed => ReqwestOutcomeClass::Fatal(ReqwestFatalReason::BridgeClosed),
+            CallOutcome::Rejected(reason) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::BridgeRejected(reason))
+            }
         }
     }
 }

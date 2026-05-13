@@ -82,9 +82,9 @@ start from an honest baseline rather than from stale roadmap wording.
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
 | Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time, TCP server/client operations, local file/path operations, local persistence, UDP, bounded DNS, native TLS client and server lanes, bounded process runs, runtime shutdown notification, and Unix `SIGINT`/`SIGTERM` capture through Tina-owned driver rails with cancellation, shutdown, trace, and same-resource lane ownership. `tina-sim` scripts TCP, file/path, persistence, UDP, DNS, TLS, process, and signal rails for deterministic replay/DST. Capability reports name lane-backed, poll-backed, completion-backed, tombstoned, drained, and unsupported shapes. | Live-substrate liveness faults, remoting, clustering, native database clients, and production-grade streaming remain future work. |
 | Local persistence | `tina-runtime` exposes local snapshot/journal helpers with explicit append-before-apply semantics, snapshot `last_journal_index`, journal `record_index`, visible truncated/corrupt/commit-uncertain recovery outcomes, persistence trace events, and bounded live storage-lane admission for snapshot/journal work. `tina-sim` captures `DurableImage` path-to-bytes state for replay. | This is not a database, durable mailbox, durable work queue, or exactly-once system. Directory fsync and rename-commit support remain platform/backend scoped. Already-started local filesystem work cannot be preempted; a full nonblocking storage reactor remains future work. |
-| Native service protocols | `tina-http` now gives Tina a native HTTP/1.1 stack: parser/framing, connection/listener isolates, request/response types, routing helpers, bounded limits, visible overload, graceful close paths, native client, native HTTPS, response streaming, response-side chunked emit, keepalive client pool, server-side keepalive, and parser/DST coverage. | HTTP/2, gRPC, request-side chunked bodies, client-side chunked response decoding, richer web-framework ergonomics, and full listener/connection simulator replay remain future work. |
-| Ecosystem bridges | `tina-tokio-bridge`, `tina-rpc-tokio`, `tina-tower-bridge`, `tina-reqwest-bridge`, `tina-sqlite-bridge`, and `tina-sqlx-bridge` exist as bounded bridge shapes. The docs name runtime cost, weakened replay boundary, explicit caps, shutdown truth, caller-owned retry, typed DB outcomes, and bridge tracing. | AWS SDK, smol, bridge convention audit, common bridge setup extraction, and bridge crate/folder layout remain future work. |
-| App/service ergonomics | Specimen work has turned repeated example pain into typed result waiters, bounded observation handles, reply aliases, TCP loop helpers, pressure summaries, HTTP router sugar, sharded placement/table helpers, deferred replies, `RequestContext` multi-turn replies, cancellation handles, deadlines, pending-call sets, bounded pools, host-burst helpers, single-call gates, reqwest/DB classifiers, capacity reports, and host `call_blocking` scripts where appropriate. | 086 `CallContext` reply obligation, `reply_with_current_request(call, ...)` helper polish after 086, cross-isolate paired registration, generic scatter/gather happy-path helpers, bridge setup unification, host-side scenario/test ergonomics, weighted/shared capacity, and more real-world specimens remain future work. |
+| Native service protocols | `tina-http` now gives Tina a native HTTP/1.1 stack: parser/framing, connection/listener isolates, request/response types, routing helpers, bounded limits, visible overload, graceful close paths, native client, native HTTPS, response streaming, response-side and request-side chunked transfer, chunked client decode, keepalive client pool, server-side keepalive, and parser/DST coverage. | HTTP/2, gRPC, WebSocket, richer web-framework ergonomics, and full listener/connection simulator replay remain future work. |
+| Ecosystem bridges | `tina-tokio-bridge`, `tina-rpc-tokio`, `tina-tower-bridge`, `tina-reqwest-bridge`, `tina-sqlite-bridge`, `tina-sqlx-bridge`, and `tina-aws-bridge` exist as bounded bridge shapes. The docs name runtime cost, weakened replay boundary, explicit caps, shutdown truth, caller-owned retry, typed DB/S3 outcomes, and bridge tracing. | SQS/Dynamo/SNS, smol, bridge convention audit, common bridge setup extraction, and bridge crate/folder layout remain future work. |
+| App/service ergonomics | Specimen work has turned repeated example pain into typed result waiters, bounded observation handles, reply aliases, TCP loop helpers, pressure summaries, HTTP router sugar, sharded placement/table helpers, deferred replies, `CallContext` reply obligation, `RequestContext` multi-turn replies, typed child refs via `spawn_observed`, cancellation handles, deadlines, pending-call sets, bounded pools, host-burst helpers, single-call gates, reqwest/DB classifiers, capacity reports, and host `call_blocking` scripts where appropriate. | `reply_with_current_request(call, ...)` helper polish, cross-isolate paired registration, generic scatter/gather happy-path helpers, bridge setup unification, host-side scenario/test ergonomics, weighted/shared capacity, race/join helpers, and more real-world specimens remain future work. |
 
 ## Testing and proof strategy
 
@@ -226,11 +226,12 @@ and reviews live under `.intent/phases/`.
   `timmerhus_dst` saved case so the new helpers are the way for new DST
   tests.
 - SQLite/Postgres bridge and HTTP maturity tranche: `tina-sqlite-bridge`,
-  `tina-sqlx-bridge`, native HTTPS, response streaming, response-side
-  chunked emit, HTTP keepalive pool, server-side keepalive, body pressure
-  metrics, bounded pool vocabulary, capacity reports, deadlines, and
-  `PendingCallSet`. These are recorded in `CHANGELOG.md`; remaining work is
-  now the next active roadmap, not a continuation of first form.
+  `tina-sqlx-bridge`, native HTTPS, response streaming, response/request
+  chunked transfer, client chunked decode, HTTP keepalive pool, server-side
+  keepalive, body pressure metrics, bounded pool vocabulary, database pressure
+  reports, deadlines, `PendingCallSet`, child refs, and call-context reply
+  obligation. These are recorded in `CHANGELOG.md`; remaining work is now the
+  next active roadmap, not a continuation of first form.
 
 ## Near-term roadmap
 
@@ -239,18 +240,16 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **077 DB pool consumers** | Make the pool vocabulary earn its keep in database land. Build SQLite and/or Postgres pool consumers on top of the shipped bridges: bounded acquire, typed release/retire, pool pressure report, deadline propagation, close modes, and specimens that show "DB access with bounded concurrency" without blocking shard threads. This is the next clearest "replace Tokio workload" win because most real services hit a DB. |
-| **078 host-side ergonomics** | Reduce test/specimen ceremony without hiding service truth. Ship host `call_blocking` docs everywhere, trace query helpers (`trace.count_completed(kind)`, `any_failed(kind)`), and maybe a tiny scenario runner for tests. These are for host/test scripts, not service handlers. Service code should still use ordinary messages/effects. |
-| **079 cancellation round 2** | PR 1 done: `ResponseChunkMsg::Cancel` on abandoned wire, cancellation truth docs table. Remaining: pool/bridge audit fixes that are clearly pulled by code (Rock 2–4), supervised-child cancel-on-stop cleanup pattern. Bridge cancellation stays documented truth unless a boring fix exists. |
-| **080 HTTP body chunked symmetric** | Client-side chunked response decoding plus server-side chunked **request** bodies. Server emit already exists. This phase adds a small shared decoder, request-side pull contract, client integration tests, and docs. No HTTP/2 yet; finish honest HTTP/1 body semantics first. |
 | **081 bridge convention audit** | We now have enough bridges (`tokio`, `tower`, `reqwest`, `sqlite`, `sqlx`, `rpc-tokio`) to audit install/config/closer/metrics/tracing/late-result naming. Output should be boring: conventions, docs, maybe tiny shared helpers. Do not build a bridge framework unless three repeated shapes demand the same code. |
 | **082 capacity modeling round 2** | Finish the capacity story beyond count-only reports: user-defined weight units, explicit `UnboundedForNow` with expiry, shard-local shared capacity scopes, DST/CI capacity assertions, and migration of body/pool/bridge reports into the shared reporting shape. Weight is not "memory"; it is a user-defined cost unit that is easy to inspect when wrong. |
 | **070 sharded data and placement structures** | Continue 053's owned-data direction into reusable shapes: sharded counters, sharded maps, session tables, batch `group_by_owner`, stale generation detection, owner-side validation helpers, hot-key reports, and fanout read helpers. The goal is not shared mutable data; the goal is owned per-shard data with easy routing and explicit wrong-shard/closed/full outcomes. |
 | **083 production service layers** | Package the copied service patterns into docs and small APIs: HTTP routing + state + DB pool + outbound keepalive + graceful shutdown + tracing + capacity assertions. Not a framework on top of Tina; a "real service skeleton" proving an LLM can assemble the layers safely. |
-| **084 child lifecycle / join / supervision usability** | Make parent/child ownership boring: `spawn_observed` returns a typed child ref to the parent as ordinary message data, child stop/result observation is generation-aware, supervised restarts refresh replacement addresses without trace spelunking, and parent stop has documented/proven child cleanup truth. First form stays local-shard and typed; host-side `observe_child_started` waits until spawn events carry enough type truth. |
 | **085 race / join helpers** | Tina-shaped equivalents for the useful parts of `select!`, `join!`, and `JoinSet`: bounded named call groups, first-success race with visible loser cancellation, join-all with partial deadline report, `CallContext`/`RequestContext` integration, and no hidden retry or anonymous branch outcomes. This builds on 086 call contexts, 072 pending call sets, 079 cancellation, and ideally 084 child refs. |
-| **086 call context reply obligation** | Replace warning-only `CallReplyAbandoned` with the real Tina contract: send handlers have no caller, call handlers receive a typed `CallContext`, and that reply authority must be replied, rejected, or carried forward as `RequestContext`. Returning unused authority rejects immediately and reclaims capacity. This is project-wide API work, not helper polish. |
 | **RequestContext helper polish** | Tiny helper after 086, no full phase unless it grows: add `reply_with_current_request(call, f)` on call/observed-call builders as sugar for `call.into_request_context()` plus `reply_with_request(...)`. The helper consumes explicit call authority, not generic `Context`. Docs should still show the expanded form once so users know where caller authority lives. |
+| **087 WebSocket first form** | Native WebSocket over Tina-owned HTTP/TCP/TLS rails. Use `tungstenite` core for frame parsing if useful, but Tina owns session isolates, ping/pong, close handshake, slow-reader pressure, inbound/outbound caps, cancellation, trace, and specimens. First form is server rooms plus a tiny test client if needed; not a broad web framework or full client crate. Plan: `.intent/phases/087-websocket-first-form/plan.md`. |
+| **088 AWS bridge first form** | In review in PR #73. Bounded S3 bridge first: object put/get/head/delete, explicit body caps, caller-owned retry/idempotency, close/drain, timeout/late-result truth, metrics, and fake-local CI. SQS/Dynamo/SNS wait until S3 proves the bridge shape. Plan: `.intent/phases/088-aws-bridge-first-form/plan.md`. |
+| **089 live trace to sim replay workflow** | Turn DST into an ops workflow: user-guided live capture of typed ops/config/topology/pressure facts, projection into `tina-sim`, compare traces, shrink the bad case. No magic "logs become replay." Missing facts must be explicit. Plan: `.intent/phases/089-live-trace-to-sim-replay-workflow/plan.md`. |
+| **090 resource lifecycle unification** | Audit runtime rails and bridge resources so open/start, ready, use, cancel, close, drain, terminal report, and pressure report mean the same boring thing everywhere. Fix small mismatches; split big semantic changes into their own PRs. |
 | **056 native HTTP/2 service stack** | Second-form HTTP after HTTP/1 body/chunked/cancellation semantics are boring. Adopt sync codec crates where they exist; Tina owns sockets, flow control, stream state, bounded queues, DST, and trace. Not a full RFC/tonic clone. |
 | **057 native gRPC service stack** | Third-form RPC after 056 HTTP/2 lands. Small layer on top: `prost`, generated Tina-shaped service trait template, typed status, unary and server-streaming first form, client and server, DST for status/cancel. Bidirectional streaming and interceptor feature-parity are later. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
@@ -285,25 +284,22 @@ tests, and specimens when the adjacent work proves the shape.
 | Saga / compensation pattern | Typed multi-step workflow pattern over DB, HTTP, pools, and services, with explicit compensation, timeout, cancellation, and partial-failure reports. | Multi-resource business workflows become readable Tina state machines instead of ad hoc async control flow. |
 | Load and soak harness | A reusable harness for long runs that records capacity high-water, full counts, latency-ish summaries, resource leaks, and trace fingerprints. | Teams can prove a Tina service stays bounded for an hour before claiming it is production-shaped. |
 
-Deferred from Phase 074 (HTTP body streaming, native HTTP/1):
+Closed follow-ups from Phase 074 (HTTP body streaming, native HTTP/1):
 
-The 074 slice shipped server-side body streaming with pressure
-metrics, `IterBodySource`, chunked transfer-encoding emit, and a
-specimen. Five items were intentionally deferred and routed to
-their next-best home rather than expanded the 074 diff. Grouping
-matters because some can land together, others must wait for
-independent work.
+The 074 slice shipped server-side body streaming with pressure metrics,
+`IterBodySource`, chunked transfer-encoding emit, and a specimen. The
+follow-ups that were intentionally deferred from that PR have now mostly
+landed in their owning phases.
 
 | Group | Lands in | Items |
 |---|---|---|
-| Cancel surface | **079 cancellation round 2** | Connection-to-source cancel signal on wire failure (`ResponseChunkMsg::Cancel`). Today the source is left idle; failure visible only via `body_io_error_count`. 066 shipped the cancellation vocabulary; round 2 applies it to surfaces 066 didn't reach, including this one. |
-| Capacity report | **082 capacity modeling round 2** | Migrating body/bridge/pool reports into the shared `CapacitySurfaceReport` shape where useful. Periodic / live-tick metric emit and shared scopes belong here, not in one HTTP slice. |
-| Chunked symmetric | **080 HTTP body chunked symmetric** | Client-side chunked decoding (today rejected as `UnsupportedTransferEncoding`). Server-side chunked **request** bodies (today rejected). One slice because they share decoder + harness. |
+| Cancel surface | **079 cancellation round 2** | Landed: connection-to-source cancel signal on wire failure (`ResponseChunkMsg::Cancel`) for known-length and chunked streaming responses. |
+| Capacity report | **082 capacity modeling round 2** | Still active: migrate body/bridge/pool reports into the shared `CapacitySurfaceReport` shape where useful. Periodic / live-tick metric emit and shared scopes belong here, not in one HTTP slice. |
+| Chunked symmetric | **080 HTTP body chunked symmetric** | Landed: client-side chunked decoding and server-side chunked request bodies through the streaming pull model. |
 
-Shipping these in 074 itself would have either bundled unrelated
-work (cancellation surface, capacity-report shape) or duplicated
-infrastructure that another slice will own anyway. Each row above
-is the *only* place that work should land.
+Do not resurrect the old "chunked is deferred" wording. The remaining body
+work is HTTP/2/WebSocket/protocol breadth and broader capacity-report polish,
+not basic HTTP/1 chunked semantics.
 
 Bridge crate layout note: the bridge crates are still small enough at the
 repo root, but the next bridge audit should revisit grouping them under a

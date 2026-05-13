@@ -177,6 +177,7 @@ The repository is a Cargo workspace:
 | [`tina-rpc-tokio`](tina-rpc-tokio/) | Tokio async facade over native Tina RPC for ecosystem-edge callers. |
 | [`tina-tokio-bridge`](tina-tokio-bridge/) | Bounded ingress from a host Tokio runtime into a Tina service, for axum/Tower/Hyper integration. |
 | [`tina-sqlite-bridge`](tina-sqlite-bridge/) | First-form SQLite worker around `rusqlite`. One connection, one blocking thread, autocommit only, named caps for mailbox / in-flight / pool / pending replies. |
+| [`tina-aws-bridge`](tina-aws-bridge/) | First-form S3 bridge around the AWS Rust SDK. S3-shaped requests, explicit config, bounded admission/in-flight work, body caps, typed errors, metrics, and honest late-result/close-drain semantics. |
 
 End consumers depend on `tina` plus one runtime or simulator crate.
 

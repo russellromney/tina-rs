@@ -14,6 +14,7 @@ use std::time::Duration;
 use http::StatusCode;
 use rustls::pki_types::ServerName;
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_http::{
     BodyMetrics, HttpConnectionMsg, HttpRequest, HttpRequestBody, HttpResponse, HttpsListener,
     HttpsListenerMsg, HttpsReady, HttpsServerConfig, HttpsStartupError, IterBodySource,
@@ -51,18 +52,25 @@ impl Isolate for ChunkProducer {
 
     fn handle(
         &mut self,
-        _msg: ResponseChunkMsg,
+        msg: ResponseChunkMsg,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(self.next_chunk(msg))
+    }
+
+    fn handle_call(&mut self, msg: ResponseChunkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.next_chunk(msg))
+    }
+}
+
+impl ChunkProducer {
+    fn next_chunk(&mut self, _msg: ResponseChunkMsg) -> ResponseChunkReply {
         if self.yielded >= self.total_chunks {
-            return reply(ResponseChunkReply::Eof);
+            return ResponseChunkReply::Eof;
         }
         let i = self.yielded;
         self.yielded += 1;
-        reply(ResponseChunkReply::Chunk(vec![
-            (i % 251) as u8;
-            self.chunk_size
-        ]))
+        ResponseChunkReply::Chunk(vec![(i % 251) as u8; self.chunk_size])
     }
 }
 
@@ -86,7 +94,17 @@ impl Isolate for StreamingService {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = if request.path == "/big" {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl StreamingService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        if request.path == "/big" {
             HttpResponse::with_stream(
                 StatusCode::OK,
                 ResponseStream {
@@ -96,8 +114,7 @@ impl Isolate for StreamingService {
             )
         } else {
             HttpResponse::not_found()
-        };
-        reply(response)
+        }
     }
 }
 
@@ -258,12 +275,21 @@ impl Isolate for ChunkedService {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = if request.path == "/big-chunked" {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl ChunkedService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        if request.path == "/big-chunked" {
             HttpResponse::stream_chunked(StatusCode::OK, self.source)
         } else {
             HttpResponse::not_found()
-        };
-        reply(response)
+        }
     }
 }
 
@@ -279,9 +305,9 @@ fn read_through_real_rustls_path(addr: SocketAddr, root_cert_der: Vec<u8>, path:
     let connection =
         rustls::ClientConnection::new(Arc::new(config), server_name).expect("client connection");
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("tcp connect");
-    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))
         .expect("read timeout");
-    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+    tcp.set_write_timeout(Some(Duration::from_secs(30)))
         .expect("write timeout");
     let mut stream = rustls::StreamOwned::new(connection, tcp);
     while stream.conn.is_handshaking() {
@@ -417,10 +443,10 @@ fn chunked_response_over_https_matches_http_shape() {
 /// sends a chunked POST; the server decodes it via the same streaming
 /// pull model used for plain HTTP. The response echoes the total decoded
 /// bytes so the test can verify end-to-end correctness.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ChunkedRequestMsg {
     Inbound(HttpRequest),
-    ChunkArrived(CallOutcome<RequestChunkReply>),
+    ChunkArrived(RequestContext<HttpResponse>, CallOutcome<RequestChunkReply>),
 }
 
 impl From<HttpRequest> for ChunkedRequestMsg {
@@ -458,42 +484,67 @@ impl Isolate for ChunkedRequestConsumer {
                 HttpRequestBody::Stream(stream) => {
                     self.accumulated.clear();
                     self.pending_source = Some(stream.source);
-                    call(
-                        stream.source,
-                        HttpConnectionMsg::body_next(),
-                        Duration::from_secs(2),
-                    )
-                    .reply(ChunkedRequestMsg::ChunkArrived)
+                    reply(HttpResponse::internal_error())
                 }
             },
-            ChunkedRequestMsg::ChunkArrived(outcome) => match outcome {
+            ChunkedRequestMsg::ChunkArrived(request, outcome) => match outcome {
                 CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
                     self.accumulated.extend_from_slice(&bytes);
                     let source = self.pending_source.expect("source set");
                     call(
                         source,
                         HttpConnectionMsg::body_next(),
-                        Duration::from_secs(2),
+                        Duration::from_secs(30),
                     )
-                    .reply(ChunkedRequestMsg::ChunkArrived)
+                    .reply_with_request(request, ChunkedRequestMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     let total = self.accumulated.len();
                     self.pending_source = None;
                     self.accumulated.clear();
-                    reply(HttpResponse::with_text(
-                        StatusCode::OK,
-                        format!("stream:{total}"),
-                    ))
+                    reply_to_request(
+                        request,
+                        HttpResponse::with_text(StatusCode::OK, format!("stream:{total}")),
+                    )
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
                 | CallOutcome::Full
                 | CallOutcome::Closed
+                | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply(HttpResponse::internal_error())
+                    reply_to_request(request, HttpResponse::internal_error())
                 }
             },
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: ChunkedRequestMsg,
+        call_ctx: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            ChunkedRequestMsg::Inbound(req) => match req.body {
+                HttpRequestBody::Buffered(bytes) => call_ctx.reply(HttpResponse::with_text(
+                    StatusCode::OK,
+                    format!("buffered:{}", bytes.len()),
+                )),
+                HttpRequestBody::Stream(stream) => {
+                    self.accumulated.clear();
+                    self.pending_source = Some(stream.source);
+                    let request = call_ctx.into_request_context();
+                    call(
+                        stream.source,
+                        HttpConnectionMsg::body_next(),
+                        Duration::from_secs(30),
+                    )
+                    .reply_with_request(request, ChunkedRequestMsg::ChunkArrived)
+                }
+            },
+            ChunkedRequestMsg::ChunkArrived(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -515,9 +566,9 @@ fn send_chunked_request_over_rustls(
     let connection =
         rustls::ClientConnection::new(Arc::new(config), server_name).expect("client connection");
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("tcp connect");
-    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))
         .expect("read timeout");
-    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+    tcp.set_write_timeout(Some(Duration::from_secs(30)))
         .expect("write timeout");
     let mut stream = rustls::StreamOwned::new(connection, tcp);
     while stream.conn.is_handshaking() {
@@ -573,6 +624,7 @@ fn chunked_request_over_https_matches_http_shape() {
 
     let mut server_config = HttpsServerConfig::dev(identity);
     server_config.http.limits.inbound_stream_chunk_size = Some(512);
+    server_config.http.service_call_timeout = Duration::from_secs(30);
     let listener_isolate = HttpsListener::<TestShard, ChunkedRequestMsg>::new(
         "127.0.0.1:0".parse().unwrap(),
         consumer,

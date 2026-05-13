@@ -28,14 +28,13 @@
     "use this, not that" entries for each shipped primitive;
     `docs/tina-user-guide/18-bridge-crates.md` mentions `classify`
     next to `flatten_outcome`.
-- In progress:
-  - (none — all in-scope rocks landed)
-- Open:
-  - Rocks 2 (self-address) and 8 (scatter/gather helper) are blocked
-    on a written design note before any code lands.
+- Closed:
+  - all in-scope rocks landed.
+- Deferred:
+  - Rocks 2 (self-address) and 8 (scatter/gather helper) require a
+    separate design/implementation slice before code.
   - Rock 7 (flat reqwest continuation) waits until a non-pedagogical
     caller mixes layered + flat.
-- Deferred:
   - Broad `flow!` / pseudo-async authoring surface.
   - Macro-heavy scatter/gather until a helper has proved the shape.
   - Hidden retry, hidden queues, hidden topology.

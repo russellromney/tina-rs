@@ -20,6 +20,20 @@ enum ParentEvent {
     StartChild,
 }
 
+#[derive(Debug)]
+enum ObservedParentEvent {
+    StartChild,
+    StartInvalidChild,
+    ChildStarted(Result<ChildRef<ChildEvent>, SpawnObservedError>),
+}
+
+#[derive(Debug)]
+enum FullParentEvent {
+    Start,
+    Fill,
+    ChildStarted(Result<ChildRef<ChildEvent>, SpawnObservedError>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildEvent {
     Data(u8),
@@ -140,6 +154,102 @@ struct Parent {
     child_seen: Rc<RefCell<Vec<u8>>>,
     order_log: Rc<RefCell<Vec<&'static str>>>,
     child_capacity: usize,
+}
+
+#[derive(Debug)]
+struct ObservedParent {
+    child_seen: Rc<RefCell<Vec<u8>>>,
+    order_log: Rc<RefCell<Vec<&'static str>>>,
+    child_ref: Rc<RefCell<Option<ChildRef<ChildEvent>>>>,
+    spawn_error: Rc<RefCell<Option<SpawnObservedError>>>,
+}
+
+impl Isolate for ObservedParent {
+    tina::isolate_types! {
+        message: ObservedParentEvent,
+        reply: (),
+        send: Outbound<ChildEvent>,
+        spawn: ChildDefinition<Child>,
+        spawn_observed: tina::SpawnObserved<ChildDefinition<Child>, ObservedParentEvent, ChildEvent>,
+        call: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ObservedParentEvent::StartChild => spawn_observed(ChildDefinition::new(
+                Child {
+                    seen: Rc::clone(&self.child_seen),
+                    order_log: Rc::clone(&self.order_log),
+                },
+                4,
+            ))
+            .reply(ObservedParentEvent::ChildStarted),
+            ObservedParentEvent::StartInvalidChild => spawn_observed(ChildDefinition::new(
+                Child {
+                    seen: Rc::clone(&self.child_seen),
+                    order_log: Rc::clone(&self.order_log),
+                },
+                0,
+            ))
+            .reply(ObservedParentEvent::ChildStarted),
+            ObservedParentEvent::ChildStarted(Ok(child)) => {
+                *self.child_ref.borrow_mut() = Some(child);
+                send(child.address, ChildEvent::Data(42))
+            }
+            ObservedParentEvent::ChildStarted(Err(error)) => {
+                *self.spawn_error.borrow_mut() = Some(error);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FullParent {
+    child_seen: Rc<RefCell<Vec<u8>>>,
+    order_log: Rc<RefCell<Vec<&'static str>>>,
+    child_started_delivered: Rc<Cell<bool>>,
+}
+
+impl Isolate for FullParent {
+    type Message = FullParentEvent;
+    type Reply = ();
+    type Send = Outbound<FullParentEvent>;
+    type Spawn = ChildDefinition<Child>;
+    type SpawnObserved = tina::SpawnObserved<Self::Spawn, Self::Message, ChildEvent, ()>;
+    type Call = Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            FullParentEvent::Start => batch([
+                send(ctx.me(), FullParentEvent::Fill),
+                spawn_observed(ChildDefinition::new(
+                    Child {
+                        seen: Rc::clone(&self.child_seen),
+                        order_log: Rc::clone(&self.order_log),
+                    },
+                    4,
+                ))
+                .reply(FullParentEvent::ChildStarted),
+            ]),
+            FullParentEvent::Fill => noop(),
+            FullParentEvent::ChildStarted(result) => {
+                let _ = result;
+                self.child_started_delivered.set(true);
+                noop()
+            }
+        }
+    }
 }
 
 impl Isolate for Parent {
@@ -266,6 +376,111 @@ fn spawn_creates_child_and_records_trace() {
             ),
         ]
     );
+}
+
+#[test]
+fn spawn_observed_delivers_typed_child_ref_and_parent_uses_address() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let child_seen = Rc::new(RefCell::new(Vec::new()));
+    let order_log = Rc::new(RefCell::new(Vec::new()));
+    let child_ref = Rc::new(RefCell::new(None));
+    let spawn_error = Rc::new(RefCell::new(None));
+    let parent = runtime.register(
+        ObservedParent {
+            child_seen: Rc::clone(&child_seen),
+            order_log: Rc::clone(&order_log),
+            child_ref: Rc::clone(&child_ref),
+            spawn_error,
+        },
+        TestMailbox::new(8),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, ObservedParentEvent::StartChild)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert!(child_seen.borrow().is_empty());
+    assert!(child_ref.borrow().is_none());
+
+    assert_eq!(runtime.step(), 1);
+    let child = (*child_ref.borrow()).expect("child ref delivered to parent");
+    assert_eq!(child.generation, child.address.generation());
+    assert_eq!(child.address.shard(), ShardId::new(3));
+
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(&*child_seen.borrow(), &[42]);
+}
+
+#[test]
+fn spawn_observed_reports_zero_capacity_without_spawning_child() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let child_seen = Rc::new(RefCell::new(Vec::new()));
+    let order_log = Rc::new(RefCell::new(Vec::new()));
+    let child_ref = Rc::new(RefCell::new(None));
+    let spawn_error = Rc::new(RefCell::new(None));
+    let parent = runtime.register(
+        ObservedParent {
+            child_seen,
+            order_log,
+            child_ref: Rc::clone(&child_ref),
+            spawn_error: Rc::clone(&spawn_error),
+        },
+        TestMailbox::new(8),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, ObservedParentEvent::StartInvalidChild)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert!(child_ref.borrow().is_none());
+    assert!(spawn_error.borrow().is_none());
+    assert!(
+        !runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+    );
+
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(
+        *spawn_error.borrow(),
+        Some(SpawnObservedError::ZeroMailboxCapacity)
+    );
+}
+
+#[test]
+fn spawn_observed_parent_delivery_full_is_traced_without_hidden_queue() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let child_seen = Rc::new(RefCell::new(Vec::new()));
+    let order_log = Rc::new(RefCell::new(Vec::new()));
+    let child_started_delivered = Rc::new(Cell::new(false));
+    let parent = runtime.register(
+        FullParent {
+            child_seen,
+            order_log,
+            child_started_delivered: Rc::clone(&child_started_delivered),
+        },
+        TestMailbox::new(1),
+    );
+
+    assert!(runtime.try_send(parent, FullParentEvent::Start).is_ok());
+    assert_eq!(runtime.step(), 1);
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                reason: tina_runtime::SendRejectedReason::Full,
+                ..
+            }
+        )
+    }));
+
+    assert_eq!(runtime.step(), 1);
+    assert!(!child_started_delivered.get());
 }
 
 #[test]

@@ -104,6 +104,16 @@ impl Worker {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Hold => {
+                self.held = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+            WorkerMsg::Release => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
 }
 
 // --- Driver: stores a CallHandle, cancels it on demand ---------------------

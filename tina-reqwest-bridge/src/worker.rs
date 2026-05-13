@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::Client;
+use tina::CallContext;
 use tina::prelude::*;
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
 use tokio::runtime::Handle;
@@ -22,6 +23,8 @@ use crate::types::{
     RedirectPolicy, ReqwestConfig, ReqwestConfigError, ReqwestError, ReqwestRequest,
     ReqwestResponse, RetryPolicy,
 };
+
+type ReqwestResult = Result<ReqwestResponse, ReqwestError>;
 
 /// `tracing` target for per-call events.
 #[cfg(feature = "tracing")]
@@ -73,6 +76,7 @@ enum SlotKind {
 
 struct Slot {
     kind: SlotKind,
+    request_context: Option<RequestContext<ReqwestResult>>,
     per_attempt_timeout: Duration,
     /// Retry attempts remaining after the current one completes.
     attempts_remaining: u8,
@@ -85,6 +89,15 @@ struct Slot {
     /// `timeout`, `replied`) can carry the same `method` field.
     /// Always populated, regardless of whether the `tracing` feature
     /// is on, so the type does not branch on cfg.
+    method: String,
+}
+
+struct Delivery {
+    request_context: Option<RequestContext<ReqwestResult>>,
+    per_attempt_timeout: Duration,
+    attempts_remaining: u8,
+    retry_delay: Duration,
+    saved_request: Option<ReqwestRequest>,
     method: String,
 }
 
@@ -256,7 +269,11 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         }
     }
 
-    fn admit_initial(&mut self, request: ReqwestRequest) -> Effect<Self> {
+    fn admit_initial(
+        &mut self,
+        request: ReqwestRequest,
+        request_context: Option<RequestContext<ReqwestResult>>,
+    ) -> Effect<Self> {
         #[cfg(feature = "tracing")]
         let method = request.method.as_str();
 
@@ -270,7 +287,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 reason = "Closed",
                 method,
             );
-            return reply::<Self>(Err(ReqwestError::Closed));
+            return Self::complete_request(request_context, Err(ReqwestError::Closed));
         }
         if request.body.len() > self.config.request_body_limit {
             self.metrics
@@ -284,7 +301,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 reason = "RequestTooLarge",
                 method,
             );
-            return reply::<Self>(Err(ReqwestError::RequestTooLarge));
+            return Self::complete_request(request_context, Err(ReqwestError::RequestTooLarge));
         }
         if self.in_flight.len() >= self.config.max_in_flight {
             self.metrics.full.fetch_add(1, Ordering::Relaxed);
@@ -296,7 +313,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 reason = "Full",
                 method,
             );
-            return reply::<Self>(Err(ReqwestError::Full));
+            return Self::complete_request(request_context, Err(ReqwestError::Full));
         }
 
         let (attempts_remaining, retry_delay) = match self.config.retry {
@@ -315,6 +332,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         };
         self.spawn_attempt(
             request,
+            request_context,
             attempts_remaining,
             retry_delay,
             per_attempt_timeout,
@@ -325,6 +343,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
     fn spawn_attempt(
         &mut self,
         request: ReqwestRequest,
+        request_context: Option<RequestContext<ReqwestResult>>,
         attempts_remaining: u8,
         retry_delay: Duration,
         per_attempt_timeout: Duration,
@@ -344,7 +363,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     detail = %err,
                 );
                 self.tally_error(&err);
-                return reply::<Self>(Err(err));
+                return Self::complete_request(request_context, Err(err));
             }
         };
 
@@ -374,6 +393,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     receiver: rx,
                     abort,
                 },
+                request_context,
                 per_attempt_timeout,
                 attempts_remaining,
                 retry_delay,
@@ -402,6 +422,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
     fn schedule_retry(
         &mut self,
         request: ReqwestRequest,
+        request_context: Option<RequestContext<ReqwestResult>>,
         attempts_remaining: u8,
         retry_delay: Duration,
         per_attempt_timeout: Duration,
@@ -414,6 +435,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             };
             return self.spawn_attempt(
                 request,
+                request_context,
                 attempts_remaining,
                 retry_delay,
                 per_attempt_timeout,
@@ -431,6 +453,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     request,
                     attempt_due_at,
                 },
+                request_context,
                 per_attempt_timeout,
                 attempts_remaining,
                 retry_delay,
@@ -452,6 +475,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
 
         let Slot {
             kind,
+            request_context,
             per_attempt_timeout,
             attempts_remaining,
             retry_delay,
@@ -466,11 +490,14 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 abort,
             } => match receiver.try_recv() {
                 Ok(result) => self.deliver(
-                    per_attempt_timeout,
-                    attempts_remaining,
-                    retry_delay,
-                    saved_request,
-                    method,
+                    Delivery {
+                        request_context,
+                        per_attempt_timeout,
+                        attempts_remaining,
+                        retry_delay,
+                        saved_request,
+                        method,
+                    },
                     result,
                 ),
                 Err(oneshot::error::TryRecvError::Empty) => {
@@ -491,6 +518,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             );
                             return self.schedule_retry(
                                 saved,
+                                request_context,
                                 attempts_remaining - 1,
                                 retry_delay,
                                 per_attempt_timeout,
@@ -507,7 +535,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             method = method.as_str(),
                             elapsed_ms = attempt_started_at.elapsed().as_millis() as u64,
                         );
-                        return reply::<Self>(Err(ReqwestError::Timeout));
+                        return Self::complete_request(request_context, Err(ReqwestError::Timeout));
                     }
                     self.in_flight.insert(
                         id,
@@ -517,6 +545,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                                 receiver,
                                 abort,
                             },
+                            request_context,
                             per_attempt_timeout,
                             attempts_remaining,
                             retry_delay,
@@ -543,6 +572,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         );
                         return self.schedule_retry(
                             saved,
+                            request_context,
                             attempts_remaining - 1,
                             retry_delay,
                             per_attempt_timeout,
@@ -559,7 +589,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         method = method.as_str(),
                         detail = %err,
                     );
-                    reply::<Self>(Err(err))
+                    Self::complete_request(request_context, Err(err))
                 }
             },
             SlotKind::PendingRetry {
@@ -574,6 +604,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     };
                     self.spawn_attempt(
                         request,
+                        request_context,
                         attempts_remaining,
                         retry_delay,
                         per_attempt_timeout,
@@ -587,6 +618,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                                 request,
                                 attempt_due_at,
                             },
+                            request_context,
                             per_attempt_timeout,
                             attempts_remaining,
                             retry_delay,
@@ -602,13 +634,18 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
 
     fn deliver(
         &mut self,
-        per_attempt_timeout: Duration,
-        attempts_remaining: u8,
-        retry_delay: Duration,
-        saved_request: Option<ReqwestRequest>,
-        method: String,
+        delivery: Delivery,
         result: Result<ReqwestResponse, ReqwestError>,
     ) -> Effect<Self> {
+        let Delivery {
+            request_context,
+            per_attempt_timeout,
+            attempts_remaining,
+            retry_delay,
+            saved_request,
+            method,
+        } = delivery;
+
         if let Err(err) = &result {
             if attempts_remaining > 0 {
                 if let (Some(saved), true) = (
@@ -627,6 +664,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     let request = saved.clone();
                     return self.schedule_retry(
                         request,
+                        request_context,
                         attempts_remaining - 1,
                         retry_delay,
                         per_attempt_timeout,
@@ -666,7 +704,17 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         #[cfg(not(feature = "tracing"))]
         let _ = method;
         self.note_terminal();
-        reply::<Self>(result)
+        Self::complete_request(request_context, result)
+    }
+
+    fn complete_request(
+        request_context: Option<RequestContext<ReqwestResult>>,
+        result: ReqwestResult,
+    ) -> Effect<Self> {
+        match request_context {
+            Some(request) => reply_to_request(request, result),
+            None => reply::<Self>(result),
+        }
     }
 
     fn note_terminal(&self) {
@@ -752,8 +800,18 @@ impl<S: Shard + 'static> Isolate for ReqwestWorker<S> {
 
     fn handle(&mut self, msg: ReqwestMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
-            ReqwestMsg::Send(request) => self.admit_initial(request),
+            ReqwestMsg::Send(request) => self.admit_initial(request, None),
             ReqwestMsg::Poll(id) => self.poll(id),
+        }
+    }
+
+    fn handle_call(&mut self, msg: ReqwestMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ReqwestMsg::Send(request) => {
+                let request_context = call.into_request_context();
+                self.admit_initial(request, Some(request_context))
+            }
+            ReqwestMsg::Poll(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }

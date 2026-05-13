@@ -266,11 +266,29 @@ witness.
 **Surfaced by:** `specimen_dynamic_worker_pool`,
 `specimen_supervised_worker`.
 
-`spawn(ChildDefinition::new(...))` returns nothing. The parent does
-not learn the child's `Address`. Today this is OK because the
-parent only needs the child to send messages *back* to the parent
-(the child has the parent's address). But it means the parent
-cannot:
+`spawn(ChildDefinition::new(...))` still returns nothing and stays
+the fire-and-forget primitive. Phase 084 adds the explicit observed
+form:
+
+```rust
+spawn_observed(ChildDefinition::new(worker, cap))
+    .reply(ParentMsg::ChildStarted)
+```
+
+The continuation receives
+`Result<ChildRef<ChildMsg, ChildReply>, SpawnObservedError>` as an
+ordinary later parent message. The parent can store the typed child
+address, send follow-up messages, and treat restart-created
+incarnations as new/stale generation truth.
+
+The error half covers spawn construction rejection, for example a zero
+mailbox capacity. If delivering the continuation to the parent is itself
+rejected because the parent's bounded mailbox is full or closed, the runtime
+records the normal send rejection in the trace; there is no hidden queue to
+force a second message through the failed path.
+
+Before this, the parent did not learn the child's `Address`. That
+meant the parent could not:
 
 - ask the runtime "is this specific child still alive?" via
   `observe_isolate_complete(child_addr)`;
@@ -278,17 +296,15 @@ cannot:
 - aggregate "missing partials" as a typed timeout (the parent
   doesn't know which child is missing).
 
-Today's workaround is the supervised-worker pattern: the child
-sends a `Boot(self_addr)` message back to a shared `Arc<Mutex<...>>`
-slot. That works for the supervisor case, but it's the wrong
-ergonomics for "spawn N workers and join all results."
+The old supervised-worker workaround had the child send a
+`Boot(self_addr)` message back to a shared `Arc<Mutex<...>>` slot.
+`specimen_supervised_worker` now uses `spawn_observed` for the
+initial address instead.
 
-**Build:** either `spawn(...)` returns the child's `Address` (would
-require a synchronous spawn API today), or a
-`spawn_observed(child).reply(MyMsg::ChildSpawned)` variant that
-delivers `Address<ChildMsg>` to the parent as a continuation
-message — analogous to `send_observed` and `runtime calls`. This
-also enables a future `JoinSet`-equivalent isolate primitive.
+**Still open:** join/stop child convenience and typed restart
+refresh as parent messages. Existing `observe_child_restarted`
+carries the new isolate id/generation, but it is a host waiter and
+does not yet deliver a typed replacement `ChildRef` to the parent.
 
 A *host-side* alternative —
 `runtime.observe_child_started::<M>(parent).wait(timeout)?` —

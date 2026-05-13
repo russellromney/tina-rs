@@ -15,10 +15,9 @@
 - Done: server-side keepalive landed in 076, and the keepalive pool is
   now proven end-to-end against the native listener. `specimen_outbound_http`
   uses the pooled keepalive shape.
-- In progress: none.
-- Open: DB pool consumers moved to 077. Bridge convention audit moved
-  to 081. Host-side ergonomics moved to 078. Cancellation follow-up
-  moved to 079.
+- Closed: HTTP keepalive consumer landed and dependent follow-ups moved to
+  their own completed phases (077, 078, 079).
+- Moved out: bridge convention audit lives in 081.
 - Deferred: multi-shard pool, keyed cluster pool, automatic lease
   reclaim.
 

@@ -9,8 +9,8 @@
   `observe_isolate_complete`; `specimen_outbound_http` replaced the
   per-request `mpsc` bridge with one scripting Driver isolate that ends via
   `stop_with(report)` + `observe_result`.
-- In progress: none.
-- Open: implement low-risk helpers, design the model-changing helpers, update Specimen examples.
+- Closed: low-risk helpers landed, dangerous helper designs recorded, and
+  specimens/docs updated where the shape was proven.
 - Deferred: fake-async pipeline syntax, hidden retries, hidden queues, broad workflow macros.
 
 ## Goal

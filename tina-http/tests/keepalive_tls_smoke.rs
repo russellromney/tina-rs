@@ -16,11 +16,12 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use tina::pool::{AcquireOutcome, PoolConfig, PoolLease, ReleaseDisposition};
+use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, PoolLease, ReleaseDisposition};
 use tina::prelude::*;
 use tina_http::{
     HttpClientConfig, HttpRequest, HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg,
-    KeepaliveOutcome, TlsTrustRoots, build_keepalive_pool,
+    KeepaliveOutcome, KeepalivePoolCloseOutcome, KeepalivePoolDrainOutcome, TlsTrustRoots,
+    build_keepalive_pool, shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
@@ -382,8 +383,18 @@ fn https_keepalive_pool_reuses_one_tls_handshake_for_three_requests() {
     assert_eq!(server.requests(), 3);
 
     // Stop the connection isolate before runtime shutdown so the TLS
-    // session ends cleanly.
-    let _ = runtime.try_send(handles.connections[0], KeepaliveConnectionMsg::Stop);
+    // session ends cleanly, and check the typed shutdown truth.
+    let report =
+        shutdown_keepalive_pool(&runtime, &handles, CloseMode::Drain, Duration::from_secs(2))
+            .expect("shutdown keepalive pool");
+    assert_eq!(report.pool_close, KeepalivePoolCloseOutcome::Closed);
+    assert_eq!(report.drain, KeepalivePoolDrainOutcome::Drained);
+    assert_eq!(report.requested, 1);
+    assert_eq!(report.stopped, 1);
+    assert_eq!(report.timed_out, 0);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.already_closed, 0);
+    assert!(report.connection_failures.is_empty());
 
     let _ = runtime.shutdown();
 }

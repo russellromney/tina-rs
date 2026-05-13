@@ -970,6 +970,7 @@ where
     type Reply = ();
     type Send = TinaOutbound<T>;
     type Spawn = Infallible;
+    type SpawnObserved = Infallible;
     // `RuntimeCall<M>` (rather than `Infallible`) so the same primitive
     // is accepted by the simulator, the explicit-step `MultiShardRuntime`,
     // and `ThreadedMultiShardRuntime` without per-runtime variants. The

@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use tina::CallRejectedReason;
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallKind, CallReplyRejectedReason,
     DeferredReplyRejectedReason, EffectKind, RestartSkippedReason, RuntimeEvent, RuntimeEventKind,
@@ -345,6 +346,17 @@ pub fn emit_event(event: &RuntimeEvent) {
             isolate,
             call_id = call_id.get(),
         ),
+        RuntimeEventKind::CallRejected { call_id, reason } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "call_rejected",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            reason = call_rejected_reason_name(reason),
+        ),
         RuntimeEventKind::SnapshotCommitted => event!(
             target: RUNTIME_TRACE_TARGET,
             Level::TRACE,
@@ -536,12 +548,14 @@ pub fn effect_kind_name(kind: EffectKind) -> &'static str {
         EffectKind::Reply => "reply",
         EffectKind::Send => "send",
         EffectKind::Spawn => "spawn",
+        EffectKind::SpawnObserved => "spawn_observed",
         EffectKind::Stop => "stop",
         EffectKind::StopWith => "stop_with",
         EffectKind::RestartChildren => "restart_children",
         EffectKind::Call => "call",
         EffectKind::Batch => "batch",
         EffectKind::ReplyTo => "reply_to",
+        EffectKind::Reject => "reject",
     }
 }
 
@@ -622,6 +636,15 @@ pub fn call_reply_rejected_reason_name(reason: CallReplyRejectedReason) -> &'sta
     }
 }
 
+/// Stable string name for a [`CallRejectedReason`].
+pub fn call_rejected_reason_name(reason: CallRejectedReason) -> &'static str {
+    match reason {
+        CallRejectedReason::ReplyAbandoned => "ReplyAbandoned",
+        CallRejectedReason::HandlerPanicked => "HandlerPanicked",
+        CallRejectedReason::UnsupportedMessage => "UnsupportedMessage",
+    }
+}
+
 /// Stable string name for a [`DeferredReplyRejectedReason`].
 pub fn deferred_reply_rejected_reason_name(reason: DeferredReplyRejectedReason) -> &'static str {
     match reason {
@@ -670,5 +693,6 @@ pub fn call_error_name(error: CallError) -> &'static str {
         CallError::ProcessFull => "ProcessFull",
         CallError::ProcessClosed => "ProcessClosed",
         CallError::KillUncertain => "KillUncertain",
+        CallError::Rejected(_) => "Rejected",
     }
 }

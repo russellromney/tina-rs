@@ -42,6 +42,7 @@ impl Isolate for Sleeper {
     type Reply = ();
     type Send = Outbound<TimerMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
     type Shard = TestShard;
 
@@ -94,6 +95,7 @@ impl Isolate for OrderingSleeper {
     type Reply = ();
     type Send = Outbound<OrderingMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<OrderingMsg>;
     type Shard = TestShard;
 

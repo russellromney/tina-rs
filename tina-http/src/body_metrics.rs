@@ -1,7 +1,8 @@
 //! Body-pressure counters for HTTP/1.1 connections.
 //!
-//! Counters are per shard. A shared capacity-report shape lives in
-//! a separate slice; when it lands these fields fold into it.
+//! Counters are per shard. `with_body_capacity` exposes request and
+//! response body bytes as weighted capacity surfaces sharing one
+//! shard-local scope.
 //!
 //! # What is counted
 //!
@@ -25,14 +26,15 @@
 //!
 //! # What is not counted
 //!
-//! - Heap memory. "Current" is bytes the connection has admitted
-//!   into its own buffers, plus whatever sits inside the runtime
-//!   call payload. Real heap footprint is at least this much.
+//! - Heap memory. "Current" is body-byte weight the connection has
+//!   admitted into its body buffers. It is not allocator truth.
 //! - Cross-shard totals. One [`BodyMetrics`] is one shard. Multi
 //!   shard services register one per shard and merge snapshots.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use tina::capacity::{CapacityMode, CapacitySurfaceReport, CapacityWeight};
 
 // CAS loop that monotonically pushes `target` up to `new`. Bounded
 // by contention: each retry observes a fresh value, so under N
@@ -73,19 +75,142 @@ pub struct BodyMetrics {
 
 #[derive(Debug, Default)]
 struct BodyMetricsInner {
+    scope_name: Option<String>,
+    local_body_weight_cap: Option<usize>,
+    shared_body_weight_cap: Option<usize>,
+    shared_body_high_water: AtomicUsize,
     request_body_current: AtomicUsize,
     request_body_high_water: AtomicUsize,
     response_body_current: AtomicUsize,
     response_body_high_water: AtomicUsize,
     body_full_count: AtomicU64,
+    request_weight_full_count: AtomicU64,
+    response_weight_full_count: AtomicU64,
+    shared_weight_full_count: AtomicU64,
     body_timeout_count: AtomicU64,
     body_io_error_count: AtomicU64,
+}
+
+/// Why weighted body admission failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyCapacityFull {
+    /// Which cap filled: `request_body`, `response_body`, or the
+    /// shared scope name.
+    pub filled: String,
+    /// Weight requested by the attempted admission.
+    pub requested_weight: usize,
+    /// Current weight before the attempted admission.
+    pub current_weight: usize,
+    /// Configured cap.
+    pub max_weight: usize,
+}
+
+impl std::fmt::Display for BodyCapacityFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HTTP body capacity full: filled={} requested_weight={} current_weight={} max_weight={}",
+            self.filled, self.requested_weight, self.current_weight, self.max_weight
+        )
+    }
+}
+
+impl std::error::Error for BodyCapacityFull {}
+
+#[derive(Debug, Clone, Copy)]
+struct BodyBytes(usize);
+
+impl CapacityWeight for BodyBytes {
+    fn capacity_weight(&self) -> usize {
+        self.0
+    }
 }
 
 impl BodyMetrics {
     /// Builds a fresh metrics instance with all counters at zero.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds metrics with a shard-local weighted scope shared by
+    /// request and response body surfaces.
+    ///
+    /// `local_body_weight_cap` is applied independently to request
+    /// and response resident body bytes. `shared_body_weight_cap`
+    /// is applied to their aggregate on this one `BodyMetrics`
+    /// instance, which callers share only within one shard.
+    pub fn with_body_capacity(
+        scope_name: impl Into<String>,
+        local_body_weight_cap: usize,
+        shared_body_weight_cap: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(BodyMetricsInner {
+                scope_name: Some(scope_name.into()),
+                local_body_weight_cap: Some(local_body_weight_cap),
+                shared_body_weight_cap: Some(shared_body_weight_cap),
+                ..BodyMetricsInner::default()
+            }),
+        }
+    }
+
+    fn shared_current(&self) -> usize {
+        self.inner.request_body_current.load(Ordering::Relaxed)
+            + self.inner.response_body_current.load(Ordering::Relaxed)
+    }
+
+    fn check_admit(
+        &self,
+        local_name: &'static str,
+        local_current: &AtomicUsize,
+        local_full_count: &AtomicU64,
+        weight: usize,
+    ) -> Result<(), BodyCapacityFull> {
+        if let Some(max) = self.inner.local_body_weight_cap {
+            let current = local_current.load(Ordering::Relaxed);
+            if current.saturating_add(weight) > max {
+                local_full_count.fetch_add(1, Ordering::Relaxed);
+                return Err(BodyCapacityFull {
+                    filled: local_name.to_string(),
+                    requested_weight: weight,
+                    current_weight: current,
+                    max_weight: max,
+                });
+            }
+        }
+        if let Some(max) = self.inner.shared_body_weight_cap {
+            let current = self.shared_current();
+            if current.saturating_add(weight) > max {
+                self.inner
+                    .shared_weight_full_count
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(BodyCapacityFull {
+                    filled: self
+                        .inner
+                        .scope_name
+                        .clone()
+                        .unwrap_or_else(|| "http.bodies".to_string()),
+                    requested_weight: weight,
+                    current_weight: current,
+                    max_weight: max,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Attempts to charge inbound body bytes against local and
+    /// shared weighted caps.
+    pub fn try_charge_request(&self, n: usize) -> Result<(), BodyCapacityFull> {
+        let weight = BodyBytes(n).capacity_weight();
+        self.check_admit(
+            "request_body",
+            &self.inner.request_body_current,
+            &self.inner.request_weight_full_count,
+            weight,
+        )?;
+        self.charge_request(n);
+        Ok(())
     }
 
     /// Charges `n` bytes of inbound body. High-water is bumped if
@@ -96,6 +221,7 @@ impl BodyMetrics {
             .request_body_current
             .fetch_add(n, Ordering::Relaxed);
         bump_high_water(&self.inner.request_body_high_water, prev + n);
+        bump_high_water(&self.inner.shared_body_high_water, self.shared_current());
     }
 
     /// Releases `n` bytes of inbound body. Saturates at zero so a
@@ -106,6 +232,20 @@ impl BodyMetrics {
         saturating_sub(&self.inner.request_body_current, n);
     }
 
+    /// Attempts to charge outbound body bytes against local and
+    /// shared weighted caps.
+    pub fn try_charge_response(&self, n: usize) -> Result<(), BodyCapacityFull> {
+        let weight = BodyBytes(n).capacity_weight();
+        self.check_admit(
+            "response_body",
+            &self.inner.response_body_current,
+            &self.inner.response_weight_full_count,
+            weight,
+        )?;
+        self.charge_response(n);
+        Ok(())
+    }
+
     /// Charges `n` bytes of outbound body.
     pub fn charge_response(&self, n: usize) {
         let prev = self
@@ -113,6 +253,7 @@ impl BodyMetrics {
             .response_body_current
             .fetch_add(n, Ordering::Relaxed);
         bump_high_water(&self.inner.response_body_high_water, prev + n);
+        bump_high_water(&self.inner.shared_body_high_water, self.shared_current());
     }
 
     /// Releases `n` bytes of outbound body. Saturates at zero.
@@ -154,11 +295,21 @@ impl BodyMetrics {
     /// snapshot is exact.
     pub fn snapshot(&self) -> BodyPressureReport {
         BodyPressureReport {
+            scope_name: self.inner.scope_name.clone(),
+            local_body_weight_cap: self.inner.local_body_weight_cap,
+            shared_body_weight_cap: self.inner.shared_body_weight_cap,
+            shared_body_high_water: self.inner.shared_body_high_water.load(Ordering::Relaxed),
             request_body_current: self.inner.request_body_current.load(Ordering::Relaxed),
             request_body_high_water: self.inner.request_body_high_water.load(Ordering::Relaxed),
             response_body_current: self.inner.response_body_current.load(Ordering::Relaxed),
             response_body_high_water: self.inner.response_body_high_water.load(Ordering::Relaxed),
             body_full_count: self.inner.body_full_count.load(Ordering::Relaxed),
+            request_weight_full_count: self.inner.request_weight_full_count.load(Ordering::Relaxed),
+            response_weight_full_count: self
+                .inner
+                .response_weight_full_count
+                .load(Ordering::Relaxed),
+            shared_weight_full_count: self.inner.shared_weight_full_count.load(Ordering::Relaxed),
             body_timeout_count: self.inner.body_timeout_count.load(Ordering::Relaxed),
             body_io_error_count: self.inner.body_io_error_count.load(Ordering::Relaxed),
         }
@@ -166,8 +317,17 @@ impl BodyMetrics {
 }
 
 /// Snapshot of body-pressure counters at a point in time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyPressureReport {
+    /// Shard-local shared scope name for request and response body
+    /// surfaces.
+    pub scope_name: Option<String>,
+    /// Per-surface body weight cap.
+    pub local_body_weight_cap: Option<usize>,
+    /// Shared aggregate body weight cap.
+    pub shared_body_weight_cap: Option<usize>,
+    /// Shared aggregate body high water.
+    pub shared_body_high_water: usize,
     /// Inbound body bytes resident in connection isolates right now.
     pub request_body_current: usize,
     /// Maximum `request_body_current` ever observed since startup.
@@ -178,6 +338,12 @@ pub struct BodyPressureReport {
     pub response_body_high_water: usize,
     /// Number of bodies rejected for exceeding `max_body_bytes`.
     pub body_full_count: u64,
+    /// Number of inbound weighted admissions rejected by the local cap.
+    pub request_weight_full_count: u64,
+    /// Number of outbound weighted admissions rejected by the local cap.
+    pub response_weight_full_count: u64,
+    /// Number of weighted admissions rejected by the shared scope.
+    pub shared_weight_full_count: u64,
     /// Number of body chunk read/write timeouts.
     pub body_timeout_count: u64,
     /// Number of non-timeout body IO errors (truncations).
@@ -185,6 +351,57 @@ pub struct BodyPressureReport {
 }
 
 impl BodyPressureReport {
+    /// Convert inbound body bytes into a weighted capacity surface.
+    pub fn request_capacity_report(
+        &self,
+        name: impl Into<String>,
+        mode: CapacityMode,
+    ) -> Option<CapacitySurfaceReport> {
+        self.local_body_weight_cap.map(|max| {
+            self.with_shared(CapacitySurfaceReport::weighted(
+                name,
+                mode,
+                max,
+                self.request_body_current,
+                self.request_body_high_water,
+                self.request_weight_full_count,
+                "bytes",
+            ))
+        })
+    }
+
+    /// Convert outbound body bytes into a weighted capacity surface.
+    pub fn response_capacity_report(
+        &self,
+        name: impl Into<String>,
+        mode: CapacityMode,
+    ) -> Option<CapacitySurfaceReport> {
+        self.local_body_weight_cap.map(|max| {
+            self.with_shared(CapacitySurfaceReport::weighted(
+                name,
+                mode,
+                max,
+                self.response_body_current,
+                self.response_body_high_water,
+                self.response_weight_full_count,
+                "bytes",
+            ))
+        })
+    }
+
+    fn with_shared(&self, report: CapacitySurfaceReport) -> CapacitySurfaceReport {
+        match (&self.scope_name, self.shared_body_weight_cap) {
+            (Some(scope), Some(max)) => report.with_shared_scope(
+                scope.clone(),
+                max,
+                self.request_body_current + self.response_body_current,
+                self.shared_body_high_water,
+                self.shared_weight_full_count,
+            ),
+            _ => report,
+        }
+    }
+
     /// True iff every counter is zero. Useful as a "no resource leak"
     /// terminal assertion: after shutdown all `current` values must
     /// be zero.
@@ -194,6 +411,9 @@ impl BodyPressureReport {
             && self.response_body_current == 0
             && self.response_body_high_water == 0
             && self.body_full_count == 0
+            && self.request_weight_full_count == 0
+            && self.response_weight_full_count == 0
+            && self.shared_weight_full_count == 0
             && self.body_timeout_count == 0
             && self.body_io_error_count == 0
     }
@@ -284,5 +504,66 @@ mod tests {
             !after.is_empty(),
             "is_empty includes high-water; drained does not"
         );
+    }
+
+    #[test]
+    fn small_weighted_payload_fits_and_reports_weight() {
+        let metrics = BodyMetrics::with_body_capacity("http.bodies", 100, 150);
+        metrics.try_charge_request(40).unwrap();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.request_body_current, 40);
+        assert_eq!(snap.shared_body_high_water, 40);
+        let report = snap
+            .request_capacity_report("http.request", CapacityMode::Fixed)
+            .expect("weighted report enabled");
+        assert_eq!(report.max_weight, Some(100));
+        assert_eq!(report.current_weight, Some(40));
+        assert_eq!(report.weight_unit.as_deref(), Some("bytes"));
+        assert_eq!(report.shared_scope.as_deref(), Some("http.bodies"));
+    }
+
+    #[test]
+    fn oversized_weighted_payload_rejects_with_weight_reason() {
+        let metrics = BodyMetrics::with_body_capacity("http.bodies", 100, 150);
+        let err = metrics.try_charge_request(101).unwrap_err();
+        assert_eq!(err.filled, "request_body");
+        assert_eq!(err.requested_weight, 101);
+        assert_eq!(err.current_weight, 0);
+        assert_eq!(err.max_weight, 100);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.request_weight_full_count, 1);
+        assert_eq!(snap.request_body_current, 0);
+    }
+
+    #[test]
+    fn shared_aggregate_fills_while_local_caps_are_okay() {
+        let metrics = BodyMetrics::with_body_capacity("http.bodies", 100, 150);
+        metrics.try_charge_request(90).unwrap();
+        let err = metrics.try_charge_response(70).unwrap_err();
+        assert_eq!(err.filled, "http.bodies");
+        assert_eq!(err.current_weight, 90);
+        assert_eq!(err.max_weight, 150);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.request_body_current, 90);
+        assert_eq!(snap.response_body_current, 0);
+        assert_eq!(snap.response_weight_full_count, 0);
+        assert_eq!(snap.shared_weight_full_count, 1);
+        let response = snap
+            .response_capacity_report("http.response", CapacityMode::Fixed)
+            .expect("weighted report enabled");
+        assert_eq!(response.shared_weight_full_count, 1);
+    }
+
+    #[test]
+    fn release_after_weighted_charge_lets_new_work_admit() {
+        let metrics = BodyMetrics::with_body_capacity("http.bodies", 100, 100);
+        metrics.try_charge_request(100).unwrap();
+        assert!(metrics.try_charge_response(1).is_err());
+        metrics.release_request(100);
+        metrics.try_charge_response(100).unwrap();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.request_body_current, 0);
+        assert_eq!(snap.response_body_current, 100);
+        assert_eq!(snap.shared_weight_full_count, 1);
     }
 }
