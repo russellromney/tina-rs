@@ -62,4 +62,18 @@ fn tina_smoke_caps_in_flight_body_and_round_trips_chunked() {
         wire > decoded,
         "chunked wire bytes must exceed decoded bytes (framing overhead); wire={wire} decoded={decoded}"
     );
+
+    let line = r
+        .tina_capacity_discovery_line
+        .expect("tina side reports capacity discovery line");
+    assert!(
+        line.contains("surface=specimen_http_body_streaming.response_body"),
+        "{line}"
+    );
+    assert!(line.contains("weight_unit=bytes"), "{line}");
+    assert!(line.contains("shared_scope=http.bodies"), "{line}");
+    assert!(
+        line.contains(&format!("high_weight={CHUNK_BYTES}")),
+        "{line}"
+    );
 }

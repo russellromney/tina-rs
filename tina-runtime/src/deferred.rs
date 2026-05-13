@@ -268,7 +268,7 @@ where
     pub fn capacity_report(&self) -> tina::capacity::CapacitySurfaceReport {
         tina::capacity::CapacitySurfaceReport::count(
             self.capacity_name.clone(),
-            self.capacity_mode,
+            self.capacity_mode.clone(),
             self.capacity,
             self.live_len(),
             self.high_water,

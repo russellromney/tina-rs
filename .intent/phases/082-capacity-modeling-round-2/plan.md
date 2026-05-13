@@ -1,295 +1,71 @@
 # Phase 082: Capacity Modeling Round 2
 
+## Status Note
+
+- Existing count-report surfaces: `WorkerPool` waiter count via
+  `PoolPressureReport::to_waiters_capacity_report`, and
+  `PendingReplies` slot count via `capacity_report()`.
+- Chosen weighted surface: `tina-http::BodyMetrics` request and
+  response body bytes. Weight is user-declared body-byte cost, not
+  heap memory.
+- Chosen shared-scope surfaces: `http.request_body` and
+  `http.response_body` reports both charge one shard-local
+  `http.bodies` scope. The scope is the cloned `BodyMetrics`
+  instance threaded through one listener's connection isolates, not
+  a process-global budget.
+
+## Scope
+
+- Add `CapacityWeight` vocabulary in `tina::capacity`.
+- Add weight and shared-scope fields to `CapacitySurfaceReport`.
+- Add explicit expiring `UnboundedForNow(reason)` and the ugly
+  `unbounded_without_expiry_i_know_this_is_bad(reason)` escape hatch.
+- Extend capacity assertions and discovery formatting so every
+  `Full` says what filled.
+- Fold HTTP body metrics into the capacity-report shape.
+- Update one specimen to show `unknown -> measured -> fixed`.
+
 ## Status
 
-- Ready to implement.
-- Builds on Phase 071 PR 1: count reports, tuning mode, policy,
-  `CapacitySurfaceReport`, `CapacitySummary`, and count assertions.
-- Not blocked by 085 race/join or RequestContext helper polish.
-
-## Grug Truth
-
-Count is not memory.
-
-Weight is what the user says a thing costs.
-
-Shared scope is one shard-local budget used by more than one surface.
-
-Unbounded is allowed only when loud, named, and expiring.
-
-Every `Full` must say what filled.
-
-## Goal
-
-Make capacity useful for real services, not just count queues.
-
-Ship:
-
-- user-defined weight units;
-- one real weighted surface;
-- shard-local shared capacity scope;
-- explicit `UnboundedForNow` with expiry;
-- ugly no-expiry escape hatch, rejected by safe policies;
-- capacity assertions usable in tests/DST;
-- docs/specimen showing `unknown -> measured -> fixed`.
-
-Keep it boring. Do not build a global memory manager.
-
-One PR is preferred. Split only if public capacity names need review before
-the bigger wiring lands.
-
-## Non-Goals
-
-- exact heap measurement;
-- recursive payload sizing;
-- process-wide/global budget;
-- Prometheus/exporter work;
-- converting every surface in the repo;
-- hiding `Full` with retry.
-
-## Rock 0: Re-Read Current Shape
-
-Start by reading:
-
-- `tina/src/capacity.rs`;
-- `tina-runtime/src/capacity.rs`;
-- `tina-runtime/src/pool.rs`;
-- `tina-runtime/src/deferred.rs`;
-- HTTP body metrics/cap code;
-- bridge pressure reports for sqlite/sqlx/reqwest if nearby.
-
-Write a tiny status note at the top of this file before coding:
-
-- what surfaces already report count;
-- which surface will get weight;
-- which two surfaces will share one scope.
-
-API home:
-
-- pure vocabulary in `tina::capacity`;
-- runtime collection/scope machinery in `tina-runtime::capacity`;
-- sim assertions in `tina-sim` only for sim-backed surfaces;
-- bridge/specimen code only adapts into shared report types.
-
-Do not invent a second capacity dialect.
-
-## Rock 1: Weight Vocabulary
-
-Add a small public vocabulary in `tina::capacity`.
-
-Shape:
-
-```rust
-pub trait CapacityWeight {
-    fn capacity_weight(&self) -> usize;
-}
-```
-
-Rules:
-
-- no automatic `size_of::<T>()` fallback;
-- weight means user-defined cost, often bytes;
-- reports call it weight, not memory;
-- weight full is distinct from count full;
-- zero weight is allowed only when documented.
-
-## Rock 2: One Weighted Surface
-
-Pick one real surface where count lies.
-
-Preferred first target: HTTP body bytes, because body pressure is already
-real and user-visible.
-
-Acceptable alternative: bridge response/request payloads if HTTP is too
-messy.
-
-Do not pick a toy-only surface.
-
-Proof:
-
-- small payload fits;
-- oversized payload rejects with weight reason;
-- high-water weight is reported;
-- current weight returns to zero after read/drop/cancel/close;
-- count full and weight full are separate facts;
-- report says which surface filled.
-
-## Rock 3: Shard-Local Shared Scope
-
-Add one shard-local shared weight budget.
-
-Shape can be smaller than this, but must be explicit:
-
-```rust
-let scope = runtime.register_capacity_scope_on(
-    shard,
-    CapacityScopeConfig::weight("http.bodies", limit),
-)?;
-```
-
-Rules:
-
-- no cross-shard scope;
-- no hidden global;
-- scope id/handle is runtime-issued, not user-forgeable;
-- scope has name, shard, max, current, high-water, full count;
-- claim/release is owned by the runtime/bridge/surface, not user memory;
-- release happens on dequeue/drop/cancel/close;
-- close/shutdown releases outstanding claims or reports the leak.
-
-Proof:
-
-- two surfaces are each under local cap;
-- combined weight fills shared scope;
-- rejection names shared scope;
-- after release, new work admits;
-- stale or unknown scope handles reject visibly if handles are public.
-
-## Rock 4: Unbounded For Now
-
-Add explicit unbounded discovery mode.
-
-Required:
-
-- reason string;
-- default live expiry: 1 hour;
-- live expiry uses `Instant`;
-- sim expiry uses simulated time or steps, but is deterministic;
-- tests use tiny expiry;
-- appears in capacity summary;
-- production policy rejects;
-- expiry failure names surface, reason, observed high-water, and next action.
-
-Ugly escape hatch:
-
-```rust
-unbounded_without_expiry_i_know_this_is_bad(reason)
-```
-
-Rules:
-
-- rejected by test/prod by default;
-- warning/event always visible where validation/reporting exists;
-- searchable ugly name is intentional;
-- no-expiry mode is never the default constructor.
-
-Do not spread unbounded everywhere. One surface is enough.
-
-## Rock 5: Assertions And Discovery
-
-Extend capacity assertions so tests can say:
-
-```rust
-summary.surface("pool.waiters").no_full();
-summary.surface("orders.mailbox").high_water_at_most(96);
-summary.scope("http.bodies").weight_high_water_at_most(64 * MIB);
-```
-
-Need both:
-
-- `Result` API for tools/sweeps;
-- assert wrappers for tests.
-
-Discovery formatter should show:
-
-- name;
-- mode;
-- fixed/tuning/unbounded;
-- count cap/current/high/full;
-- weight cap/current/high/full;
-- suggested next action.
-
-Failure messages name the surface/scope and observed numbers.
-
-## Rock 6: Sim/DST Proof If Touched Surface Has Sim
-
-If the chosen weighted/shared surface exists in `tina-sim`, add replay
-summary assertions.
-
-Minimum:
-
-- same seed/config/history gives same capacity summary;
-- changed cap changes failure or report intentionally.
-
-If live-only, say so in this plan and add normal runtime tests instead.
-Do not claim DST proof for live-only code.
-
-## Rock 7: Docs And One Specimen
-
-Update docs with the workflow:
-
-```text
-unknown -> measured -> fixed
-```
-
-Say plainly:
-
-- count protects turns;
-- weight protects user-declared payload cost;
-- shared scope protects a group;
-- unbounded is temporary and loud;
-- huge caps are not design.
-
-Update one specimen that naturally shows this:
-
-- HTTP body/backpressure specimen, preferred; or
-- DB/bridge/pool specimen if HTTP is not the implementation target.
-
-The specimen should emit or assert a capacity summary.
-
-The README must show the copied path:
-
-```text
-run tuning load
-read high water
-choose fixed cap
-assert fixed cap in test
-```
-
-## Proof Targets
-
-- weight trait/report unit tests;
-- weighted surface small/too-heavy/high-water/reclaim tests;
-- shared-scope aggregate-full/release/refill tests;
-- stale/unknown scope handle rejection if handles are public;
-- unbounded expiry test;
-- policy rejects unbounded in prod;
-- test/prod reject no-expiry escape by default;
-- assertion helper tests;
-- sim/DST capacity test if available;
-- one specimen smoke test.
-
-## Stop Signs
-
-Stop and report before broadening scope if:
-
-- the design wants process-global budgets;
-- exact heap memory measurement appears;
-- every surface needs conversion to prove one idea;
-- user-owned manual release becomes the common path;
-- `Full` gets hidden behind automatic retry;
-- sim proof starts requiring a fake live-clock rewrite.
-
-## Landing Criteria
-
-- One real weighted capacity works.
-- One shared shard-local scope works.
-- Unbounded is explicit, expiring, and policy-rejected.
-- Reports distinguish count, local weight, and shared weight.
-- `Full` names surface/scope and pressure kind.
-- Capacity current returns to zero after cancellation/close/drop for touched
-  surfaces.
-- Docs teach how to tune from evidence.
+- [x] Status note added before coding.
+- [x] `CapacityWeight` added.
+- [x] HTTP body bytes exposed as the weighted surface.
+- [x] Request/response body reports share one shard-local scope.
+- [x] Expiring `UnboundedForNow(reason)` added with one-hour default.
+- [x] No-expiry escape hatch added and rejected by test/prod policy.
+- [x] Assertions and discovery lines include weight/shared fields.
+- [x] No DST proof added: the touched weighted surface is live
+  HTTP metrics, not simulator state.
+- [x] Docs and `specimen_http_body_streaming` updated.
+- [x] Relevant tests, fmt, and clippy complete.
+- [x] Hostile-review notes complete.
+- [ ] PR opened.
 
 ## Hostile Review Notes
 
-- Risk: fake memory accounting. Guardrail: say weight, never memory; require
-  user-declared weight.
-- Risk: shared scopes leak claims. Guardrail: prove release on
-  dequeue/drop/cancel/close and refill after release.
-- Risk: unbounded becomes normal. Guardrail: reason + expiry + policy reject +
-  ugly no-expiry name.
-- Risk: live-only HTTP work pretends to be DST. Guardrail: sim proof only for
-  sim-backed surfaces; otherwise say live-only.
-- Risk: scope creep. Guardrail: one weighted surface, one shared scope, one
-  specimen.
+- Fixed during review: shared-scope high-water initially only moved
+  on explicit `try_charge_*` calls, while existing HTTP connection
+  code uses `charge_*`; moved shared high-water updates into the
+  common charge path so real HTTP traffic reports the shared scope.
+- Fixed after hostile review: live HTTP connection traffic now uses
+  weighted admission (`try_charge_request` / `try_charge_response`)
+  on request and response body charge points. Request-side weighted
+  Full maps to the existing 413 shape before service dispatch;
+  response-side weighted Full closes/truncates because the response
+  head may already be on the wire. Both paths are covered by
+  integration tests that assert the user-visible outcome and the
+  weighted Full counters.
+- Fixed after hostile review: weighted assertion helpers now fail
+  loudly when pointed at count-only surfaces instead of treating
+  missing weight fields as zero.
+- Fixed after hostile review: weighted discovery hints now use
+  `high_weight / max_weight` instead of always saying the weighted
+  cap fits.
+- Fixed after hostile review: body metrics docs no longer make even
+  a lower-bound heap footprint claim; they describe body-byte weight
+  only.
+- Fixed while here: unbounded modes now reject empty reasons so
+  "loud and named" is enforced by policy validation.
+- No DST proof added: the weighted surface touched here is live
+  HTTP metrics, not simulator-owned state. Adding fake DST state for
+  live-only metrics would make the proof less honest.

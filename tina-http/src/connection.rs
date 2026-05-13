@@ -528,8 +528,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                     let body_already_in_buf = self.read_buf.len().saturating_sub(head_len);
                     self.parsed_head = Some(head);
                     self.head_len = head_len;
-                    if !self.parsed_head.as_ref().unwrap().chunked {
-                        self.charge_request(body_already_in_buf);
+                    if !self.parsed_head.as_ref().unwrap().chunked
+                        && self.charge_request(body_already_in_buf).is_err()
+                    {
+                        self.head_deadline_armed = false;
+                        return self.send_parse_error(RequestParseError::BodyTooLarge);
                     }
                     self.head_deadline_armed = false;
                 }
@@ -546,7 +549,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         } else {
             // Head already parsed. Every new byte read is body.
             let delta = self.read_buf.len() - pre_len;
-            self.charge_request(delta);
+            if self.charge_request(delta).is_err() {
+                return self.send_parse_error(RequestParseError::BodyTooLarge);
+            }
         }
 
         self.maybe_dispatch_or_read_more()
@@ -655,7 +660,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                     self.inbound_delivered = 0;
                     self.inbound_buffer = decoded;
                     self.inbound_chunk_size = chunk_size.max(1);
-                    self.charge_request(self.inbound_buffer.len());
+                    if self.charge_request(self.inbound_buffer.len()).is_err() {
+                        self.inbound_buffer.clear();
+                        self.chunked_raw_buffer.clear();
+                        self.chunked_decoder = None;
+                        return self.send_parse_error(RequestParseError::BodyTooLarge);
+                    }
                     self.chunked_decoder = Some(decoder);
                     self.inbound_chunked = true;
                     match progress {
@@ -681,7 +691,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                     let pre_buf_len = buf.len();
                     self.inbound_buffer = buf;
                     self.inbound_chunk_size = chunk_size.max(1);
-                    self.charge_request(pre_buf_len);
+                    if self.charge_request(pre_buf_len).is_err() {
+                        self.inbound_buffer.clear();
+                        return self.send_parse_error(RequestParseError::BodyTooLarge);
+                    }
                 }
                 let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
                     tina::Address::new_with_generation(
@@ -835,7 +848,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 };
                 self.chunked_raw_buffer.drain(..consumed);
                 let new_decoded = self.inbound_buffer.len() - prev_len;
-                self.charge_request(new_decoded);
+                if self.charge_request(new_decoded).is_err() {
+                    self.inbound_buffer.truncate(prev_len);
+                    self.chunked_raw_buffer.clear();
+                    self.body_eof_replied = true;
+                    return reply(RequestChunkReply::Error(CallError::StorageFull));
+                }
                 match progress {
                     crate::chunked_decoder::FeedAllResult::Complete => {
                         if !self.inbound_buffer.is_empty() {
@@ -869,7 +887,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         } else {
             self.inbound_received += bytes.len();
             self.inbound_buffer.extend_from_slice(&bytes);
-            self.charge_request(bytes.len());
+            if self.charge_request(bytes.len()).is_err() {
+                let keep = self.inbound_buffer.len().saturating_sub(bytes.len());
+                self.inbound_buffer.truncate(keep);
+                self.body_eof_replied = true;
+                return reply(RequestChunkReply::Error(CallError::StorageFull));
+            }
         }
         self.serve_chunk_from_buffer()
     }
@@ -996,7 +1019,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             if let Some(body) = self.pending_buffered_body.take() {
                 let n = body.len();
                 self.pending_response = body;
-                self.charge_response(n);
+                if self.charge_response(n).is_err() {
+                    self.pending_response.clear();
+                    self.record_body_io_error();
+                    return self.begin_close();
+                }
                 return self.write_pending();
             }
             // Streaming branch: pull the next chunk if the source
@@ -1145,7 +1172,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         };
         let n = written_bytes.len();
         self.pending_response = written_bytes;
-        self.charge_response(n);
+        if self.charge_response(n).is_err() {
+            self.pending_response.clear();
+            self.record_body_io_error();
+            let cancel = self.cancel_stream_source();
+            self.stream_chunked = false;
+            let close = self.begin_close();
+            return match cancel {
+                Some(c) => batch(vec![c, close]),
+                None => close,
+            };
+        }
         self.write_pending()
     }
 
@@ -1160,7 +1197,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         framed.extend_from_slice(&bytes);
         framed.extend_from_slice(b"\r\n");
         self.pending_response = framed;
-        self.charge_response(n);
+        if self.charge_response(n).is_err() {
+            self.pending_response.clear();
+            self.record_body_io_error();
+            let cancel = self.cancel_stream_source();
+            self.stream_chunked = false;
+            let close = self.begin_close();
+            return match cancel {
+                Some(c) => batch(vec![c, close]),
+                None => close,
+            };
+        }
         self.write_pending()
     }
 
@@ -1229,14 +1276,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     // --- BodyMetrics helpers --------------------------------------
 
-    fn charge_request(&mut self, n: usize) {
+    fn charge_request(&mut self, n: usize) -> Result<(), crate::body_metrics::BodyCapacityFull> {
         if n == 0 {
-            return;
+            return Ok(());
         }
         if let Some(metrics) = &self.metrics {
-            metrics.charge_request(n);
+            metrics.try_charge_request(n)?;
             self.metrics_request_charge += n;
         }
+        Ok(())
     }
 
     fn release_request(&mut self, n: usize) {
@@ -1263,14 +1311,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         self.metrics_request_charge = 0;
     }
 
-    fn charge_response(&mut self, n: usize) {
+    fn charge_response(&mut self, n: usize) -> Result<(), crate::body_metrics::BodyCapacityFull> {
         if n == 0 {
-            return;
+            return Ok(());
         }
         if let Some(metrics) = &self.metrics {
-            metrics.charge_response(n);
+            metrics.try_charge_response(n)?;
             self.metrics_response_charge += n;
         }
+        Ok(())
     }
 
     fn release_response(&mut self, n: usize) {
