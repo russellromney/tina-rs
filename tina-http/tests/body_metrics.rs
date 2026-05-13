@@ -305,6 +305,19 @@ impl Isolate for BigBufferedResponse {
         _request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        self.big_response()
+    }
+
+    fn handle_call(&mut self, _request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(HttpResponse::with_body(
+            StatusCode::OK,
+            vec![b'z'; self.bytes],
+        ))
+    }
+}
+
+impl BigBufferedResponse {
+    fn big_response(&self) -> Effect<Self> {
         reply(HttpResponse::with_body(
             StatusCode::OK,
             vec![b'z'; self.bytes],
