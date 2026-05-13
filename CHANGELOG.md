@@ -4,6 +4,18 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 056 Native HTTP/2 Service Stack
+
+- Added a native HTTP/2 first form in `tina-http`: frame parsing/encoding,
+  client preface/settings, headers/data/reset/goaway handling, bounded stream
+  state, flow-control accounting, and Tina-owned TCP/TLS I/O.
+- Kept the scope narrow and honest: HTTP/2 is service-shaped and bounded, not a
+  full hyper/tonic clone. gRPC, broad web-framework ergonomics, and advanced
+  HTTP/2 feature parity remain follow-up work.
+- Added live tests for handshake, request/response, concurrent streams, body
+  caps, flow-control pressure, reset/goaway, malformed frames, TLS transport,
+  and trace/DST projection support.
+
 ### Phase 092 AWS Bridge Follow-Ups
 
 - Extended `tina-aws-bridge` with a bounded SQS first follow-up:
@@ -18,6 +30,34 @@ This file records completed work.
   cap rejection, full/closed pressure, timeout/late-result metrics,
   close/drain operation kinds, typed SDK queue errors, supplied-client retry
   ownership, and config validation.
+
+### Phase 091 Timer Vocabulary
+
+- Added replay-safe timer helper vocabulary in `tina::time`: interval,
+  backoff, retry-delay, debounce, and throttle state helpers.
+- Kept helpers as state, not schedulers. User code still emits
+  `sleep(delay).reply(...)`, so the runtime owns time and simulator replay stays
+  honest.
+- Added timer semantics tests and migrated `specimen_periodic_batcher` to the
+  copied interval/backoff shape.
+
+### Phase 085 Race And Join Helpers
+
+- Added bounded `CallGroup` support in `tina-runtime` for first-success race
+  patterns over named calls.
+- Kept loser cancellation visible and bounded: no hidden retry, no hidden
+  unbounded result collection, and no magic `select!` clone.
+- Migrated the cancellation-chain specimen to the helper and added tests for
+  winner selection, loser cancellation, full/closed/timeout paths, dropped
+  callers, and capacity cleanup.
+
+### Phase 082 Capacity Modeling Round 2
+
+- Added weighted capacity reporting, shared HTTP body-byte capacity scopes,
+  explicit unbounded-for-now policies, and stronger capacity discovery /
+  assertion helpers.
+- Updated HTTP body streaming metrics and specimens so users can tune from
+  observed high-water/full counts instead of guessing giant caps.
 
 ### Phase 088 AWS Bridge First Form
 
