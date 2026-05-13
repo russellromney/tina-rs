@@ -6,12 +6,10 @@
 //! arms in async/await (the buffer, the deadline, "is a timer in
 //! flight?") is plain isolate state.
 //!
-//! Cancellation of a stale timer is the one extra ceremony: Tina has
-//! no API to abort an in-flight `sleep`, so each `sleep(...).reply(...)`
-//! carries a `gen: u64` and the handler ignores any `Tick` whose
-//! generation does not match the latest scheduled one. That keeps
-//! `timer_flushes` accurate even when a size-triggered flush runs
-//! before the corresponding timer fires.
+//! Cancellation of a stale timer is still explicit: Tina has no API to
+//! abort an in-flight `sleep`, so each `sleep(...).reply(...)` carries
+//! the interval tick number chosen by `TimerInterval`. The handler
+//! ignores any `Tick` that does not match the pending tick.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -29,10 +27,9 @@ use crate::{
 enum BatcherMsg {
     /// One item from the producer.
     Submit(u32),
-    /// Interval timer fired. The `u64` is the generation of the
-    /// timer; if it does not match the batcher's latest generation,
-    /// the tick is stale (a size flush already happened) and is
-    /// ignored.
+    /// Interval timer fired. The `u64` is the helper-assigned tick
+    /// number. If it does not match the pending tick, a size flush
+    /// already invalidated it and the tick is ignored.
     Tick(u64, SleepReply),
     /// Producer has closed the burst. Flush any remaining items as a
     /// final timer-style flush, then `stop_with(report)`.
@@ -40,23 +37,20 @@ enum BatcherMsg {
 }
 
 struct Batcher {
-    interval: Duration,
+    interval: TimerInterval,
     /// Buffer of item indices, drained on every flush. Stored so the
     /// `Submit(u32)` payload is read deliberately rather than ignored.
     buffer: Vec<u32>,
-    /// Generation of the latest scheduled timer. Incremented every
-    /// time we schedule a new timer or invalidate an in-flight one.
-    timer_gen: u64,
-    /// `Some(gen)` when a timer with that generation is in flight.
+    /// `Some(tick_number)` when a timer for that interval tick is in flight.
     /// `None` when no timer is scheduled (buffer is empty or a size
     /// flush invalidated the previous one).
-    pending_timer_gen: Option<u64>,
+    pending_tick: Option<u64>,
     report: Report,
 }
 
 #[tina_runtime::isolate(message = BatcherMsg)]
 impl Batcher {
-    fn handle(&mut self, msg: BatcherMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: BatcherMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             BatcherMsg::Submit(item) => {
                 self.report.items_seen += 1;
@@ -64,35 +58,38 @@ impl Batcher {
                 if self.buffer.len() >= BATCH_SIZE {
                     self.buffer.clear();
                     self.report.size_flushes += 1;
-                    // Invalidate any in-flight timer; its Tick will be
-                    // ignored as stale.
-                    self.timer_gen += 1;
-                    self.pending_timer_gen = None;
+                    // Invalidate any in-flight timer; its Tick will be ignored
+                    // as stale. Clear the helper so the next item starts a
+                    // fresh period from that later handler turn's runtime time.
+                    self.pending_tick = None;
+                    self.interval.clear();
                     return noop();
                 }
-                if self.pending_timer_gen.is_none() {
-                    self.timer_gen += 1;
-                    let g = self.timer_gen;
-                    self.pending_timer_gen = Some(g);
-                    sleep(self.interval).reply(move |reply| BatcherMsg::Tick(g, reply))
+                if self.pending_tick.is_none() {
+                    let decision = self.interval.next_delay(ctx.now());
+                    let tick = decision.tick_number();
+                    self.pending_tick = Some(tick);
+                    sleep(decision.delay()).reply(move |reply| BatcherMsg::Tick(tick, reply))
                 } else {
                     noop()
                 }
             }
-            BatcherMsg::Tick(g, reply) => {
+            BatcherMsg::Tick(tick, reply) => {
                 if reply.is_err() {
                     // Sleep was cancelled (runtime shutdown). Treat as
                     // "no flush"; the burst-closed path handles
                     // anything still in the buffer.
-                    self.pending_timer_gen = None;
+                    if self.pending_tick == Some(tick) {
+                        self.pending_tick = None;
+                    }
                     return noop();
                 }
-                if self.pending_timer_gen != Some(g) {
+                if self.pending_tick != Some(tick) {
                     // Stale tick; a size flush invalidated this
-                    // generation. Ignore.
+                    // interval tick. Ignore.
                     return noop();
                 }
-                self.pending_timer_gen = None;
+                self.pending_tick = None;
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
                     self.report.timer_flushes += 1;
@@ -118,10 +115,10 @@ pub fn run() -> anyhow::Result<Report> {
     ));
 
     let batcher = Batcher {
-        interval: Duration::from_millis(BATCH_INTERVAL_MS),
+        interval: TimerInterval::every(Duration::from_millis(BATCH_INTERVAL_MS))
+            .map_err(|e| anyhow::anyhow!("configure interval: {e:?}"))?,
         buffer: Vec::with_capacity(BATCH_SIZE),
-        timer_gen: 0,
-        pending_timer_gen: None,
+        pending_tick: None,
         report: Report::default(),
     };
     let addr = runtime

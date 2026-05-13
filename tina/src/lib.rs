@@ -2457,10 +2457,15 @@ pub mod prelude {
         Shard, ShardId, SingleShard, SpawnObservedError, batch, isolate, isolate_types, noop,
         reply, reply_to, reply_to_request, restart_children, send, sequence, spawn, spawn_observed,
         stop, stop_with,
+        time::{
+            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, TimerConfigError,
+            TimerDecision, TimerInterval,
+        },
     };
 }
 
 pub mod capacity;
 mod pending_call_set;
 pub mod pool;
+pub mod time;
 pub use pending_call_set::{PendingCallSet, PendingCallSetInsertError};
