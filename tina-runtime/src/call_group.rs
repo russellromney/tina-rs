@@ -509,7 +509,7 @@ where
         K: Clone,
     {
         let drained = self.drain_entries_for_cancel();
-        if drained.is_empty() {
+        if drained.is_empty() && self.expected_cancels.is_empty() {
             self.race_state = RaceState::Complete;
         } else {
             self.race_state = RaceState::CancellingLosers;
@@ -547,7 +547,6 @@ where
         K: Clone,
     {
         let mut requests = Vec::with_capacity(self.entries.len());
-        self.expected_cancels.clear();
         for entry in self.entries.drain(..) {
             self.expected_cancels.push(ExpectedCancel {
                 key: entry.key.clone(),
@@ -820,5 +819,32 @@ mod tests {
         assert_ne!(a, c);
         assert_ne!(b, d);
         assert!(group.is_full());
+    }
+
+    #[test]
+    fn owner_stop_drain_keeps_existing_expected_cancel_truth() {
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(3);
+        let winner = group.insert(1, make_handle()).unwrap();
+        let loser = group.insert(2, make_handle()).unwrap();
+        let step = group
+            .record_reply(1, winner, CallOutcome::Replied(Reply(1)), |reply| {
+                matches!(reply, Reply(1))
+            })
+            .unwrap();
+        assert_eq!(step.cancel_losers.len(), 1);
+        assert!(!group.report_ready());
+
+        let drained = group.drain_pending_for_cancel();
+        assert!(
+            drained.is_empty(),
+            "winner path already drained all live entries"
+        );
+        assert!(!group.report_ready());
+        assert!(
+            group
+                .record_cancel(2, loser, CancelOutcome::Cancelled)
+                .unwrap(),
+            "expected loser cancel should still complete the group"
+        );
     }
 }
