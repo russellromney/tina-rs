@@ -153,6 +153,51 @@ batch(vec![
 Batch is useful. Batch can also make ergonomics feel clunky when many effect
 types are involved. When that happens, write it down as a Tina paper cut.
 
+## Timer Helpers
+
+`sleep(delay).reply(...)` is still the runtime truth. The small helpers in
+`tina::time` only decide the delay and report visible state such as missed
+ticks, retry attempt number, deadline caps, and exhausted attempts.
+
+Pattern:
+
+```text
+helper decides delay
+user returns sleep(delay).reply(...)
+continuation handles the result and records any user-visible outcome
+```
+
+Interval shape:
+
+```rust
+use tina::prelude::*;
+use tina_runtime::sleep;
+
+match self.interval.next_delay_until(ctx.now(), self.deadline) {
+    TimerDecision::Sleep(delay) => {
+        let tick = delay.tick_number();
+        sleep(delay.delay()).reply(move |reply| Msg::Tick(tick, reply))
+    }
+    TimerDecision::DeadlineElapsed => stop(),
+    TimerDecision::Exhausted => unreachable!("interval has no attempt budget"),
+}
+```
+
+Backoff shape:
+
+```rust
+match self.backoff.next_delay_until(ctx.now(), self.deadline) {
+    TimerDecision::Sleep(delay) => {
+        sleep(delay.delay()).reply(move |reply| Msg::Retry(delay.attempt(), reply))
+    }
+    TimerDecision::DeadlineElapsed | TimerDecision::Exhausted => reply(Msg::Failed),
+}
+```
+
+No helper retries user work. No helper samples `Instant::now()`. If a deadline
+matters, build it from runtime time with `ctx.deadline_after(...)` or
+`Deadline::from_instant(ctx.now(), ...)`.
+
 ## No Async In Handler
 
 This is expected to feel strange at first.

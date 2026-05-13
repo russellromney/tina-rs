@@ -16,9 +16,10 @@ queueing component.
 | unbounded channel | usually a bug or explicit adapter |
 | `select!` | state machine plus runtime call replies |
 | `sleep().await` | `sleep(...).reply(...)` |
+| `tokio::time::interval` | `TimerInterval` state plus `sleep(delay).reply(...)` |
 | socket read/write | `tcp_read` / `tcp_write` effects |
 | request task then await answer | `call(..., timeout).reply(...)` |
-| retry loop | message state plus timer |
+| retry loop | message state plus `Backoff` and timer |
 | task panic | supervised child stop/restart |
 
 ## Porting Steps
@@ -70,6 +71,42 @@ impl Conn {
 Tina is more verbose here.
 
 The trade is explicit state and runtime control.
+
+## Timers
+
+Tokio timer loops often hide policy in control flow:
+
+```rust
+loop {
+    tokio::select! {
+        _ = interval.tick() => flush(),
+        result = work() => maybe_retry(result),
+    }
+}
+```
+
+In Tina, name that policy as state:
+
+```rust
+let decision = self.interval.next_delay(ctx.now());
+sleep(decision.delay()).reply(move |reply| Msg::Tick(decision.tick_number(), reply))
+```
+
+For retries:
+
+```rust
+match self.backoff.next_delay_until(ctx.now(), self.deadline) {
+    TimerDecision::Sleep(delay) => {
+        sleep(delay.delay()).reply(move |reply| Msg::Retry(delay.attempt(), reply))
+    }
+    TimerDecision::DeadlineElapsed | TimerDecision::Exhausted => reply(Failed),
+}
+```
+
+The important split is unchanged: helper decides delay, user returns the
+visible sleep effect, continuation handles the result and records any
+user-visible outcome. Missed ticks and exhausted attempts stay in ordinary user
+code where replay can see them.
 
 ## Comparison Checklist
 

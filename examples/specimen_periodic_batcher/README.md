@@ -48,15 +48,17 @@ order under simultaneous wake.
 ## Tina shape
 
 One isolate. The two events become two messages: `Submit(item)` and
-`Tick(gen, SleepReply)`. The buffer, the deadline-equivalent
+`Tick(tick_number, SleepReply)`. The buffer, the deadline-equivalent
 ("is a timer in flight?"), and the size-vs-timer decision live in
 plain isolate state.
 
-Cancellation of an in-flight `sleep` is the one piece of ceremony
-Tina has no built-in for: each sleep carries a `gen: u64`, and the
-handler ignores any `Tick` whose generation does not match the
-latest. A size flush bumps `timer_gen` so the still-pending sleep's
-later `Tick` is silently discarded.
+The old pain was the local generation counter: each sleep carried a
+`gen: u64`, and a size flush manually bumped `timer_gen` so the
+still-pending sleep's later `Tick` was silently discarded.
+
+Now the interval helper owns only the timer math and tick numbering.
+The user code still returns the visible sleep effect, and stale work
+is still explicit:
 
 ```rust
 match msg {
@@ -64,23 +66,23 @@ match msg {
         self.buffer.push(item);
         if self.buffer.len() >= BATCH_SIZE {
             self.buffer.clear();
-            self.timer_gen += 1;            // invalidate pending Tick
-            self.pending_timer_gen = None;
+            self.pending_tick = None;       // invalidate pending Tick
+            self.interval.clear();          // next item starts a fresh period
             noop()
-        } else if self.pending_timer_gen.is_none() {
-            self.timer_gen += 1;
-            let g = self.timer_gen;
-            self.pending_timer_gen = Some(g);
-            sleep(self.interval).reply(move |reply| BatcherMsg::Tick(g, reply))
+        } else if self.pending_tick.is_none() {
+            let decision = self.interval.next_delay(ctx.now());
+            let tick = decision.tick_number();
+            self.pending_tick = Some(tick);
+            sleep(decision.delay()).reply(move |reply| BatcherMsg::Tick(tick, reply))
         } else {
             noop()
         }
     }
-    BatcherMsg::Tick(g, reply) => {
-        if self.pending_timer_gen != Some(g) || reply.is_err() {
+    BatcherMsg::Tick(tick, reply) => {
+        if self.pending_tick != Some(tick) || reply.is_err() {
             return noop();    // stale or cancelled
         }
-        self.pending_timer_gen = None;
+        self.pending_tick = None;
         if !self.buffer.is_empty() {
             self.buffer.clear();
             self.report.timer_flushes += 1;
@@ -101,7 +103,7 @@ What feels better:
   "between awaits."
 - **State that survives timer cancellation is just isolate state.**
   Tokio's `deadline: Option<Instant>` and the timer-arm future have
-  to compose under `select!`; Tina's `pending_timer_gen: Option<u64>`
+  to compose under `select!`; Tina's `pending_tick: Option<u64>`
   is a plain field.
 - **End-of-burst is a Tina message.** `BurstClosed` flows through the
   same mailbox as items. The Tokio side does the same thing via
@@ -110,24 +112,23 @@ What feels better:
 
 What feels worse:
 
-- **Generation counter to cancel a stale timer.** Tina's `sleep(...)`
-  has no cancel API: an in-flight timer always fires. The
-  `(timer_gen, pending_timer_gen)` pair is a workaround. The
-  classifier is small (5 lines) but the same pattern shows up
-  wherever an isolate must invalidate a previously-scheduled timer.
+- **Stale timer filtering is still user state.** Tina's `sleep(...)`
+  has no cancel API: an in-flight timer always fires. `TimerInterval`
+  removes the local generation arithmetic, but `pending_tick` is still
+  explicit because invisible dropped work would lie.
 - **Timer `Tick` carries `(u64, SleepReply)`.** Two unrelated
-  payloads — the generation we want and the canonical reply alias —
-  travel together. A built-in `cancellable_sleep` that returns a
-  cancel handle would replace both with a typed `Cancelled` arm.
+  payloads — the tick number we want and the canonical reply alias —
+  travel together. A built-in `cancellable_sleep` that returns a cancel
+  handle would replace both with a typed `Cancelled` arm.
 
 ## What this suggests
 
-`SingleCallGate` (Phase 062 Rock 5) names "one timer in flight,
-plus N queued" but does **not** cover stale-tick invalidation —
-the case where a size-triggered flush wants to invalidate the
-still-pending timer's eventual `Tick`. So this specimen does not
-adopt the gate; it keeps the generation counter pattern explicit.
-A future "cancellable sleep" primitive (returning a cancel handle
-that produces a typed `Cancelled` reply arm) would replace both
-the gen counter and the manual Tick filter without hiding any
-trace event.
+`TimerInterval` names the repeated-delay state, missed-tick policy,
+and tick numbering. It deliberately does not cancel a runtime sleep or
+queue work. This specimen still keeps `pending_tick` explicit so a
+size-triggered flush can invalidate the already-returned sleep without
+making a hidden scheduler.
+
+A future "cancellable sleep" primitive (returning a cancel handle that
+produces a typed `Cancelled` reply arm) would replace the manual Tick
+filter without hiding any trace event.
