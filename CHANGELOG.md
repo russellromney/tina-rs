@@ -34,7 +34,63 @@ This file records completed work.
   isolates to direct `call_blocking` calls, removing ~130 lines of
   ceremony while preserving `CallOutcome` visibility.
 
-### Response body source cancel (079 PR 1)
+### Phase 086 Call Context Reply Obligation
+
+- Split send and call handling at the public isolate boundary. Plain
+  `handle(...)` messages have no caller; `handle_call(...)` receives a typed
+  `CallContext` that must be replied, rejected, or promoted into a
+  `RequestContext`.
+- Replaced warning-only abandoned replies with immediate caller truth:
+  unused call authority rejects as
+  `CallOutcome::Rejected(CallRejectedReason::ReplyAbandoned)` and reclaims
+  capacity instead of leaving the caller in timeout purgatory.
+- Added explicit `CallRejectedReason` vocabulary for unsupported call messages,
+  abandoned replies, and handler panics, with live/runtime/simulator trace
+  coverage.
+- Migrated runtime, simulator, bridge crates, docs, and specimens to the new
+  call-shaped service dispatch. Multi-turn services now carry
+  `RequestContext` deliberately through continuation messages and finish with
+  `reply_to_request(...)`.
+- Updated request/reply docs with the blessed multi-turn pattern so readers do
+  not copy the old "runtime magically keeps caller context" bug.
+
+### Phase 084 Child Lifecycle / Join / Supervision Usability
+
+- Added typed child observation through `ChildRef<M, R>` and
+  `spawn_observed(...)`, so a parent can spawn a child and receive the child's
+  typed address/generation as ordinary message data.
+- Kept the first form honest: child refs are not liveness promises, stale
+  generations remain visible, host-side typed child-start observation is
+  deferred until spawn events carry enough type truth, and cross-shard child
+  ownership remains out of scope.
+- Added live and simulator proofs for observed spawn success, zero-capacity
+  rejection, invalid construction, parent-delivery failure, and parent use of
+  the returned child address.
+- Updated supervision docs/specimens away from Boot-message and trace-spelunking
+  patterns where the new child ref is the clearer copied shape.
+
+### Phase 080 HTTP Body Chunked Symmetric
+
+- Added a shared incremental HTTP/1 chunked-transfer decoder.
+- The native HTTP client now decodes chunked responses into bounded buffered
+  response bodies, charging decoded bytes against `HttpLimits::max_body_bytes`.
+- The native HTTP server now accepts chunked request bodies through the existing
+  streaming pull model when inbound streaming is enabled, while still rejecting
+  chunked requests loudly when streaming is disabled.
+- Added integration coverage for client chunked decode, server chunked request
+  streaming, HTTPS chunked request parity, malformed/truncated chunked wire, body
+  cap enforcement, and body-metric accounting.
+
+### Phase 079 Cancellation Round 2
+
+- Applied cancellation truth to HTTP body sources: when a connection abandons a
+  streaming response, `ResponseChunkMsg::Cancel` is delivered to the source so
+  it can release files, downstream calls, and pending slots.
+- Added cancellation paths for known-length and chunked streaming responses and
+  made duplicate cancels harmless.
+- Added a cancellation truth table to the lifecycle guide that names what cancel
+  means on Tina-owned rails, bridge/external work, pools, body sources, and
+  caller-owned request flows.
 
 `ResponseChunkMsg::Cancel` is a new typed variant sent to chunk sources
 when the HTTP connection abandons the wire mid-stream. Sources can
@@ -55,6 +111,19 @@ tests prove both known-length and chunked paths.
 Added a cancellation truth table to
 `docs/tina-user-guide/14-lifecycle-and-shutdown.md` that names what
 cancel means on every surface Tina exposes.
+
+### Phase 077 DB Pool Consumers
+
+- Made the database bridges report pool-shaped pressure instead of leaving DB
+  concurrency as bridge folklore.
+- Added `PgPressureReport` / `PgMetricsHandle::pressure_report` for the SQLx
+  bridge, separating Tina admission `Full`, SQLx pool-acquire pressure,
+  per-attempt timeout, SQL errors, and lane high-water truth.
+- Added `SqlitePressureReport` / `SqliteMetricsHandle::pressure_report` for the
+  serial SQLite bridge, making the one-connection / one-in-flight shape visible
+  through the same pool vocabulary.
+- Added admission tests proving the pressure reports match the installed bridge
+  capacity instead of caller-supplied stale config.
 
 ### SQLx/Postgres bridge
 
@@ -90,7 +159,7 @@ The Postgres counter specimen now drives the bridge with host
 `ThreadedRuntime::call_blocking`, keeping the example as a SQL script
 instead of a fake Driver isolate.
 
-### SQLite bridge
+### Phase 063 Native Database First Form
 
 Added `tina-sqlite-bridge`, a serial SQLite bridge around one
 `rusqlite::Connection` on one blocking std thread. The first form is
@@ -124,9 +193,10 @@ whole response.
 
 The body-streaming specimen demonstrates the blessed shape:
 `IterBodySource` plus `stream_known_length` for fixed length, and a
-chunked route for unknown length. Deferred work is now explicit:
-request-side chunked bodies, client-side chunked response decoding,
-source cancellation on abandoned wire, and periodic metric emission.
+chunked route for unknown length. Follow-up phases later closed the basic
+HTTP/1 gaps: request-side chunked bodies, client-side chunked response
+decoding, and source cancellation on abandoned wire. Periodic metric emission
+remains future capacity/observability polish.
 
 ### Native HTTPS first form
 
@@ -176,7 +246,7 @@ effects. Force close retires outstanding leases; late release is typed,
 not silent. Follow-on work turned HTTP keepalive into the first real
 consumer.
 
-### Service bootstrap and fanout ergonomics
+### Phase 064 Service Bootstrap And Fanout Ergonomics
 
 Round-4 specimen follow-up shipped the boring helper wins and recorded
 design notes for the dangerous ones. Landed pieces include
@@ -188,7 +258,7 @@ pipeline sugar, generic scatter/gather, flat reqwest continuation
 sugar, work-settled helpers, and cross-isolate paired registration
 unshipped until a real caller proves the shape.
 
-### Specimen round 2 ergonomics
+### Phase 062 Specimen Round 2 Ergonomics
 
 Round-2 specimen work produced and applied the low-risk helpers:
 `ThreadedMultiShardRuntime::observe_result`, `HostBurstOutcomes` and
@@ -198,7 +268,7 @@ outbound HTTP specimens were migrated so the helpers are the copied
 shape. Self-address multi-shard parity, generic scatter/gather, and
 reqwest flat continuation sugar remain evidence-gated.
 
-### Server-side HTTP/1.1 keep-alive
+### Phase 076 Server-Side HTTP/1.1 Keepalive
 
 `tina_http::HttpListener` / `HttpConnection` can now serve multiple
 sequential requests on one TCP/TLS stream. Opt in with
@@ -224,7 +294,7 @@ server `TcpAccept` across the whole script. `specimen_outbound_http`
 now uses the same pooled keepalive client shape against a
 keepalive-enabled Tina listener.
 
-### HTTP/1.1 keepalive pool
+### Phase 073 Pool Consumers
 
 `tina-http` now ships a real keepalive pool consumer of the
 `WorkerPool` vocabulary. One TCP (or TLS) connection serves many

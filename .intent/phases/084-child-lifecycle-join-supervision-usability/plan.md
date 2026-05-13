@@ -5,7 +5,8 @@
 - Done: plan + review.
 - Done: `ChildRef`, `spawn_observed`, typed spawn construction failure,
   traced parent-delivery rejection, live/sim proof, docs/specimen cleanup.
-- Open: child join/stop/restart polish only where obvious.
+- Closed: first form merged. Child join/stop/restart polish moves to later
+  work when a real caller proves the exact shape.
 - Deferred: cross-shard child ownership, distributed supervision,
   supervisor strategy matrix, timed restart windows.
 

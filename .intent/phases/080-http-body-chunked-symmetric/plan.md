@@ -1,5 +1,11 @@
 # Phase 080: HTTP Body Chunked Symmetric
 
+## Status
+
+- Done: shared decoder, client chunked response decode, server chunked request
+  streaming, tests, docs, and merge.
+- Deferred: trailers, broad transfer-coding support, and HTTP/2.
+
 ## Goal
 
 Add symmetric chunked-transfer-encoding support to `tina-http`:

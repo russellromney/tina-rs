@@ -13,8 +13,7 @@
   reuse, idle close, slow-loris on subsequent requests, body cap,
   mixed GET/POST flow, and the real keepalive pool driving the real
   listener over one accepted server stream.
-- In progress: none.
-- Open: none.
+- Closed: merged.
 - Deferred: idle-timeout + max-requests-per-connection as separate
   knobs (one knob covers both for first form), 408 emission on
   slow-loris (waits for runtime `tcp_cancel_read` affordance),
@@ -33,8 +32,8 @@ the Tina ecosystem — every test of the client against
   completes). The reset between iterations drops any read-ahead
   bytes; well-behaved HTTP/1.1 clients don't pipeline.
 - No HTTP/2 or WebSocket upgrade.
-- No chunked request bodies. Response-side chunked streaming already
-  exists and can ride keepalive when the response completes cleanly.
+- Chunked request bodies were not part of 076; they landed later in
+  080 and should not be treated as a keepalive non-goal anymore.
 - No max-requests-per-connection knob in first form. Server can
   always close on its own decision but the configuration surface
   doesn't grow until evidence demands it.
