@@ -340,8 +340,10 @@ enum WorkerRequest {
     Stop,
 }
 
-#[derive(Debug)]
-struct ReplyWorker;
+#[derive(Debug, Default)]
+struct ReplyWorker {
+    held: Option<tina::RequestContext<WorkerReply>>,
+}
 
 impl Isolate for ReplyWorker {
     tina::isolate_types! {
@@ -362,6 +364,21 @@ impl Isolate for ReplyWorker {
             WorkerRequest::ReplyNow => reply(WorkerReply("pong")),
             WorkerRequest::DoNotReply => noop(),
             WorkerRequest::Stop => stop(),
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: Self::Message,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            WorkerRequest::ReplyNow => call.reply(WorkerReply("pong")),
+            WorkerRequest::DoNotReply => {
+                self.held = Some(call.into_request_context());
+                noop()
+            }
+            WorkerRequest::Stop => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -475,7 +492,7 @@ fn downstream_consumer_can_call_isolate_and_observe_reply_full_closed_timeout() 
     ] {
         let outcomes = Rc::new(RefCell::new(Vec::new()));
         let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
-        let target = runtime.register_with_capacity(ReplyWorker, target_capacity);
+        let target = runtime.register_with_capacity(ReplyWorker::default(), target_capacity);
         let caller = runtime.register_with_capacity(
             CallerWorker {
                 outcomes: Rc::clone(&outcomes),
@@ -518,7 +535,7 @@ fn downstream_consumer_can_call_isolate_and_observe_reply_full_closed_timeout() 
 fn downstream_consumer_sees_late_isolate_call_reply_rejected_after_timeout() {
     let outcomes = Rc::new(RefCell::new(Vec::new()));
     let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
-    let target = runtime.register_with_capacity(ReplyWorker, 8);
+    let target = runtime.register_with_capacity(ReplyWorker::default(), 8);
     let caller = runtime.register_with_capacity(
         CallerWorker {
             outcomes: Rc::clone(&outcomes),
@@ -565,7 +582,7 @@ fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_mail
     let outcomes = Rc::new(RefCell::new(Vec::new()));
     let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
     let filler = runtime.register_with_capacity(FillerWorker, 8);
-    let target = runtime.register_with_capacity(ReplyWorker, 8);
+    let target = runtime.register_with_capacity(ReplyWorker::default(), 8);
     let caller = runtime.register_with_capacity(
         CallerWorker {
             outcomes: Rc::clone(&outcomes),
@@ -604,7 +621,7 @@ fn downstream_consumer_sees_call_cancelled_owner_stopped_when_requester_stops() 
     // pending entry was already cleaned up.
     let outcomes = Rc::new(RefCell::new(Vec::new()));
     let mut runtime = Runtime::new(ConsumerShard, ConsumerMailboxFactory);
-    let target = runtime.register_with_capacity(ReplyWorker, 8);
+    let target = runtime.register_with_capacity(ReplyWorker::default(), 8);
     let caller = runtime.register_with_capacity(
         CallerWorker {
             outcomes: Rc::clone(&outcomes),

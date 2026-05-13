@@ -132,6 +132,7 @@ impl Isolate for PanicIsolate {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -164,6 +165,7 @@ impl Isolate for PanicSender {
     type Reply = ();
     type Send = Outbound<PanicMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 
@@ -191,6 +193,7 @@ impl Isolate for OrderIsolate {
     type Reply = ();
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
     type Shard = TestShard;
 

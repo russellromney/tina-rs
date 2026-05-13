@@ -17,7 +17,7 @@ use crate::config::{
     Checker, CheckerDecision, CheckerFailure, DurableImage, MultiShardReplayArtifact,
     SimulatorConfig,
 };
-use crate::{IdSource, IntoErasedSpawn, QueuedRemoteEnvelope, Simulator};
+use crate::{IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, QueuedRemoteEnvelope, Simulator};
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
 type RemoteQueues = Vec<VecDeque<QueuedRemoteEnvelope>>;
@@ -173,6 +173,7 @@ where
             > + 'static,
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -199,6 +200,7 @@ where
             > + 'static,
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,

@@ -307,6 +307,7 @@ fn project_executed(outcome: PgCallOutcome) -> PgExecutedOutcome {
         CallOutcome::Full => CallOutcome::Full,
         CallOutcome::Closed => CallOutcome::Closed,
         CallOutcome::Timeout => CallOutcome::Timeout,
+        CallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
     }
 }
 
@@ -322,6 +323,7 @@ fn project_fetch_one(outcome: PgCallOutcome) -> PgFetchOneOutcome {
         CallOutcome::Full => CallOutcome::Full,
         CallOutcome::Closed => CallOutcome::Closed,
         CallOutcome::Timeout => CallOutcome::Timeout,
+        CallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
     }
 }
 
@@ -337,6 +339,7 @@ fn project_fetch_many(outcome: PgCallOutcome) -> PgFetchManyOutcome {
         CallOutcome::Full => CallOutcome::Full,
         CallOutcome::Closed => CallOutcome::Closed,
         CallOutcome::Timeout => CallOutcome::Timeout,
+        CallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
     }
 }
 
@@ -350,6 +353,7 @@ fn project_transaction(outcome: PgCallOutcome) -> PgTransactionCallOutcome {
         CallOutcome::Full => CallOutcome::Full,
         CallOutcome::Closed => CallOutcome::Closed,
         CallOutcome::Timeout => CallOutcome::Timeout,
+        CallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
     }
 }
 
@@ -429,6 +433,8 @@ pub enum PgFatalReason {
     BridgeFull,
     /// Bridge target closed or stale (runtime layer).
     BridgeClosed,
+    /// Bridge target rejected the call without a worker reply.
+    BridgeRejected(tina::CallRejectedReason),
 }
 
 /// Extension trait that adds [`Self::classify`] to the various
@@ -510,5 +516,8 @@ fn classify_inner<R, T>(
         CallOutcome::Timeout => PgOutcomeClass::Transient(PgTransientReason::BridgeTimeout),
         CallOutcome::Full => PgOutcomeClass::Fatal(PgFatalReason::BridgeFull),
         CallOutcome::Closed => PgOutcomeClass::Fatal(PgFatalReason::BridgeClosed),
+        CallOutcome::Rejected(reason) => {
+            PgOutcomeClass::Fatal(PgFatalReason::BridgeRejected(reason))
+        }
     }
 }

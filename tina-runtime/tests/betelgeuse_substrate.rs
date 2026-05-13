@@ -15,7 +15,7 @@ use betelgeuse::{
     AcceptCompletion, AcceptOp, ConnectCompletion, IO, IOFile, IOLoop, IOLoopHandle, IOSocket,
     OpenOptions, Operation, RecvCompletion, SendCompletion, io::simulated::SimulatedIO,
 };
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::{CallContext, Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallCompletionRejectedReason, CallInput, CallKind, CallOutcome, CallOutput,
     DriverRuntimeRequirement, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
@@ -1428,6 +1428,15 @@ impl Isolate for CallTarget {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            CallTargetMsg::Ask => {
+                *self.hits.lock().expect("hits mutex") += 1;
+                call.reply(CallReply)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1441,6 +1450,7 @@ enum CallObservation {
     Replied,
     Full,
     Closed,
+    Rejected,
     Timeout,
 }
 
@@ -1473,6 +1483,7 @@ impl Isolate for CallClient {
                     CallOutcome::Replied(_) => CallObservation::Replied,
                     CallOutcome::Full => CallObservation::Full,
                     CallOutcome::Closed => CallObservation::Closed,
+                    CallOutcome::Rejected(_) => CallObservation::Rejected,
                     CallOutcome::Timeout => CallObservation::Timeout,
                 };
                 self.observations

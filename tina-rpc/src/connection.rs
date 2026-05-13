@@ -743,6 +743,13 @@ where
                 FrameError::Internal,
                 Vec::new(),
             )),
+            CallOutcome::Rejected(_) => Some(Frame::error(
+                request_id,
+                service,
+                method,
+                FrameError::Internal,
+                Vec::new(),
+            )),
             // Wire-error invariant: no Timeout frame. Client times out
             // locally. The slot is freed; the late router reply, if any,
             // is dropped by the runtime since the IsolateCall already
@@ -812,6 +819,7 @@ where
     type Reply = ();
     type Send = Outbound<CloseReason>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = S;
 
@@ -901,8 +909,10 @@ mod tests {
         match effect {
             Effect::Noop => shape.noop += 1,
             Effect::Reply(_) => shape.reply += 1,
+            Effect::Reject(_) => shape.reply += 1,
             Effect::Send(_) => shape.send += 1,
             Effect::Spawn(_) => shape.spawn += 1,
+            Effect::SpawnObserved(_) => shape.spawn_observed += 1,
             Effect::Stop => shape.stop += 1,
             Effect::StopWith(_) => shape.stop_with += 1,
             Effect::RestartChildren => shape.restart += 1,
@@ -922,6 +932,7 @@ mod tests {
         reply: usize,
         send: usize,
         spawn: usize,
+        spawn_observed: usize,
         stop: usize,
         stop_with: usize,
         restart: usize,

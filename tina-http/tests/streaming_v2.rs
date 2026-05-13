@@ -17,6 +17,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use http::StatusCode;
+use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
     BodyMetrics, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
@@ -52,7 +53,17 @@ impl Isolate for StreamRouter {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = match request.path.as_str() {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl StreamRouter {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        match request.path.as_str() {
             "/known" => HttpResponse::stream_known_length(
                 StatusCode::OK,
                 self.known_length,
@@ -60,8 +71,7 @@ impl Isolate for StreamRouter {
             ),
             "/chunked" => HttpResponse::stream_chunked(StatusCode::OK, self.chunked_source),
             _ => HttpResponse::not_found(),
-        };
-        reply(response)
+        }
     }
 }
 
@@ -552,6 +562,29 @@ impl Isolate for CancelRecordingSource {
         msg: tina_http::ResponseChunkMsg,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        self.effect_for(msg)
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: tina_http::ResponseChunkMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            tina_http::ResponseChunkMsg::Next => {
+                call.reply(tina_http::ResponseChunkReply::Chunk(self.chunk.clone()))
+            }
+            tina_http::ResponseChunkMsg::Cancel => {
+                self.received_cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+                stop()
+            }
+        }
+    }
+}
+
+impl CancelRecordingSource {
+    fn effect_for(&mut self, msg: tina_http::ResponseChunkMsg) -> Effect<Self> {
         match msg {
             tina_http::ResponseChunkMsg::Next => {
                 reply(tina_http::ResponseChunkReply::Chunk(self.chunk.clone()))
@@ -825,9 +858,26 @@ fn known_length_zero_does_not_pull_source() {
         }
         fn handle(
             &mut self,
-            _msg: tina_http::ResponseChunkMsg,
+            msg: tina_http::ResponseChunkMsg,
             _ctx: &mut Context<'_, TestShard, Self::Reply>,
         ) -> Effect<Self> {
+            self.reply_for(msg)
+        }
+
+        fn handle_call(
+            &mut self,
+            msg: tina_http::ResponseChunkMsg,
+            call: CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            if matches!(msg, tina_http::ResponseChunkMsg::Next) {
+                self.pulls.fetch_add(1, Ordering::Relaxed);
+            }
+            call.reply(tina_http::ResponseChunkReply::Eof)
+        }
+    }
+
+    impl CountingSource {
+        fn reply_for(&mut self, _msg: tina_http::ResponseChunkMsg) -> Effect<Self> {
             self.pulls.fetch_add(1, Ordering::Relaxed);
             reply(tina_http::ResponseChunkReply::Eof)
         }
@@ -903,7 +953,9 @@ fn known_length_zero_does_not_pull_source() {
 #[test]
 fn chunked_source_timeout_records_both_timeout_and_io_error() {
     /// Source that never replies. Caller's call-deadline fires.
-    struct DeadSource;
+    struct DeadSource {
+        pending: Vec<tina::RequestContext<tina_http::ResponseChunkReply>>,
+    }
     impl Isolate for DeadSource {
         tina::isolate_types! {
             message: tina_http::ResponseChunkMsg,
@@ -918,6 +970,15 @@ fn chunked_source_timeout_records_both_timeout_and_io_error() {
             _msg: tina_http::ResponseChunkMsg,
             _ctx: &mut Context<'_, TestShard, Self::Reply>,
         ) -> Effect<Self> {
+            tina::prelude::noop()
+        }
+
+        fn handle_call(
+            &mut self,
+            _msg: tina_http::ResponseChunkMsg,
+            call: CallContext<'_, Self>,
+        ) -> Effect<Self> {
+            self.pending.push(call.into_request_context());
             tina::prelude::noop()
         }
     }
@@ -935,7 +996,12 @@ fn chunked_source_timeout_records_both_timeout_and_io_error() {
     // isolate's stream_call_timeout is set from the listener's
     // service_call_timeout below.
     let chunked_source = runtime
-        .register_with_capacity::<DeadSource, Infallible>(DeadSource, 16)
+        .register_with_capacity::<DeadSource, Infallible>(
+            DeadSource {
+                pending: Vec::new(),
+            },
+            16,
+        )
         .expect("register dead source");
     let service = runtime
         .register_with_capacity::<StreamRouter, Infallible>(

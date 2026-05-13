@@ -3,8 +3,9 @@
 ## Status
 
 - Done: plan + review.
-- Open: child refs, `spawn_observed`, child join/stop/restart polish
-  only where obvious, specimen/docs cleanup.
+- Done: `ChildRef`, `spawn_observed`, typed spawn construction failure,
+  traced parent-delivery rejection, live/sim proof, docs/specimen cleanup.
+- Open: child join/stop/restart polish only where obvious.
 - Deferred: cross-shard child ownership, distributed supervision,
   supervisor strategy matrix, timed restart windows.
 
@@ -94,7 +95,9 @@ Rules:
 - old `spawn(...)` unchanged;
 - child address type comes from the child definition at spawn site;
 - parent receives result as ordinary later message;
-- spawn failure / parent stopped before delivery is typed and traced;
+- spawn construction failure is typed and traced;
+- parent-delivery rejection is traced through the normal bounded-mailbox
+  send rejection path; it is not delivered through a hidden queue;
 - no hidden queue beyond existing mailboxes.
 
 Use `Effect::SpawnObserved` if that is the clean shape.
@@ -158,7 +161,8 @@ Required:
 
 - parent gets `ChildRef` as message;
 - parent sends follow-up to child;
-- spawn failure / abandoned parent path is typed and traced;
+- spawn construction failure is typed;
+- abandoned parent delivery is traced without a hidden queue;
 - sim mirrors live, or records explicit follow-up;
 - old `spawn` still works.
 

@@ -144,8 +144,10 @@ enum CrossShardCallWorkerMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CrossShardCallReply(Vec<u8>);
 
-#[derive(Debug)]
-struct CrossShardCallWorker;
+#[derive(Debug, Default)]
+struct CrossShardCallWorker {
+    held: Vec<tina::RequestContext<CrossShardCallReply>>,
+}
 
 #[tina_runtime::isolate(
     message = CrossShardCallWorkerMsg,
@@ -162,6 +164,23 @@ impl CrossShardCallWorker {
             CrossShardCallWorkerMsg::Echo(bytes) => reply(CrossShardCallReply(bytes)),
             CrossShardCallWorkerMsg::NoReply => noop(),
             CrossShardCallWorkerMsg::Stop => stop(),
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: CrossShardCallWorkerMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossShardCallWorkerMsg::Echo(bytes) => call.reply(CrossShardCallReply(bytes)),
+            CrossShardCallWorkerMsg::NoReply => {
+                self.held.push(call.into_request_context());
+                noop()
+            }
+            CrossShardCallWorkerMsg::Stop => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -1822,7 +1841,7 @@ fn blue_whale_combined_e2e_core_preallocation_and_cross_shard_call() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(46),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register worker");
@@ -2867,7 +2886,7 @@ fn live_cross_shard_isolate_call_round_trips_reply_to_requester_shard() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(46),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register cross shard worker");
@@ -2939,7 +2958,7 @@ fn live_cross_shard_isolate_call_timeout_settles_on_requester_shard() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(48),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register timeout worker");
@@ -2993,7 +3012,7 @@ fn live_cross_shard_isolate_call_destination_full_returns_typed_full() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(50),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             0,
         )
         .expect("register full worker");
@@ -3046,7 +3065,7 @@ fn live_cross_shard_isolate_call_destination_closed_returns_typed_closed() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(52),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register closable worker");
@@ -3269,7 +3288,7 @@ fn failed_shard_cross_shard_call_returns_one_closed_outcome() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(84),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register worker before shard failure");
@@ -3323,7 +3342,7 @@ fn timeout_before_later_shard_failure_keeps_timeout_outcome() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(86),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register no-reply worker");

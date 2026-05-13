@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
+use tina::{RequestContext, reply_to_request};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
 };
@@ -29,11 +30,18 @@ impl Echo {
             EchoMsg::AddOne(value) => reply(value + 1),
         }
     }
+
+    fn handle_call(&mut self, msg: EchoMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            EchoMsg::AddOne(value) => call.reply(value + 1),
+        }
+    }
 }
 
 #[derive(Debug)]
 enum SilentMsg {
     Start,
+    Done(RequestContext<u32>),
 }
 
 struct Silent;
@@ -43,6 +51,17 @@ impl Silent {
     fn handle(&mut self, msg: SilentMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
             SilentMsg::Start => noop(),
+            SilentMsg::Done(req) => reply_to_request(req, 1),
+        }
+    }
+
+    fn handle_call(&mut self, msg: SilentMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SilentMsg::Start => {
+                let req = call.into_request_context();
+                tina_runtime::sleep(Duration::from_millis(100)).reply(move |_| SilentMsg::Done(req))
+            }
+            SilentMsg::Done(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -61,6 +80,13 @@ impl Stopper {
         match msg {
             StopperMsg::Stop => stop(),
             StopperMsg::Ping => reply(1),
+        }
+    }
+
+    fn handle_call(&mut self, msg: StopperMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            StopperMsg::Ping => call.reply(1),
+            StopperMsg::Stop => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }

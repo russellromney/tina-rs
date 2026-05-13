@@ -68,6 +68,13 @@ impl ChunkedDecoder {
         matches!(self.state, State::Done)
     }
 
+    pub fn preferred_read_size(&self, max: usize) -> usize {
+        match self.state {
+            State::Data { remaining } => remaining.min(max).max(1),
+            State::Size | State::DataCrlf | State::Trailers | State::Done => 1,
+        }
+    }
+
     pub fn feed<'a>(&mut self, input: &'a [u8]) -> (ChunkedProgress<'a>, usize) {
         let mut consumed = 0;
         let mut remaining = input;

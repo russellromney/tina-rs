@@ -97,6 +97,7 @@ impl Isolate for App {
                     }
                     CallOutcome::Full => println!("err bridge full"),
                     CallOutcome::Closed => println!("err bridge closed"),
+                    CallOutcome::Rejected(reason) => println!("err bridge rejected: {reason:?}"),
                     CallOutcome::Timeout => println!("err call timeout"),
                 }
                 // Or, with the opt-in flatten helper:
