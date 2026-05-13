@@ -4,6 +4,25 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 090 Resource Lifecycle Unification
+
+- Added a compact lifecycle matrix to the shutdown guide, naming close
+  admission, close resource, cancel, drain, terminal proof, and honest
+  `not Tina-owned` boundaries for runtime, pool, HTTP body, keepalive, and
+  bridge surfaces.
+- Fixed `KeepaliveConnectionMsg::Stop` on the call-shaped path so callers see
+  `CallOutcome::Replied(KeepaliveOutcome::Stopped)` instead of
+  `Rejected(UnsupportedMessage)`.
+- Added `shutdown_keepalive_pool(...)` and
+  `KeepalivePoolShutdownReport` as the copied keepalive shutdown path:
+  close pool admission, wait for `Drain` leases to return before stopping
+  connections, count requested/stopped/timed-out/rejected/already-closed, and
+  name any non-stopped connection by slot. If admission close fails or `Drain`
+  times out with leases remaining, the helper leaves connections running and
+  reports that terminal truth.
+- Follow-up: bridge close/drain terms still deserve a separate audit before any
+  common bridge lifecycle helper is introduced.
+
 ### Phase 070 Small Sharded Ergonomics
 
 - Added `ShardBatch<T>` and `GroupByOwnerError::CapExceeded` to

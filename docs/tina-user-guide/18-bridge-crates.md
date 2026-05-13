@@ -22,11 +22,16 @@ roots themselves — so cross-origin reuse cannot happen at the
 connection-isolate level. The recommended consumer pattern is
 always release `Reuse`; the connection self-heals on
 `must_retire = true` (drops the bad transport, reconnects on the
-next request). Send `KeepaliveConnectionMsg::Stop` to each
-address in `handles.connections` on shutdown so transports close
-promptly. Reach for a bridge when you need HTTP/2, ALPN, system
-trust roots, redirects/cookies, an existing Axum app, or a
-third-party SDK that only ships a Tokio client.
+next request). On shutdown, call `shutdown_keepalive_pool(...)`
+or close the pool and call `KeepaliveConnectionMsg::Stop` on each
+address in `handles.connections`, checking for
+`KeepaliveOutcome::Stopped`; closing the pool alone only closes
+lease admission. With `CloseMode::Drain`, the helper waits for
+leased connections to return before stopping connection isolates;
+if that deadline fires, the report names the remaining leased count
+and leaves connections running. Reach for a bridge when you need
+HTTP/2, ALPN, system trust roots, redirects/cookies, an existing
+Axum app, or a third-party SDK that only ships a Tokio client.
 
 ## What ships today
 
