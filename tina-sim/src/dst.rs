@@ -863,6 +863,8 @@ pub enum RuntimeEventKindName {
     CallFailed,
     /// [`RuntimeEventKind::CallCompletionRejected`].
     CallCompletionRejected,
+    /// [`RuntimeEventKind::CallRejected`].
+    CallRejected,
     /// [`RuntimeEventKind::CallReplyRejected`].
     CallReplyRejected,
     /// [`RuntimeEventKind::CallReplyAbandoned`].
@@ -930,6 +932,7 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         RuntimeEventKind::CallCompletionRejected { .. } => {
             RuntimeEventKindName::CallCompletionRejected
         }
+        RuntimeEventKind::CallRejected { .. } => RuntimeEventKindName::CallRejected,
         RuntimeEventKind::CallReplyRejected { .. } => RuntimeEventKindName::CallReplyRejected,
         RuntimeEventKind::CallReplyAbandoned { .. } => RuntimeEventKindName::CallReplyAbandoned,
         RuntimeEventKind::CallCancelled { .. } => RuntimeEventKindName::CallCancelled,
