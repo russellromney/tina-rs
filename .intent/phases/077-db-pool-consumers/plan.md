@@ -4,10 +4,8 @@
 
 - Done: plan created after 067 pools, 072 deadlines, 073 HTTP pool,
   075 SQLx bridge, and 076 server keepalive landed.
-- In progress: PR #55 open; addressing review feedback (caller-supplied
-  capacity hole fixed for both bridges, plan status cleaned up).
-- Closed: audit, decision, material implementation, verification, commit,
-  PR opened.
+- Done: audit, decision, material implementation, verification, review fixes,
+  and merge.
 - Deferred: generic multi-shard pools, ORM/schema tooling, connection
   leak timers, and automatic retry.
 

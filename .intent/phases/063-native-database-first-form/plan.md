@@ -19,10 +19,10 @@
   classifier `SqliteOutcomeClass<T>` over the success carrier.
   Demo modes (constraint, timeout, closed, invalid, retry) live on
   the example.
-- Open: write the next-slice plan (Postgres / SQLx / pooled SQLite)
-  once 063 lessons are written down.
-- Deferred: `tina-sqlx-bridge`, native Postgres wire, pooling,
-  migrations, ORM, schema tools, transactions, typed row mapping.
+- Closed: SQLite first form and its ergonomics polish landed. Later SQLx and
+  DB pool work moved into their own completed follow-up phases.
+- Deferred: native Postgres wire, migrations, ORM, schema tools, and typed
+  user-struct row mapping.
 - Parallel: this phase may start while 064 runs. Do not wait for the
   064 bridge audit. Follow the current `tina-reqwest-bridge` style
   for install/config/metrics/shutdown, keep the surface small, and

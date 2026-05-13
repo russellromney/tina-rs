@@ -4,9 +4,8 @@
 
 - Done: plan created after 066 cancellation, 072 deadlines, 074 body
   streaming, and DB/HTTP bridge work landed.
-- In progress: PR 1 — response body source cancel + cancellation truth
-  docs table.
-- Open: PR 2 — pool/bridge audit fixes that are clearly pulled by code.
+- Done: response body source cancel, cancellation truth docs table, and
+  follow-up audit fixes that were clearly pulled by code.
 - Deferred: universal preemptive cancellation, OS-level kill semantics,
   exact DB cancellation guarantees.
 
