@@ -10,6 +10,18 @@ This file records completed work.
 - Pinned the cancellation truth: bridge timeout lets Tina stop waiting, but already accepted SDK work may finish late and continues occupying bounded bridge capacity until it reports terminal truth. `S3Closer::close_and_drain` reports remaining in-flight operation kinds at deadline.
 - Added fake-local S3 tests for happy put/get/head/delete, body caps, full/closed pressure, timeout/late-result metrics, close/drain lifecycle, typed SDK errors, supplied-client ownership, and zero-cap config validation.
 
+### Phase 089 Live Trace To Sim Replay Workflow
+
+- Added live replay capture tooling in `tina-sim`: `LiveReplayCapture`,
+  `LiveReplayReport`, `TraceProjection`, `UnsupportedLiveFact`,
+  `SavedReplayCase`, and `CapturedReplayMismatch`.
+- Made live-to-sim replay fail closed. A captured case cannot pass while
+  unsupported live facts remain, and projected comparison rejects event kinds
+  that were not explicitly included or ignored.
+- Added the user workflow for "bug in a box": capture typed live inputs/config/
+  topology/pressure facts, save a replay case, run the simulator projection,
+  and get a mismatch that names the missing fact or divergent trace shape.
+
 ### Phase 090 Resource Lifecycle Unification
 
 - Added a compact lifecycle matrix to the shutdown guide, naming close
