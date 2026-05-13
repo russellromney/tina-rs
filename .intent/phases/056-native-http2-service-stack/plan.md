@@ -69,6 +69,21 @@ Before coding, add a status note here:
 - first-form TLS/ALPN choice;
 - tests chosen.
 
+Status note, implementation pass 1:
+
+- codec choice: local sync HTTP/2 frame codec plus a deliberately small local
+  HPACK subset for first-form literal/indexed request and response headers; no
+  async/runtime-owning codec dependency;
+- API home: `tina-http/src/http2.rs`, re-exported narrowly from
+  `tina-http/src/lib.rs`;
+- first-form TLS/ALPN choice: prior-knowledge cleartext h2c only; no HTTPS/2
+  or ALPN claim in this pass;
+- tests chosen: pure frame/state tests plus live h2c listener tests for
+  preface/settings, unary request/response, stream cap/full, DATA window
+  enforcement, WINDOW_UPDATE credit return and response unblock, RST_STREAM
+  capacity release, bounded response-body rejection, late-reply reporting, and
+  GOAWAY new-stream rejection.
+
 Likely home:
 
 - `tina-http/src/http2.rs`;

@@ -1,5 +1,6 @@
-//! Native HTTP/1.1 and HTTPS/1.1 for tina-rs. No Tokio edge. No
-//! pipelining, no `Expect: 100-continue`.
+//! Native HTTP/1.1, HTTPS/1.1, and a first-form cleartext HTTP/2
+//! server for tina-rs. No Tokio edge. No HTTP/1 pipelining, no
+//! `Expect: 100-continue`.
 //!
 //! # Body model
 //!
@@ -70,9 +71,21 @@
 //! concurrency — see [`HttpsServerConfig`] for the lane-yield
 //! trade-off.
 //!
-//! Out of scope: HTTP/2, ALPN, ACME, mTLS, SNI routing, system roots,
-//! certificate reload, redirects, cookies. For mature outbound
-//! web-client behaviour use the `tina-reqwest-bridge` crate.
+//! HTTP/2: [`Http2Listener`] is a prior-knowledge cleartext h2c
+//! server first form. It owns the TCP stream, frame parsing, bounded
+//! stream table, connection/stream flow-control windows, reset/close
+//! outcomes, and service dispatch to the same [`HttpRequest`] /
+//! [`HttpResponse`] shape where honest. Request and response bodies are
+//! buffered under explicit byte caps in this first form; flow-control
+//! credit returns when buffered request bytes leave the connection for
+//! the service, and outbound responses can park behind a bounded
+//! pending response until `WINDOW_UPDATE` arrives. It is not an
+//! HTTPS/2 or ALPN claim, not gRPC, not a full client, and not a full
+//! RFC feature clone.
+//!
+//! Still out of scope: HTTP/2 TLS ALPN, gRPC, ACME, mTLS, SNI routing,
+//! system roots, certificate reload, redirects, cookies. For mature
+//! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -80,6 +93,7 @@ pub mod body_metrics;
 pub mod chunked_decoder;
 pub mod client;
 pub mod connection;
+pub mod http2;
 pub mod keepalive;
 pub mod listener;
 pub mod listener_tls;
@@ -95,6 +109,11 @@ pub mod types;
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
+pub use http2::{
+    Http2Connection, Http2ConnectionMsg, Http2ConnectionReport, Http2Limits, Http2Listener,
+    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig, Http2StreamReport,
+    Http2StreamState,
+};
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,
     KeepaliveConnectionStopOutcome, KeepaliveOutcome, KeepalivePoolCloseOutcome,

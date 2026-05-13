@@ -855,6 +855,8 @@ pub enum RuntimeEventKindName {
     MessageAbandoned,
     /// [`RuntimeEventKind::CallDispatchAttempted`].
     CallDispatchAttempted,
+    /// [`RuntimeEventKind::CallRejected`].
+    CallRejected,
     /// [`RuntimeEventKind::CallCompleted`].
     CallCompleted,
     /// [`RuntimeEventKind::CallFailed`].
@@ -922,6 +924,7 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         RuntimeEventKind::CallDispatchAttempted { .. } => {
             RuntimeEventKindName::CallDispatchAttempted
         }
+        RuntimeEventKind::CallRejected { .. } => RuntimeEventKindName::CallRejected,
         RuntimeEventKind::CallCompleted { .. } => RuntimeEventKindName::CallCompleted,
         RuntimeEventKind::CallFailed { .. } => RuntimeEventKindName::CallFailed,
         RuntimeEventKind::CallCompletionRejected { .. } => {
