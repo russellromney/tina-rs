@@ -1351,6 +1351,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_window_update_is_protocol_error() {
+        let mut conn = unit_connection();
+        let frame = Frame::new(FRAME_WINDOW_UPDATE, 0, 0, 0_u32.to_be_bytes().to_vec());
+        assert_eq!(
+            conn.handle_window_update(frame),
+            Err(Http2ProtocolError::WindowOverflow)
+        );
+    }
+
+    #[test]
+    fn pseudo_header_after_regular_header_is_rejected() {
+        let mut block = Vec::new();
+        encode_literal_header("x-test", "ok", &mut block);
+        encode_literal_header(":method", "GET", &mut block);
+        assert!(matches!(
+            decode_headers_block(&block, 1024),
+            Err(Http2ProtocolError::InvalidPseudoHeaders)
+        ));
+    }
+
+    #[test]
     fn report_records_late_reply_after_stream_is_gone() {
         let mut conn = unit_connection();
         let _ = conn.handle_service_returned(1, CallOutcome::Replied(HttpResponse::text("late")));

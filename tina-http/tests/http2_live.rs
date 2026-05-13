@@ -12,6 +12,7 @@ use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRunti
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;
+const FRAME_PING: u8 = 0x6;
 const FRAME_RST_STREAM: u8 = 0x3;
 const FRAME_SETTINGS: u8 = 0x4;
 const FRAME_GOAWAY: u8 = 0x7;
@@ -226,6 +227,16 @@ fn read_until_rst(stream: &mut TcpStream, stream_id: u32) -> TestFrame {
     panic!("did not see RST_STREAM for {stream_id}");
 }
 
+fn read_until_goaway(stream: &mut TcpStream) -> TestFrame {
+    for _ in 0..10 {
+        let frame = read_frame(stream);
+        if frame.ty == FRAME_GOAWAY {
+            return frame;
+        }
+    }
+    panic!("did not see GOAWAY");
+}
+
 #[test]
 fn http2_h2c_unary_request_response() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
@@ -366,6 +377,50 @@ fn http2_oversized_body_resets_stream_without_connection_close() {
         &request_headers("GET", "/counter"),
     );
     assert_eq!(read_response_body(&mut stream, 3), b"0");
+    harness.shutdown();
+}
+
+#[test]
+fn http2_oversized_frame_sends_goaway() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_frame_size: 1,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(&mut stream, FRAME_PING, 0, 0, b"12345678");
+
+    let frame = read_until_goaway(&mut stream);
+    assert_eq!(frame.stream_id, 0);
+    harness.shutdown();
+}
+
+#[test]
+fn http2_oversized_header_sends_goaway() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_header_bytes: 8,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/counter"),
+    );
+
+    let frame = read_until_goaway(&mut stream);
+    assert_eq!(frame.stream_id, 0);
     harness.shutdown();
 }
 
