@@ -14,6 +14,7 @@ path = "src/lib.rs"
 tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
 aws-sdk-s3 = "1.96"
+aws-sdk-sqs = "1.85"
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 
@@ -27,3 +28,4 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+serde_json = "1"
