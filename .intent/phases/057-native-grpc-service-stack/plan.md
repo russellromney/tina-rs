@@ -7,6 +7,8 @@
 - Builds on shipped native HTTP/2.
 - Do not run beside 087 WebSocket unless `tina-http` file ownership is
   coordinated.
+- First PR is server-first. Client support is optional only if native HTTP/2
+  client plumbing already exists or is tiny and honest.
 
 ## Grug Truth
 
@@ -38,7 +40,7 @@ Use `prost` for protobuf bytes. Tina owns:
 First form supports:
 
 - unary server;
-- unary client if small enough;
+- unary client only if it does not require a fake Tokio/hyper path;
 - server-streaming response if unary is boring;
 - typed `GrpcStatus`;
 - message compression rejected unless explicitly unsupported;
@@ -56,6 +58,8 @@ First form supports:
 - no reflection;
 - no health protocol unless the specimen needs it;
 - no hidden Tokio runtime.
+- no TLS ALPN / `h2` negotiation in this slice unless HTTP/2 already exposes
+  it cleanly; h2c prior-knowledge is acceptable first form and must be named.
 
 ## Rock 0: API Home
 
@@ -88,13 +92,29 @@ Pin boring names:
 Wire rules:
 
 - content type must be `application/grpc` or `application/grpc+proto`;
+- first transport may be prior-knowledge h2c if TLS ALPN is not ready;
 - path maps to service/method;
 - request body is gRPC message framing: 1 compression byte + 4 byte length +
   protobuf bytes;
 - compression flag `1` rejects as unsupported in first form;
 - message length is capped before allocation;
 - response trailers carry `grpc-status` and optional `grpc-message`;
+- gRPC errors are trailers/status, not broad HTTP 500, when the stream is still
+  healthy enough to send trailers;
 - HTTP/2 reset/cancel maps to typed status/cancel truth.
+
+Status mapping must be pinned before coding:
+
+- unknown method -> `Unimplemented`;
+- malformed frame -> `InvalidArgument` or a named protocol error;
+- message too large -> `ResourceExhausted`;
+- service timeout/deadline -> `DeadlineExceeded`;
+- peer reset/cancel -> `Cancelled`;
+- internal Tina bug -> `Internal`.
+
+If the current HTTP/2 first form cannot send trailers, add the smallest trailer
+support needed for gRPC and prove HTTP/2 still passes. Do not encode
+`grpc-status` as a fake response body.
 
 ## Rock 2: Unary Server
 
@@ -111,12 +131,21 @@ Requirements:
 
 - decode exactly one request message;
 - reject zero/multiple messages unless method says streaming;
-- service receives typed protobuf payload or raw bytes plus user decoder;
+- service receives typed protobuf payload through `prost::Message` or raw bytes
+  plus explicit user decoder;
 - service returns typed payload/status;
 - encode one response message plus trailers;
 - all decode/status/body caps are typed outcomes.
 
 Do not require users to hand-build HTTP/2 trailers for common unary service.
+Do not require a build.rs/codegen story in first form; hand-written
+`prost::Message` test types are enough.
+
+RequestContext rule:
+
+- multi-turn gRPC services must carry caller authority explicitly, same as
+  ordinary Tina request/reply;
+- docs/specimen must not teach "reply context magically survives a DB call."
 
 ## Rock 3: Client Shape
 
@@ -145,6 +174,9 @@ Rules:
 - cancel from peer reaches source as typed cancel;
 - final status/trailers are explicit.
 
+Server-streaming must reuse the HTTP body/source cancellation truth where
+possible. If it invents a second streaming model, stop and redesign.
+
 If this grows, stop at unary and write the follow-up in the plan.
 
 ## Rock 5: Specimen
@@ -172,11 +204,15 @@ Required unary tests:
 - compressed request rejects;
 - request message too large rejects before big allocation;
 - response message too large returns typed failure;
+- zero messages rejects;
+- two messages on unary rejects;
 - service timeout/cancel maps to typed status;
 - HTTP/2 stream reset is visible;
 - trailers include `grpc-status`;
+- trailers include percent-safe `grpc-message` when set;
 - content-type mismatch rejects;
 - concurrent unary streams respect HTTP/2 stream cap.
+- multi-turn unary service uses `RequestContext` correctly.
 
 Required if server-streaming ships:
 
@@ -201,6 +237,7 @@ Update:
 Docs must say:
 
 - Tina gRPC first form is native over Tina HTTP/2;
+- first transport is h2c unless TLS ALPN was explicitly added;
 - not tonic feature parity;
 - no compression in first form;
 - streaming support exactly as shipped;

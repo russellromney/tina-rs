@@ -10,9 +10,11 @@ replay cases. The plan says no. Keep saying no.
 ## Required Guardrails
 
 - Pick one edge. Do not support every protocol.
+- Do not depend on an unmerged protocol phase.
 - App operations must be recorded explicitly. Do not infer them from trace.
 - Unknown event kinds fail closed.
 - Unsupported live facts are allowed, but they must block a "pass".
+- Unsupported facts must not be smuggled in as ignored projection events.
 - Shrink only history ops.
 
 ## Review Focus
@@ -21,6 +23,7 @@ replay cases. The plan says no. Keep saying no.
 - Projection config must be visible.
 - Config/topology/mailboxes must travel with the case.
 - Any new fact must have a sim meaning or be explicitly unsupported.
+- The plan status should name the chosen edge before code lands.
 
 ## Good First Edge
 

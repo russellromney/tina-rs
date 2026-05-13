@@ -6,6 +6,7 @@
 - One PR.
 - Can run beside 087 WebSocket and 057 gRPC if it stays in `tina-sim`, docs,
   and one narrow specimen/test.
+- At start of implementation, edit this plan status to name the chosen edge.
 
 ## Grug Truth
 
@@ -56,12 +57,13 @@ Choose one.
 
 Preferred:
 
-1. HTTP/2 pressure/cancel edge if it has simulator-representable facts.
-2. WebSocket room pressure if 087 lands first.
-3. Existing HTTP/1 keepalive/body pressure if it is easier and already stable.
-4. Sharded hot-key pressure if protocol work would conflict.
+1. Existing HTTP/1 keepalive/body pressure if protocol work would conflict.
+2. Sharded hot-key pressure if it gives the cleanest sim/live parity.
+3. HTTP/2 pressure/cancel edge if it has simulator-representable facts.
+4. WebSocket room pressure if 087 lands first.
 
 Do not wait for all of them.
+Do not depend on an unmerged protocol phase.
 
 The case must include at least one real Tina fact:
 
@@ -110,9 +112,16 @@ Examples:
 Every fact needs:
 
 - typed representation;
+- source of truth: event, report, config, or explicit app op;
 - display/debug text useful in failure output;
 - fail-closed behavior when missing;
 - test.
+
+Fact rule:
+
+- if the simulator can reproduce it, include it in expected projection;
+- if the simulator cannot reproduce it, record it as `UnsupportedLiveFact`;
+- never silently downgrade an unsupported fact into an ignored event.
 
 If the fact cannot be replayed honestly, add it to `UnsupportedLiveFact` and
 make the report say exactly that.
@@ -150,6 +159,9 @@ Add one end-to-end test:
 If live timing would be flaky, use a deterministic live-shaped `ThreadedRuntime`
 test with explicit waits. Do not build a sleep-based fake pass.
 
+The test must name the chosen edge in the case name and failure output. Future
+users should know what real bug shape this protects.
+
 ## Rock 4: Shrink Path
 
 Prove the captured case can enter existing shrink flow.
@@ -160,6 +172,9 @@ Rules:
 - recompute expected count/hash after shrink;
 - output says what constants to paste;
 - config/topology are not shrunk in this phase.
+
+If the chosen edge has no meaningful shrinkable history, add a second tiny
+history-only case for shrink. Do not pretend a one-op case proves shrink.
 
 ## Rock 5: Docs
 
@@ -188,6 +203,7 @@ Docs must say:
 - `cargo fmt --all --check`
 - `cargo test -p tina-sim live_replay --tests`
 - targeted test for chosen specimen/crate
+- `cargo test -p tina-sim saved_replay_cases --tests`
 - `cargo clippy -p tina-sim --tests -- -D warnings`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` if docs/rustdoc
   changed

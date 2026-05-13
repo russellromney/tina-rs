@@ -16,7 +16,10 @@ queue named and capped.
 ## Watch During Review
 
 - Upgrade must not silently accept unsupported extensions.
+- Upgrade handoff must leave exactly one owner for the stream.
+- Client frames must be masked; server frames must be unmasked.
 - Fragmentation behavior must be one clear rule: reject, or bounded reassemble.
 - Room specimen must show slow peer truth, not only happy broadcast.
 - Close handshake must close the resource eventually.
+- Outbound buffering must be capped by bytes as well as item count.
 - No hidden Tokio / async WebSocket crate.
