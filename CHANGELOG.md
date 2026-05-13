@@ -4,6 +4,12 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 088 AWS Bridge First Form
+
+- Added `tina-aws-bridge`, an opt-in S3-only bridge around the AWS Rust SDK with explicit config, bounded mailbox and in-flight admission, capped `PutObject` / `GetObject`, `HeadObject`, `DeleteObject`, typed S3 request/response/error enums, metrics, and examples.
+- Pinned the cancellation truth: bridge timeout lets Tina stop waiting, but already accepted SDK work may finish late and continues occupying bounded bridge capacity until it reports terminal truth. `S3Closer::close_and_drain` reports remaining in-flight operation kinds at deadline.
+- Added fake-local S3 tests for happy put/get/head/delete, body caps, full/closed pressure, timeout/late-result metrics, close/drain lifecycle, typed SDK errors, supplied-client ownership, and zero-cap config validation.
+
 ### Phase 090 Resource Lifecycle Unification
 
 - Added a compact lifecycle matrix to the shutdown guide, naming close

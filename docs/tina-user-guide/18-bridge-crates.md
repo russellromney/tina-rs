@@ -42,6 +42,7 @@ Axum app, or a third-party SDK that only ships a Tokio client.
 | `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; reqwest covers everything else. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
 | `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
+| `tina-aws-bridge` | Tina caller → AWS SDK S3 | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. S3 first form only: `PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`. The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
 
 Each crate is small, opt-in, and bounded. Native Tina crates
 (`tina-http`, etc.) do not depend on any bridge; bridges do not leak
@@ -323,6 +324,109 @@ in `PgValue::Null` regardless of how the NULL was bound.
 Non-goals: generic `sqlx::Database`, ORM, migrations, struct
 mapping, a transaction *handle* (vs. atomic script). See the
 phase plan for the why.
+
+### `tina-aws-bridge` — Tina → AWS SDK S3
+
+Adoption bridge. The AWS Rust SDK owns AWS protocol behavior; Tina
+owns bounded admission, body caps, per-operation timeout truth,
+typed outcomes, and metrics.
+
+```rust
+use tina_aws_bridge::{
+    S3Config, S3Credentials, S3Request, S3PutObject, install_s3, send_s3,
+};
+
+let cfg = S3Config::new()
+    .with_region("us-east-1")
+    .with_credentials(S3Credentials::new("access-key-id", "secret-access-key"))
+    .with_max_in_flight(8)
+    .with_default_timeout(Duration::from_secs(2));
+let bridge = install_s3(&runtime, cfg)?;
+
+// In a handler:
+send_s3(
+    self.aws,
+    S3Request::PutObject(S3PutObject {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        body: b"hello".to_vec(),
+        content_type: Some("text/plain".into()),
+    }),
+    Duration::from_secs(2),
+)
+.reply(AppMsg::S3PutDone);
+```
+
+The copied raw call shape is:
+
+```rust
+call(
+    aws,
+    S3Msg::Send(S3Request::PutObject(S3PutObject {
+        bucket,
+        key,
+        body,
+        content_type: None,
+    })),
+    Duration::from_secs(2),
+)
+.reply(AppMsg::S3PutDone)
+```
+
+**Operations.**
+
+| Request | Returns | Notes |
+| --- | --- | --- |
+| `PutObject` | `S3PutObjectOk` | Full buffered request body; capped by `request_body_limit`. |
+| `GetObject { max_bytes }` | `S3Object` | Reads SDK stream chunk by chunk; fails with `ResponseTooLarge` once the request/config cap would be crossed. |
+| `HeadObject` | `S3ObjectHead` | Object metadata without buffering a body. |
+| `DeleteObject` | `S3DeletedObject` | Object delete only; no batch/delete framework. |
+
+**Pressure and retry truth.**
+
+```text
+mailbox full        -> CallError::TargetFull / CallOutcome::Full
+max_in_flight       -> S3Error::Full
+request body cap    -> S3Error::RequestTooLarge
+response body cap   -> S3Error::ResponseTooLarge
+per-operation clock -> S3Error::Timeout
+SDK failure         -> S3Error::Sdk(detail)
+worker closed       -> S3Error::Closed
+```
+
+`S3Config` disables AWS SDK retries by default. If you opt into
+`SdkRetryPolicy::Standard { max_attempts }`, one admitted bridge
+operation may perform multiple SDK HTTP attempts internally. The
+bridge exposes the configured `sdk_max_attempts` in metrics; it does
+not claim to observe every internal retry attempt. If you wrap a
+caller-supplied `aws_sdk_s3::Client`, SDK retry policy is entirely
+caller-owned and `sdk_max_attempts` is reported as `0` (unknown).
+
+`install` builds an S3 client from explicit bridge config. First form
+supports static credentials only (`S3Credentials`). Use
+`with_supplied_client` when you need the AWS default provider chain,
+assume-role, SSO, custom HTTP connector, custom TLS, proxy policy, or
+any other SDK-owned client setup.
+
+No unbounded request/result buffer is part of the bridge: callers are
+bounded by the Tina mailbox, SDK work is bounded by `max_in_flight`,
+and the bridge does not queue waiters behind saturated in-flight
+slots.
+
+**Cancellation.** `S3Closer::close()` stops Tina-side admission.
+`S3Closer::close_and_drain(timeout)` closes admission and waits a
+bounded time for already accepted SDK work to leave the bridge's
+in-flight set. If the deadline fires, `S3DrainReport` names the
+remaining operation kinds and count. On bridge timeout, the caller can
+stop waiting; the spawned SDK future is left alive because task abort
+does not prove AWS/Hyper cancelled bytes already accepted for IO. That
+late SDK future continues to occupy `max_in_flight` capacity until it
+reports terminal truth; then worker-terminal metrics are tallied and
+`late_results` increments.
+
+Owned install builds a private Tokio runtime for SDK work and drops it
+with the worker. The supplied-client path uses the caller's Tokio
+runtime handle and never shuts it down.
 
 ## What bridges preserve and weaken
 
