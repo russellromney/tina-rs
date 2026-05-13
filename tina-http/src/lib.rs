@@ -96,8 +96,10 @@ pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use keepalive::{
-    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveOutcome,
-    KeepalivePoolHandles, OriginKey, build_keepalive_pool,
+    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,
+    KeepaliveConnectionStopOutcome, KeepaliveOutcome, KeepalivePoolCloseOutcome,
+    KeepalivePoolDrainOutcome, KeepalivePoolHandles, KeepalivePoolShutdownReport, OriginKey,
+    build_keepalive_pool, shutdown_keepalive_pool,
 };
 pub use listener::{HttpListener, HttpListenerMsg};
 pub use listener_tls::{

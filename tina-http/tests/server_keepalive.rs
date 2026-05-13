@@ -18,7 +18,8 @@ use http::StatusCode;
 use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, ReleaseDisposition, ReleaseOutcome};
 use tina_http::{
     HttpClientConfig, HttpLimits, HttpRequest, HttpTarget, KeepaliveConnAddr,
-    KeepaliveConnectionMsg, KeepaliveOutcome, build_keepalive_pool,
+    KeepaliveConnectionMsg, KeepaliveOutcome, KeepalivePoolCloseOutcome, KeepalivePoolDrainOutcome,
+    build_keepalive_pool, shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{CallKind, CallOutcome, RuntimeEventKind};
@@ -552,25 +553,21 @@ fn keepalive_pool_reuses_native_listener_connection_across_requests() {
     );
 
     release_keepalive_connection(&harness, handles.pool, lease);
-    match harness
-        .runtime_handle()
-        .call_blocking(
-            handles.pool,
-            WorkerPoolMsg::Close(CloseMode::Drain),
-            Duration::from_secs(2),
-        )
-        .expect("close pool")
-    {
-        CallOutcome::Replied(WorkerPoolReply::Closed) => {}
-        other => panic!("expected pool closed ack, got {other:?}"),
-    }
-    for conn in handles.connections {
-        let _ = harness.runtime_handle().call_blocking(
-            conn,
-            KeepaliveConnectionMsg::Stop,
-            Duration::from_secs(2),
-        );
-    }
+    let report = shutdown_keepalive_pool(
+        harness.runtime_handle(),
+        &handles,
+        CloseMode::Drain,
+        Duration::from_secs(2),
+    )
+    .expect("shutdown keepalive pool");
+    assert_eq!(report.pool_close, KeepalivePoolCloseOutcome::Closed);
+    assert_eq!(report.drain, KeepalivePoolDrainOutcome::Drained);
+    assert_eq!(report.requested, 1);
+    assert_eq!(report.stopped, 1);
+    assert_eq!(report.timed_out, 0);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.already_closed, 0);
+    assert!(report.connection_failures.is_empty());
 
     // Let the listener process any peer EOF caused by stopping the
     // client-side keepalive connection before we inspect the trace.

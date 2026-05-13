@@ -47,6 +47,17 @@ tcp_close_stream(stream).reply(ConnMsg::Closed)
 If close cancels pending work, the runtime should report that as resource-close
 truth, not leave hidden in-flight calls around.
 
+### Lifecycle Matrix
+
+| Surface | Close admission | Close resource | Cancel | Drain | Terminal proof |
+|---|---|---|---|---|---|
+| isolate address | stopped isolate rejects sends/calls as `Closed` | isolate-owned IDs are closed by that isolate or runtime shutdown | `cancel_call(handle)` closes the caller wait | app protocol, not `wait_idle()` | `IsolateStopped`, typed result waiter, or later `CallOutcome::Closed` |
+| `WorkerPool` | `WorkerPoolMsg::Close(Drain/Force)` | not owned by the pool unless the handle type says so | acquire waiter cancel reclaims waiter slot | `Drain` lets leases return; `Force` marks them stale | `WorkerPoolReply::Closed` and `PoolPressureReport { closed: true, ... }` |
+| keepalive pool | `WorkerPoolMsg::Close` closes lease admission | `KeepaliveConnectionMsg::Stop` drops the connection transport and stops the isolate | request caller can stop waiting; accepted transport work may still finish late | `shutdown_keepalive_pool(..., Drain, ...)` waits for pool leases to return before stopping connections | `KeepalivePoolShutdownReport` with pool close, drain outcome, requested/stopped/timed-out/rejected/already-closed, and failed slot indexes |
+| TCP/TLS stream | owner stops issuing new I/O for that ID | `tcp_close_stream` / `tls_close` effect or runtime shutdown cleanup | pending runtime call is cancelled/tombstoned; started backend work may complete late | owner protocol plus bounded shutdown | close reply, late-reply trace, or terminal remaining-resource report |
+| HTTP body stream | connection stops pulling chunks | source releases buffers/files/calls on EOF/error/cancel | `ResponseChunkMsg::Cancel` tells source to release state | body metrics return to zero current bytes | `BodyPressureReport::drained()` plus IO/full/timeout counters |
+| external bridge work | bridge closer stops Tina-side admission | remote resource is not Tina-owned unless bridge documents it | caller wait can close; remote work may continue unless explicit cancel exists | bridge-specific bounded drain | bridge metrics and runtime late-result trace |
+
 ## Pending Work
 
 Pending work can live in several places:
