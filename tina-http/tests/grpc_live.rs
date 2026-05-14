@@ -3,6 +3,7 @@ mod common;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::TestShard;
@@ -10,8 +11,9 @@ use prost::Message;
 use tina::prelude::*;
 use tina_http::{
     GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
-    GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, Http2Listener, Http2ListenerMsg,
-    Http2ServerConfig, HttpRequest, HttpResponse, IterBodySource, grpc_unary_call_h2c,
+    GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, Http2Limits, Http2Listener,
+    Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, IterBodySource,
+    grpc_unary_call_h2c,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -54,15 +56,23 @@ struct GrpcHarness {
 impl GrpcHarness {
     fn start_router(config: Http2ServerConfig, limits: GrpcLimits) -> Self {
         let runtime = runtime();
-        let watch_chunks = vec![
-            tina_http::encode_grpc_message(&CounterReply { value: 1 }, GrpcLimits::default())
-                .expect("encode watch one"),
-            tina_http::encode_grpc_message(&CounterReply { value: 2 }, GrpcLimits::default())
-                .expect("encode watch two"),
-        ];
-        let watch_source =
-            IterBodySource::<TestShard>::register(&runtime, watch_chunks.into_iter(), 16)
-                .expect("register watch source");
+        let watch_sources = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..8 {
+            let watch_chunks = vec![
+                tina_http::encode_grpc_message(&CounterReply { value: 1 }, GrpcLimits::default())
+                    .expect("encode watch one"),
+                tina_http::encode_grpc_message(&CounterReply { value: 2 }, GrpcLimits::default())
+                    .expect("encode watch two"),
+            ];
+            let watch_source =
+                IterBodySource::<TestShard>::register(&runtime, watch_chunks.into_iter(), 16)
+                    .expect("register watch source");
+            watch_sources
+                .lock()
+                .expect("watch sources")
+                .push(watch_source);
+        }
+        let watch_sources_for_route = Arc::clone(&watch_sources);
         let router = GrpcRouter::<TestShard>::new(limits)
             .unary(
                 "/specimen.Counter/Increment",
@@ -98,6 +108,11 @@ impl GrpcHarness {
             .server_streaming(
                 "/specimen.Counter/Watch",
                 move |_request: GrpcRequest<CounterRequest>| {
+                    let watch_source = watch_sources_for_route
+                        .lock()
+                        .expect("watch sources")
+                        .pop()
+                        .expect("watch source per call");
                     Ok(GrpcServerStreamingResponse::new(watch_source))
                 },
             )
@@ -299,6 +314,18 @@ fn read_frame(stream: &mut TcpStream) -> Frame {
 
 fn request_headers(path: &str, content_type: &str) -> Vec<u8> {
     request_headers_with_encoding(path, content_type, None)
+}
+
+fn request_headers_with_content_length(path: &str, content_type: &str, len: usize) -> Vec<u8> {
+    let mut block = request_headers(path, content_type);
+    literal("content-length", &len.to_string(), &mut block);
+    block
+}
+
+fn request_trailers() -> Vec<u8> {
+    let mut block = Vec::new();
+    literal("x-request-trailer", "not-supported", &mut block);
+    block
 }
 
 fn request_headers_with_encoding(
@@ -504,6 +531,34 @@ fn grpc_server_streaming_sends_messages_then_status_trailers() {
 }
 
 #[test]
+fn grpc_server_streaming_route_works_more_than_once() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 0 });
+
+    for stream_id in [1, 3] {
+        write_frame(
+            &mut stream,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            stream_id,
+            &request_headers("/specimen.Counter/Watch", "application/grpc+proto"),
+        );
+        write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, stream_id, &body);
+        let (body, status) = read_body_and_status(&mut stream, stream_id);
+        assert_eq!(status, GrpcStatusCode::Ok);
+        assert_eq!(
+            decode_grpc_replies(&body)
+                .iter()
+                .map(|reply| reply.value)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+    harness.shutdown();
+}
+
+#[test]
 fn grpc_client_streaming_reads_multiple_request_messages() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
     let mut stream = connect_h2(harness.addr);
@@ -530,6 +585,187 @@ fn grpc_client_streaming_reads_multiple_request_messages() {
     let (body, status) = read_body_and_status(&mut stream, 1);
     assert_eq!(status, GrpcStatusCode::Ok);
     assert_eq!(decode_one_grpc_reply(&body).value, 42);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_modes_share_one_http2_connection_without_cross_talk() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let watch_body = grpc_body(&CounterRequest { delta: 0 });
+    let mut sum_body = Vec::new();
+    sum_body.extend_from_slice(&grpc_body(&CounterRequest { delta: 10 }));
+    sum_body.extend_from_slice(&grpc_body(&CounterRequest { delta: 32 }));
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Watch", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        3,
+        &request_headers("/specimen.Counter/Sum", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &watch_body);
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        3,
+        &sum_body[..sum_body.len() / 2],
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        3,
+        &sum_body[sum_body.len() / 2..],
+    );
+
+    let mut watch_body = Vec::new();
+    let mut sum_body = Vec::new();
+    let mut watch_status = None;
+    let mut sum_status = None;
+    for _ in 0..64 {
+        let frame = read_frame(&mut stream);
+        match (frame.ty, frame.stream_id) {
+            (FRAME_DATA, 1) => watch_body.extend_from_slice(&frame.payload),
+            (FRAME_DATA, 3) => sum_body.extend_from_slice(&frame.payload),
+            (FRAME_HEADERS, 1) if frame.flags & FLAG_END_STREAM != 0 => {
+                watch_status = Some(decode_status(&frame.payload));
+            }
+            (FRAME_HEADERS, 3) if frame.flags & FLAG_END_STREAM != 0 => {
+                sum_status = Some(decode_status(&frame.payload));
+            }
+            (FRAME_HEADERS, _) => {}
+            (FRAME_RST_STREAM, id) => panic!("unexpected reset for stream {id}: {frame:?}"),
+            _ => {}
+        }
+        if watch_status.is_some() && sum_status.is_some() {
+            break;
+        }
+    }
+
+    assert_eq!(watch_status, Some(GrpcStatusCode::Ok));
+    assert_eq!(sum_status, Some(GrpcStatusCode::Ok));
+    assert_eq!(
+        decode_grpc_replies(&watch_body)
+            .iter()
+            .map(|reply| reply.value)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(decode_one_grpc_reply(&sum_body).value, 42);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_request_trailers_are_rejected_not_treated_as_eof() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Sum", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_trailers(),
+    );
+
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_request_content_length_overrun_resets_stream() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 7 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers_with_content_length(
+            "/specimen.Counter/Sum",
+            "application/grpc+proto",
+            body.len() - 1,
+        ),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
+
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_request_content_length_underrun_resets_stream() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 7 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers_with_content_length(
+            "/specimen.Counter/Sum",
+            "application/grpc+proto",
+            body.len() + 1,
+        ),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
+
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_request_total_body_cap_counts_consumed_chunks() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_body_bytes: 12,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = GrpcHarness::start_router(config, GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let first = grpc_body(&CounterRequest { delta: 1 });
+    let second = grpc_body(&CounterRequest { delta: 2 });
+
+    assert!(first.len() <= 12);
+    assert!(first.len() + second.len() > 12);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Sum", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, 0, 1, &first);
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &second);
+
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
     harness.shutdown();
 }
 

@@ -9,6 +9,50 @@ Right direction, but the phase has two traps:
 
 ## Findings
 
+### Fixed In Code Review: Server Streaming Needed Repeat-Call Proof
+
+The first server-streaming test only called one route once. That can hide
+single-use source bugs. The live suite now calls the same streaming route twice
+on one connection and proves both calls receive full messages plus final
+status.
+
+### Fixed In Code Review: Streaming Modes Needed Same-Connection Proof
+
+Testing server-streaming and client-streaming separately does not prove HTTP/2
+multiplexing. The live suite now runs server-streaming and client-streaming on
+separate streams of the same connection and asserts no cross-talk.
+
+### Fixed In Code Review: Client-Streaming Needed Hostile Framing Proof
+
+Client-streaming now has tests for request trailers, content-length overrun,
+content-length underrun, and total body cap across consumed chunks. These force
+protocol bugs to reset visibly instead of returning friendly but false gRPC
+statuses.
+
+### Still Risky: Server-Streaming API Is Too Raw
+
+`GrpcServerStreamingResponse` currently asks handlers to provide a
+`ResponseChunkMsg` source of already gRPC-framed bytes. That is real transport
+plumbing, but it is not yet the final pleasant Tina-shaped typed message source.
+The next pass should wrap typed `prost::Message` streams so user handlers do
+not hand-build gRPC frames.
+
+### Bullshitproof E2E Tests Still Needed
+
+Before claiming 096 complete, add tests that:
+
+1. Run grpcurl against the specimen with an explicit proto/descriptor.
+2. Run a tonic client against unary, server-streaming, client-streaming, and
+   bidi routes.
+3. Force server-streaming pressure with a non-reading client, then send
+   `RST_STREAM` and prove source cancel.
+4. Force client-streaming with thousands of small messages and one oversized
+   declared message that must fail before protobuf allocation.
+5. Interleave bidi request/response messages while one direction is
+   flow-control blocked.
+6. Start/stop the specimen repeatedly on random ports and run copy-paste
+   documented commands, not private helper clients.
+
 ### Production Client Is Conditional
 
 The plan correctly says a production gRPC client can only land if a real HTTP/2

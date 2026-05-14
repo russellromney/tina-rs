@@ -552,8 +552,10 @@ struct ActiveStream {
     response_pull_in_flight: bool,
     request_dispatched_streaming: bool,
     request_eof: bool,
+    request_content_length: Option<usize>,
+    request_bytes_received: usize,
     request_chunks: VecDeque<Vec<u8>>,
-    pending_request_body_reply: Option<tina::RequestContext<RequestChunkReply>>,
+    pending_request_body_reply: Option<tina::RequestContext<Http2ConnectionReply>>,
     reset: bool,
 }
 
@@ -583,6 +585,8 @@ impl ActiveStream {
             response_pull_in_flight: false,
             request_dispatched_streaming: false,
             request_eof: false,
+            request_content_length: None,
+            request_bytes_received: 0,
             request_chunks: VecDeque::new(),
             pending_request_body_reply: None,
             reset: false,
@@ -624,6 +628,12 @@ impl Http2ConnectionMsg {
     pub fn body_next(stream_id: u32) -> Self {
         Self::RequestBodyNext { stream_id }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum Http2ConnectionReply {
+    RequestChunk(RequestChunkReply),
+    Report(Http2ConnectionReport),
 }
 
 /// One HTTP/2 connection isolate over one TCP stream.
@@ -685,7 +695,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http2Connection<S, M> {
     tina::isolate_types! {
         message: Http2ConnectionMsg,
-        reply: RequestChunkReply,
+        reply: Http2ConnectionReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
         call: tina_runtime::RuntimeCall<Http2ConnectionMsg>,
@@ -730,6 +740,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         match msg {
             Http2ConnectionMsg::RequestBodyNext { stream_id } => {
                 self.handle_request_body_next(stream_id, call)
+            }
+            Http2ConnectionMsg::Report => {
+                call.reply(Http2ConnectionReply::Report(self.report.clone()))
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
@@ -894,17 +907,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_REFUSED_STREAM))?;
             return Ok(());
         }
-        if let Some(idx) = self.find_stream(frame.stream_id) {
-            if self.streams[idx].request_dispatched_streaming
-                && !self.streams[idx].request_eof
-                && frame.flags & FLAG_END_STREAM != 0
-            {
-                self.streams[idx].request_eof = true;
-                self.streams[idx].state = Http2StreamState::HalfClosedRemote;
-                effects.push(self.reply_pending_request_chunk(frame.stream_id)?);
-                return Ok(());
-            }
+        if self.find_stream(frame.stream_id).is_some() {
+            let stream_id = frame.stream_id;
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+            self.reset_active_stream_for_protocol(stream_id, effects);
             return Ok(());
         }
         if frame.stream_id <= self.highest_client_stream_id {
@@ -974,12 +980,20 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.report.flow_control_blocked += 1;
             return Err(Http2ProtocolError::FlowControl);
         }
+        if let Some(content_length) = self.streams[idx].request_content_length {
+            let received = self.streams[idx]
+                .request_bytes_received
+                .checked_add(len)
+                .ok_or(Http2ProtocolError::HeadersTooLarge)?;
+            if received > content_length {
+                self.report.protocol_errors += 1;
+                self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+                self.reset_active_stream_for_protocol(frame.stream_id, effects);
+                return Ok(());
+            }
+        }
         let buffered_len = if self.streams[idx].request_dispatched_streaming {
-            self.streams[idx]
-                .request_chunks
-                .iter()
-                .map(Vec::len)
-                .sum::<usize>()
+            self.streams[idx].request_bytes_received
         } else {
             self.streams[idx].body.len()
         };
@@ -994,6 +1008,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
         self.recv_window -= len as i32;
         self.streams[idx].recv_window -= len as i32;
+        self.streams[idx].request_bytes_received += len;
         if self.streams[idx].request_dispatched_streaming {
             if !frame.payload.is_empty() {
                 self.streams[idx].request_chunks.push_back(frame.payload);
@@ -1002,6 +1017,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.streams[idx].body.extend_from_slice(&frame.payload);
         }
         if frame.flags & FLAG_END_STREAM != 0 {
+            if self.streams[idx]
+                .request_content_length
+                .is_some_and(|content_length| {
+                    self.streams[idx].request_bytes_received != content_length
+                })
+            {
+                self.report.protocol_errors += 1;
+                self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+                self.reset_active_stream_for_protocol(frame.stream_id, effects);
+                return Ok(());
+            }
             self.streams[idx].request_eof = true;
             self.streams[idx].state = Http2StreamState::HalfClosedRemote;
             if self.streams[idx].request_dispatched_streaming {
@@ -1048,7 +1074,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             if let Some(call) = stream.pending_request_body_reply.take() {
                 effects.push(reply_to_request(
                     call,
-                    RequestChunkReply::Error(CallError::TargetClosed),
+                    Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
+                        CallError::TargetClosed,
+                    )),
                 ));
             }
             if let Some(handle) = stream.pending_call.take() {
@@ -1139,6 +1167,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             .get(http::header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok());
+        self.streams[idx].request_content_length = content_length;
         let source = tina::Address::new_with_generation(
             self.self_shard_id.expect("shard id captured"),
             self.self_isolate_id.expect("isolate id captured"),
@@ -1530,7 +1559,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         call: tina::CallContext<'_, Self>,
     ) -> Effect<Self> {
         let Some(idx) = self.find_stream(stream_id) else {
-            return call.reply(RequestChunkReply::Error(CallError::TargetClosed));
+            return call.reply(Http2ConnectionReply::RequestChunk(
+                RequestChunkReply::Error(CallError::TargetClosed),
+            ));
         };
         if self.streams[idx].pending_request_body_reply.is_some() {
             return call.reject(tina::CallRejectedReason::UnsupportedMessage);
@@ -1541,10 +1572,49 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             Err(_) => {
                 if let Some(idx) = self.find_stream(stream_id) {
                     if let Some(call) = self.streams[idx].pending_request_body_reply.take() {
-                        return reply_to_request(call, RequestChunkReply::Error(CallError::Io));
+                        return reply_to_request(
+                            call,
+                            Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
+                                CallError::Io,
+                            )),
+                        );
                     }
                 }
                 noop()
+            }
+        }
+    }
+
+    fn reset_active_stream_for_protocol(
+        &mut self,
+        stream_id: u32,
+        effects: &mut Vec<Effect<Self>>,
+    ) {
+        if let Some(mut stream) = self.remove_stream(stream_id) {
+            self.report.reset_streams += 1;
+            self.report.closed_streams += 1;
+            if let Some(call) = stream.pending_request_body_reply.take() {
+                effects.push(reply_to_request(
+                    call,
+                    Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(CallError::Io)),
+                ));
+            }
+            if let Some(handle) = stream.pending_call.take() {
+                effects.push(cancel_call(handle).reply(move |outcome| {
+                    Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
+                }));
+            }
+            if let Some(source) = stream.response_source.take() {
+                effects.push(
+                    call(
+                        source,
+                        ResponseChunkMsg::Cancel,
+                        self.limits.response_stream_call_timeout,
+                    )
+                    .reply(move |outcome| {
+                        Http2ConnectionMsg::StreamSourceCancelDone { stream_id, outcome }
+                    }),
+                );
             }
         }
     }
@@ -1571,10 +1641,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 self.streams[idx].recv_window.saturating_add(len as i32);
             self.enqueue_frame(window_update_frame(0, len as u32))?;
             self.enqueue_frame(window_update_frame(stream_id, len as u32))?;
-            return Ok(reply_to_request(call, RequestChunkReply::Chunk(chunk)));
+            return Ok(reply_to_request(
+                call,
+                Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(chunk)),
+            ));
         }
         if self.streams[idx].request_eof {
-            Ok(reply_to_request(call, RequestChunkReply::Eof))
+            Ok(reply_to_request(
+                call,
+                Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof),
+            ))
         } else {
             self.streams[idx].pending_request_body_reply = Some(call);
             Ok(noop())

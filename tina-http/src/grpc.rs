@@ -19,7 +19,7 @@ use tina::prelude::*;
 use tina::reply_to_request;
 use tina_runtime::{CallOutcome, call};
 
-use crate::{HttpRequest, HttpRequestBody, HttpResponse, RequestChunkReply};
+use crate::{Http2ConnectionReply, HttpRequest, HttpRequestBody, HttpResponse, RequestChunkReply};
 use crate::{ResponseChunkMsg, ResponseChunkReply};
 
 const GRPC_FRAME_HEADER_LEN: usize = 5;
@@ -339,7 +339,7 @@ pub enum GrpcRouterMsg {
     Request(HttpRequest),
     RequestBodyChunk {
         id: u64,
-        outcome: CallOutcome<RequestChunkReply>,
+        outcome: CallOutcome<Http2ConnectionReply>,
     },
 }
 
@@ -475,7 +475,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
     fn handle_request_chunk(
         &mut self,
         id: u64,
-        outcome: CallOutcome<RequestChunkReply>,
+        outcome: CallOutcome<Http2ConnectionReply>,
     ) -> Effect<Self> {
         let Some(mut pending) = self.pending.remove(&id) else {
             return noop();
@@ -487,7 +487,9 @@ impl<S: Shard + 'static> GrpcRouter<S> {
             );
         };
         match outcome {
-            CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
+            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(
+                bytes,
+            ))) => {
                 pending.body.extend_from_slice(&bytes);
                 let source = stream.source;
                 let stream_id = stream.stream_id;
@@ -499,12 +501,15 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 )
                 .reply(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
             }
-            CallOutcome::Replied(RequestChunkReply::Eof) => {
+            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof)) => {
                 pending.request.body = HttpRequestBody::Buffered(pending.body);
                 let response = self.response_for(pending.request);
                 reply_to_request(pending.call, response)
             }
-            CallOutcome::Replied(RequestChunkReply::Error(_))
+            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
+                _,
+            )))
+            | CallOutcome::Replied(Http2ConnectionReply::Report(_))
             | CallOutcome::Full
             | CallOutcome::Closed
             | CallOutcome::Rejected(_)

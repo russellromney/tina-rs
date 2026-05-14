@@ -11,7 +11,11 @@
     over the HTTP/2 request pull path and returns one response;
   - unary route path preserved over the same HTTP/2 request pull path;
   - live tests for server-streaming messages/status and client-streaming
-    multiple request messages.
+    multiple request messages;
+  - hostile-review live tests for repeated server-streaming calls, mixed
+    server/client-streaming modes on one HTTP/2 connection, request-trailer
+    rejection, content-length overrun/underrun, and total body cap across
+    consumed chunks.
 - Still deferred in this branch:
   - true bidirectional streaming with independent request/response lifecycles;
   - tonic/grpcurl interop scripts;

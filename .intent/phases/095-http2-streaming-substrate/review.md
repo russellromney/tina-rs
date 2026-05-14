@@ -11,6 +11,25 @@ bidi. Build request and response streaming here.
 
 ## Findings
 
+### Fixed In Code Review: Report Calls Were Broken By Request Pulls
+
+The first implementation changed `Http2Connection`'s reply type to
+`RequestChunkReply`, which silently broke the existing `Report` call path.
+That was a bad substrate regression. The connection now replies with an
+explicit `Http2ConnectionReply` enum so request chunks and reports can coexist.
+
+### Fixed In Code Review: Request Trailers Were Fake EOF
+
+Trailing request HEADERS were being treated as clean end-of-stream for the
+streaming request path. That is a lie until real request-trailer semantics are
+implemented. The code now rejects trailing request HEADERS with stream reset.
+
+### Fixed In Code Review: Body Cap Counted Resident Bytes, Not Total Bytes
+
+The streaming request cap initially counted queued resident chunks. A fast
+consumer could drain chunks and let total request bytes exceed `max_body_bytes`.
+The cap now applies to total bytes received for the HTTP/2 stream.
+
 ### Superseded: Request Streaming Is Now Required
 
 The earlier review fixed an overclaim by allowing request streaming to be

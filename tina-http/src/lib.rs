@@ -124,9 +124,9 @@ pub use grpc::{
     decode_streaming_request, decode_unary_request, encode_grpc_message, grpc_unary_call_h2c,
 };
 pub use http2::{
-    Http2Connection, Http2ConnectionMsg, Http2ConnectionReport, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig, Http2StreamReport,
-    Http2StreamState,
+    Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
+    Http2Listener, Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig,
+    Http2StreamReport, Http2StreamState,
 };
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,

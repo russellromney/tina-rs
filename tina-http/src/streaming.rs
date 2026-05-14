@@ -164,7 +164,7 @@ pub struct Http2RequestStream {
     /// Declared `Content-Length` if one arrived. HTTP/2 does not require it.
     pub content_length: Option<usize>,
     /// Chunk source — the HTTP/2 connection isolate.
-    pub source: Address<crate::Http2ConnectionMsg, RequestChunkReply>,
+    pub source: Address<crate::Http2ConnectionMsg, crate::Http2ConnectionReply>,
 }
 
 /// Iterator-backed chunk source for the response side. Wraps any

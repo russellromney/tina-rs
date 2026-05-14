@@ -13,6 +13,9 @@
   - HTTP/2 request body pull source for gRPC-dispatched streams;
   - unary gRPC now exercises the HTTP/2 request pull path when request HEADERS
     and DATA arrive separately.
+  - hostile-review fixes for request-trailer rejection, content-length
+    overrun/underrun, total request body cap across consumed chunks, and
+    preserved connection report replies.
 - Still deferred in this branch:
   - generic non-gRPC HTTP/2 request-stream opt-in API;
   - full request-trailer support; request trailers are not a compatibility
