@@ -20,6 +20,13 @@
   - health/readiness endpoints;
   - richer bounded room report counters and high-water fields;
   - CI-short load/churn/shutdown proof.
+  - bounded single-room lifecycle for `default`:
+    `POST /rooms/default` creates/reopens, `DELETE /rooms/default` deletes and
+    closes current members, idle expiry deletes an empty room through a
+    Tina-owned timer, and deleted rooms reject new upgrades until recreated;
+  - public session reports include last close code and close reason byte count;
+  - browser `wss://` smoke now asserts the served report path and browser close
+    event instead of skipping TLS report proof.
 - Checks run for this implementation slice:
   - `cargo fmt --all --check`;
   - `cargo test -p tina-http websocket --tests`;
@@ -115,7 +122,7 @@ Required session report fields:
 - queued outbound bytes;
 - active write bytes if tracked;
 - last pressure reason;
-- last close code/reason class.
+- last close code and bounded reason byte count.
 
 Required room/server report fields:
 
@@ -139,11 +146,11 @@ copyable.
 
 Required:
 
-- bounded room registry;
+- bounded room registry: one named room, `default`, with explicit capacity `1`;
 - bounded members per room;
 - join and leave;
-- room create/delete;
-- idle room expiry through Tina-owned timer policy;
+- room create/delete via `POST /rooms/default` and `DELETE /rooms/default`;
+- idle room expiry through Tina-owned timer policy for empty active rooms;
 - graceful room drain;
 - listener shutdown rejects new rooms and drains existing rooms;
 - health/readiness endpoints distinguish accepting, draining, shutting down,

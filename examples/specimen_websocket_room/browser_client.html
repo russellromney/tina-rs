@@ -10,6 +10,7 @@ const log = document.getElementById("log");
 const scheme = location.protocol === "https:" ? "wss:" : "ws:";
 const ws = new WebSocket(`${scheme}//${location.host}/room`, ["tina.room.v1"]);
 ws.binaryType = "arraybuffer";
+let closed = false;
 
 function line(text) {
   log.textContent += `${text}\n`;
@@ -26,6 +27,10 @@ ws.addEventListener("message", (event) => {
     line(event.data);
   } else {
     line(`binary:${event.data.byteLength}`);
+    if (!closed) {
+      closed = true;
+      ws.close(1000, "done");
+    }
   }
 });
 

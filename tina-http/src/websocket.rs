@@ -445,6 +445,8 @@ pub struct WebSocketSessionReport {
     pub queued_outbound_bytes: usize,
     pub pending_write_bytes: usize,
     pub last_pressure: Option<WebSocketError>,
+    pub last_close_code: Option<WebSocketCloseCode>,
+    pub last_close_reason_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -35,22 +35,24 @@ async function stopServer(child) {
   }
 }
 
-async function proveBrowserRoom(page, server, scheme, checkReport = true) {
+async function proveBrowserRoom(page, server, scheme) {
   await page.goto(`${scheme}://${server.addr}/`);
   const log = page.locator("#log");
   await expect(log).toContainText("open:tina.room.v1");
   await expect(log).toContainText(/^join:/m);
   await expect(log).toContainText("binary:3");
+  await expect(log).toContainText(/^close:/m);
 
-  if (!checkReport) {
-    return;
-  }
-  const report = await page.request.get(`${scheme}://${server.addr}/room-report`);
-  expect(report.ok()).toBeTruthy();
-  const body = await report.json();
+  const response = await page.evaluate(async () => {
+    const report = await fetch("/room-report");
+    return { ok: report.ok, body: await report.json() };
+  });
+  expect(response.ok).toBeTruthy();
+  const body = response.body;
   expect(body.joined).toBe(1);
-  expect(body.live_members).toBe(1);
+  expect(body.live_members).toBe(0);
   expect(body.selected_subprotocol_seen).toBe(true);
+  expect(body.peer_close_seen).toBe(true);
 }
 
 test("browser ws page opens, sends, receives, and reports", async ({ page }) => {
@@ -67,7 +69,7 @@ test("browser wss page opens, sends, receives, and reports", async ({ browser })
   const page = await context.newPage();
   const server = await startServer(true);
   try {
-    await proveBrowserRoom(page, server, "https", false);
+    await proveBrowserRoom(page, server, "https");
   } finally {
     await stopServer(server.child);
     await context.close();

@@ -84,3 +84,17 @@ Those belong in the roadmap follow-up, not as quiet stretch promises here.
 - Finding: Load proof could grow one result per message. Fixed by adding a
   CI-short churn test that asserts aggregate high-water and rejection counters
   only.
+- Finding: The room lifecycle was still too report-shaped: `room_capacity` was
+  visible, but create/delete/idle expiry were not explicit enough. Fixed by
+  making the specimen a one-room bounded registry with `POST /rooms/default`,
+  `DELETE /rooms/default`, idle expiry of empty rooms through a Tina timer, and
+  e2e tests proving delete rejects, create refills, and idle expiry rejects
+  until recreate.
+- Finding: The public session report API exposed useful queue/close state but
+  did not carry the last close code/reason shape. Fixed by adding
+  `last_close_code` and `last_close_reason_bytes` to
+  `WebSocketSessionReport`; this stays bounded and avoids a close-event log.
+- Finding: The browser `wss://` proof skipped `/room-report`. Fixed by fetching
+  the report from inside the TLS-loaded browser page, then asserting selected
+  subprotocol, close event, peer close, and live-member drain for both `ws://`
+  and `wss://`.

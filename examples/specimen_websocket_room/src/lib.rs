@@ -15,7 +15,8 @@ use tina_http::{
     WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+    ThreadedRuntimeConfig, sleep,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -151,15 +152,18 @@ struct Gateway {
     limits: WebSocketLimits,
     admission: AdmissionPolicy,
     report: Arc<SharedReport>,
+    room_active: bool,
+    idle_room_expiry: Duration,
+    idle_generation: u64,
 }
 
 impl Isolate for Gateway {
     tina::isolate_types! {
         message: HttpRequest,
         reply: HttpResponse,
-        send: tina::Outbound<Infallible>,
+        send: tina::Outbound<WebSocketSessionMsg>,
         spawn: Infallible,
-        call: Infallible,
+        call: RuntimeCall<HttpRequest>,
         shard: DemoShard,
     }
 
@@ -168,17 +172,48 @@ impl Isolate for Gateway {
         request: HttpRequest,
         _ctx: &mut Context<'_, DemoShard, Self::Reply>,
     ) -> Effect<Self> {
-        reply(self.response_for(request))
+        if let Some(generation) = idle_generation_from_path(&request.path) {
+            return self.handle_idle_deadline(generation);
+        }
+        let is_delete = request.method == Method::DELETE && request.path == "/rooms/default";
+        let is_create = request.method == Method::POST && request.path == "/rooms/default";
+        let response = self.response_for(request);
+        if is_delete {
+            batch(vec![reply(response), self.room_delete_effect()])
+        } else if is_create {
+            batch(vec![reply(response), self.room_create_effect()])
+        } else {
+            reply(response)
+        }
     }
 
     fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
-        call.reply(self.response_for(request))
+        if let Some(generation) = idle_generation_from_path(&request.path) {
+            return batch(vec![
+                self.handle_idle_deadline(generation),
+                call.reply(HttpResponse::with_body(http::StatusCode::OK, Vec::new())),
+            ]);
+        }
+        let is_delete = request.method == Method::DELETE && request.path == "/rooms/default";
+        let is_create = request.method == Method::POST && request.path == "/rooms/default";
+        let response = self.response_for(request);
+        let mut effects = vec![call.reply(response), self.arm_idle_deadline()];
+        if is_delete {
+            effects.push(self.room_delete_effect());
+        } else if is_create {
+            effects.push(self.room_create_effect());
+        }
+        batch(effects)
     }
 }
 
 impl Gateway {
-    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+    fn response_for(&mut self, request: HttpRequest) -> HttpResponse {
         if request.method == Method::GET && request.path == "/room" {
+            if !self.room_active || self.report.snapshot().active_rooms == 0 {
+                self.report.update(|r| r.rejected_shutdown += 1);
+                return HttpResponse::service_unavailable();
+            }
             if !self.admission.origin_allowed(&request) {
                 self.report.update(|r| r.rejected_origin += 1);
                 return HttpResponse::with_body(http::StatusCode::FORBIDDEN, b"bad origin".to_vec());
@@ -213,8 +248,20 @@ impl Gateway {
                 Ok(upgrade) => HttpResponse::websocket(upgrade.accept(self.room, self.limits)),
                 Err(_) => HttpResponse::bad_request(),
             }
+        } else if request.method == Method::POST && request.path == "/rooms/default" {
+            self.room_active = true;
+            self.report.update(|r| {
+                r.active_rooms = 1;
+                r.room_high_water = r.room_high_water.max(1);
+                r.shutdown_started = false;
+            });
+            HttpResponse::with_body(http::StatusCode::CREATED, b"created".to_vec())
+        } else if request.method == Method::DELETE && request.path == "/rooms/default" {
+            self.delete_room();
+            HttpResponse::with_body(http::StatusCode::OK, b"deleted".to_vec())
         } else if request.method == Method::GET && request.path == "/" {
-            let mut response = HttpResponse::with_body(http::StatusCode::OK, BROWSER_CLIENT.as_bytes().to_vec());
+            let mut response =
+                HttpResponse::with_body(http::StatusCode::OK, BROWSER_CLIENT.as_bytes().to_vec());
             response.headers.insert(
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("text/html; charset=utf-8"),
@@ -243,9 +290,72 @@ impl Gateway {
             HttpResponse::not_found()
         }
     }
+
+    fn delete_room(&mut self) {
+        if !self.room_active {
+            return;
+        }
+        self.room_active = false;
+        self.report.update(|r| {
+            r.active_rooms = 0;
+            r.shutdown_started = true;
+        });
+    }
+
+    fn room_delete_effect(&self) -> Effect<Self> {
+        send(
+            self.room,
+            WebSocketSessionMsg::Shutdown {
+                code: Some(WebSocketCloseCode(1001)),
+                reason: b"room delete".to_vec(),
+            },
+        )
+    }
+
+    fn room_create_effect(&self) -> Effect<Self> {
+        send(
+            self.room,
+            WebSocketSessionMsg::Text(ROOM_CREATE_CONTROL.to_string()),
+        )
+    }
+
+    fn arm_idle_deadline(&mut self) -> Effect<Self> {
+        if !self.room_active || self.idle_room_expiry.is_zero() {
+            return noop();
+        }
+        self.idle_generation = self.idle_generation.saturating_add(1);
+        let generation = self.idle_generation;
+        sleep(self.idle_room_expiry).reply(move |_| idle_deadline_request(generation))
+    }
+
+    fn handle_idle_deadline(&mut self, generation: u64) -> Effect<Self> {
+        if generation == self.idle_generation
+            && self.room_active
+            && self.report.snapshot().live_members == 0
+        {
+            self.delete_room();
+        }
+        noop()
+    }
+}
+
+fn idle_deadline_request(generation: u64) -> HttpRequest {
+    HttpRequest {
+        method: Method::GET,
+        path: format!("/__idle_expire/{generation}"),
+        version: http::Version::HTTP_11,
+        headers: http::HeaderMap::new(),
+        body: tina_http::HttpRequestBody::Buffered(Vec::new()),
+    }
+}
+
+fn idle_generation_from_path(path: &str) -> Option<u64> {
+    path.strip_prefix("/__idle_expire/")?.parse().ok()
 }
 
 const BROWSER_CLIENT: &str = include_str!("../browser_client.html");
+const ROOM_CREATE_CONTROL: &str = "__room_create__";
+const ROOM_IDLE_EXPIRE_CONTROL: &str = "__room_idle_expire__:";
 
 #[derive(Debug, Clone, Default)]
 pub struct AdmissionPolicy {
@@ -293,11 +403,14 @@ impl AdmissionPolicy {
 struct Room {
     members: BTreeMap<WebSocketSessionId, WebSocketSessionHandle>,
     member_capacity: usize,
+    idle_room_expiry: Duration,
+    idle_generation: u64,
     report: Arc<SharedReport>,
     first_closed: Option<WebSocketSessionId>,
     stale_probe: Option<WebSocketSessionHandle>,
     pending_stale_probe: Option<WebSocketSessionId>,
     shutting_down: bool,
+    deleting: bool,
 }
 
 impl Isolate for Room {
@@ -328,9 +441,45 @@ impl Isolate for Room {
 }
 
 impl Room {
+    fn after_possible_leave(&mut self, removed_member: bool) -> Effect<Self> {
+        if removed_member && self.members.is_empty() {
+            self.arm_idle_expiry()
+        } else {
+            reply(WebSocketSessionOutcome::None)
+        }
+    }
+
+    fn arm_idle_expiry(&mut self) -> Effect<Self> {
+        if self.idle_room_expiry.is_zero() {
+            return reply(WebSocketSessionOutcome::None);
+        }
+        self.idle_generation = self.idle_generation.saturating_add(1);
+        let generation = self.idle_generation;
+        sleep(self.idle_room_expiry).reply(move |_| {
+            WebSocketSessionMsg::Text(format!("{ROOM_IDLE_EXPIRE_CONTROL}{generation}"))
+        })
+    }
+
+    fn expire_idle_room(&mut self, generation: &str) -> bool {
+        let Ok(generation) = generation.parse::<u64>() else {
+            return false;
+        };
+        if generation != self.idle_generation || !self.members.is_empty() {
+            return true;
+        }
+        self.shutting_down = true;
+        self.deleting = false;
+        self.report.update(|r| {
+            r.active_rooms = 0;
+            r.shutdown_started = true;
+        });
+        true
+    }
+
     fn handle_room_msg(&mut self, msg: WebSocketSessionMsg) -> Effect<Self> {
         match msg {
             WebSocketSessionMsg::SessionOpen { session } => {
+                self.idle_generation = self.idle_generation.saturating_add(1);
                 let session_id = session.session_id();
                 if self.shutting_down {
                     self.report.update(|r| r.rejected_shutdown += 1);
@@ -456,6 +605,7 @@ impl Room {
                         }
                     }
                 });
+                let mut removed_member = false;
                 if outcome.result.is_err() && !stale_probe {
                     if let Some(handle) = self.members.remove(&outcome.session)
                         && self.stale_probe.is_none()
@@ -463,12 +613,13 @@ impl Room {
                         self.stale_probe = Some(handle);
                     }
                     self.first_closed = Some(outcome.session);
+                    removed_member = true;
                     self.report.update(|r| {
                         r.left += 1;
                         r.live_members = self.members.len();
                     });
                 }
-                reply(WebSocketSessionOutcome::None)
+                self.after_possible_leave(removed_member)
             }
             WebSocketSessionMsg::SessionReport(outcome) => {
                 self.report.update(|r| match outcome.result {
@@ -488,7 +639,9 @@ impl Room {
                 reply(WebSocketSessionOutcome::None)
             }
             WebSocketSessionMsg::Shutdown { code, reason } => {
+                let room_delete = reason.as_slice() == b"room delete";
                 self.shutting_down = true;
+                self.deleting = room_delete;
                 let effects = self
                     .members
                     .values()
@@ -502,6 +655,10 @@ impl Room {
                     r.shutdown_close_requested += effects.len();
                 });
                 if effects.is_empty() {
+                    if self.deleting {
+                        self.shutting_down = false;
+                        self.deleting = false;
+                    }
                     reply(WebSocketSessionOutcome::None)
                 } else {
                     batch(effects)
@@ -509,10 +666,12 @@ impl Room {
             }
             WebSocketSessionMsg::SessionClose { session_id, .. }
             | WebSocketSessionMsg::SessionClosed { session_id, .. } => {
+                let mut removed_member = false;
                 if let Some(handle) = self.members.remove(&session_id)
                     && self.stale_probe.is_none()
                 {
                     self.stale_probe = Some(handle);
+                    removed_member = true;
                 }
                 self.first_closed = Some(session_id);
                 self.report.update(|r| {
@@ -520,16 +679,22 @@ impl Room {
                     r.live_members = self.members.len();
                     r.peer_close_seen = true;
                 });
-                reply(WebSocketSessionOutcome::None)
+                if self.deleting && self.members.is_empty() {
+                    self.shutting_down = false;
+                    self.deleting = false;
+                }
+                self.after_possible_leave(removed_member)
             }
             WebSocketSessionMsg::SessionPressure {
                 session_id,
                 error: error @ (WebSocketError::PeerClosed | WebSocketError::Closing),
             } => {
+                let mut removed_member = false;
                 if let Some(handle) = self.members.remove(&session_id)
                     && self.stale_probe.is_none()
                 {
                     self.stale_probe = Some(handle);
+                    removed_member = true;
                 }
                 self.first_closed = Some(session_id);
                 self.report.update(|r| {
@@ -544,7 +709,11 @@ impl Room {
                         _ => {}
                     }
                 });
-                reply(WebSocketSessionOutcome::None)
+                if self.deleting && self.members.is_empty() {
+                    self.shutting_down = false;
+                    self.deleting = false;
+                }
+                self.after_possible_leave(removed_member)
             }
             WebSocketSessionMsg::SessionPressure { error, .. } => {
                 self.report.update(|r| match error {
@@ -564,6 +733,24 @@ impl Room {
             }
             WebSocketSessionMsg::Close(_, _) => {
                 self.report.update(|r| r.peer_close_seen = true);
+                reply(WebSocketSessionOutcome::None)
+            }
+            WebSocketSessionMsg::Text(text) if text == ROOM_CREATE_CONTROL => {
+                self.shutting_down = false;
+                self.deleting = false;
+                self.idle_generation = self.idle_generation.saturating_add(1);
+                self.report.update(|r| {
+                    r.active_rooms = 1;
+                    r.shutdown_started = false;
+                });
+                reply(WebSocketSessionOutcome::None)
+            }
+            WebSocketSessionMsg::Text(text)
+                if text.strip_prefix(ROOM_IDLE_EXPIRE_CONTROL).is_some() =>
+            {
+                if let Some(generation) = text.strip_prefix(ROOM_IDLE_EXPIRE_CONTROL) {
+                    self.expire_idle_room(generation);
+                }
                 reply(WebSocketSessionOutcome::None)
             }
             WebSocketSessionMsg::Open
@@ -600,6 +787,7 @@ pub struct RoomServerConfig {
     pub limits: WebSocketLimits,
     pub room_capacity: usize,
     pub member_capacity: usize,
+    pub idle_room_expiry: Duration,
     pub admission: AdmissionPolicy,
     pub room_mailbox_capacity: usize,
     pub gateway_mailbox_capacity: usize,
@@ -618,6 +806,7 @@ impl Default for RoomServerConfig {
             },
             room_capacity: 1,
             member_capacity: 3,
+            idle_room_expiry: Duration::from_secs(60),
             admission: AdmissionPolicy::default(),
             room_mailbox_capacity: 16,
             gateway_mailbox_capacity: 16,
@@ -633,6 +822,10 @@ impl RoomServer {
     }
 
     pub fn start_with(config: RoomServerConfig) -> Self {
+        assert_eq!(
+            config.room_capacity, 1,
+            "specimen_websocket_room supports one bounded named room"
+        );
         let report = Arc::new(SharedReport::default());
         report.update(|r| {
             r.active_rooms = 1;
@@ -654,22 +847,28 @@ impl RoomServer {
                 Room {
                     members: BTreeMap::new(),
                     member_capacity: config.member_capacity,
+                    idle_room_expiry: config.idle_room_expiry,
+                    idle_generation: 0,
                     report: report.clone(),
                     first_closed: None,
                     stale_probe: None,
                     pending_stale_probe: None,
                     shutting_down: false,
+                    deleting: false,
                 },
                 config.room_mailbox_capacity,
             )
             .expect("register room");
         let gateway = runtime
-            .register_with_capacity::<Gateway, Infallible>(
+            .register_with_capacity::<Gateway, WebSocketSessionMsg>(
                 Gateway {
                     room,
                     limits: config.limits,
                     admission: config.admission.clone(),
                     report: report.clone(),
+                    room_active: true,
+                    idle_room_expiry: config.idle_room_expiry,
+                    idle_generation: 0,
                 },
                 config.gateway_mailbox_capacity,
             )
@@ -751,6 +950,10 @@ impl TlsRoomServer {
     }
 
     pub fn start_with(config: RoomServerConfig) -> Self {
+        assert_eq!(
+            config.room_capacity, 1,
+            "specimen_websocket_room supports one bounded named room"
+        );
         let generated = generate_identity();
         let report = Arc::new(SharedReport::default());
         report.update(|r| {
@@ -773,22 +976,28 @@ impl TlsRoomServer {
                 Room {
                     members: BTreeMap::new(),
                     member_capacity: config.member_capacity,
+                    idle_room_expiry: config.idle_room_expiry,
+                    idle_generation: 0,
                     report: report.clone(),
                     first_closed: None,
                     stale_probe: None,
                     pending_stale_probe: None,
                     shutting_down: false,
+                    deleting: false,
                 },
                 config.room_mailbox_capacity,
             )
             .expect("register tls room");
         let gateway = runtime
-            .register_with_capacity::<Gateway, Infallible>(
+            .register_with_capacity::<Gateway, WebSocketSessionMsg>(
                 Gateway {
                     room,
                     limits: config.limits,
                     admission: config.admission,
                     report: report.clone(),
+                    room_active: true,
+                    idle_room_expiry: config.idle_room_expiry,
+                    idle_generation: 0,
                 },
                 config.gateway_mailbox_capacity,
             )
@@ -1204,6 +1413,57 @@ mod tests {
     }
 
     #[test]
+    fn room_delete_rejects_new_upgrades_then_create_allows_refill() {
+        let _guard = test_guard();
+        let server = crate::RoomServer::start();
+        let url = format!("ws://{}/room", server.addr());
+        let mut client = connect_room(url.as_str());
+        assert!(client.read().expect("join").is_text());
+
+        let deleted = http_request(server.addr(), "DELETE", "/rooms/default");
+        assert!(deleted.starts_with("HTTP/1.1 200"), "{deleted}");
+        assert!(client.read().expect("delete close").is_close());
+        let report = server.wait_until(Duration::from_secs(2), |r| {
+            r.active_rooms == 0 && r.live_members == 0
+        });
+        assert_eq!(report.active_rooms, 0, "{report:?}");
+        assert!(connect(url.as_str()).is_err(), "deleted room must reject upgrade");
+
+        let created = http_request(server.addr(), "POST", "/rooms/default");
+        assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+        let mut refill = connect_room(url.as_str());
+        assert!(refill.read().expect("refill join").is_text());
+        let report = server.wait_until(Duration::from_secs(2), |r| r.active_rooms == 1);
+        assert_eq!(report.active_rooms, 1, "{report:?}");
+        let _ = refill.close(None);
+        let _ = server.stop();
+    }
+
+    #[test]
+    fn idle_room_expiry_rejects_until_room_is_created_again() {
+        let _guard = test_guard();
+        let server = crate::RoomServer::start_with(crate::RoomServerConfig {
+            idle_room_expiry: Duration::from_millis(20),
+            ..Default::default()
+        });
+        let url = format!("ws://{}/room", server.addr());
+        let mut before_idle = connect_room(url.as_str());
+        assert!(before_idle.read().expect("join before idle").is_text());
+        before_idle.close(None).expect("close before idle");
+        assert!(before_idle.read().expect("close reply").is_close());
+        let report = server.wait_until(Duration::from_secs(2), |r| r.active_rooms == 0);
+        assert_eq!(report.active_rooms, 0, "{report:?}");
+
+        assert!(connect(url.as_str()).is_err(), "expired room must reject upgrade");
+        let created = http_request(server.addr(), "POST", "/rooms/default");
+        assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+        let mut client = connect_room(url.as_str());
+        assert!(client.read().expect("join after idle create").is_text());
+        let _ = client.close(None);
+        let _ = server.stop();
+    }
+
+    #[test]
     fn shutdown_during_broadcast_closes_clients_without_hanging() {
         let _guard = test_guard();
         let server = crate::RoomServer::start();
@@ -1405,6 +1665,12 @@ mod tests {
         fn start() -> Self {
             let generated = generate_identity();
             let report = std::sync::Arc::new(crate::SharedReport::default());
+            report.update(|r| {
+                r.active_rooms = 1;
+                r.room_capacity = 1;
+                r.member_capacity = 3;
+                r.room_high_water = 1;
+            });
             let limits = WebSocketLimits::default();
             let runtime = ThreadedRuntime::with_config(
                 crate::DemoShard,
@@ -1420,22 +1686,28 @@ mod tests {
                     crate::Room {
                         members: std::collections::BTreeMap::new(),
                         member_capacity: 3,
+                        idle_room_expiry: Duration::from_secs(60),
+                        idle_generation: 0,
                         report: report.clone(),
                         first_closed: None,
                         stale_probe: None,
                         pending_stale_probe: None,
                         shutting_down: false,
+                        deleting: false,
                     },
                     16,
                 )
                 .expect("register room");
             let gateway = runtime
-                .register_with_capacity::<crate::Gateway, Infallible>(
+                .register_with_capacity::<crate::Gateway, tina_http::WebSocketSessionMsg>(
                     crate::Gateway {
                         room,
                         limits,
                         admission: crate::AdmissionPolicy::default(),
                         report: report.clone(),
+                        room_active: true,
+                        idle_room_expiry: Duration::from_secs(60),
+                        idle_generation: 0,
                     },
                     16,
                 )
@@ -1518,11 +1790,15 @@ mod tests {
     }
 
     fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        http_request(addr, "GET", path)
+    }
+
+    fn http_request(addr: std::net::SocketAddr, method: &str, path: &str) -> String {
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
         .expect("write request");
         let mut bytes = Vec::new();

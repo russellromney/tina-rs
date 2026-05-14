@@ -86,6 +86,8 @@ struct WebSocketState {
     ping_generation: u64,
     awaiting_pong_generation: Option<u64>,
     last_pressure: Option<WebSocketError>,
+    last_close_code: Option<WebSocketCloseCode>,
+    last_close_reason_bytes: usize,
 }
 
 struct WebSocketFragment {
@@ -116,6 +118,8 @@ impl WebSocketState {
             ping_generation: 0,
             awaiting_pong_generation: None,
             last_pressure: None,
+            last_close_code: None,
+            last_close_reason_bytes: 0,
         }
     }
 }
@@ -1541,6 +1545,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         if let Some(ws) = self.websocket.as_mut() {
                             ws.close_received = true;
                             ws.close_sent = true;
+                            ws.last_close_code = code;
+                            ws.last_close_reason_bytes = reason.len();
                         }
                         batch(vec![
                             self.call_websocket_app_many(vec![
@@ -1713,6 +1719,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let mut encoded = Vec::new();
         let mut new_bytes = 0usize;
         for message in outcome_messages(outcome) {
+            if let WebSocketMessage::Close(code, reason) = &message
+                && let Some(ws) = self.websocket.as_mut()
+            {
+                ws.last_close_code = *code;
+                ws.last_close_reason_bytes = reason.len();
+            }
             let is_close = matches!(message, WebSocketMessage::Close(_, _));
             let is_ping = matches!(message, WebSocketMessage::Ping(_));
             let bytes = match encode_server_message(message) {
@@ -1815,6 +1827,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 queued_outbound_bytes: ws.outbound.queued_bytes(),
                 pending_write_bytes: ws.pending_write.len(),
                 last_pressure: ws.last_pressure.clone(),
+                last_close_code: ws.last_close_code,
+                last_close_reason_bytes: ws.last_close_reason_bytes,
             }),
         }
     }
@@ -1834,6 +1848,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
         let is_close = matches!(send.message, WebSocketMessage::Close(_, _));
         let is_ping = matches!(send.message, WebSocketMessage::Ping(_));
+        if let WebSocketMessage::Close(code, reason) = &send.message
+            && let Some(ws) = self.websocket.as_mut()
+        {
+            ws.last_close_code = *code;
+            ws.last_close_reason_bytes = reason.len();
+        }
         let bytes = encode_server_message(send.message)?;
         if !self.websocket_can_accept_app_output(1, bytes.len()) {
             return Err(if self.websocket_frame_slots_available() < 1 {
