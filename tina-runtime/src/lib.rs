@@ -1133,6 +1133,7 @@ where
                         message.message,
                         &mut self.shard,
                         isolate_id,
+                        self.entries[index].generation,
                         caller,
                         now,
                     ),
@@ -1140,6 +1141,7 @@ where
                         message.message,
                         &mut self.shard,
                         isolate_id,
+                        self.entries[index].generation,
                         None,
                         now,
                     ),
@@ -3818,6 +3820,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: Option<MessageCaller>,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F>;
@@ -3827,6 +3830,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: MessageCaller,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F>;
@@ -3910,6 +3914,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: Option<MessageCaller>,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
@@ -3918,7 +3923,9 @@ where
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
+                .with_now(now);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }
@@ -3933,6 +3940,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: MessageCaller,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
@@ -3942,6 +3950,7 @@ where
 
         let effect = {
             let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
                 .with_now(now)
                 .with_caller(caller);
             self.isolate.handle_call(*message, CallContext::new(ctx))
@@ -3976,6 +3985,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: Option<MessageCaller>,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
@@ -3984,7 +3994,9 @@ where
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
+                .with_now(now);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }
@@ -3999,6 +4011,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: MessageCaller,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
@@ -4008,6 +4021,7 @@ where
 
         let effect = {
             let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
                 .with_now(now)
                 .with_caller(caller);
             self.isolate.handle_call(*message, CallContext::new(ctx))

@@ -486,6 +486,7 @@ impl Isolate for ChunkedRequestConsumer {
                     self.pending_source = Some(stream.source);
                     reply(HttpResponse::internal_error())
                 }
+                HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
             },
             ChunkedRequestMsg::ChunkArrived(request, outcome) => match outcome {
                 CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
@@ -508,6 +509,7 @@ impl Isolate for ChunkedRequestConsumer {
                     )
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
                 | CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)
@@ -541,6 +543,7 @@ impl Isolate for ChunkedRequestConsumer {
                     )
                     .then_with_request(request, ChunkedRequestMsg::ChunkArrived)
                 }
+                HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
             },
             ChunkedRequestMsg::ChunkArrived(_, _) => {
                 call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)

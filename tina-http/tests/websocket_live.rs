@@ -1,17 +1,24 @@
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::Method;
+use rustls::pki_types::ServerName;
 use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
-    HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, WebSocketCloseCode, WebSocketError,
+    HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg,
+    HttpsReady, HttpsServerConfig, TlsServerIdentity, WebSocketCloseCode, WebSocketError,
     WebSocketLimits, WebSocketMessage, WebSocketSessionMsg, WebSocketSessionOutcome,
     websocket_upgrade,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+};
+
+const TEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 struct TestShard;
@@ -55,6 +62,17 @@ impl Gateway {
     fn response_for(&self, request: HttpRequest) -> HttpResponse {
         if request.method == Method::GET && request.path == "/ws" {
             match websocket_upgrade(&request, self.limits) {
+                Ok(upgrade)
+                    if upgrade
+                        .offered_subprotocols()
+                        .iter()
+                        .any(|protocol| protocol == "chat.v1") =>
+                {
+                    match upgrade.accept_subprotocol(self.ws_app, self.limits, "chat.v1") {
+                        Ok(accept) => HttpResponse::websocket(accept),
+                        Err(_) => HttpResponse::bad_request(),
+                    }
+                }
                 Ok(upgrade) => HttpResponse::websocket(upgrade.accept(self.ws_app, self.limits)),
                 Err(_) => HttpResponse::bad_request(),
             }
@@ -127,9 +145,17 @@ impl WsEcho {
             WebSocketSessionMsg::Pressure(_) | WebSocketSessionMsg::Closed(_) => {
                 WebSocketSessionOutcome::None
             }
-            WebSocketSessionMsg::Open | WebSocketSessionMsg::Ping(_) => {
-                WebSocketSessionOutcome::None
-            }
+            WebSocketSessionMsg::Open
+            | WebSocketSessionMsg::SessionAccepted { .. }
+            | WebSocketSessionMsg::SessionOpen { .. }
+            | WebSocketSessionMsg::SessionText { .. }
+            | WebSocketSessionMsg::SessionBinary { .. }
+            | WebSocketSessionMsg::SessionClose { .. }
+            | WebSocketSessionMsg::SessionPressure { .. }
+            | WebSocketSessionMsg::SessionClosed { .. }
+            | WebSocketSessionMsg::SendOutcome(_)
+            | WebSocketSessionMsg::Shutdown { .. }
+            | WebSocketSessionMsg::Ping(_) => WebSocketSessionOutcome::None,
         }
     }
 }
@@ -138,6 +164,50 @@ struct Harness {
     addr: SocketAddr,
     runtime: Option<ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>>,
     listener: Address<HttpListenerMsg>,
+}
+
+struct GeneratedIdentity {
+    identity: TlsServerIdentity,
+    cert_der: Vec<u8>,
+}
+
+fn generate_identity() -> GeneratedIdentity {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-sign");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+    let identity = TlsServerIdentity::from_der(vec![cert_der.clone()], key_der);
+    GeneratedIdentity { identity, cert_der }
+}
+
+fn rustls_client(
+    addr: SocketAddr,
+    root_cert_der: Vec<u8>,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(root_cert_der))
+        .expect("add root");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("localhost").expect("server name");
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), server_name).expect("client connection");
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("tcp connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("write timeout");
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    while stream.conn.is_handshaking() {
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .expect("client handshake");
+    }
+    stream
 }
 
 impl Harness {
@@ -190,33 +260,12 @@ impl Drop for Harness {
 }
 
 fn connect_ws(addr: SocketAddr) -> TcpStream {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    let mut stream = TcpStream::connect_timeout(&addr, TEST_IO_TIMEOUT).expect("connect");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(TEST_IO_TIMEOUT))
         .expect("read timeout");
-    stream
-        .write_all(
-            b"GET /ws HTTP/1.1\r\n\
-              Host: x\r\n\
-              Upgrade: websocket\r\n\
-              Connection: Upgrade\r\n\
-              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-              Sec-WebSocket-Version: 13\r\n\r\n",
-        )
-        .expect("write upgrade");
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).expect("read head");
-        head.push(byte[0]);
-    }
-    let text = String::from_utf8(head).expect("utf8 head");
-    assert!(text.starts_with("HTTP/1.1 101"), "{text}");
-    assert!(
-        text.to_ascii_lowercase()
-            .contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=\r\n"),
-        "{text}"
-    );
+    write_upgrade(&mut stream);
+    read_upgrade_response(&mut stream);
     stream
 }
 
@@ -240,6 +289,11 @@ fn masked_frame_with_first_byte(first: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+fn masked_fragment(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let first = if fin { 0x80 | opcode } else { opcode };
+    masked_frame_with_first_byte(first, payload)
+}
+
 fn unmasked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = vec![0x80 | opcode];
     if payload.len() < 126 {
@@ -252,7 +306,21 @@ fn unmasked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+fn read_upgrade_head(stream: &mut impl Read) -> String {
+    let mut bytes = Vec::new();
+    let mut b = [0u8; 1];
+    while !bytes.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut b).unwrap();
+        bytes.push(b[0]);
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
 fn read_server_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    read_server_frame_from(stream)
+}
+
+fn read_server_frame_from(stream: &mut impl Read) -> (u8, Vec<u8>) {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).expect("read frame head");
     assert_eq!(head[1] & 0x80, 0, "server frames must be unmasked");
@@ -266,6 +334,35 @@ fn read_server_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
     let mut payload = vec![0; len];
     stream.read_exact(&mut payload).expect("read payload");
     (opcode, payload)
+}
+
+fn write_upgrade(stream: &mut impl Write) {
+    stream
+        .write_all(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: x\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .expect("write upgrade");
+}
+
+fn read_upgrade_response(stream: &mut impl Read) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("read head");
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8(head).expect("utf8 head");
+    assert!(text.starts_with("HTTP/1.1 101"), "{text}");
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=\r\n"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -290,7 +387,7 @@ fn websocket_bad_upgrade_headers_reject() {
 }
 
 #[test]
-fn websocket_unsupported_extension_rejects() {
+fn websocket_extension_offer_is_ignored() {
     let harness = Harness::start(WebSocketLimits::default());
     let mut stream = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).unwrap();
     stream
@@ -299,6 +396,49 @@ fn websocket_unsupported_extension_rejects() {
     stream
         .write_all(
             b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+        )
+        .unwrap();
+    let head = read_upgrade_head(&mut stream);
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(
+        !head
+            .to_ascii_lowercase()
+            .contains("sec-websocket-extensions"),
+        "{head}"
+    );
+}
+
+#[test]
+fn websocket_subprotocol_selection_is_returned() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat.v0, chat.v1\r\n\r\n",
+        )
+        .unwrap();
+    let head = read_upgrade_head(&mut stream);
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("sec-websocket-protocol: chat.v1"),
+        "{head}"
+    );
+}
+
+#[test]
+fn websocket_invalid_subprotocol_offer_rejects() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat.v1, chat.v1\r\n\r\n",
         )
         .unwrap();
     let mut response = String::new();
@@ -314,6 +454,87 @@ fn websocket_text_and_binary_echo_work() {
     assert_eq!(read_server_frame(&mut stream), (0x1, b"hello".to_vec()));
     stream.write_all(&masked_frame(0x2, b"\x01\x02")).unwrap();
     assert_eq!(read_server_frame(&mut stream), (0x2, vec![1, 2]));
+}
+
+#[test]
+fn websocket_fragmented_text_reassembles_with_interleaved_ping() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = connect_ws(harness.addr);
+    stream
+        .write_all(&masked_fragment(false, 0x1, b"hel"))
+        .unwrap();
+    stream.write_all(&masked_frame(0x9, b"mid")).unwrap();
+    assert_eq!(read_server_frame(&mut stream), (0xA, b"mid".to_vec()));
+    stream
+        .write_all(&masked_fragment(true, 0x0, b"lo"))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut stream), (0x1, b"hello".to_vec()));
+}
+
+#[test]
+fn websocket_fragmented_binary_reassembles() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = connect_ws(harness.addr);
+    stream
+        .write_all(&masked_fragment(false, 0x2, &[1, 2]))
+        .unwrap();
+    stream
+        .write_all(&masked_fragment(false, 0x0, &[3]))
+        .unwrap();
+    stream
+        .write_all(&masked_fragment(true, 0x0, &[4, 5]))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut stream), (0x2, vec![1, 2, 3, 4, 5]));
+}
+
+#[test]
+fn websocket_tls_text_and_ping_work() {
+    let GeneratedIdentity { identity, cert_der } = generate_identity();
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let limits = WebSocketLimits::default();
+    let ws_app = runtime
+        .register_with_capacity::<WsEcho, Infallible>(WsEcho, 16)
+        .expect("register ws app");
+    let gateway = runtime
+        .register_with_capacity::<Gateway, Infallible>(Gateway { ws_app, limits }, 16)
+        .expect("register gateway");
+    let listener_isolate = HttpsListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        gateway,
+        HttpsServerConfig::dev(identity),
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register https listener");
+    let ready = match runtime
+        .call_blocking(listener, HttpsListenerMsg::Start, Duration::from_secs(5))
+        .expect("start call runs")
+    {
+        CallOutcome::Replied(Ok(HttpsReady { local_addr })) => local_addr,
+        other => panic!("expected TLS listener ready, got {other:?}"),
+    };
+
+    let mut stream = rustls_client(ready, cert_der);
+    write_upgrade(&mut stream);
+    stream.flush().expect("flush upgrade");
+    read_upgrade_response(&mut stream);
+    stream.write_all(&masked_frame(0x1, b"tls")).unwrap();
+    stream.flush().unwrap();
+    assert_eq!(read_server_frame_from(&mut stream), (0x1, b"tls".to_vec()));
+    stream.write_all(&masked_frame(0x9, b"abc")).unwrap();
+    stream.flush().unwrap();
+    assert_eq!(read_server_frame_from(&mut stream), (0xA, b"abc".to_vec()));
+
+    let _ = runtime.try_send(listener, HttpsListenerMsg::Stop);
+    let _ = runtime.shutdown();
 }
 
 #[test]
@@ -350,6 +571,43 @@ fn websocket_control_frame_rules_are_enforced() {
         .write_all(&masked_frame(0x9, &[b'x'; 126]))
         .unwrap();
     assert_eq!(read_server_frame(&mut oversized_ping).0, 0x8);
+}
+
+#[test]
+fn websocket_malformed_fragmentation_rejects() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut continuation_without_start = connect_ws(harness.addr);
+    continuation_without_start
+        .write_all(&masked_fragment(true, 0x0, b"bad"))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut continuation_without_start).0, 0x8);
+
+    let mut nested_data_fragment = connect_ws(harness.addr);
+    nested_data_fragment
+        .write_all(&masked_fragment(false, 0x1, b"one"))
+        .unwrap();
+    nested_data_fragment
+        .write_all(&masked_fragment(false, 0x2, b"two"))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut nested_data_fragment).0, 0x8);
+}
+
+#[test]
+fn websocket_fragmented_message_cap_is_enforced() {
+    let limits = WebSocketLimits {
+        max_frame_bytes: 64,
+        max_message_bytes: 4,
+        ..Default::default()
+    };
+    let harness = Harness::start(limits);
+    let mut stream = connect_ws(harness.addr);
+    stream
+        .write_all(&masked_fragment(false, 0x1, b"ab"))
+        .unwrap();
+    stream
+        .write_all(&masked_fragment(true, 0x0, b"cde"))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut stream).0, 0x8);
 }
 
 #[test]

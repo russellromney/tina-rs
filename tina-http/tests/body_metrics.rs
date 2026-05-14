@@ -60,7 +60,7 @@ impl EchoLen {
     fn response_for(request: HttpRequest) -> HttpResponse {
         let n = match request.body {
             HttpRequestBody::Buffered(b) => b.len(),
-            HttpRequestBody::Stream(_) => 0,
+            HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => 0,
         };
         HttpResponse::with_text(StatusCode::OK, n.to_string())
     }
@@ -448,6 +448,7 @@ impl Isolate for StreamingConsumer {
                     self.pending_source = Some(stream.source);
                     reply(HttpResponse::internal_error())
                 }
+                HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
                 HttpRequestBody::Buffered(b) => {
                     reply(HttpResponse::with_text(StatusCode::OK, b.len().to_string()))
                 }
@@ -471,6 +472,7 @@ impl Isolate for StreamingConsumer {
                     )
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
                 | CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)
@@ -496,6 +498,7 @@ impl Isolate for StreamingConsumer {
                     )
                     .then_with_request(request, StreamMsg::ChunkArrived)
                 }
+                HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
                 HttpRequestBody::Buffered(b) => {
                     call_ctx.reply(HttpResponse::with_text(StatusCode::OK, b.len().to_string()))
                 }

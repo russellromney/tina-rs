@@ -199,7 +199,11 @@ wrapper if it is genuinely simpler.
 Required builder families:
 
 - isolate call: `call(addr, msg, timeout)`;
+<<<<<<< HEAD
 - cancelable isolate call: `call_cancelable(addr, msg, timeout)`;
+=======
+- isolate call with handle: `call_with_handle(addr, msg, timeout)`;
+>>>>>>> origin/main
 - observed send: `send_observed(addr, msg)`;
 - typed runtime call: `sleep`, TCP/TLS/file/process/DNS/etc. typed calls.
 
@@ -317,9 +321,13 @@ Add focused runtime tests from a user's point of view:
 - plain `work.then(...)` inside `handle_call` still produces
   `ReplyAbandoned` if `CallContext` is not consumed, while the ordinary
   continuation still runs;
+<<<<<<< HEAD
 - `call_ctx.defer_cancelable(call_cancelable(...)).reply(...)` returns a
   pending token plus effect, replies on worker return, and still answers the
   original caller on explicit cancel;
+=======
+- `call_with_handle` returns the handle and preserves request context;
+>>>>>>> origin/main
 - `send_observed` accepted and full paths preserve request context;
 - typed runtime-call success and typed `CallError` paths preserve request
   context;
@@ -353,7 +361,11 @@ Migrate one small and one real-ish specimen:
 
 Optional:
 
+<<<<<<< HEAD
 - `specimen_cancellation_chain` if `call_cancelable` or typed sleep
+=======
+- `specimen_cancellation_chain` if `call_with_handle` or typed sleep
+>>>>>>> origin/main
   coverage benefits from a real cancellation example.
 
 Do not migrate every `.reply(...)` in examples. The goal is vocabulary proof,

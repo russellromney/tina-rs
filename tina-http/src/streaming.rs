@@ -120,6 +120,8 @@ pub enum RequestChunkReply {
     /// Read failed mid-body. Distinct from `Eof` so the service
     /// can tell clean short delivery from truncation.
     Error(tina_runtime::CallError),
+    /// Reply to a call-shaped WebSocket session-handle send.
+    WebSocketSend(crate::websocket::WebSocketSendOutcome),
 }
 
 /// A streaming request body: declared length plus a source isolate.
@@ -150,6 +152,21 @@ pub struct RequestStream {
     pub chunked: bool,
     /// Chunk source — the connection isolate.
     pub source: Address<crate::HttpConnectionMsg, RequestChunkReply>,
+}
+
+/// HTTP/2 streaming request body source.
+///
+/// The HTTP/2 connection isolate owns the socket and flow-control windows.
+/// Services pull chunks through this handle; the connection returns stream and
+/// connection window credit only after a chunk is delivered or discarded.
+#[derive(Debug, Clone)]
+pub struct Http2RequestStream {
+    /// HTTP/2 stream id.
+    pub stream_id: u32,
+    /// Declared `Content-Length` if one arrived. HTTP/2 does not require it.
+    pub content_length: Option<usize>,
+    /// Chunk source — the HTTP/2 connection isolate.
+    pub source: Address<crate::Http2ConnectionMsg, crate::Http2ConnectionReply>,
 }
 
 /// Iterator-backed chunk source for the response side. Wraps any

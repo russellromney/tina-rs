@@ -79,7 +79,8 @@ impl Counter {
             (Method::POST, "/echo") => {
                 let body_bytes = match request.body {
                     tina_http::HttpRequestBody::Buffered(b) => b,
-                    tina_http::HttpRequestBody::Stream(_) => Vec::new(),
+                    tina_http::HttpRequestBody::Stream(_)
+                    | tina_http::HttpRequestBody::Http2Stream(_) => Vec::new(),
                 };
                 HttpResponse::with_body(StatusCode::OK, body_bytes)
             }

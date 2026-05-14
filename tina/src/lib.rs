@@ -864,6 +864,7 @@ where
 {
     shard: &'a mut S,
     current_isolate: IsolateId,
+    current_generation: AddressGeneration,
     caller: Option<MessageCaller>,
     /// Runtime/sim-stamped current time. `None` for hand-built contexts
     /// in tests that do not exercise time. Calls to [`Context::now`] or
@@ -897,10 +898,18 @@ where
         Self {
             shard,
             current_isolate,
+            current_generation: AddressGeneration::new(0),
             caller: None,
             now: None,
             _reply: PhantomData,
         }
+    }
+
+    /// Attach the current isolate generation. Runtime-only constructor.
+    #[doc(hidden)]
+    pub fn with_current_generation(mut self, generation: AddressGeneration) -> Self {
+        self.current_generation = generation;
+        self
     }
 
     /// Attach the current message's caller. Runtime-only constructor.
@@ -1068,7 +1077,11 @@ where
 
     /// Builds an [`Address`] for the currently executing isolate.
     pub fn me<M>(&self) -> Address<M> {
-        Address::new(self.shard_id(), self.current_isolate)
+        Address::new_with_generation(
+            self.shard_id(),
+            self.current_isolate,
+            self.current_generation,
+        )
     }
 
     /// Returns an effect that sends one message back to the current isolate.
@@ -1165,7 +1178,11 @@ where
 
     /// Builds an [`Address`] for the currently executing isolate.
     pub fn me(&self) -> Address<I::Message, I::Reply> {
-        Address::new(self.shard_id(), self.ctx.isolate_id()).with_reply::<I::Reply>()
+        Address::<I::Message, I::Reply>::new_with_generation(
+            self.shard_id(),
+            self.ctx.isolate_id(),
+            self.ctx.current_generation,
+        )
     }
 
     /// Returns an effect that sends one message back to the current isolate.

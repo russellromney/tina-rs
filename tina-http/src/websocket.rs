@@ -5,25 +5,29 @@
 //! connection isolate after a successful `101 Switching Protocols`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
-use http::header::{CONNECTION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, UPGRADE};
+use http::header::{CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, UPGRADE};
 use http::{HeaderMap, Method};
 use sha1::{Digest, Sha1};
-use tina::Address;
+use tina::{Address, Effect, Isolate};
+use tina_runtime::{CallOutcome, RuntimeCall, call};
 
+use crate::connection::HttpConnectionMsg;
+use crate::streaming::RequestChunkReply;
 use crate::types::HttpRequest;
 
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Capacity and timer knobs for one upgraded WebSocket session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebSocketLimits {
     /// Largest payload accepted in one data frame.
     pub max_frame_bytes: usize,
-    /// Largest complete message. First form rejects fragmentation, so
-    /// this usually equals `max_frame_bytes`.
+    /// Largest complete message, including bounded fragmented reassembly.
     pub max_message_bytes: usize,
     /// Largest resident read buffer before the peer is closed.
     pub read_buffer_high_water: usize,
@@ -69,6 +73,8 @@ pub enum WebSocketError {
     InvalidKey,
     UnsupportedVersion,
     UnsupportedExtension,
+    UnsupportedSubprotocol,
+    InvalidSubprotocol,
     FrameTooLarge,
     MessageTooLarge,
     ReadBufferTooLarge,
@@ -85,13 +91,154 @@ pub enum WebSocketError {
     PeerClosed,
     ProtocolError,
     Timeout,
+    StaleSession,
+    Closing,
 }
+
+/// Stable identity for one WebSocket session incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WebSocketSessionId {
+    id: u64,
+    generation: u64,
+}
+
+impl WebSocketSessionId {
+    pub(crate) fn new(generation: u64) -> Self {
+        Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            generation,
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.id
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Cloneable bounded send handle for one WebSocket session incarnation.
+///
+/// The handle targets the connection isolate that owns the upgraded stream.
+/// Sends are ordinary Tina messages back to that owner; the handle never owns
+/// a writer and never keeps a closed session alive.
+#[derive(Debug, Clone, Copy)]
+pub struct WebSocketSessionHandle {
+    session_id: WebSocketSessionId,
+    target: Address<HttpConnectionMsg, RequestChunkReply>,
+}
+
+impl WebSocketSessionHandle {
+    pub(crate) fn new(
+        session_id: WebSocketSessionId,
+        target: Address<HttpConnectionMsg, RequestChunkReply>,
+    ) -> Self {
+        Self { session_id, target }
+    }
+
+    pub const fn session_id(self) -> WebSocketSessionId {
+        self.session_id
+    }
+
+    pub const fn target(self) -> Address<HttpConnectionMsg, RequestChunkReply> {
+        self.target
+    }
+
+    pub fn send(self, message: WebSocketMessage) -> HttpConnectionMsg {
+        HttpConnectionMsg::WebSocketSend(WebSocketSend {
+            session: self.session_id,
+            message,
+        })
+    }
+
+    pub fn text(self, text: impl Into<String>) -> HttpConnectionMsg {
+        self.send(WebSocketMessage::Text(text.into()))
+    }
+
+    pub fn binary(self, bytes: impl Into<Vec<u8>>) -> HttpConnectionMsg {
+        self.send(WebSocketMessage::Binary(bytes.into()))
+    }
+
+    pub fn close(
+        self,
+        code: Option<WebSocketCloseCode>,
+        reason: impl Into<Vec<u8>>,
+    ) -> HttpConnectionMsg {
+        self.send(WebSocketMessage::Close(code, reason.into()))
+    }
+
+    /// Build the public bounded send call for this session.
+    ///
+    /// The call routes through the connection isolate that owns the upgraded
+    /// stream and translates runtime `Full` / `Closed` / `Timeout` plus
+    /// session-owner admission into [`WebSocketSessionMsg::SendOutcome`].
+    pub fn send_effect<
+        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+    >(
+        self,
+        message: WebSocketMessage,
+        timeout: Duration,
+    ) -> Effect<I> {
+        let session = self.session_id;
+        call(self.target, self.send(message), timeout).then(move |outcome| {
+            WebSocketSessionMsg::SendOutcome(WebSocketSendOutcome::from_connection_call(
+                session, outcome,
+            ))
+        })
+    }
+
+    pub fn text_effect<
+        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+    >(
+        self,
+        text: impl Into<String>,
+        timeout: Duration,
+    ) -> Effect<I> {
+        self.send_effect(WebSocketMessage::Text(text.into()), timeout)
+    }
+
+    pub fn binary_effect<
+        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+    >(
+        self,
+        bytes: impl Into<Vec<u8>>,
+        timeout: Duration,
+    ) -> Effect<I> {
+        self.send_effect(WebSocketMessage::Binary(bytes.into()), timeout)
+    }
+
+    pub fn close_effect<
+        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+    >(
+        self,
+        code: Option<WebSocketCloseCode>,
+        reason: impl Into<Vec<u8>>,
+        timeout: Duration,
+    ) -> Effect<I> {
+        self.send_effect(WebSocketMessage::Close(code, reason.into()), timeout)
+    }
+}
+
+impl PartialEq for WebSocketSessionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.target.shard() == other.target.shard()
+            && self.target.isolate() == other.target.isolate()
+            && self.target.generation() == other.target.generation()
+    }
+}
+
+impl Eq for WebSocketSessionHandle {}
 
 /// Validated upgrade request. Convert it to [`WebSocketAccept`] once
 /// the app session address and limits are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSocketUpgradeRequest {
     accept_key: String,
+    offered_subprotocols: Vec<String>,
+    extension_offers: Vec<String>,
 }
 
 impl WebSocketUpgradeRequest {
@@ -102,13 +249,47 @@ impl WebSocketUpgradeRequest {
     ) -> WebSocketAccept {
         WebSocketAccept {
             accept_key: self.accept_key,
+            selected_subprotocol: None,
             app,
             limits,
         }
     }
 
+    pub fn accept_subprotocol(
+        &self,
+        app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
+        limits: WebSocketLimits,
+        subprotocol: impl Into<String>,
+    ) -> Result<WebSocketAccept, WebSocketError> {
+        let subprotocol = subprotocol.into();
+        if !is_subprotocol_token(&subprotocol) {
+            return Err(WebSocketError::InvalidSubprotocol);
+        }
+        if !self
+            .offered_subprotocols
+            .iter()
+            .any(|offered| offered == &subprotocol)
+        {
+            return Err(WebSocketError::UnsupportedSubprotocol);
+        }
+        Ok(WebSocketAccept {
+            accept_key: self.accept_key.clone(),
+            selected_subprotocol: Some(subprotocol),
+            app,
+            limits,
+        })
+    }
+
     pub fn accept_key(&self) -> &str {
         &self.accept_key
+    }
+
+    pub fn offered_subprotocols(&self) -> &[String] {
+        &self.offered_subprotocols
+    }
+
+    pub fn extension_offers(&self) -> &[String] {
+        &self.extension_offers
     }
 }
 
@@ -117,6 +298,7 @@ impl WebSocketUpgradeRequest {
 #[derive(Debug, Clone)]
 pub struct WebSocketAccept {
     accept_key: String,
+    selected_subprotocol: Option<String>,
     pub(crate) app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
     pub(crate) limits: WebSocketLimits,
 }
@@ -124,6 +306,10 @@ pub struct WebSocketAccept {
 impl WebSocketAccept {
     pub fn accept_key(&self) -> &str {
         &self.accept_key
+    }
+
+    pub fn selected_subprotocol(&self) -> Option<&str> {
+        self.selected_subprotocol.as_deref()
     }
 
     pub fn app(&self) -> Address<WebSocketSessionMsg, WebSocketSessionOutcome> {
@@ -139,12 +325,49 @@ impl WebSocketAccept {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebSocketSessionMsg {
     Open,
+    SessionOpen {
+        session: WebSocketSessionHandle,
+    },
+    SessionAccepted {
+        session_id: WebSocketSessionId,
+        selected_subprotocol: Option<String>,
+    },
+    SessionText {
+        session_id: WebSocketSessionId,
+        text: String,
+    },
+    SessionBinary {
+        session_id: WebSocketSessionId,
+        bytes: Vec<u8>,
+    },
+    SessionClose {
+        session_id: WebSocketSessionId,
+        code: Option<WebSocketCloseCode>,
+        reason: Vec<u8>,
+    },
+    SessionPressure {
+        session_id: WebSocketSessionId,
+        error: WebSocketError,
+    },
+    SessionClosed {
+        session_id: WebSocketSessionId,
+        error: WebSocketError,
+    },
     Text(String),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close(Option<WebSocketCloseCode>, Vec<u8>),
     Pressure(WebSocketError),
+    SendOutcome(WebSocketSendOutcome),
+    /// App/admin message for production-shaped room shutdown. Tina's
+    /// connection owner never emits this variant; room code may send it
+    /// to its own WebSocket app isolate to close every stored session
+    /// through the ordinary bounded handle path.
+    Shutdown {
+        code: Option<WebSocketCloseCode>,
+        reason: Vec<u8>,
+    },
     Closed(WebSocketError),
 }
 
@@ -167,6 +390,63 @@ pub enum WebSocketMessage {
     Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close(Option<WebSocketCloseCode>, Vec<u8>),
+}
+
+/// Admission request routed through the session owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSend {
+    pub session: WebSocketSessionId,
+    pub message: WebSocketMessage,
+}
+
+/// Result of a public handle send after the connection owner evaluates
+/// session identity, close state, frame count, and byte budgets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSendOutcome {
+    pub session: WebSocketSessionId,
+    pub result: Result<(), WebSocketSendError>,
+}
+
+/// Public send-admission failures. These are intentionally narrower than
+/// protocol close reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketSendError {
+    Stale,
+    Closing,
+    Closed,
+    OutboundQueueFull,
+    OutboundBytesFull,
+    Protocol,
+    Timeout,
+}
+
+impl From<WebSocketError> for WebSocketSendError {
+    fn from(value: WebSocketError) -> Self {
+        match value {
+            WebSocketError::StaleSession => Self::Stale,
+            WebSocketError::Closing => Self::Closing,
+            WebSocketError::PeerClosed => Self::Closed,
+            WebSocketError::OutboundQueueFull => Self::OutboundQueueFull,
+            WebSocketError::OutboundBytesFull => Self::OutboundBytesFull,
+            _ => Self::Protocol,
+        }
+    }
+}
+
+impl WebSocketSendOutcome {
+    pub fn from_connection_call(
+        session: WebSocketSessionId,
+        outcome: CallOutcome<RequestChunkReply>,
+    ) -> Self {
+        let result = match outcome {
+            CallOutcome::Replied(RequestChunkReply::WebSocketSend(outcome)) => outcome.result,
+            CallOutcome::Replied(_) => Err(WebSocketSendError::Protocol),
+            CallOutcome::Full => Err(WebSocketSendError::OutboundQueueFull),
+            CallOutcome::Closed | CallOutcome::Rejected(_) => Err(WebSocketSendError::Closed),
+            CallOutcome::Timeout => Err(WebSocketSendError::Timeout),
+        };
+        Self { session, result }
+    }
 }
 
 /// Close code wrapper. Keeps raw code visible while avoiding a large
@@ -264,9 +544,8 @@ pub fn websocket_upgrade(
         Some(version) if version.as_bytes() == b"13" => {}
         _ => return Err(WebSocketError::UnsupportedVersion),
     }
-    if request.headers.contains_key(SEC_WEBSOCKET_EXTENSIONS) {
-        return Err(WebSocketError::UnsupportedExtension);
-    }
+    let offered_subprotocols = parse_subprotocol_headers(&request.headers)?;
+    let extension_offers = parse_extension_offers(&request.headers);
     let key = request
         .headers
         .get(SEC_WEBSOCKET_KEY)
@@ -280,6 +559,8 @@ pub fn websocket_upgrade(
     }
     Ok(WebSocketUpgradeRequest {
         accept_key: websocket_accept_key(key),
+        offered_subprotocols,
+        extension_offers,
     })
 }
 
@@ -298,6 +579,63 @@ fn websocket_accept_key(key: &str) -> String {
     hasher.update(WEBSOCKET_GUID);
     let digest = hasher.finalize();
     base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
+fn parse_subprotocol_headers(headers: &HeaderMap) -> Result<Vec<String>, WebSocketError> {
+    let mut out = Vec::new();
+    for value in headers.get_all(SEC_WEBSOCKET_PROTOCOL) {
+        let value = value
+            .to_str()
+            .map_err(|_| WebSocketError::InvalidSubprotocol)?;
+        for part in value.split(',') {
+            let token = part.trim();
+            if token.is_empty() || !is_subprotocol_token(token) {
+                return Err(WebSocketError::InvalidSubprotocol);
+            }
+            if out.iter().any(|existing| existing == token) {
+                return Err(WebSocketError::InvalidSubprotocol);
+            }
+            out.push(token.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+fn parse_extension_offers(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all("sec-websocket-extensions")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(',').map(str::trim))
+        .filter(|offer| !offer.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn is_subprotocol_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.bytes().all(|b| {
+            matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
 }
 
 pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> FrameParse {
@@ -351,9 +689,6 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     if is_control && !fin {
         return FrameParse::Error(WebSocketError::ControlFrameFragmented);
     }
-    if !fin {
-        return FrameParse::Error(WebSocketError::FragmentationUnsupported);
-    }
     if len > limits.max_frame_bytes {
         return FrameParse::Error(WebSocketError::FrameTooLarge);
     }
@@ -376,7 +711,11 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     }
     buf.drain(..offset + len);
     match opcode {
-        0x0 => FrameParse::Error(WebSocketError::FragmentationUnsupported),
+        0x0 => FrameParse::Frame(WebSocketFrame {
+            fin,
+            opcode,
+            payload,
+        }),
         0x1 | 0x2 | 0x8 | 0x9 | 0xA => FrameParse::Frame(WebSocketFrame {
             fin,
             opcode,
@@ -475,5 +814,41 @@ mod tests {
             queue.push(vec![1, 2, 3, 4, 5]),
             Err(WebSocketError::OutboundBytesFull)
         );
+    }
+
+    #[test]
+    fn session_handle_carries_session_and_address_generation() {
+        let session = WebSocketSessionId {
+            id: 7,
+            generation: 3,
+        };
+        let target = Address::<HttpConnectionMsg, RequestChunkReply>::new_with_generation(
+            tina::ShardId::new(1),
+            tina::IsolateId::new(2),
+            tina::AddressGeneration::new(9),
+        );
+        let handle = WebSocketSessionHandle::new(session, target);
+        assert_eq!(handle.session_id(), session);
+        assert_eq!(handle.target().generation().get(), 9);
+        match handle.text("hello") {
+            HttpConnectionMsg::WebSocketSend(send) => {
+                assert_eq!(send.session, session);
+                assert_eq!(send.message, WebSocketMessage::Text("hello".to_owned()));
+            }
+            other => panic!("expected WebSocketSend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_session_ids_are_distinct_from_refill_sessions() {
+        let stale = WebSocketSessionId {
+            id: 1,
+            generation: 0,
+        };
+        let refill = WebSocketSessionId {
+            id: 2,
+            generation: 0,
+        };
+        assert_ne!(stale, refill);
     }
 }

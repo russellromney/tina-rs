@@ -57,22 +57,28 @@ use crate::transport::HttpTransport;
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError};
 use crate::websocket::{
     FrameParse, WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketMessage,
-    WebSocketOutboundQueue, WebSocketSessionMsg, WebSocketSessionOutcome, decode_close_payload,
-    encode_server_message, outcome_messages, parse_client_frame,
+    WebSocketOutboundQueue, WebSocketSend, WebSocketSendError, WebSocketSendOutcome,
+    WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome,
+    decode_close_payload, encode_server_message, outcome_messages, parse_client_frame,
 };
 
 /// Bytes the connection isolate asks for per `tcp_read`. Bounded so a
 /// single read does not pull more than this into the runtime, regardless
 /// of what the kernel has buffered.
 const READ_CHUNK: usize = 4096;
+const WEBSOCKET_PENDING_APP_MSG_CAP: usize = 4;
 
 struct WebSocketState {
+    session_id: WebSocketSessionId,
+    selected_subprotocol: Option<String>,
     app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
     limits: crate::websocket::WebSocketLimits,
     read_buf: Vec<u8>,
+    fragmented_message: Option<WebSocketFragment>,
     outbound: WebSocketOutboundQueue,
     pending_write: Vec<u8>,
     post_write_app: Option<WebSocketSessionMsg>,
+    pending_app_msgs: std::collections::VecDeque<WebSocketSessionMsg>,
     close_sent: bool,
     close_received: bool,
     close_generation: u64,
@@ -80,19 +86,28 @@ struct WebSocketState {
     awaiting_pong_generation: Option<u64>,
 }
 
+struct WebSocketFragment {
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
 impl WebSocketState {
-    fn new(accept: WebSocketAccept) -> Self {
+    fn new(accept: WebSocketAccept, generation: tina::AddressGeneration) -> Self {
         let limits = accept.limits();
         Self {
+            session_id: WebSocketSessionId::new(generation.get()),
+            selected_subprotocol: accept.selected_subprotocol().map(ToOwned::to_owned),
             app: accept.app(),
             limits,
             read_buf: Vec::new(),
+            fragmented_message: None,
             outbound: WebSocketOutboundQueue::new(
                 limits.outbound_frame_queue_capacity,
                 limits.max_queued_outbound_bytes,
             ),
             pending_write: Vec::new(),
             post_write_app: None,
+            pending_app_msgs: std::collections::VecDeque::new(),
             close_sent: false,
             close_received: false,
             close_generation: 0,
@@ -135,6 +150,8 @@ pub enum HttpConnectionMsg {
     Closed(Result<(), CallError>),
     /// App reply to one WebSocket session event.
     WebSocketAppReturned(CallOutcome<WebSocketSessionOutcome>),
+    /// Public bounded send request routed through the connection/session owner.
+    WebSocketSend(WebSocketSend),
     /// Close-handshake timer for an upgraded WebSocket session.
     WebSocketCloseDeadline {
         generation: u64,
@@ -264,6 +281,7 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     // the typed self-address for streaming-body dispatch.
     self_shard_id: Option<tina::ShardId>,
     self_isolate_id: Option<tina::IsolateId>,
+    self_generation: Option<tina::AddressGeneration>,
 
     // Whether the connection should close after the current response.
     // Set on parse error, on service-call failure (Full/Closed/Timeout
@@ -379,6 +397,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             inbound_chunked: false,
             self_shard_id: None,
             self_isolate_id: None,
+            self_generation: None,
             will_close: false,
             request_generation: 0,
             head_deadline_armed: true,
@@ -410,8 +429,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         // Capture self-identity once. Used by the streaming-request
         // dispatch path to hand the service a typed self-address.
         if self.self_isolate_id.is_none() {
-            self.self_shard_id = Some(ctx.shard_id());
-            self.self_isolate_id = Some(ctx.isolate_id());
+            let me = ctx
+                .me::<HttpConnectionMsg>()
+                .with_reply::<RequestChunkReply>();
+            self.self_shard_id = Some(me.shard());
+            self.self_isolate_id = Some(me.isolate());
+            self.self_generation = Some(me.generation());
         }
         match msg {
             HttpConnectionMsg::Begin => self.start(),
@@ -469,6 +492,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpConnectionMsg::WebSocketAppReturned(outcome) => {
                 self.handle_websocket_app_outcome(outcome)
             }
+            HttpConnectionMsg::WebSocketSend(send) => self.handle_websocket_send(send),
             HttpConnectionMsg::WebSocketCloseDeadline { generation, .. } => {
                 self.handle_websocket_close_deadline(generation)
             }
@@ -480,8 +504,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
     fn handle_call(&mut self, msg: HttpConnectionMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         if self.self_isolate_id.is_none() {
-            self.self_shard_id = Some(call.shard_id());
-            self.self_isolate_id = Some(call.me().isolate());
+            let me = call.me();
+            self.self_shard_id = Some(me.shard());
+            self.self_isolate_id = Some(me.isolate());
+            self.self_generation = Some(me.generation());
         }
         match msg {
             HttpConnectionMsg::RequestBodyNext => {
@@ -490,6 +516,27 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 }
                 self.pending_request_body_reply = Some(call.into_request_context());
                 self.handle_request_body_next()
+            }
+            HttpConnectionMsg::WebSocketSend(send) => {
+                let session = send.session;
+                let result = self.admit_websocket_send(send);
+                let outcome = WebSocketSendOutcome {
+                    session,
+                    result: result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| WebSocketSendError::from(error.clone())),
+                };
+                let reply = call.reply(RequestChunkReply::WebSocketSend(outcome));
+                match result {
+                    Ok(write) => batch(vec![write, reply]),
+                    Err(
+                        WebSocketError::StaleSession
+                        | WebSocketError::Closing
+                        | WebSocketError::PeerClosed,
+                    ) => reply,
+                    Err(error) => batch(vec![reply, self.websocket_pressure_then_close(error)]),
+                }
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
@@ -1046,7 +1093,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             }
             HttpResponseBody::WebSocket(accept) => {
                 self.pending_response = head_bytes;
-                self.websocket = Some(WebSocketState::new(*accept));
+                let generation = self
+                    .self_generation
+                    .unwrap_or_else(|| tina::AddressGeneration::new(0));
+                self.websocket = Some(WebSocketState::new(*accept, generation));
                 self.websocket_upgrade_after_write = true;
                 self.write_pending()
             }
@@ -1386,7 +1436,24 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             }
             self.pending_response.clear();
             self.websocket_upgrade_after_write = false;
-            return self.call_websocket_app(WebSocketSessionMsg::Open);
+            let Some(handle) = self.websocket_handle() else {
+                return self.begin_close();
+            };
+            let Some((session_id, selected_subprotocol)) = self
+                .websocket
+                .as_ref()
+                .map(|ws| (ws.session_id, ws.selected_subprotocol.clone()))
+            else {
+                return self.begin_close();
+            };
+            return self.call_websocket_app_many(vec![
+                WebSocketSessionMsg::SessionOpen { session: handle },
+                WebSocketSessionMsg::SessionAccepted {
+                    session_id,
+                    selected_subprotocol,
+                },
+                WebSocketSessionMsg::Open,
+            ]);
         }
 
         let Some(ws) = self.websocket.as_mut() else {
@@ -1400,6 +1467,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         if let Some(msg) = ws.post_write_app.take() {
             return self.call_websocket_app(msg);
         }
+        if let Some(msg) = ws.pending_app_msgs.pop_front() {
+            return self.call_websocket_app(msg);
+        }
         if ws.close_sent && ws.close_received {
             return self.begin_close();
         }
@@ -1411,8 +1481,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     fn handle_websocket_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
         if bytes.is_empty() {
+            let Some(session_id) = self.websocket.as_ref().map(|ws| ws.session_id) else {
+                return self.begin_close();
+            };
             return batch(vec![
-                self.call_websocket_app(WebSocketSessionMsg::Closed(WebSocketError::PeerClosed)),
+                self.call_websocket_app_many(vec![
+                    WebSocketSessionMsg::SessionClosed {
+                        session_id,
+                        error: WebSocketError::PeerClosed,
+                    },
+                    WebSocketSessionMsg::Closed(WebSocketError::PeerClosed),
+                ]),
                 self.begin_close(),
             ]);
         }
@@ -1427,20 +1506,23 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn handle_websocket_buffered_frame(&mut self) -> Effect<Self> {
-        let Some(ws) = self.websocket.as_mut() else {
-            return self.begin_close();
+        let parsed = {
+            let Some(ws) = self.websocket.as_mut() else {
+                return self.begin_close();
+            };
+            parse_client_frame(&mut ws.read_buf, ws.limits)
         };
-        match parse_client_frame(&mut ws.read_buf, ws.limits) {
+        match parsed {
             FrameParse::NeedMore => self.websocket_read_more(),
             FrameParse::Error(error) => self.websocket_protocol_close(error),
             FrameParse::Frame(frame) => match frame.opcode {
-                0x1 => match String::from_utf8(frame.payload) {
-                    Ok(text) => self.call_websocket_app(WebSocketSessionMsg::Text(text)),
-                    Err(_) => self.websocket_protocol_close(WebSocketError::ProtocolError),
-                },
-                0x2 => self.call_websocket_app(WebSocketSessionMsg::Binary(frame.payload)),
+                0x0..=0x2 => self.handle_websocket_data_frame(frame),
                 0x8 => match decode_close_payload(&frame.payload) {
                     Ok((code, reason)) => {
+                        let Some(session_id) = self.websocket.as_ref().map(|ws| ws.session_id)
+                        else {
+                            return self.begin_close();
+                        };
                         let close = WebSocketMessage::Close(code, reason.clone());
                         let bytes = match encode_server_message(close) {
                             Ok(bytes) => bytes,
@@ -1451,7 +1533,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                             ws.close_sent = true;
                         }
                         batch(vec![
-                            self.call_websocket_app(WebSocketSessionMsg::Close(code, reason)),
+                            self.call_websocket_app_many(vec![
+                                WebSocketSessionMsg::SessionClose {
+                                    session_id,
+                                    code,
+                                    reason: reason.clone(),
+                                },
+                                WebSocketSessionMsg::Close(code, reason),
+                            ]),
                             self.websocket_queue_or_write(bytes),
                         ])
                     }
@@ -1478,11 +1567,124 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
     }
 
+    fn handle_websocket_data_frame(
+        &mut self,
+        frame: crate::websocket::WebSocketFrame,
+    ) -> Effect<Self> {
+        match frame.opcode {
+            0x1 | 0x2 if frame.fin => self.deliver_websocket_message(frame.opcode, frame.payload),
+            0x1 | 0x2 => {
+                let Some(ws) = self.websocket.as_mut() else {
+                    return self.begin_close();
+                };
+                if ws.fragmented_message.is_some() {
+                    return self.websocket_protocol_close(WebSocketError::ProtocolError);
+                }
+                ws.fragmented_message = Some(WebSocketFragment {
+                    opcode: frame.opcode,
+                    payload: frame.payload,
+                });
+                self.websocket_continue_read()
+            }
+            0x0 => {
+                let complete = {
+                    let Some(ws) = self.websocket.as_mut() else {
+                        return self.begin_close();
+                    };
+                    let Some(fragment) = ws.fragmented_message.as_mut() else {
+                        return self.websocket_protocol_close(WebSocketError::ProtocolError);
+                    };
+                    let next_len = match fragment.payload.len().checked_add(frame.payload.len()) {
+                        Some(len) => len,
+                        None => {
+                            return self.websocket_protocol_close(WebSocketError::MessageTooLarge);
+                        }
+                    };
+                    if next_len > ws.limits.max_message_bytes {
+                        return self.websocket_protocol_close(WebSocketError::MessageTooLarge);
+                    }
+                    fragment.payload.extend_from_slice(&frame.payload);
+                    if frame.fin {
+                        ws.fragmented_message
+                            .take()
+                            .map(|fragment| (fragment.opcode, fragment.payload))
+                    } else {
+                        None
+                    }
+                };
+                match complete {
+                    Some((opcode, payload)) => self.deliver_websocket_message(opcode, payload),
+                    None => self.websocket_continue_read(),
+                }
+            }
+            _ => self.websocket_protocol_close(WebSocketError::ProtocolError),
+        }
+    }
+
+    fn deliver_websocket_message(&mut self, opcode: u8, payload: Vec<u8>) -> Effect<Self> {
+        match opcode {
+            0x1 => match String::from_utf8(payload) {
+                Ok(text) => {
+                    let Some(session_id) = self.websocket.as_ref().map(|ws| ws.session_id) else {
+                        return self.begin_close();
+                    };
+                    self.call_websocket_app_many(vec![
+                        WebSocketSessionMsg::SessionText {
+                            session_id,
+                            text: text.clone(),
+                        },
+                        WebSocketSessionMsg::Text(text),
+                    ])
+                }
+                Err(_) => self.websocket_protocol_close(WebSocketError::ProtocolError),
+            },
+            0x2 => {
+                let Some(session_id) = self.websocket.as_ref().map(|ws| ws.session_id) else {
+                    return self.begin_close();
+                };
+                self.call_websocket_app_many(vec![
+                    WebSocketSessionMsg::SessionBinary {
+                        session_id,
+                        bytes: payload.clone(),
+                    },
+                    WebSocketSessionMsg::Binary(payload),
+                ])
+            }
+            _ => self.websocket_protocol_close(WebSocketError::ProtocolError),
+        }
+    }
+
     fn call_websocket_app(&mut self, msg: WebSocketSessionMsg) -> Effect<Self> {
         let Some(ws) = self.websocket.as_ref() else {
             return self.begin_close();
         };
         call(ws.app, msg, self.service_call_timeout).then(HttpConnectionMsg::WebSocketAppReturned)
+    }
+
+    fn call_websocket_app_many(&mut self, mut msgs: Vec<WebSocketSessionMsg>) -> Effect<Self> {
+        if msgs.is_empty() {
+            return self.websocket_continue_read();
+        }
+        let first = msgs.remove(0);
+        if let Some(ws) = self.websocket.as_mut() {
+            if ws.pending_app_msgs.len().saturating_add(msgs.len()) > WEBSOCKET_PENDING_APP_MSG_CAP
+            {
+                return self.websocket_pressure_then_close(WebSocketError::AppMailboxFull);
+            }
+            ws.pending_app_msgs.extend(msgs);
+        }
+        self.call_websocket_app(first)
+    }
+
+    fn websocket_handle(&self) -> Option<WebSocketSessionHandle> {
+        let ws = self.websocket.as_ref()?;
+        let shard = self.self_shard_id?;
+        let isolate = self.self_isolate_id?;
+        let generation = self.self_generation?;
+        let target = Address::<HttpConnectionMsg, RequestChunkReply>::new_with_generation(
+            shard, isolate, generation,
+        );
+        Some(WebSocketSessionHandle::new(ws.session_id, target))
     }
 
     fn handle_websocket_app_outcome(
@@ -1539,9 +1741,69 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 .as_ref()
                 .is_none_or(|ws| ws.pending_write.is_empty())
         {
-            effects.push(self.websocket_continue_read());
+            if let Some(msg) = self
+                .websocket
+                .as_mut()
+                .and_then(|ws| ws.pending_app_msgs.pop_front())
+            {
+                effects.push(self.call_websocket_app(msg));
+            } else {
+                effects.push(self.websocket_continue_read());
+            }
         }
         batch(effects)
+    }
+
+    fn handle_websocket_send(&mut self, send: WebSocketSend) -> Effect<Self> {
+        let result = self.admit_websocket_send(send.clone());
+        let effect =
+            self.call_websocket_app(WebSocketSessionMsg::SendOutcome(WebSocketSendOutcome {
+                session: send.session,
+                result: result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| WebSocketSendError::from(error.clone())),
+            }));
+        match result {
+            Ok(write) => batch(vec![write, effect]),
+            Err(
+                WebSocketError::StaleSession | WebSocketError::Closing | WebSocketError::PeerClosed,
+            ) => effect,
+            Err(error) => batch(vec![effect, self.websocket_pressure_then_close(error)]),
+        }
+    }
+
+    fn admit_websocket_send(
+        &mut self,
+        send: WebSocketSend,
+    ) -> Result<Effect<Self>, WebSocketError> {
+        let Some(ws) = self.websocket.as_ref() else {
+            return Err(WebSocketError::PeerClosed);
+        };
+        if ws.session_id != send.session {
+            return Err(WebSocketError::StaleSession);
+        }
+        if ws.close_sent || ws.close_received {
+            return Err(WebSocketError::Closing);
+        }
+        let is_close = matches!(send.message, WebSocketMessage::Close(_, _));
+        let is_ping = matches!(send.message, WebSocketMessage::Ping(_));
+        let bytes = encode_server_message(send.message)?;
+        if !self.websocket_can_accept_app_output(1, bytes.len()) {
+            return Err(if self.websocket_frame_slots_available() < 1 {
+                WebSocketError::OutboundQueueFull
+            } else {
+                WebSocketError::OutboundBytesFull
+            });
+        }
+        let mut effects = Vec::new();
+        if is_close {
+            effects.push(self.arm_websocket_close_deadline());
+        } else if is_ping {
+            effects.push(self.arm_websocket_pong_deadline());
+        }
+        effects.push(self.websocket_queue_or_write(bytes));
+        Ok(batch(effects))
     }
 
     fn websocket_can_accept_app_output(&self, new_frames: usize, new_bytes: usize) -> bool {
@@ -1621,7 +1883,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn websocket_protocol_close(&mut self, error: WebSocketError) -> Effect<Self> {
-        let notify = self.call_websocket_app(WebSocketSessionMsg::Pressure(error));
+        let notify = match self.websocket.as_ref().map(|ws| ws.session_id) {
+            Some(session_id) => self.call_websocket_app_many(vec![
+                WebSocketSessionMsg::SessionPressure {
+                    session_id,
+                    error: error.clone(),
+                },
+                WebSocketSessionMsg::Pressure(error),
+            ]),
+            None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error)),
+        };
         match encode_server_message(WebSocketMessage::Close(
             Some(WebSocketCloseCode(1002)),
             Vec::new(),
@@ -1636,10 +1907,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn websocket_pressure_then_close(&mut self, error: WebSocketError) -> Effect<Self> {
-        batch(vec![
-            self.call_websocket_app(WebSocketSessionMsg::Pressure(error)),
-            self.begin_close(),
-        ])
+        let notify = match self.websocket.as_ref().map(|ws| ws.session_id) {
+            Some(session_id) => self.call_websocket_app_many(vec![
+                WebSocketSessionMsg::SessionPressure {
+                    session_id,
+                    error: error.clone(),
+                },
+                WebSocketSessionMsg::Pressure(error),
+            ]),
+            None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error)),
+        };
+        batch(vec![notify, self.begin_close()])
     }
 
     fn arm_websocket_close_deadline(&mut self) -> Effect<Self> {

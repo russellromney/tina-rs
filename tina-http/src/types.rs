@@ -43,6 +43,9 @@ pub enum HttpRequestBody {
     /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
     /// .then(...)` until `RequestChunkReply::Eof`.
     Stream(crate::streaming::RequestStream),
+    /// HTTP/2 streaming source. Services pull chunks via
+    /// `call(stream.source, crate::Http2ConnectionMsg::body_next(), t)`.
+    Http2Stream(crate::streaming::Http2RequestStream),
 }
 
 impl HttpRequestBody {
@@ -50,7 +53,7 @@ impl HttpRequestBody {
     pub fn as_buffered(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(bytes) => Some(bytes),
-            Self::Stream(_) => None,
+            Self::Stream(_) | Self::Http2Stream(_) => None,
         }
     }
 
@@ -66,6 +69,7 @@ impl HttpRequestBody {
                     Some(s.content_length)
                 }
             }
+            Self::Http2Stream(s) => s.content_length,
         }
     }
 
@@ -73,6 +77,7 @@ impl HttpRequestBody {
         match self {
             Self::Buffered(bytes) => !bytes.is_empty(),
             Self::Stream(s) => s.chunked || s.content_length > 0,
+            Self::Http2Stream(s) => s.content_length != Some(0),
         }
     }
 }
@@ -95,7 +100,7 @@ impl PartialEq<[u8]> for HttpRequestBody {
     fn eq(&self, other: &[u8]) -> bool {
         match self {
             Self::Buffered(bytes) => bytes == other,
-            Self::Stream(_) => false,
+            Self::Stream(_) | Self::Http2Stream(_) => false,
         }
     }
 }
@@ -355,6 +360,13 @@ impl HttpResponse {
             http::HeaderValue::from_str(accept.accept_key())
                 .expect("computed websocket accept key is header-safe"),
         );
+        if let Some(protocol) = accept.selected_subprotocol() {
+            response.headers.insert(
+                http::HeaderName::from_static("sec-websocket-protocol"),
+                http::HeaderValue::from_str(protocol)
+                    .expect("validated websocket subprotocol is header-safe"),
+            );
+        }
         response.body = HttpResponseBody::WebSocket(Box::new(accept));
         response
     }

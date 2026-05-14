@@ -2,13 +2,23 @@
 
 ## Status
 
-- Ready to implement.
+- Shipped in PR for `codex/phase-057-native-grpc-service-stack`.
 - One PR.
 - Builds on shipped native HTTP/2.
+- Unary server shipped with `prost` payloads, typed gRPC status trailers,
+  bounded message caps, timeout/status mappings, h2c client specimen helper,
+  docs, and live tests.
+- Server-streaming deferred: unary plus trailer/status support was the clean
+  first form; streaming should reuse the HTTP body/source cancellation model in
+  a later slice.
+- Production Tina gRPC client service deferred: this PR ships a tiny blocking
+  h2c helper for tests/specimens only, not a pooled runtime-owned client
+  topology.
 - Do not run beside 087 WebSocket unless `tina-http` file ownership is
   coordinated.
-- First PR is server-first. Client support is optional only if native HTTP/2
-  client plumbing already exists or is tiny and honest.
+- First PR is server-first. Client support is intentionally tiny and honest:
+  `grpc_unary_call_h2c` proves the native HTTP/2/protobuf/status path without
+  Tokio, hyper, tonic, pooling, or hidden runtime ownership.
 
 ## Grug Truth
 
@@ -245,13 +255,13 @@ Docs must say:
 
 ## Required Checks
 
-- `cargo fmt --all --check`
-- `cargo test -p tina-http grpc --tests`
-- `cargo test -p tina-http http2 --tests`
-- `cargo clippy -p tina-http --tests -- -D warnings`
-- specimen smoke test
-- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` if docs/rustdoc
-  changed
+- Passed: `cargo fmt --all --check`
+- Passed: `cargo test -p tina-http grpc --tests`
+- Passed: `cargo test -p tina-http http2 --tests`
+- Passed: `cargo clippy -p tina-http --tests -- -D warnings`
+- Passed: `cargo test --manifest-path examples/specimen_grpc_counter/Cargo.toml`
+- Passed: `cargo run --manifest-path examples/specimen_grpc_counter/Cargo.toml`
+- Passed: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 
 ## Done Means
 
