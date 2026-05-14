@@ -360,6 +360,13 @@ impl HttpResponse {
             http::HeaderValue::from_str(accept.accept_key())
                 .expect("computed websocket accept key is header-safe"),
         );
+        if let Some(protocol) = accept.selected_subprotocol() {
+            response.headers.insert(
+                http::HeaderName::from_static("sec-websocket-protocol"),
+                http::HeaderValue::from_str(protocol)
+                    .expect("validated websocket subprotocol is header-safe"),
+            );
+        }
         response.body = HttpResponseBody::WebSocket(Box::new(accept));
         response
     }

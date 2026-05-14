@@ -120,6 +120,8 @@ pub enum RequestChunkReply {
     /// Read failed mid-body. Distinct from `Eof` so the service
     /// can tell clean short delivery from truncation.
     Error(tina_runtime::CallError),
+    /// Reply to a call-shaped WebSocket session-handle send.
+    WebSocketSend(crate::websocket::WebSocketSendOutcome),
 }
 
 /// A streaming request body: declared length plus a source isolate.

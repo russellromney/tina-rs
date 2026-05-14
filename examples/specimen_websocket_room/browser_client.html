@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tina WebSocket Room Smoke</title>
+<main>
+  <h1>Tina WebSocket Room Smoke</h1>
+  <pre id="log"></pre>
+</main>
+<script>
+const log = document.getElementById("log");
+const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+const ws = new WebSocket(`${scheme}//${location.host}/room`, ["tina.room.v1"]);
+ws.binaryType = "arraybuffer";
+
+function line(text) {
+  log.textContent += `${text}\n`;
+}
+
+ws.addEventListener("open", () => {
+  line(`open:${ws.protocol}`);
+  ws.send("browser:hello");
+  ws.send(new Uint8Array([1, 2, 3]).buffer);
+});
+
+ws.addEventListener("message", (event) => {
+  if (typeof event.data === "string") {
+    line(event.data);
+  } else {
+    line(`binary:${event.data.byteLength}`);
+  }
+});
+
+ws.addEventListener("close", (event) => {
+  line(`close:${event.code}:${event.reason}`);
+});
+
+ws.addEventListener("error", () => {
+  line("error");
+});
+</script>

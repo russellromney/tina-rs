@@ -2,8 +2,71 @@
 
 ## Status
 
-- Ready to implement after 087 lands.
-- One PR.
+- Implemented in PR.
+- Fragmentation decision: bounded fragmented data-message reassembly is
+  implemented. Each frame is still capped by `max_frame_bytes`; accumulated
+  text/binary messages are capped by `max_message_bytes`; control frames may
+  interleave; malformed continuation state closes as protocol error.
+- Exact public handle/send names:
+  `WebSocketSessionId`, `WebSocketSessionHandle`, `WebSocketSend`,
+  `WebSocketSendOutcome`, and `WebSocketSendError`.
+- Public send route: store the `WebSocketSessionHandle` from
+  `WebSocketSessionMsg::SessionOpen`, then call
+  `handle.text_effect::<Room>(..., timeout)` / `send_effect(...)`. The helper
+  routes through the same `HttpConnection` owner; no second writer is created,
+  and runtime-level `Full` / `Closed` / `Timeout` is visible. The lower-level
+  `WebSocketSendOutcome::from_connection_call(...)` remains available for code
+  that intentionally builds the raw call shape.
+- Send outcome names: `Ok(())`, `Stale`, `Closing`, `Closed`,
+  `OutboundQueueFull`, `OutboundBytesFull`, `Protocol`, and `Timeout`.
+- Slow-peer policy in `examples/specimen_websocket_room`: the room records
+  `OutboundQueueFull` / `OutboundBytesFull` as `broadcast_full`, removes the
+  member from the bounded table, and records `slow_peer_closed`.
+- Browser compatibility decision: unsupported extension offers, including the
+  browser-default `permessage-deflate` offer, are ignored rather than
+  negotiated or rejected. Tina still does not implement compression and does
+  not return `Sec-WebSocket-Extensions`.
+- User-facing e2e proof: `examples/specimen_websocket_room` now exposes a
+  reusable `RoomServer`, browser smoke page at `/`, report endpoint at
+  `/room-report`, app-level `WebSocketSessionMsg::Shutdown`, and real
+  `tungstenite` client tests over both `ws://` and `wss://`. It also has an
+  optional Playwright Chromium smoke that runs the served browser page and
+  asserts open, join, binary echo, and report counters.
+- 087 compatibility: the original echo-style `WebSocketSessionMsg::Open`,
+  `Text`, `Binary`, `Ping`, `Pong`, `Close`, `Pressure`, `Closed` plus
+  `WebSocketSessionOutcome` reply path remains. The new handle-bearing
+  `SessionOpen`, `SessionText`, `SessionBinary`, `SessionClose`,
+  `SessionPressure`, and `SessionClosed` events are additive.
+- Bounded storage shape: each session owner has one `WebSocketOutboundQueue`
+  capped by frame count and queued/active bytes; the room specimen owns a
+  fixed-capacity `BTreeMap<WebSocketSessionId, WebSocketSessionHandle>`;
+  fill-close-refill is covered by the live specimen and a member-table proof.
+  Handles carry a
+  session id plus generation and the target address generation.
+- TCP/TLS proof shape: `websocket_live` covers cleartext upgrade/message paths
+  and `websocket_tls_text_and_ping_work` covers `HttpsListener` upgrade, text,
+  and ping/pong over a real rustls client.
+- Roadmap honesty after reread: this PR does not make WebSockets "fully
+  supported" in the broad product sense. Still not done: permessage-deflate
+  compression, native client, HTTP/2 WebSocket, Autobahn/compliance suite,
+  making browser CI a required repo check, simulator/live-replay byte proof,
+  production realtime-room system specimen with recurring liveness, and
+  load/soak harness.
+- Exact checks run:
+  - `cargo fmt --all --check`
+  - `cargo test -p tina-http websocket --tests`
+  - `cargo test -p tina-http websocket_fragment --tests`
+  - `cargo test -p tina-http websocket_tls --tests`
+  - `cargo test -p tina-http http2 --tests`
+  - `cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml`
+  - `cargo clippy --manifest-path examples/specimen_websocket_room/Cargo.toml --tests -- -D warnings`
+  - `npm ci` in `examples/specimen_websocket_room`
+  - `npx playwright install chromium` in `examples/specimen_websocket_room`
+  - `npm run browser:smoke` in `examples/specimen_websocket_room`
+  - `cargo test -p tina`
+  - `cargo clippy -p tina-http --tests -- -D warnings`
+  - `cargo test -p tina-runtime`
+  - `RUSTDOCFLAGS="-D warnings" cargo doc -p tina-http --no-deps`
 - Owns `tina-http` WebSocket API/docs/tests and
   `examples/specimen_websocket_room`.
 - Do not run beside broad `tina-http` protocol rewrites, HTTP/2 WebSocket,
