@@ -17,7 +17,9 @@ use std::time::Duration;
 use http::{Method, StatusCode};
 use tina::CallContext;
 use tina::prelude::*;
-use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
+use tina_http::{
+    BodyMetrics, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
+};
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
     ThreadedRuntimeConfig,
@@ -89,12 +91,13 @@ impl Counter {
 /// One configurable knob: the service isolate's mailbox capacity. Tests
 /// that exercise overload set this to 1; everyone else uses a generous
 /// default.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HarnessConfig {
     pub service_mailbox_capacity: usize,
     pub connection_mailbox_capacity: usize,
     pub service_call_timeout: Duration,
     pub limits: HttpLimits,
+    pub body_metrics: Option<BodyMetrics>,
 }
 
 impl Default for HarnessConfig {
@@ -104,6 +107,7 @@ impl Default for HarnessConfig {
             connection_mailbox_capacity: 16,
             service_call_timeout: Duration::from_secs(2),
             limits: HttpLimits::default(),
+            body_metrics: None,
         }
     }
 }
@@ -142,13 +146,16 @@ impl TestHarness {
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
 
-        let listener_isolate = HttpListener::<TestShard>::new(
+        let mut listener_isolate = HttpListener::<TestShard>::new(
             bind_addr,
             counter,
             config.limits,
             config.service_call_timeout,
             config.connection_mailbox_capacity,
         );
+        if let Some(metrics) = config.body_metrics.clone() {
+            listener_isolate = listener_isolate.with_metrics(metrics);
+        }
         let listener = runtime
             .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
             .expect("register listener");

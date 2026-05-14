@@ -13,13 +13,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina::{IsolateId, ShardId};
 use tina_runtime::{EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
 use tina_sim::dst::{
-    LiveReplayCapture, LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport,
+    LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport,
     RuntimeEventKindName, ShrinkConfig, TraceProjection, assert_replay_case, check_captured_replay,
-    check_replay_case, discover_constants, shrink_replay_case,
+    check_replay_case, discover_constants, read_saved_replay_case, shrink_replay_case,
+    write_saved_replay_case,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
@@ -43,6 +45,25 @@ enum Op {
     Burst { size: u32 },
     /// Drain the simulator one step.
     Step,
+}
+
+fn encode_op(op: &Op) -> String {
+    match op {
+        Op::Burst { size } => format!("burst:{size}"),
+        Op::Step => "step".to_owned(),
+    }
+}
+
+fn decode_op(text: &str) -> Result<Op, String> {
+    if text == "step" {
+        return Ok(Op::Step);
+    }
+    let Some(size) = text.strip_prefix("burst:") else {
+        return Err(format!("unknown op {text:?}"));
+    };
+    Ok(Op::Burst {
+        size: size.parse::<u32>().map_err(|error| error.to_string())?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,7 +189,20 @@ fn run_burst_overflow_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
 fn run_burst_overflow_live_replay(
     case: &ReplayCase<Op>,
 ) -> Result<LiveReplayReport<Output>, tina_sim::dst::TraceProjectionError> {
-    Ok(LiveReplayReport::exact(run_burst_overflow_case(case)))
+    let report = run_burst_overflow_case(case);
+    let fact = http1_keepalive_body_pressure_fact(&report.output);
+    Ok(LiveReplayReport::exact(report).with_live_fact(fact))
+}
+
+fn http1_keepalive_body_pressure_fact(output: &Output) -> LiveReplayFact {
+    LiveReplayFact::capacity_surface(&CapacitySurfaceReport::count(
+        "http1.keepalive.body-pressure.sink-mailbox",
+        CapacityMode::Fixed,
+        2,
+        0,
+        2,
+        output.full_rejections as u64,
+    ))
 }
 
 /// Two bursts of 4 messages into a sink with capacity 2 produce
@@ -187,12 +221,12 @@ fn burst_overflow_case() -> ReplayCase<Op> {
         .with_mailbox(SOURCE_ROLE, 8)
         .with_mailbox(SINK_ROLE, 2);
     ReplayCase::new(
-        "burst overflow under local-send delay",
+        "http1 keepalive body pressure under local-send delay",
         7,
         config,
-        "two bursts of 4 sends into a capacity-2 sink under seeded local-send delay",
+        "HTTP/1 keepalive/body-pressure shaped run: two explicit app bursts into a capacity-2 sink under seeded local-send delay",
         vec![Op::Burst { size: 4 }, Op::Step, Op::Burst { size: 4 }],
-        "mailbox full produces SendRejected{ reason: Full } that the trace records",
+        "body-pressure capture records capacity high-water/full facts and SendRejected{ reason: Full }",
     )
     .expecting(BURST_OVERFLOW_EVENT_COUNT, BURST_OVERFLOW_TRACE_HASH)
 }
@@ -256,18 +290,20 @@ fn check_replay_case_reports_drift_when_constants_are_stale() {
     assert!(mismatch.count_diverged());
     assert!(mismatch.hash_diverged());
     let rendered = mismatch.to_string();
-    assert!(rendered.contains("burst overflow"));
+    assert!(rendered.contains("http1 keepalive body pressure"));
     assert!(rendered.contains("next step"));
 }
 
 fn capture_burst_overflow() -> LiveReplayCapture<Op> {
     let case = burst_overflow_case();
     let report = run_burst_overflow_case(&case);
+    let fact = http1_keepalive_body_pressure_fact(&report.output);
     LiveReplayCapture::from_case_and_report(
         &case,
-        "simulated pressure capture shaped like a live export",
+        "HTTP/1 keepalive/body pressure live-shaped capture",
         &report,
     )
+    .with_live_fact(fact)
 }
 
 #[test]
@@ -293,10 +329,45 @@ fn changed_config_invalidates_captured_pressure_replay() {
     let mismatch = check_captured_replay(&capture, &changed, run_burst_overflow_live_replay)
         .expect_err("changed mailbox capacity must invalidate captured replay");
     let rendered = mismatch.to_string();
-    assert!(rendered.contains("changed:   config"));
+    assert!(rendered.contains("config"));
     assert!(rendered.contains("events:"));
     assert!(rendered.contains("hash:"));
     assert!(rendered.contains("invariant:"));
+}
+
+#[test]
+fn captured_http1_body_pressure_case_saves_and_converts() {
+    let capture = capture_burst_overflow();
+    let path = std::env::temp_dir().join(format!(
+        "tina-http1-body-pressure-{}-{}.case",
+        std::process::id(),
+        capture.expected.trace_hash
+    ));
+
+    write_saved_replay_case(&path, &capture, encode_op).expect("write saved replay case");
+    let saved = read_saved_replay_case(&path, decode_op).expect("read saved replay case");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(saved.name, capture.name);
+    assert_eq!(saved.history, capture.history.operations());
+    assert_eq!(saved.live_facts.len(), capture.live_facts.len());
+    assert!(
+        saved
+            .live_facts
+            .iter()
+            .any(|fact| fact.contains("http1.keepalive.body-pressure"))
+    );
+
+    let case = saved
+        .to_replay_case(
+            capture.name,
+            capture.config.clone(),
+            capture.scenario,
+            capture.invariant,
+        )
+        .expect("saved config hash matches typed config");
+    check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
+        .expect("saved captured case converts back to replay");
 }
 
 #[test]
