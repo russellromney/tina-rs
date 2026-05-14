@@ -24,7 +24,8 @@
     `POST /rooms/default` creates/reopens, `DELETE /rooms/default` deletes and
     closes current members, idle expiry deletes an empty room through a
     Tina-owned timer, and deleted rooms reject new upgrades until recreated;
-  - public session reports include last close code and close reason byte count;
+  - public session reports are `#[non_exhaustive]` bounded diagnostic
+    snapshots and include last close code and close reason byte count;
   - browser `wss://` smoke now asserts the served report path and browser close
     event instead of skipping TLS report proof.
 - Checks run for this implementation slice:
@@ -137,7 +138,10 @@ Required room/server report fields:
   mailboxes.
 
 Reports must be snapshots over bounded owned state. Do not add an event log
-that grows with traffic.
+that grows with traffic. Keep `WebSocketSessionReport` narrow in `tina-http`;
+room registries, room reports, admission helpers, fanout helpers, and slow-peer
+policies are ecosystem/helper-crate candidates once more than the specimen
+needs them.
 
 ## Rock 4: Production Room Lifecycle
 
@@ -233,5 +237,8 @@ At least one test must prove each bad user path:
 - Autobahn compliance classification.
 - Live trace to simulator replay for WebSocket facts.
 - Tina-native WebSocket client, unless a real workload demands it sooner.
+- Extract a small `tina-websocket-room`-style helper crate if repeated apps
+  need the specimen's room registry, admission, fanout, slow-peer, and report
+  policies.
 - `permessage-deflate` support, unless bounded compression becomes a product
   requirement.

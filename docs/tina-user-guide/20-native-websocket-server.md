@@ -162,6 +162,13 @@ queued outbound frames/bytes, active write bytes, or the last pressure reason:
 handle.report_effect::<Room>(Duration::from_secs(1))
 ```
 
+`WebSocketSessionReport` is a `#[non_exhaustive]` diagnostic snapshot. Treat it
+as a point-in-time answer from the session owner, not as an event stream,
+metrics contract, or room report. Core `tina-http` keeps this narrow because it
+belongs to the session-owner boundary; reusable room registries, admission
+policies, fanout helpers, and slow-peer policies belong in a future helper crate
+if the specimen shape becomes shared ecosystem code.
+
 Keep report collection bounded. The specimen exposes aggregate room/server
 snapshots rather than appending one event per message.
 

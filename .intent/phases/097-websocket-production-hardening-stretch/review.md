@@ -94,6 +94,11 @@ Those belong in the roadmap follow-up, not as quiet stretch promises here.
   did not carry the last close code/reason shape. Fixed by adding
   `last_close_code` and `last_close_reason_bytes` to
   `WebSocketSessionReport`; this stays bounded and avoids a close-event log.
+- Finding: The session report API could ossify into a broad observability
+  surface. Fixed by marking `WebSocketSessionReport` `#[non_exhaustive]` and
+  documenting it as a narrow connection-owner diagnostic snapshot. Room
+  registry/admission/fanout/slow-peer helpers stay out of `tina-http` and are
+  named as future helper-crate material.
 - Finding: The browser `wss://` proof skipped `/room-report`. Fixed by fetching
   the report from inside the TLS-loaded browser page, then asserting selected
   subprotocol, close event, peer close, and live-member drain for both `ws://`

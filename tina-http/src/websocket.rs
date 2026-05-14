@@ -169,6 +169,11 @@ impl WebSocketSessionHandle {
         self.send(WebSocketMessage::Close(code, reason.into()))
     }
 
+    /// Build a bounded owner-routed diagnostic snapshot request.
+    ///
+    /// This does not subscribe to a stream of events and does not expose room
+    /// state. It asks the connection isolate that owns this session for one
+    /// point-in-time snapshot.
     pub fn report(self) -> HttpConnectionMsg {
         HttpConnectionMsg::WebSocketReport(WebSocketReportRequest {
             session: self.session_id,
@@ -226,6 +231,12 @@ impl WebSocketSessionHandle {
         self.send_effect(WebSocketMessage::Close(code, reason.into()), timeout)
     }
 
+    /// Route a bounded session snapshot request through the connection owner.
+    ///
+    /// Use this for diagnostics and room policy decisions that need
+    /// connection-owned state, such as selected subprotocol, close state, and
+    /// queued outbound pressure. The returned snapshot is intentionally narrow:
+    /// it is not a metrics feed, room report, or event log.
     pub fn report_effect<
         I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
     >(
@@ -434,7 +445,13 @@ pub struct WebSocketSendOutcome {
     pub result: Result<(), WebSocketSendError>,
 }
 
-/// Snapshot of one connection-owned WebSocket session.
+/// Bounded diagnostic snapshot of one connection-owned WebSocket session.
+///
+/// This is deliberately a point-in-time owner report, not a metrics stream or
+/// a room/server report. It is `non_exhaustive` so Tina can add narrowly useful
+/// fields without turning today's queue internals into a forever-complete
+/// observability API.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSocketSessionReport {
     pub session: WebSocketSessionId,
