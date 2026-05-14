@@ -666,6 +666,12 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         request: HttpRequest,
         call_ctx: tina::CallContext<'_, Self>,
     ) -> Effect<Self> {
+        if request.method != Method::POST {
+            return call_ctx.reply(grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::Unimplemented),
+            ));
+        }
         match &request.body {
             HttpRequestBody::Buffered(_) => call_ctx.reply(self.response_for(request)),
             HttpRequestBody::Stream(_) => call_ctx.reply(grpc_http_response(

@@ -948,6 +948,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
         if self.streams[idx].request_eof {
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_STREAM_CLOSED))?;
+            self.reset_active_stream_for_protocol(frame.stream_id, effects);
             return Ok(());
         }
         if self.streams[idx].recv_window < len as i32 {
@@ -977,7 +978,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         if new_len > self.limits.max_body_bytes {
             self.report.stream_full += 1;
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_ENHANCE_YOUR_CALM))?;
-            self.remove_stream(frame.stream_id);
+            self.reset_active_stream_for_protocol(frame.stream_id, effects);
             return Ok(());
         }
         self.recv_window -= len as i32;

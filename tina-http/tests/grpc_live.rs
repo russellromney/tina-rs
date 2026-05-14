@@ -362,6 +362,17 @@ fn request_headers(path: &str, content_type: &str) -> Vec<u8> {
     request_headers_with_encoding(path, content_type, None)
 }
 
+fn request_headers_with_method(method: &str, path: &str, content_type: &str) -> Vec<u8> {
+    let mut block = Vec::new();
+    literal(":method", method, &mut block);
+    literal(":scheme", "http", &mut block);
+    literal(":path", path, &mut block);
+    literal(":authority", "localhost", &mut block);
+    literal("content-type", content_type, &mut block);
+    literal("te", "trailers", &mut block);
+    block
+}
+
 fn request_headers_with_content_length(path: &str, content_type: &str, len: usize) -> Vec<u8> {
     let mut block = request_headers(path, content_type);
     literal("content-length", &len.to_string(), &mut block);
@@ -955,6 +966,8 @@ fn grpc_client_streaming_can_return_early_success_and_connection_survives_late_d
         1,
         &grpc_body(&CounterRequest { delta: 1000 }),
     );
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
     let status = raw_grpc_status(
         &mut stream,
         3,
@@ -1022,6 +1035,8 @@ fn grpc_client_streaming_can_return_early_error_and_connection_survives_late_dat
         1,
         &grpc_body(&CounterRequest { delta: 1000 }),
     );
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
     let status = raw_grpc_status(
         &mut stream,
         3,
@@ -1073,6 +1088,57 @@ fn grpc_client_streaming_rejects_malformed_message_after_valid_handoff() {
 
     assert_eq!(read_status(&mut stream, 1), GrpcStatusCode::InvalidArgument);
     assert_eq!(decoded.load(Ordering::Acquire), 1);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_live_client_streaming_get_method_is_unimplemented_before_service_start() {
+    let runtime = runtime();
+    let service_starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_route = Arc::clone(&service_starts);
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).client_streaming(
+        "/specimen.Counter/GetMustNotStart",
+        move |_start| {
+            starts_for_route.fetch_add(1, Ordering::AcqRel);
+            0_u64
+        },
+        |sum, request: GrpcRequest<CounterRequest>| {
+            *sum += request.message.delta;
+            Ok(GrpcClientStreamingControl::<CounterReply>::Continue)
+        },
+        |sum| Ok(GrpcResponse::new(CounterReply { value: sum })),
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers_with_method(
+            "GET",
+            "/specimen.Counter/GetMustNotStart",
+            "application/grpc+proto",
+        ),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &grpc_body(&CounterRequest { delta: 1 }),
+    );
+
+    assert_eq!(read_status(&mut stream, 1), GrpcStatusCode::Unimplemented);
+    assert_eq!(
+        service_starts.load(Ordering::Acquire),
+        0,
+        "live client-streaming GET must reject before service init"
+    );
     harness.shutdown();
 }
 
@@ -1298,6 +1364,46 @@ fn grpc_streaming_request_total_body_cap_counts_consumed_chunks() {
     let rst = read_until_rst(&mut stream, 1);
     assert_eq!(rst.stream_id, 1);
     harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_request_body_cap_cancels_accepted_streaming_service_call() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_body_bytes: 12,
+            ..Http2Limits::default()
+        },
+        service_call_timeout: Duration::from_secs(1),
+        ..Http2ServerConfig::default()
+    };
+    let mut harness = GrpcHarness::start_router(config, GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let first = grpc_body(&CounterRequest { delta: 1 });
+    let second = grpc_body(&CounterRequest { delta: 2 });
+
+    assert!(first.len() <= 12);
+    assert!(first.len() + second.len() > 12);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Sum", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, 0, 1, &first);
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &second);
+
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
+    std::thread::sleep(Duration::from_millis(20));
+    let events = harness.shutdown_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::CallCancelled { .. })),
+        "HTTP/2 body cap reset must cancel the accepted streaming service call; events: {events:?}"
+    );
 }
 
 #[test]
@@ -1577,6 +1683,47 @@ fn grpc_peer_reset_cancels_accepted_service_call() {
             .iter()
             .any(|event| matches!(event.kind(), RuntimeEventKind::CallCancelled { .. })),
         "peer reset must cancel the accepted service call; events: {events:?}"
+    );
+}
+
+#[test]
+fn grpc_data_after_request_eof_resets_and_cancels_accepted_service_call() {
+    let mut harness = GrpcHarness::start_hanging(Http2ServerConfig {
+        service_call_timeout: Duration::from_secs(1),
+        ..Http2ServerConfig::default()
+    });
+    let mut stream = connect_h2(harness.addr);
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Hang", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &grpc_body(&CounterRequest { delta: 1 }),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &grpc_body(&CounterRequest { delta: 2 }),
+    );
+
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
+    std::thread::sleep(Duration::from_millis(20));
+    let events = harness.shutdown_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::CallCancelled { .. })),
+        "DATA after request EOF must cancel the accepted service call; events: {events:?}"
     );
 }
 
