@@ -20,7 +20,7 @@ use tina::reply_to_request;
 use tina_runtime::{CallOutcome, call};
 
 use crate::{Http2ConnectionReply, HttpRequest, HttpRequestBody, HttpResponse, RequestChunkReply};
-use crate::{ResponseChunkMsg, ResponseChunkReply};
+use crate::{IterBodySource, ResponseChunkMsg, ResponseChunkReply};
 
 const GRPC_FRAME_HEADER_LEN: usize = 5;
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -256,6 +256,28 @@ pub struct GrpcServerStreamingResponse {
 impl GrpcServerStreamingResponse {
     pub fn new(source: tina::Address<ResponseChunkMsg, ResponseChunkReply>) -> Self {
         Self { source }
+    }
+
+    pub fn from_messages<S, F, T, I>(
+        runtime: &tina_runtime::ThreadedRuntime<S, F>,
+        messages: I,
+        limits: GrpcLimits,
+        mailbox_capacity: usize,
+    ) -> Result<Self, GrpcError>
+    where
+        S: Shard + Send + Sync + 'static,
+        F: tina_runtime::MailboxFactory + Send + 'static,
+        T: Message + Send + 'static,
+        I: IntoIterator<Item = T>,
+        I::IntoIter: Send + 'static,
+    {
+        let chunks = messages
+            .into_iter()
+            .map(|message| encode_grpc_message(&message, limits))
+            .collect::<Result<Vec<_>, _>>()?;
+        let source = IterBodySource::<S>::register(runtime, chunks.into_iter(), mailbox_capacity)
+            .map_err(|error| GrpcError::Io(format!("{error:?}")))?;
+        Ok(Self { source })
     }
 }
 

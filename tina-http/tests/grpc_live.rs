@@ -3,6 +3,7 @@ mod common;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,8 +13,7 @@ use tina::prelude::*;
 use tina_http::{
     GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
     GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, IterBodySource,
-    grpc_unary_call_h2c,
+    Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, grpc_unary_call_h2c,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -56,23 +56,21 @@ struct GrpcHarness {
 impl GrpcHarness {
     fn start_router(config: Http2ServerConfig, limits: GrpcLimits) -> Self {
         let runtime = runtime();
-        let watch_sources = Arc::new(Mutex::new(Vec::new()));
+        let watch_responses = Arc::new(Mutex::new(Vec::new()));
         for _ in 0..8 {
-            let watch_chunks = vec![
-                tina_http::encode_grpc_message(&CounterReply { value: 1 }, GrpcLimits::default())
-                    .expect("encode watch one"),
-                tina_http::encode_grpc_message(&CounterReply { value: 2 }, GrpcLimits::default())
-                    .expect("encode watch two"),
-            ];
-            let watch_source =
-                IterBodySource::<TestShard>::register(&runtime, watch_chunks.into_iter(), 16)
-                    .expect("register watch source");
-            watch_sources
+            let watch_response = GrpcServerStreamingResponse::from_messages(
+                &runtime,
+                vec![CounterReply { value: 1 }, CounterReply { value: 2 }],
+                GrpcLimits::default(),
+                16,
+            )
+            .expect("register watch response");
+            watch_responses
                 .lock()
-                .expect("watch sources")
-                .push(watch_source);
+                .expect("watch responses")
+                .push(watch_response);
         }
-        let watch_sources_for_route = Arc::clone(&watch_sources);
+        let watch_responses_for_route = Arc::clone(&watch_responses);
         let router = GrpcRouter::<TestShard>::new(limits)
             .unary(
                 "/specimen.Counter/Increment",
@@ -108,12 +106,11 @@ impl GrpcHarness {
             .server_streaming(
                 "/specimen.Counter/Watch",
                 move |_request: GrpcRequest<CounterRequest>| {
-                    let watch_source = watch_sources_for_route
+                    watch_responses_for_route
                         .lock()
-                        .expect("watch sources")
+                        .expect("watch responses")
                         .pop()
-                        .expect("watch source per call");
-                    Ok(GrpcServerStreamingResponse::new(watch_source))
+                        .ok_or_else(|| GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
                 },
             )
             .client_streaming(
@@ -207,6 +204,54 @@ struct HangingGrpc;
 enum HangingMsg {
     Request,
     Done(tina::RequestContext<HttpResponse>),
+}
+
+struct CancelRecordingSource {
+    chunk: Vec<u8>,
+    received_cancel: Arc<AtomicBool>,
+}
+
+impl Isolate for CancelRecordingSource {
+    tina::isolate_types! {
+        message: tina_http::ResponseChunkMsg,
+        reply: tina_http::ResponseChunkReply,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: tina_http::ResponseChunkMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            tina_http::ResponseChunkMsg::Next => {
+                reply(tina_http::ResponseChunkReply::Chunk(self.chunk.clone()))
+            }
+            tina_http::ResponseChunkMsg::Cancel => {
+                self.received_cancel.store(true, Ordering::Release);
+                stop()
+            }
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: tina_http::ResponseChunkMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            tina_http::ResponseChunkMsg::Next => {
+                call.reply(tina_http::ResponseChunkReply::Chunk(self.chunk.clone()))
+            }
+            tina_http::ResponseChunkMsg::Cancel => {
+                self.received_cancel.store(true, Ordering::Release);
+                stop()
+            }
+        }
+    }
 }
 
 impl From<HttpRequest> for HangingMsg {
@@ -414,7 +459,7 @@ fn read_status(stream: &mut TcpStream, stream_id: u32) -> GrpcStatusCode {
 
 fn read_body_and_status(stream: &mut TcpStream, stream_id: u32) -> (Vec<u8>, GrpcStatusCode) {
     let mut body = Vec::new();
-    for _ in 0..32 {
+    for _ in 0..512 {
         let frame = read_frame(stream);
         if frame.stream_id != stream_id {
             continue;
@@ -559,6 +604,57 @@ fn grpc_server_streaming_route_works_more_than_once() {
 }
 
 #[test]
+fn grpc_server_streaming_peer_reset_cancels_response_source() {
+    let runtime = runtime();
+    let received_cancel = Arc::new(AtomicBool::new(false));
+    let encoded =
+        tina_http::encode_grpc_message(&CounterReply { value: 99 }, GrpcLimits::default())
+            .expect("encode stream chunk");
+    let source = runtime
+        .register_with_capacity::<CancelRecordingSource, Infallible>(
+            CancelRecordingSource {
+                chunk: encoded,
+                received_cancel: Arc::clone(&received_cancel),
+            },
+            16,
+        )
+        .expect("register cancel source");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).server_streaming(
+        "/specimen.Counter/CancelWatch",
+        move |_request: GrpcRequest<CounterRequest>| Ok(GrpcServerStreamingResponse::new(source)),
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 0 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/CancelWatch", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
+
+    for _ in 0..16 {
+        let frame = read_frame(&mut stream);
+        if frame.stream_id == 1 && frame.ty == FRAME_DATA {
+            break;
+        }
+    }
+    write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        received_cancel.load(Ordering::Acquire),
+        "server-streaming peer reset must cancel response source"
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn grpc_client_streaming_reads_multiple_request_messages() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
     let mut stream = connect_h2(harness.addr);
@@ -585,6 +681,34 @@ fn grpc_client_streaming_reads_multiple_request_messages() {
     let (body, status) = read_body_and_status(&mut stream, 1);
     assert_eq!(status, GrpcStatusCode::Ok);
     assert_eq!(decode_one_grpc_reply(&body).value, 42);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_handles_many_small_messages() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut body = Vec::new();
+    let expected: u64 = (0..1000).sum();
+    for delta in 0..1000 {
+        body.extend_from_slice(&grpc_body(&CounterRequest { delta }));
+    }
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Sum", "application/grpc+proto"),
+    );
+    for chunk in body.chunks(97) {
+        write_frame(&mut stream, FRAME_DATA, 0, 1, chunk);
+    }
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &[]);
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(decode_one_grpc_reply(&body).value, expected);
     harness.shutdown();
 }
 

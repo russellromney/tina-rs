@@ -15,7 +15,9 @@
   - hostile-review live tests for repeated server-streaming calls, mixed
     server/client-streaming modes on one HTTP/2 connection, request-trailer
     rejection, content-length overrun/underrun, and total body cap across
-    consumed chunks.
+    consumed chunks;
+  - typed finite server-streaming helper and many-small-message
+    client-streaming proof.
 - Still deferred in this branch:
   - true bidirectional streaming with independent request/response lifecycles;
   - tonic/grpcurl interop scripts;

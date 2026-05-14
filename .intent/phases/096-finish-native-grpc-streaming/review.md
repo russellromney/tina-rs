@@ -29,6 +29,19 @@ content-length underrun, and total body cap across consumed chunks. These force
 protocol bugs to reset visibly instead of returning friendly but false gRPC
 statuses.
 
+### Fixed In Execution Slice: Typed Finite Server-Streaming Helper
+
+`GrpcServerStreamingResponse::from_messages` now lets a handler return finite
+typed `prost::Message` streams without manually building gRPC frames. This is
+not the final infinite/backpressured typed stream API, but it removes the worst
+specimen ergonomics lie from the first server-streaming shape.
+
+### Fixed In Execution Slice: Many Small Client Messages
+
+The live suite now sends 1000 tiny client-streamed messages split across
+awkward DATA chunk boundaries. This caught the HTTP/2 window-credit flood and
+now proves the route survives user-shaped small-message streams.
+
 ### Still Risky: Server-Streaming API Is Too Raw
 
 `GrpcServerStreamingResponse` currently asks handlers to provide a
@@ -45,7 +58,8 @@ Before claiming 096 complete, add tests that:
 2. Run a tonic client against unary, server-streaming, client-streaming, and
    bidi routes.
 3. Force server-streaming pressure with a non-reading client, then send
-   `RST_STREAM` and prove source cancel.
+   `RST_STREAM` and prove source cancel. Basic peer reset source-cancel proof
+   is now present; the non-reading pressure variant is still needed.
 4. Force client-streaming with thousands of small messages and one oversized
    declared message that must fail before protobuf allocation.
 5. Interleave bidi request/response messages while one direction is

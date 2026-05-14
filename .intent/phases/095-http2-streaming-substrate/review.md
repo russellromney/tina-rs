@@ -30,6 +30,13 @@ The streaming request cap initially counted queued resident chunks. A fast
 consumer could drain chunks and let total request bytes exceed `max_body_bytes`.
 The cap now applies to total bytes received for the HTTP/2 stream.
 
+### Fixed In Execution Slice: Tiny Chunk Credit Flood
+
+A thousand-message client-streaming test exposed another pressure bug: the
+connection emitted two `WINDOW_UPDATE` frames for every tiny consumed DATA
+chunk, filled the bounded outbound queue, and reset the stream. Request-body
+window credit is now coalesced and flushed at a threshold or EOF.
+
 ### Superseded: Request Streaming Is Now Required
 
 The earlier review fixed an overclaim by allowing request streaming to be

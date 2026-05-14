@@ -27,6 +27,7 @@ const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_HEADER_LEN: usize = 9;
 const DEFAULT_WINDOW: i32 = 65_535;
 const READ_CHUNK: usize = 16 * 1024;
+const WINDOW_CREDIT_FLUSH_THRESHOLD: u32 = 16 * 1024;
 
 const FLAG_ACK: u8 = 0x1;
 const FLAG_END_STREAM: u8 = 0x1;
@@ -554,6 +555,7 @@ struct ActiveStream {
     request_eof: bool,
     request_content_length: Option<usize>,
     request_bytes_received: usize,
+    pending_recv_window_credit: u32,
     request_chunks: VecDeque<Vec<u8>>,
     pending_request_body_reply: Option<tina::RequestContext<Http2ConnectionReply>>,
     reset: bool,
@@ -587,6 +589,7 @@ impl ActiveStream {
             request_eof: false,
             request_content_length: None,
             request_bytes_received: 0,
+            pending_recv_window_credit: 0,
             request_chunks: VecDeque::new(),
             pending_request_body_reply: None,
             reset: false,
@@ -647,6 +650,7 @@ pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = Htt
     streams: Vec<ActiveStream>,
     highest_client_stream_id: u32,
     recv_window: i32,
+    pending_recv_window_credit: u32,
     send_window: i32,
     goaway: bool,
     closing_after_write: bool,
@@ -675,6 +679,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
             streams: Vec::with_capacity(limits.max_concurrent_streams),
             highest_client_stream_id: 0,
             recv_window: limits.initial_connection_window,
+            pending_recv_window_credit: 0,
             send_window: DEFAULT_WINDOW,
             goaway: false,
             closing_after_write: false,
@@ -1637,16 +1642,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             let len = chunk.len();
             self.recv_window = self.recv_window.saturating_add(len as i32);
+            self.pending_recv_window_credit =
+                self.pending_recv_window_credit.saturating_add(len as u32);
             self.streams[idx].recv_window =
                 self.streams[idx].recv_window.saturating_add(len as i32);
-            self.enqueue_frame(window_update_frame(0, len as u32))?;
-            self.enqueue_frame(window_update_frame(stream_id, len as u32))?;
+            self.streams[idx].pending_recv_window_credit = self.streams[idx]
+                .pending_recv_window_credit
+                .saturating_add(len as u32);
+            self.maybe_flush_request_window_credit(stream_id, false)?;
             return Ok(reply_to_request(
                 call,
                 Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(chunk)),
             ));
         }
         if self.streams[idx].request_eof {
+            self.maybe_flush_request_window_credit(stream_id, true)?;
             Ok(reply_to_request(
                 call,
                 Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof),
@@ -1663,6 +1673,41 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         } else {
             noop()
         }
+    }
+
+    fn maybe_flush_request_window_credit(
+        &mut self,
+        stream_id: u32,
+        force: bool,
+    ) -> Result<(), Http2ProtocolError> {
+        let Some(idx) = self.find_stream(stream_id) else {
+            return Ok(());
+        };
+        let conn_credit = self.pending_recv_window_credit;
+        let stream_credit = self.streams[idx].pending_recv_window_credit;
+        let send_conn = conn_credit > 0 && (force || conn_credit >= WINDOW_CREDIT_FLUSH_THRESHOLD);
+        let send_stream =
+            stream_credit > 0 && (force || stream_credit >= WINDOW_CREDIT_FLUSH_THRESHOLD);
+        let slots_needed = usize::from(send_conn) + usize::from(send_stream);
+        if slots_needed == 0 {
+            return Ok(());
+        }
+        if self.write_queue.len().saturating_add(slots_needed)
+            > self.limits.connection_outbound_queue_capacity
+        {
+            return Ok(());
+        }
+        if send_conn {
+            self.pending_recv_window_credit = 0;
+            self.enqueue_frame(window_update_frame(0, conn_credit))?;
+        }
+        if send_stream {
+            if let Some(idx) = self.find_stream(stream_id) {
+                self.streams[idx].pending_recv_window_credit = 0;
+            }
+            self.enqueue_frame(window_update_frame(stream_id, stream_credit))?;
+        }
+        Ok(())
     }
 
     fn push_ready_response_pulls(&mut self, effects: &mut Vec<Effect<Self>>) {
