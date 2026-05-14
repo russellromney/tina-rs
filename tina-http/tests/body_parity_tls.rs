@@ -510,6 +510,7 @@ impl Isolate for ChunkedRequestConsumer {
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
                 | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketReport(_))
                 | CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)

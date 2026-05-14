@@ -186,8 +186,9 @@ pub use types::{
 };
 pub use websocket::{
     WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketLimits, WebSocketMessage,
-    WebSocketOutboundQueue, WebSocketSend, WebSocketSendError, WebSocketSendOutcome,
-    WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome,
+    WebSocketOutboundQueue, WebSocketReportRequest, WebSocketSend, WebSocketSendError,
+    WebSocketSendOutcome, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
+    WebSocketSessionOutcome, WebSocketSessionReport, WebSocketSessionReportOutcome,
     WebSocketUpgradeRequest, websocket_upgrade,
 };
 

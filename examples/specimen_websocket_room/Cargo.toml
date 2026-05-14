@@ -9,10 +9,10 @@ tina = { path = "../../tina" }
 tina-http = { path = "../../tina-http" }
 tina-runtime = { path = "../../tina-runtime" }
 http = { version = "1", default-features = false, features = ["std"] }
-
-[dev-dependencies]
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+
+[dev-dependencies]
 tungstenite = "0.29"
 
 [lib]

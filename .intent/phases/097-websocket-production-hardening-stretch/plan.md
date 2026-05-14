@@ -2,7 +2,7 @@
 
 ## Status
 
-- Planned.
+- In progress on PR #88.
 - This phase follows 094 and the 096 subprotocol/admission slice on PR #83.
 - Goal: make Tina WebSocket servers feel production-shaped for bounded
   realtime rooms.
@@ -11,6 +11,24 @@
 - Hostile review pass completed in `review.md`; the plan already folds in the
   review findings around browser `wss://`, bounded reports, no sleep-based
   proof, load high-water assertions, and explicit deferrals.
+- Implemented so far:
+  - public handle-routed `WebSocketSessionHandle::report_effect(...)`;
+  - `WebSocketSessionReport` / `WebSocketSessionReportOutcome`;
+  - specimen Origin/auth/subprotocol admission policy;
+  - browser `ws://` and `wss://` Playwright smoke path;
+  - `TlsRoomServer` for local TLS browser/specimen proof;
+  - health/readiness endpoints;
+  - richer bounded room report counters and high-water fields;
+  - CI-short load/churn/shutdown proof.
+- Checks run for this implementation slice:
+  - `cargo fmt --all --check`;
+  - `cargo test -p tina-http websocket --tests`;
+  - `cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml -- --test-threads=1`;
+  - `cargo clippy -p tina-http --tests -- -D warnings`;
+  - `cargo clippy --manifest-path examples/specimen_websocket_room/Cargo.toml --tests -- -D warnings`;
+  - `RUSTDOCFLAGS="-D warnings" cargo doc -p tina-http --no-deps`;
+  - `npm ci && npm run browser:smoke` from
+    `examples/specimen_websocket_room`.
 
 ## Claim
 

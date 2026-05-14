@@ -15,7 +15,9 @@ The specimen serves:
 - `GET /` - a copyable browser `WebSocket` smoke page;
 - `GET /room` - the WebSocket upgrade route;
 - `GET /room-report` - JSON counters for joins, leaves, send outcomes,
-  shutdown, stale-handle rejection, and fill-close-refill.
+  admission rejections, shutdown, stale-handle rejection, high-water counts,
+  and fill-close-refill;
+- `GET /health` and `GET /ready` - small liveness/readiness endpoints.
 
 The browser smoke requests `tina.room.v1`; the gateway selects that
 subprotocol when offered and omits it otherwise. Unsupported extension offers
@@ -37,6 +39,11 @@ npx playwright install chromium
 npm run browser:smoke
 ```
 
+The Playwright smoke starts both a plain `RoomServer` and a TLS
+`TlsRoomServer`, then proves Chromium can use the browser page over `ws://` and
+`wss://`. The TLS path uses local test trust only; production deployments should
+use ordinary trusted certificates.
+
 The room stores `WebSocketSessionHandle` values in a fixed-capacity member
 table. Broadcast and shutdown use only public API:
 
@@ -52,15 +59,17 @@ closed session alive.
 This specimen keeps fanout deliberately tiny. Its tests prove the public
 multi-client WebSocket path through raw frames, real `tungstenite` clients over
 `ws://`, a real `tungstenite` client over `wss://` backed by rustls, browser
-page serving, bidirectional broadcast, slow-peer byte pressure, room report,
-shutdown close/reject behavior, capacity+1 rejection, repeated reconnect/refill
-without live-member leaks, many-client shutdown, ordinary HTTP routes beside
-an active WebSocket, and fill-close-refill capacity shape.
+page serving over `ws://` and `wss://`, Origin/auth/subprotocol admission
+rejection, bidirectional broadcast, slow-peer byte pressure, room report,
+health/readiness, shutdown close/reject behavior, capacity+1 rejection,
+repeated reconnect/refill without live-member leaks, CI-short load/churn,
+many-client shutdown, ordinary HTTP routes beside an active WebSocket, and
+fill-close-refill capacity shape.
 Room send outcomes distinguish
 `OutboundQueueFull`, `OutboundBytesFull`, `Closed`, `Closing`, `Stale`, and
 `Protocol`; the specimen policy removes a member on full/closed pressure.
 
 Still out of scope here: HTTP/2 WebSocket, permessage-deflate compression,
-browser session/auth helpers, automatic reconnect, automated real-browser CI,
-and a broad native WebSocket client crate. Browser extension offers are
-ignored unless Tina explicitly negotiates an extension in a later slice.
+automatic reconnect, Autobahn classification, live trace to simulator replay,
+and a broad native WebSocket client crate. Browser extension offers are ignored
+unless Tina explicitly negotiates an extension in a later slice.

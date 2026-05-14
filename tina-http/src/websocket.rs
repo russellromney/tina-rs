@@ -169,6 +169,12 @@ impl WebSocketSessionHandle {
         self.send(WebSocketMessage::Close(code, reason.into()))
     }
 
+    pub fn report(self) -> HttpConnectionMsg {
+        HttpConnectionMsg::WebSocketReport(WebSocketReportRequest {
+            session: self.session_id,
+        })
+    }
+
     /// Build the public bounded send call for this session.
     ///
     /// The call routes through the connection isolate that owns the upgraded
@@ -218,6 +224,20 @@ impl WebSocketSessionHandle {
         timeout: Duration,
     ) -> Effect<I> {
         self.send_effect(WebSocketMessage::Close(code, reason.into()), timeout)
+    }
+
+    pub fn report_effect<
+        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+    >(
+        self,
+        timeout: Duration,
+    ) -> Effect<I> {
+        let session = self.session_id;
+        call(self.target, self.report(), timeout).reply(move |outcome| {
+            WebSocketSessionMsg::SessionReport(WebSocketSessionReportOutcome::from_connection_call(
+                session, outcome,
+            ))
+        })
     }
 }
 
@@ -332,6 +352,7 @@ pub enum WebSocketSessionMsg {
         session_id: WebSocketSessionId,
         selected_subprotocol: Option<String>,
     },
+    SessionReport(WebSocketSessionReportOutcome),
     SessionText {
         session_id: WebSocketSessionId,
         text: String,
@@ -399,12 +420,37 @@ pub struct WebSocketSend {
     pub message: WebSocketMessage,
 }
 
+/// Report request routed through the session owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebSocketReportRequest {
+    pub session: WebSocketSessionId,
+}
+
 /// Result of a public handle send after the connection owner evaluates
 /// session identity, close state, frame count, and byte budgets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSocketSendOutcome {
     pub session: WebSocketSessionId,
     pub result: Result<(), WebSocketSendError>,
+}
+
+/// Snapshot of one connection-owned WebSocket session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSessionReport {
+    pub session: WebSocketSessionId,
+    pub selected_subprotocol: Option<String>,
+    pub close_sent: bool,
+    pub close_received: bool,
+    pub queued_outbound_frames: usize,
+    pub queued_outbound_bytes: usize,
+    pub pending_write_bytes: usize,
+    pub last_pressure: Option<WebSocketError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSessionReportOutcome {
+    pub session: WebSocketSessionId,
+    pub result: Result<WebSocketSessionReport, WebSocketSendError>,
 }
 
 /// Public send-admission failures. These are intentionally narrower than
@@ -440,6 +486,22 @@ impl WebSocketSendOutcome {
     ) -> Self {
         let result = match outcome {
             CallOutcome::Replied(RequestChunkReply::WebSocketSend(outcome)) => outcome.result,
+            CallOutcome::Replied(_) => Err(WebSocketSendError::Protocol),
+            CallOutcome::Full => Err(WebSocketSendError::OutboundQueueFull),
+            CallOutcome::Closed | CallOutcome::Rejected(_) => Err(WebSocketSendError::Closed),
+            CallOutcome::Timeout => Err(WebSocketSendError::Timeout),
+        };
+        Self { session, result }
+    }
+}
+
+impl WebSocketSessionReportOutcome {
+    pub fn from_connection_call(
+        session: WebSocketSessionId,
+        outcome: CallOutcome<RequestChunkReply>,
+    ) -> Self {
+        let result = match outcome {
+            CallOutcome::Replied(RequestChunkReply::WebSocketReport(outcome)) => outcome.result,
             CallOutcome::Replied(_) => Err(WebSocketSendError::Protocol),
             CallOutcome::Full => Err(WebSocketSendError::OutboundQueueFull),
             CallOutcome::Closed | CallOutcome::Rejected(_) => Err(WebSocketSendError::Closed),

@@ -66,3 +66,21 @@ Even after this phase, two hard claims remain unproven:
 
 Those belong in the roadmap follow-up, not as quiet stretch promises here.
 
+## Implementation Review So Far
+
+- Finding: A first attempt had the room request a connection-owned session
+  report during `SessionOpen`. That made the simple two-client broadcast path
+  timing-sensitive because the app was asking the connection for a report while
+  the connection was still unwinding the join/open sequence. Fixed by keeping
+  the public report API but not auto-calling it during join; the specimen room
+  report remains a bounded room-owned snapshot.
+- Finding: Browser TLS proof could accidentally use the Rust TLS client only.
+  Fixed by adding a TLS-start mode to the specimen binary and requiring the
+  Playwright smoke to open the served page over `https://`, which then uses
+  browser `wss://`.
+- Finding: Admission could be invisible framework prose. Fixed by adding a
+  local `AdmissionPolicy` and e2e rejection assertions for bad Origin, bad
+  bearer token, and unsupported required subprotocol.
+- Finding: Load proof could grow one result per message. Fixed by adding a
+  CI-short churn test that asserts aggregate high-water and rejection counters
+  only.

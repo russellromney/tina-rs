@@ -15,8 +15,8 @@ That means:
 - upgrade code can inspect offered subprotocols/extensions and select one
   subprotocol for the `101` response.
 
-It does not mean HTTP/2 WebSocket, permessage-deflate compression, browser
-auth/session helpers, reconnect, or a broad native WebSocket client crate.
+It does not mean HTTP/2 WebSocket, permessage-deflate compression, automatic
+reconnect, or a broad native WebSocket client crate.
 Browser extension offers such as `permessage-deflate` are ignored unless Tina
 explicitly negotiates an extension in the future.
 
@@ -29,9 +29,10 @@ cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml
 ```
 
 Copy from `examples/specimen_websocket_room/src/lib.rs` when you need a
-small multi-client room with bounded member storage, send outcomes, slow-peer
-policy, stale-handle proof, app-level shutdown, report endpoint, browser smoke
-page, and fill-close-refill capacity proof.
+small multi-client room with bounded member storage, Origin/auth/subprotocol
+admission, send outcomes, slow-peer policy, stale-handle proof, app-level
+shutdown, health/readiness endpoints, report endpoint, browser `ws://` and
+`wss://` smoke page, and fill-close-refill capacity proof.
 
 ## Upgrade
 
@@ -79,6 +80,12 @@ if upgrade
 
 Unsupported extension offers are visible through `extension_offers()` but are
 not negotiated by default.
+
+The room specimen keeps admission local and boring: an optional Origin
+allowlist, optional bearer-token-or-cookie check, and optional required
+subprotocol. Rejections are ordinary HTTP responses before the stream upgrades:
+`403` for Origin, `401` for auth, `400` for unsupported required
+subprotocol, `503` for shutdown/full service state.
 
 ## Echo Path
 
@@ -147,6 +154,17 @@ preserved as `Full`, `Closed`, or `Timeout`, then mapped into
 | `ping_pong_timeout` | unanswered ping deadline |
 | `close_handshake_timeout` | close handshake deadline |
 
+Session handles also expose a bounded owner-routed report call. Use it when a
+room needs connection-owned state such as close state, selected subprotocol,
+queued outbound frames/bytes, active write bytes, or the last pressure reason:
+
+```rust
+handle.report_effect::<Room>(Duration::from_secs(1))
+```
+
+Keep report collection bounded. The specimen exposes aggregate room/server
+snapshots rather than appending one event per message.
+
 ## Pressure
 
 | Where | Visible outcome |
@@ -174,9 +192,12 @@ The room specimen tests the path users are likely to copy:
 - a real `tungstenite` client over `wss://` upgrades through `HttpsListener`
   and rustls;
 - `GET /` serves a tiny browser `WebSocket` page that points at `/room`, and
-  the optional Playwright smoke runs that page in Chromium;
+  the Playwright smoke runs that page in Chromium over both `ws://` and
+  `wss://` with local test trust;
 - `GET /room-report` exposes counters for joins, leaves, send outcomes,
-  shutdown, stale-handle rejection, and live member count;
+  admission rejections, shutdown, stale-handle rejection, high-water counts,
+  and live member count;
+- `GET /health` and `GET /ready` expose simple liveness/readiness;
 - shutdown closes existing clients and rejects new room upgrades.
 
 ## What This Is Not
@@ -184,6 +205,6 @@ The room specimen tests the path users are likely to copy:
 This is a usable bounded server surface, not the final WebSocket product
 story. Before Tina should call WebSockets "fully ready" from a user
 perspective, it still needs at least a standards/compliance pass, automated
-real-browser CI, load/soak evidence for long-lived rooms, simulator/live-replay
-facts for the byte path, and a production room system specimen with recurring
-liveness work.
+Autobahn classification, simulator/live-replay facts for the byte path, and a
+product decision on Tina-native client support versus documented external
+clients.

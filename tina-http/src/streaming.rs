@@ -122,6 +122,8 @@ pub enum RequestChunkReply {
     Error(tina_runtime::CallError),
     /// Reply to a call-shaped WebSocket session-handle send.
     WebSocketSend(crate::websocket::WebSocketSendOutcome),
+    /// Reply to a call-shaped WebSocket session report request.
+    WebSocketReport(crate::websocket::WebSocketSessionReportOutcome),
 }
 
 /// A streaming request body: declared length plus a source isolate.
