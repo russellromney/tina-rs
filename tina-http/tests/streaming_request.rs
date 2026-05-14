@@ -97,7 +97,8 @@ impl Isolate for Consumer {
                     reply_to_request(request, HttpResponse::with_text(StatusCode::OK, body))
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
-                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_)) => {
+                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketReport(_)) => {
                     self.pending_source = None;
                     reply_to_request(request, HttpResponse::internal_error())
                 }
@@ -581,7 +582,8 @@ impl Isolate for NotifyingConsumer {
                     reply_to_request(request, HttpResponse::with_text(StatusCode::OK, body))
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
-                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_)) => {
+                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketReport(_)) => {
                     self.pending_source = None;
                     reply_to_request(request, HttpResponse::internal_error())
                 }

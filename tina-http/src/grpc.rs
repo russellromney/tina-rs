@@ -534,6 +534,9 @@ impl<S: Shard + 'static> GrpcRouter<S> {
             | CallOutcome::Replied(Http2ConnectionReply::Report(_))
             | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
                 RequestChunkReply::WebSocketSend(_),
+            ))
+            | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
+                RequestChunkReply::WebSocketReport(_),
             )) => reply_to_request(
                 pending.call,
                 grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal)),

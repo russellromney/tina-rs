@@ -57,8 +57,9 @@ use crate::transport::HttpTransport;
 use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError};
 use crate::websocket::{
     FrameParse, WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketMessage,
-    WebSocketOutboundQueue, WebSocketSend, WebSocketSendError, WebSocketSendOutcome,
-    WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome,
+    WebSocketOutboundQueue, WebSocketReportRequest, WebSocketSend, WebSocketSendError,
+    WebSocketSendOutcome, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
+    WebSocketSessionOutcome, WebSocketSessionReport, WebSocketSessionReportOutcome,
     decode_close_payload, encode_server_message, outcome_messages, parse_client_frame,
 };
 
@@ -84,6 +85,9 @@ struct WebSocketState {
     close_generation: u64,
     ping_generation: u64,
     awaiting_pong_generation: Option<u64>,
+    last_pressure: Option<WebSocketError>,
+    last_close_code: Option<WebSocketCloseCode>,
+    last_close_reason_bytes: usize,
 }
 
 struct WebSocketFragment {
@@ -113,6 +117,9 @@ impl WebSocketState {
             close_generation: 0,
             ping_generation: 0,
             awaiting_pong_generation: None,
+            last_pressure: None,
+            last_close_code: None,
+            last_close_reason_bytes: 0,
         }
     }
 }
@@ -152,6 +159,8 @@ pub enum HttpConnectionMsg {
     WebSocketAppReturned(CallOutcome<WebSocketSessionOutcome>),
     /// Public bounded send request routed through the connection/session owner.
     WebSocketSend(WebSocketSend),
+    /// Public bounded report request routed through the connection/session owner.
+    WebSocketReport(WebSocketReportRequest),
     /// Close-handshake timer for an upgraded WebSocket session.
     WebSocketCloseDeadline {
         generation: u64,
@@ -493,6 +502,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 self.handle_websocket_app_outcome(outcome)
             }
             HttpConnectionMsg::WebSocketSend(send) => self.handle_websocket_send(send),
+            HttpConnectionMsg::WebSocketReport(report) => self.handle_websocket_report_msg(report),
             HttpConnectionMsg::WebSocketCloseDeadline { generation, .. } => {
                 self.handle_websocket_close_deadline(generation)
             }
@@ -537,6 +547,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     ) => reply,
                     Err(error) => batch(vec![reply, self.websocket_pressure_then_close(error)]),
                 }
+            }
+            HttpConnectionMsg::WebSocketReport(report) => {
+                let outcome = self.websocket_session_report(report);
+                call.reply(RequestChunkReply::WebSocketReport(outcome))
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
@@ -1531,6 +1545,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         if let Some(ws) = self.websocket.as_mut() {
                             ws.close_received = true;
                             ws.close_sent = true;
+                            ws.last_close_code = code;
+                            ws.last_close_reason_bytes = reason.len();
                         }
                         batch(vec![
                             self.call_websocket_app_many(vec![
@@ -1703,6 +1719,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let mut encoded = Vec::new();
         let mut new_bytes = 0usize;
         for message in outcome_messages(outcome) {
+            if let WebSocketMessage::Close(code, reason) = &message
+                && let Some(ws) = self.websocket.as_mut()
+            {
+                ws.last_close_code = *code;
+                ws.last_close_reason_bytes = reason.len();
+            }
             let is_close = matches!(message, WebSocketMessage::Close(_, _));
             let is_ping = matches!(message, WebSocketMessage::Ping(_));
             let bytes = match encode_server_message(message) {
@@ -1773,6 +1795,44 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
     }
 
+    fn handle_websocket_report_msg(&mut self, report: WebSocketReportRequest) -> Effect<Self> {
+        let outcome = self.websocket_session_report(report);
+        self.call_websocket_app(WebSocketSessionMsg::SessionReport(outcome))
+    }
+
+    fn websocket_session_report(
+        &self,
+        report: WebSocketReportRequest,
+    ) -> WebSocketSessionReportOutcome {
+        let Some(ws) = self.websocket.as_ref() else {
+            return WebSocketSessionReportOutcome {
+                session: report.session,
+                result: Err(WebSocketSendError::Closed),
+            };
+        };
+        if ws.session_id != report.session {
+            return WebSocketSessionReportOutcome {
+                session: report.session,
+                result: Err(WebSocketSendError::Stale),
+            };
+        }
+        WebSocketSessionReportOutcome {
+            session: report.session,
+            result: Ok(WebSocketSessionReport {
+                session: ws.session_id,
+                selected_subprotocol: ws.selected_subprotocol.clone(),
+                close_sent: ws.close_sent,
+                close_received: ws.close_received,
+                queued_outbound_frames: ws.outbound.len(),
+                queued_outbound_bytes: ws.outbound.queued_bytes(),
+                pending_write_bytes: ws.pending_write.len(),
+                last_pressure: ws.last_pressure.clone(),
+                last_close_code: ws.last_close_code,
+                last_close_reason_bytes: ws.last_close_reason_bytes,
+            }),
+        }
+    }
+
     fn admit_websocket_send(
         &mut self,
         send: WebSocketSend,
@@ -1788,6 +1848,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
         let is_close = matches!(send.message, WebSocketMessage::Close(_, _));
         let is_ping = matches!(send.message, WebSocketMessage::Ping(_));
+        if let WebSocketMessage::Close(code, reason) = &send.message
+            && let Some(ws) = self.websocket.as_mut()
+        {
+            ws.last_close_code = *code;
+            ws.last_close_reason_bytes = reason.len();
+        }
         let bytes = encode_server_message(send.message)?;
         if !self.websocket_can_accept_app_output(1, bytes.len()) {
             return Err(if self.websocket_frame_slots_available() < 1 {
@@ -1883,6 +1949,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn websocket_protocol_close(&mut self, error: WebSocketError) -> Effect<Self> {
+        if let Some(ws) = self.websocket.as_mut() {
+            ws.last_pressure = Some(error.clone());
+        }
         let notify = match self.websocket.as_ref().map(|ws| ws.session_id) {
             Some(session_id) => self.call_websocket_app_many(vec![
                 WebSocketSessionMsg::SessionPressure {
@@ -1907,6 +1976,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn websocket_pressure_then_close(&mut self, error: WebSocketError) -> Effect<Self> {
+        if let Some(ws) = self.websocket.as_mut() {
+            ws.last_pressure = Some(error.clone());
+        }
         let notify = match self.websocket.as_ref().map(|ws| ws.session_id) {
             Some(session_id) => self.call_websocket_app_many(vec![
                 WebSocketSessionMsg::SessionPressure {
