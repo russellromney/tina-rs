@@ -84,6 +84,9 @@ For protocols, prefer boring sync codec crates:
 - HTTP/1 parse with `httparse`
 - HTTP/2 cleartext server first form with Tina-owned frames, bounded stream
   table, and explicit flow-control windows
+- gRPC unary plus first server-streaming/client-streaming form over Tina
+  HTTP/2 h2c with `prost`, typed `GrpcStatus` trailers, explicit message caps,
+  service-call timeout mapping, and no compression
 - HTTP types with `http`
 - TLS state machine with `rustls` — driven by the runtime's TLS lane
   (`tls_bind` / `tls_accept` / `tls_connect` / `tls_read` / `tls_write`
@@ -91,7 +94,8 @@ For protocols, prefer boring sync codec crates:
   these directly: HTTP/1.1 over a real `rustls` handshake, no Tokio
   edge. DER cert/key inputs are explicit; no system trust roots, no
   HTTPS/2, no ALPN. HTTP/2's first form is cleartext h2c server-side
-  only; gRPC waits for the next protocol layer.
+  only. gRPC's first form also uses that h2c path; TLS ALPN remains future
+  work.
 - JSON with `serde_json`
 - protobuf with `prost`
 - Postgres wire with `postgres-protocol`
@@ -102,3 +106,36 @@ into structs and structs into bytes.
 Do not hide Tokio under a Tina service and call it native.
 
 Bridges are allowed. Bridges should say they are bridges.
+
+## Native gRPC First Form
+
+`tina-http::GrpcRouter` is the current native gRPC layer. It sits on
+`Http2Listener`, so the transport is prior-knowledge cleartext h2c in this
+slice.
+
+What ships:
+
+- unary request/response;
+- first server-streaming response path: one request message, many response DATA
+  chunks, final gRPC status trailers;
+- first client-streaming request path: many request messages over HTTP/2 DATA,
+  one response message, final gRPC status trailers;
+- `prost::Message` payload encode/decode;
+- gRPC frame parsing (`compressed flag + u32 length + protobuf bytes`);
+- `GrpcStatus` / `GrpcStatusCode` in HTTP/2 trailers;
+- explicit per-message caps through `GrpcLimits` (`512 KiB` by default);
+- service-call timeout mapped to `DeadlineExceeded`;
+- compression rejected as `Unimplemented`.
+
+What does not ship yet:
+
+- TLS ALPN / HTTPS/2 gRPC;
+- true bidirectional streaming with independent request/response lifecycles;
+- tonic/grpcurl interop scripts or reflection;
+- tonic compatibility, interceptors, reflection, health, or load balancing;
+- a pooled Tina gRPC client service.
+
+The tiny `grpc_unary_call_h2c` helper exists to prove the native wire path in
+tests and specimens without pulling in Tokio, hyper, or tonic. Production
+client topology should become a normal Tina client service once HTTP/2 client
+plumbing grows beyond this first form.

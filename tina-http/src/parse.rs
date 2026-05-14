@@ -396,6 +396,9 @@ fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec
         crate::types::HttpRequestBody::Stream(_) => {
             panic!("encode_request cannot serialise a streaming body")
         }
+        crate::types::HttpRequestBody::Http2Stream(_) => {
+            panic!("encode_request cannot serialise an HTTP/2 streaming body")
+        }
     };
     let mut out = Vec::with_capacity(128 + body_bytes.len());
 

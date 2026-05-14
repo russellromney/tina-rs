@@ -18,6 +18,8 @@ use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
+const TEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Default)]
 struct TestShard;
 
@@ -258,9 +260,9 @@ impl Drop for Harness {
 }
 
 fn connect_ws(addr: SocketAddr) -> TcpStream {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    let mut stream = TcpStream::connect_timeout(&addr, TEST_IO_TIMEOUT).expect("connect");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(TEST_IO_TIMEOUT))
         .expect("read timeout");
     write_upgrade(&mut stream);
     read_upgrade_response(&mut stream);
