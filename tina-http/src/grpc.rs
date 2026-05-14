@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderValue, Method, StatusCode};
@@ -198,6 +199,14 @@ trait ErasedClientStreaming: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
 }
 
+trait ErasedClientStreamingLive: Send + Sync {
+    fn start(
+        &self,
+        request: &HttpRequest,
+        limits: GrpcLimits,
+    ) -> Result<PendingGrpcBody, GrpcStatus>;
+}
+
 struct UnaryHandler<Req, Resp, F> {
     f: F,
     _types: PhantomData<fn(Req) -> Resp>,
@@ -241,6 +250,13 @@ struct ServerStreamingHandler<Req, F> {
 struct ClientStreamingHandler<Req, Resp, F> {
     f: F,
     _types: PhantomData<fn(Req) -> Resp>,
+}
+
+struct ClientStreamingLiveHandler<Req, Resp, State, Init, Step, Finish> {
+    init: Arc<Init>,
+    step: Arc<Step>,
+    finish: Arc<Finish>,
+    _types: PhantomData<fn(Req, Resp, State)>,
 }
 
 /// Response returned by a server-streaming gRPC handler.
@@ -308,6 +324,22 @@ pub struct GrpcClientStreamingRequest<T> {
     pub messages: Vec<T>,
 }
 
+/// Start metadata for an incremental client-streaming call.
+#[derive(Debug, Clone)]
+pub struct GrpcClientStreamingStart {
+    pub path: String,
+}
+
+/// Control returned after each decoded request message.
+///
+/// `Continue` asks the router to pull the next HTTP/2 DATA chunk. `Respond`
+/// finishes the RPC immediately, without waiting for request EOF.
+#[derive(Debug, Clone)]
+pub enum GrpcClientStreamingControl<T> {
+    Continue,
+    Respond(GrpcResponse<T>),
+}
+
 impl<Req, Resp, F> ErasedClientStreaming for ClientStreamingHandler<Req, Resp, F>
 where
     Req: Message + Default + Send + Sync + 'static,
@@ -341,6 +373,116 @@ where
     }
 }
 
+impl<Req, Resp, State, Init, Step, Finish> ErasedClientStreamingLive
+    for ClientStreamingLiveHandler<Req, Resp, State, Init, Step, Finish>
+where
+    Req: Message + Default + Send + Sync + 'static,
+    Resp: Message + Default + Send + Sync + 'static,
+    State: Send + 'static,
+    Init: Fn(GrpcClientStreamingStart) -> State + Send + Sync + 'static,
+    Step: Fn(&mut State, GrpcRequest<Req>) -> Result<GrpcClientStreamingControl<Resp>, GrpcStatus>
+        + Send
+        + Sync
+        + 'static,
+    Finish: Fn(State) -> Result<GrpcResponse<Resp>, GrpcStatus> + Send + Sync + 'static,
+{
+    fn start(
+        &self,
+        request: &HttpRequest,
+        _limits: GrpcLimits,
+    ) -> Result<PendingGrpcBody, GrpcStatus> {
+        validate_grpc_request(request).map_err(status_for_error)?;
+        let path = request.path.clone();
+        let state = (self.init)(GrpcClientStreamingStart { path: path.clone() });
+        Ok(PendingGrpcBody::LiveClientStreaming(Box::new(
+            LiveClientStreamingState::<Req, Resp, State, Step, Finish> {
+                path,
+                state: Some(state),
+                decoder: GrpcStreamingDecoder::new(),
+                step: Arc::clone(&self.step),
+                finish: Arc::clone(&self.finish),
+                _types: PhantomData,
+            },
+        )))
+    }
+}
+
+trait ErasedLiveClientStreamingState: Send {
+    fn push_chunk(
+        &mut self,
+        bytes: &[u8],
+        limits: GrpcLimits,
+    ) -> Result<Option<HttpResponse>, GrpcStatus>;
+    fn finish(self: Box<Self>, limits: GrpcLimits) -> HttpResponse;
+}
+
+struct LiveClientStreamingState<Req, Resp, State, Step, Finish> {
+    path: String,
+    state: Option<State>,
+    decoder: GrpcStreamingDecoder<Req>,
+    step: Arc<Step>,
+    finish: Arc<Finish>,
+    _types: PhantomData<fn(Resp)>,
+}
+
+impl<Req, Resp, State, Step, Finish> ErasedLiveClientStreamingState
+    for LiveClientStreamingState<Req, Resp, State, Step, Finish>
+where
+    Req: Message + Default + Send + Sync + 'static,
+    Resp: Message + Default + Send + Sync + 'static,
+    State: Send + 'static,
+    Step: Fn(&mut State, GrpcRequest<Req>) -> Result<GrpcClientStreamingControl<Resp>, GrpcStatus>
+        + Send
+        + Sync
+        + 'static,
+    Finish: Fn(State) -> Result<GrpcResponse<Resp>, GrpcStatus> + Send + Sync + 'static,
+{
+    fn push_chunk(
+        &mut self,
+        bytes: &[u8],
+        limits: GrpcLimits,
+    ) -> Result<Option<HttpResponse>, GrpcStatus> {
+        let step = Arc::clone(&self.step);
+        let path = self.path.clone();
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| GrpcStatus::new(GrpcStatusCode::Internal))?;
+        self.decoder
+            .push(bytes, limits, move |message| {
+                match step(
+                    state,
+                    GrpcRequest {
+                        path: path.clone(),
+                        message,
+                    },
+                )? {
+                    GrpcClientStreamingControl::Continue => Ok(None),
+                    GrpcClientStreamingControl::Respond(response) => {
+                        Ok(Some(response_to_http(response, limits)))
+                    }
+                }
+            })
+            .map_err(status_for_error)
+    }
+
+    fn finish(mut self: Box<Self>, limits: GrpcLimits) -> HttpResponse {
+        if !self.decoder.is_idle() {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        }
+        let Some(state) = self.state.take() else {
+            return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal));
+        };
+        match (self.finish)(state) {
+            Ok(response) => response_to_http(response, limits),
+            Err(status) => grpc_http_response(Vec::new(), status),
+        }
+    }
+}
+
 /// Tina-shaped unary service/router template.
 ///
 /// Register this isolate behind [`crate::Http2Listener`]. Each route
@@ -351,6 +493,7 @@ pub struct GrpcRouter<S: Shard> {
     unary: BTreeMap<String, Box<dyn ErasedUnary>>,
     server_streaming: BTreeMap<String, Box<dyn ErasedServerStreaming>>,
     client_streaming: BTreeMap<String, Box<dyn ErasedClientStreaming>>,
+    live_client_streaming: BTreeMap<String, Box<dyn ErasedClientStreamingLive>>,
     pending: BTreeMap<u64, PendingGrpcRequest>,
     next_pending_id: u64,
     _shard: PhantomData<S>,
@@ -373,8 +516,13 @@ impl From<HttpRequest> for GrpcRouterMsg {
 
 struct PendingGrpcRequest {
     request: HttpRequest,
-    body: Vec<u8>,
+    body: PendingGrpcBody,
     call: tina::RequestContext<HttpResponse>,
+}
+
+enum PendingGrpcBody {
+    Buffered(Vec<u8>),
+    LiveClientStreaming(Box<dyn ErasedLiveClientStreamingState>),
 }
 
 impl<S: Shard + 'static> GrpcRouter<S> {
@@ -384,6 +532,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
             unary: BTreeMap::new(),
             server_streaming: BTreeMap::new(),
             client_streaming: BTreeMap::new(),
+            live_client_streaming: BTreeMap::new(),
             pending: BTreeMap::new(),
             next_pending_id: 1,
             _shard: PhantomData,
@@ -424,7 +573,39 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         self
     }
 
-    pub fn client_streaming<Req, Resp, F>(mut self, path: impl Into<String>, f: F) -> Self
+    pub fn client_streaming<Req, Resp, State, Init, Step, Finish>(
+        mut self,
+        path: impl Into<String>,
+        init: Init,
+        step: Step,
+        finish: Finish,
+    ) -> Self
+    where
+        Req: Message + Default + Send + Sync + 'static,
+        Resp: Message + Default + Send + Sync + 'static,
+        State: Send + 'static,
+        Init: Fn(GrpcClientStreamingStart) -> State + Send + Sync + 'static,
+        Step: Fn(&mut State, GrpcRequest<Req>) -> Result<GrpcClientStreamingControl<Resp>, GrpcStatus>
+            + Send
+            + Sync
+            + 'static,
+        Finish: Fn(State) -> Result<GrpcResponse<Resp>, GrpcStatus> + Send + Sync + 'static,
+    {
+        self.live_client_streaming.insert(
+            path.into(),
+            Box::new(
+                ClientStreamingLiveHandler::<Req, Resp, State, Init, Step, Finish> {
+                    init: Arc::new(init),
+                    step: Arc::new(step),
+                    finish: Arc::new(finish),
+                    _types: PhantomData,
+                },
+            ),
+        );
+        self
+    }
+
+    pub fn client_streaming_buffered<Req, Resp, F>(mut self, path: impl Into<String>, f: F) -> Self
     where
         Req: Message + Default + Send + Sync + 'static,
         Resp: Message + Default + Send + Sync + 'static,
@@ -450,6 +631,27 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         if let Some(handler) = self.unary.get(&request.path) {
             return handler.call(request, self.limits);
         }
+        if let Some(handler) = self.live_client_streaming.get(&request.path) {
+            let body = request.body.as_buffered().map(|body| body.to_vec());
+            let Some(body) = body else {
+                return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal));
+            };
+            let mut pending = match handler.start(&request, self.limits) {
+                Ok(PendingGrpcBody::LiveClientStreaming(pending)) => pending,
+                Ok(PendingGrpcBody::Buffered(_)) => {
+                    return grpc_http_response(
+                        Vec::new(),
+                        GrpcStatus::new(GrpcStatusCode::Internal),
+                    );
+                }
+                Err(status) => return grpc_http_response(Vec::new(), status),
+            };
+            match pending.push_chunk(&body, self.limits) {
+                Ok(Some(response)) => return response,
+                Ok(None) => return pending.finish(self.limits),
+                Err(status) => return grpc_http_response(Vec::new(), status),
+            }
+        }
         if let Some(handler) = self.client_streaming.get(&request.path) {
             return handler.call(request, self.limits);
         }
@@ -471,6 +673,16 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
             )),
             HttpRequestBody::Http2Stream(stream) => {
+                let body = if let Some(handler) = self.live_client_streaming.get(&request.path) {
+                    match handler.start(&request, self.limits) {
+                        Ok(body) => body,
+                        Err(status) => {
+                            return call_ctx.reply(grpc_http_response(Vec::new(), status));
+                        }
+                    }
+                } else {
+                    PendingGrpcBody::Buffered(Vec::new())
+                };
                 let id = self.next_pending_id;
                 self.next_pending_id = self.next_pending_id.saturating_add(1);
                 let source = stream.source;
@@ -480,7 +692,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     id,
                     PendingGrpcRequest {
                         request,
-                        body: Vec::new(),
+                        body,
                         call: request_context,
                     },
                 );
@@ -512,7 +724,21 @@ impl<S: Shard + 'static> GrpcRouter<S> {
             CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(
                 bytes,
             ))) => {
-                pending.body.extend_from_slice(&bytes);
+                match &mut pending.body {
+                    PendingGrpcBody::Buffered(body) => body.extend_from_slice(&bytes),
+                    PendingGrpcBody::LiveClientStreaming(state) => {
+                        match state.push_chunk(&bytes, self.limits) {
+                            Ok(Some(response)) => return reply_to_request(pending.call, response),
+                            Ok(None) => {}
+                            Err(status) => {
+                                return reply_to_request(
+                                    pending.call,
+                                    grpc_http_response(Vec::new(), status),
+                                );
+                            }
+                        }
+                    }
+                }
                 let source = stream.source;
                 let stream_id = stream.stream_id;
                 self.pending.insert(id, pending);
@@ -524,8 +750,13 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 .reply(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
             }
             CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof)) => {
-                pending.request.body = HttpRequestBody::Buffered(pending.body);
-                let response = self.response_for(pending.request);
+                let response = match pending.body {
+                    PendingGrpcBody::Buffered(body) => {
+                        pending.request.body = HttpRequestBody::Buffered(body);
+                        self.response_for(pending.request)
+                    }
+                    PendingGrpcBody::LiveClientStreaming(state) => state.finish(self.limits),
+                };
                 reply_to_request(pending.call, response)
             }
             CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
@@ -618,22 +849,7 @@ pub fn decode_unary_request<T: Message + Default>(
     request: &HttpRequest,
     limits: GrpcLimits,
 ) -> Result<T, GrpcError> {
-    let content_type = request
-        .headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if !is_grpc_content_type(content_type) {
-        return Err(GrpcError::BadContentType);
-    }
-    let unsupported_encoding = request
-        .headers
-        .get("grpc-encoding")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
-    if unsupported_encoding {
-        return Err(GrpcError::CompressedUnsupported);
-    }
+    validate_grpc_request(request)?;
     let body = request.body.as_buffered().ok_or(GrpcError::BadFrame)?;
     let mut cursor = 0;
     let message = decode_one_grpc_message::<T>(body, &mut cursor, limits)?;
@@ -647,6 +863,17 @@ pub fn decode_streaming_request<T: Message + Default>(
     request: &HttpRequest,
     limits: GrpcLimits,
 ) -> Result<Vec<T>, GrpcError> {
+    validate_grpc_request(request)?;
+    let body = request.body.as_buffered().ok_or(GrpcError::BadFrame)?;
+    let mut cursor = 0;
+    let mut messages = Vec::new();
+    while cursor < body.len() {
+        messages.push(decode_one_grpc_message::<T>(body, &mut cursor, limits)?);
+    }
+    Ok(messages)
+}
+
+fn validate_grpc_request(request: &HttpRequest) -> Result<(), GrpcError> {
     let content_type = request
         .headers
         .get(http::header::CONTENT_TYPE)
@@ -663,13 +890,7 @@ pub fn decode_streaming_request<T: Message + Default>(
     if unsupported_encoding {
         return Err(GrpcError::CompressedUnsupported);
     }
-    let body = request.body.as_buffered().ok_or(GrpcError::BadFrame)?;
-    let mut cursor = 0;
-    let mut messages = Vec::new();
-    while cursor < body.len() {
-        messages.push(decode_one_grpc_message::<T>(body, &mut cursor, limits)?);
-    }
-    Ok(messages)
+    Ok(())
 }
 
 pub fn encode_grpc_message<T: Message>(
@@ -725,8 +946,107 @@ fn decode_one_grpc_message<T: Message + Default>(
     Ok(decoded)
 }
 
+struct GrpcStreamingDecoder<T> {
+    header: [u8; GRPC_FRAME_HEADER_LEN],
+    header_len: usize,
+    message: Vec<u8>,
+    expected_len: Option<usize>,
+    _type: PhantomData<T>,
+}
+
+impl<T> GrpcStreamingDecoder<T>
+where
+    T: Message + Default,
+{
+    fn new() -> Self {
+        Self {
+            header: [0; GRPC_FRAME_HEADER_LEN],
+            header_len: 0,
+            message: Vec::new(),
+            expected_len: None,
+            _type: PhantomData,
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.header_len == 0 && self.expected_len.is_none() && self.message.is_empty()
+    }
+
+    fn push<F>(
+        &mut self,
+        mut bytes: &[u8],
+        limits: GrpcLimits,
+        mut on_message: F,
+    ) -> Result<Option<HttpResponse>, GrpcError>
+    where
+        F: FnMut(T) -> Result<Option<HttpResponse>, GrpcStatus>,
+    {
+        while !bytes.is_empty() || self.expected_len == Some(0) {
+            if self.expected_len.is_none() {
+                let take = (GRPC_FRAME_HEADER_LEN - self.header_len).min(bytes.len());
+                self.header[self.header_len..self.header_len + take]
+                    .copy_from_slice(&bytes[..take]);
+                self.header_len += take;
+                bytes = &bytes[take..];
+                if self.header_len < GRPC_FRAME_HEADER_LEN {
+                    continue;
+                }
+                if self.header[0] != 0 {
+                    return Err(GrpcError::CompressedUnsupported);
+                }
+                let len = u32::from_be_bytes([
+                    self.header[1],
+                    self.header[2],
+                    self.header[3],
+                    self.header[4],
+                ]) as usize;
+                if len > limits.max_message_bytes {
+                    return Err(GrpcError::MessageTooLarge {
+                        len,
+                        max: limits.max_message_bytes,
+                    });
+                }
+                self.message.clear();
+                self.message.reserve(len);
+                self.expected_len = Some(len);
+            }
+
+            let expected_len = self.expected_len.expect("expected length is set");
+            let remaining = expected_len.saturating_sub(self.message.len());
+            let take = remaining.min(bytes.len());
+            self.message.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+
+            if self.message.len() == expected_len {
+                let decoded = T::decode(&self.message[..]).map_err(|_| GrpcError::Decode)?;
+                self.header_len = 0;
+                self.expected_len = None;
+                self.message.clear();
+                if let Some(response) = on_message(decoded).map_err(GrpcError::Status)? {
+                    return Ok(Some(response));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
 pub(crate) fn grpc_status_http_response(status: GrpcStatus) -> HttpResponse {
     grpc_http_response(Vec::new(), status)
+}
+
+fn response_to_http<T: Message>(response: GrpcResponse<T>, limits: GrpcLimits) -> HttpResponse {
+    match encode_grpc_message(&response.message, limits) {
+        Ok(body) => grpc_http_response(body, GrpcStatus::ok()),
+        Err(GrpcError::EncodeTooLarge { len, max }) => grpc_http_response(
+            Vec::new(),
+            GrpcStatus::with_message(
+                GrpcStatusCode::ResourceExhausted,
+                format!("response message {len} exceeds cap {max}"),
+            ),
+        ),
+        Err(_) => grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal)),
+    }
 }
 
 fn grpc_http_response(body: Vec<u8>, status: GrpcStatus) -> HttpResponse {

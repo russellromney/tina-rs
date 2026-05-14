@@ -21,12 +21,13 @@ server-first h2c path in `tina-http::Http2Listener`: cleartext
 prior-knowledge transport, bounded stream table, explicit
 connection/stream flow-control windows, ordinary `HttpRequest` /
 `HttpResponse` service dispatch, streamed response DATA from Tina chunk
-sources, and gRPC request-body pull sources. Native gRPC now layers unary plus
-first server-streaming/client-streaming `prost` messages on that h2c path
-through `tina_http::GrpcRouter`: typed `GrpcStatus` trailers, message caps, no
-compression, and service timeout mapped to `DeadlineExceeded`. It is not tonic
-parity, not true bidirectional streaming, not HTTPS/2 ALPN, and not a broad
-client. Native HTTPS/1.1 lives in `tina-http`'s
+sources, and gRPC request-body pull sources. Native gRPC now layers unary,
+server-streaming, and incremental client-streaming `prost` messages on that h2c
+path through `tina_http::GrpcRouter`: typed `GrpcStatus` trailers, message
+caps, no compression, service timeout mapped to `DeadlineExceeded`, and tonic
+h2c smoke interop for the shipped modes. It is not full tonic parity, not true
+bidirectional streaming, not HTTPS/2 ALPN, and not a broad client. Native
+HTTPS/1.1 lives in `tina-http`'s
 `HttpsListener` and `HttpClient` — explicit DER cert config, typed
 startup, matchable TLS errors. For repeated outbound
 requests against the same origin, `tina_http::build_keepalive_pool`

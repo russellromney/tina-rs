@@ -935,9 +935,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.report.flow_control_blocked += 1;
             return Err(Http2ProtocolError::FlowControl);
         }
-        let idx = self
-            .find_stream(frame.stream_id)
-            .ok_or(Http2ProtocolError::StreamClosed)?;
+        let Some(idx) = self.find_stream(frame.stream_id) else {
+            if frame.stream_id <= self.highest_client_stream_id {
+                self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_STREAM_CLOSED))?;
+                return Ok(());
+            }
+            return Err(Http2ProtocolError::StreamClosed);
+        };
         if self.streams[idx].state == Http2StreamState::Closed || self.streams[idx].reset {
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_STREAM_CLOSED))?;
             return Ok(());

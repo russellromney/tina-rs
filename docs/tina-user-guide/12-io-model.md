@@ -84,9 +84,10 @@ For protocols, prefer boring sync codec crates:
 - HTTP/1 parse with `httparse`
 - HTTP/2 cleartext server first form with Tina-owned frames, bounded stream
   table, and explicit flow-control windows
-- gRPC unary plus first server-streaming/client-streaming form over Tina
+- gRPC unary plus server-streaming/incremental client-streaming form over Tina
   HTTP/2 h2c with `prost`, typed `GrpcStatus` trailers, explicit message caps,
-  service-call timeout mapping, and no compression
+  service-call timeout mapping, tonic h2c smoke interop for shipped modes, and
+  no compression
 - HTTP types with `http`
 - TLS state machine with `rustls` — driven by the runtime's TLS lane
   (`tls_bind` / `tls_accept` / `tls_connect` / `tls_read` / `tls_write`
@@ -118,21 +119,24 @@ What ships:
 - unary request/response;
 - first server-streaming response path: one request message, many response DATA
   chunks, final gRPC status trailers;
-- first client-streaming request path: many request messages over HTTP/2 DATA,
-  one response message, final gRPC status trailers;
+- incremental client-streaming request path: many request messages over HTTP/2
+  DATA, one response message, final gRPC status trailers;
 - `prost::Message` payload encode/decode;
 - gRPC frame parsing (`compressed flag + u32 length + protobuf bytes`);
 - `GrpcStatus` / `GrpcStatusCode` in HTTP/2 trailers;
 - explicit per-message caps through `GrpcLimits` (`512 KiB` by default);
 - service-call timeout mapped to `DeadlineExceeded`;
+- tonic h2c smoke interop for unary, server-streaming, and normal/early-final
+  client-streaming;
 - compression rejected as `Unimplemented`.
 
 What does not ship yet:
 
 - TLS ALPN / HTTPS/2 gRPC;
 - true bidirectional streaming with independent request/response lifecycles;
-- tonic/grpcurl interop scripts or reflection;
-- tonic compatibility, interceptors, reflection, health, or load balancing;
+- automated grpcurl interop scripts or reflection;
+- full tonic feature parity, interceptors, reflection, health, or load
+  balancing;
 - a pooled Tina gRPC client service.
 
 The tiny `grpc_unary_call_h2c` helper exists to prove the native wire path in

@@ -25,10 +25,22 @@
   - hostile-review fixes for large tonic unary responses, request-sensitive
     server-streaming specimen output, tight-queue final trailer preservation,
     and explicit grpcurl proto/command ownership.
+  - true incremental service-level client-streaming route API:
+    `GrpcRouter::client_streaming` now decodes each gRPC request message from
+    the HTTP/2 pull stream and calls user code per message; the former `Vec<T>`
+    helper is now named `client_streaming_buffered`.
+  - early client-streaming success/error before request EOF, with same HTTP/2
+    connection survival after late DATA on the finalized stream.
+  - one-byte HTTP/2 DATA frame splits across the 5-byte gRPC frame header and
+    protobuf body.
+  - valid-message-then-malformed-message failure with first handoff preserved.
+  - zero-message client-streaming behavior pinned as an empty stream that
+    finishes through the route's `finish` callback.
+  - zero-length protobuf request message decoded as one real message, not
+    confused with an empty stream or partial frame.
+  - tonic h2c client-streaming interop for normal, early-success, and
+    early-error paths.
 - Still deferred in this branch:
-  - true service-level client-streaming handler API; the current client
-    streaming route still accumulates decoded request messages for the handler,
-    so 096 cannot honestly claim final client-streaming until this lands;
   - true bidirectional streaming with independent request/response lifecycles;
   - automated grpcurl interop in CI; the proto and manual commands are owned,
     but the local environment used for this PR does not ship `grpcurl`;
@@ -384,6 +396,10 @@ Required client-streaming tests:
 - malformed request frame maps to status;
 - oversized request message maps to status;
 - service early error releases/cancels request stream.
+- service early success releases/cancels request stream.
+- one-byte DATA frame splits across gRPC header and protobuf body.
+- same HTTP/2 connection survives late DATA after early success/error.
+- tonic h2c observes normal, early-success, and early-error client streaming.
 
 Required bidirectional tests:
 
@@ -433,10 +449,11 @@ Docs must say:
 
 ## Done Means
 
-Current PR status: partially done. Unary, first server-streaming, and first
-client-streaming are implemented over the native HTTP/2 h2c server. The phase
-is not complete until bidirectional lifecycle policy, interop commands, and any
-claimed client behavior are proven or explicitly split out.
+Current PR status: partially done. Unary, server-streaming, and true
+incremental client-streaming are implemented over the native HTTP/2 h2c server.
+The phase is not complete until bidirectional lifecycle policy, grpcurl CI
+automation, and any claimed production client/TLS behavior are proven or
+explicitly split out.
 
 - Tina gRPC supports unary plus every streaming mode claimed in this phase.
 - Streaming modes reuse the 095 HTTP/2 streaming substrate.

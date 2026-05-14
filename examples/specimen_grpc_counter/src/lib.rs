@@ -5,8 +5,8 @@ use std::time::Duration;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg,
-    GrpcServerStreamingResponse, Http2Listener, Http2ListenerMsg, Http2ServerConfig,
+    GrpcClientStreamingControl, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
+    GrpcRouterMsg, GrpcServerStreamingResponse, Http2Listener, Http2ListenerMsg, Http2ServerConfig,
     grpc_unary_call_h2c,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
@@ -143,10 +143,39 @@ pub fn start_server_on(bind_addr: SocketAddr) -> Result<SpecimenServer, String> 
     )
     .client_streaming(
         "/specimen.Counter/Sum",
-        |request: GrpcClientStreamingRequest<CounterRequest>| {
-            Ok(GrpcResponse::new(CounterReply {
-                value: request.messages.iter().map(|message| message.delta).sum(),
-            }))
+        |_start| 0_u64,
+        |sum, request: GrpcRequest<CounterRequest>| {
+            *sum += request.message.delta;
+            Ok(GrpcClientStreamingControl::<CounterReply>::Continue)
+        },
+        |sum| {
+            Ok(GrpcResponse::new(CounterReply { value: sum }))
+        },
+    )
+    .client_streaming(
+        "/specimen.Counter/EarlySum",
+        |_start| 0_u64,
+        |sum, request: GrpcRequest<CounterRequest>| {
+            *sum += request.message.delta;
+            Ok(GrpcClientStreamingControl::Respond(GrpcResponse::new(
+                CounterReply { value: *sum },
+            )))
+        },
+        |sum| {
+            Ok(GrpcResponse::new(CounterReply { value: sum }))
+        },
+    )
+    .client_streaming(
+        "/specimen.Counter/EarlyReject",
+        |_start| (),
+        |_state, request: GrpcRequest<CounterRequest>| {
+            Err::<GrpcClientStreamingControl<CounterReply>, _>(tina_http::GrpcStatus::with_message(
+                tina_http::GrpcStatusCode::InvalidArgument,
+                format!("bad delta {}", request.message.delta),
+            ))
+        },
+        |_state| {
+            Ok(GrpcResponse::new(CounterReply { value: 0 }))
         },
     );
 

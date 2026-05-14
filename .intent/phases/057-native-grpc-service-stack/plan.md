@@ -8,9 +8,12 @@
 - Unary server shipped with `prost` payloads, typed gRPC status trailers,
   bounded message caps, timeout/status mappings, h2c client specimen helper,
   docs, and live tests.
-- Server-streaming deferred: unary plus trailer/status support was the clean
-  first form; streaming should reuse the HTTP body/source cancellation model in
-  a later slice.
+- PR #85 now also ships server-streaming and true incremental
+  client-streaming over native HTTP/2 h2c. Server-streaming reuses Tina chunk
+  sources; client-streaming decodes one gRPC message at a time from the HTTP/2
+  request pull path and exposes the old `Vec<T>` shape only as
+  `client_streaming_buffered`.
+- Bidirectional streaming remains deferred to Phase 096.
 - Production Tina gRPC client service deferred: this PR ships a tiny blocking
   h2c helper for tests/specimens only, not a pooled runtime-owned client
   topology.
@@ -30,9 +33,9 @@ Do not hide HTTP/2 pressure.
 
 Unary first.
 
-Server-streaming second.
+Server-streaming and client-streaming next.
 
-Client-streaming and bidirectional streaming later.
+Bidirectional streaming later.
 
 ## Goal
 

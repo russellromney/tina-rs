@@ -11,7 +11,7 @@ use common::TestShard;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
+    GrpcClientStreamingControl, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
     GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, Http2Limits, Http2Listener,
     Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, grpc_unary_call_h2c,
 };
@@ -115,11 +115,12 @@ impl GrpcHarness {
             )
             .client_streaming(
                 "/specimen.Counter/Sum",
-                |request: GrpcClientStreamingRequest<CounterRequest>| {
-                    Ok(GrpcResponse::new(CounterReply {
-                        value: request.messages.iter().map(|message| message.delta).sum(),
-                    }))
+                |_start| 0_u64,
+                |sum, request: GrpcRequest<CounterRequest>| {
+                    *sum += request.message.delta;
+                    Ok(GrpcClientStreamingControl::<CounterReply>::Continue)
                 },
+                |sum| Ok(GrpcResponse::new(CounterReply { value: sum })),
             );
         let service = runtime
             .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
@@ -795,6 +796,287 @@ fn grpc_client_streaming_handles_many_small_messages() {
 }
 
 #[test]
+fn grpc_client_streaming_decodes_one_byte_http2_data_frames_incrementally() {
+    let runtime = runtime();
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let decoded_for_route = Arc::clone(&decoded);
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).client_streaming(
+        "/specimen.Counter/TinySum",
+        |_start| 0_u64,
+        move |sum, request: GrpcRequest<CounterRequest>| {
+            decoded_for_route.fetch_add(1, Ordering::AcqRel);
+            *sum += request.message.delta;
+            Ok(GrpcClientStreamingControl::<CounterReply>::Continue)
+        },
+        |sum| Ok(GrpcResponse::new(CounterReply { value: sum })),
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut body = Vec::new();
+    body.extend_from_slice(&grpc_body(&CounterRequest { delta: 2 }));
+    body.extend_from_slice(&grpc_body(&CounterRequest { delta: 40 }));
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/TinySum", "application/grpc+proto"),
+    );
+    for byte in body {
+        write_frame(&mut stream, FRAME_DATA, 0, 1, &[byte]);
+    }
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &[]);
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(decode_one_grpc_reply(&body).value, 42);
+    assert_eq!(decoded.load(Ordering::Acquire), 2);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_zero_message_stream_finishes_as_empty_stream() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("/specimen.Counter/Sum", "application/grpc+proto"),
+    );
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(decode_one_grpc_reply(&body).value, 0);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_zero_length_protobuf_message_decodes_before_eof() {
+    let runtime = runtime();
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).client_streaming(
+        "/specimen.Counter/CountMessages",
+        |_start| 0_u64,
+        |count, _request: GrpcRequest<CounterRequest>| {
+            *count += 1;
+            Ok(GrpcClientStreamingControl::<CounterReply>::Continue)
+        },
+        |count| Ok(GrpcResponse::new(CounterReply { value: count })),
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let zero_len_grpc_message = [0, 0, 0, 0, 0];
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/CountMessages", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &zero_len_grpc_message,
+    );
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(decode_one_grpc_reply(&body).value, 1);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_can_return_early_success_and_connection_survives_late_data() {
+    let runtime = runtime();
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let decoded_for_route = Arc::clone(&decoded);
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default())
+        .unary(
+            "/specimen.Counter/Increment",
+            |request: GrpcRequest<CounterRequest>| {
+                Ok(GrpcResponse::new(CounterReply {
+                    value: request.message.delta + 1,
+                }))
+            },
+        )
+        .client_streaming(
+            "/specimen.Counter/EarlySum",
+            |_start| 0_u64,
+            move |sum, request: GrpcRequest<CounterRequest>| {
+                decoded_for_route.fetch_add(1, Ordering::AcqRel);
+                *sum += request.message.delta;
+                Ok(GrpcClientStreamingControl::Respond(GrpcResponse::new(
+                    CounterReply { value: *sum },
+                )))
+            },
+            |_sum| Ok(GrpcResponse::new(CounterReply { value: 999 })),
+        );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/EarlySum", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        1,
+        &grpc_body(&CounterRequest { delta: 7 }),
+    );
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(decode_one_grpc_reply(&body).value, 7);
+    assert_eq!(decoded.load(Ordering::Acquire), 1);
+
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &grpc_body(&CounterRequest { delta: 1000 }),
+    );
+    let status = raw_grpc_status(
+        &mut stream,
+        3,
+        "/specimen.Counter/Increment",
+        "application/grpc+proto",
+        &grpc_body(&CounterRequest { delta: 41 }),
+    );
+    assert_eq!(status, GrpcStatusCode::Ok);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_can_return_early_error_and_connection_survives_late_data() {
+    let runtime = runtime();
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let decoded_for_route = Arc::clone(&decoded);
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default())
+        .unary(
+            "/specimen.Counter/Increment",
+            |request: GrpcRequest<CounterRequest>| {
+                Ok(GrpcResponse::new(CounterReply {
+                    value: request.message.delta + 1,
+                }))
+            },
+        )
+        .client_streaming(
+            "/specimen.Counter/EarlyReject",
+            |_start| (),
+            move |_state, request: GrpcRequest<CounterRequest>| {
+                decoded_for_route.fetch_add(1, Ordering::AcqRel);
+                Err::<GrpcClientStreamingControl<CounterReply>, _>(GrpcStatus::with_message(
+                    GrpcStatusCode::InvalidArgument,
+                    format!("bad delta {}", request.message.delta),
+                ))
+            },
+            |_state| Ok(GrpcResponse::new(CounterReply { value: 999 })),
+        );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/EarlyReject", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        1,
+        &grpc_body(&CounterRequest { delta: 13 }),
+    );
+    assert_eq!(read_status(&mut stream, 1), GrpcStatusCode::InvalidArgument);
+    assert_eq!(decoded.load(Ordering::Acquire), 1);
+
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &grpc_body(&CounterRequest { delta: 1000 }),
+    );
+    let status = raw_grpc_status(
+        &mut stream,
+        3,
+        "/specimen.Counter/Increment",
+        "application/grpc+proto",
+        &grpc_body(&CounterRequest { delta: 41 }),
+    );
+    assert_eq!(status, GrpcStatusCode::Ok);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_rejects_malformed_message_after_valid_handoff() {
+    let runtime = runtime();
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let decoded_for_route = Arc::clone(&decoded);
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).client_streaming(
+        "/specimen.Counter/StrictSum",
+        |_start| 0_u64,
+        move |sum, request: GrpcRequest<CounterRequest>| {
+            decoded_for_route.fetch_add(1, Ordering::AcqRel);
+            *sum += request.message.delta;
+            Ok(GrpcClientStreamingControl::<CounterReply>::Continue)
+        },
+        |sum| Ok(GrpcResponse::new(CounterReply { value: sum })),
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let malformed = [0, 0, 0, 0, 1, 0xff];
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/StrictSum", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        1,
+        &grpc_body(&CounterRequest { delta: 5 }),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &malformed);
+
+    assert_eq!(read_status(&mut stream, 1), GrpcStatusCode::InvalidArgument);
+    assert_eq!(decoded.load(Ordering::Acquire), 1);
+    harness.shutdown();
+}
+
+#[test]
 fn grpc_client_streaming_declared_message_cap_fails_before_service() {
     let runtime = runtime();
     let service_calls = Arc::new(AtomicUsize::new(0));
@@ -804,12 +1086,13 @@ fn grpc_client_streaming_declared_message_cap_fails_before_service() {
     })
     .client_streaming(
         "/specimen.Counter/Sum",
-        move |request: GrpcClientStreamingRequest<CounterRequest>| {
+        |_start| 0_u64,
+        move |sum, request: GrpcRequest<CounterRequest>| {
             calls_for_route.fetch_add(1, Ordering::AcqRel);
-            Ok(GrpcResponse::new(CounterReply {
-                value: request.messages.iter().map(|message| message.delta).sum(),
-            }))
+            *sum += request.message.delta;
+            Ok(GrpcClientStreamingControl::<CounterReply>::Continue)
         },
+        |sum| Ok(GrpcResponse::new(CounterReply { value: sum })),
     );
     let service = runtime
         .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)

@@ -86,13 +86,12 @@ commands for unary, server-streaming, and client-streaming. The current local
 verification environment does not have `grpcurl`, so CI automation is still
 listed as deferred rather than falsely claimed.
 
-### Still Risky: Client-Streaming Handler API Is Buffered
+### Fixed In Code: Client-Streaming Handler API Is Incremental
 
-The HTTP/2 request pull path is real, caps fire before service code, and the
-many-small-message path is proven. But `GrpcRouter::client_streaming` still
-collects decoded messages into a `Vec<T>` before invoking the user handler.
-That is not the final service-level streaming API for unbounded streams, early
-application reject, or request/response overlap.
+The HTTP/2 request pull path is real, caps fire before the per-message handler,
+and the many-small-message path is proven. `GrpcRouter::client_streaming` now
+decodes one message at a time and calls user code per message. The old
+whole-`Vec<T>` shape survives only as `client_streaming_buffered`.
 
 ### Fixed In Plan: Client-Streaming Is Now A Bidi Prerequisite
 

@@ -7,7 +7,9 @@ fn specimen_grpc_counter_smoke() {
 #[tokio::test]
 async fn specimen_grpc_counter_tonic_h2c_interop() {
     use http::uri::PathAndQuery;
-    use tokio_stream::iter;
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, sleep};
+    use tokio_stream::{iter, wrappers::ReceiverStream};
     use tonic::Request;
     use tonic::client::Grpc;
     use tonic::codec::ProstCodec;
@@ -86,6 +88,50 @@ async fn specimen_grpc_counter_tonic_h2c_interop() {
         .expect("tonic client streaming")
         .into_inner();
     assert_eq!(response.value, 42);
+
+    client.ready().await.expect("tonic ready");
+    let (tx, rx) = mpsc::channel(2);
+    tokio::spawn(async move {
+        tx.send(specimen_grpc_counter::CounterRequest { delta: 7 })
+            .await
+            .expect("send first early-sum request");
+        sleep(Duration::from_millis(50)).await;
+        let _ = tx
+            .send(specimen_grpc_counter::CounterRequest { delta: 1000 })
+            .await;
+    });
+    let response: specimen_grpc_counter::CounterReply = client
+        .client_streaming(
+            Request::new(ReceiverStream::new(rx)),
+            PathAndQuery::from_static("/specimen.Counter/EarlySum"),
+            ProstCodec::default(),
+        )
+        .await
+        .expect("tonic early client-streaming success")
+        .into_inner();
+    assert_eq!(response.value, 7);
+
+    client.ready().await.expect("tonic ready");
+    let (tx, rx) = mpsc::channel(2);
+    tokio::spawn(async move {
+        tx.send(specimen_grpc_counter::CounterRequest { delta: 13 })
+            .await
+            .expect("send first early-reject request");
+        sleep(Duration::from_millis(50)).await;
+        let _ = tx
+            .send(specimen_grpc_counter::CounterRequest { delta: 1000 })
+            .await;
+    });
+    let result: Result<tonic::Response<specimen_grpc_counter::CounterReply>, tonic::Status> =
+        client
+            .client_streaming(
+                Request::new(ReceiverStream::new(rx)),
+                PathAndQuery::from_static("/specimen.Counter/EarlyReject"),
+                ProstCodec::default(),
+            )
+            .await;
+    let error = result.expect_err("tonic early client-streaming error");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     server.shutdown().expect("shutdown specimen server");
 }
