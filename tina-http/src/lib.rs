@@ -83,7 +83,14 @@
 //! HTTPS/2 or ALPN claim, not gRPC, not a full client, and not a full
 //! RFC feature clone.
 //!
-//! Still out of scope: HTTP/2 TLS ALPN, gRPC, ACME, mTLS, SNI routing,
+//! gRPC: [`GrpcRouter`] layers unary `prost` messages and typed
+//! [`GrpcStatus`] trailers on that HTTP/2 h2c server. It rejects
+//! compression, caps message bytes before protobuf decode, maps service
+//! call timeout to `DeadlineExceeded`, and keeps server-streaming,
+//! client-streaming, bidirectional streaming, interceptors, reflection,
+//! and TLS ALPN out of this first form.
+//!
+//! Still out of scope: HTTP/2 TLS ALPN, ACME, mTLS, SNI routing,
 //! system roots, certificate reload, redirects, cookies. For mature
 //! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
 
@@ -93,6 +100,7 @@ pub mod body_metrics;
 pub mod chunked_decoder;
 pub mod client;
 pub mod connection;
+pub mod grpc;
 pub mod http2;
 pub mod keepalive;
 pub mod listener;
@@ -110,6 +118,10 @@ pub mod websocket;
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
+pub use grpc::{
+    GrpcError, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcStatus, GrpcStatusCode,
+    decode_unary_request, encode_grpc_message, grpc_unary_call_h2c,
+};
 pub use http2::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReport, Http2Limits, Http2Listener,
     Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig, Http2StreamReport,

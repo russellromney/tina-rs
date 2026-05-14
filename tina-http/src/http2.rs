@@ -13,8 +13,8 @@ use std::time::Duration;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, CallOutcome, ListenerId, StreamId, call, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_read, tcp_write,
+    CallError, CallOutcome, ListenerId, StreamId, call_with_handle, cancel_call, tcp_accept,
+    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
 use crate::{HttpRequest, HttpRequestBody, HttpResponse, HttpResponseBody};
@@ -489,11 +489,28 @@ fn encode_response_headers(response: &HttpResponse, body_len: usize) -> Vec<u8> 
         if name.as_str().starts_with(':') {
             continue;
         }
+        if name.as_str() == "grpc-status" || name.as_str() == "grpc-message" {
+            continue;
+        }
         if let Ok(value) = value.to_str() {
             encode_literal_header(name.as_str(), value, &mut block);
         }
     }
     block
+}
+
+fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8>> {
+    let status = response.headers.get("grpc-status")?;
+    let mut block = Vec::new();
+    if let Ok(value) = status.to_str() {
+        encode_literal_header("grpc-status", value, &mut block);
+    }
+    if let Some(message) = response.headers.get("grpc-message") {
+        if let Ok(value) = message.to_str() {
+            encode_literal_header("grpc-message", value, &mut block);
+        }
+    }
+    Some(block)
 }
 
 #[derive(Debug)]
@@ -502,6 +519,8 @@ struct ActiveStream {
     state: Http2StreamState,
     headers: Option<HeaderBlock>,
     body: Vec<u8>,
+    grpc: bool,
+    pending_call: Option<tina::CallHandle<HttpResponse>>,
     recv_window: i32,
     send_window: i32,
     pending_response: Option<PendingResponse>,
@@ -512,15 +531,18 @@ struct ActiveStream {
 struct PendingResponse {
     header_block: Vec<u8>,
     body: Vec<u8>,
+    trailers: Option<Vec<u8>>,
 }
 
 impl ActiveStream {
-    fn new(id: u32, headers: HeaderBlock, recv_window: i32, send_window: i32) -> Self {
+    fn new(id: u32, headers: HeaderBlock, recv_window: i32, send_window: i32, grpc: bool) -> Self {
         Self {
             id,
             state: Http2StreamState::Open,
             headers: Some(headers),
             body: Vec::new(),
+            grpc,
+            pending_call: None,
             recv_window,
             send_window,
             pending_response: None,
@@ -537,6 +559,10 @@ pub enum Http2ConnectionMsg {
     ServiceReturned {
         stream_id: u32,
         outcome: CallOutcome<HttpResponse>,
+    },
+    ServiceCancelled {
+        stream_id: u32,
+        outcome: tina::CancelOutcome,
     },
     Wrote(Result<usize, CallError>),
     Closed(Result<(), CallError>),
@@ -618,6 +644,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             Http2ConnectionMsg::ServiceReturned { stream_id, outcome } => {
                 self.handle_service_returned(stream_id, outcome)
             }
+            Http2ConnectionMsg::ServiceCancelled { .. } => noop(),
             Http2ConnectionMsg::Wrote(Ok(n)) => self.handle_wrote(n),
             Http2ConnectionMsg::Wrote(Err(_)) => self.close_now(),
             Http2ConnectionMsg::Closed(_) => stop(),
@@ -739,7 +766,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             FRAME_HEADERS => self.handle_headers(frame, effects),
             FRAME_DATA => self.handle_data(frame, effects),
             FRAME_WINDOW_UPDATE => self.handle_window_update(frame),
-            FRAME_RST_STREAM => self.handle_rst_stream(frame),
+            FRAME_RST_STREAM => self.handle_rst_stream(frame, effects),
             FRAME_PING => self.handle_ping(frame),
             FRAME_GOAWAY => {
                 self.goaway = true;
@@ -806,12 +833,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
         let headers = decode_headers_block(&frame.payload, self.limits.max_header_bytes)?;
         validate_request_headers(&headers)?;
+        let grpc = headers
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(crate::grpc::is_grpc_content_type);
         let end_stream = frame.flags & FLAG_END_STREAM != 0;
         let mut stream = ActiveStream::new(
             frame.stream_id,
             headers,
             self.limits.initial_stream_window,
             DEFAULT_WINDOW,
+            grpc,
         );
         self.report.opened_streams += 1;
         if end_stream {
@@ -888,13 +921,23 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         Ok(())
     }
 
-    fn handle_rst_stream(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
+    fn handle_rst_stream(
+        &mut self,
+        frame: Frame,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
         if frame.stream_id == 0 || frame.payload.len() != 4 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
-        if self.remove_stream(frame.stream_id).is_some() {
+        if let Some(mut stream) = self.remove_stream(frame.stream_id) {
             self.report.reset_streams += 1;
             self.report.closed_streams += 1;
+            if let Some(handle) = stream.pending_call.take() {
+                let stream_id = frame.stream_id;
+                effects.push(cancel_call(handle).reply(move |outcome| {
+                    Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
+                }));
+            }
         }
         Ok(())
     }
@@ -936,10 +979,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(window_update_frame(0, consumed as u32))?;
             self.enqueue_frame(window_update_frame(stream_id, consumed as u32))?;
         }
-        effects.push(
-            call(self.service, M::from(request), self.service_call_timeout)
-                .reply(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome }),
-        );
+        let (effect, handle) =
+            call_with_handle(self.service, M::from(request), self.service_call_timeout)
+                .reply(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
+        if let Some(idx) = self.find_stream(stream_id) {
+            self.streams[idx].pending_call = Some(handle);
+        }
+        effects.push(effect);
         Ok(())
     }
 
@@ -951,6 +997,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         if self.find_stream(stream_id).is_none() {
             self.report.late_replies_after_close += 1;
             return noop();
+        }
+        let grpc = self
+            .find_stream(stream_id)
+            .and_then(|idx| self.streams.get(idx))
+            .is_some_and(|stream| stream.grpc);
+        if let Some(idx) = self.find_stream(stream_id) {
+            let _ = self.streams[idx].pending_call.take();
         }
         match outcome {
             CallOutcome::Replied(response) => {
@@ -965,13 +1018,34 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             CallOutcome::Full => {
                 self.report.stream_full += 1;
-                let _ = self.enqueue_response(stream_id, &HttpResponse::service_unavailable());
+                let response = if grpc {
+                    crate::grpc::grpc_status_http_response(crate::grpc::GrpcStatus::new(
+                        crate::grpc::GrpcStatusCode::ResourceExhausted,
+                    ))
+                } else {
+                    HttpResponse::service_unavailable()
+                };
+                let _ = self.enqueue_response(stream_id, &response);
             }
             CallOutcome::Closed | CallOutcome::Rejected(_) => {
-                let _ = self.enqueue_response(stream_id, &HttpResponse::internal_error());
+                let response = if grpc {
+                    crate::grpc::grpc_status_http_response(crate::grpc::GrpcStatus::new(
+                        crate::grpc::GrpcStatusCode::Internal,
+                    ))
+                } else {
+                    HttpResponse::internal_error()
+                };
+                let _ = self.enqueue_response(stream_id, &response);
             }
             CallOutcome::Timeout => {
-                let _ = self.enqueue_response(stream_id, &HttpResponse::gateway_timeout());
+                let response = if grpc {
+                    crate::grpc::grpc_status_http_response(crate::grpc::GrpcStatus::new(
+                        crate::grpc::GrpcStatusCode::DeadlineExceeded,
+                    ))
+                } else {
+                    HttpResponse::gateway_timeout()
+                };
+                let _ = self.enqueue_response(stream_id, &response);
             }
         }
         if self.pending_write.is_empty() && !self.write_queue.is_empty() {
@@ -1004,11 +1078,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
         };
         let block = encode_response_headers(response, body.len());
+        let trailers = encode_response_trailers(response);
         self.queue_or_send_response(
             stream_id,
             PendingResponse {
                 header_block: block,
                 body,
+                trailers,
             },
         )
     }
@@ -1045,20 +1121,24 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         } else {
             pending.body.len().div_ceil(frame_cap)
         };
-        let slots_needed = 1 + data_frames;
+        let trailer_frames = usize::from(pending.trailers.is_some());
+        let slots_needed = 1 + data_frames + trailer_frames;
         self.ensure_outbound_slots(slots_needed)?;
         self.enqueue_frame(headers_frame(
             stream_id,
-            pending.body.is_empty(),
+            pending.body.is_empty() && pending.trailers.is_none(),
             pending.header_block,
         ))?;
         if !pending.body.is_empty() {
             self.send_window -= pending.body.len() as i32;
             self.streams[idx].send_window -= pending.body.len() as i32;
             for (chunk_index, chunk) in pending.body.chunks(frame_cap).enumerate() {
-                let end_stream = chunk_index + 1 == data_frames;
+                let end_stream = chunk_index + 1 == data_frames && pending.trailers.is_none();
                 self.enqueue_frame(data_frame(stream_id, end_stream, chunk.to_vec()))?;
             }
+        }
+        if let Some(trailers) = pending.trailers {
+            self.enqueue_frame(headers_frame(stream_id, true, trailers))?;
         }
         self.streams[idx].state = Http2StreamState::Closed;
         self.remove_stream(stream_id);
@@ -1389,6 +1469,7 @@ mod tests {
             HeaderBlock::default(),
             DEFAULT_WINDOW,
             DEFAULT_WINDOW,
+            false,
         ));
         conn.enqueue_response(1, &HttpResponse::with_body(StatusCode::OK, b"abc".to_vec()))
             .expect("response cap maps to rst, not connection error");

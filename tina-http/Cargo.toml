@@ -17,6 +17,7 @@ httparse = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 sha1 = { version = "0.10", default-features = false }
+prost = { version = "0.13", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
 tina-sim = { path = "../tina-sim" }
