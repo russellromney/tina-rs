@@ -12,9 +12,17 @@
     protocol;
   - extension offer inspection with `extension_offers()`;
   - browser/specimen path requests and proves `tina.room.v1`.
-- Not complete yet: Autobahn classification, browser `wss://`, full production
-  room system, load/soak harness, native-client decision implementation, live
-  trace to simulator replay, and production ops reports.
+- Not complete yet: browser `wss://`, full production room system, load/soak
+  harness, production ops reports, Autobahn classification, native-client
+  decision implementation, and live trace to simulator replay.
+- Follow-up split after review:
+  - Phase 097 owns the stretch-but-implementable production-server hardening:
+    browser `wss://`, admission/auth/subprotocol hardening, close/heartbeat
+    policy, session/room reports, production room lifecycle, load/soak proof,
+    and external-client docs.
+  - The roadmap follow-up owns the broader replacement gates: Autobahn
+    classification, live trace to simulator replay, Tina-native client if still
+    desired, and bounded compression if it becomes a product requirement.
 - Checks run for this in-progress slice:
   - `cargo fmt --all --check`;
   - `cargo test -p tina-http websocket --tests`;
@@ -25,9 +33,10 @@
   - `npm ci && npm run browser:smoke` from
     `examples/specimen_websocket_room`;
   - `git diff --check`.
-- This is intentionally one large phase. Do not split into separate compliance,
-  browser, load, replay, client, or room-lifecycle phases unless the phase is
-  formally abandoned.
+- The original 096 monster phase is now split on purpose. Keep the current PR
+  honest: 096 started the production replacement push, 097 carries the
+  production-server stretch, and the roadmap names the remaining replacement
+  follow-up.
 - Phase 094 makes Tina usable for bounded server-side HTTP/1.1 WebSockets.
   Phase 096 is the bar for saying:
 

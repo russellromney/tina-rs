@@ -1,0 +1,68 @@
+# 097 Hostile Review
+
+## Verdict
+
+This is the right size only if it stays about production-shaped server
+operation, not full standards replacement. The plan must make real user paths
+fail loudly: browser TLS, bad admission, slow peers, shutdown, stale handles,
+and reconnect churn.
+
+## Findings Folded Into Plan
+
+- Finding: The phase could drift back into the huge 096 replacement bucket.
+  Fixed by making Autobahn and live replay explicit roadmap follow-ups.
+- Finding: "WSS works" can become a raw TLS client test. Fixed by requiring a
+  Chromium browser `wss://` smoke with deterministic local trust.
+- Finding: Admission hooks could become docs-only. Fixed by requiring Origin,
+  auth, subprotocol, full-room, and shutdown rejection tests.
+- Finding: Reports can become an unbounded event stream. Fixed by requiring
+  bounded snapshots and aggregate counters only.
+- Finding: Heartbeats often hide fake cancellation. Fixed by requiring visible
+  close/write outcomes: completion, timeout, full, closed, or stale.
+- Finding: Load tests often print vibes. Fixed by requiring CI-short and
+  local-long commands with checked high-water summaries and before/after
+  resource counts.
+- Finding: Room lifecycle can become a framework. Fixed by keeping the target
+  copyable and allowing an `examples/systems` move only if specimen size is no
+  longer honest.
+- Finding: Native client work can swallow the phase. Fixed by choosing browser
+  plus `tungstenite` interop as the required client story.
+- Finding: Timing flakes can masquerade as proof. Fixed by banning sleeps as
+  proof and requiring barriers, reports, deadlines, and socket deadlines.
+
+## Must Not Slip
+
+- Do not claim full WebSocket replacement after this phase.
+- Do not add an unbounded collector to make load reporting easy.
+- Do not use a browser-served HTML file as browser proof.
+- Do not disable TLS verification in docs except in clearly labeled local-test
+  setup.
+- Do not let room shutdown accept a new upgrade after readiness flips.
+- Do not let stale handles succeed after room/session recreation.
+- Do not make reconnect/resume look lossless.
+- Do not make ping/pong timers depend on sleeps in tests.
+
+## Extra Test Pressure
+
+The plan should hurt regressions from the user's side:
+
+- browser connects with `wss://`, sends text and binary, receives both, sees
+  selected subprotocol, and observes close;
+- raw/bad clients hit bad Origin, bad auth, bad subprotocol, malformed close,
+  and protocol-error close;
+- slow readers force `Full`/`Timeout` while healthy readers keep receiving;
+- load run churns clients while rooms expire and refill;
+- shutdown starts while broadcasts are in flight and still reaches a terminal
+  report;
+- every e2e client has read/write deadlines so missing frames fail instead of
+  hanging.
+
+## Remaining Skepticism
+
+Even after this phase, two hard claims remain unproven:
+
+- standards compatibility across Autobahn;
+- production bug replay through live trace to simulator facts.
+
+Those belong in the roadmap follow-up, not as quiet stretch promises here.
+
