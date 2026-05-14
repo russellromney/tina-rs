@@ -3,7 +3,7 @@ mod common;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -655,6 +655,52 @@ fn grpc_server_streaming_peer_reset_cancels_response_source() {
 }
 
 #[test]
+fn grpc_server_streaming_non_reading_peer_reset_cancels_blocked_source() {
+    let runtime = runtime();
+    let received_cancel = Arc::new(AtomicBool::new(false));
+    let source = runtime
+        .register_with_capacity::<CancelRecordingSource, Infallible>(
+            CancelRecordingSource {
+                chunk: vec![0; 128 * 1024],
+                received_cancel: Arc::clone(&received_cancel),
+            },
+            16,
+        )
+        .expect("register blocked cancel source");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).server_streaming(
+        "/specimen.Counter/BlockedCancelWatch",
+        move |_request: GrpcRequest<CounterRequest>| Ok(GrpcServerStreamingResponse::new(source)),
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 0 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers(
+            "/specimen.Counter/BlockedCancelWatch",
+            "application/grpc+proto",
+        ),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
+    std::thread::sleep(Duration::from_millis(50));
+
+    write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        received_cancel.load(Ordering::Acquire),
+        "peer reset must cancel a response source even when the client never drains DATA"
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn grpc_client_streaming_reads_multiple_request_messages() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
     let mut stream = connect_h2(harness.addr);
@@ -709,6 +755,48 @@ fn grpc_client_streaming_handles_many_small_messages() {
     let (body, status) = read_body_and_status(&mut stream, 1);
     assert_eq!(status, GrpcStatusCode::Ok);
     assert_eq!(decode_one_grpc_reply(&body).value, expected);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_declared_message_cap_fails_before_service() {
+    let runtime = runtime();
+    let service_calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_route = Arc::clone(&service_calls);
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits {
+        max_message_bytes: 8,
+    })
+    .client_streaming(
+        "/specimen.Counter/Sum",
+        move |request: GrpcClientStreamingRequest<CounterRequest>| {
+            calls_for_route.fetch_add(1, Ordering::AcqRel);
+            Ok(GrpcResponse::new(CounterReply {
+                value: request.messages.iter().map(|message| message.delta).sum(),
+            }))
+        },
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut malicious = Vec::new();
+    malicious.push(0);
+    malicious.extend_from_slice(&1024_u32.to_be_bytes());
+
+    let status = raw_grpc_status(
+        &mut stream,
+        1,
+        "/specimen.Counter/Sum",
+        "application/grpc+proto",
+        &malicious,
+    );
+    assert_eq!(status, GrpcStatusCode::ResourceExhausted);
+    assert_eq!(
+        service_calls.load(Ordering::Acquire),
+        0,
+        "oversized declared message must fail before invoking user service"
+    );
     harness.shutdown();
 }
 

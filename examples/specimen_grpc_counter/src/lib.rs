@@ -5,8 +5,9 @@ use std::time::Duration;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg, Http2Listener, Http2ListenerMsg,
-    Http2ServerConfig, grpc_unary_call_h2c,
+    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg,
+    GrpcServerStreamingResponse, Http2Listener, Http2ListenerMsg, Http2ServerConfig,
+    grpc_unary_call_h2c,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
@@ -31,7 +32,36 @@ impl Shard for SpecimenShard {
     }
 }
 
-pub fn run_smoke() -> Result<u64, String> {
+pub struct SpecimenServer {
+    pub addr: SocketAddr,
+    runtime: Option<ThreadedRuntime<SpecimenShard, DefaultThreadedMailboxFactory>>,
+    listener: Address<Http2ListenerMsg>,
+}
+
+impl SpecimenServer {
+    pub fn shutdown(mut self) -> Result<(), String> {
+        self.shutdown_inner()
+    }
+
+    fn shutdown_inner(&mut self) -> Result<(), String> {
+        let Some(runtime) = self.runtime.take() else {
+            return Ok(());
+        };
+        let _ = runtime.try_send(self.listener, Http2ListenerMsg::Stop);
+        runtime
+            .shutdown()
+            .map(|_| ())
+            .map_err(|error| format!("shutdown: {error:?}"))
+    }
+}
+
+impl Drop for SpecimenServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown_inner();
+    }
+}
+
+pub fn start_server() -> Result<SpecimenServer, String> {
     let runtime = ThreadedRuntime::with_config(
         SpecimenShard,
         DefaultThreadedMailboxFactory,
@@ -44,6 +74,23 @@ pub fn run_smoke() -> Result<u64, String> {
 
     let state = Arc::new(Mutex::new(0_u64));
     let router_state = Arc::clone(&state);
+    let watch_responses = Arc::new(Mutex::new(Vec::new()));
+    for _ in 0..16 {
+        let watch_response = GrpcServerStreamingResponse::from_messages(
+            &runtime,
+            vec![CounterReply { value: 41 }, CounterReply { value: 42 }],
+            GrpcLimits {
+                max_message_bytes: 1024,
+            },
+            16,
+        )
+        .map_err(|error| format!("register watch response: {error:?}"))?;
+        watch_responses
+            .lock()
+            .expect("watch responses")
+            .push(watch_response);
+    }
+    let watch_responses_for_route = Arc::clone(&watch_responses);
     let router = GrpcRouter::<SpecimenShard>::new(GrpcLimits {
         max_message_bytes: 1024,
     })
@@ -53,6 +100,26 @@ pub fn run_smoke() -> Result<u64, String> {
             let mut value = router_state.lock().expect("counter lock");
             *value += request.message.delta;
             Ok(GrpcResponse::new(CounterReply { value: *value }))
+        },
+    )
+    .server_streaming(
+        "/specimen.Counter/Watch",
+        move |_request: GrpcRequest<CounterRequest>| {
+            watch_responses_for_route
+                .lock()
+                .expect("watch responses")
+                .pop()
+                .ok_or_else(|| {
+                    tina_http::GrpcStatus::new(tina_http::GrpcStatusCode::ResourceExhausted)
+                })
+        },
+    )
+    .client_streaming(
+        "/specimen.Counter/Sum",
+        |request: GrpcClientStreamingRequest<CounterRequest>| {
+            Ok(GrpcResponse::new(CounterReply {
+                value: request.messages.iter().map(|message| message.delta).sum(),
+            }))
         },
     );
 
@@ -79,8 +146,17 @@ pub fn run_smoke() -> Result<u64, String> {
         .wait(Duration::from_secs(2))
         .map_err(|error| format!("listener did not publish bound address: {error:?}"))?;
 
-    let reply: CounterReply = grpc_unary_call_h2c(
+    Ok(SpecimenServer {
         addr,
+        runtime: Some(runtime),
+        listener,
+    })
+}
+
+pub fn run_smoke() -> Result<u64, String> {
+    let server = start_server()?;
+    let reply: CounterReply = grpc_unary_call_h2c(
+        server.addr,
         "/specimen.Counter/Increment",
         &CounterRequest { delta: 7 },
         Duration::from_secs(2),
@@ -90,9 +166,6 @@ pub fn run_smoke() -> Result<u64, String> {
     )
     .map_err(|error| format!("grpc call: {error:?}"))?;
 
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    runtime
-        .shutdown()
-        .map_err(|error| format!("shutdown: {error:?}"))?;
+    server.shutdown()?;
     Ok(reply.value)
 }

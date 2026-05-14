@@ -307,38 +307,29 @@ struct HeaderBlock {
     saw_regular: bool,
 }
 
+#[cfg(test)]
 fn decode_headers_block(
     block: &[u8],
     max_header_bytes: usize,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
+    let mut decoder = hpack::Decoder::new();
+    decode_headers_block_with(&mut decoder, block, max_header_bytes)
+}
+
+fn decode_headers_block_with(
+    decoder: &mut hpack::Decoder<'static>,
+    block: &[u8],
+    max_header_bytes: usize,
+) -> Result<HeaderBlock, Http2ProtocolError> {
     let mut out = HeaderBlock::default();
-    let mut cursor = 0;
-    while cursor < block.len() {
-        let b = block[cursor];
-        if b & 0x80 != 0 {
-            let (idx, used) = decode_integer(&block[cursor..], 7)?;
-            cursor += used;
-            let (name, value) = static_header(idx).ok_or(Http2ProtocolError::HpackUnsupported)?;
-            add_header(&mut out, name, value, max_header_bytes)?;
-        } else if b & 0xe0 == 0x20 {
-            return Err(Http2ProtocolError::HpackUnsupported);
-        } else {
-            let prefix = if b & 0x40 != 0 { 6 } else { 4 };
-            let (name_index, used) = decode_integer(&block[cursor..], prefix)?;
-            cursor += used;
-            let name = if name_index == 0 {
-                let (s, used) = decode_string(&block[cursor..])?;
-                cursor += used;
-                s
-            } else {
-                static_header_name(name_index)
-                    .ok_or(Http2ProtocolError::HpackUnsupported)?
-                    .to_owned()
-            };
-            let (value, used) = decode_string(&block[cursor..])?;
-            cursor += used;
-            add_header(&mut out, &name, &value, max_header_bytes)?;
-        }
+    for (name, value) in decoder
+        .decode(block)
+        .map_err(|_| Http2ProtocolError::HpackUnsupported)?
+    {
+        let name = std::str::from_utf8(&name).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
+        let value =
+            std::str::from_utf8(&value).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
+        add_header(&mut out, name, value, max_header_bytes)?;
     }
     Ok(out)
 }
@@ -389,53 +380,6 @@ fn add_header(
     Ok(())
 }
 
-fn decode_integer(input: &[u8], prefix_bits: u8) -> Result<(usize, usize), Http2ProtocolError> {
-    if input.is_empty() || prefix_bits == 0 || prefix_bits > 8 {
-        return Err(Http2ProtocolError::HpackUnsupported);
-    }
-    let mask = (1_u16 << prefix_bits) - 1;
-    let mut value = (input[0] as usize) & mask as usize;
-    if value < mask as usize {
-        return Ok((value, 1));
-    }
-    let mut shift = 0_usize;
-    let mut used = 1_usize;
-    loop {
-        if used >= input.len() || shift > 28 {
-            return Err(Http2ProtocolError::HpackUnsupported);
-        }
-        let b = input[used];
-        used += 1;
-        value = value
-            .checked_add(((b & 0x7f) as usize) << shift)
-            .ok_or(Http2ProtocolError::HpackUnsupported)?;
-        if b & 0x80 == 0 {
-            return Ok((value, used));
-        }
-        shift += 7;
-    }
-}
-
-fn decode_string(input: &[u8]) -> Result<(String, usize), Http2ProtocolError> {
-    if input.is_empty() {
-        return Err(Http2ProtocolError::HpackUnsupported);
-    }
-    if input[0] & 0x80 != 0 {
-        return Err(Http2ProtocolError::HpackUnsupported);
-    }
-    let (len, used) = decode_integer(input, 7)?;
-    let end = used
-        .checked_add(len)
-        .ok_or(Http2ProtocolError::HpackUnsupported)?;
-    if input.len() < end {
-        return Err(Http2ProtocolError::HpackUnsupported);
-    }
-    let s = std::str::from_utf8(&input[used..end])
-        .map_err(|_| Http2ProtocolError::HpackUnsupported)?
-        .to_owned();
-    Ok((s, end))
-}
-
 fn encode_literal_header(name: &str, value: &str, out: &mut Vec<u8>) {
     out.push(0);
     encode_string(name, out);
@@ -460,37 +404,6 @@ fn encode_integer(mut value: usize, prefix_bits: u8, pattern: u8, out: &mut Vec<
         value >>= 7;
     }
     out.push(value as u8);
-}
-
-fn static_header(index: usize) -> Option<(&'static str, &'static str)> {
-    Some(match index {
-        1 => (":authority", ""),
-        2 => (":method", "GET"),
-        3 => (":method", "POST"),
-        4 => (":path", "/"),
-        5 => (":path", "/index.html"),
-        6 => (":scheme", "http"),
-        7 => (":scheme", "https"),
-        8 => (":status", "200"),
-        9 => (":status", "204"),
-        10 => (":status", "206"),
-        11 => (":status", "304"),
-        12 => (":status", "400"),
-        13 => (":status", "404"),
-        14 => (":status", "500"),
-        _ => return None,
-    })
-}
-
-fn static_header_name(index: usize) -> Option<&'static str> {
-    Some(match index {
-        1 => ":authority",
-        2 | 3 => ":method",
-        4 | 5 => ":path",
-        6 | 7 => ":scheme",
-        8..=14 => ":status",
-        _ => return None,
-    })
 }
 
 fn encode_response_headers(response: &HttpResponse, body_len: usize) -> Vec<u8> {
@@ -646,6 +559,7 @@ pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = Htt
     limits: Http2Limits,
     service_call_timeout: Duration,
     read_buf: Vec<u8>,
+    hpack_decoder: hpack::Decoder<'static>,
     preface_seen: bool,
     streams: Vec<ActiveStream>,
     highest_client_stream_id: u32,
@@ -675,6 +589,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
             limits,
             service_call_timeout,
             read_buf: Vec::new(),
+            hpack_decoder: hpack::Decoder::new(),
             preface_seen: false,
             streams: Vec::with_capacity(limits.max_concurrent_streams),
             highest_client_stream_id: 0,
@@ -927,7 +842,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_ENHANCE_YOUR_CALM))?;
             return Ok(());
         }
-        let headers = decode_headers_block(&frame.payload, self.limits.max_header_bytes)?;
+        let headers = decode_headers_block_with(
+            &mut self.hpack_decoder,
+            &frame.payload,
+            self.limits.max_header_bytes,
+        )?;
         validate_request_headers(&headers)?;
         let grpc = headers
             .headers

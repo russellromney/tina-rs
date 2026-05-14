@@ -42,6 +42,30 @@ The live suite now sends 1000 tiny client-streamed messages split across
 awkward DATA chunk boundaries. This caught the HTTP/2 window-credit flood and
 now proves the route survives user-shaped small-message streams.
 
+### Fixed In Execution Slice: Non-Reading Streaming Cancel
+
+The live suite now starts a server-streaming response whose first source chunk
+is larger than the HTTP/2 send window, never drains the response DATA, sends
+`RST_STREAM`, and proves the source receives cancel. This catches the specific
+lie where cancellation only works after the happy reader has already drained a
+chunk.
+
+### Fixed In Execution Slice: Declared Message Cap Before Service
+
+Client-streaming now sends a malicious gRPC frame header declaring a message
+larger than `max_message_bytes` without providing the protobuf payload. The
+route returns `ResourceExhausted` and the user handler is not invoked, proving
+the cap fires before protobuf decode or service code.
+
+### Fixed In Execution Slice: Tonic h2c Interop
+
+The specimen now has a tonic client test that connects over h2c and exercises
+unary, server-streaming, and client-streaming routes. This exposed a real
+interop gap: the server's request HPACK decoder only understood the private
+literal headers used by Tina tests. Incoming HTTP/2 headers now use a stateful
+HPACK decoder so dynamic/indexed/huffman-encoded client headers are not a
+hidden compatibility cliff.
+
 ### Still Risky: Server-Streaming API Is Too Raw
 
 `GrpcServerStreamingResponse` currently asks handlers to provide a
@@ -55,16 +79,10 @@ not hand-build gRPC frames.
 Before claiming 096 complete, add tests that:
 
 1. Run grpcurl against the specimen with an explicit proto/descriptor.
-2. Run a tonic client against unary, server-streaming, client-streaming, and
-   bidi routes.
-3. Force server-streaming pressure with a non-reading client, then send
-   `RST_STREAM` and prove source cancel. Basic peer reset source-cancel proof
-   is now present; the non-reading pressure variant is still needed.
-4. Force client-streaming with thousands of small messages and one oversized
-   declared message that must fail before protobuf allocation.
-5. Interleave bidi request/response messages while one direction is
+2. Run a tonic client against bidi routes.
+3. Interleave bidi request/response messages while one direction is
    flow-control blocked.
-6. Start/stop the specimen repeatedly on random ports and run copy-paste
+4. Start/stop the specimen repeatedly on random ports and run copy-paste
    documented commands, not private helper clients.
 
 ### Production Client Is Conditional

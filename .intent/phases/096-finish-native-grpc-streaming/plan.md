@@ -18,9 +18,14 @@
     consumed chunks;
   - typed finite server-streaming helper and many-small-message
     client-streaming proof.
+  - hostile user-proof tests for non-reading server-streaming peer reset and
+    oversized declared client-streaming messages failing before service code.
+  - tonic h2c client interop against the specimen for unary, server-streaming,
+    and client-streaming; this also forced real incoming HPACK decode.
 - Still deferred in this branch:
   - true bidirectional streaming with independent request/response lifecycles;
-  - tonic/grpcurl interop scripts;
+  - grpcurl interop scripts;
+  - tonic h2c bidi interop;
   - reflection;
   - production pooled Tina gRPC client;
   - TLS ALPN.
