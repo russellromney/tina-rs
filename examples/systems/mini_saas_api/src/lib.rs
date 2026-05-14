@@ -32,6 +32,7 @@ pub struct RunReport {
     pub outbound_pressure_503: bool,
     pub ready_after_db_close_503: bool,
     pub ready_during_shutdown_503: bool,
+    pub ingress_rejects_after_close: bool,
     pub shutdown_clean: bool,
     pub multi_turn_notify: bool,
     pub capacity_line: String,
@@ -44,7 +45,8 @@ impl RunReport {
             "system=mini_saas_api health_ok={} ready_ok={} created_item={} read_item={} \
              notified_item={} missing_404={} method_405={} bad_request_400={} body_cap_413={} \
              db_constraint_409={} outbound_pressure_503={} ready_after_db_close_503={} \
-             ready_during_shutdown_503={} shutdown_clean={} multi_turn_notify={}",
+             ready_during_shutdown_503={} ingress_rejects_after_close={} shutdown_clean={} \
+             multi_turn_notify={}",
             self.health_ok,
             self.ready_ok,
             self.created_item,
@@ -58,6 +60,7 @@ impl RunReport {
             self.outbound_pressure_503,
             self.ready_after_db_close_503,
             self.ready_during_shutdown_503,
+            self.ingress_rejects_after_close,
             self.shutdown_clean,
             self.multi_turn_notify,
         )

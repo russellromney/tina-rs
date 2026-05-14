@@ -122,6 +122,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     let during_shutdown = get(addr, "/ready")?;
     report.ready_during_shutdown_503 =
         during_shutdown.status == 503 && during_shutdown.body.contains("ingress_stopped");
+    let rejected_after_close = post(addr, "/items", "name=after-close")?;
+    report.ingress_rejects_after_close =
+        rejected_after_close.status == 503 && rejected_after_close.body.contains("ingress_stopped");
 
     sqlite.closer.close();
     let after_db_close = get(addr, "/ready")?;
@@ -673,7 +676,6 @@ impl Controller {
                 )
                 .reply(move |outcome| ControllerMsg::ReadyDb(req, ingress_stopped, outcome))
             }
-            (http::Method::POST, "/items") => self.create_item(request, call_ctx),
             (http::Method::GET, "/debug/capacity") => {
                 let req = call_ctx.into_request_context();
                 call(
@@ -683,6 +685,10 @@ impl Controller {
                 )
                 .reply_with_request(req, ControllerMsg::CapacityPool)
             }
+            _ if !self.ingress_open => {
+                call_ctx.reply(text(StatusCode::SERVICE_UNAVAILABLE, "ingress_stopped\n"))
+            }
+            (http::Method::POST, "/items") => self.create_item(request, call_ctx),
             _ if path.starts_with("/items/") => self.item_route(request, call_ctx),
             _ => call_ctx.reply(text(StatusCode::NOT_FOUND, "not_found\n")),
         }

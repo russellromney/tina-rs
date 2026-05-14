@@ -15,6 +15,7 @@ fn smoke_covers_service_layers() {
     assert!(report.db_constraint_409);
     assert!(report.ready_after_db_close_503);
     assert!(report.ready_during_shutdown_503);
+    assert!(report.ingress_rejects_after_close);
     assert!(report.shutdown_clean);
     assert!(report.multi_turn_notify);
     assert!(report.capacity_line.contains("db.waiters="));
