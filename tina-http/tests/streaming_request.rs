@@ -71,7 +71,9 @@ impl Isolate for Consumer {
                         format!("buffered:{}", bytes.iter().fold(0u64, |a, b| a + *b as u64));
                     reply(HttpResponse::with_text(StatusCode::OK, body_summary))
                 }
-                HttpRequestBody::Stream(_) => reply(HttpResponse::internal_error()),
+                HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => {
+                    reply(HttpResponse::internal_error())
+                }
             },
             ConsumerMsg::ChunkArrived(request, outcome) => match outcome {
                 CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
@@ -129,6 +131,7 @@ impl Isolate for Consumer {
                     )
                     .reply_with_request(request, ConsumerMsg::ChunkArrived)
                 }
+                HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
             },
             ConsumerMsg::ChunkArrived(_, _) => {
                 call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
@@ -550,7 +553,9 @@ impl Isolate for NotifyingConsumer {
                         // (test harness configured streaming on).
                         reply(HttpResponse::internal_error())
                     }
-                    HttpRequestBody::Stream(_) => reply(HttpResponse::internal_error()),
+                    HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => {
+                        reply(HttpResponse::internal_error())
+                    }
                 }
             }
             NotifyingMsg::ChunkArrived(request, outcome) => match outcome {
@@ -608,6 +613,7 @@ impl Isolate for NotifyingConsumer {
                         )
                         .reply_with_request(request, NotifyingMsg::ChunkArrived)
                     }
+                    HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
                 }
             }
             NotifyingMsg::ChunkArrived(_, _) => {

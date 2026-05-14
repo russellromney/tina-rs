@@ -76,19 +76,19 @@
 //! stream table, connection/stream flow-control windows, reset/close
 //! outcomes, and service dispatch to the same [`HttpRequest`] /
 //! [`HttpResponse`] shape where honest. Request and response bodies are
-//! buffered under explicit byte caps in this first form; flow-control
-//! credit returns when buffered request bytes leave the connection for
-//! the service, and outbound responses can park behind a bounded
-//! pending response until `WINDOW_UPDATE` arrives. It is not an
-//! HTTPS/2 or ALPN claim, not gRPC, not a full client, and not a full
-//! RFC feature clone.
+//! buffered under explicit byte caps for ordinary unary services.
+//! gRPC requests can be exposed through an HTTP/2 pull source, and
+//! responses can stream from Tina chunk sources with DATA flow-control
+//! and real trailers. It is not an HTTPS/2 or ALPN claim, not a full
+//! client, and not a full RFC feature clone.
 //!
-//! gRPC: [`GrpcRouter`] layers unary `prost` messages and typed
-//! [`GrpcStatus`] trailers on that HTTP/2 h2c server. It rejects
-//! compression, caps message bytes before protobuf decode, maps service
-//! call timeout to `DeadlineExceeded`, and keeps server-streaming,
-//! client-streaming, bidirectional streaming, interceptors, reflection,
-//! and TLS ALPN out of this first form.
+//! gRPC: [`GrpcRouter`] layers unary plus first server-streaming and
+//! client-streaming `prost` messages with typed [`GrpcStatus`] trailers
+//! on that HTTP/2 h2c server. It rejects compression, caps message
+//! bytes before protobuf decode, maps service call timeout to
+//! `DeadlineExceeded`, and keeps bidirectional streaming, interceptors,
+//! reflection, production pooled clients, and TLS ALPN out of this
+//! first form.
 //!
 //! Still out of scope: HTTP/2 TLS ALPN, ACME, mTLS, SNI routing,
 //! system roots, certificate reload, redirects, cookies. For mature
@@ -119,8 +119,9 @@ pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{
-    GrpcError, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcStatus, GrpcStatusCode,
-    decode_unary_request, encode_grpc_message, grpc_unary_call_h2c,
+    GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
+    GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
+    decode_streaming_request, decode_unary_request, encode_grpc_message, grpc_unary_call_h2c,
 };
 pub use http2::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReport, Http2Limits, Http2Listener,
@@ -155,8 +156,8 @@ pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
 // need a public name since there is no `with_chunked_stream`
 // equivalent — `stream_chunked` is the only constructor.
 pub use streaming::{
-    IterBodySource, RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply,
-    ResponseStream,
+    Http2RequestStream, IterBodySource, RequestChunkReply, RequestStream, ResponseChunkMsg,
+    ResponseChunkReply, ResponseStream,
 };
 pub use target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
 pub use transport::HttpTransport;

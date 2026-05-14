@@ -5,7 +5,7 @@ use std::time::Duration;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, Http2Listener, Http2ListenerMsg,
+    GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg, Http2Listener, Http2ListenerMsg,
     Http2ServerConfig, grpc_unary_call_h2c,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
@@ -61,8 +61,8 @@ pub fn run_smoke() -> Result<u64, String> {
         .map_err(|error| format!("register router: {error:?}"))?;
     let config = Http2ServerConfig::default();
     let listener = runtime
-        .register_with_capacity::<Http2Listener<SpecimenShard>, _>(
-            Http2Listener::<SpecimenShard>::new(
+        .register_with_capacity::<Http2Listener<SpecimenShard, GrpcRouterMsg>, _>(
+            Http2Listener::<SpecimenShard, GrpcRouterMsg>::new(
                 "127.0.0.1:0".parse::<SocketAddr>().expect("loopback"),
                 service,
                 config,

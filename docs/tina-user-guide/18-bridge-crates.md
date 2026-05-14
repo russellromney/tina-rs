@@ -18,15 +18,14 @@ permessage-deflate, a browser session framework, or a broad client
 crate. Native HTTP/2 now has a
 server-first h2c path in `tina-http::Http2Listener`: cleartext
 prior-knowledge transport, bounded stream table, explicit
-connection/stream flow-control windows, and ordinary `HttpRequest` /
-`HttpResponse` service dispatch. First-form bodies are buffered under
-explicit request/response caps; outbound responses blocked by flow
-control park behind one bounded pending response until `WINDOW_UPDATE`.
-Native gRPC now layers unary `prost` messages on that h2c path through
-`tina_http::GrpcRouter`: one request message, one response message, typed
-`GrpcStatus` trailers, message caps, no compression, and service timeout mapped
-to `DeadlineExceeded`. It is not tonic parity, not server/client/bidirectional
-streaming, not HTTPS/2 ALPN, and not a broad client. Native HTTPS/1.1 lives in `tina-http`'s
+connection/stream flow-control windows, ordinary `HttpRequest` /
+`HttpResponse` service dispatch, streamed response DATA from Tina chunk
+sources, and gRPC request-body pull sources. Native gRPC now layers unary plus
+first server-streaming/client-streaming `prost` messages on that h2c path
+through `tina_http::GrpcRouter`: typed `GrpcStatus` trailers, message caps, no
+compression, and service timeout mapped to `DeadlineExceeded`. It is not tonic
+parity, not true bidirectional streaming, not HTTPS/2 ALPN, and not a broad
+client. Native HTTPS/1.1 lives in `tina-http`'s
 `HttpsListener` and `HttpClient` — explicit DER cert config, typed
 startup, matchable TLS errors. For repeated outbound
 requests against the same origin, `tina_http::build_keepalive_pool`

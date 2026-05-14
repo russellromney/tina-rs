@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use common::{Counter, TestShard};
 use tina::prelude::*;
-use tina_http::{Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig};
+use tina_http::{
+    Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse,
+    IterBodySource,
+};
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -44,6 +47,34 @@ impl Http2Harness {
         let listener = runtime
             .register_with_capacity::<Http2Listener<TestShard>, _>(
                 Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config),
+                config.listener_mailbox_capacity,
+            )
+            .expect("register http2 listener");
+        let bound = runtime.observe_next_bound();
+        runtime
+            .try_send(listener, Http2ListenerMsg::Start)
+            .expect("start listener");
+        let addr = bound
+            .wait(Duration::from_secs(2))
+            .expect("listener publishes bound address");
+        Self {
+            addr,
+            runtime: Some(runtime),
+            listener,
+        }
+    }
+
+    fn start_with_service<M>(
+        runtime: ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
+        service: Address<M, HttpResponse>,
+        config: Http2ServerConfig,
+    ) -> Self
+    where
+        M: From<HttpRequest> + Send + 'static,
+    {
+        let listener = runtime
+            .register_with_capacity::<Http2Listener<TestShard, M>, _>(
+                Http2Listener::<TestShard, M>::new("127.0.0.1:0".parse().unwrap(), service, config),
                 config.listener_mailbox_capacity,
             )
             .expect("register http2 listener");
@@ -237,6 +268,43 @@ fn read_until_goaway(stream: &mut TcpStream) -> TestFrame {
     panic!("did not see GOAWAY");
 }
 
+struct StreamingResponseService {
+    source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
+}
+
+impl Isolate for StreamingResponseService {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<std::convert::Infallible>,
+        spawn: std::convert::Infallible,
+        call: std::convert::Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        _request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(HttpResponse::stream_chunked(
+            http::StatusCode::OK,
+            self.source,
+        ))
+    }
+
+    fn handle_call(
+        &mut self,
+        _request: HttpRequest,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reply(HttpResponse::stream_chunked(
+            http::StatusCode::OK,
+            self.source,
+        ))
+    }
+}
+
 #[test]
 fn http2_h2c_unary_request_response() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
@@ -251,6 +319,44 @@ fn http2_h2c_unary_request_response() {
     );
 
     assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
+fn http2_streaming_response_sends_multiple_data_frames() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let source = IterBodySource::<TestShard>::register(
+        &runtime,
+        vec![b"hello ".to_vec(), b"stream".to_vec()].into_iter(),
+        16,
+    )
+    .expect("register source");
+    let service = runtime
+        .register_with_capacity::<StreamingResponseService, std::convert::Infallible>(
+            StreamingResponseService { source },
+            16,
+        )
+        .expect("register service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/stream"),
+    );
+
+    assert_eq!(read_response_body(&mut stream, 1), b"hello stream");
     harness.shutdown();
 }
 

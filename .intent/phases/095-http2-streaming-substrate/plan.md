@@ -3,7 +3,22 @@
 ## Status
 
 - IDD phase.
-- Ready to review, not ready to implement.
+- In implementation on PR #85.
+- Shipped in this branch so far:
+  - HTTP/2 response DATA streaming from Tina `ResponseChunkMsg` sources;
+  - streamed response DATA obeys HTTP/2 frame splitting and flow-control
+    windows;
+  - streamed response EOF sends final DATA or trailing HEADERS;
+  - peer reset cancels accepted service work and response sources;
+  - HTTP/2 request body pull source for gRPC-dispatched streams;
+  - unary gRPC now exercises the HTTP/2 request pull path when request HEADERS
+    and DATA arrive separately.
+- Still deferred in this branch:
+  - generic non-gRPC HTTP/2 request-stream opt-in API;
+  - full request-trailer support; request trailers are not a compatibility
+    claim yet;
+  - complete full-duplex blocked-one-way proof matrix;
+  - production HTTP/2 client state machine.
 - One PR when implemented.
 - Blocks honest gRPC server-streaming, client-streaming, bidirectional
   streaming, and broader HTTP/2 streaming interop claims. Production gRPC
@@ -303,6 +318,11 @@ Docs must say:
   change
 
 ## Done Means
+
+Current PR status: partially done. The response-streaming substrate and gRPC
+request pull path are implemented and tested; the whole 095 done bar remains
+open until generic HTTP/2 request-streaming policy and full-duplex pressure
+proofs land.
 
 - HTTP/2 can stream at least response DATA from a bounded source with real flow
   control, trailers, reset cancellation, and pressure reports/tests.

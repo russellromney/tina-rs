@@ -9,8 +9,9 @@ use common::TestShard;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcStatus, GrpcStatusCode, Http2Listener,
-    Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, grpc_unary_call_h2c,
+    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
+    GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, Http2Listener, Http2ListenerMsg,
+    Http2ServerConfig, HttpRequest, HttpResponse, IterBodySource, grpc_unary_call_h2c,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -53,6 +54,15 @@ struct GrpcHarness {
 impl GrpcHarness {
     fn start_router(config: Http2ServerConfig, limits: GrpcLimits) -> Self {
         let runtime = runtime();
+        let watch_chunks = vec![
+            tina_http::encode_grpc_message(&CounterReply { value: 1 }, GrpcLimits::default())
+                .expect("encode watch one"),
+            tina_http::encode_grpc_message(&CounterReply { value: 2 }, GrpcLimits::default())
+                .expect("encode watch two"),
+        ];
+        let watch_source =
+            IterBodySource::<TestShard>::register(&runtime, watch_chunks.into_iter(), 16)
+                .expect("register watch source");
         let router = GrpcRouter::<TestShard>::new(limits)
             .unary(
                 "/specimen.Counter/Increment",
@@ -82,6 +92,20 @@ impl GrpcHarness {
                 |request: GrpcRequest<BlobRequest>| {
                     Ok(GrpcResponse::new(CounterReply {
                         value: request.message.bytes.len() as u64,
+                    }))
+                },
+            )
+            .server_streaming(
+                "/specimen.Counter/Watch",
+                move |_request: GrpcRequest<CounterRequest>| {
+                    Ok(GrpcServerStreamingResponse::new(watch_source))
+                },
+            )
+            .client_streaming(
+                "/specimen.Counter/Sum",
+                |request: GrpcClientStreamingRequest<CounterRequest>| {
+                    Ok(GrpcResponse::new(CounterReply {
+                        value: request.messages.iter().map(|message| message.delta).sum(),
                     }))
                 },
             );
@@ -361,6 +385,26 @@ fn read_status(stream: &mut TcpStream, stream_id: u32) -> GrpcStatusCode {
     panic!("missing grpc status trailers");
 }
 
+fn read_body_and_status(stream: &mut TcpStream, stream_id: u32) -> (Vec<u8>, GrpcStatusCode) {
+    let mut body = Vec::new();
+    for _ in 0..32 {
+        let frame = read_frame(stream);
+        if frame.stream_id != stream_id {
+            continue;
+        }
+        match frame.ty {
+            FRAME_HEADERS if frame.flags & FLAG_END_STREAM != 0 => {
+                return (body, decode_status(&frame.payload));
+            }
+            FRAME_HEADERS => {}
+            FRAME_DATA => body.extend_from_slice(&frame.payload),
+            FRAME_RST_STREAM => panic!("unexpected reset: {frame:?}"),
+            _ => {}
+        }
+    }
+    panic!("missing grpc response end");
+}
+
 fn read_until_rst(stream: &mut TcpStream, stream_id: u32) -> Frame {
     for _ in 0..16 {
         let frame = read_frame(stream);
@@ -393,6 +437,32 @@ fn read_hpack_string(input: &[u8]) -> (String, usize) {
     (std::str::from_utf8(&input[1..end]).unwrap().to_owned(), end)
 }
 
+fn decode_grpc_replies(body: &[u8]) -> Vec<CounterReply> {
+    let mut cursor = 0;
+    let mut replies = Vec::new();
+    while cursor < body.len() {
+        assert_eq!(body[cursor], 0);
+        cursor += 1;
+        let len = u32::from_be_bytes([
+            body[cursor],
+            body[cursor + 1],
+            body[cursor + 2],
+            body[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+        let end = cursor + len;
+        replies.push(CounterReply::decode(&body[cursor..end]).expect("decode reply"));
+        cursor = end;
+    }
+    replies
+}
+
+fn decode_one_grpc_reply(body: &[u8]) -> CounterReply {
+    let replies = decode_grpc_replies(body);
+    assert_eq!(replies.len(), 1);
+    replies.into_iter().next().unwrap()
+}
+
 #[test]
 fn grpc_happy_unary_request_response() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
@@ -405,6 +475,61 @@ fn grpc_happy_unary_request_response() {
     )
     .expect("grpc unary reply");
     assert_eq!(reply.value, 42);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_server_streaming_sends_messages_then_status_trailers() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 0 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Watch", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    let replies = decode_grpc_replies(&body);
+    assert_eq!(
+        replies.iter().map(|reply| reply.value).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_reads_multiple_request_messages() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut body = Vec::new();
+    body.extend_from_slice(&grpc_body(&CounterRequest { delta: 2 }));
+    body.extend_from_slice(&grpc_body(&CounterRequest { delta: 40 }));
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Sum", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, 0, 1, &body[..body.len() / 2]);
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &body[body.len() / 2..],
+    );
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(decode_one_grpc_reply(&body).value, 42);
     harness.shutdown();
 }
 

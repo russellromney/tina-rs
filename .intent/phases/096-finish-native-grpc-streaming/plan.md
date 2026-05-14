@@ -3,7 +3,21 @@
 ## Status
 
 - IDD phase.
-- Not ready to implement until 095 HTTP/2 streaming substrate ships.
+- In implementation on PR #85.
+- Shipped in this branch so far:
+  - server-streaming route shape over native HTTP/2 streamed DATA and final
+    gRPC trailers;
+  - client-streaming route shape that receives multiple gRPC request messages
+    over the HTTP/2 request pull path and returns one response;
+  - unary route path preserved over the same HTTP/2 request pull path;
+  - live tests for server-streaming messages/status and client-streaming
+    multiple request messages.
+- Still deferred in this branch:
+  - true bidirectional streaming with independent request/response lifecycles;
+  - tonic/grpcurl interop scripts;
+  - reflection;
+  - production pooled Tina gRPC client;
+  - TLS ALPN.
 - One PR when implemented unless tonic/grpcurl interop forces a follow-up.
 - Builds on Phase 057 unary gRPC and Phase 095 HTTP/2 bidirectional streaming
   substrate.
@@ -343,6 +357,11 @@ Docs must say:
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 
 ## Done Means
+
+Current PR status: partially done. Unary, first server-streaming, and first
+client-streaming are implemented over the native HTTP/2 h2c server. The phase
+is not complete until bidirectional lifecycle policy, interop commands, and any
+claimed client behavior are proven or explicitly split out.
 
 - Tina gRPC supports unary plus every streaming mode claimed in this phase.
 - Streaming modes reuse the 095 HTTP/2 streaming substrate.

@@ -68,7 +68,7 @@ impl Counter {
             (Method::POST, "/echo") => {
                 let body = match request.body {
                     HttpRequestBody::Buffered(b) => b,
-                    HttpRequestBody::Stream(_) => Vec::new(),
+                    HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => Vec::new(),
                 };
                 HttpResponse::with_body(StatusCode::OK, body)
             }

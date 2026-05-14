@@ -152,6 +152,21 @@ pub struct RequestStream {
     pub source: Address<crate::HttpConnectionMsg, RequestChunkReply>,
 }
 
+/// HTTP/2 streaming request body source.
+///
+/// The HTTP/2 connection isolate owns the socket and flow-control windows.
+/// Services pull chunks through this handle; the connection returns stream and
+/// connection window credit only after a chunk is delivered or discarded.
+#[derive(Debug, Clone)]
+pub struct Http2RequestStream {
+    /// HTTP/2 stream id.
+    pub stream_id: u32,
+    /// Declared `Content-Length` if one arrived. HTTP/2 does not require it.
+    pub content_length: Option<usize>,
+    /// Chunk source — the HTTP/2 connection isolate.
+    pub source: Address<crate::Http2ConnectionMsg, RequestChunkReply>,
+}
+
 /// Iterator-backed chunk source for the response side. Wraps any
 /// `Iterator<Item = Vec<u8>> + Send + 'static` into an [`Isolate`]
 /// that answers [`ResponseChunkMsg::Next`] by yielding the next
