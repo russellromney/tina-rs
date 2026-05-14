@@ -40,6 +40,11 @@
     confused with an empty stream or partial frame.
   - tonic h2c client-streaming interop for normal, early-success, and
     early-error paths.
+  - `GrpcRequestStream<T>` pull handle plus `GrpcRouter::client_streaming_service`
+    for Tina services that need explicit `next` calls before bidi.
+  - live pull-handle tests for EOF completion, malformed-message status
+    propagation through user service code, and HTTP/2 body-cap reset
+    cancellation of the accepted service call.
 - Still deferred in this branch:
   - true bidirectional streaming with independent request/response lifecycles;
   - automated grpcurl interop in CI; the proto and manual commands are owned,
@@ -449,11 +454,11 @@ Docs must say:
 
 ## Done Means
 
-Current PR status: partially done. Unary, server-streaming, and true
-incremental client-streaming are implemented over the native HTTP/2 h2c server.
-The phase is not complete until bidirectional lifecycle policy, grpcurl CI
-automation, and any claimed production client/TLS behavior are proven or
-explicitly split out.
+Current PR status: partially done. Unary, server-streaming, true incremental
+client-streaming, and the reusable `GrpcRequestStream<T>::next` pull handle are
+implemented over the native HTTP/2 h2c server. The phase is not complete until
+bidirectional lifecycle policy, grpcurl CI automation, and any claimed
+production client/TLS behavior are proven or explicitly split out.
 
 - Tina gRPC supports unary plus every streaming mode claimed in this phase.
 - Streaming modes reuse the 095 HTTP/2 streaming substrate.

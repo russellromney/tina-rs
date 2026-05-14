@@ -24,8 +24,9 @@ connection/stream flow-control windows, ordinary `HttpRequest` /
 sources, and gRPC request-body pull sources. Native gRPC now layers unary,
 server-streaming, and incremental client-streaming `prost` messages on that h2c
 path through `tina_http::GrpcRouter`: typed `GrpcStatus` trailers, message
-caps, no compression, service timeout mapped to `DeadlineExceeded`, and tonic
-h2c smoke interop for the shipped modes. It is not full tonic parity, not true
+caps, a `GrpcRequestStream<T>::next` pull handle for Tina service isolates, no
+compression, service timeout mapped to `DeadlineExceeded`, and tonic h2c smoke
+interop for the shipped modes. It is not full tonic parity, not true
 bidirectional streaming, not HTTPS/2 ALPN, and not a broad client. Native
 HTTPS/1.1 lives in `tina-http`'s
 `HttpsListener` and `HttpClient` — explicit DER cert config, typed

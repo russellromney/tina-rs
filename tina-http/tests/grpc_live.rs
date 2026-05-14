@@ -11,9 +11,11 @@ use common::TestShard;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcClientStreamingControl, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
+    GrpcClientStreamingControl, GrpcClientStreamingPullRequest, GrpcLimits, GrpcRequest,
+    GrpcRequestStream, GrpcRequestStreamNext, GrpcResponse, GrpcRouter,
     GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, grpc_unary_call_h2c,
+    Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, grpc_response,
+    grpc_unary_call_h2c,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -289,6 +291,87 @@ impl Isolate for HangingGrpc {
                 sleep(Duration::from_millis(250)).reply(move |_| HangingMsg::Done(request))
             }
             HangingMsg::Done(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+}
+
+struct PullSumGrpc {
+    limits: GrpcLimits,
+}
+
+enum PullSumMsg {
+    Start(GrpcClientStreamingPullRequest<CounterRequest>),
+    Next {
+        reply_to: tina::RequestContext<HttpResponse>,
+        stream: GrpcRequestStream<CounterRequest>,
+        sum: u64,
+        next: GrpcRequestStreamNext<CounterRequest>,
+    },
+}
+
+impl Isolate for PullSumGrpc {
+    tina::isolate_types! {
+        message: PullSumMsg,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: tina_runtime::RuntimeCall<PullSumMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: PullSumMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            PullSumMsg::Start(_) => noop(),
+            PullSumMsg::Next {
+                reply_to,
+                stream,
+                sum,
+                next,
+            } => match next {
+                GrpcRequestStreamNext::Message(message) => {
+                    let next_sum = sum + message.delta;
+                    let next_stream = stream.clone();
+                    stream.next(Duration::from_secs(2), move |next| PullSumMsg::Next {
+                        reply_to,
+                        stream: next_stream,
+                        sum: next_sum,
+                        next,
+                    })
+                }
+                GrpcRequestStreamNext::Eof => reply_to_request(
+                    reply_to,
+                    grpc_response(
+                        Ok(GrpcResponse::new(CounterReply { value: sum })),
+                        self.limits,
+                    ),
+                ),
+                GrpcRequestStreamNext::Error(status) => reply_to_request(
+                    reply_to,
+                    grpc_response::<CounterReply>(Err(status), self.limits),
+                ),
+            },
+        }
+    }
+
+    fn handle_call(&mut self, msg: PullSumMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            PullSumMsg::Start(request) => {
+                let reply_to = call.into_request_context();
+                let stream = request.stream.clone();
+                request
+                    .stream
+                    .next(Duration::from_secs(2), move |next| PullSumMsg::Next {
+                        reply_to,
+                        stream,
+                        sum: 0,
+                        next,
+                    })
+            }
+            PullSumMsg::Next { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -804,6 +887,152 @@ fn grpc_client_streaming_handles_many_small_messages() {
     assert_eq!(status, GrpcStatusCode::Ok);
     assert_eq!(decode_one_grpc_reply(&body).value, expected);
     harness.shutdown();
+}
+
+#[test]
+fn grpc_request_stream_next_handle_lets_user_service_pull_until_eof() {
+    let runtime = runtime();
+    let pull_service = runtime
+        .register_with_capacity::<PullSumGrpc, Infallible>(
+            PullSumGrpc {
+                limits: GrpcLimits::default(),
+            },
+            16,
+        )
+        .expect("register pull sum service");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default())
+        .client_streaming_service::<CounterRequest, _, _>(
+            "/specimen.Counter/PullSum",
+            pull_service,
+            PullSumMsg::Start,
+        );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut body = Vec::new();
+    body.extend_from_slice(&grpc_body(&CounterRequest { delta: 10 }));
+    body.extend_from_slice(&grpc_body(&CounterRequest { delta: 32 }));
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/PullSum", "application/grpc+proto"),
+    );
+    for chunk in body.chunks(3) {
+        write_frame(&mut stream, FRAME_DATA, 0, 1, chunk);
+    }
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &[]);
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(decode_one_grpc_reply(&body).value, 42);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_request_stream_next_handle_surfaces_decode_error_to_user_service() {
+    let runtime = runtime();
+    let pull_service = runtime
+        .register_with_capacity::<PullSumGrpc, Infallible>(
+            PullSumGrpc {
+                limits: GrpcLimits::default(),
+            },
+            16,
+        )
+        .expect("register pull sum service");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default())
+        .client_streaming_service::<CounterRequest, _, _>(
+            "/specimen.Counter/PullSum",
+            pull_service,
+            PullSumMsg::Start,
+        );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let malformed = [0, 0, 0, 0, 1, 0xff];
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/PullSum", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        1,
+        &grpc_body(&CounterRequest { delta: 5 }),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &malformed);
+
+    assert_eq!(read_status(&mut stream, 1), GrpcStatusCode::InvalidArgument);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_request_stream_next_handle_body_cap_cancels_user_service_call() {
+    let runtime = runtime();
+    let pull_service = runtime
+        .register_with_capacity::<PullSumGrpc, Infallible>(
+            PullSumGrpc {
+                limits: GrpcLimits::default(),
+            },
+            16,
+        )
+        .expect("register pull sum service");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default())
+        .client_streaming_service::<CounterRequest, _, _>(
+            "/specimen.Counter/PullSum",
+            pull_service,
+            PullSumMsg::Start,
+        );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_body_bytes: 12,
+            ..Http2Limits::default()
+        },
+        service_call_timeout: Duration::from_secs(1),
+        ..Http2ServerConfig::default()
+    };
+    let mut harness = GrpcHarness::start_with_service(runtime, service, config);
+    let mut stream = connect_h2(harness.addr);
+    let first = grpc_body(&CounterRequest { delta: 1 });
+    let second = grpc_body(&CounterRequest { delta: 2 });
+
+    assert!(first.len() <= 12);
+    assert!(first.len() + second.len() > 12);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/PullSum", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, 0, 1, &first);
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &second);
+
+    let rst = read_until_rst(&mut stream, 1);
+    assert_eq!(rst.stream_id, 1);
+    std::thread::sleep(Duration::from_millis(20));
+    let events = harness.shutdown_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::CallCancelled { .. })),
+        "HTTP/2 body cap reset must cancel the accepted pull-handle service call; events: {events:?}"
+    );
 }
 
 #[test]

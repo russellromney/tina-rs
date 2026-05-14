@@ -86,9 +86,11 @@
 //! client-streaming `prost` messages with typed [`GrpcStatus`] trailers
 //! on that HTTP/2 h2c server. `GrpcRouter::client_streaming` decodes one
 //! request message at a time from the HTTP/2 request stream; the older
-//! whole-`Vec<T>` helper is explicit as `client_streaming_buffered`. It rejects
-//! compression, caps message bytes before protobuf decode, maps service call
-//! timeout to `DeadlineExceeded`, and keeps bidirectional streaming,
+//! whole-`Vec<T>` helper is explicit as `client_streaming_buffered`.
+//! `GrpcRouter::client_streaming_service` passes a [`GrpcRequestStream`] pull
+//! handle to Tina service isolates that need explicit `next` cadence. It
+//! rejects compression, caps message bytes before protobuf decode, maps service
+//! call timeout to `DeadlineExceeded`, and keeps bidirectional streaming,
 //! interceptors, reflection, production pooled clients, and TLS ALPN out of
 //! this first form.
 //!
@@ -139,10 +141,11 @@ pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{
-    GrpcClientStreamingControl, GrpcClientStreamingRequest, GrpcClientStreamingStart, GrpcError,
-    GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse,
+    GrpcClientStreamingControl, GrpcClientStreamingPullRequest, GrpcClientStreamingRequest,
+    GrpcClientStreamingStart, GrpcError, GrpcLimits, GrpcRequest, GrpcRequestStream,
+    GrpcRequestStreamNext, GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse,
     GrpcStatus, GrpcStatusCode, decode_streaming_request, decode_unary_request,
-    encode_grpc_message, grpc_unary_call_h2c,
+    encode_grpc_message, grpc_response, grpc_unary_call_h2c,
 };
 pub use http2::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,

@@ -121,6 +121,8 @@ What ships:
   chunks, final gRPC status trailers;
 - incremental client-streaming request path: many request messages over HTTP/2
   DATA, one response message, final gRPC status trailers;
+- `GrpcRequestStream<T>::next` pull handle for Tina service isolates that need
+  explicit request-message cadence before bidirectional streaming;
 - `prost::Message` payload encode/decode;
 - gRPC frame parsing (`compressed flag + u32 length + protobuf bytes`);
 - `GrpcStatus` / `GrpcStatusCode` in HTTP/2 trailers;
