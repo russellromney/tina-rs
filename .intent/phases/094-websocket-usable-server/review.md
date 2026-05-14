@@ -28,6 +28,11 @@ helpers behind that line unless the core claim is already proved.
 - Required the room specimen's `run()` report to prove the same path users run.
 - Required live multi-client room behavior and a real non-reading/slow peer.
 - Added public-API-only e2e proof and a grug implementation order.
+- Required 087 echo-path compatibility to stay documented while room/fanout
+  graduates to session handles.
+- Required room/session pressure reports so users do not need trace spelunking.
+- Required session handles to carry generation/incarnation and prove
+  fill-close-refill.
 
 ## Must Not Slip
 
@@ -41,6 +46,8 @@ helpers behind that line unless the core claim is already proved.
   reassembly correctly.
 - Do not use sleep-heavy flaky tests to prove slow peer pressure.
 - Do not move ownership of an upgraded stream into two independent writers.
+- Do not let stale session handles send to a new connection.
+- Do not let closed sessions keep member-table capacity forever.
 - Do not rely on private test helpers for copied docs/examples.
 - Do not let the specimen's `run()` test a different path than the user-facing
   room.
@@ -60,6 +67,8 @@ helpers behind that line unless the core claim is already proved.
 - Slow-peer pressure should use a live non-reading peer or deterministic
   equivalent, not just direct queue insertion.
 - Public examples should compile, ideally as doctests or specimen code.
+- The room report should be asserted by tests, not printed and eyeballed.
+- Session id generation must be boring and visible enough to debug.
 
 ## Likely Deferrals
 
@@ -77,10 +86,12 @@ Less acceptable to defer:
 - session handles or equivalent bounded send API;
 - real room specimen;
 - public send outcome;
+- room/session pressure report;
 - pressure tests;
 - copyable docs;
 - TLS e2e;
 - public-API-only room e2e.
+- stale-handle/fill-close-refill proof.
 
 Without those, the honest phrase remains "WebSocket first form", not "you can
 use Tina for WebSockets".
