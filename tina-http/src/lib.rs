@@ -88,9 +88,11 @@
 //! request message at a time from the HTTP/2 request stream; the older
 //! whole-`Vec<T>` helper is explicit as `client_streaming_buffered`.
 //! `GrpcRouter::client_streaming_service` passes a [`GrpcRequestStream`] pull
-//! handle to Tina service isolates that need explicit `next` cadence. It
-//! rejects compression, caps message bytes before protobuf decode, maps service
-//! call timeout to `DeadlineExceeded`, and keeps bidirectional streaming,
+//! handle to Tina service isolates that need explicit `next` cadence. Each
+//! `next` timeout bounds the underlying HTTP/2 body pull; the route timeout
+//! bounds the whole service call. It rejects compression, caps message bytes
+//! before protobuf decode, maps service call timeout to `DeadlineExceeded`, and
+//! keeps bidirectional streaming,
 //! interceptors, reflection, production pooled clients, and TLS ALPN out of
 //! this first form.
 //!

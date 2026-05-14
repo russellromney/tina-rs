@@ -376,6 +376,116 @@ impl Isolate for PullSumGrpc {
     }
 }
 
+struct TimeoutPullGrpc {
+    limits: GrpcLimits,
+    next_timeout: Duration,
+}
+
+enum TimeoutPullMsg {
+    Start(GrpcClientStreamingPullRequest<CounterRequest>),
+    Next {
+        reply_to: tina::RequestContext<HttpResponse>,
+        next: GrpcRequestStreamNext<CounterRequest>,
+    },
+}
+
+impl Isolate for TimeoutPullGrpc {
+    tina::isolate_types! {
+        message: TimeoutPullMsg,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: tina_runtime::RuntimeCall<TimeoutPullMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: TimeoutPullMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TimeoutPullMsg::Start(_) => noop(),
+            TimeoutPullMsg::Next { reply_to, next } => match next {
+                GrpcRequestStreamNext::Message(message) => reply_to_request(
+                    reply_to,
+                    grpc_response(
+                        Ok(GrpcResponse::new(CounterReply {
+                            value: message.delta,
+                        })),
+                        self.limits,
+                    ),
+                ),
+                GrpcRequestStreamNext::Eof => reply_to_request(
+                    reply_to,
+                    grpc_response(
+                        Ok(GrpcResponse::new(CounterReply { value: 0 })),
+                        self.limits,
+                    ),
+                ),
+                GrpcRequestStreamNext::Error(status) => reply_to_request(
+                    reply_to,
+                    grpc_response::<CounterReply>(Err(status), self.limits),
+                ),
+            },
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: TimeoutPullMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            TimeoutPullMsg::Start(request) => {
+                let reply_to = call.into_request_context();
+                request
+                    .stream
+                    .next(self.next_timeout, move |next| TimeoutPullMsg::Next {
+                        reply_to,
+                        next,
+                    })
+            }
+            TimeoutPullMsg::Next { .. } => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct NeverReplyPullGrpc {
+    held: Option<tina::RequestContext<HttpResponse>>,
+}
+
+impl Isolate for NeverReplyPullGrpc {
+    tina::isolate_types! {
+        message: GrpcClientStreamingPullRequest<CounterRequest>,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: tina_runtime::RuntimeCall<GrpcClientStreamingPullRequest<CounterRequest>>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        _msg: GrpcClientStreamingPullRequest<CounterRequest>,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(
+        &mut self,
+        _msg: GrpcClientStreamingPullRequest<CounterRequest>,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        self.held = Some(call.into_request_context());
+        noop()
+    }
+}
+
 #[derive(Debug)]
 struct Frame {
     ty: u8,
@@ -580,6 +690,27 @@ fn read_until_rst(stream: &mut TcpStream, stream_id: u32) -> Frame {
         }
     }
     panic!("missing rst stream");
+}
+
+fn router_deferred_call_was_cancelled(events: &[RuntimeEvent], router: tina::IsolateId) -> bool {
+    let captured_by_router: Vec<_> = events
+        .iter()
+        .filter_map(|event| {
+            if event.isolate() == router {
+                if let RuntimeEventKind::DeferredReplyCaptured { call_id, .. } = event.kind() {
+                    return Some(call_id);
+                }
+            }
+            None
+        })
+        .collect();
+
+    events.iter().any(|event| {
+        let RuntimeEventKind::CallCancelled { call_id, cause } = event.kind() else {
+            return false;
+        };
+        cause == tina::CancelCause::CallerCancelled && captured_by_router.contains(&call_id)
+    })
 }
 
 fn decode_status(block: &[u8]) -> GrpcStatusCode {
@@ -997,6 +1128,7 @@ fn grpc_request_stream_next_handle_body_cap_cancels_user_service_call() {
     let service = runtime
         .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
         .expect("register grpc router");
+    let router_isolate = service.isolate();
     let config = Http2ServerConfig {
         limits: Http2Limits {
             max_body_bytes: 12,
@@ -1028,11 +1160,83 @@ fn grpc_request_stream_next_handle_body_cap_cancels_user_service_call() {
     std::thread::sleep(Duration::from_millis(20));
     let events = harness.shutdown_events();
     assert!(
-        events
-            .iter()
-            .any(|event| matches!(event.kind(), RuntimeEventKind::CallCancelled { .. })),
+        router_deferred_call_was_cancelled(&events, router_isolate),
         "HTTP/2 body cap reset must cancel the accepted pull-handle service call; events: {events:?}"
     );
+}
+
+#[test]
+fn grpc_request_stream_next_timeout_controls_underlying_http2_pull() {
+    let runtime = runtime();
+    let pull_service = runtime
+        .register_with_capacity::<TimeoutPullGrpc, Infallible>(
+            TimeoutPullGrpc {
+                limits: GrpcLimits::default(),
+                next_timeout: Duration::from_millis(25),
+            },
+            16,
+        )
+        .expect("register timeout pull service");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default())
+        .client_streaming_service_with_timeout::<CounterRequest, _, _>(
+            "/specimen.Counter/TimeoutPull",
+            pull_service,
+            TimeoutPullMsg::Start,
+            Duration::from_secs(2),
+        );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/TimeoutPull", "application/grpc+proto"),
+    );
+
+    assert_eq!(
+        read_status(&mut stream, 1),
+        GrpcStatusCode::DeadlineExceeded
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_client_streaming_service_route_timeout_bounds_whole_service_call() {
+    let runtime = runtime();
+    let pull_service = runtime
+        .register_with_capacity::<NeverReplyPullGrpc, Infallible>(NeverReplyPullGrpc::default(), 16)
+        .expect("register never-reply pull service");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default())
+        .client_streaming_service_with_timeout::<CounterRequest, _, _>(
+            "/specimen.Counter/NeverReply",
+            pull_service,
+            |request| request,
+            Duration::from_millis(25),
+        );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/NeverReply", "application/grpc+proto"),
+    );
+
+    assert_eq!(
+        read_status(&mut stream, 1),
+        GrpcStatusCode::DeadlineExceeded
+    );
+    harness.shutdown();
 }
 
 #[test]

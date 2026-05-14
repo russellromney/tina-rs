@@ -122,7 +122,10 @@ What ships:
 - incremental client-streaming request path: many request messages over HTTP/2
   DATA, one response message, final gRPC status trailers;
 - `GrpcRequestStream<T>::next` pull handle for Tina service isolates that need
-  explicit request-message cadence before bidirectional streaming;
+  explicit request-message cadence before bidirectional streaming; each
+  `next(timeout, ...)` timeout also bounds the underlying HTTP/2 body pull, while
+  `GrpcRouter::client_streaming_service_with_timeout` bounds the whole service
+  call through the final response;
 - `prost::Message` payload encode/decode;
 - gRPC frame parsing (`compressed flag + u32 length + protobuf bytes`);
 - `GrpcStatus` / `GrpcStatusCode` in HTTP/2 trailers;

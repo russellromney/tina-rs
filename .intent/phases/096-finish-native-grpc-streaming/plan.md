@@ -43,8 +43,9 @@
   - `GrpcRequestStream<T>` pull handle plus `GrpcRouter::client_streaming_service`
     for Tina services that need explicit `next` calls before bidi.
   - live pull-handle tests for EOF completion, malformed-message status
-    propagation through user service code, and HTTP/2 body-cap reset
-    cancellation of the accepted service call.
+    propagation through user service code, `next(timeout)` propagation to the
+    underlying HTTP/2 body pull, whole-service-call timeout, and HTTP/2 body-cap
+    reset cancellation of the accepted service call.
 - Still deferred in this branch:
   - true bidirectional streaming with independent request/response lifecycles;
   - automated grpcurl interop in CI; the proto and manual commands are owned,

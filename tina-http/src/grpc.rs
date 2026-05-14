@@ -382,13 +382,23 @@ impl<T> GrpcRequestStream<T>
 where
     T: Message + Default + Send + 'static,
 {
+    /// Pulls the next decoded request message, EOF, or typed gRPC status.
+    ///
+    /// The timeout bounds both the call into the request-stream source and the
+    /// underlying HTTP/2 body pull. Only one `next` call may be outstanding for
+    /// a stream handle at a time.
     pub fn next<I, M, F>(&self, timeout: Duration, map: F) -> Effect<I>
     where
         I: Isolate<Message = M, Call = tina_runtime::RuntimeCall<M>>,
         M: 'static,
         F: FnOnce(GrpcRequestStreamNext<T>) -> M + 'static,
     {
-        call(self.source, GrpcRequestStreamSourceMsg::Next, timeout).reply(move |outcome| {
+        call(
+            self.source,
+            GrpcRequestStreamSourceMsg::Next { timeout },
+            timeout,
+        )
+        .reply(move |outcome| {
             let next = match outcome {
                 CallOutcome::Replied(GrpcRequestStreamSourceReply::Message(bytes)) => {
                     match T::decode(&bytes[..]) {
@@ -592,7 +602,9 @@ where
 
 #[derive(Debug)]
 pub enum GrpcRequestStreamSourceMsg {
-    Next,
+    Next {
+        timeout: Duration,
+    },
     Stop,
     SourceChunk {
         outcome: CallOutcome<Http2ConnectionReply>,
@@ -611,7 +623,7 @@ pub struct GrpcRequestStreamSource<S: Shard> {
     limits: GrpcLimits,
     decoder: GrpcFrameStreamDecoder,
     decoded: VecDeque<Vec<u8>>,
-    pending_next: Option<tina::RequestContext<GrpcRequestStreamSourceReply>>,
+    pending_next: Option<(tina::RequestContext<GrpcRequestStreamSourceReply>, Duration)>,
     eof: bool,
     terminal_error: Option<GrpcStatus>,
     pull_in_flight: bool,
@@ -636,7 +648,7 @@ impl<S: Shard> GrpcRequestStreamSource<S> {
 
 impl<S: Shard + 'static> GrpcRequestStreamSource<S> {
     fn satisfy_or_pull(&mut self) -> Effect<Self> {
-        let Some(call_ctx) = self.pending_next.take() else {
+        let Some((call_ctx, timeout)) = self.pending_next.take() else {
             return noop();
         };
         if let Some(message) = self.decoded.pop_front() {
@@ -654,7 +666,7 @@ impl<S: Shard + 'static> GrpcRequestStreamSource<S> {
                 stop(),
             ]);
         }
-        self.pending_next = Some(call_ctx);
+        self.pending_next = Some((call_ctx, timeout));
         if self.pull_in_flight {
             return noop();
         }
@@ -664,7 +676,7 @@ impl<S: Shard + 'static> GrpcRequestStreamSource<S> {
         call(
             source,
             crate::Http2ConnectionMsg::body_next(stream_id),
-            REQUEST_BODY_PULL_TIMEOUT,
+            timeout,
         )
         .reply(move |outcome| GrpcRequestStreamSourceMsg::SourceChunk { outcome })
     }
@@ -686,7 +698,7 @@ impl<S: Shard + 'static> Isolate for GrpcRequestStreamSource<S> {
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            GrpcRequestStreamSourceMsg::Next => noop(),
+            GrpcRequestStreamSourceMsg::Next { .. } => noop(),
             GrpcRequestStreamSourceMsg::Stop => stop(),
             GrpcRequestStreamSourceMsg::SourceChunk { outcome } => {
                 self.pull_in_flight = false;
@@ -730,11 +742,11 @@ impl<S: Shard + 'static> Isolate for GrpcRequestStreamSource<S> {
         call_ctx: tina::CallContext<'_, Self>,
     ) -> Effect<Self> {
         match msg {
-            GrpcRequestStreamSourceMsg::Next => {
+            GrpcRequestStreamSourceMsg::Next { timeout } => {
                 if self.pending_next.is_some() {
                     return call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage);
                 }
-                self.pending_next = Some(call_ctx.into_request_context());
+                self.pending_next = Some((call_ctx.into_request_context(), timeout));
                 self.satisfy_or_pull()
             }
             GrpcRequestStreamSourceMsg::Stop => batch(vec![
@@ -910,6 +922,11 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         self
     }
 
+    /// Registers a client-streaming route backed by a Tina service isolate.
+    ///
+    /// The default timeout bounds the whole service call, from initial
+    /// `GrpcClientStreamingPullRequest` delivery through final `HttpResponse`.
+    /// Long-lived streams should use [`Self::client_streaming_service_with_timeout`].
     pub fn client_streaming_service<Req, Msg, F>(
         self,
         path: impl Into<String>,
@@ -924,6 +941,10 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         self.client_streaming_service_with_timeout(path, service, make, REQUEST_BODY_PULL_TIMEOUT)
     }
 
+    /// Registers a client-streaming service route with an explicit whole-call timeout.
+    ///
+    /// Individual request-message pulls still choose their own
+    /// [`GrpcRequestStream::next`] timeout.
     pub fn client_streaming_service_with_timeout<Req, Msg, F>(
         mut self,
         path: impl Into<String>,
