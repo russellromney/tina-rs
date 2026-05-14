@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use http::Method;
@@ -165,6 +165,7 @@ struct Harness {
     addr: SocketAddr,
     runtime: Option<ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>>,
     listener: Address<HttpListenerMsg>,
+    _serial_guard: MutexGuard<'static, ()>,
 }
 
 struct GeneratedIdentity {
@@ -213,6 +214,9 @@ fn rustls_client(
 
 impl Harness {
     fn start(limits: WebSocketLimits) -> Self {
+        let serial_guard = websocket_live_test_lock()
+            .lock()
+            .expect("websocket live test lock");
         let runtime = ThreadedRuntime::with_config(
             TestShard,
             DefaultThreadedMailboxFactory,
@@ -247,8 +251,14 @@ impl Harness {
             addr,
             runtime: Some(runtime),
             listener,
+            _serial_guard: serial_guard,
         }
     }
+}
+
+fn websocket_live_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 impl Drop for Harness {
