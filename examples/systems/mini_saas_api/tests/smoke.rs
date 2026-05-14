@@ -17,14 +17,27 @@ fn smoke_covers_service_layers() {
     assert!(report.ready_during_shutdown_503);
     assert!(report.shutdown_clean);
     assert!(report.multi_turn_notify);
-    assert!(report.capacity_line.contains("db."));
-    assert!(report.capacity_line.contains("outbound."));
-    assert!(report.live_replay_fact.contains("status_413"));
+    assert!(report.capacity_line.contains("db.waiters="));
+    assert!(report.capacity_line.contains("db.in_flight="));
+    assert!(report.capacity_line.contains("outbound.waiters="));
+    assert!(report.capacity_line.contains("outbound.in_flight="));
+    assert!(
+        report
+            .capacity_line
+            .contains("outbound.high_water_waiters=")
+    );
+    assert!(report.capacity_line.contains("outbound.full="));
+    assert!(report.capacity_line.contains("outbound.drain=Drained"));
+    assert_eq!(
+        report.live_replay_fact,
+        "case=mini_saas_body_full ops=[post:/items:41bytes] fact=status_413 cap=32"
+    );
 }
 
 #[test]
 fn pressure_covers_outbound_pool_full() {
     let report = run(RunMode::Pressure).expect("mini_saas_api pressure ran");
     assert!(report.outbound_pressure_503);
+    assert!(report.capacity_line.contains("outbound.full=1"));
     assert!(report.shutdown_clean);
 }

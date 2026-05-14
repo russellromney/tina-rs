@@ -48,12 +48,12 @@ typed reasons such as `db_closed`, `db_full`, `db_timeout`, `outbound_full`,
 
 ## Shutdown Order
 
-1. Stop public ingress.
-2. Probe readiness so `ingress_stopped` is visible.
+1. Mark public ingress closed in the controller.
+2. Probe readiness over HTTP so `ingress_stopped` is visible.
 3. Close the SQLite bridge.
 4. Probe readiness so `db_closed` is visible.
 5. Drain and stop the outbound keepalive pool with `shutdown_keepalive_pool`.
-6. Stop the notification listener.
+6. Stop the notification listener and public listener.
 7. Shutdown the runtime and assert the terminal report/trace facts.
 
 ## Multi-Turn RequestContext
@@ -78,11 +78,12 @@ The route replies several turns after the original HTTP/controller call.
 The smoke run prints a materialized fact:
 
 ```text
-live_replay_fact case=mini_saas_body_full ops=[post:/items:40bytes] fact=status_413 cap=32
+live_replay_fact case=mini_saas_body_full ops=[post:/items:41bytes] fact=status_413 cap=32
 ```
 
-This is intentionally small: the operation is explicit, the fact is typed, and
-a cap mismatch fails the smoke assertion instead of being inferred from raw log
+This is intentionally small: the operation is explicit, the fact is checked via
+`tina_sim::dst` live-replay capture with a typed capacity surface, and a
+cap/status mismatch fails the smoke run instead of being inferred from raw log
 text.
 
 ## Commands

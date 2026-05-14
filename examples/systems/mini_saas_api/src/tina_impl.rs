@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use rusqlite::Connection;
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::pool::{
     AcquireOutcome, CloseMode, PoolConfig, PoolLease, PoolPressureReport, ReleaseDisposition,
     ReleaseOutcome,
@@ -18,8 +19,12 @@ use tina_http::{
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, RuntimeEventKind, ThreadedRuntime,
-    call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, RuntimeEvent, RuntimeEventKind,
+    ThreadedRuntime, call, sleep,
+};
+use tina_sim::dst::{
+    LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
+    ReplayReport, check_captured_replay,
 };
 use tina_sqlite_bridge::{
     SqliteAddress, SqliteConfig, SqliteError, SqliteMetricsHandle, SqlitePressureReport,
@@ -110,21 +115,18 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
 
     let mut report = drive_script(addr, mode)?;
 
-    runtime
-        .try_send(main_listener, HttpListenerMsg::Stop)
-        .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
-    let during_shutdown = get(addr, "/ready");
-    report.ready_during_shutdown_503 = during_shutdown
-        .as_ref()
-        .map(|r| r.status == 503 && r.body.contains("ingress_stopped"))
-        .unwrap_or(true);
+    match runtime.call_blocking(controller, ControllerMsg::CloseIngress, REQUEST_TIMEOUT)? {
+        CallOutcome::Replied(response) if response.status == StatusCode::OK => {}
+        other => anyhow::bail!("close ingress control call failed: {other:?}"),
+    }
+    let during_shutdown = get(addr, "/ready")?;
+    report.ready_during_shutdown_503 =
+        during_shutdown.status == 503 && during_shutdown.body.contains("ingress_stopped");
 
     sqlite.closer.close();
-    let after_db_close = get(addr, "/ready");
-    report.ready_after_db_close_503 = after_db_close
-        .as_ref()
-        .map(|r| r.status == 503 && r.body.contains("db_closed"))
-        .unwrap_or(true);
+    let after_db_close = get(addr, "/ready")?;
+    report.ready_after_db_close_503 =
+        after_db_close.status == 503 && after_db_close.body.contains("db_closed");
 
     let db_pressure = sqlite.metrics.pressure_report();
     let outbound_shutdown = shutdown_keepalive_pool(
@@ -137,6 +139,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     runtime
         .try_send(notify_listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("stop notify listener: {e:?}"))?;
+    runtime
+        .try_send(main_listener, HttpListenerMsg::Stop)
+        .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
     let trace = runtime.shutdown().unwrap_or_default();
     let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
     let deferred_replies = trace
@@ -147,22 +152,12 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     report.shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained);
     report.multi_turn_notify = report.notified_item && deferred_replies >= 3;
     report.capacity_line = format!(
-        "capacity http.body_bytes={} controller.mailbox={} db.capacity={} db.leased={} \
-         db.high_water={} db.full={} db.closed={} outbound.drain={:?} trace_pressure={}",
-        BODY_CAP_BYTES,
-        CONTROLLER_MAILBOX_CAPACITY,
+        "capacity {} db.capacity={} db.closed={} outbound.drain={:?} trace_pressure={}",
+        report.capacity_line.trim(),
         db_pressure.capacity,
-        db_pressure.leased,
-        db_pressure.high_water,
-        db_pressure.full_count,
         db_pressure.closed_count,
         outbound_shutdown.drain,
         pressure
-    );
-    report.live_replay_fact = format!(
-        "case=mini_saas_body_full ops=[post:/items:{}bytes] fact=status_413 cap={}",
-        BODY_CAP_BYTES + 8,
-        BODY_CAP_BYTES
     );
 
     Ok(report)
@@ -189,15 +184,24 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
     report.missing_404 = get(addr, "/items/999")?.status == 404;
     report.method_405 = put(addr, "/items/1")?.status == 405;
     report.bad_request_400 = post(addr, "/items", "bad")?.status == 400;
-    report.body_cap_413 =
-        post(addr, "/items", "name=abcdefghijklmnopqrstuvwxyz0123456789")?.status == 413;
+    let body_cap_body = "name=abcdefghijklmnopqrstuvwxyz0123456789";
+    let body_cap = post(addr, "/items", body_cap_body)?;
+    report.body_cap_413 = body_cap.status == 413;
+    report.live_replay_fact = live_replay_fact(ReplayCase {
+        name: "mini_saas_body_full",
+        method: "post",
+        path: "/items",
+        request_body_bytes: body_cap_body.len(),
+        cap: BODY_CAP_BYTES,
+        status: body_cap.status,
+    })?;
     report.db_constraint_409 = post(addr, "/items", "name=alpha")?.status == 409;
 
     if matches!(mode, RunMode::Pressure) {
         let a = addr;
         let b = addr;
         let t1 = std::thread::spawn(move || post(a, "/items/1/notify", "slow"));
-        std::thread::sleep(Duration::from_millis(20));
+        wait_for_capacity(addr, "outbound.in_flight=1", Duration::from_secs(2))?;
         let t2 = std::thread::spawn(move || post(b, "/items/1/notify", ""));
         let r1 = t1
             .join()
@@ -211,6 +215,124 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
     let capacity = get(addr, "/debug/capacity")?;
     report.capacity_line = capacity.body;
     Ok(report)
+}
+
+struct ReplayCase {
+    name: &'static str,
+    method: &'static str,
+    path: &'static str,
+    request_body_bytes: usize,
+    cap: usize,
+    status: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplayOp {
+    Post {
+        path: &'static str,
+        body_bytes: usize,
+        status: u16,
+    },
+}
+
+fn live_replay_fact(case: ReplayCase) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        case.request_body_bytes > case.cap,
+        "replay case {} does not exceed body cap: body={} cap={}",
+        case.name,
+        case.request_body_bytes,
+        case.cap
+    );
+    anyhow::ensure!(
+        case.status == 413,
+        "replay case {} expected status_413, got status_{}",
+        case.name,
+        case.status
+    );
+    let op = ReplayOp::Post {
+        path: case.path,
+        body_bytes: case.request_body_bytes,
+        status: case.status,
+    };
+    let replay_case = DstReplayCase::new(
+        case.name,
+        83,
+        ReplayConfig::default(),
+        "mini-saas body cap request",
+        vec![op],
+        "oversize POST returns typed body-cap status",
+    );
+    let capacity_fact = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+        "mini_saas.http.body",
+        CapacityMode::Fixed,
+        case.cap,
+        0,
+        case.request_body_bytes,
+        1,
+        "bytes",
+    ));
+    check_live_replay_case(&replay_case, capacity_fact)
+        .map_err(|e| anyhow::anyhow!("live replay capture mismatch: {e}"))?;
+    Ok(format!(
+        "case={} ops=[{}:{}:{}bytes] fact=status_413 cap={}",
+        case.name, case.method, case.path, case.request_body_bytes, case.cap
+    ))
+}
+
+fn check_live_replay_case(
+    case: &DstReplayCase<ReplayOp>,
+    capacity_fact: LiveReplayFact,
+) -> Result<(), Box<tina_sim::dst::CapturedReplayMismatch<ReplayOp>>> {
+    let runner = |case: &DstReplayCase<ReplayOp>| {
+        let Some(ReplayOp::Post {
+            body_bytes, status, ..
+        }) = case.history.operations().first()
+        else {
+            return Err(tina_sim::dst::TraceProjectionError {
+                event_id: tina_runtime::EventId::new(0),
+                kind: None,
+                reason: "missing materialized replay op".to_owned(),
+            });
+        };
+        let report = ReplayReport::from_case_and_events(case, &[] as &[RuntimeEvent], *status);
+        let fact = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+            "mini_saas.http.body",
+            CapacityMode::Fixed,
+            BODY_CAP_BYTES,
+            0,
+            *body_bytes,
+            u64::from(*status == 413),
+            "bytes",
+        ));
+        Ok(LiveReplayReport::exact(report).with_live_fact(fact))
+    };
+    let report = runner(case).expect("local live replay runner uses exact projection");
+    let capture =
+        LiveReplayCapture::from_case_and_report(case, "mini_saas_api_live", &report.replay)
+            .with_live_fact(capacity_fact);
+    check_captured_replay(&capture, &capture.to_replay_case(), runner).map(|_| ())
+}
+
+fn wait_for_capacity(
+    addr: std::net::SocketAddr,
+    needle: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match get(addr, "/debug/capacity") {
+            Ok(response) => {
+                last = response.body;
+                if last.contains(needle) {
+                    return Ok(());
+                }
+            }
+            Err(error) => last = format!("capacity probe failed: {error}"),
+        }
+        std::thread::yield_now();
+    }
+    anyhow::bail!("timed out waiting for capacity {needle}; last={last:?}")
 }
 
 fn listener_config(max_body_bytes: usize) -> HttpServerConfig {
@@ -319,9 +441,15 @@ impl Controller {
 
 enum ControllerMsg {
     Http(HttpRequest),
-    ReadyDb(RequestContext<HttpResponse>, CallOutcome<SqliteResult>),
+    CloseIngress,
+    ReadyDb(
+        RequestContext<HttpResponse>,
+        bool,
+        CallOutcome<SqliteResult>,
+    ),
     ReadyPool(
         RequestContext<HttpResponse>,
+        bool,
         CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
     ),
     Created(
@@ -383,23 +511,50 @@ impl Isolate for Controller {
     ) -> Effect<Self> {
         match msg {
             ControllerMsg::Http(_) => noop(),
-            ControllerMsg::ReadyDb(req, outcome) => match outcome {
+            ControllerMsg::CloseIngress => {
+                self.ingress_open = false;
+                noop()
+            }
+            ControllerMsg::ReadyDb(req, ingress_stopped, outcome) => match outcome {
                 CallOutcome::Replied(Ok(_)) => call(
                     self.outbound_pool,
                     WorkerPoolMsg::PressureReport,
                     REQUEST_TIMEOUT,
                 )
-                .reply_with_request(req, ControllerMsg::ReadyPool),
-                other => reply_to_request(req, readiness(false, &[db_reason(&other)])),
+                .reply_with_request(req, move |req, outcome| {
+                    ControllerMsg::ReadyPool(req, ingress_stopped, outcome)
+                }),
+                other => reply_to_request(
+                    req,
+                    readiness(
+                        false,
+                        &ready_reasons(ingress_stopped, Some(db_reason(&other))),
+                    ),
+                ),
             },
-            ControllerMsg::ReadyPool(req, outcome) => match outcome {
-                CallOutcome::Replied(WorkerPoolReply::Pressure(report)) if report.available > 0 => {
+            ControllerMsg::ReadyPool(req, ingress_stopped, outcome) => match outcome {
+                CallOutcome::Replied(WorkerPoolReply::Pressure(report))
+                    if report.available > 0 && !ingress_stopped =>
+                {
                     reply_to_request(req, readiness(true, &[]))
                 }
-                CallOutcome::Replied(WorkerPoolReply::Pressure(_)) => {
-                    reply_to_request(req, readiness(false, &["outbound_full"]))
+                CallOutcome::Replied(WorkerPoolReply::Pressure(report)) if report.available > 0 => {
+                    reply_to_request(req, readiness(false, &ready_reasons(ingress_stopped, None)))
                 }
-                _ => reply_to_request(req, readiness(false, &["outbound_closed"])),
+                CallOutcome::Replied(WorkerPoolReply::Pressure(_)) => reply_to_request(
+                    req,
+                    readiness(
+                        false,
+                        &ready_reasons(ingress_stopped, Some("outbound_full")),
+                    ),
+                ),
+                _ => reply_to_request(
+                    req,
+                    readiness(
+                        false,
+                        &ready_reasons(ingress_stopped, Some("outbound_closed")),
+                    ),
+                ),
             },
             ControllerMsg::Created(req, id, name, outcome) => match outcome {
                 CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => {
@@ -446,19 +601,23 @@ impl Isolate for Controller {
                 other => reply_to_request(req, pool_acquire_error_response(other)),
             },
             ControllerMsg::NotifySent(req, lease, outcome) => {
-                let ok = matches!(
-                    outcome,
+                let (ok, disposition) = match &outcome {
                     CallOutcome::Replied(KeepaliveOutcome::Request {
-                        result: Ok(ref response),
-                        ..
-                    }) if response.status.is_success()
-                );
+                        result: Ok(response),
+                        must_retire,
+                    }) => (
+                        response.status.is_success(),
+                        if *must_retire {
+                            ReleaseDisposition::Retire
+                        } else {
+                            ReleaseDisposition::Reuse
+                        },
+                    ),
+                    _ => (false, ReleaseDisposition::Retire),
+                };
                 call(
                     self.outbound_pool,
-                    WorkerPoolMsg::Release {
-                        lease,
-                        disposition: ReleaseDisposition::Reuse,
-                    },
+                    WorkerPoolMsg::Release { lease, disposition },
                     REQUEST_TIMEOUT,
                 )
                 .reply_with_request(req, move |req, release| {
@@ -489,6 +648,10 @@ impl Isolate for Controller {
     fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             ControllerMsg::Http(request) => self.route(request, call),
+            ControllerMsg::CloseIngress => {
+                self.ingress_open = false;
+                call.reply(text(StatusCode::OK, "ingress_closed\n"))
+            }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
@@ -501,16 +664,14 @@ impl Controller {
         match (method, path.as_str()) {
             (http::Method::GET, "/health") => call_ctx.reply(text(StatusCode::OK, "alive\n")),
             (http::Method::GET, "/ready") => {
-                if !self.ingress_open {
-                    return call_ctx.reply(readiness(false, &["ingress_stopped"]));
-                }
+                let ingress_stopped = !self.ingress_open;
                 let req = call_ctx.into_request_context();
                 send_request(
                     self.db,
                     SqliteRequest::query_rows("SELECT 1", 1),
                     REQUEST_TIMEOUT,
                 )
-                .reply(move |outcome| ControllerMsg::ReadyDb(req, outcome))
+                .reply(move |outcome| ControllerMsg::ReadyDb(req, ingress_stopped, outcome))
             }
             (http::Method::POST, "/items") => self.create_item(request, call_ctx),
             (http::Method::GET, "/debug/capacity") => {
@@ -674,6 +835,17 @@ fn readiness(ok: bool, reasons: &[&str]) -> HttpResponse {
             format!("not_ready reasons={}\n", reasons.join(",")),
         )
     }
+}
+
+fn ready_reasons(ingress_stopped: bool, reason: Option<&'static str>) -> Vec<&'static str> {
+    let mut reasons = Vec::with_capacity(2);
+    if ingress_stopped {
+        reasons.push("ingress_stopped");
+    }
+    if let Some(reason) = reason {
+        reasons.push(reason);
+    }
+    reasons
 }
 
 fn capacity_body(db: SqlitePressureReport, outbound: PoolPressureReport) -> String {
