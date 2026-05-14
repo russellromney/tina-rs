@@ -140,6 +140,22 @@ pinned success-before-EOF policy. Implementation must prove the connection does
 not accept unbounded unread DATA, silently reuse the stream id, or lose final
 status.
 
+### Fixed In Plan: User-Realistic Client-Streaming Gates
+
+The plan now requires real client-shaped tests, not just private frame helpers:
+tonic must observe early success/error cleanly, slow producers must split the
+gRPC frame header and body across tiny DATA frames, slow handlers must prove
+window credit returns only after user-level `next` consumption, and the same
+HTTP/2 connection must survive early success/error/cancel for a follow-up RPC.
+
+### Hostile Review: Same-Connection Survival Is The Bug Amplifier
+
+The strongest client-streaming test is not the one that sees an error; it is
+the one that sees an early final status, keeps sending unread DATA, then proves
+another RPC on the same HTTP/2 connection still works. That forces stream-state,
+flow-control credit, final trailers, and reset/drain policy to agree under user
+behavior that real clients absolutely will produce.
+
 ### Still Risky: Server-Streaming API Is Too Raw
 
 `GrpcServerStreamingResponse` currently asks handlers to provide a
@@ -158,9 +174,14 @@ Before claiming 096 complete, add tests that:
    reject and early success before request EOF.
 4. Prove client-streaming resident memory is bounded by current message/chunk,
    not total message count.
-5. Interleave bidi request/response messages while one direction is
+5. Prove post-final-status DATA from the client follows the pinned policy and
+   does not break the HTTP/2 connection for a follow-up RPC.
+6. Prove slow producer and slow handler timing: split frame header/body across
+   tiny DATA frames, delay between user `next` calls, and assert window credit
+   timing.
+7. Interleave bidi request/response messages while one direction is
    flow-control blocked.
-6. Start/stop the specimen repeatedly on random ports and run copy-paste
+8. Start/stop the specimen repeatedly on random ports and run copy-paste
    documented commands, not private helper clients.
 
 ### Production Client Is Conditional

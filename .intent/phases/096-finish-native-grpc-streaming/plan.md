@@ -243,12 +243,25 @@ Requirements:
     sending;
   - a handler reads one message and returns success while the client is still
     sending;
+  - a real tonic client-streaming caller observes the exact early success or
+    error status and exits cleanly when Tina returns before request EOF;
+  - a slow producer splits the 5-byte gRPC frame header and protobuf body
+    across one-byte or awkwardly small HTTP/2 DATA frames;
+  - a slow handler delays between `next` calls, proving HTTP/2 window credit is
+    returned only after user-level consumption;
   - a handler sums many messages without resident memory growing with message
     count, proven by a high-water/cap assertion rather than just completion;
   - a protobuf frame split across multiple HTTP/2 DATA frames decodes once;
+  - a stream with one valid message followed by a malformed or oversized
+    message preserves the first handoff and fails the second with the right
+    status;
   - malformed and oversized messages fail before invoking the user handler for
     that message;
-  - peer reset while `next` is pending wakes the handler with cancel truth.
+  - peer reset while `next` is pending wakes the handler with cancel truth;
+  - after early success or early error, a client that keeps sending DATA hits
+    the pinned drain/reset policy without corrupting the connection;
+  - after early success/error/cancel, the same HTTP/2 connection can still
+    complete a second unary or streaming RPC.
 
 ## Rock 4: Bidirectional Streaming
 
