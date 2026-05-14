@@ -83,6 +83,24 @@
 //! HTTPS/2 or ALPN claim, not gRPC, not a full client, and not a full
 //! RFC feature clone.
 //!
+//! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
+//! upgrades for [`HttpListener`] and [`HttpsListener`]. After the
+//! `101 Switching Protocols` response, the same connection isolate owns
+//! the upgraded TCP/TLS stream. The 087 echo path remains:
+//! handle `WebSocketSessionMsg::Text` and reply with
+//! `WebSocketSessionOutcome::Text`. Room/fanout code can instead store
+//! the `WebSocketSessionHandle` from `WebSocketSessionMsg::SessionOpen`
+//! and route bounded sends back through the session owner with
+//! `handle.text_effect::<Room>("...", timeout)`. Room/admin code can send
+//! `WebSocketSessionMsg::Shutdown` to close stored handles through the same
+//! bounded owner path. Upgrade code can inspect
+//! `WebSocketUpgradeRequest::offered_subprotocols()` and select a protocol
+//! with `accept_subprotocol(...)`. Data fragmentation is reassembled under
+//! `max_message_bytes`, with control frames allowed between fragments. There is
+//! no permessage-deflate compression or native broad client in this slice;
+//! extension offers are visible and ignored unless a future slice explicitly
+//! negotiates one.
+//!
 //! Still out of scope: HTTP/2 TLS ALPN, gRPC, ACME, mTLS, SNI routing,
 //! system roots, certificate reload, redirects, cookies. For mature
 //! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
@@ -155,8 +173,9 @@ pub use types::{
 };
 pub use websocket::{
     WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketLimits, WebSocketMessage,
-    WebSocketOutboundQueue, WebSocketSessionMsg, WebSocketSessionOutcome, WebSocketUpgradeRequest,
-    websocket_upgrade,
+    WebSocketOutboundQueue, WebSocketSend, WebSocketSendError, WebSocketSendOutcome,
+    WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome,
+    WebSocketUpgradeRequest, websocket_upgrade,
 };
 
 // Re-exports from the `http` crate for convenient `tina_http::Method`,

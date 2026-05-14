@@ -43,6 +43,7 @@ Read in order if new:
 17. [Pressure Report Convention](17-pressure-report-convention.md)
 18. [Bridge Crates](18-bridge-crates.md)
 19. [Tracing](19-tracing.md)
+20. [Native WebSocket Server](20-native-websocket-server.md)
 
 For runnable specimens, see repo-root `examples/`.
 

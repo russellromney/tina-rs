@@ -471,6 +471,7 @@ impl Isolate for StreamingConsumer {
                     )
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
                 | CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)

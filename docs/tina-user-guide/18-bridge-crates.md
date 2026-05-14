@@ -15,7 +15,8 @@ Tina-owned TCP/TLS rails after handoff, bounded frame/message/queue
 limits, visible ping/pong and close messages, client masking
 validation, and unmasked server frames. It is not HTTP/2 WebSocket,
 permessage-deflate, a browser session framework, or a broad client
-crate. Native HTTP/2 now has a
+crate. For the bounded room/fanout copy path, see
+[Native WebSocket Server](20-native-websocket-server.md). Native HTTP/2 now has a
 server-first h2c path in `tina-http::Http2Listener`: cleartext
 prior-knowledge transport, bounded stream table, explicit
 connection/stream flow-control windows, and ordinary `HttpRequest` /
