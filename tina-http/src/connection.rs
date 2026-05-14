@@ -76,6 +76,8 @@ struct WebSocketState {
     close_sent: bool,
     close_received: bool,
     close_generation: u64,
+    ping_generation: u64,
+    awaiting_pong_generation: Option<u64>,
 }
 
 impl WebSocketState {
@@ -94,6 +96,8 @@ impl WebSocketState {
             close_sent: false,
             close_received: false,
             close_generation: 0,
+            ping_generation: 0,
+            awaiting_pong_generation: None,
         }
     }
 }
@@ -133,6 +137,11 @@ pub enum HttpConnectionMsg {
     WebSocketAppReturned(CallOutcome<WebSocketSessionOutcome>),
     /// Close-handshake timer for an upgraded WebSocket session.
     WebSocketCloseDeadline {
+        generation: u64,
+        result: Result<(), CallError>,
+    },
+    /// Ping liveness timer for an upgraded WebSocket session.
+    WebSocketPongDeadline {
         generation: u64,
         result: Result<(), CallError>,
     },
@@ -462,6 +471,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             }
             HttpConnectionMsg::WebSocketCloseDeadline { generation, .. } => {
                 self.handle_websocket_close_deadline(generation)
+            }
+            HttpConnectionMsg::WebSocketPongDeadline { generation, .. } => {
+                self.handle_websocket_pong_deadline(generation)
             }
         }
     }
@@ -1387,13 +1399,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         if let Some(next) = ws.outbound.pop() {
             return self.websocket_write(next);
         }
-        self.websocket_read_more()
+        self.websocket_continue_read()
     }
 
     fn handle_websocket_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
         if bytes.is_empty() {
-            return self
-                .call_websocket_app(WebSocketSessionMsg::Closed(WebSocketError::PeerClosed));
+            return batch(vec![
+                self.call_websocket_app(WebSocketSessionMsg::Closed(WebSocketError::PeerClosed)),
+                self.begin_close(),
+            ]);
         }
         let Some(ws) = self.websocket.as_mut() else {
             return self.begin_close();
@@ -1402,6 +1416,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         if ws.read_buf.len() > ws.limits.read_buffer_high_water {
             return self.websocket_protocol_close(WebSocketError::ReadBufferTooLarge);
         }
+        self.handle_websocket_buffered_frame()
+    }
+
+    fn handle_websocket_buffered_frame(&mut self) -> Effect<Self> {
+        let Some(ws) = self.websocket.as_mut() else {
+            return self.begin_close();
+        };
         match parse_client_frame(&mut ws.read_buf, ws.limits) {
             FrameParse::NeedMore => self.websocket_read_more(),
             FrameParse::Error(error) => self.websocket_protocol_close(error),
@@ -1439,7 +1460,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         Err(error) => self.websocket_protocol_close(error),
                     }
                 }
-                0xA => self.call_websocket_app(WebSocketSessionMsg::Pong(frame.payload)),
+                0xA => {
+                    if let Some(ws) = self.websocket.as_mut() {
+                        ws.awaiting_pong_generation = None;
+                    }
+                    self.call_websocket_app(WebSocketSessionMsg::Pong(frame.payload))
+                }
                 _ => self.websocket_protocol_close(WebSocketError::ProtocolError),
             },
         }
@@ -1468,21 +1494,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let mut effects = Vec::new();
         for message in outcome_messages(outcome) {
             let is_close = matches!(message, WebSocketMessage::Close(_, _));
+            let is_ping = matches!(message, WebSocketMessage::Ping(_));
             let bytes = match encode_server_message(message) {
                 Ok(bytes) => bytes,
                 Err(error) => return self.websocket_protocol_close(error),
             };
             if is_close {
-                if let Some(ws) = self.websocket.as_mut() {
-                    ws.close_sent = true;
-                    ws.close_generation = ws.close_generation.saturating_add(1);
-                    let generation = ws.close_generation;
-                    effects.push(
-                        sleep(ws.limits.close_handshake_timeout).reply(move |result| {
-                            HttpConnectionMsg::WebSocketCloseDeadline { generation, result }
-                        }),
-                    );
-                }
+                effects.push(self.arm_websocket_close_deadline());
+            } else if is_ping {
+                effects.push(self.arm_websocket_pong_deadline());
             }
             effects.push(self.websocket_queue_or_write(bytes));
         }
@@ -1492,21 +1512,41 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 .as_ref()
                 .is_none_or(|ws| ws.pending_write.is_empty())
         {
-            effects.push(self.websocket_read_more());
+            effects.push(self.websocket_continue_read());
         }
         batch(effects)
+    }
+
+    fn websocket_continue_read(&mut self) -> Effect<Self> {
+        let has_buffered = self
+            .websocket
+            .as_ref()
+            .is_some_and(|ws| !ws.read_buf.is_empty());
+        if has_buffered {
+            self.handle_websocket_buffered_frame()
+        } else {
+            self.websocket_read_more()
+        }
     }
 
     fn websocket_queue_or_write(&mut self, bytes: Vec<u8>) -> Effect<Self> {
         let Some(ws) = self.websocket.as_mut() else {
             return self.begin_close();
         };
+        let next_bytes = ws
+            .pending_write
+            .len()
+            .saturating_add(ws.outbound.queued_bytes())
+            .saturating_add(bytes.len());
+        if next_bytes > ws.limits.max_queued_outbound_bytes {
+            return self.websocket_pressure_then_close(WebSocketError::OutboundBytesFull);
+        }
         if ws.pending_write.is_empty() {
             self.websocket_write(bytes)
         } else {
             match ws.outbound.push(bytes) {
                 Ok(()) => noop(),
-                Err(error) => self.websocket_protocol_close(error),
+                Err(error) => self.websocket_pressure_then_close(error),
             }
         }
     }
@@ -1538,14 +1578,42 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             Some(WebSocketCloseCode(1002)),
             Vec::new(),
         )) {
-            Ok(bytes) => {
-                if let Some(ws) = self.websocket.as_mut() {
-                    ws.close_sent = true;
-                }
-                batch(vec![notify, self.websocket_queue_or_write(bytes)])
-            }
+            Ok(bytes) => batch(vec![
+                notify,
+                self.arm_websocket_close_deadline(),
+                self.websocket_queue_or_write(bytes),
+            ]),
             Err(_) => self.begin_close(),
         }
+    }
+
+    fn websocket_pressure_then_close(&mut self, error: WebSocketError) -> Effect<Self> {
+        batch(vec![
+            self.call_websocket_app(WebSocketSessionMsg::Pressure(error)),
+            self.begin_close(),
+        ])
+    }
+
+    fn arm_websocket_close_deadline(&mut self) -> Effect<Self> {
+        let Some(ws) = self.websocket.as_mut() else {
+            return noop();
+        };
+        ws.close_sent = true;
+        ws.close_generation = ws.close_generation.saturating_add(1);
+        let generation = ws.close_generation;
+        sleep(ws.limits.close_handshake_timeout)
+            .reply(move |result| HttpConnectionMsg::WebSocketCloseDeadline { generation, result })
+    }
+
+    fn arm_websocket_pong_deadline(&mut self) -> Effect<Self> {
+        let Some(ws) = self.websocket.as_mut() else {
+            return noop();
+        };
+        ws.ping_generation = ws.ping_generation.saturating_add(1);
+        let generation = ws.ping_generation;
+        ws.awaiting_pong_generation = Some(generation);
+        sleep(ws.limits.ping_pong_timeout)
+            .reply(move |result| HttpConnectionMsg::WebSocketPongDeadline { generation, result })
     }
 
     fn handle_websocket_close_deadline(&mut self, generation: u64) -> Effect<Self> {
@@ -1554,6 +1622,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         };
         if ws.close_sent && !ws.close_received && ws.close_generation == generation {
             return self.begin_close();
+        }
+        noop()
+    }
+
+    fn handle_websocket_pong_deadline(&mut self, generation: u64) -> Effect<Self> {
+        let Some(ws) = self.websocket.as_ref() else {
+            return noop();
+        };
+        if ws.awaiting_pong_generation == Some(generation) {
+            return self.websocket_protocol_close(WebSocketError::Timeout);
         }
         noop()
     }

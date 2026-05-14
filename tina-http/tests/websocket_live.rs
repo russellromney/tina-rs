@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use http::Method;
@@ -97,6 +97,15 @@ impl Isolate for WsEcho {
 impl WsEcho {
     fn outcome_for(msg: WebSocketSessionMsg) -> WebSocketSessionOutcome {
         match msg {
+            WebSocketSessionMsg::Text(text) if text == "server-ping" => {
+                WebSocketSessionOutcome::Many(vec![WebSocketMessage::Ping(b"alive".to_vec())])
+            }
+            WebSocketSessionMsg::Text(text) if text == "large-out" => {
+                WebSocketSessionOutcome::Text("x".repeat(64))
+            }
+            WebSocketSessionMsg::Text(text) if text == "server-close" => {
+                WebSocketSessionOutcome::Close(Some(WebSocketCloseCode(1000)), b"bye".to_vec())
+            }
             WebSocketSessionMsg::Text(text) => WebSocketSessionOutcome::Text(text),
             WebSocketSessionMsg::Binary(bytes) => WebSocketSessionOutcome::Binary(bytes),
             WebSocketSessionMsg::Pong(bytes) => {
@@ -205,8 +214,12 @@ fn connect_ws(addr: SocketAddr) -> TcpStream {
 }
 
 fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    masked_frame_with_first_byte(0x80 | opcode, payload)
+}
+
+fn masked_frame_with_first_byte(first: u8, payload: &[u8]) -> Vec<u8> {
     let mask = [1u8, 2, 3, 4];
-    let mut out = vec![0x80 | opcode];
+    let mut out = vec![first];
     if payload.len() < 126 {
         out.push(0x80 | payload.len() as u8);
     } else {
@@ -297,6 +310,17 @@ fn websocket_text_and_binary_echo_work() {
 }
 
 #[test]
+fn websocket_two_buffered_frames_do_not_wait_for_more_bytes() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = connect_ws(harness.addr);
+    let mut frames = masked_frame(0x1, b"one");
+    frames.extend_from_slice(&masked_frame(0x1, b"two"));
+    stream.write_all(&frames).unwrap();
+    assert_eq!(read_server_frame(&mut stream), (0x1, b"one".to_vec()));
+    assert_eq!(read_server_frame(&mut stream), (0x1, b"two".to_vec()));
+}
+
+#[test]
 fn websocket_unmasked_client_frame_rejects() {
     let harness = Harness::start(WebSocketLimits::default());
     let mut stream = connect_ws(harness.addr);
@@ -322,6 +346,16 @@ fn websocket_control_frame_rules_are_enforced() {
 }
 
 #[test]
+fn websocket_rsv_bits_reject_without_negotiated_extensions() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = connect_ws(harness.addr);
+    stream
+        .write_all(&masked_frame_with_first_byte(0x80 | 0x40 | 0x1, b"bad"))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut stream).0, 0x8);
+}
+
+#[test]
 fn websocket_ping_produces_pong_and_pong_is_visible() {
     let harness = Harness::start(WebSocketLimits::default());
     let mut stream = connect_ws(harness.addr);
@@ -341,6 +375,83 @@ fn websocket_peer_close_gets_close_reply() {
     let (opcode, body) = read_server_frame(&mut stream);
     assert_eq!(opcode, 0x8);
     assert_eq!(body, payload);
+}
+
+#[test]
+fn websocket_bad_close_payload_rejects() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = connect_ws(harness.addr);
+    stream.write_all(&masked_frame(0x8, &[0x03])).unwrap();
+    assert_eq!(read_server_frame(&mut stream).0, 0x8);
+
+    let mut stream = connect_ws(harness.addr);
+    let mut payload = 1000u16.to_be_bytes().to_vec();
+    payload.push(0xff);
+    stream.write_all(&masked_frame(0x8, &payload)).unwrap();
+    assert_eq!(read_server_frame(&mut stream).0, 0x8);
+}
+
+#[test]
+fn websocket_app_ping_timeout_closes() {
+    let limits = WebSocketLimits {
+        ping_pong_timeout: Duration::from_millis(20),
+        close_handshake_timeout: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let harness = Harness::start(limits);
+    let mut stream = connect_ws(harness.addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    stream
+        .write_all(&masked_frame(0x1, b"server-ping"))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut stream), (0x9, b"alive".to_vec()));
+    assert_eq!(read_server_frame(&mut stream).0, 0x8);
+}
+
+#[test]
+fn websocket_close_handshake_timeout_closes_resource() {
+    let limits = WebSocketLimits {
+        close_handshake_timeout: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let harness = Harness::start(limits);
+    let mut stream = connect_ws(harness.addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    stream
+        .write_all(&masked_frame(0x1, b"server-close"))
+        .unwrap();
+    assert_eq!(read_server_frame(&mut stream).0, 0x8);
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn websocket_peer_fin_closes_resource() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = connect_ws(harness.addr);
+    stream.shutdown(Shutdown::Write).unwrap();
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn websocket_immediate_outbound_bytes_cap_is_visible_pressure() {
+    let limits = WebSocketLimits {
+        max_queued_outbound_bytes: 8,
+        ..Default::default()
+    };
+    let harness = Harness::start(limits);
+    let mut stream = connect_ws(harness.addr);
+    stream.write_all(&masked_frame(0x1, b"large-out")).unwrap();
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "large outbound frame must not be written");
 }
 
 #[test]

@@ -299,8 +299,12 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     let b0 = buf[0];
     let b1 = buf[1];
     let fin = b0 & 0x80 != 0;
+    let rsv = b0 & 0x70;
     let opcode = b0 & 0x0f;
     let masked = b1 & 0x80 != 0;
+    if rsv != 0 {
+        return FrameParse::Error(WebSocketError::UnsupportedExtension);
+    }
     if !masked {
         return FrameParse::Error(WebSocketError::ClientFrameUnmasked);
     }
@@ -429,9 +433,16 @@ pub(crate) fn decode_close_payload(
         1 => Err(WebSocketError::InvalidClosePayload),
         _ => {
             let code = u16::from_be_bytes([payload[0], payload[1]]);
+            if !valid_close_code(code) || std::str::from_utf8(&payload[2..]).is_err() {
+                return Err(WebSocketError::InvalidClosePayload);
+            }
             Ok((Some(WebSocketCloseCode(code)), payload[2..].to_vec()))
         }
     }
+}
+
+fn valid_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 #[cfg(test)]
