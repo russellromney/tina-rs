@@ -366,11 +366,15 @@ only after every generated operation has been materialized into the
 history. If a TCP read, timer firing, retry decision, bridge
 completion, or topology fact matters, it must be an `Op` or part of
 `ReplayConfig`; otherwise the simulator has no honest way to replay it.
+Live reports can also carry typed facts such as capacity high-water and
+full-rejection snapshots. Those facts are compared explicitly as a set.
+If the simulator runner does not reproduce them, replay fails closed.
 
 ```rust
 use tina_sim::dst::{
-    LiveReplayCapture, LiveReplayReport, RuntimeEventKindName, TraceProjection,
-    check_captured_replay, read_saved_replay_case, write_saved_replay_case,
+    LiveReplayCapture, LiveReplayFact, LiveReplayReport, RuntimeEventKindName,
+    TraceProjection, check_captured_replay, read_saved_replay_case,
+    write_saved_replay_case,
 };
 
 let projection = TraceProjection::Projected {
@@ -389,6 +393,8 @@ let capture = LiveReplayCapture::from_events_with_options(
     projection,
     Vec::new(),
 )?;
+let body_fact = LiveReplayFact::capacity_surface(&http_body_capacity_report);
+let capture = capture.with_live_fact(body_fact.clone());
 
 write_saved_replay_case("cases/late-reply.case", &capture, |op| op.to_string())?;
 
@@ -401,14 +407,21 @@ let case = saved.to_replay_case(
 )?;
 check_captured_replay(&capture, &case, |case| {
     let events = run_case_events(case)?;
-    LiveReplayReport::from_case_and_events(case, &events, (), capture.projection.clone())
+    Ok(LiveReplayReport::from_case_and_events(
+        case,
+        &events,
+        (),
+        capture.projection.clone(),
+    )?
+    .with_live_fact(body_fact.clone()))
 })?;
 ```
 
 The saved-case file is intentionally small and line-oriented. It stores
 name, seed, scenario, invariant, source, config debug/hash, topology
-roles, projection debug, unsupported facts, expected event count/hash,
-and one `op=` line per materialized operation. Tina does not
+roles, projection debug, typed live fact display lines, unsupported
+facts, expected event count/hash, and one `op=` line per materialized
+operation. Tina does not
 deserialize arbitrary service config for you; the caller supplies the
 typed `ReplayConfig` when loading, and the helper checks the config hash
 before replay.
@@ -420,6 +433,13 @@ ignored event kind. An event kind that is not named fails closed with a
 typed projection mismatch. Unsupported facts are also fail-closed: they
 are saved and printed in the mismatch report until the history/config
 is rich enough to model them.
+
+Unsupported facts are a success of honesty, not a Tina failure. They say
+"this capture noticed something real, and the replay case cannot model it
+yet." Add or support the fact, or narrow the projection, before calling a
+case replayable. Unsupported facts must not be smuggled into ignored
+event kinds, and a seed without config, materialized history, projection,
+and facts is not replay.
 
 ```rust
 let capture = capture.with_unsupported_fact(
@@ -436,6 +456,10 @@ changed:   name, seed, scenario, config, history, event count, hash, invariant
 seed:      expected 42, got 43 (changed)
 config:    expected 0x..., got 0x... (changed)
 history:   expected 8 ops, got 7 ops (changed)
+live facts:
+  expected:
+    - capacity surface http1.keepalive.request_body ...
+  actual:
 unsupported fact: external HTTP completion (...)
 projection: expected Projected { ... }, got Projected { ... }
 ignored event kinds: HandlerStarted
@@ -453,12 +477,14 @@ The copied workflow:
 
 ```text
 1. run live code with trace capture enabled
-2. project live inputs/resource completions/topology facts into Op history
-3. build LiveReplayCapture with seed, ReplayConfig, topology/mailboxes, history, invariant, projection, unsupported facts, TraceShape
-4. save it with write_saved_replay_case
-5. run check_captured_replay against the simulator runner
-6. when it fails for the expected bug, use shrink_replay_case on capture.to_replay_case()
-7. commit the shrunk ReplayCase and the saved case
+2. record app operations explicitly as Op values; do not infer them from the raw trace
+3. project live inputs/resource completions/topology facts into Op history or typed live facts
+4. build LiveReplayCapture with seed, ReplayConfig, topology/mailboxes, history, invariant, projection, unsupported facts, typed facts, and TraceShape
+5. save it with write_saved_replay_case
+6. run check_captured_replay against the simulator runner
+7. if unsupported facts appear, either support them or keep the replay blocked
+8. when it fails for the expected bug, use shrink_replay_case on capture.to_replay_case()
+9. shrink only materialized history ops, recompute expected count/hash, and commit the shrunk ReplayCase plus the saved case
 ```
 
 ## Bug Report Shape
@@ -502,7 +528,8 @@ Good Tina simulation targets:
   `from_case_and_events` / `pinned_constants`), `ReplayConfig` (with
   `with_faults` / `with_mailbox` / `mailbox`), `observe_replay_case`,
   `discover_constants`, `LiveReplayCapture`, `LiveReplayReport`,
-  `TraceShape`, `TraceProjection`, `UnsupportedLiveFact`,
+  `TraceShape`, `TraceProjection`, `LiveReplayFact`,
+  `UnsupportedLiveFact`,
   `write_saved_replay_case`, `read_saved_replay_case`,
   `check_captured_replay`, `assert_captured_replay`,
   `CapturedReplayMismatch`,

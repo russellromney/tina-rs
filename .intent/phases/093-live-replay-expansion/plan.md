@@ -2,11 +2,11 @@
 
 ## Status
 
-- Ready to implement.
+- Implemented in PR #79.
+- Chosen stable edge: existing HTTP/1 keepalive/body pressure.
 - One PR.
 - Can run beside 087 WebSocket and 057 gRPC if it stays in `tina-sim`, docs,
   and one narrow specimen/test.
-- At start of implementation, edit this plan status to name the chosen edge.
 
 ## Grug Truth
 

@@ -9,6 +9,7 @@ use std::fmt::{Debug, Write};
 use std::io;
 use std::path::Path;
 
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::{AddressGeneration, IsolateId, ShardId};
 use tina_runtime::{
     CallError, CallId, CauseId, EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
@@ -1415,6 +1416,125 @@ impl std::fmt::Display for UnsupportedLiveFact {
     }
 }
 
+/// A typed live fact that replay must reproduce or reject.
+///
+/// These facts are deliberately small and explicit. They are recorded from
+/// live reports, configs, or materialized app operations; they are not inferred
+/// from raw trace text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveReplayFact {
+    /// A bounded capacity surface snapshot such as HTTP body bytes or pool
+    /// pressure.
+    CapacitySurface(CapacityReplayFact),
+}
+
+impl LiveReplayFact {
+    /// Captures one [`CapacitySurfaceReport`] as replay-comparable data.
+    pub fn capacity_surface(report: &CapacitySurfaceReport) -> Self {
+        Self::CapacitySurface(CapacityReplayFact::from_report(report))
+    }
+}
+
+impl std::fmt::Display for LiveReplayFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapacitySurface(fact) => write!(f, "{fact}"),
+        }
+    }
+}
+
+/// Replay-comparable capacity surface fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityReplayFact {
+    /// Stable surface name.
+    pub name: String,
+    /// How the cap was chosen.
+    pub mode: CapacityMode,
+    /// Configured count cap.
+    pub max_messages: Option<usize>,
+    /// Live count at capture time.
+    pub current_messages: usize,
+    /// Highest count observed since surface construction.
+    pub high_water_messages: usize,
+    /// Cumulative count-cap full rejections.
+    pub full_count: u64,
+    /// Configured weight cap.
+    pub max_weight: Option<usize>,
+    /// Live weight at capture time.
+    pub current_weight: Option<usize>,
+    /// Highest weight observed since surface construction.
+    pub high_water_weight: Option<usize>,
+    /// Cumulative weight-cap full rejections.
+    pub weight_full_count: u64,
+    /// Unit for weight fields.
+    pub weight_unit: Option<String>,
+    /// Optional shard-local shared scope name.
+    pub shared_scope: Option<String>,
+    /// Configured shared-scope weight cap.
+    pub shared_max_weight: Option<usize>,
+    /// Live shared-scope weight at capture time.
+    pub shared_current_weight: Option<usize>,
+    /// Highest shared-scope weight observed since surface construction.
+    pub shared_high_water_weight: Option<usize>,
+    /// Cumulative shared-scope full rejections.
+    pub shared_weight_full_count: u64,
+}
+
+impl CapacityReplayFact {
+    fn from_report(report: &CapacitySurfaceReport) -> Self {
+        Self {
+            name: report.name.clone(),
+            mode: report.mode.clone(),
+            max_messages: report.max_messages,
+            current_messages: report.current_messages,
+            high_water_messages: report.high_water_messages,
+            full_count: report.full_count,
+            max_weight: report.max_weight,
+            current_weight: report.current_weight,
+            high_water_weight: report.high_water_weight,
+            weight_full_count: report.weight_full_count,
+            weight_unit: report.weight_unit.clone(),
+            shared_scope: report.shared_scope.clone(),
+            shared_max_weight: report.shared_max_weight,
+            shared_current_weight: report.shared_current_weight,
+            shared_high_water_weight: report.shared_high_water_weight,
+            shared_weight_full_count: report.shared_weight_full_count,
+        }
+    }
+}
+
+impl std::fmt::Display for CapacityReplayFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "capacity surface {} mode={:?} messages={}/{:?} high_water={} full={} weight={:?}/{:?} weight_high_water={:?} weight_full={} unit={:?}",
+            self.name,
+            self.mode,
+            self.current_messages,
+            self.max_messages,
+            self.high_water_messages,
+            self.full_count,
+            self.current_weight,
+            self.max_weight,
+            self.high_water_weight,
+            self.weight_full_count,
+            self.weight_unit,
+        )?;
+        if let Some(scope) = &self.shared_scope {
+            write!(
+                f,
+                " shared={} weight={:?}/{:?} high_water={:?} full={}",
+                scope,
+                self.shared_current_weight,
+                self.shared_max_weight,
+                self.shared_high_water_weight,
+                self.shared_weight_full_count
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Facts captured from a live or simulator run that are sufficient to try a
 /// simulator replay.
 ///
@@ -1449,6 +1569,8 @@ pub struct LiveReplayCapture<Op> {
     pub source: &'static str,
     /// Live facts not represented by the replay config/history.
     pub unsupported_facts: Vec<UnsupportedLiveFact>,
+    /// Typed facts the replay runner must reproduce exactly.
+    pub live_facts: Vec<LiveReplayFact>,
 }
 
 impl<Op> LiveReplayCapture<Op> {
@@ -1510,6 +1632,7 @@ impl<Op> LiveReplayCapture<Op> {
             invariant,
             source,
             unsupported_facts,
+            live_facts: Vec::new(),
         })
     }
 
@@ -1559,6 +1682,7 @@ impl<Op> LiveReplayCapture<Op> {
             invariant: case.invariant,
             source,
             unsupported_facts: Vec::new(),
+            live_facts: Vec::new(),
         }
     }
 
@@ -1575,6 +1699,18 @@ impl<Op> LiveReplayCapture<Op> {
     ) -> Self {
         self.unsupported_facts
             .push(UnsupportedLiveFact::new(fact, reason));
+        self
+    }
+
+    /// Adds one typed live fact and returns the capture.
+    pub fn with_live_fact(mut self, fact: LiveReplayFact) -> Self {
+        self.live_facts.push(fact);
+        self
+    }
+
+    /// Replaces the typed live fact set and returns the capture.
+    pub fn with_live_facts(mut self, facts: Vec<LiveReplayFact>) -> Self {
+        self.live_facts = facts;
         self
     }
 
@@ -1626,6 +1762,8 @@ pub struct SavedReplayCase<Op> {
     pub projection_debug: String,
     /// Unsupported live facts recorded with the capture.
     pub unsupported_facts: Vec<UnsupportedLiveFact>,
+    /// Display form of typed live facts recorded with the capture.
+    pub live_facts: Vec<String>,
     /// Captured expected trace shape.
     pub expected: TraceShape,
     /// Materialized operation history.
@@ -1656,6 +1794,7 @@ impl<Op> SavedReplayCase<Op> {
                 .collect(),
             projection_debug: format!("{:?}", capture.projection),
             unsupported_facts: capture.unsupported_facts.clone(),
+            live_facts: capture.live_facts.iter().map(ToString::to_string).collect(),
             expected: capture.expected,
             history: capture
                 .history
@@ -1821,6 +1960,9 @@ where
         reject_newline("unsupported_fact", &fact.fact)?;
         reject_newline("unsupported_reason", &fact.reason)?;
     }
+    for fact in &capture.live_facts {
+        reject_newline("live_fact", &fact.to_string())?;
+    }
 
     let mut body = String::new();
     body.push_str("tina-replay-case-v1\n");
@@ -1842,6 +1984,11 @@ where
         body.push_str(&fact.fact);
         body.push_str(" | ");
         body.push_str(&fact.reason);
+        body.push('\n');
+    }
+    for fact in &capture.live_facts {
+        body.push_str("live_fact=");
+        body.push_str(&fact.to_string());
         body.push('\n');
     }
     body.push_str(&format!(
@@ -1894,6 +2041,7 @@ where
     let mut topology_roles = Vec::new();
     let mut projection_debug = None;
     let mut unsupported_facts = Vec::new();
+    let mut live_facts = Vec::new();
     let mut expected_event_count = None;
     let mut expected_trace_hash = None;
     let mut history = Vec::new();
@@ -1934,6 +2082,7 @@ where
                 };
                 unsupported_facts.push(UnsupportedLiveFact::new(fact, reason));
             }
+            "live_fact" => live_facts.push(value.to_owned()),
             "expected_event_count" => {
                 expected_event_count =
                     Some(
@@ -1977,6 +2126,7 @@ where
         projection_debug: projection_debug
             .ok_or(SavedReplayCaseError::MissingField("projection_debug"))?,
         unsupported_facts,
+        live_facts,
         expected: TraceShape {
             event_count: expected_event_count
                 .ok_or(SavedReplayCaseError::MissingField("expected_event_count"))?,
@@ -2010,6 +2160,8 @@ pub enum CapturedReplayChange {
     Scenario,
     /// Capture contains live facts that are not modeled by replay history/config.
     UnsupportedFact,
+    /// Typed live facts changed or were not reproduced by the candidate.
+    LiveFact,
     /// Trace projection contract changed or could not be applied.
     Projection,
     /// Replay config changed.
@@ -2032,6 +2184,8 @@ pub struct LiveReplayReport<Output> {
     /// Projection contract used to compute `replay.event_count` and
     /// `replay.trace_hash`.
     pub projection: TraceProjection,
+    /// Typed live facts reproduced by the runner.
+    pub live_facts: Vec<LiveReplayFact>,
 }
 
 impl<Output> LiveReplayReport<Output> {
@@ -2054,6 +2208,7 @@ impl<Output> LiveReplayReport<Output> {
                 output,
             },
             projection,
+            live_facts: Vec::new(),
         })
     }
 
@@ -2062,7 +2217,20 @@ impl<Output> LiveReplayReport<Output> {
         Self {
             replay,
             projection: TraceProjection::Exact,
+            live_facts: Vec::new(),
         }
+    }
+
+    /// Adds one typed live fact and returns the report.
+    pub fn with_live_fact(mut self, fact: LiveReplayFact) -> Self {
+        self.live_facts.push(fact);
+        self
+    }
+
+    /// Replaces the typed live fact set and returns the report.
+    pub fn with_live_facts(mut self, facts: Vec<LiveReplayFact>) -> Self {
+        self.live_facts = facts;
+        self
     }
 }
 
@@ -2090,6 +2258,10 @@ pub struct CapturedReplayMismatch<Op> {
     pub actual_projection: TraceProjection,
     /// Unsupported live facts from the capture.
     pub unsupported_facts: Vec<UnsupportedLiveFact>,
+    /// Typed live facts from the capture.
+    pub expected_live_facts: Vec<LiveReplayFact>,
+    /// Typed live facts reproduced by the candidate.
+    pub actual_live_facts: Vec<LiveReplayFact>,
     /// Projection error from the candidate runner, when projection failed.
     pub projection_error: Option<TraceProjectionError>,
     /// Diagnostic config hash from the capture.
@@ -2166,6 +2338,7 @@ impl<Op: Debug> std::fmt::Display for CapturedReplayMismatch<Op> {
                     CapturedReplayChange::Seed => "seed",
                     CapturedReplayChange::Scenario => "scenario",
                     CapturedReplayChange::UnsupportedFact => "unsupported fact",
+                    CapturedReplayChange::LiveFact => "live fact",
                     CapturedReplayChange::Projection => "projection",
                     CapturedReplayChange::Config => "config",
                     CapturedReplayChange::History => "history",
@@ -2179,6 +2352,17 @@ impl<Op: Debug> std::fmt::Display for CapturedReplayMismatch<Op> {
         if !self.unsupported_facts.is_empty() {
             writeln!(f, "  unsupported facts:")?;
             for fact in &self.unsupported_facts {
+                writeln!(f, "      - {fact}")?;
+            }
+        }
+        if self.includes(CapturedReplayChange::LiveFact) {
+            writeln!(f, "  live facts:")?;
+            writeln!(f, "    expected:")?;
+            for fact in &self.expected_live_facts {
+                writeln!(f, "      - {fact}")?;
+            }
+            writeln!(f, "    actual:")?;
+            for fact in &self.actual_live_facts {
                 writeln!(f, "      - {fact}")?;
             }
         }
@@ -2302,45 +2486,51 @@ where
         )));
     }
     let projection_result = runner(candidate);
-    let (report, actual, actual_projection, projection_error) = match projection_result {
-        Ok(report) => {
-            if let Some(error) = report_identity_error(candidate, &report.replay) {
-                let mismatch = captured_mismatch(
-                    capture,
-                    candidate,
-                    TraceShape {
-                        event_count: report.replay.event_count,
-                        trace_hash: report.replay.trace_hash,
-                    },
-                    report.projection.clone(),
-                    Some(TraceProjectionError {
-                        event_id: EventId::new(0),
-                        kind: None,
-                        reason: error,
-                    }),
-                    vec![CapturedReplayChange::Projection],
-                );
-                return Err(Box::new(mismatch));
+    let (report, actual, actual_projection, actual_live_facts, projection_error) =
+        match projection_result {
+            Ok(report) => {
+                if let Some(error) = report_identity_error(candidate, &report.replay) {
+                    let mismatch = captured_mismatch(
+                        capture,
+                        candidate,
+                        TraceShape {
+                            event_count: report.replay.event_count,
+                            trace_hash: report.replay.trace_hash,
+                        },
+                        report.projection.clone(),
+                        Some(TraceProjectionError {
+                            event_id: EventId::new(0),
+                            kind: None,
+                            reason: error,
+                        }),
+                        vec![CapturedReplayChange::Projection],
+                    );
+                    return Err(Box::new(mismatch));
+                }
+                let actual = TraceShape::from_report(&report.replay);
+                let projection = report.projection.clone();
+                let live_facts = report.live_facts.clone();
+                (Some(report), actual, projection, live_facts, None)
             }
-            let actual = TraceShape::from_report(&report.replay);
-            let projection = report.projection.clone();
-            (Some(report), actual, projection, None)
-        }
-        Err(error) => (
-            None,
-            TraceShape {
-                event_count: 0,
-                trace_hash: 0,
-            },
-            capture.projection.clone(),
-            Some(error),
-        ),
-    };
+            Err(error) => (
+                None,
+                TraceShape {
+                    event_count: 0,
+                    trace_hash: 0,
+                },
+                capture.projection.clone(),
+                Vec::new(),
+                Some(error),
+            ),
+        };
     let actual_config_hash = replay_config_hash(&candidate.config);
     let expected_config_hash = replay_config_hash(&capture.config);
     let mut changes = Vec::new();
     if !capture.unsupported_facts.is_empty() {
         changes.push(CapturedReplayChange::UnsupportedFact);
+    }
+    if !live_fact_sets_match(&capture.live_facts, &actual_live_facts) {
+        changes.push(CapturedReplayChange::LiveFact);
     }
     if let Some(error) = &projection_error {
         let _ = error;
@@ -2390,6 +2580,8 @@ where
             expected_projection: capture.projection.clone(),
             actual_projection,
             unsupported_facts: capture.unsupported_facts.clone(),
+            expected_live_facts: capture.live_facts.clone(),
+            actual_live_facts,
             projection_error,
             expected_config_hash,
             actual_config_hash,
@@ -2423,6 +2615,8 @@ fn captured_mismatch<Op: Clone>(
         expected_projection: capture.projection.clone(),
         actual_projection,
         unsupported_facts: capture.unsupported_facts.clone(),
+        expected_live_facts: capture.live_facts.clone(),
+        actual_live_facts: Vec::new(),
         projection_error,
         expected_config_hash: replay_config_hash(&capture.config),
         actual_config_hash: replay_config_hash(&candidate.config),
@@ -2434,6 +2628,14 @@ fn captured_mismatch<Op: Clone>(
         actual_invariant: candidate.invariant,
         changes,
     }
+}
+
+fn live_fact_sets_match(left: &[LiveReplayFact], right: &[LiveReplayFact]) -> bool {
+    let mut left_keys = left.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let mut right_keys = right.iter().map(ToString::to_string).collect::<Vec<_>>();
+    left_keys.sort();
+    right_keys.sort();
+    left_keys == right_keys
 }
 
 /// Test sugar over [`check_captured_replay`].
@@ -3459,6 +3661,111 @@ mod replay_case_tests {
     }
 
     #[test]
+    fn live_capture_requires_typed_capacity_facts_to_replay() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let fact = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+            "http.keepalive.request_body",
+            CapacityMode::Fixed,
+            16,
+            0,
+            5,
+            1,
+            "bytes",
+        ));
+        let capture =
+            LiveReplayCapture::from_case_and_events(&c, "http/1 keepalive body pressure", &events)
+                .with_live_fact(fact.clone());
+        let replay_case = capture.to_replay_case();
+
+        let missing = check_captured_replay(&capture, &replay_case, run_three_events_live)
+            .expect_err("missing typed live fact must fail closed");
+        assert!(missing.includes(CapturedReplayChange::LiveFact));
+        assert!(missing.to_string().contains("http.keepalive.request_body"));
+
+        fn runner_with_fact(
+            case: &ReplayCase<u32>,
+        ) -> Result<LiveReplayReport<u32>, TraceProjectionError> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            let fact = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+                "http.keepalive.request_body",
+                CapacityMode::Fixed,
+                16,
+                0,
+                5,
+                1,
+                "bytes",
+            ));
+            Ok(
+                LiveReplayReport::exact(ReplayReport::from_case_and_events(case, &events, 6))
+                    .with_live_fact(fact),
+            )
+        }
+
+        check_captured_replay(&capture, &replay_case, runner_with_fact)
+            .expect("matching typed live fact replays");
+    }
+
+    #[test]
+    fn live_capture_compares_typed_facts_as_a_set() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let request = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+            "http.keepalive.request_body",
+            CapacityMode::Fixed,
+            16,
+            0,
+            5,
+            1,
+            "bytes",
+        ));
+        let response = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+            "http.keepalive.response_body",
+            CapacityMode::Fixed,
+            16,
+            0,
+            7,
+            0,
+            "bytes",
+        ));
+        let capture =
+            LiveReplayCapture::from_case_and_events(&c, "http/1 keepalive body pressure", &events)
+                .with_live_facts(vec![request.clone(), response.clone()]);
+        let replay_case = capture.to_replay_case();
+
+        fn runner_with_reversed_facts(
+            case: &ReplayCase<u32>,
+        ) -> Result<LiveReplayReport<u32>, TraceProjectionError> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            let request = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+                "http.keepalive.request_body",
+                CapacityMode::Fixed,
+                16,
+                0,
+                5,
+                1,
+                "bytes",
+            ));
+            let response = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+                "http.keepalive.response_body",
+                CapacityMode::Fixed,
+                16,
+                0,
+                7,
+                0,
+                "bytes",
+            ));
+            Ok(
+                LiveReplayReport::exact(ReplayReport::from_case_and_events(case, &events, 6))
+                    .with_live_facts(vec![response, request]),
+            )
+        }
+
+        check_captured_replay(&capture, &replay_case, runner_with_reversed_facts)
+            .expect("same typed facts in a different order are still the same fact set");
+    }
+
+    #[test]
     fn captured_replay_mismatch_names_every_changed_fact() {
         let c = case();
         let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
@@ -3577,6 +3884,7 @@ mod replay_case_tests {
                 .collect(),
             projection_debug: format!("{:?}", capture.projection),
             unsupported_facts: capture.unsupported_facts.clone(),
+            live_facts: capture.live_facts.iter().map(ToString::to_string).collect(),
             expected: capture.expected,
             history: c.history.operations().to_vec(),
         };
