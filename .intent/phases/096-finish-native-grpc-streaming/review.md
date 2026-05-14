@@ -15,11 +15,25 @@ The plan correctly says a production gRPC client can only land if a real HTTP/2
 client state machine exists. Keep that line hard. The Phase 057 h2c helper must
 not grow into a hidden production client by accident.
 
+### Fixed In Plan: Server Claim Was Easy To Misread
+
+The goal now says server-side gRPC streaming. That matters. Without an HTTP/2
+client state machine, this phase can finish the server layer and interop
+against real clients, but it cannot honestly claim a production Tina gRPC
+client.
+
 ### Interop Must Use Real Tools
 
 Interop means tonic/grpcurl commands or tests, not "our own frames decode." If
 the phase only tests Tina client/helper against Tina server, it may claim native
 streaming, not interop.
+
+### Fixed In Plan: Interop Commands Must Be Owned
+
+The first review said "use real tools" but did not force the repo to own the
+commands. The plan now requires checked-in tests, scripts, or specimen commands,
+and requires documented commands to own descriptors, ports, fixture setup, and
+environment. A command pasted from chat history is not a gate.
 
 ### Bidi Needs Lifecycle Rules Before Code
 
@@ -33,6 +47,13 @@ Bidirectional streaming needs policy for:
 
 These should be pinned in Rock 0 before implementation.
 
+### Fixed In Plan: Bidi Lifecycle Is A Gate
+
+Rock 0 now requires the exact bidirectional lifecycle policy before coding:
+request EOF, response EOF, early service error, peer reset, local cancel, and
+final status ownership. Tests now include service error while request DATA is
+still arriving.
+
 ### Reflection Should Not Hijack Streaming
 
 grpcurl often wants reflection for convenience, but explicit proto/descriptor
@@ -44,6 +65,20 @@ feature unless deliberately scoped.
 If compression remains unsupported, every streaming mode must reject compressed
 messages consistently. Do not let one path silently accept `grpc-encoding`.
 
+### Still Risky: User Perspective Can Be Under-Proven
+
+A user does not care that an internal helper passed. They care that a specimen
+server starts, a documented command talks to it, caps fail with the named
+status, cancel/deadline behavior is observable, and the command exits cleanly.
+The plan now requires command proofs, but implementation must keep them in CI
+or a scripted smoke target.
+
+### Still Risky: Pressure Proof Can Drift Back Into HTTP/2
+
+096 should not retest every HTTP/2 window edge, but it must prove gRPC exposes
+the pressure truth produced by 095. If gRPC wraps every flow-control outcome as
+`Internal`, users lose the reason this native stack exists.
+
 ## Recommendation
 
 Implement after 095 in this order:
@@ -51,6 +86,7 @@ Implement after 095 in this order:
 1. Server-streaming.
 2. Client-streaming.
 3. Bidirectional streaming.
-4. h2c tonic/grpcurl interop for shipped server modes.
-5. Production client only if the native HTTP/2 client state machine is already
+4. User-facing specimen command proof.
+5. h2c tonic/grpcurl interop for shipped server modes.
+6. Production client only if the native HTTP/2 client state machine is already
    real; otherwise create the client phase next.

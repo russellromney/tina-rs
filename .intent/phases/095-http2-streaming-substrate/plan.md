@@ -27,6 +27,8 @@ DATA frames must obey windows.
 
 Trailers must be real trailing HEADERS.
 
+END_STREAM must mean exactly one thing at exactly one point.
+
 Peer reset must cancel accepted work.
 
 Slow peers are pressure, not memory.
@@ -51,6 +53,8 @@ The claim this phase must make:
 - peer `RST_STREAM` cancels request body sources, response body sources, and
   accepted service calls;
 - final trailers are explicit and sent after the last DATA frame;
+- HTTP/2 `END_STREAM` semantics are pinned for request DATA, response DATA, and
+  trailing HEADERS;
 - existing buffered HTTP/2 and unary gRPC tests still pass.
 
 This phase is a substrate phase, not a gRPC streaming phase. It should leave
@@ -109,6 +113,9 @@ Before coding, edit this plan with:
 - exact public service-facing request-stream type, if any;
 - exact response-stream type reuse or adapter choice;
 - exact full-duplex request/response ownership model;
+- exact `END_STREAM` state machine for HEADERS, DATA, and trailing HEADERS in
+  both directions;
+- exact request-trailer support/rejection policy;
 - exact trailer API shape;
 - exact caps and default values;
 - exact test list shipped/deferred.
@@ -140,6 +147,8 @@ Required shape:
 - EOF sends final DATA with `END_STREAM` only if there are no trailers;
 - if trailers exist, final DATA does not end the stream and trailing HEADERS
   does;
+- after response `END_STREAM`, later DATA/HEADERS for that stream are rejected
+  or reset visibly;
 - source error maps to a typed stream failure and, when possible, trailers or
   reset;
 - peer `RST_STREAM`, connection close, or owner stop sends source cancel.
@@ -163,6 +172,9 @@ Required shape:
   consumed or discarded;
 - declared `content-length`, if present, is enforced;
 - end-of-stream is distinct from truncation/reset/protocol error;
+- request trailers are either supported as real trailing HEADERS or rejected
+  with a pinned typed protocol outcome; do not silently treat them as body;
+- request DATA after request `END_STREAM` is rejected/reset visibly;
 - body/message caps fire before large allocation;
 - service timeout/cancel closes the pull wait and releases buffered chunks;
 - peer reset cancels the request stream source and accepted service call;
@@ -206,6 +218,7 @@ Required outcomes/counters, names may differ but distinctions must remain:
 - request stream full;
 - request stream cancelled on service timeout/reset;
 - late source reply after reset/close visible in trace or report.
+- full-duplex progress while one direction is flow-control blocked.
 
 Hard rules:
 
@@ -214,6 +227,8 @@ Hard rules:
 - no `usize::MAX` caps;
 - no separate gRPC pressure model;
 - no hidden retry on blocked windows.
+- no deadlock where outbound window exhaustion prevents inbound DATA
+  consumption or reset handling.
 
 ## Rock 5: Tests
 
@@ -228,6 +243,7 @@ Required response-streaming tests:
 - peer `RST_STREAM` cancels response source;
 - source error maps to typed failure/reset/trailers;
 - source timeout maps visibly;
+- DATA/HEADERS after response `END_STREAM` rejects/resets visibly;
 - existing buffered HTTP/2 responses still pass;
 - unary gRPC trailers still pass.
 
@@ -238,9 +254,19 @@ Required request-streaming tests:
 - request window credit returns only after consumption;
 - oversized body rejects before large allocation;
 - truncated body is distinct from clean EOF;
+- request trailers are supported or rejected exactly as documented;
+- DATA/HEADERS after request `END_STREAM` rejects/resets visibly;
 - peer reset cancels request source and accepted service call;
 - service timeout/cancel releases buffered request chunks;
 - buffered request path still passes.
+
+Required full-duplex substrate tests:
+
+- service can consume inbound request DATA while outbound response DATA is
+  blocked by stream window;
+- peer `RST_STREAM` is processed while outbound response DATA is blocked;
+- request EOF does not implicitly close response streaming;
+- response completion does not leak unread request chunks.
 
 Required regression:
 

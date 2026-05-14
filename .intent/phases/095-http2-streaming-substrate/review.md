@@ -54,6 +54,22 @@ The connection isolate must remain the only TCP reader/writer, but services
 need request-body pull and response-body source handles. The implementation
 must name who owns every buffer, wait, cancel handle, and trailer decision.
 
+### Fixed In Plan: END_STREAM Was Under-Specified
+
+The plan said "trailers after DATA" but did not force a precise HTTP/2
+`END_STREAM` state machine. That leaves room for bugs where a stream accepts
+DATA after EOF, treats request trailers as body, or ends response DATA before
+trailers. The plan now requires explicit END_STREAM and request-trailer policy
+before coding.
+
+### Fixed In Plan: Full-Duplex Progress Needed Proof
+
+The plan required request and response streaming, but did not require tests that
+one blocked direction still allows the other direction to make progress. That
+is the classic bidi deadlock. The plan now requires full-duplex substrate tests
+for inbound progress while outbound is window-blocked and reset handling while
+outbound is blocked.
+
 ## Recommendation
 
 Implement 095 in this order:
@@ -63,5 +79,6 @@ Implement 095 in this order:
 3. Request DATA streaming to a bounded source/handle.
 4. Reset cancellation and late-reply proof in both directions.
 5. Window/queue pressure proof in both directions.
+6. Full-duplex blocked-one-way progress proof.
 
-Do not start gRPC streaming until 1-5 are green.
+Do not start gRPC streaming until 1-6 are green.

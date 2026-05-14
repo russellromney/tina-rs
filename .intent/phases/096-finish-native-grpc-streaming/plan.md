@@ -33,9 +33,9 @@ Peer cancel must reach the source/sink.
 Finish native gRPC enough that Tina can honestly claim:
 
 ```text
-unary, server-streaming, client-streaming, and bidirectional gRPC over native
-HTTP/2 h2c, with bounded messages, typed status, explicit cancel/deadline truth,
-and no hidden Tokio runtime.
+server-side unary, server-streaming, client-streaming, and bidirectional gRPC
+over native HTTP/2 h2c, with bounded messages, typed status, explicit
+cancel/deadline truth, and no hidden Tokio runtime.
 ```
 
 The claim this phase may make:
@@ -52,6 +52,8 @@ The claim this phase may make:
 - peer reset/cancel/deadline reaches the Tina service/source/sink;
 - tonic/grpcurl interop is tested for the modes claimed, or explicitly listed
   as deferred.
+- production Tina gRPC client is claimed only if a real native HTTP/2 client
+  state machine exists; otherwise client work is a separate follow-up.
 
 ## Non-Goals
 
@@ -61,6 +63,8 @@ The claim this phase may make:
 - no load balancing;
 - no health protocol unless a specimen needs it;
 - no TLS ALPN unless a prior/follow-up HTTP/2 TLS phase lands;
+- no production Tina gRPC client unless the HTTP/2 client state machine already
+  exists;
 - no generated build-system miracle;
 - no hidden Tokio, hyper, tonic, or h2 runtime;
 - no unbounded message queues;
@@ -88,6 +92,10 @@ Before coding, edit this plan with:
 - exact client shape if implemented here;
 - exact interop targets: grpcurl, tonic client, tonic server, or deferred;
 - exact specimen shape.
+- exact bidirectional lifecycle policy: request EOF, response EOF, early
+  service error, peer reset, local cancel, and final status ownership.
+- exact user-facing command proofs: specimen command, grpcurl command, tonic
+  command or test, and what each proves.
 
 Cut line:
 
@@ -96,6 +104,8 @@ Cut line:
 - If interop requires TLS ALPN, keep h2c interop separate and record TLS ALPN
   as a future phase.
 - If reflection grows, defer reflection; do not hold streaming hostage to it.
+- If production client work starts creating an HTTP/2 client state machine,
+  split that to its own phase instead of smuggling it into gRPC streaming.
 
 ## Rock 1: Service Shapes
 
@@ -193,6 +203,11 @@ server-side streaming.
 If included, it must build on a real HTTP/2 client state machine, not the Phase
 057 blocking h2c helper.
 
+Default stance: this phase is server-side gRPC streaming. Production client
+support is included only if the HTTP/2 client state machine has already shipped
+or is already in the branch as an explicit prerequisite, not as a side effect of
+gRPC streaming.
+
 Client requirements:
 
 - pooled or single-connection shape is explicit;
@@ -226,6 +241,14 @@ scoped.
 If tonic server interop requires a native production client that is not ready,
 defer tonic-server interop and say so.
 
+Interop commands must be checked in as tests, scripts, or documented specimen
+commands. A manually remembered command is not an interop gate.
+
+Any documented command must be copy-paste runnable from the repo root or from
+the specimen directory it names. If a command needs a generated descriptor,
+temporary port, fixture server, or environment variable, the script owns that
+setup.
+
 ## Rock 7: Specimen
 
 Add or extend a specimen.
@@ -254,6 +277,8 @@ Required common tests:
 - timeout/deadline maps to `DeadlineExceeded`;
 - peer reset maps to cancel truth;
 - late source/sink replies visible.
+- externally documented specimen/interop commands run in CI or in a scripted
+  smoke target, not only in a README.
 
 Required server-streaming tests:
 
@@ -275,6 +300,8 @@ Required bidirectional tests:
 
 - request and response messages interleave;
 - response can continue after request EOF when service policy allows;
+- service error while request DATA is still arriving cancels/drains the request
+  stream according to the pinned policy;
 - peer reset cancels both sides;
 - outbound pressure does not block inbound consumption forever;
 - final status sent exactly once.
