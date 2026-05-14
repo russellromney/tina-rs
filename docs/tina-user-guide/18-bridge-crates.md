@@ -213,6 +213,18 @@ The Postgres SQLx bridge follows it too, with two install paths
 (`install` builds a pool from config; `install_with_pool` wraps a
 caller-supplied `sqlx::PgPool` whose SQLx settings stay caller-owned).
 
+The production-shaped copy path for SQLite plus native outbound HTTP is
+`examples/systems/mini_saas_api`:
+
+```sh
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+```
+
+It uses `SqliteWorker` as the honest one-lane pool shape and
+`build_keepalive_pool` for outbound notifications. The route code keeps
+bridge-layer `Full` / `Closed` / `Timeout` distinct from worker or upstream
+failures.
+
 `flatten_outcome(outcome)` is available when the call site does not
 need to distinguish bridge-layer from worker-layer failures.
 

@@ -56,6 +56,28 @@ impl Worker {
 }
 ```
 
+## First Service To Copy
+
+For an HTTP service with state, DB work, outbound HTTP, readiness, shutdown,
+capacity, and a live-replay fact, copy:
+
+```text
+examples/systems/mini_saas_api
+```
+
+Run it from the repo root:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+```
+
+The route to study first is `POST /items/{id}/notify`: it captures
+`CallContext` as `RequestContext`, does SQLite work, acquires a native
+keepalive pool lease, calls an upstream HTTP service, releases the lease, and
+only then replies to the original HTTP caller.
+
 ## Request Reply Shape
 
 Caller:

@@ -38,6 +38,22 @@ queues bounded, and execution replayable.
 > Tina is experimental and in active development. The model is now strong
 > enough to write specimen services against; the public API is still moving.
 
+## Copyable Service Skeleton
+
+The current production-shaped service skeleton is
+[`examples/systems/mini_saas_api`](examples/systems/mini_saas_api/). It uses
+native `tina-http`, a controller isolate, `tina-sqlite-bridge`, a native
+outbound keepalive pool, health/readiness, graceful shutdown, capacity
+reporting, and a live-replay fact.
+
+Run it from the repo root:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+```
+
 Tina is aimed at services where these properties matter more than linear
 `async fn` syntax:
 

@@ -2,7 +2,59 @@
 
 ## Status
 
-- Ready to implement.
+- Implemented in `examples/systems/mini_saas_api`.
+- Chosen DB bridge/pool: `tina-sqlite-bridge::SqliteWorker`, using its
+  documented single-connection pool-shaped pressure report
+  (`max_in_flight = 1`, no hidden waiters).
+- Chosen outbound HTTP path: native `tina-http` keepalive pool from
+  `build_keepalive_pool`, with explicit acquire/request/release and
+  `shutdown_keepalive_pool` for close/drain.
+- System path: `examples/systems/mini_saas_api`.
+- Routes:
+  - `GET /health`;
+  - `GET /ready`;
+  - `POST /items`;
+  - `GET /items/{id}`;
+  - `POST /items/{id}/notify`;
+  - `GET /debug/capacity`.
+- Helper APIs expected: none outside the system. Repeated route/body/status,
+  capacity formatting, and smoke-script glue stay specimen-local unless the
+  implementation proves repeated ugliness across crate boundaries.
+- Helper homes if that changes: protocol-only helpers in `tina-http`,
+  generic request/reply helpers in `tina`, runtime/capacity helpers in
+  `tina-runtime`, DB helpers in the DB bridge crate, otherwise
+  specimen-local.
+- Actual helper APIs added outside specimen: none.
+- Docs updated:
+  - `README.md`;
+  - `docs/tina-user-guide/00-agent-quickstart.md`;
+  - `docs/tina-user-guide/10-service-patterns.md`;
+  - `docs/tina-user-guide/14-lifecycle-and-shutdown.md`;
+  - `docs/tina-user-guide/15-service-client-worked-example.md`
+    (`origin/main` name for the service-client page);
+  - `docs/tina-user-guide/18-bridge-crates.md`;
+  - `examples/systems/README.md`;
+  - `examples/systems/mini_saas_api/README.md`.
+- Checks run:
+  - `cargo fmt --all --check`;
+  - `cargo fmt --all --check --manifest-path examples/systems/mini_saas_api/Cargo.toml`;
+  - `cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml`;
+  - `cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke`;
+  - `cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure`;
+  - `cargo clippy --manifest-path examples/systems/mini_saas_api/Cargo.toml --all-targets -- -D warnings`;
+  - `cargo test -p tina-sqlite-bridge`;
+  - `cargo test -p tina-http --test keepalive_pool`;
+  - `cargo test -p tina-sim request_context`;
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`;
+  - `cargo clippy --workspace --all-targets -- -D warnings`;
+  - `make verify`.
+- Hostile review result: fixed the only implementation finding found during
+  review, where the pressure script initially failed to hold the outbound
+  keepalive lease long enough to prove pool `Full`. Rechecked no web framework
+  was added, no `Arc<Mutex<AppState>>` domain state exists, `Full`/`Closed`/
+  `Timeout` route bodies stay distinct, the multi-turn route carries
+  `RequestContext`, shutdown uses `shutdown_keepalive_pool`, and the documented
+  system smoke command passes.
 - One PR.
 - Can run beside 094 WebSocket usable server if it does not edit WebSocket
   internals.
