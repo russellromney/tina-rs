@@ -23,6 +23,7 @@ const FRAME_WINDOW_UPDATE: u8 = 0x8;
 const FLAG_ACK: u8 = 0x1;
 const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
+const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 
 struct Http2Harness {
     addr: SocketAddr,
@@ -168,6 +169,15 @@ fn write_window_update(stream: &mut TcpStream, stream_id: u32, increment: u32) {
     );
 }
 
+fn write_settings(stream: &mut TcpStream, settings: &[(u16, u32)]) {
+    let mut payload = Vec::with_capacity(settings.len() * 6);
+    for (id, value) in settings {
+        payload.extend_from_slice(&id.to_be_bytes());
+        payload.extend_from_slice(&value.to_be_bytes());
+    }
+    write_frame(stream, FRAME_SETTINGS, 0, 0, &payload);
+}
+
 fn write_data_chunks(stream: &mut TcpStream, stream_id: u32, body: &[u8]) {
     for (idx, chunk) in body.chunks(16 * 1024).enumerate() {
         let end_stream = (idx + 1) * 16 * 1024 >= body.len();
@@ -210,6 +220,12 @@ fn request_headers(method: &str, path: &str) -> Vec<u8> {
     block
 }
 
+fn request_headers_with_duplicate_method(method: &str, path: &str) -> Vec<u8> {
+    let mut block = request_headers(method, path);
+    literal(":method", method, &mut block);
+    block
+}
+
 fn literal(name: &str, value: &str, out: &mut Vec<u8>) {
     out.push(0);
     hpack_string(name, out);
@@ -224,7 +240,7 @@ fn hpack_string(value: &str, out: &mut Vec<u8>) {
 
 fn read_response_body(stream: &mut TcpStream, stream_id: u32) -> Vec<u8> {
     let mut body = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..64 {
         let frame = read_frame(stream);
         if frame.stream_id != stream_id {
             continue;
@@ -241,6 +257,7 @@ fn read_response_body(stream: &mut TcpStream, stream_id: u32) -> Vec<u8> {
                     return body;
                 }
             }
+            FRAME_SETTINGS | FRAME_WINDOW_UPDATE => {}
             FRAME_RST_STREAM => panic!("stream {stream_id} reset: {frame:?}"),
             other => panic!("unexpected response frame {other}: {frame:?}"),
         }
@@ -319,6 +336,59 @@ fn http2_h2c_unary_request_response() {
     );
 
     assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
+fn http2_duplicate_pseudo_header_resets_or_goaways() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers_with_duplicate_method("GET", "/counter"),
+    );
+
+    let frame = read_frame(&mut stream);
+    assert!(
+        frame.ty == FRAME_GOAWAY || (frame.ty == FRAME_RST_STREAM && frame.stream_id == 1),
+        "duplicate pseudo-header must fail visibly, got {frame:?}"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn http2_large_buffered_response_obeys_peer_initial_stream_window() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            initial_connection_window: 100_000,
+            initial_stream_window: 100_000,
+            max_body_bytes: 100_000,
+            max_response_body_bytes: 100_000,
+            connection_outbound_queue_capacity: 16,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+    let body = vec![b'z'; 70_000];
+
+    write_settings(&mut stream, &[(SETTINGS_INITIAL_WINDOW_SIZE, 100_000)]);
+    write_window_update(&mut stream, 0, 100_000);
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/echo"),
+    );
+    write_data_chunks(&mut stream, 1, &body);
+
+    assert_eq!(read_response_body(&mut stream, 1), body);
     harness.shutdown();
 }
 
@@ -585,13 +655,20 @@ fn http2_window_update_unblocks_bounded_pending_response() {
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("short read timeout");
+    let mut partial = Vec::new();
     loop {
         match read_frame_result(&mut stream) {
             Ok(frame) if frame.ty == FRAME_WINDOW_UPDATE => {}
-            Ok(frame) => panic!("response should be flow-control blocked before update: {frame:?}"),
+            Ok(frame) if frame.ty == FRAME_HEADERS => {}
+            Ok(frame) if frame.ty == FRAME_DATA => partial.extend_from_slice(&frame.payload),
+            Ok(frame) => panic!("unexpected response frame before update: {frame:?}"),
             Err(_) => break,
         }
     }
+    assert!(
+        partial.len() < body.len(),
+        "response should be flow-control blocked before update"
+    );
 
     write_window_update(&mut stream, 0, 100_000);
     write_window_update(&mut stream, 1, 100_000);
@@ -599,7 +676,9 @@ fn http2_window_update_unblocks_bounded_pending_response() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("restore read timeout");
 
-    assert_eq!(read_response_body(&mut stream, 1), body);
+    let mut full = partial;
+    full.extend_from_slice(&read_response_body(&mut stream, 1));
+    assert_eq!(full, body);
     harness.shutdown();
 }
 

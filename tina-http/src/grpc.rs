@@ -529,26 +529,51 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 reply_to_request(pending.call, response)
             }
             CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
-                _,
-            )))
-            | CallOutcome::Replied(Http2ConnectionReply::Report(_))
-            | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
+                error,
+            ))) => reply_to_request(
+                pending.call,
+                grpc_http_response(Vec::new(), status_for_request_pull_error(error)),
+            ),
+            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
                 RequestChunkReply::WebSocketSend(_),
-            )) => reply_to_request(
+            ))
+            | CallOutcome::Replied(Http2ConnectionReply::Report(_)) => reply_to_request(
                 pending.call,
                 grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal)),
             ),
-            CallOutcome::Full
-            | CallOutcome::Closed
-            | CallOutcome::Rejected(_)
-            | CallOutcome::Timeout => reply_to_request(
+            other => reply_to_request(
                 pending.call,
-                grpc_http_response(
-                    Vec::new(),
-                    GrpcStatus::new(GrpcStatusCode::DeadlineExceeded),
-                ),
+                grpc_http_response(Vec::new(), status_for_request_pull_outcome(&other)),
             ),
         }
+    }
+}
+
+fn status_for_request_pull_error(error: tina_runtime::CallError) -> GrpcStatus {
+    match error {
+        tina_runtime::CallError::TargetClosed => GrpcStatus::new(GrpcStatusCode::Cancelled),
+        tina_runtime::CallError::TargetFull
+        | tina_runtime::CallError::ResourceBusy
+        | tina_runtime::CallError::StorageFull
+        | tina_runtime::CallError::DnsFull
+        | tina_runtime::CallError::TlsFull
+        | tina_runtime::CallError::SignalFull
+        | tina_runtime::CallError::ProcessFull => {
+            GrpcStatus::new(GrpcStatusCode::ResourceExhausted)
+        }
+        tina_runtime::CallError::Timeout => GrpcStatus::new(GrpcStatusCode::DeadlineExceeded),
+        tina_runtime::CallError::Io => GrpcStatus::new(GrpcStatusCode::Unavailable),
+        _ => GrpcStatus::new(GrpcStatusCode::Internal),
+    }
+}
+
+fn status_for_request_pull_outcome(outcome: &CallOutcome<Http2ConnectionReply>) -> GrpcStatus {
+    match outcome {
+        CallOutcome::Full => GrpcStatus::new(GrpcStatusCode::ResourceExhausted),
+        CallOutcome::Closed => GrpcStatus::new(GrpcStatusCode::Cancelled),
+        CallOutcome::Rejected(_) => GrpcStatus::new(GrpcStatusCode::Internal),
+        CallOutcome::Timeout => GrpcStatus::new(GrpcStatusCode::DeadlineExceeded),
+        CallOutcome::Replied(_) => GrpcStatus::new(GrpcStatusCode::Internal),
     }
 }
 

@@ -576,6 +576,42 @@ fn grpc_server_streaming_sends_messages_then_status_trailers() {
 }
 
 #[test]
+fn grpc_server_streaming_preserves_final_trailers_when_outbound_queue_is_tight() {
+    let harness = GrpcHarness::start_router(
+        Http2ServerConfig {
+            limits: Http2Limits {
+                connection_outbound_queue_capacity: 3,
+                ..Http2Limits::default()
+            },
+            ..Http2ServerConfig::default()
+        },
+        GrpcLimits::default(),
+    );
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 0 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Watch", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(
+        decode_grpc_replies(&body)
+            .iter()
+            .map(|reply| reply.value)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn grpc_server_streaming_route_works_more_than_once() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
     let mut stream = connect_h2(harness.addr);

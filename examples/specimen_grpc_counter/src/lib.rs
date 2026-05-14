@@ -23,6 +23,12 @@ pub struct CounterReply {
     pub value: u64,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct BlobReply {
+    #[prost(bytes, tag = "1")]
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Default)]
 pub struct SpecimenShard;
 
@@ -62,6 +68,10 @@ impl Drop for SpecimenServer {
 }
 
 pub fn start_server() -> Result<SpecimenServer, String> {
+    start_server_on("127.0.0.1:0".parse::<SocketAddr>().expect("loopback"))
+}
+
+pub fn start_server_on(bind_addr: SocketAddr) -> Result<SpecimenServer, String> {
     let runtime = ThreadedRuntime::with_config(
         SpecimenShard,
         DefaultThreadedMailboxFactory,
@@ -75,16 +85,22 @@ pub fn start_server() -> Result<SpecimenServer, String> {
     let state = Arc::new(Mutex::new(0_u64));
     let router_state = Arc::clone(&state);
     let watch_responses = Arc::new(Mutex::new(Vec::new()));
-    for _ in 0..16 {
-        let watch_response = GrpcServerStreamingResponse::from_messages(
+    for delta in [40_u64, 5, 40, 5, 40, 5, 40, 5, 40, 5, 40, 5, 40, 5, 40, 5] {
+        let watch_response = (
+            delta,
+            GrpcServerStreamingResponse::from_messages(
             &runtime,
-            vec![CounterReply { value: 41 }, CounterReply { value: 42 }],
+                vec![
+                    CounterReply { value: delta + 1 },
+                    CounterReply { value: delta + 2 },
+                ],
             GrpcLimits {
-                max_message_bytes: 1024,
+                max_message_bytes: 100_000,
             },
             16,
         )
-        .map_err(|error| format!("register watch response: {error:?}"))?;
+            .map_err(|error| format!("register watch response: {error:?}"))?,
+        );
         watch_responses
             .lock()
             .expect("watch responses")
@@ -92,7 +108,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
     }
     let watch_responses_for_route = Arc::clone(&watch_responses);
     let router = GrpcRouter::<SpecimenShard>::new(GrpcLimits {
-        max_message_bytes: 1024,
+        max_message_bytes: 100_000,
     })
     .unary(
         "/specimen.Counter/Increment",
@@ -102,16 +118,27 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             Ok(GrpcResponse::new(CounterReply { value: *value }))
         },
     )
+    .unary(
+        "/specimen.Counter/BigBlob",
+        |request: GrpcRequest<CounterRequest>| {
+            Ok(GrpcResponse::new(BlobReply {
+                bytes: vec![7; request.message.delta as usize],
+            }))
+        },
+    )
     .server_streaming(
         "/specimen.Counter/Watch",
-        move |_request: GrpcRequest<CounterRequest>| {
-            watch_responses_for_route
-                .lock()
-                .expect("watch responses")
-                .pop()
-                .ok_or_else(|| {
-                    tina_http::GrpcStatus::new(tina_http::GrpcStatusCode::ResourceExhausted)
-                })
+        move |request: GrpcRequest<CounterRequest>| {
+            let mut responses = watch_responses_for_route.lock().expect("watch responses");
+            let Some(index) = responses
+                .iter()
+                .position(|(delta, _)| *delta == request.message.delta)
+            else {
+                return Err(tina_http::GrpcStatus::new(
+                    tina_http::GrpcStatusCode::ResourceExhausted,
+                ));
+            };
+            Ok(responses.swap_remove(index).1)
         },
     )
     .client_streaming(
@@ -130,7 +157,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
     let listener = runtime
         .register_with_capacity::<Http2Listener<SpecimenShard, GrpcRouterMsg>, _>(
             Http2Listener::<SpecimenShard, GrpcRouterMsg>::new(
-                "127.0.0.1:0".parse::<SocketAddr>().expect("loopback"),
+                bind_addr,
                 service,
                 config,
             ),
@@ -161,7 +188,7 @@ pub fn run_smoke() -> Result<u64, String> {
         &CounterRequest { delta: 7 },
         Duration::from_secs(2),
         GrpcLimits {
-            max_message_bytes: 1024,
+            max_message_bytes: 100_000,
         },
     )
     .map_err(|error| format!("grpc call: {error:?}"))?;

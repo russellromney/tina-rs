@@ -22,9 +22,15 @@
     oversized declared client-streaming messages failing before service code.
   - tonic h2c client interop against the specimen for unary, server-streaming,
     and client-streaming; this also forced real incoming HPACK decode.
+  - hostile-review fixes for large tonic unary responses, request-sensitive
+    server-streaming specimen output, tight-queue final trailer preservation,
+    and explicit grpcurl proto/command ownership.
 - Still deferred in this branch:
   - true bidirectional streaming with independent request/response lifecycles;
-  - grpcurl interop scripts;
+  - automated grpcurl interop in CI; the proto and manual commands are owned,
+    but the local environment used for this PR does not ship `grpcurl`;
+  - true service-level client-streaming handler API; the current client
+    streaming route still accumulates decoded request messages for the handler;
   - tonic h2c bidi interop;
   - reflection;
   - production pooled Tina gRPC client;

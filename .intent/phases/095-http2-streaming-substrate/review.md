@@ -37,6 +37,32 @@ connection emitted two `WINDOW_UPDATE` frames for every tiny consumed DATA
 chunk, filled the bounded outbound queue, and reset the stream. Request-body
 window credit is now coalesced and flushed at a threshold or EOF.
 
+### Fixed In Hostile Review: Buffered Responses Were All-Or-Nothing
+
+Large buffered responses used to wait until the entire body fit both the
+connection and stream send windows. That could deadlock a healthy client on a
+large unary response. Buffered responses now send headers and DATA
+incrementally, keep unsent bytes pending, and resume on `WINDOW_UPDATE`.
+
+### Fixed In Hostile Review: Peer Initial Stream Window Was Ignored
+
+The server ACKed SETTINGS but ignored `SETTINGS_INITIAL_WINDOW_SIZE`, so real
+clients could advertise larger stream windows and still get default-window
+behavior. The connection now applies the SETTINGS delta to active streams and
+uses the peer's current initial stream window for new streams.
+
+### Fixed In Hostile Review: Duplicate Pseudo-Headers Were Accepted
+
+The HPACK/header path used to let duplicate `:method`, `:path`, `:scheme`,
+`:authority`, or `:status` overwrite earlier values. Duplicate pseudo-headers
+now fail as malformed HTTP/2 input.
+
+### Fixed In Hostile Review: Streaming EOF Could Lose END_STREAM
+
+Streaming response EOF used to ignore outbound queue failure while enqueueing
+final trailers or the final empty DATA frame, then remove the stream. The EOF
+marker now stays pending until the final frame is actually queued.
+
 ### Superseded: Request Streaming Is Now Required
 
 The earlier review fixed an overclaim by allowing request streaming to be

@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package specimen;
+
+service Counter {
+  rpc Increment(CounterRequest) returns (CounterReply);
+  rpc BigBlob(CounterRequest) returns (BlobReply);
+  rpc Watch(CounterRequest) returns (stream CounterReply);
+  rpc Sum(stream CounterRequest) returns (CounterReply);
+}
+
+message CounterRequest {
+  uint64 delta = 1;
+}
+
+message CounterReply {
+  uint64 value = 1;
+}
+
+message BlobReply {
+  bytes bytes = 1;
+}

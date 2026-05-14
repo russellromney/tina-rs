@@ -66,6 +66,34 @@ literal headers used by Tina tests. Incoming HTTP/2 headers now use a stateful
 HPACK decoder so dynamic/indexed/huffman-encoded client headers are not a
 hidden compatibility cliff.
 
+### Fixed In Hostile Review: Tonic Large Unary And Request-Sensitive Streaming
+
+The tonic interop test now asks for a 70KB protobuf response and verifies
+server-streaming output depends on the decoded request message. This caught the
+HTTP/2 buffered-response all-or-nothing flow-control bug and removes the
+previous specimen lie where `Watch` returned fixed values regardless of input.
+
+### Fixed In Hostile Review: Tight-Queue Final Trailer Proof
+
+The gRPC live suite now runs server-streaming with a tiny outbound frame queue
+and still requires final `grpc-status` trailers. This protects the exact edge
+where HTTP/2 EOF handling could drop trailers and close the stream state.
+
+### Fixed In Hostile Review: grpcurl Command Ownership
+
+The specimen now owns `proto/specimen_counter.proto` plus documented grpcurl
+commands for unary, server-streaming, and client-streaming. The current local
+verification environment does not have `grpcurl`, so CI automation is still
+listed as deferred rather than falsely claimed.
+
+### Still Risky: Client-Streaming Handler API Is Buffered
+
+The HTTP/2 request pull path is real, caps fire before service code, and the
+many-small-message path is proven. But `GrpcRouter::client_streaming` still
+collects decoded messages into a `Vec<T>` before invoking the user handler.
+That is not the final service-level streaming API for unbounded streams, early
+application reject, or request/response overlap.
+
 ### Still Risky: Server-Streaming API Is Too Raw
 
 `GrpcServerStreamingResponse` currently asks handlers to provide a
@@ -78,11 +106,13 @@ not hand-build gRPC frames.
 
 Before claiming 096 complete, add tests that:
 
-1. Run grpcurl against the specimen with an explicit proto/descriptor.
+1. Run grpcurl against the specimen with an explicit proto/descriptor in CI.
 2. Run a tonic client against bidi routes.
-3. Interleave bidi request/response messages while one direction is
+3. Add the service-level client-streaming API and prove early application
+   reject before request EOF.
+4. Interleave bidi request/response messages while one direction is
    flow-control blocked.
-4. Start/stop the specimen repeatedly on random ports and run copy-paste
+5. Start/stop the specimen repeatedly on random ports and run copy-paste
    documented commands, not private helper clients.
 
 ### Production Client Is Conditional
