@@ -4,6 +4,28 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 094 WebSocket Usable Server
+
+- Added the user-shaped WebSocket server layer on top of the first-form
+  WebSocket rail: public session handles, bounded session send, bounded
+  room/fanout helpers, slow-peer policy, and copyable service docs.
+- Added TCP/TLS/browser-shaped WebSocket proofs plus a room specimen so the
+  WebSocket path is no longer only a frame/protocol primitive.
+- Left the larger production-replacement claim explicit: compliance matrix,
+  Autobahn-style classification, load/soak, production observability, native
+  client decision, and live trace-to-sim replay remain follow-up work.
+
+### Phase 057 Native gRPC Service Stack
+
+- Added native gRPC over Tina's HTTP/2 h2c path with `prost`, typed
+  `GrpcStatus`, trailers, unary service shape, request/response caps,
+  timeout/cancel/status mapping, and live tests.
+- Extended the first gRPC stack with initial server-streaming and
+  client-streaming routes on native HTTP/2, plus a small h2c specimen helper.
+- Kept the scope honest: true bidirectional streaming, production pooled Tina
+  gRPC client, tonic/grpcurl interop scripts, TLS ALPN, and richer HTTP/2
+  streaming substrate remain follow-up work.
+
 ### Phase 056 Native HTTP/2 Service Stack
 
 - Added a native HTTP/2 first form in `tina-http`: frame parsing/encoding,
