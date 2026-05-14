@@ -50,6 +50,8 @@ The claim this phase may make:
   `WebSocketLimits`, `websocket_upgrade`, `WebSocketAccept`,
   `WebSocketSessionMsg`, `WebSocketSessionOutcome`, send outcomes, and session
   handles.
+- a user can keep the simple 087 echo path, then graduate to session handles
+  for rooms/fanout without rewriting the whole service.
 
 ## Non-Goals
 
@@ -87,6 +89,9 @@ At start of implementation, edit this status with:
 - exact session handle API names;
 - exact send outcome API names;
 - chosen slow-peer policy in the room specimen.
+- what remains compatible with the 087 echo-style `WebSocketSessionOutcome`
+  path.
+- exact bounded storage shape for session handles/member table.
 
 Do not change the public claim until the tests and docs match it.
 
@@ -119,6 +124,14 @@ Candidate vocabulary:
 - `WebSocketSendError`;
 - `WebSocketSessionReport`.
 
+Identity rule:
+
+- every handle carries session id plus generation/incarnation;
+- closed session ids cannot be confused with later sessions;
+- stale handles return `Closed` / `Stale` / equivalent typed outcome;
+- member/session tables have fixed capacity or a named bounded policy;
+- fill-close-refill is tested.
+
 The copied app path should feel like:
 
 ```rust
@@ -139,6 +152,8 @@ Hard rules:
 - sends to stale/closed sessions fail visibly;
 - handle sends are bounded by outbound frame count and bytes;
 - active write bytes count against the same outbound byte budget;
+- handle sends route through the connection/session owner; they must not create
+  a second writer for the same stream;
 - app sees `QueueFull`, `BytesFull`, `Closing`, `Closed`, or `Timeout`
   distinctly;
 - no `mpsc::unbounded`, no hidden thread, no hidden Tokio task;
@@ -146,6 +161,8 @@ Hard rules:
 - handles must be cheap to clone/store but must not keep a closed session alive;
 - send outcomes must include enough identity for a room to remove or mark the
   failed member.
+- room/user code must be able to observe a per-session pressure/lifecycle
+  report without reading raw runtime trace.
 
 If the existing "app replies with outbound commands" shape remains, document it
 as the simple echo path. Room/fanout must use explicit handles or another
@@ -198,6 +215,8 @@ Required caps:
 - app/session mailbox capacity;
 - room broadcast fanout target count;
 - room per-peer send timeout or call timeout;
+- room member table capacity;
+- session handle table capacity;
 - ping/pong timeout;
 - close handshake timeout.
 
@@ -215,6 +234,9 @@ Every overflow must surface a typed fact:
 - `ProtocolError`;
 - `PingTimeout`;
 - `CloseTimeout`.
+
+If names differ, keep the same distinctions. Do not collapse pressure,
+protocol error, peer close, app close, and stale handle into one `Closed`.
 
 Avoid one giant "error soup" if the names become too broad. Use a small public
 send error for send admission and a session close/report reason for lifecycle.
@@ -261,6 +283,7 @@ multi-client room specimen.
 Shape:
 
 - room isolate owns member table;
+- member table capacity is explicit and tested;
 - each WebSocket session has a stable session id/handle;
 - join and leave are visible room messages;
 - two or more live clients connect in the smoke test;
@@ -271,6 +294,9 @@ Shape:
 - slow/non-reading peer creates visible pressure before memory can grow without
   bound;
 - app policy is explicit: drop message, shed peer, or close peer;
+- room report names joined, left, broadcast_ok, broadcast_full/closed/timeout,
+  slow_peer_closed, and live member count;
+- stale handle after close is tested;
 - shutdown closes sessions and room cleanly.
 
 The specimen must not use `tokio-tungstenite`, axum WebSocket, or any broad
@@ -302,6 +328,7 @@ Unit/pure codec tests:
 - control-frame rules;
 - close payload decode matrix;
 - outbound queue count and byte caps.
+- stale session generation cannot send to a new session.
 
 Live `tina-http` tests:
 
@@ -332,6 +359,8 @@ Live `tina-http` tests:
 - app mailbox full visible if reachable;
 - slow/non-reading peer cannot create unbounded memory;
 - HTTP/2 WebSocket remains unsupported and does not accidentally claim upgrade.
+- fill session/member table, close some sessions, then admit new sessions
+  without stale entries consuming capacity.
 
 Specimen tests:
 
@@ -339,6 +368,7 @@ Specimen tests:
 - leave removes member;
 - slow/full peer pressure reported distinctly;
 - chosen slow-peer policy executes;
+- room report counters match the live socket story;
 - shutdown closes sessions;
 - specimen public `run()` report proves the same user-visible facts as the
   live smoke, not a different unit-only path.
@@ -377,6 +407,7 @@ Run a small "new user" audit:
 - an app can echo without understanding HTTP internals;
 - a room can store/remove session handles without fighting lifetimes;
 - failures a user must handle appear in public enums, not logs or traces only.
+- stale handle and slow-peer outcomes are easy to match without trace spelunking.
 
 If one of these requires too much ceremony, add a tiny helper rather than a
 framework.
