@@ -997,7 +997,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 }
                 bytes.clone()
             }
-            HttpResponseBody::Stream(_) | HttpResponseBody::ChunkedStream(_) => {
+            HttpResponseBody::Stream(_)
+            | HttpResponseBody::ChunkedStream(_)
+            | HttpResponseBody::WebSocket(_) => {
                 return Err(Http2ProtocolError::UnsupportedFrame(FRAME_DATA));
             }
         };

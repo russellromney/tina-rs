@@ -141,7 +141,9 @@ fn run_one_fetch(
 fn body_str(response: &HttpResponse) -> String {
     let bytes = match &response.body {
         HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_) | HttpResponseBody::ChunkedStream(_) => Vec::new(),
+        HttpResponseBody::Stream(_)
+        | HttpResponseBody::ChunkedStream(_)
+        | HttpResponseBody::WebSocket(_) => Vec::new(),
     };
     String::from_utf8(bytes).expect("utf8 body")
 }

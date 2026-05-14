@@ -1,0 +1,14 @@
+[package]
+name = "specimen_websocket_room"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tina = { path = "../../tina" }
+tina-http = { path = "../../tina-http" }
+tina-runtime = { path = "../../tina-runtime" }
+http = { version = "1", default-features = false, features = ["std"] }
+
+[lib]
+path = "src/lib.rs"

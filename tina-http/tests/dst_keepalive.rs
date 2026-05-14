@@ -184,6 +184,7 @@ fn keepalive_connection_replays_byte_identical() {
                 HttpResponseBody::Buffered(b) => b,
                 HttpResponseBody::Stream(_) => Vec::new(),
                 HttpResponseBody::ChunkedStream(_) => Vec::new(),
+                HttpResponseBody::WebSocket(_) => Vec::new(),
             };
             assert_eq!(body, b"hello");
         }

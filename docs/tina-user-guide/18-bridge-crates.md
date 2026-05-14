@@ -9,7 +9,13 @@ The rule:
 > Tokio may speak ecosystem. Tina owns state. Bridge shows pressure.
 > Bridge may adapt. Bridge may not lie.
 
-If you can use a native Tina crate, do. Native HTTP/2 now has a
+If you can use a native Tina crate, do. Native WebSocket server
+upgrade now lives in `tina-http`: HTTP/1.1 `GET` upgrade validation,
+Tina-owned TCP/TLS rails after handoff, bounded frame/message/queue
+limits, visible ping/pong and close messages, client masking
+validation, and unmasked server frames. It is not HTTP/2 WebSocket,
+permessage-deflate, a browser session framework, or a broad client
+crate. Native HTTP/2 now has a
 server-first h2c path in `tina-http::Http2Listener`: cleartext
 prior-knowledge transport, bounded stream table, explicit
 connection/stream flow-control windows, and ordinary `HttpRequest` /
