@@ -166,6 +166,11 @@ pub enum HttpResponseBody {
     /// `Transfer-Encoding: chunked`. Same `Next`/`Chunk`/`Eof`
     /// exchange as `Stream`; only the framing differs.
     ChunkedStream(crate::streaming::ChunkedResponseStream),
+    /// HTTP/1.1 upgrade to a Tina-owned WebSocket session. The
+    /// connection writes the `101 Switching Protocols` response and
+    /// then stops HTTP request handling; the same isolate owns the
+    /// upgraded stream as a WebSocket session.
+    WebSocket(Box<crate::websocket::WebSocketAccept>),
 }
 
 impl HttpResponseBody {
@@ -173,7 +178,7 @@ impl HttpResponseBody {
     pub fn as_buffered(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(bytes) => Some(bytes),
-            Self::Stream(_) | Self::ChunkedStream(_) => None,
+            Self::Stream(_) | Self::ChunkedStream(_) | Self::WebSocket(_) => None,
         }
     }
 
@@ -191,7 +196,7 @@ impl HttpResponseBody {
         match self {
             Self::Buffered(bytes) => Some(bytes.len()),
             Self::Stream(s) => Some(s.content_length),
-            Self::ChunkedStream(_) => None,
+            Self::ChunkedStream(_) | Self::WebSocket(_) => None,
         }
     }
 }
@@ -214,7 +219,7 @@ impl PartialEq<[u8]> for HttpResponseBody {
     fn eq(&self, other: &[u8]) -> bool {
         match self {
             Self::Buffered(bytes) => bytes == other,
-            Self::Stream(_) | Self::ChunkedStream(_) => false,
+            Self::Stream(_) | Self::ChunkedStream(_) | Self::WebSocket(_) => false,
         }
     }
 }
@@ -328,6 +333,29 @@ impl HttpResponse {
         let mut response = Self::with_status(status);
         response.body =
             HttpResponseBody::ChunkedStream(crate::streaming::ChunkedResponseStream { source });
+        response
+    }
+
+    /// Builds a `101 Switching Protocols` response that hands the
+    /// connection into the native WebSocket session loop after the
+    /// upgrade head drains.
+    pub fn websocket(accept: crate::websocket::WebSocketAccept) -> Self {
+        let mut response = Self::with_status(StatusCode::SWITCHING_PROTOCOLS);
+        response.version = Version::HTTP_11;
+        response.headers.insert(
+            http::header::UPGRADE,
+            http::HeaderValue::from_static("websocket"),
+        );
+        response.headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("Upgrade"),
+        );
+        response.headers.insert(
+            http::HeaderName::from_static("sec-websocket-accept"),
+            http::HeaderValue::from_str(accept.accept_key())
+                .expect("computed websocket accept key is header-safe"),
+        );
+        response.body = HttpResponseBody::WebSocket(Box::new(accept));
         response
     }
 

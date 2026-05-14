@@ -15,6 +15,8 @@ tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
 httparse = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false, features = ["std"] }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+sha1 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 tina-sim = { path = "../tina-sim" }

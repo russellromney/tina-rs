@@ -105,6 +105,7 @@ pub mod streaming;
 pub mod target;
 pub mod transport;
 pub mod types;
+pub mod websocket;
 
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
@@ -151,6 +152,11 @@ pub use types::{
     HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody, HttpResponse,
     HttpResponseBody, HttpServerConfig, HttpTransportPhase, PoolConfig, RequestParseError,
     ResponseParseError,
+};
+pub use websocket::{
+    WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketLimits, WebSocketMessage,
+    WebSocketOutboundQueue, WebSocketSessionMsg, WebSocketSessionOutcome, WebSocketUpgradeRequest,
+    websocket_upgrade,
 };
 
 // Re-exports from the `http` crate for convenient `tina_http::Method`,
