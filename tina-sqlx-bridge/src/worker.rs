@@ -349,7 +349,7 @@ impl<S: Shard + 'static> PgWorker<S> {
             in_flight,
         );
 
-        sleep(self.config.poll_interval).reply(move |_| PgMsg::Poll(id))
+        sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id))
     }
 
     fn poll(&mut self, id: u64) -> Effect<Self> {
@@ -434,7 +434,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                     return tina::reply_to_request(in_flight.reply_to, Err(PgError::Timeout));
                 }
                 self.in_flight.insert(id, in_flight);
-                sleep(self.config.poll_interval).reply(move |_| PgMsg::Poll(id))
+                sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id))
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.note_terminal();

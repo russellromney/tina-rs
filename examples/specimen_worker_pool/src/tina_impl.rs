@@ -38,7 +38,7 @@ impl Worker {
             // Vary the wait by id so replies arrive out of dispatch order.
             WorkerMsg::Do(payload) => {
                 let id = self.id;
-                sleep(self.work).reply(move |reply| WorkerMsg::Done(reply, payload + id))
+                sleep(self.work).then(move |reply| WorkerMsg::Done(reply, payload + id))
             }
             WorkerMsg::Done(Ok(()), result) => reply(WorkerReply(result)),
             WorkerMsg::Done(Err(_), _) => stop(),
@@ -83,7 +83,7 @@ impl Frontend {
                         let worker = self.workers[self.next_worker];
                         self.next_worker = (self.next_worker + 1) % self.workers.len();
                         call(worker, WorkerMsg::Do(payload), CALL_TIMEOUT)
-                            .reply(move |outcome| FrontendMsg::WorkerDone(qid, outcome))
+                            .then(move |outcome| FrontendMsg::WorkerDone(qid, outcome))
                     }
                     Err(PendingRepliesTryCaptureError::Full) => reply(FrontendReply::Full),
                     Err(other) => panic!("try_capture: {other:?}"),
@@ -143,7 +143,7 @@ impl Driver {
                     .enumerate()
                     .map(|(i, payload)| {
                         call(frontend, FrontendMsg::Submit(payload), CALL_TIMEOUT)
-                            .reply(move |outcome| DriverMsg::Returned(i, outcome))
+                            .then(move |outcome| DriverMsg::Returned(i, outcome))
                     })
                     .collect();
                 Effect::Batch(calls)

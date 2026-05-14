@@ -49,7 +49,7 @@
 //!                 })),
 //!                 Duration::from_secs(2),
 //!             )
-//!             .reply(AppMsg::S3PutDone),
+//!             .then(AppMsg::S3PutDone),
 //!             AppMsg::S3PutDone(_) => stop(),
 //!         }
 //!     }

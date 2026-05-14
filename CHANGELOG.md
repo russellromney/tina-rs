@@ -4,6 +4,20 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 095 Call Context Defer Ergonomics
+
+- Added `CallContext::defer(work).reply(...)` so multi-turn call handlers start
+  from explicit caller authority without making ordinary continuations carry
+  hidden request context.
+- Added `then(...)` and `then_with_request(...)` names for ordinary runtime
+  continuations, deprecated the old ordinary `reply(...)` /
+  `reply_with_request(...)` builder spellings, and added a `ReplyAbandoned`
+  diagnostic hint pointing at `call_ctx.defer(work).reply(...)`.
+- Migrated the multi-turn request-context specimen and selected
+  `mini_saas_api` call sites, and added runtime/specimen tests for successful
+  deferred replies, full/closed/timeout outcomes, unsupported call paths, and
+  caller-visible timeout handling.
+
 ### Phase 056 Native HTTP/2 Service Stack
 
 - Added a native HTTP/2 first form in `tina-http`: frame parsing/encoding,
@@ -36,7 +50,7 @@ This file records completed work.
 - Added replay-safe timer helper vocabulary in `tina::time`: interval,
   backoff, retry-delay, debounce, and throttle state helpers.
 - Kept helpers as state, not schedulers. User code still emits
-  `sleep(delay).reply(...)`, so the runtime owns time and simulator replay stays
+  `sleep(delay).then(...)`, so the runtime owns time and simulator replay stays
   honest.
 - Added timer semantics tests and migrated `specimen_periodic_batcher` to the
   copied interval/backoff shape.
@@ -491,7 +505,7 @@ plan-mandated proof tests.
   the new `CancelOutcome::WrongShard` if the cancel runs on a
   different shard than the originating one.
 - `CancelOutcome::NotDispatched` removed — the only reachable path
-  to it (cancel batched ahead of its own `call_with_handle` effect
+  to it (cancel batched ahead of its own `call_cancelable` effect
   in one isolate handler) was both rare and a wrong-result hazard
   (cancel returned `NotDispatched` while the call still ran). The
   cancel-dispatch path now `expect`s the `call_id` stamp; user code
@@ -612,9 +626,10 @@ your matches):
 API additions:
 
 - `tina::CallHandle<R>` (move-only, `!Clone`, `#[must_use]`) plus
-  `tina_runtime::call_with_handle(addr, msg, t).reply(...)` returning
-  `(Effect, CallHandle<R>)`.
-- `tina_runtime::cancel_call(handle).reply(...)` closes the wait,
+  `tina_runtime::call_cancelable(addr, msg, t).then(...)` returning
+  `(Effect, CallHandle<R>)`. The old `call_with_handle(...)` spelling
+  remains as deprecated compatibility pending a later scrub.
+- `tina_runtime::cancel_call(handle).then(...)` closes the wait,
   reclaims caller-side capacity, and emits
   `RuntimeEventKind::CallCancelled { call_id, cause }`. Late callee
   replies surface as `CallReplyRejected { NoPendingCall }` or

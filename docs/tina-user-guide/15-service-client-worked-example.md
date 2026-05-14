@@ -18,7 +18,7 @@ Caller code should look boring:
 
 ```rust
 call(http_client, HttpClientMsg::Fetch(request), Duration::from_secs(2))
-    .reply(AppMsg::HttpReturned)
+    .then(AppMsg::HttpReturned)
 ```
 
 The caller does not spawn a temporary child. It calls a service.
@@ -62,13 +62,13 @@ impl HttpClient {
         match msg {
             HttpClientMsg::Fetch(request) => {
                 tcp_connect(self.target)
-                    .reply(|result| HttpClientMsg::Connected(result, request))
+                    .then(|result| HttpClientMsg::Connected(result, request))
             }
 
             HttpClientMsg::Connected(Ok(stream), request) => {
                 self.stream = Some(stream);
                 let bytes = encode_request(request);
-                tcp_write(stream, bytes).reply(HttpClientMsg::Wrote)
+                tcp_write(stream, bytes).then(HttpClientMsg::Wrote)
             }
 
             HttpClientMsg::Connected(Err(_), _request) => {
@@ -77,7 +77,7 @@ impl HttpClient {
 
             HttpClientMsg::Wrote(Ok(_)) => {
                 let stream = self.stream.expect("connected before write");
-                tcp_read(stream, 8192).reply(HttpClientMsg::Read)
+                tcp_read(stream, 8192).then(HttpClientMsg::Read)
             }
 
             HttpClientMsg::Wrote(Err(_)) => {
@@ -90,7 +90,7 @@ impl HttpClient {
                     Ok(Some(response)) => reply(HttpClientReply::Response(response)),
                     Ok(None) => {
                         let stream = self.stream.expect("connected before read");
-                        tcp_read(stream, 8192).reply(HttpClientMsg::Read)
+                        tcp_read(stream, 8192).then(HttpClientMsg::Read)
                     }
                     Err(_err) => reply(HttpClientReply::Failed(HttpClientError::Parse)),
                 }
@@ -116,7 +116,7 @@ The caller owns the outer deadline:
 
 ```rust
 call(http_client, HttpClientMsg::Fetch(request), Duration::from_secs(2))
-    .reply(AppMsg::HttpReturned)
+    .then(AppMsg::HttpReturned)
 ```
 
 If the client service takes too long, the caller receives `CallOutcome::Timeout`.
@@ -138,7 +138,7 @@ App -> ClientPoolFrontend -> HttpClient worker 0
 The pool frontend is still one address:
 
 ```rust
-call(pool, PoolMsg::Fetch(request), timeout).reply(AppMsg::HttpReturned)
+call(pool, PoolMsg::Fetch(request), timeout).then(AppMsg::HttpReturned)
 ```
 
 Pressure remains visible at the pool mailbox, worker mailboxes, in-flight

@@ -330,7 +330,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
 
             KeepaliveConnectionMsg::Connected(Ok((stream, _local, _peer))) => {
                 if self.in_flight.is_none() {
-                    return tcp_close_stream(stream).reply(KeepaliveConnectionMsg::Closed);
+                    return tcp_close_stream(stream).then(KeepaliveConnectionMsg::Closed);
                 }
                 self.transport = Some(HttpTransport::Tcp(stream));
                 let bytes = self
@@ -350,7 +350,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             KeepaliveConnectionMsg::TlsConnected(Ok(stream)) => {
                 if self.in_flight.is_none() {
                     return tls_close(stream, self.config.request_timeout)
-                        .reply(KeepaliveConnectionMsg::Closed);
+                        .then(KeepaliveConnectionMsg::Closed);
                 }
                 self.transport = Some(HttpTransport::Tls(stream));
                 let bytes = self
@@ -481,7 +481,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         });
 
         let deadline_effect: Effect<Self> = sleep(request_timeout)
-            .reply(move |result| KeepaliveConnectionMsg::Deadline { generation, result });
+            .then(move |result| KeepaliveConnectionMsg::Deadline { generation, result });
 
         if self.transport.is_some() {
             // Reuse path: skip connect, queue the write directly.
@@ -496,7 +496,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             self.pending_connect_bytes = Some(request_bytes);
             let connect_effect: Effect<Self> = match &self.target {
                 HttpTarget::Http { addr, .. } => {
-                    tcp_connect(*addr).reply(KeepaliveConnectionMsg::Connected)
+                    tcp_connect(*addr).then(KeepaliveConnectionMsg::Connected)
                 }
                 HttpTarget::Https {
                     addr,
@@ -509,7 +509,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
                     trust_roots.root_certificates_der.clone(),
                     request_timeout,
                 )
-                .reply(KeepaliveConnectionMsg::TlsConnected),
+                .then(KeepaliveConnectionMsg::TlsConnected),
             };
             batch(vec![connect_effect, deadline_effect])
         }
@@ -551,10 +551,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let bytes = in_flight.pending_write.clone();
         match transport {
             HttpTransport::Tcp(stream) => {
-                tcp_write(stream, bytes).reply(KeepaliveConnectionMsg::Wrote)
+                tcp_write(stream, bytes).then(KeepaliveConnectionMsg::Wrote)
             }
             HttpTransport::Tls(stream) => tls_write(stream, bytes, self.config.request_timeout)
-                .reply(KeepaliveConnectionMsg::Wrote),
+                .then(KeepaliveConnectionMsg::Wrote),
         }
     }
 
@@ -578,10 +578,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let transport = self.transport.expect("transport set before read");
         match transport {
             HttpTransport::Tcp(stream) => {
-                tcp_read(stream, READ_CHUNK).reply(KeepaliveConnectionMsg::Read)
+                tcp_read(stream, READ_CHUNK).then(KeepaliveConnectionMsg::Read)
             }
             HttpTransport::Tls(stream) => tls_read(stream, READ_CHUNK, self.config.request_timeout)
-                .reply(KeepaliveConnectionMsg::Read),
+                .then(KeepaliveConnectionMsg::Read),
         }
     }
 
@@ -700,10 +700,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let transport = self.transport.take()?;
         let effect: Effect<Self> = match transport {
             HttpTransport::Tcp(stream) => {
-                tcp_close_stream(stream).reply(KeepaliveConnectionMsg::Closed)
+                tcp_close_stream(stream).then(KeepaliveConnectionMsg::Closed)
             }
             HttpTransport::Tls(stream) => {
-                tls_close(stream, self.config.request_timeout).reply(KeepaliveConnectionMsg::Closed)
+                tls_close(stream, self.config.request_timeout).then(KeepaliveConnectionMsg::Closed)
             }
         };
         Some(effect)

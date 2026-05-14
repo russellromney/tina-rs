@@ -122,7 +122,7 @@ pub fn send_request(
 // Typed shorthands.
 // ---------------------------------------------------------------------------
 
-/// Prepared `Execute` call. Use [`Self::reply`] to fold into the
+/// Prepared `Execute` call. Use [`Self::then`] to fold into the
 /// continuation message of your isolate.
 pub struct ExecuteCall {
     inner: IsolateCall<PgMsg, PgResult>,
@@ -136,14 +136,25 @@ impl std::fmt::Debug for ExecuteCall {
 
 impl ExecuteCall {
     /// Turn this prepared call into one continuation message.
+    #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
         I: Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(PgExecutedOutcome) -> M + 'static,
         M: 'static,
     {
+        self.then(translator)
+    }
+
+    /// Turn this prepared call into one continuation message.
+    pub fn then<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(PgExecutedOutcome) -> M + 'static,
+        M: 'static,
+    {
         self.inner
-            .reply(move |raw| translator(project_executed(raw)))
+            .then(move |raw| translator(project_executed(raw)))
     }
 }
 
@@ -160,14 +171,25 @@ impl std::fmt::Debug for FetchManyCall {
 
 impl FetchManyCall {
     /// Turn this prepared call into one continuation message.
+    #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
         I: Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(PgFetchManyOutcome) -> M + 'static,
         M: 'static,
     {
+        self.then(translator)
+    }
+
+    /// Turn this prepared call into one continuation message.
+    pub fn then<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(PgFetchManyOutcome) -> M + 'static,
+        M: 'static,
+    {
         self.inner
-            .reply(move |raw| translator(project_fetch_many(raw)))
+            .then(move |raw| translator(project_fetch_many(raw)))
     }
 }
 
@@ -184,14 +206,25 @@ impl std::fmt::Debug for FetchOneCall {
 
 impl FetchOneCall {
     /// Turn this prepared call into one continuation message.
+    #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
         I: Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(PgFetchOneOutcome) -> M + 'static,
         M: 'static,
     {
+        self.then(translator)
+    }
+
+    /// Turn this prepared call into one continuation message.
+    pub fn then<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(PgFetchOneOutcome) -> M + 'static,
+        M: 'static,
+    {
         self.inner
-            .reply(move |raw| translator(project_fetch_one(raw)))
+            .then(move |raw| translator(project_fetch_one(raw)))
     }
 }
 
@@ -271,14 +304,25 @@ impl std::fmt::Debug for TransactionCall {
 
 impl TransactionCall {
     /// Turn this prepared call into one continuation message.
+    #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
         I: Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(PgTransactionCallOutcome) -> M + 'static,
         M: 'static,
     {
+        self.then(translator)
+    }
+
+    /// Turn this prepared call into one continuation message.
+    pub fn then<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(PgTransactionCallOutcome) -> M + 'static,
+        M: 'static,
+    {
         self.inner
-            .reply(move |raw| translator(project_transaction(raw)))
+            .then(move |raw| translator(project_transaction(raw)))
     }
 }
 

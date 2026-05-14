@@ -46,7 +46,7 @@ Caller:
 
 ```rust
 call(counter, CounterMsg::Add(1), Duration::from_millis(20))
-    .reply(ClientMsg::CounterReturned)
+    .then(ClientMsg::CounterReturned)
 ```
 
 ## Service That Does I/O
@@ -233,7 +233,7 @@ Tina (`ShardPlacement` + `ShardServiceTable::try_from_placement(...)` +
 per-shard `Store` isolates with `placement.require_owner_str(...)`)
 implementation that runs the same `SET / GET / DEL / SUM / QUIT` script
 and produces the same `Report`. The Tina side uses
-`call(addr, msg, timeout).reply(continuation)` for keyed access and a
+`call(addr, msg, timeout).then(continuation)` for keyed access and a
 sequential per-shard fanout for `SUM`. The richer parallel
 scatter/gather form (with `send_observed` and a `ReplyAdapter`) is
 proven in `tina-runtime/tests/sharded_primitives.rs`.
@@ -282,7 +282,7 @@ logs and metrics.
 
 ## Deferred Replies
 
-`call(svc, msg, timeout).reply(...)` works when the service answers in
+`call(svc, msg, timeout).then(...)` works when the service answers in
 one handler turn. Some shapes need to answer later:
 
 - pool frontend, reply arrives from one of N workers
@@ -359,15 +359,33 @@ When the reply is intentionally multi-turn, use `RequestContext<R>` instead of
 `DeferredReply`. The name signals intent to readers.
 
 ```rust
-let req: RequestContext<MyReply> = call_ctx.into_request_context();
-call(probe, ProbeMsg, timeout)
-    .reply_with_request(req, MyMsg::ProbeResult)
+call_ctx
+    .defer(call(probe, ProbeMsg, timeout))
+    .reply(MyMsg::ProbeResult)
 ```
 
-`reply_with_request` boxes a translator that carries the context into the
-continuation message. The caller timeout still governs. The service still
-answers later with `reply_to_request(req, MyReply)`. There is no hidden
-state preservation and no async-looking sugar.
+The continuation message still carries `RequestContext<MyReply>`, so the
+message enum stays honest:
+
+```rust
+ProbeResult(RequestContext<MyReply>, CallOutcome<ProbeReply>)
+```
+
+The caller timeout still governs. The service still answers later with
+`reply_to_request(req, MyReply)`. There is no hidden state preservation and no
+async-looking sugar.
+
+When the expanded authority move reads better, spell it out:
+
+```rust
+let req: RequestContext<MyReply> = call_ctx.into_request_context();
+call(probe, ProbeMsg, timeout)
+    .then_with_request(req, MyMsg::ProbeResult)
+```
+
+Use `then(...)` for ordinary continuations that do not carry caller authority.
+Do not use ordinary `then(...)` as the default in `handle_call` unless you also
+reply, reject, or defer the `CallContext`.
 
 `RequestContext` is a real newtype over `DeferredReply`; it exists so that
 a handler signature can say "I carry the promise across turns" instead of

@@ -14,7 +14,7 @@ use tina::pool::{
 };
 use tina::prelude::*;
 use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
-use tina_runtime::{CallOutcome, call, call_with_handle, cancel_call};
+use tina_runtime::{CallOutcome, call, call_cancelable, cancel_call};
 use tina_sim::{Simulator, SimulatorConfig};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -110,11 +110,11 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::BeginAcquire { id } => call(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
-                .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome }),
+                .then(move |outcome| DriverMsg::AcquireReturned { id, outcome }),
             DriverMsg::BeginAcquireWithHandle { id } => {
                 let (effect, handle) =
-                    call_with_handle(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
-                        .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome });
+                    call_cancelable(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
+                        .then(move |outcome| DriverMsg::AcquireReturned { id, outcome });
                 self.handles.push((id, handle));
                 effect
             }
@@ -176,7 +176,7 @@ impl Driver {
                     .position(|(hid, _)| *hid == id)
                     .expect("handle for id");
                 let (_, handle) = self.handles.remove(pos);
-                cancel_call(handle).reply(DriverMsg::CancelReturned)
+                cancel_call(handle).then(DriverMsg::CancelReturned)
             }
             DriverMsg::CancelReturned(outcome) => {
                 self.obs.lock().expect("obs").cancel_acks.push(outcome);
@@ -184,7 +184,7 @@ impl Driver {
             }
             DriverMsg::BeginPressure => {
                 call(self.pool, WorkerPoolMsg::PressureReport, CALL_TIMEOUT)
-                    .reply(DriverMsg::PressureReturned)
+                    .then(DriverMsg::PressureReturned)
             }
             DriverMsg::PressureReturned(outcome) => {
                 if let CallOutcome::Replied(WorkerPoolReply::Pressure(report)) = outcome {
@@ -194,7 +194,7 @@ impl Driver {
             }
             DriverMsg::BeginClose(mode) => {
                 call(self.pool, WorkerPoolMsg::Close(mode), CALL_TIMEOUT)
-                    .reply(DriverMsg::CloseReturned)
+                    .then(DriverMsg::CloseReturned)
             }
             DriverMsg::CloseReturned(outcome) => {
                 if matches!(outcome, CallOutcome::Replied(WorkerPoolReply::Closed)) {

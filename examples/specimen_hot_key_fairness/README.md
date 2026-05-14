@@ -17,7 +17,7 @@ Both sides:
   task per shard sleeping `PER_WRITE_MS` per item. Producer uses
   `try_send`.
 - Tina: `Store` isolate per shard, mailbox cap = `SHARD_MAILBOX`,
-  rate-limited via `sleep().reply(Tick)`. Producer uses one
+  rate-limited via `sleep().then(Tick)`. Producer uses one
   `HostBurstOutcomes` per shard plus `runtime.try_send_outcome` —
   the typed snapshot reports `admitted` / `mailbox_full` /
   `ingress_full` per shard with no observer closure.

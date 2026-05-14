@@ -8,7 +8,7 @@
 //!
 //! Then it computes the batch result (sum of items) and replies to
 //! every caller with the same total. Callers see the batch reply
-//! through their original `call(...).reply(...)` continuation.
+//! through their original `call(...).then(...)` continuation.
 
 pub mod tina_impl;
 pub mod tokio_impl;

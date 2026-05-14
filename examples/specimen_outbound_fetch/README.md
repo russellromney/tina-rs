@@ -40,13 +40,13 @@ returns `Err` collapses into a `failed += 1`.
 A `Fetcher` isolate with a state machine. Phase 059 Rocks 1+3 own
 the loops:
 
-- `Begin → tcp_connect.reply(Connected)`.
+- `Begin → tcp_connect.then(Connected)`.
 - `Connected(Ok(...)) → TcpWriteAll(GET).next_effect(Wrote)`. The
   helper retries the next chunk on partial writes; the handler arm
   is "advance and dispatch".
 - `Wrote(Done) → TcpReadToEof.next_effect(Read)`. The helper accumulates
   bytes until EOF or a `RESPONSE_MAX` cap.
-- `Read(Done(buffer)) → classify → tcp_close_stream.reply(Closed)`.
+- `Read(Done(buffer)) → classify → tcp_close_stream.then(Closed)`.
 - `Closed → next iteration or stop_with(self.outcome)`.
 
 The host registers a typed result waiter and waits on it:

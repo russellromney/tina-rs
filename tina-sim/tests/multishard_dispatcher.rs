@@ -218,7 +218,7 @@ impl Isolate for TimedCoordinator {
     ) -> Effect<Self> {
         match msg {
             TimedCoordinatorEvent::Start => {
-                sleep(self.backoff).reply(|_| TimedCoordinatorEvent::DelayElapsed)
+                sleep(self.backoff).then(|_| TimedCoordinatorEvent::DelayElapsed)
             }
             TimedCoordinatorEvent::DelayElapsed => send(
                 self.worker,
@@ -816,7 +816,7 @@ impl Isolate for DurableStore {
                 bytes,
                 reply_to,
             } => journal_append(self.journal_path.clone(), index, bytes.clone())
-                .reply(move |result| DurableStoreMsg::Appended(result, bytes, reply_to)),
+                .then(move |result| DurableStoreMsg::Appended(result, bytes, reply_to)),
             DurableStoreMsg::Appended(result, bytes, reply_to) => {
                 send(reply_to, DurableTcpFrontendMsg::Persisted(result, bytes))
             }
@@ -1074,7 +1074,7 @@ impl Isolate for DurableBatchStore {
             DurableBatchStoreMsg::Append { bytes, reply_to } => {
                 self.next_index += 1;
                 journal_append(self.journal_path.clone(), self.next_index, bytes.clone())
-                    .reply(move |result| DurableBatchStoreMsg::Appended(result, bytes, reply_to))
+                    .then(move |result| DurableBatchStoreMsg::Appended(result, bytes, reply_to))
             }
             DurableBatchStoreMsg::Appended(result, bytes, reply_to) => send(
                 reply_to,

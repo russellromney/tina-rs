@@ -2,7 +2,7 @@
 //! the reqwest bridge. Each increment exercises a different
 //! call-site shape so the file reads as a side-by-side comparison:
 //!
-//! 1. Increment #1 uses `send_request(...).reply(...)` — the
+//! 1. Increment #1 uses `send_request(...).then(...)` — the
 //!    polished helper. This is the recommended default shape.
 //! 2. Increment #2 uses literal
 //!    `call(addr, ReqwestMsg::Send(req), timeout)` — the raw layered
@@ -66,7 +66,7 @@ impl Driver {
                 // in PostedViaSendRequest. This is the default a user
                 // should reach for.
                 send_request(self.http, request, self.timeout)
-                    .reply(DriverMsg::PostedViaSendRequest)
+                    .then(DriverMsg::PostedViaSendRequest)
             }
             2 => {
                 // Shape 2: raw layered call. Functionally identical
@@ -75,7 +75,7 @@ impl Driver {
                 // If you find yourself writing this every time, use
                 // shape 1 instead.
                 call(self.http, ReqwestMsg::Send(request), self.timeout)
-                    .reply(DriverMsg::PostedViaRawCall)
+                    .then(DriverMsg::PostedViaRawCall)
             }
             3 => {
                 // Shape 3: polished helper + flatten_outcome at the
@@ -87,7 +87,7 @@ impl Driver {
                 // failures — the flat error type still names which
                 // layer failed via Bridge(...) vs Worker(...).
                 send_request(self.http, request, self.timeout)
-                    .reply(|outcome| DriverMsg::PostedFlattened(flatten_outcome(outcome)))
+                    .then(|outcome| DriverMsg::PostedFlattened(flatten_outcome(outcome)))
             }
             _ => noop(),
         }

@@ -39,9 +39,9 @@ give completion back to Tina runtime
 Tina wraps that in isolate-friendly effects:
 
 ```rust
-tcp_read(stream, 4096).reply(ConnMsg::Read)
-tcp_write(stream, bytes).reply(ConnMsg::Wrote)
-sleep(duration).reply(Msg::TimerDone)
+tcp_read(stream, 4096).then(ConnMsg::Read)
+tcp_write(stream, bytes).then(ConnMsg::Wrote)
+sleep(duration).then(Msg::TimerDone)
 ```
 
 Application code should not call Betelgeuse directly.

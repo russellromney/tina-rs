@@ -112,7 +112,7 @@ impl Proxy {
             HttpClientMsg::call(self.upstream, outbound),
             self.client_call_timeout,
         )
-        .reply_with_request(request, ProxyMsg::ClientReturned)
+        .then_with_request(request, ProxyMsg::ClientReturned)
     }
 
     fn response_for_client_outcome(

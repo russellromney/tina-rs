@@ -1,4 +1,4 @@
-//! Focused tests for [`tina_runtime::call_with_handle`] and
+//! Focused tests for [`tina_runtime::call_cancelable`] and
 //! [`tina_runtime::cancel_call`].
 //!
 //! These prove first-form cancel semantics on the live runtime:
@@ -24,7 +24,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallKind, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, RuntimeEventKind, ThreadedRuntime, call_with_handle, cancel_call,
+    DeferredReplyRejectedReason, RuntimeEventKind, ThreadedRuntime, call_cancelable, cancel_call,
 };
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -147,14 +147,14 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
-                let (effect, handle) = call_with_handle(self.worker, WorkerMsg::Hold, CALL_TIMEOUT)
-                    .reply(DriverMsg::Returned);
+                let (effect, handle) = call_cancelable(self.worker, WorkerMsg::Hold, CALL_TIMEOUT)
+                    .then(DriverMsg::Returned);
                 self.pending = Some(handle);
                 effect
             }
             DriverMsg::DoCancel => {
                 if let Some(handle) = self.pending.take() {
-                    cancel_call(handle).reply(DriverMsg::Cancelled)
+                    cancel_call(handle).then(DriverMsg::Cancelled)
                 } else {
                     noop()
                 }

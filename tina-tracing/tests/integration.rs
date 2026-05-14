@@ -797,7 +797,7 @@ fn tracing_observer_emits_events_through_runtime_hook() {
             _ctx: &mut Context<'_, SingleShard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                Msg::Begin => sleep(Duration::ZERO).reply(|_| Msg::Done),
+                Msg::Begin => sleep(Duration::ZERO).then(|_| Msg::Done),
                 Msg::Done => stop(),
             }
         }

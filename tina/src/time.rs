@@ -3,7 +3,7 @@
 //! Helpers in this module decide delays around runtime-owned sleep. They do
 //! not schedule work, retry operations, read clocks, or own hidden queues.
 //! Runtime-aware code still returns an explicit runtime call such as
-//! `sleep(delay).reply(...)`.
+//! `sleep(delay).then(...)`.
 //!
 //! All APIs that need a current time take `now` from the caller. Inside an
 //! isolate, that should usually be [`Context::now`](crate::Context::now).
@@ -32,7 +32,7 @@ pub enum TimerConfigError {
 
 /// A timer helper decision that may refuse to sleep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[must_use = "handle DeadlineElapsed/Exhausted, or return sleep(decision.delay()).reply(...)"]
+#[must_use = "handle DeadlineElapsed/Exhausted, or return sleep(decision.delay()).then(...)"]
 pub enum TimerDecision<T> {
     /// Sleep for the delay carried by `T`.
     Sleep(T),
@@ -66,7 +66,7 @@ pub enum MissedTickPolicy {
 
 /// Delay chosen by [`TimerInterval`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[must_use = "return sleep(delay()).reply(...) and keep the visible tick metadata"]
+#[must_use = "return sleep(delay()).then(...) and keep the visible tick metadata"]
 pub struct IntervalDelay {
     delay: Duration,
     tick_number: u64,
@@ -262,7 +262,7 @@ impl TimerInterval {
 
 /// Delay chosen by [`Backoff`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[must_use = "return sleep(delay()).reply(...) or record why retry stopped"]
+#[must_use = "return sleep(delay()).then(...) or record why retry stopped"]
 pub struct BackoffDelay {
     attempt: u64,
     delay: Duration,

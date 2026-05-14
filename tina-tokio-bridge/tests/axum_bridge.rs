@@ -499,7 +499,7 @@ impl ScheduledWorker {
     ) -> Effect<Self> {
         match msg {
             ScheduledMsg::Request(request) => {
-                sleep(Duration::from_millis(1)).reply(move |_| ScheduledMsg::Ready(request))
+                sleep(Duration::from_millis(1)).then(move |_| ScheduledMsg::Ready(request))
             }
             ScheduledMsg::Ready(request) => {
                 let (request, responder) = request.into_parts();
@@ -593,7 +593,7 @@ impl FileBridgeWorker {
                     request.request().llama
                 ));
                 let payload = format!("{} via file", request.request().llama).into_bytes();
-                file_create(path.clone()).reply(move |result| FileBridgeMsg::Opened {
+                file_create(path.clone()).then(move |result| FileBridgeMsg::Opened {
                     result,
                     request,
                     path,
@@ -607,7 +607,7 @@ impl FileBridgeWorker {
                 payload,
             } => {
                 let payload_len = payload.len();
-                file_write(file, payload).reply(move |result| FileBridgeMsg::Wrote {
+                file_write(file, payload).then(move |result| FileBridgeMsg::Wrote {
                     result,
                     request,
                     path,
@@ -622,7 +622,7 @@ impl FileBridgeWorker {
                 file,
                 payload_len,
             } if count == payload_len => {
-                file_fsync(file).reply(move |result| FileBridgeMsg::Synced {
+                file_fsync(file).then(move |result| FileBridgeMsg::Synced {
                     result,
                     request,
                     path,
@@ -634,7 +634,7 @@ impl FileBridgeWorker {
                 request,
                 path,
                 file,
-            } => file_size(file).reply(move |result| FileBridgeMsg::Sized {
+            } => file_size(file).then(move |result| FileBridgeMsg::Sized {
                 result,
                 request,
                 path,
@@ -645,7 +645,7 @@ impl FileBridgeWorker {
                 request,
                 path,
                 file,
-            } => file_read(file, size as usize).reply(move |result| FileBridgeMsg::Read {
+            } => file_read(file, size as usize).then(move |result| FileBridgeMsg::Read {
                 result,
                 request,
                 path,
@@ -656,7 +656,7 @@ impl FileBridgeWorker {
                 request,
                 path,
                 file,
-            } => file_close(file).reply(move |result| FileBridgeMsg::Closed {
+            } => file_close(file).then(move |result| FileBridgeMsg::Closed {
                 result,
                 request,
                 path,

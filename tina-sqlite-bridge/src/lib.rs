@@ -49,7 +49,7 @@
 //!                 vec![7.into()],
 //!                 Duration::from_secs(2),
 //!             )
-//!             .reply(AppMsg::DbDone),
+//!             .then(AppMsg::DbDone),
 //!             AppMsg::DbDone(outcome) => match outcome {
 //!                 CallOutcome::Replied(Ok(_rows_changed)) => stop(),
 //!                 _ => stop(),

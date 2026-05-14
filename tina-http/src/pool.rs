@@ -6,10 +6,10 @@
 //!
 //! ```rust,ignore
 //! call(pool, HttpPoolMsg::Submit(OutboundCall { target, request }), timeout)
-//!     .reply(MyMsg::HttpReturned)
+//!     .then(MyMsg::HttpReturned)
 //! ```
 //!
-//! Slot free: pool forwards via `call(client, ...).reply(Returned)`,
+//! Slot free: pool forwards via `call(client, ...).then(Returned)`,
 //! and the continuation chain replies to the original Submit caller.
 //! Slot busy: new Submit replies `Err(HttpClientError::PoolFull)`
 //! immediately. No waiter queue. No idle reuse.
@@ -124,7 +124,7 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
                     HttpClientMsg::Call(Box::new(outbound)),
                     self.config.client_call_timeout,
                 )
-                .reply_with_request(request, HttpPoolMsg::Returned)
+                .then_with_request(request, HttpPoolMsg::Returned)
             }
             HttpPoolMsg::Returned(_, _) => {
                 call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)

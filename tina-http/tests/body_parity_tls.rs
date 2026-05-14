@@ -496,7 +496,7 @@ impl Isolate for ChunkedRequestConsumer {
                         HttpConnectionMsg::body_next(),
                         Duration::from_secs(30),
                     )
-                    .reply_with_request(request, ChunkedRequestMsg::ChunkArrived)
+                    .then_with_request(request, ChunkedRequestMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     let total = self.accumulated.len();
@@ -539,7 +539,7 @@ impl Isolate for ChunkedRequestConsumer {
                         HttpConnectionMsg::body_next(),
                         Duration::from_secs(30),
                     )
-                    .reply_with_request(request, ChunkedRequestMsg::ChunkArrived)
+                    .then_with_request(request, ChunkedRequestMsg::ChunkArrived)
                 }
             },
             ChunkedRequestMsg::ChunkArrived(_, _) => {

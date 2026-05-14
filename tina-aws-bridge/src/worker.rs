@@ -325,7 +325,7 @@ impl<S: Shard + 'static> S3Worker<S> {
         self.metrics.note_admit_kind(request_kind);
         self.metrics.set_in_flight(in_flight);
         self.metrics.note_in_flight(in_flight);
-        sleep(self.config.poll_interval).reply(move |_| S3Msg::Poll(id))
+        sleep(self.config.poll_interval).then(move |_| S3Msg::Poll(id))
     }
 
     fn poll(&mut self, id: u64) -> Effect<Self> {
@@ -354,11 +354,11 @@ impl<S: Shard + 'static> S3Worker<S> {
                     self.in_flight.insert(id, in_flight);
                     return batch(vec![
                         Self::complete_request(request_context, Err(S3Error::Timeout)),
-                        sleep(self.config.poll_interval).reply(move |_| S3Msg::Poll(id)),
+                        sleep(self.config.poll_interval).then(move |_| S3Msg::Poll(id)),
                     ]);
                 }
                 self.in_flight.insert(id, in_flight);
-                sleep(self.config.poll_interval).reply(move |_| S3Msg::Poll(id))
+                sleep(self.config.poll_interval).then(move |_| S3Msg::Poll(id))
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.note_terminal(in_flight.request_kind);

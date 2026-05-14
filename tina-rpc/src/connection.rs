@@ -450,11 +450,11 @@ where
         // debug_assert in `Client::new`/`Connection::new` catches this
         // in dev; the clamp is the release-build guard.
         let max_len = self.config.read_chunk.max(1);
-        tcp_read(self.stream, max_len).reply(ConnectionMsg::Read)
+        tcp_read(self.stream, max_len).then(ConnectionMsg::Read)
     }
 
     fn write_effect(bytes: Vec<u8>, stream: StreamId) -> Effect<Self> {
-        tcp_write(stream, bytes).reply(ConnectionMsg::Wrote)
+        tcp_write(stream, bytes).then(ConnectionMsg::Wrote)
     }
 
     fn idle_arm_effect(&self) -> Effect<Self> {
@@ -479,7 +479,7 @@ where
         self.in_flight = 0;
         self.write_queue.clear();
         self.write_in_flight = None;
-        tcp_close_stream(self.stream).reply(ConnectionMsg::StreamClosed)
+        tcp_close_stream(self.stream).then(ConnectionMsg::StreamClosed)
     }
 
     fn finalize_close(&mut self) -> Effect<Self> {
@@ -551,7 +551,7 @@ where
             crate::registry::RegistryMsg::Route(request),
             self.config.service_call_timeout,
         )
-        .reply(move |outcome| ConnectionMsg::Routed {
+        .then(move |outcome| ConnectionMsg::Routed {
             request_id,
             service,
             method,

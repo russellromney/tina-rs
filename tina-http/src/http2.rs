@@ -640,7 +640,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
     fn read_more(&mut self) -> Effect<Self> {
-        tcp_read(self.stream, READ_CHUNK).reply(Http2ConnectionMsg::Read)
+        tcp_read(self.stream, READ_CHUNK).then(Http2ConnectionMsg::Read)
     }
 
     fn write_more(&mut self) -> Effect<Self> {
@@ -655,11 +655,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             return noop();
         }
-        tcp_write(self.stream, self.pending_write.clone()).reply(Http2ConnectionMsg::Wrote)
+        tcp_write(self.stream, self.pending_write.clone()).then(Http2ConnectionMsg::Wrote)
     }
 
     fn close_now(&mut self) -> Effect<Self> {
-        tcp_close_stream(self.stream).reply(Http2ConnectionMsg::Closed)
+        tcp_close_stream(self.stream).then(Http2ConnectionMsg::Closed)
     }
 
     fn begin_goaway_shutdown(&mut self) -> Effect<Self> {
@@ -938,7 +938,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
         effects.push(
             call(self.service, M::from(request), self.service_call_timeout)
-                .reply(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome }),
+                .then(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome }),
         );
         Ok(())
     }
@@ -1216,23 +1216,23 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     return noop();
                 }
                 self.started = true;
-                tcp_bind(self.bind_addr).reply(Http2ListenerMsg::Bound)
+                tcp_bind(self.bind_addr).then(Http2ListenerMsg::Bound)
             }
             Http2ListenerMsg::Bound(Ok((listener, _addr))) => {
                 self.listener = Some(listener);
                 if self.stopping {
                     let listener = self.listener.take().expect("listener just set");
-                    return tcp_close_listener(listener).reply(Http2ListenerMsg::ListenerClosed);
+                    return tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed);
                 }
-                tcp_accept(listener).reply(Http2ListenerMsg::Accepted)
+                tcp_accept(listener).then(Http2ListenerMsg::Accepted)
             }
             Http2ListenerMsg::Bound(Err(_)) => stop(),
             Http2ListenerMsg::Accepted(Ok((stream, _peer))) => {
                 if self.stopping {
-                    return tcp_close_stream(stream).reply(Http2ListenerMsg::StreamClosed);
+                    return tcp_close_stream(stream).then(Http2ListenerMsg::StreamClosed);
                 }
                 let Some(listener) = self.listener else {
-                    return tcp_close_stream(stream).reply(Http2ListenerMsg::StreamClosed);
+                    return tcp_close_stream(stream).then(Http2ListenerMsg::StreamClosed);
                 };
                 batch(vec![
                     spawn(
@@ -1247,12 +1247,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                         )
                         .with_initial_message(Http2ConnectionMsg::Begin),
                     ),
-                    tcp_accept(listener).reply(Http2ListenerMsg::Accepted),
+                    tcp_accept(listener).then(Http2ListenerMsg::Accepted),
                 ])
             }
             Http2ListenerMsg::Accepted(Err(_)) => {
                 if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).reply(Http2ListenerMsg::ListenerClosed)
+                    tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed)
                 } else {
                     stop()
                 }
@@ -1260,7 +1260,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             Http2ListenerMsg::Stop => {
                 self.stopping = true;
                 if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).reply(Http2ListenerMsg::ListenerClosed)
+                    tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed)
                 } else {
                     stop()
                 }

@@ -408,9 +408,9 @@ impl Isolate for NotifySink {
                         .reply(text(StatusCode::INTERNAL_SERVER_ERROR, "upstream_failed\n"));
                 }
                 if body_text(&request).contains("slow") {
-                    let req = call.into_request_context();
-                    return sleep(Duration::from_millis(250))
-                        .reply(move |_| NotifyMsg::Delayed(req));
+                    return call
+                        .defer(sleep(Duration::from_millis(250)))
+                        .reply(|req, _| NotifyMsg::Delayed(req));
                 }
                 self.accepted += 1;
                 call.reply(text(StatusCode::OK, "accepted\n"))
@@ -524,7 +524,7 @@ impl Isolate for Controller {
                     WorkerPoolMsg::PressureReport,
                     REQUEST_TIMEOUT,
                 )
-                .reply_with_request(req, move |req, outcome| {
+                .then_with_request(req, move |req, outcome| {
                     ControllerMsg::ReadyPool(req, ingress_stopped, outcome)
                 }),
                 other => reply_to_request(
@@ -576,7 +576,7 @@ impl Isolate for Controller {
                 match item_from_rows(id, outcome) {
                     Ok(Some(name)) => {
                         call(self.outbound_pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)
-                            .reply_with_request(req, move |req, outcome| {
+                            .then_with_request(req, move |req, outcome| {
                                 ControllerMsg::NotifyAcquired(req, id, name, slow, outcome)
                             })
                     }
@@ -597,7 +597,7 @@ impl Isolate for Controller {
                         KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
                         REQUEST_TIMEOUT + Duration::from_secs(1),
                     )
-                    .reply_with_request(req, move |req, outcome| {
+                    .then_with_request(req, move |req, outcome| {
                         ControllerMsg::NotifySent(req, lease, outcome)
                     })
                 }
@@ -623,7 +623,7 @@ impl Isolate for Controller {
                     WorkerPoolMsg::Release { lease, disposition },
                     REQUEST_TIMEOUT,
                 )
-                .reply_with_request(req, move |req, release| {
+                .then_with_request(req, move |req, release| {
                     ControllerMsg::NotifyReleased(req, ok, release)
                 })
             }
@@ -668,22 +668,22 @@ impl Controller {
             (http::Method::GET, "/health") => call_ctx.reply(text(StatusCode::OK, "alive\n")),
             (http::Method::GET, "/ready") => {
                 let ingress_stopped = !self.ingress_open;
-                let req = call_ctx.into_request_context();
-                send_request(
-                    self.db,
-                    SqliteRequest::query_rows("SELECT 1", 1),
-                    REQUEST_TIMEOUT,
-                )
-                .reply(move |outcome| ControllerMsg::ReadyDb(req, ingress_stopped, outcome))
+                call_ctx
+                    .defer(send_request(
+                        self.db,
+                        SqliteRequest::query_rows("SELECT 1", 1),
+                        REQUEST_TIMEOUT,
+                    ))
+                    .reply(move |req, outcome| ControllerMsg::ReadyDb(req, ingress_stopped, outcome))
             }
             (http::Method::GET, "/debug/capacity") => {
-                let req = call_ctx.into_request_context();
-                call(
-                    self.outbound_pool,
-                    WorkerPoolMsg::PressureReport,
-                    REQUEST_TIMEOUT,
-                )
-                .reply_with_request(req, ControllerMsg::CapacityPool)
+                call_ctx
+                    .defer(call(
+                        self.outbound_pool,
+                        WorkerPoolMsg::PressureReport,
+                        REQUEST_TIMEOUT,
+                    ))
+                    .reply(ControllerMsg::CapacityPool)
             }
             _ if !self.ingress_open => {
                 call_ctx.reply(text(StatusCode::SERVICE_UNAVAILABLE, "ingress_stopped\n"))
@@ -711,16 +711,15 @@ impl Controller {
         let id = self.next_id;
         self.next_id += 1;
         let name = name.to_owned();
-        let req = call.into_request_context();
-        send_request(
+        call.defer(send_request(
             self.db,
             SqliteRequest::execute("INSERT INTO items (id, name) VALUES (?, ?)").params(vec![
                 SqliteValue::Integer(id),
                 SqliteValue::Text(name.clone()),
             ]),
             REQUEST_TIMEOUT,
-        )
-        .reply(move |outcome| ControllerMsg::Created(req, id, name, outcome))
+        ))
+        .reply(move |req, outcome| ControllerMsg::Created(req, id, name, outcome))
     }
 
     fn item_route(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
@@ -734,25 +733,23 @@ impl Controller {
         };
         match (&request.method, notify) {
             (&http::Method::GET, false) => {
-                let req = call.into_request_context();
-                send_request(
+                call.defer(send_request(
                     self.db,
                     SqliteRequest::query_rows("SELECT name FROM items WHERE id = ?", 1)
                         .params(vec![SqliteValue::Integer(id)]),
                     REQUEST_TIMEOUT,
-                )
-                .reply(move |outcome| ControllerMsg::Loaded(req, id, outcome))
+                ))
+                .reply(move |req, outcome| ControllerMsg::Loaded(req, id, outcome))
             }
             (&http::Method::POST, true) => {
-                let req = call.into_request_context();
                 let slow = body_text(&request).contains("slow");
-                send_request(
+                call.defer(send_request(
                     self.db,
                     SqliteRequest::query_rows("SELECT name FROM items WHERE id = ?", 1)
                         .params(vec![SqliteValue::Integer(id)]),
                     REQUEST_TIMEOUT,
-                )
-                .reply(move |outcome| ControllerMsg::NotifyLoaded(req, id, slow, outcome))
+                ))
+                .reply(move |req, outcome| ControllerMsg::NotifyLoaded(req, id, slow, outcome))
             }
             _ => call.reply(text(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed\n")),
         }

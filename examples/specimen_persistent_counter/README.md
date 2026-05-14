@@ -56,11 +56,11 @@ different ones.
 
 A `Counter` isolate using runtime-owned primitives:
 
-- `snapshot_load(path).reply(...)` and `snapshot_commit(path,
-  bytes, last_index).reply(...)` — the runtime owns the temp-file +
+- `snapshot_load(path).then(...)` and `snapshot_commit(path,
+  bytes, last_index).then(...)` — the runtime owns the temp-file +
   rename + fsync dance.
-- `journal_append(path, index, bytes).reply(...)` and
-  `journal_replay(path).reply(...)` — the runtime owns record
+- `journal_append(path, index, bytes).then(...)` and
+  `journal_replay(path).then(...)` — the runtime owns record
   framing, torn-tail detection, replay walk.
 - The `Counter` isolate just sequences these calls and tracks
   `(value, last_journal_index)` as state.

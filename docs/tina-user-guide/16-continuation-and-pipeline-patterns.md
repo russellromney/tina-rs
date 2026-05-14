@@ -74,7 +74,7 @@ Canonical shape:
 ```rust
 fn handle(&mut self, msg: FetchMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
     match msg {
-        FetchMsg::Begin                                 => tcp_connect(self.target).reply(FetchMsg::Connected),
+        FetchMsg::Begin                                 => tcp_connect(self.target).then(FetchMsg::Connected),
         FetchMsg::Connected(Ok((stream, _, _)))         => self.start_write(stream),
         FetchMsg::Connected(Err(_))                     => self.next_iteration(),
         FetchMsg::Wrote(Ok(count))                      => self.handle_write_progress(count),
@@ -115,11 +115,9 @@ but the type name signals the multi-turn intent.
 ```rust
 fn handle_call(&mut self, msg: SvcMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
     match msg {
-        SvcMsg::Start => {
-            let req = call_ctx.into_request_context();
-            call(self.probe, ProbeMsg, Duration::from_millis(50))
-                .reply_with_request(req, SvcMsg::ProbeResult)
-        }
+        SvcMsg::Start => call_ctx
+            .defer(call(self.probe, ProbeMsg, Duration::from_millis(50)))
+            .then(SvcMsg::ProbeResult),
         SvcMsg::ProbeResult(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
     }
 }
@@ -139,10 +137,10 @@ fn handle(&mut self, msg: SvcMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect
 
 Rules:
 
-- `CallContext::into_request_context` consumes the caller in the first turn, same as
-  `take_reply_slot`;
-- `reply_with_request` boxes the translator so the continuation message
-  carries the context back to the service;
+- `CallContext::defer(work)` consumes the caller in the first turn, same as
+  `into_request_context`;
+- `.reply(...)` on the deferred builder boxes the translator so the
+  continuation message carries `RequestContext` back to the service;
 - `reply_to_request` consumes the context and delivers the final reply;
 - the caller timeout still governs; the runtime still records `Timeout`
   or `Closed` if the service forgets to reply.
@@ -152,6 +150,16 @@ Do not:
 - use `RequestContext` when a single-turn `reply` suffices;
 - hide the context in a shared state or closure — it must move through
   the message enum so every turn is a trace event.
+- use ordinary `then(...)` in a call handler and expect it to preserve caller
+  authority.
+
+Expanded form:
+
+```rust
+let req = call_ctx.into_request_context();
+call(self.probe, ProbeMsg, Duration::from_millis(50))
+    .then_with_request(req, SvcMsg::ProbeResult)
+```
 
 ## List-processing pattern
 
@@ -179,7 +187,7 @@ impl Worker {
             stop_with(self.summary())
         } else {
             self.remaining -= 1;
-            do_one_call(self.target).reply(WorkerMsg::ItemDone)
+            do_one_call(self.target).then(WorkerMsg::ItemDone)
         }
     }
 }

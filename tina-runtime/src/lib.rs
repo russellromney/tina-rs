@@ -110,26 +110,29 @@ pub use mailbox::{DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxF
 pub use crate::persistence::{
     LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
 };
+#[allow(deprecated)]
 pub use call::{
-    CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply, DnsLookupReply, ErasedCall,
-    FileCloseReply, FileFsyncReply, FileId, FileOpenOptions, FileOpenReply, FileReadReply,
-    FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall, JournalAppendReply, JournalRecord,
-    JournalReplay, JournalReplayReply, JournalReplayWarning, ListenerId, MkdirReply, PathKind,
-    PathMetadata, PathMetadataReply, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult,
-    ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply, RuntimeCall,
-    RuntimeCallParts, RuntimeCallable, SendOutcome, SignalWaitReply, SleepReply,
-    SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId, SyncParentReply,
-    TcpAcceptReply, TcpBindReply, TcpConnectReply, TcpListenerCloseReply, TcpReadReply,
-    TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
-    TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
-    TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, call_handle_call_id, call_with_handle, cancel_call, dns_lookup, file_close,
-    file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
-    file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir,
-    remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit,
-    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
-    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply, CancelableCall,
+    DeferredCancelableCall, DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall,
+    DnsLookupReply, ErasedCall, FileCloseReply, FileFsyncReply, FileId, FileOpenOptions,
+    FileOpenReply, FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall,
+    IsolateCallWithHandle, JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply,
+    JournalReplayWarning, ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply,
+    PendingCancelableCall, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult, ProcessStatus,
+    ReadDirReply, RemoveFileReply, RenameReplaceReply, RuntimeCall, RuntimeCallParts,
+    RuntimeCallable, SendOutcome, SignalWaitReply, SleepReply, SnapshotCommitReply, SnapshotImage,
+    SnapshotLoadReply, StreamId, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
+    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply,
+    TlsBindReply, TlsCloseReply, TlsConnectReply, TlsListenerCloseReply, TlsListenerId,
+    TlsReadReply, TlsStreamId, TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply,
+    UdpRecvFromReply, UdpSendToReply, UdpSocketId, call, call_cancelable, call_handle_call_id,
+    call_with_handle, cancel_call, dns_lookup, file_close, file_create, file_fsync, file_open,
+    file_read, file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay,
+    mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed,
+    signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept,
+    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept,
+    tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind,
+    udp_close_socket, udp_recv_from, udp_send_to,
 };
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
@@ -2247,7 +2250,7 @@ where
             tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
             tina::CallHandleState::Pending => {
                 let raw_call_id = handle_shared.call_id().expect(
-                    "cancel_call dispatched before its call_with_handle's effect ran. \
+                    "cancel_call dispatched before its call_cancelable effect ran. \
                      Within one isolate handler, batched effects dispatch in order, so \
                      this means cancel was emitted before the call effect — issue cancel \
                      from a separate handler, or store the handle and cancel later.",

@@ -67,7 +67,7 @@ impl Fetcher {
                 if self.remaining == 0 {
                     return stop_with(self.outcome.clone());
                 }
-                tcp_connect(self.target).reply(FetchMsg::Connected)
+                tcp_connect(self.target).then(FetchMsg::Connected)
             }
             FetchMsg::Connected(Ok((stream, _local, _peer))) => {
                 self.state.stream = Some(stream);
@@ -147,7 +147,7 @@ impl Fetcher {
 
     fn close_or_iterate(&mut self) -> Effect<Self> {
         if let Some(stream) = self.state.stream.take() {
-            tcp_close_stream(stream).reply(FetchMsg::Closed)
+            tcp_close_stream(stream).then(FetchMsg::Closed)
         } else {
             self.next_iteration()
         }
@@ -158,7 +158,7 @@ impl Fetcher {
         if self.remaining == 0 {
             stop_with(self.outcome.clone())
         } else {
-            tcp_connect(self.target).reply(FetchMsg::Connected)
+            tcp_connect(self.target).then(FetchMsg::Connected)
         }
     }
 }

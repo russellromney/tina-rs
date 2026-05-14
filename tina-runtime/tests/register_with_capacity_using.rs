@@ -246,7 +246,7 @@ impl Front {
         match msg {
             FrontMsg::Submit(qid) => match self.pending.try_capture(ctx, qid) {
                 // Sleep keeps the slot live until Shutdown fires.
-                Ok(()) => sleep(Duration::from_millis(10)).reply(FrontMsg::Tick),
+                Ok(()) => sleep(Duration::from_millis(10)).then(FrontMsg::Tick),
                 Err(PendingRepliesTryCaptureError::Full) => reply(Closed),
                 Err(other) => panic!("try_capture: {other:?}"),
             },

@@ -49,7 +49,7 @@ impl Dispatcher {
                     .iter()
                     .map(|url| {
                         send_request(self.http, ReqwestRequest::get(url), PER_CALL_TIMEOUT)
-                            .reply(DispatcherMsg::HookReturned)
+                            .then(DispatcherMsg::HookReturned)
                     })
                     .collect();
                 Effect::Batch(calls)

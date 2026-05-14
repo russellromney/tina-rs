@@ -10,7 +10,7 @@
 //!   [`tina_runtime::sharded::WrongShard`] on mismatch — a routing bug
 //!   does not look like data loss.
 //! - `Driver` walks the script one command at a time using
-//!   `call(addr, StoreMsg, timeout).reply(...)`. The
+//!   `call(addr, StoreMsg, timeout).then(...)`. The
 //!   [`ShardServiceTable`] hands it the right per-shard address for
 //!   every key without exposing a hidden registry.
 //! - `SUM` fans out sequentially across `placement.shards()`. The
@@ -155,7 +155,7 @@ impl Driver {
                 .address_for(shard)
                 .expect("shard came from placement.shards()");
             return call(address, StoreMsg::Count, Duration::from_millis(200))
-                .reply(DriverMsg::StoreReturned);
+                .then(DriverMsg::StoreReturned);
         }
 
         match self.commands.pop_front() {
@@ -166,17 +166,17 @@ impl Driver {
                     StoreMsg::Set { key, value },
                     Duration::from_millis(200),
                 )
-                .reply(DriverMsg::StoreReturned)
+                .then(DriverMsg::StoreReturned)
             }
             Some(Command::Get { key }) => {
                 let address = self.table.address_for_str(&key);
                 call(address, StoreMsg::Get { key }, Duration::from_millis(200))
-                    .reply(DriverMsg::StoreReturned)
+                    .then(DriverMsg::StoreReturned)
             }
             Some(Command::Del { key }) => {
                 let address = self.table.address_for_str(&key);
                 call(address, StoreMsg::Del { key }, Duration::from_millis(200))
-                    .reply(DriverMsg::StoreReturned)
+                    .then(DriverMsg::StoreReturned)
             }
             Some(Command::Sum) => {
                 self.sum_total = 0;
@@ -243,7 +243,7 @@ pub fn run() -> anyhow::Result<Report> {
     .context("register stores per shard")?;
 
     // Driver lives on the first shard; it walks the script one
-    // command at a time via `call(...).reply(...)`.
+    // command at a time via `call(...).then(...)`.
     let driver = runtime
         .register_with_capacity_on::<Driver, Infallible>(
             ShardId::new(SHARD_RAW_IDS[0]),

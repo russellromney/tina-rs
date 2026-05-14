@@ -15,7 +15,7 @@ FINDINGS.
 | # | Attempted leak                                      | Compiles? | Why                                          |
 |---|-----------------------------------------------------|-----------|----------------------------------------------|
 | 1 | `Rc<RefCell<T>>` in a message variant                | No        | `ThreadedRuntime` requires `Message: Send`   |
-| 2 | `&mut self.value` moved into a `.reply(...)` closure | No        | reply translator must be `'static`           |
+| 2 | `&mut self.value` moved into a `.then(...)` closure | No        | continuation translator must be `'static`    |
 | 3 | `&mut self.value` moved into an outbound `Send` payload closure | No | same `'static` constraint                |
 | 4 | Spawn a child whose state contains `Rc<RefCell<T>>`  | No        | `ChildDefinition<I>` requires `I: Send`      |
 

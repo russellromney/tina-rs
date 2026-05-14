@@ -70,7 +70,7 @@ impl Isolate for Driver {
                 request,
                 timeout,
             } => call(client, HttpClientMsg::call(target, request), timeout)
-                .reply(DriverMsg::Returned),
+                .then(DriverMsg::Returned),
             DriverMsg::Returned(outcome) => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,

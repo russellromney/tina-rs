@@ -391,7 +391,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
             request_kind,
         );
 
-        sleep(self.config.poll_interval).reply(|_| SqliteMsg::Poll)
+        sleep(self.config.poll_interval).then(|_| SqliteMsg::Poll)
     }
 
     fn poll(&mut self) -> Effect<Self> {
@@ -431,7 +431,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                     return tina::reply_to_request(in_flight.reply_to, Err(SqliteError::Timeout));
                 }
                 self.in_flight = Some(in_flight);
-                sleep(self.config.poll_interval).reply(|_| SqliteMsg::Poll)
+                sleep(self.config.poll_interval).then(|_| SqliteMsg::Poll)
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.metrics.set_in_flight(0);

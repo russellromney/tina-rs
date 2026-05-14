@@ -41,7 +41,7 @@ pub enum HttpRequestBody {
     Buffered(Vec<u8>),
     /// Streaming source: the service pulls chunks via
     /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
-    /// .reply(...)` until `RequestChunkReply::Eof`.
+    /// .then(...)` until `RequestChunkReply::Eof`.
     Stream(crate::streaming::RequestStream),
 }
 
@@ -160,7 +160,7 @@ pub enum HttpResponseBody {
     Buffered(Vec<u8>),
     /// Streaming source with declared length. The connection isolate
     /// pulls chunks via `call(stream.source, ResponseChunkMsg::Next,
-    /// t).reply(...)` until `ResponseChunkReply::Eof`.
+    /// t).then(...)` until `ResponseChunkReply::Eof`.
     Stream(crate::streaming::ResponseStream),
     /// Streaming source with no declared length. Wire framing is
     /// `Transfer-Encoding: chunked`. Same `Next`/`Chunk`/`Eof`
@@ -526,7 +526,7 @@ pub struct HttpLimits {
     /// source as soon as the head parses, then pulls body bytes from
     /// the socket on demand. The service drives the pull with
     /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
-    /// .reply(...)`; each call returns a chunk of up to `chunk_size`
+    /// .then(...)`; each call returns a chunk of up to `chunk_size`
     /// bytes (or `Eof`). The connection only issues `tcp_read` when
     /// the buffer is empty and more body is owed, so a slow service
     /// applies real backpressure to TCP reads.

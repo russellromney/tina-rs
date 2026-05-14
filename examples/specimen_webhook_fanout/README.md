@@ -20,7 +20,7 @@ Both sides produce `delivered=2 unavailable=1 timed_out=1 other=0`.
   `Transient(reason)`, `Fatal(reason)` — with typed reasons that
   still name *which* layer failed. The dispatcher's bucketer is
   five short arms.
-- One `send_request(http, req, timeout).reply(ctor)` per endpoint,
+- One `send_request(http, req, timeout).then(ctor)` per endpoint,
   `Effect::Batch(...)` to ship them all. The dispatcher's full
   fanout is six lines.
 - The `503` and the timeout produce trace events the Tokio side

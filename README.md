@@ -103,14 +103,14 @@ struct Connection {
 impl Connection {
     fn handle(&mut self, msg: ConnMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ConnMsg::Begin => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
+            ConnMsg::Begin => tcp_read(self.stream, 4096).then(ConnMsg::Read),
             ConnMsg::Read(Ok(bytes)) if bytes.is_empty() => {
-                tcp_close_stream(self.stream).reply(ConnMsg::Closed)
+                tcp_close_stream(self.stream).then(ConnMsg::Closed)
             }
-            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).reply(ConnMsg::Wrote),
-            ConnMsg::Wrote(Ok(_)) => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
+            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).then(ConnMsg::Wrote),
+            ConnMsg::Wrote(Ok(_)) => tcp_read(self.stream, 4096).then(ConnMsg::Read),
             ConnMsg::Read(Err(_)) | ConnMsg::Wrote(Err(_)) => {
-                tcp_close_stream(self.stream).reply(ConnMsg::Closed)
+                tcp_close_stream(self.stream).then(ConnMsg::Closed)
             }
             ConnMsg::Closed(_) => stop(),
         }
@@ -219,6 +219,21 @@ where timeout lives, or what message comes next.
 
 That matters for humans, and it matters for LLMs. Copyable local patterns are
 safer than clever APIs whose important rules live somewhere else.
+
+### Current ergonomics gap: cancelable deferred calls
+
+`CallContext::defer(work).reply(...)` is the blessed helper for ordinary
+multi-turn replies. Cancelable work is intentionally more explicit:
+`call_ctx.defer_cancelable(call_cancelable(...)).reply(key, Msg::Done)`
+returns both the effect to dispatch and a `PendingCancelableCall` token that
+holds the original `RequestContext` plus the cancel handle.
+
+The caller-authority token must be stored before the child effect is returned.
+If bounded storage is full or the key is a duplicate, the service must not
+dispatch the child effect; it should answer or reject the original caller via
+`pending.into_request_context()`. A future helper should probably provide a
+bounded `PendingCancelableCallSet` so this "store-or-do-not-dispatch" rule is
+copyable instead of hand-rolled.
 
 ## Deterministic simulation testing
 

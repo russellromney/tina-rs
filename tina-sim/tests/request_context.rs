@@ -30,7 +30,7 @@ impl tina::Shard for DefShard {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-turn through RequestContext + reply_with_request
+// Multi-turn through RequestContext + then_with_request
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +111,7 @@ impl Isolate for Svc {
             SvcMsg::Start => {
                 let req = call_ctx.into_request_context();
                 tina_runtime::call(self.probe, ProbeMsg, Duration::from_millis(50))
-                    .reply_with_request(req, SvcMsg::ProbeResult)
+                    .then_with_request(req, SvcMsg::ProbeResult)
             }
             SvcMsg::ProbeResult(_, _) => {
                 call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
@@ -755,7 +755,7 @@ impl Isolate for CrossSvc {
             CrossSvcMsg::Start => {
                 let req = call.into_request_context();
                 tina_runtime::call(self.probe, CrossProbeMsg, Duration::from_millis(50))
-                    .reply_with_request(req, CrossSvcMsg::ProbeResult)
+                    .then_with_request(req, CrossSvcMsg::ProbeResult)
             }
             CrossSvcMsg::RejectNow => call.reject(tina::CallRejectedReason::UnsupportedMessage),
             CrossSvcMsg::ProbeResult(_, _) => {

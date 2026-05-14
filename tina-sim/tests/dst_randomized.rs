@@ -111,7 +111,7 @@ impl TimerDriver {
     ) -> Effect<Self> {
         match msg {
             TimerMsg::After(value) => sleep(Duration::from_millis(1 + u64::from(value % 5)))
-                .reply(move |_| TimerMsg::Elapsed(value)),
+                .then(move |_| TimerMsg::Elapsed(value)),
             TimerMsg::Elapsed(value) => send(self.target, TargetMsg::Data(value)),
         }
     }
@@ -389,27 +389,27 @@ impl CrossCallClient {
                 CrossCallWorkerMsg::Reply(value),
                 Duration::from_millis(8),
             )
-            .reply(CrossCallClientMsg::Returned),
+            .then(CrossCallClientMsg::Returned),
             CrossCallClientMsg::Burst(value) => batch([
                 call(
                     self.worker,
                     CrossCallWorkerMsg::Reply(value),
                     Duration::from_millis(8),
                 )
-                .reply(CrossCallClientMsg::Returned),
+                .then(CrossCallClientMsg::Returned),
                 call(
                     self.worker,
                     CrossCallWorkerMsg::Reply(value.wrapping_add(1)),
                     Duration::from_millis(8),
                 )
-                .reply(CrossCallClientMsg::Returned),
+                .then(CrossCallClientMsg::Returned),
             ]),
             CrossCallClientMsg::NoReply(value) => call(
                 self.worker,
                 CrossCallWorkerMsg::NoReply,
                 Duration::from_millis(1 + u64::from(value % 3)),
             )
-            .reply(CrossCallClientMsg::Returned),
+            .then(CrossCallClientMsg::Returned),
             CrossCallClientMsg::StopWorker => send(self.worker, CrossCallWorkerMsg::Stop),
             CrossCallClientMsg::Returned(outcome) => {
                 self.outcomes.borrow_mut().push(outcome);

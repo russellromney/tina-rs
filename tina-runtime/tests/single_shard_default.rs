@@ -69,7 +69,7 @@ impl Sleeper {
     ) -> Effect<Self> {
         match msg {
             SleeperMsg::Start => {
-                tina_runtime::sleep(Duration::from_millis(1)).reply(|_| SleeperMsg::Done)
+                tina_runtime::sleep(Duration::from_millis(1)).then(|_| SleeperMsg::Done)
             }
             SleeperMsg::Done => stop(),
         }

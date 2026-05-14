@@ -1,5 +1,5 @@
 //! Tina side. The driver fans out one IsolateCall per worker via
-//! [`call_with_handle`], stores each named wait in a bounded
+//! [`call_cancelable`], stores each named wait in a bounded
 //! [`CallGroup`], and on the host's `Cancel` signal drains the group
 //! and cancels each entry explicitly with [`cancel_call`]. Worker
 //! replies that arrive after cancellation are
@@ -14,7 +14,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime, call_with_handle,
+    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime, call_cancelable,
     cancel_call, sleep,
 };
 
@@ -51,7 +51,7 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(self.work).reply(WorkerMsg::Done),
+            WorkerMsg::Do => sleep(self.work).then(WorkerMsg::Done),
             // Pattern-match the SleepReply alias so a cancelled
             // sleep (runtime shutdown) becomes a reply with the
             // same shape rather than panic.
@@ -65,7 +65,7 @@ impl Worker {
     fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             WorkerMsg::Do => sleep(self.work)
-                .reply_with_request(call.into_request_context(), WorkerMsg::DoneForCall),
+                .then_with_request(call.into_request_context(), WorkerMsg::DoneForCall),
             WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
@@ -125,8 +125,8 @@ impl Driver {
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
                     let token = self.group.reserve_token().expect("group sized to FANOUT");
-                    let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, CALL_TIMEOUT)
-                        .reply(move |outcome| DriverMsg::Returned {
+                    let (effect, handle) = call_cancelable(*worker, WorkerMsg::Do, CALL_TIMEOUT)
+                        .then(move |outcome| DriverMsg::Returned {
                             worker: key,
                             token,
                             outcome,
@@ -167,7 +167,7 @@ impl Driver {
                 // user code, one named wait at a time.
                 for request in cancel_requests {
                     let (worker, token, handle) = request.into_parts();
-                    effects.push(cancel_call(handle).reply(move |outcome| {
+                    effects.push(cancel_call(handle).then(move |outcome| {
                         DriverMsg::Cancelled {
                             worker,
                             token,

@@ -145,21 +145,21 @@ impl Connection {
 }
 
 fn read_call(stream: StreamId, max_len: usize) -> Effect<Connection> {
-    tcp_read(stream, max_len).reply(|result| match result {
+    tcp_read(stream, max_len).then(|result| match result {
         Ok(bytes) => ConnectionEvent::Read(bytes),
         Err(_) => ConnectionEvent::IoFailed,
     })
 }
 
 fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
-    tcp_write(stream, bytes).reply(|result| match result {
+    tcp_write(stream, bytes).then(|result| match result {
         Ok(count) => ConnectionEvent::Wrote(count),
         Err(_) => ConnectionEvent::IoFailed,
     })
 }
 
 fn close_call(stream: StreamId) -> Effect<Connection> {
-    tcp_close_stream(stream).reply(|result| match result {
+    tcp_close_stream(stream).then(|result| match result {
         Ok(()) => ConnectionEvent::Closed,
         Err(_) => ConnectionEvent::IoFailed,
     })
@@ -206,7 +206,7 @@ impl Listener {
         match msg {
             ListenerEvent::Start => {
                 let addr = self.bind_addr;
-                tcp_bind(addr).reply(move |result| match result {
+                tcp_bind(addr).then(move |result| match result {
                     Ok((listener, local_addr)) => ListenerEvent::Bound {
                         listener,
                         addr: local_addr,
@@ -220,14 +220,14 @@ impl Listener {
                     .bound_addr_slot
                     .lock()
                     .expect("bound addr mutex never poisoned") = Some(addr);
-                tcp_accept(listener).reply(|result| match result {
+                tcp_accept(listener).then(|result| match result {
                     Ok((stream, _peer_addr)) => ListenerEvent::Accepted { stream },
                     Err(_) => ListenerEvent::IoFailed,
                 })
             }
             ListenerEvent::AcceptNext => {
                 let listener = self.listener.expect("listener stored before re-arm");
-                tcp_accept(listener).reply(|result| match result {
+                tcp_accept(listener).then(|result| match result {
                     Ok((stream, _peer_addr)) => ListenerEvent::Accepted { stream },
                     Err(_) => ListenerEvent::IoFailed,
                 })
@@ -255,7 +255,7 @@ impl Listener {
             }
             ListenerEvent::Close => {
                 let listener = self.listener.expect("listener stored before close");
-                tcp_close_listener(listener).reply(|result| match result {
+                tcp_close_listener(listener).then(|result| match result {
                     Ok(()) => ListenerEvent::Closed,
                     Err(_) => ListenerEvent::IoFailed,
                 })

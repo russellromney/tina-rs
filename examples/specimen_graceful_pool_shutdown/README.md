@@ -72,7 +72,7 @@ lease.
 
 ## How caller cancellation removes waiters
 
-Acquire via `call_with_handle(pool, WorkerPoolMsg::Acquire, timeout)`
+Acquire via `call_cancelable(pool, WorkerPoolMsg::Acquire, timeout)`
 gives the caller a `CallHandle`. Firing `cancel_call(handle)` closes
 the caller-side wait; the pool's deferred reply slot for that waiter
 moves to `Closed`. The pool sweeps closed slots on every incoming

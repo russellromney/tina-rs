@@ -104,23 +104,23 @@ shutdown call site.
 ### Single-in-flight timer
 
 Use `tina_runtime::SingleCallGate` for isolates whose rate-limit
-shape is `sleep(window).reply(Tick)` and must keep at most one timer
+shape is `sleep(window).then(Tick)` and must keep at most one timer
 in flight:
 
 ```rust
 WorkerMsg::Submit(_) => {
-    if self.gate.submit() { sleep(window).reply(WorkerMsg::Tick) }
+    if self.gate.submit() { sleep(window).then(WorkerMsg::Tick) }
     else { noop() }
 }
 WorkerMsg::Tick(_) => {
     self.processed += 1;
-    if self.gate.complete() { sleep(window).reply(WorkerMsg::Tick) }
+    if self.gate.complete() { sleep(window).then(WorkerMsg::Tick) }
     else { noop() }
 }
 ```
 
 The gate is plain data; it does not own the timer or the message
-type. Every `sleep(...).reply(...)` still appears as one `Sleep`
+type. Every `sleep(...).then(...)` still appears as one `Sleep`
 trace event.
 
 Do not hand-roll `pending: u32` plus `was_idle = pending == 0` in
@@ -415,7 +415,7 @@ Use `#[tina_runtime::isolate(message = M)]` if your `handle` calls
 
 Use `#[tina::isolate(message = M, ...)]` for pure
 message/reply/spawn isolates. The `tina` path defaults `Call =
-Infallible`, so `call(...).reply(...)` will not type-check there.
+Infallible`, so `call(...).then(...)` will not type-check there.
 
 Do not fall back to a hand-written `impl Isolate` with
 `tina::isolate_types! { call: RuntimeCall<M>, ... }` just to use
@@ -493,7 +493,7 @@ buckets:
 ```rust
 match outcome.classify() {
     ReqwestOutcomeClass::Succeeded(resp) => finish_ok(resp),
-    ReqwestOutcomeClass::Transient(_) => sleep(backoff).reply(Retry),
+    ReqwestOutcomeClass::Transient(_) => sleep(backoff).then(Retry),
     ReqwestOutcomeClass::Fatal(_) => fail(),
 }
 ```
@@ -553,7 +553,7 @@ let pool = WorkerPool::<MyHandle, SingleShard>::new(
 ```
 
 Caller uses the typed effect builders instead of raw
-`call(pool, WorkerPoolMsg::..., timeout).reply(...)`. Two flavors:
+`call(pool, WorkerPoolMsg::..., timeout).then(...)`. Two flavors:
 
 **Result-flavored** — translator receives a flat
 `Result<PoolLease<H>, AcquireFailure>` / `Result<(), ReleaseFailure>`:
@@ -569,7 +569,7 @@ the caller can inspect the transport layer separately:
 ```rust
 acquire_effect(pool, timeout, MyMsg::Acquired)
 release_effect(lease, pool, ReleaseDisposition::Reuse, timeout, MyMsg::Released)
-acquire_with_handle_effect(pool, timeout, MyMsg::Acquired)  // cancellable
+acquire_with_handle_effect(pool, timeout, MyMsg::Acquired)  // cancelable
 close_effect(pool, CloseMode::Drain, timeout, MyMsg::Closed)
 pressure_effect(pool, timeout, MyMsg::Pressure)
 ```
@@ -637,7 +637,7 @@ slots eat capacity forever.
 ### Bounded pending call handles
 
 `PendingReplies` is for *deferred reply slots you owe other callers*.
-For the inverse — *outstanding `call_with_handle` calls you own as
+For the inverse — *outstanding `call_cancelable` calls you own as
 the caller* — use `tina::PendingCallSet::<K, R>::with_capacity(n)`.
 Same hard rules: bounded storage, typed `Full` / `DuplicateKey` on
 insert, explicit `remove(&key)` on each completion. No `Drop` magic
@@ -666,8 +666,8 @@ Reused-key services have two correct patterns:
 let mut calls: PendingCallSet<RequestId, MyReply> =
     PendingCallSet::with_capacity(64);
 
-let (effect, handle) = call_with_handle(target, msg, timeout)
-    .reply(move |outcome| Msg::Returned { id, outcome });
+let (effect, handle) = call_cancelable(target, msg, timeout)
+    .then(move |outcome| Msg::Returned { id, outcome });
 calls.insert(id, handle).expect("not at capacity");
 
 // On completion / timeout / explicit cancel — drop the slot:
@@ -679,7 +679,7 @@ Msg::Returned { id, outcome } => {
 // Owner-stop / cancel-all is one drain in user code:
 let mut effects = Vec::with_capacity(self.calls.len());
 for (_, handle) in self.calls.drain() {
-    effects.push(cancel_call(handle).reply(Msg::Cancelled));
+    effects.push(cancel_call(handle).then(Msg::Cancelled));
 }
 batch(effects)
 ```
@@ -702,7 +702,7 @@ Build a deadline from inside a handler:
 ```rust
 let deadline = ctx.deadline_after(Duration::from_secs(2));
 call(downstream, Msg::Forward { deadline }, deadline.remaining_or_zero(ctx.now()))
-    .reply(Msg::DownstreamReturned)
+    .then(Msg::DownstreamReturned)
 ```
 
 `Context::deadline_after` and `Context::now` read from the
@@ -729,7 +729,7 @@ call `Instant::now()` internally and silently break DST/replay.
 ### Continuation messages for runtime calls
 
 Use `Result<T, CallError>` directly in the message variant, then pass
-the variant constructor to `.reply(...)`:
+the variant constructor to `.then(...)`:
 
 ```rust
 enum ConnMsg {
@@ -738,7 +738,7 @@ enum ConnMsg {
     Closed(Result<(), CallError>),
 }
 
-tcp_read(stream, max).reply(ConnMsg::Read);
+tcp_read(stream, max).then(ConnMsg::Read);
 ```
 
 Match `Ok` / `Err` per arm and collapse error arms into one
@@ -753,7 +753,7 @@ ConnMsg::Read(Err(_)) | ConnMsg::Wrote(Err(_)) | ConnMsg::Closed(Err(_)) => stop
 
 Do not introduce a parallel `IoFailed` variant plus a per-call-site
 closure that re-maps `Err(_)` into it. That doubles the variants and
-adds the same closure to every `.reply(...)` call.
+adds the same closure to every `.then(...)` call.
 
 ### Default-zero state on isolates
 

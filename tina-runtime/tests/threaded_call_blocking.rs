@@ -59,7 +59,7 @@ impl Silent {
         match msg {
             SilentMsg::Start => {
                 let req = call.into_request_context();
-                tina_runtime::sleep(Duration::from_millis(100)).reply(move |_| SilentMsg::Done(req))
+                tina_runtime::sleep(Duration::from_millis(100)).then(move |_| SilentMsg::Done(req))
             }
             SilentMsg::Done(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }

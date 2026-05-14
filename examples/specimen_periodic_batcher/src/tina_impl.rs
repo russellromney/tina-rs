@@ -7,7 +7,7 @@
 //! flight?") is plain isolate state.
 //!
 //! Cancellation of a stale timer is still explicit: Tina has no API to
-//! abort an in-flight `sleep`, so each `sleep(...).reply(...)` carries
+//! abort an in-flight `sleep`, so each `sleep(...).then(...)` carries
 //! the interval tick number chosen by `TimerInterval`. The handler
 //! ignores any `Tick` that does not match the pending tick.
 
@@ -69,7 +69,7 @@ impl Batcher {
                     let decision = self.interval.next_delay(ctx.now());
                     let tick = decision.tick_number();
                     self.pending_tick = Some(tick);
-                    sleep(decision.delay()).reply(move |reply| BatcherMsg::Tick(tick, reply))
+                    sleep(decision.delay()).then(move |reply| BatcherMsg::Tick(tick, reply))
                 } else {
                     noop()
                 }

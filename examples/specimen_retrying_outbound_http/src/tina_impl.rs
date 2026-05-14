@@ -1,7 +1,7 @@
 //! Tina side. Same flaky upstream, but the client is
 //! [`tina_reqwest_bridge::ReqwestWorker`] with no built-in retry, plus
 //! a `Caller` isolate that drives retry by hand using
-//! `call(...).reply(...)` and `sleep(...).reply(...)`.
+//! `call(...).then(...)` and `sleep(...).then(...)`.
 //!
 //! The point: every attempt is one `IsolateCall` and one continuation
 //! message. The retry budget, backoff, and "what counts as transient"
@@ -141,7 +141,7 @@ impl Caller {
             ReqwestRequest::get(&self.url),
             PER_ATTEMPT_TIMEOUT,
         )
-        .reply(CallerMsg::HttpReturned)
+        .then(CallerMsg::HttpReturned)
     }
 
     fn absorb(&mut self, outcome: ReqwestCallOutcome) -> Effect<Self> {
@@ -159,7 +159,7 @@ impl Caller {
                 if self.report.attempts_made >= MAX_ATTEMPTS {
                     self.finish(false)
                 } else {
-                    sleep(RETRY_BACKOFF).reply(CallerMsg::BackoffElapsed)
+                    sleep(RETRY_BACKOFF).then(CallerMsg::BackoffElapsed)
                 }
             }
             ReqwestOutcomeClass::Fatal(_) => self.finish(false),

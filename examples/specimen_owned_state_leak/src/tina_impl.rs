@@ -34,7 +34,7 @@ pub mod compile_fail {
     /// ```
     pub fn _probe_1() {}
 
-    /// Probe 2: `&mut self.value` in a `.reply(...)` translator.
+    /// Probe 2: `&mut self.value` in a `.then(...)` translator.
     ///
     /// ```compile_fail
     /// use std::time::Duration;
@@ -48,7 +48,7 @@ pub mod compile_fail {
     /// impl I {
     ///     fn handle(&mut self, _: Msg, _: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
     ///         let r = &mut self.value;
-    ///         sleep(Duration::from_millis(1)).reply(move |_| { *r += 1; Msg::Tick(Ok(())) })
+    ///         sleep(Duration::from_millis(1)).then(move |_| { *r += 1; Msg::Tick(Ok(())) })
     ///     }
     /// }
     /// ```

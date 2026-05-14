@@ -1,4 +1,4 @@
-//! Deterministic proof for `call_with_handle` + `cancel_call` in the
+//! Deterministic proof for `call_cancelable` + `cancel_call` in the
 //! simulator. These tests pin the public behavior the threaded runtime
 //! must also satisfy (see `tina-runtime/tests/cancel_call.rs` for the
 //! live-runtime parity smoke tests).
@@ -25,7 +25,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallKind, CallOutcome, CallReplyRejectedReason, DeferredReplyRejectedReason, RuntimeEventKind,
-    call_with_handle, cancel_call,
+    call_cancelable, cancel_call,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -131,8 +131,8 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
-                let (effect, handle) = call_with_handle(self.worker, WorkerMsg::Hold, CALL_TIMEOUT)
-                    .reply(DriverMsg::Returned);
+                let (effect, handle) = call_cancelable(self.worker, WorkerMsg::Hold, CALL_TIMEOUT)
+                    .then(DriverMsg::Returned);
                 if self.aux_shared.is_some() {
                     self.aux_shared = Some(std::sync::Arc::clone(
                         tina::runtime_internal::call_handle_shared(&handle),
@@ -146,10 +146,10 @@ impl Driver {
                 if let Some(shared) = self.aux_shared.take() {
                     let aux: CallHandle<WorkerReply> =
                         tina::runtime_internal::call_handle_from_shared(shared);
-                    effects.push(cancel_call(aux).reply(DriverMsg::Cancelled));
+                    effects.push(cancel_call(aux).then(DriverMsg::Cancelled));
                 }
                 if let Some(handle) = self.pending.take() {
-                    effects.push(cancel_call(handle).reply(DriverMsg::Cancelled));
+                    effects.push(cancel_call(handle).then(DriverMsg::Cancelled));
                 }
                 if effects.is_empty() {
                     noop()
@@ -477,7 +477,7 @@ enum OwnerDriverMsg {
     /// Test-only: count how many calls returned via the translator
     /// before owner-stop ran. Owner-stop discards translators, so any
     /// post-stop reply must NOT increment this. Payload kept so the
-    /// translator type matches `call_with_handle`.
+    /// translator type matches `call_cancelable`.
     Returned(#[allow(dead_code)] CallOutcome<WorkerReply>),
 }
 
@@ -499,8 +499,8 @@ impl OwnerDriver {
             OwnerDriverMsg::BeginAll => {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for worker in &self.workers {
-                    let (effect, handle) = call_with_handle(*worker, WorkerMsg::Hold, CALL_TIMEOUT)
-                        .reply(OwnerDriverMsg::Returned);
+                    let (effect, handle) = call_cancelable(*worker, WorkerMsg::Hold, CALL_TIMEOUT)
+                        .then(OwnerDriverMsg::Returned);
                     self.pending.push(handle);
                     effects.push(effect);
                 }
@@ -767,7 +767,7 @@ fn cross_shard_cancel_is_rejected_with_wrong_shard() {
             match msg {
                 Aux::Run => {
                     let h = self.handle.take().expect("handle");
-                    cancel_call(h).reply(Aux::Cancelled)
+                    cancel_call(h).then(Aux::Cancelled)
                 }
                 Aux::Cancelled(outcome) => {
                     self.observations

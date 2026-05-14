@@ -88,7 +88,7 @@ What feels worse:
 
 - **The line-parsing loop is hand-rolled.** `position(b == b'\n')`
   + `drain(..=idx)` is fine, but every framed-line client will write
-  it. A `tcp_read_lines(stream).reply(...)` shape would be welcome.
+  it. A `tcp_read_lines(stream).then(...)` shape would be welcome.
 - **Two runtimes for the Tina side.** The responder lives in a
   Tokio runtime on a side thread; the client lives in a Tina
   threaded runtime; they exchange the address via `std::sync::mpsc`.

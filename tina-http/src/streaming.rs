@@ -8,7 +8,7 @@
 //! - **Response streaming** (service produces). The service registers
 //!   a chunk-source isolate whose `Message = ResponseChunkMsg` and
 //!   `Reply = ResponseChunkReply`. The connection pulls with
-//!   `call(stream.source, ResponseChunkMsg::Next, t).reply(...)`.
+//!   `call(stream.source, ResponseChunkMsg::Next, t).then(...)`.
 //!   For the common iterator-style source, [`IterBodySource`] turns
 //!   any `Iterator<Item = Vec<u8>>` into a chunk source without a
 //!   custom `Isolate` impl.
@@ -16,7 +16,7 @@
 //! - **Request streaming** (service consumes). The connection isolate
 //!   itself is the chunk source; its `Message = HttpConnectionMsg`,
 //!   `Reply = RequestChunkReply`. The service pulls with
-//!   `call(stream.source, HttpConnectionMsg::body_next(), t).reply(...)`.
+//!   `call(stream.source, HttpConnectionMsg::body_next(), t).then(...)`.
 //!   This asymmetry exists because the connection has to fold the
 //!   chunk-request variant into its existing message type to keep the
 //!   socket and chunk pulls on a single mailbox.
@@ -131,7 +131,7 @@ pub enum RequestChunkReply {
 /// ```rust,ignore
 /// use tina_http::HttpConnectionMsg;
 /// call(stream.source, HttpConnectionMsg::body_next(), timeout)
-///     .reply(MyMsg::ChunkArrived)
+///     .then(MyMsg::ChunkArrived)
 /// ```
 ///
 /// `HttpConnectionMsg::body_next()` is a convenience constructor for

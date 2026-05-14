@@ -106,7 +106,7 @@ impl Isolate for CallerIsolate {
     ) -> Effect<Self> {
         match msg {
             CallerMsg::Run(request) => {
-                send_request(self.worker, request, self.timeout).reply(CallerMsg::Done)
+                send_request(self.worker, request, self.timeout).then(CallerMsg::Done)
             }
             CallerMsg::Done(outcome) => {
                 self.sink.put(outcome);
@@ -502,7 +502,7 @@ fn fetch_many_typed_helper_returns_pgrows() {
                     10,
                     Duration::from_secs(5),
                 )
-                .reply(HelperMsg::Done),
+                .then(HelperMsg::Done),
                 HelperMsg::Done(outcome) => {
                     let stored = match outcome {
                         CallOutcome::Replied(r) => Some(r),
@@ -994,7 +994,7 @@ fn transaction_typed_helper_returns_outcome() {
                     ],
                     Duration::from_secs(5),
                 )
-                .reply(HelperMsg::Done),
+                .then(HelperMsg::Done),
                 HelperMsg::Done(outcome) => {
                     let stored = match outcome {
                         CallOutcome::Replied(r) => Some(r),

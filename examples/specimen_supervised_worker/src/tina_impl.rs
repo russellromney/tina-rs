@@ -2,7 +2,7 @@
 //! `Worker` as a `RestartableChildDefinition`; the runtime
 //! supervisor restarts it on panic, charged against a typed
 //! `RestartBudget`. Each restart's correctness comes from
-//! `spawn_observed(...).reply(ParentMsg::ChildStarted)` for the initial
+//! `spawn_observed(...).then(ParentMsg::ChildStarted)` for the initial
 //! typed child reference plus
 //! `runtime.observe_child_restarted(parent).wait(...)` for restart
 //! generations — no manual generation counter, no trace polling.
@@ -78,7 +78,7 @@ impl Parent {
             ParentMsg::Spawn => {
                 let capacity = self.worker_capacity;
                 spawn_observed(RestartableChildDefinition::new(move || Worker, capacity))
-                    .reply(ParentMsg::ChildStarted)
+                    .then(ParentMsg::ChildStarted)
             }
             ParentMsg::ChildStarted(Ok(child)) => {
                 self.slot.set(child.address);

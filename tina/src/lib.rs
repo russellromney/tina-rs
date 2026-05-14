@@ -394,7 +394,7 @@ where
     /// returns `CallError::ResourceBusy` because the first is still pending.
     /// For "do these writes one after another" semantics, fold the loop
     /// through the isolate's own continuation messages (one
-    /// `tcp_write(...).reply(...)`, then another from the next handler turn).
+    /// `tcp_write(...).then(...)`, then another from the next handler turn).
     /// See `docs/tcp-loops.md` for canonical patterns.
     Batch(Vec<Effect<I>>),
 
@@ -1119,6 +1119,35 @@ where
         Effect::Reject(reason)
     }
 
+    /// Defers this caller reply through one visible runtime-owned work item.
+    ///
+    /// The returned builder is supplied by the runtime crate that owns `work`.
+    /// It must carry a [`RequestContext`] into an ordinary continuation message;
+    /// it does not auto-reply to the caller and it does not make caller
+    /// authority ambient.
+    pub fn defer<W>(self, work: W) -> W::Deferred
+    where
+        W: DeferThrough<I>,
+        I::Reply: 'static,
+    {
+        work.defer_through(self)
+    }
+
+    /// Defers this caller reply through one visible runtime-owned work item
+    /// that also exposes explicit cancellation control.
+    ///
+    /// Cancelable work must return a visible pending token instead of hiding
+    /// caller authority inside the worker continuation. That token owns the
+    /// [`RequestContext`] and the runtime cancel handle together, so both
+    /// worker-return and cancel-return paths can explicitly answer the caller.
+    pub fn defer_cancelable<W>(self, work: W) -> W::DeferredCancelable
+    where
+        W: DeferCancelableThrough<I>,
+        I::Reply: 'static,
+    {
+        work.defer_cancelable_through(self)
+    }
+
     /// Carries the caller authority into a later handler turn.
     pub fn into_request_context(mut self) -> RequestContext<I::Reply>
     where
@@ -1148,6 +1177,44 @@ where
     }
 }
 
+/// Runtime-provided support for [`CallContext::defer`].
+///
+/// `tina` owns caller authority vocabulary but not concrete runtime work
+/// builders. Runtime crates implement this trait for their own prepared work
+/// types so user code can write `call_ctx.defer(work).reply(Msg::Done)`
+/// without `tina` depending on those runtime crates.
+///
+/// Implementations must be only sugar for consuming the [`CallContext`] into a
+/// [`RequestContext`] and carrying that context into a continuation message.
+/// They must not create hidden state, hidden retries, or hidden final replies.
+pub trait DeferThrough<I>
+where
+    I: Isolate,
+{
+    /// Builder returned after caller authority has been captured.
+    type Deferred;
+
+    /// Consumes caller authority and prepares the deferred continuation.
+    fn defer_through(self, call: CallContext<'_, I>) -> Self::Deferred;
+}
+
+/// Runtime-provided support for [`CallContext::defer_cancelable`].
+///
+/// Implementations must consume the caller authority into a visible pending
+/// token that user code stores in isolate state. They must not hide the
+/// [`RequestContext`] solely inside a worker-return continuation, because a
+/// cancellation path must still be able to answer the original caller.
+pub trait DeferCancelableThrough<I>
+where
+    I: Isolate,
+{
+    /// Builder returned after caller authority has been captured.
+    type DeferredCancelable;
+
+    /// Consumes caller authority and prepares the cancelable deferred work.
+    fn defer_cancelable_through(self, call: CallContext<'_, I>) -> Self::DeferredCancelable;
+}
+
 /// Runtime-level reason a call was rejected without an application reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallRejectedReason {
@@ -1157,6 +1224,20 @@ pub enum CallRejectedReason {
     HandlerPanicked,
     /// The callee has no call handler for this message shape.
     UnsupportedMessage,
+}
+
+impl CallRejectedReason {
+    /// Human-facing diagnostic hint for this rejection, when one is useful.
+    pub const fn diagnostic_hint(self) -> Option<&'static str> {
+        match self {
+            Self::ReplyAbandoned => Some(
+                "call handler returned without consuming CallContext; use \
+                 call_ctx.reply(...), call_ctx.reject(...), or \
+                 call_ctx.defer(work).reply(...)",
+            ),
+            Self::HandlerPanicked | Self::UnsupportedMessage => None,
+        }
+    }
 }
 
 /// Typed address for one isolate mailbox incarnation.
@@ -1365,7 +1446,7 @@ impl<M, R> ChildRef<M, R> {
 }
 
 /// Spawn-construction error delivered to a
-/// `spawn_observed(...).reply(...)` continuation.
+/// `spawn_observed(...).then(...)` continuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SpawnObservedError {
@@ -1398,7 +1479,7 @@ where
     type Reply = I::Reply;
 }
 
-/// Result delivered by `spawn_observed(...).reply(...)`.
+/// Result delivered by `spawn_observed(...).then(...)`.
 pub type SpawnObservedResult<M, R = ()> = Result<ChildRef<M, R>, SpawnObservedError>;
 
 /// Continuation invoked by the runtime after an observed spawn is processed.
@@ -1426,7 +1507,21 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     }
 
     /// Maps the runtime's later child-start result into a parent message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
+    )]
     pub fn reply<I, P, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+    {
+        self.then(continuation)
+    }
+
+    /// Maps the runtime's later child-start result into an ordinary parent
+    /// continuation message.
+    pub fn then<I, P, F>(self, continuation: F) -> Effect<I>
     where
         I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
         F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
@@ -1808,7 +1903,7 @@ pub enum DeferredSlotState {
 
 /// Caller-owned handle for one in-flight isolate call.
 ///
-/// Built by `tina_runtime::call_with_handle(addr, msg, t).reply(...)`.
+/// Built by `tina_runtime::call_cancelable(addr, msg, t).then(...)`.
 /// Pass to `cancel_call(handle)` to close the wait. Move-only and
 /// `!Clone`: one handle, one cancel.
 ///
@@ -2452,11 +2547,11 @@ pub mod runtime_internal {
 pub mod prelude {
     pub use crate::{
         Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition,
-        ChildRef, Context, Deadline, DeferredReply, Effect, Isolate, IsolateId, Outbound,
-        PendingCallSet, PendingCallSetInsertError, RequestContext, RestartableChildDefinition,
-        Shard, ShardId, SingleShard, SpawnObservedError, batch, isolate, isolate_types, noop,
-        reply, reply_to, reply_to_request, restart_children, send, sequence, spawn, spawn_observed,
-        stop, stop_with,
+        ChildRef, Context, Deadline, DeferCancelableThrough, DeferThrough, DeferredReply, Effect,
+        Isolate, IsolateId, Outbound, PendingCallSet, PendingCallSetInsertError, RequestContext,
+        RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch,
+        isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
+        sequence, spawn, spawn_observed, stop, stop_with,
         time::{
             Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, TimerConfigError,
             TimerDecision, TimerInterval,

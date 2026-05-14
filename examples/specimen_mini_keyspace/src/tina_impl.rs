@@ -1,7 +1,7 @@
 //! Tina: real loopback TCP. The `Store` isolate genuinely owns its
 //! `BTreeMap`. The `Connection` isolate is an explicit state machine
 //! that walks `Begin → Read → (StoreReturned)* → Wrote → Closed`.
-//! `call(addr, msg, timeout).reply(continuation)` is how each script
+//! `call(addr, msg, timeout).then(continuation)` is how each script
 //! command crosses the boundary into the store and back.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -103,7 +103,7 @@ struct Connection {
 impl Connection {
     fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            ConnectionMsg::Begin => tcp_read(self.stream, 4096).reply(ConnectionMsg::Read),
+            ConnectionMsg::Begin => tcp_read(self.stream, 4096).then(ConnectionMsg::Read),
             ConnectionMsg::Read(Ok(bytes)) => {
                 self.state.commands = parse_commands(&bytes).expect("script parses").into();
                 self.next_effect()
@@ -113,7 +113,7 @@ impl Connection {
                 self.next_effect()
             }
             ConnectionMsg::Wrote(Ok(_)) => {
-                tcp_close_stream(self.stream).reply(ConnectionMsg::Closed)
+                tcp_close_stream(self.stream).then(ConnectionMsg::Closed)
             }
             ConnectionMsg::Closed(Ok(())) => stop(),
             ConnectionMsg::Read(Err(_))
@@ -135,7 +135,7 @@ impl Connection {
     fn next_effect(&mut self) -> Effect<Self> {
         let Some(command) = self.state.commands.pop_front() else {
             return tcp_write(self.stream, std::mem::take(&mut self.state.response))
-                .reply(ConnectionMsg::Wrote);
+                .then(ConnectionMsg::Wrote);
         };
         match command {
             Command::Set { key, value } => call(
@@ -143,19 +143,19 @@ impl Connection {
                 StoreMsg::Set { key, value },
                 Duration::from_millis(100),
             )
-            .reply(ConnectionMsg::StoreReturned),
+            .then(ConnectionMsg::StoreReturned),
             Command::Get { key } => call(
                 self.store,
                 StoreMsg::Get { key },
                 Duration::from_millis(100),
             )
-            .reply(ConnectionMsg::StoreReturned),
+            .then(ConnectionMsg::StoreReturned),
             Command::Del { key } => call(
                 self.store,
                 StoreMsg::Del { key },
                 Duration::from_millis(100),
             )
-            .reply(ConnectionMsg::StoreReturned),
+            .then(ConnectionMsg::StoreReturned),
             Command::Quit => {
                 self.state.response.extend_from_slice(b"BYE\n");
                 self.next_effect()
@@ -205,10 +205,10 @@ struct Listener {
 impl Listener {
     fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
+            ListenerMsg::Start => tcp_bind(self.bind_addr).then(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {
                 self.listener = Some(listener);
-                tcp_accept(listener).reply(ListenerMsg::Accepted)
+                tcp_accept(listener).then(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
                 let listener = self.listener.expect("listener set after bind");
@@ -224,7 +224,7 @@ impl Listener {
                         )
                         .with_initial_message(ConnectionMsg::Begin),
                     ),
-                    tcp_close_listener(listener).reply(ListenerMsg::ListenerClosed),
+                    tcp_close_listener(listener).then(ListenerMsg::ListenerClosed),
                 ])
             }
             ListenerMsg::ListenerClosed(Ok(())) => stop(),

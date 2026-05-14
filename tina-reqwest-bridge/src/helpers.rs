@@ -60,7 +60,7 @@ pub type ReqwestResult = Result<ReqwestResponse, ReqwestError>;
 pub type ReqwestAddress = Address<ReqwestMsg, ReqwestResult>;
 
 /// Full reply shape returned by the runtime when a Tina caller does
-/// `call(addr, ReqwestMsg::Send(...), timeout).reply(...)` against a
+/// `call(addr, ReqwestMsg::Send(...), timeout).then(...)` against a
 /// reqwest worker. Preserves the bridge-delivery / worker-outcome
 /// layering.
 pub type ReqwestCallOutcome = CallOutcome<ReqwestResult>;
@@ -69,13 +69,13 @@ pub type ReqwestCallOutcome = CallOutcome<ReqwestResult>;
 ///
 /// Thin wrapper over `tina_runtime::call(addr, ReqwestMsg::Send(req),
 /// timeout)`. No hidden retry, no hidden timeout, no queue. The
-/// returned [`IsolateCall`] still needs `.reply(...)` to produce an
+/// returned [`IsolateCall`] still needs `.then(...)` to produce an
 /// `Effect`; the user picks how to translate the outcome into their
 /// own message.
 ///
 /// ```ignore
 /// send_request(self.http, ReqwestRequest::get(&url), timeout)
-///     .reply(AppMsg::HttpReturned)
+///     .then(AppMsg::HttpReturned)
 /// ```
 pub fn send_request(
     addr: ReqwestAddress,

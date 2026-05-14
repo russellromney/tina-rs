@@ -87,7 +87,7 @@ impl Isolate for App {
                 }),
                 Duration::from_secs(5),
             )
-            .reply(AppMsg::HeadDone),
+            .then(AppMsg::HeadDone),
             AppMsg::HeadDone(outcome) => {
                 match outcome {
                     CallOutcome::Replied(Ok(S3Response::HeadObject(_))) => {

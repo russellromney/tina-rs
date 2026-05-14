@@ -48,7 +48,7 @@
 //!                 ReqwestRequest::get("http://127.0.0.1:0/"),
 //!                 Duration::from_secs(2),
 //!             )
-//!             .reply(AppMsg::HttpReturned),
+//!             .then(AppMsg::HttpReturned),
 //!             AppMsg::HttpReturned(_) => stop(),
 //!         }
 //!     }

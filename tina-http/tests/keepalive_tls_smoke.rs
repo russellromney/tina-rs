@@ -254,7 +254,7 @@ impl Isolate for Driver {
         match msg {
             DriverMsg::BeginAcquire => {
                 call(self.pool, WorkerPoolMsg::Acquire, Duration::from_secs(5))
-                    .reply(DriverMsg::AcquireReturned)
+                    .then(DriverMsg::AcquireReturned)
             }
             DriverMsg::AcquireReturned(outcome) => match outcome {
                 CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
@@ -272,7 +272,7 @@ impl Isolate for Driver {
                     KeepaliveConnectionMsg::request(request, Duration::from_secs(5)),
                     Duration::from_secs(5),
                 )
-                .reply(DriverMsg::RequestReturned)
+                .then(DriverMsg::RequestReturned)
             }
             DriverMsg::RequestReturned(outcome) => {
                 match outcome {
