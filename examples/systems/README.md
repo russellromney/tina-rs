@@ -88,7 +88,7 @@ Keep a separate system only when it finds a different class of pain.
 
 | System | Build | Pulls On |
 |---|---|---|
-| `system_mini_saas_api` | HTTPS API with routes, Postgres pool, outbound webhook, graceful shutdown, health/readiness. | `tina-http`, `tina-sqlx-bridge`, keepalive pool, cancellation docs, tracing, capacity reports, service shutdown. |
+| `mini_saas_api` | Native HTTP API with routes, SQLite bridge pool shape, outbound keepalive webhook, graceful shutdown, health/readiness, capacity report, and live-replay fact. Run with `cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml`. | `tina-http`, `tina-sqlite-bridge`, keepalive pool, tracing, capacity reports, service shutdown. |
 | `system_realtime_rooms` | Chat/game rooms with join/leave, presence, ticks, durable replay-on-join, slow clients, ping/pong. | WebSocket shape, child/session lifecycle, recurring timers, slow-consumer pressure, bounded fanout, persistence. |
 | `system_job_queue` | Submit jobs, bounded workers, cancel jobs, retry, progress polling, worker panic/restart. | Supervision, child lifecycle, join-many, `PendingCallSet`, cancellation, worker pools, topology report. |
 | `system_session_auth` | Login, cookie/session state, touch session, expire idle sessions, logout. | Sharded placement, recurring timers, owned keyed state, HTTP routing, state snapshot/restore. |

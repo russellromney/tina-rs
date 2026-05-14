@@ -106,6 +106,33 @@ wait bounded time for completions
 report what remains
 ```
 
+## Service Shutdown Skeleton
+
+`examples/systems/mini_saas_api` has the current copyable local-service
+shutdown order:
+
+1. Stop the public `tina-http` listener so new ingress is closed.
+2. Probe `/ready` and surface `ingress_stopped`.
+3. Close the SQLite bridge admission with its closer.
+4. Probe `/ready` and surface `db_closed`.
+5. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
+   pool.
+6. Stop the private notification listener.
+7. Shutdown the runtime and inspect trace/capacity facts.
+
+The exact smoke command is:
+
+```sh
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+```
+
+The pressure variant holds the outbound keepalive lease and proves a second
+notify request sees typed pool pressure:
+
+```sh
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+```
+
 ## Timeout During Shutdown
 
 Shutdown timeout is not "everything is fine".

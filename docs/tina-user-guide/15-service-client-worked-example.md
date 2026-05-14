@@ -156,3 +156,30 @@ route result back manually
 
 That may be useful for a special topology. It is not the normal Tina service
 shape.
+# Service Client Worked Example
+
+For a full HTTP + DB + outbound client service shape, start with
+`examples/systems/mini_saas_api`.
+
+The key path is:
+
+```text
+POST /items/{id}/notify
+  -> controller captures RequestContext<HttpResponse>
+  -> SQLite query through tina-sqlite-bridge
+  -> acquire native tina-http keepalive lease
+  -> POST /notify upstream
+  -> release lease as Reuse
+  -> reply to original HTTP caller
+```
+
+Exact commands:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+```
+
+The system README contains the route table, capacity table, readiness meanings,
+shutdown order, and out-of-scope list.

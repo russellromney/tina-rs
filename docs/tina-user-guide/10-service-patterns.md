@@ -72,6 +72,46 @@ This is the right shape for:
 Do not turn these into spawn-and-route-back helpers just because the answer is
 not immediate. Tina can carry the reply context through continuation chains.
 
+## Production Service Skeleton
+
+The copyable service skeleton lives in
+`examples/systems/mini_saas_api`.
+
+It assembles the blessed local-service layers:
+
+| Layer | Skeleton choice |
+| --- | --- |
+| inbound HTTP | native `tina_http::HttpListener` |
+| routing | direct method/path match in the controller isolate |
+| domain state | controller isolate fields, not `Arc<Mutex<AppState>>` |
+| DB | `tina-sqlite-bridge::SqliteWorker` as the documented one-lane pool shape |
+| outbound HTTP | native `tina_http::build_keepalive_pool` |
+| readiness | `GET /ready` probes DB and outbound pool state |
+| capacity | `GET /debug/capacity` reports body, controller, DB, and outbound surfaces |
+| shutdown | stop ingress, close DB, drain keepalive pool, stop listeners, shutdown runtime |
+| replay hook | materialized `live_replay_fact` for the body-cap pressure case |
+
+Route table:
+
+| Route | Turns before reply |
+| --- | --- |
+| `GET /health` | one |
+| `GET /ready` | DB turn, outbound-pool turn |
+| `POST /items` | DB insert turn |
+| `GET /items/{id}` | DB query turn |
+| `POST /items/{id}/notify` | DB query, pool acquire, keepalive request, pool release |
+| `GET /debug/capacity` | outbound-pool pressure turn |
+
+Run it:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+```
+
+This is a skeleton, not a framework. It deliberately keeps route parsing,
+small response helpers, and scenario glue specimen-local.
+
 ## Topology Shapes
 
 The registry should not become a scheduler.
