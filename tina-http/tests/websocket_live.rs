@@ -103,6 +103,13 @@ impl WsEcho {
             WebSocketSessionMsg::Text(text) if text == "large-out" => {
                 WebSocketSessionOutcome::Text("x".repeat(64))
             }
+            WebSocketSessionMsg::Text(text) if text == "burst-out" => {
+                WebSocketSessionOutcome::Many(vec![
+                    WebSocketMessage::Text("one".to_owned()),
+                    WebSocketMessage::Text("two".to_owned()),
+                    WebSocketMessage::Text("three".to_owned()),
+                ])
+            }
             WebSocketSessionMsg::Text(text) if text == "server-close" => {
                 WebSocketSessionOutcome::Close(Some(WebSocketCloseCode(1000)), b"bye".to_vec())
             }
@@ -452,6 +459,38 @@ fn websocket_immediate_outbound_bytes_cap_is_visible_pressure() {
     let mut rest = Vec::new();
     let _ = stream.read_to_end(&mut rest);
     assert!(rest.is_empty(), "large outbound frame must not be written");
+}
+
+#[test]
+fn websocket_app_many_respects_frame_cap_before_writing() {
+    let limits = WebSocketLimits {
+        outbound_frame_queue_capacity: 1,
+        max_queued_outbound_bytes: 1024,
+        ..Default::default()
+    };
+    let harness = Harness::start(limits);
+    let mut stream = connect_ws(harness.addr);
+    stream.write_all(&masked_frame(0x1, b"burst-out")).unwrap();
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    assert!(
+        rest.is_empty(),
+        "over-cap app burst must not partially write frames before closing"
+    );
+}
+
+#[test]
+fn websocket_read_buffer_high_water_caps_each_read() {
+    let limits = WebSocketLimits {
+        read_buffer_high_water: 2,
+        max_frame_bytes: 64,
+        max_message_bytes: 64,
+        ..Default::default()
+    };
+    let harness = Harness::start(limits);
+    let mut stream = connect_ws(harness.addr);
+    stream.write_all(&masked_frame(0x1, b"hello")).unwrap();
+    assert_eq!(read_server_frame(&mut stream).0, 0x8);
 }
 
 #[test]

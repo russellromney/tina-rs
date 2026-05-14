@@ -220,6 +220,14 @@ impl WebSocketOutboundQueue {
         self.queue.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn max_frames(&self) -> usize {
+        self.max_frames
+    }
+
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }

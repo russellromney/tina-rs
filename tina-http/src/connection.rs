@@ -1358,12 +1358,19 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn websocket_read_more(&mut self) -> Effect<Self> {
+        let max = self.websocket.as_ref().map_or(READ_CHUNK, |ws| {
+            ws.limits
+                .read_buffer_high_water
+                .saturating_sub(ws.read_buf.len())
+                .min(READ_CHUNK)
+        });
+        if max == 0 {
+            return self.websocket_protocol_close(WebSocketError::ReadBufferTooLarge);
+        }
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read(stream, READ_CHUNK).reply(HttpConnectionMsg::Read)
-            }
+            HttpTransport::Tcp(stream) => tcp_read(stream, max).reply(HttpConnectionMsg::Read),
             HttpTransport::Tls(stream) => {
-                tls_read(stream, READ_CHUNK, self.tls_io_timeout).reply(HttpConnectionMsg::Read)
+                tls_read(stream, max, self.tls_io_timeout).reply(HttpConnectionMsg::Read)
             }
         }
     }
@@ -1491,7 +1498,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 return self.begin_close();
             }
         };
-        let mut effects = Vec::new();
+        let mut encoded = Vec::new();
+        let mut new_bytes = 0usize;
         for message in outcome_messages(outcome) {
             let is_close = matches!(message, WebSocketMessage::Close(_, _));
             let is_ping = matches!(message, WebSocketMessage::Ping(_));
@@ -1499,6 +1507,25 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 Ok(bytes) => bytes,
                 Err(error) => return self.websocket_protocol_close(error),
             };
+            new_bytes = match new_bytes.checked_add(bytes.len()) {
+                Some(total) => total,
+                None => {
+                    return self.websocket_pressure_then_close(WebSocketError::OutboundBytesFull);
+                }
+            };
+            if !self.websocket_can_accept_app_output(encoded.len() + 1, new_bytes) {
+                return self.websocket_pressure_then_close(
+                    if self.websocket_frame_slots_available() < encoded.len() + 1 {
+                        WebSocketError::OutboundQueueFull
+                    } else {
+                        WebSocketError::OutboundBytesFull
+                    },
+                );
+            }
+            encoded.push((bytes, is_close, is_ping));
+        }
+        let mut effects = Vec::new();
+        for (bytes, is_close, is_ping) in encoded {
             if is_close {
                 effects.push(self.arm_websocket_close_deadline());
             } else if is_ping {
@@ -1515,6 +1542,27 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             effects.push(self.websocket_continue_read());
         }
         batch(effects)
+    }
+
+    fn websocket_can_accept_app_output(&self, new_frames: usize, new_bytes: usize) -> bool {
+        let Some(ws) = self.websocket.as_ref() else {
+            return false;
+        };
+        new_frames <= self.websocket_frame_slots_available()
+            && ws
+                .pending_write
+                .len()
+                .saturating_add(ws.outbound.queued_bytes())
+                .saturating_add(new_bytes)
+                <= ws.limits.max_queued_outbound_bytes
+    }
+
+    fn websocket_frame_slots_available(&self) -> usize {
+        let Some(ws) = self.websocket.as_ref() else {
+            return 0;
+        };
+        let active_slot = usize::from(ws.pending_write.is_empty());
+        active_slot + ws.outbound.max_frames().saturating_sub(ws.outbound.len())
     }
 
     fn websocket_continue_read(&mut self) -> Effect<Self> {
