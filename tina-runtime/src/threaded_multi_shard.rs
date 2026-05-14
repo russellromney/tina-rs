@@ -57,6 +57,17 @@ where
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
 }
 
+struct ThreadedRemoteWiring {
+    senders:
+        BTreeMap<(ShardId, ShardId), std::sync::mpsc::SyncSender<SendableQueuedRemoteEnvelope>>,
+    receivers: Vec<(
+        ShardId,
+        std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+    )>,
+    queue_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
+    shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
+}
+
 impl<S, F> ThreadedMultiShardRuntime<S, F>
 where
     S: Shard + Send + 'static,
@@ -205,10 +216,13 @@ where
             };
             let factory = mailbox_factory.clone();
             let ids = ids.clone();
-            let remote_senders = remote_senders.clone();
             let shard_id = shard.id();
-            let remote_receivers = remote_receivers.remove(&shard_id).unwrap_or_default();
-            let remote_metrics_for_worker = remote_metrics.clone();
+            let remote_wiring = ThreadedRemoteWiring {
+                senders: remote_senders.clone(),
+                receivers: remote_receivers.remove(&shard_id).unwrap_or_default(),
+                queue_metrics: remote_metrics.clone(),
+                shard_metrics: shard_metrics.clone(),
+            };
             let shard_metrics_for_worker = Arc::clone(
                 shard_metrics
                     .get(&shard_id)
@@ -245,9 +259,7 @@ where
                             runtime,
                             receiver,
                             worker_config,
-                            remote_senders,
-                            remote_receivers,
-                            remote_metrics_for_worker,
+                            remote_wiring,
                             shard_metrics_for_worker,
                         )
                     })
@@ -602,15 +614,7 @@ fn threaded_worker_loop_with_remote<S, F>(
     mut runtime: Runtime<S, F>,
     receiver: std::sync::mpsc::Receiver<ThreadedCommand<S, F>>,
     config: ThreadedRuntimeConfig,
-    remote_senders: BTreeMap<
-        (ShardId, ShardId),
-        std::sync::mpsc::SyncSender<SendableQueuedRemoteEnvelope>,
-    >,
-    remote_receivers: Vec<(
-        ShardId,
-        std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
-    )>,
-    remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
+    remote_wiring: ThreadedRemoteWiring,
     shard_metrics: Arc<LiveShardMetrics>,
 ) -> ThreadedWorkerExit
 where
@@ -623,14 +627,26 @@ where
         shard_metrics.set_resource_counts(runtime.resource_report());
         let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
             let target_shard = envelope.target_shard();
-            let Some(sender) = remote_senders.get(&(source_shard, target_shard)) else {
+            let metrics = remote_wiring
+                .queue_metrics
+                .get(&(source_shard, target_shard));
+            if remote_wiring
+                .shard_metrics
+                .get(&target_shard)
+                .is_some_and(|metrics| metrics.state() == LiveShardState::Failed)
+            {
+                if let Some(metrics) = metrics {
+                    metrics.rejected_closed();
+                }
+                return Err(SendRejectedReason::Closed);
+            }
+            let Some(sender) = remote_wiring.senders.get(&(source_shard, target_shard)) else {
                 panic!(
                     "ThreadedMultiShardRuntime targeted unknown destination shard {}",
                     target_shard.get()
                 );
             };
             let envelope = SendableQueuedRemoteEnvelope::new(envelope);
-            let metrics = remote_metrics.get(&(source_shard, target_shard));
             match sender.try_send(envelope) {
                 Ok(()) => {
                     if let Some(metrics) = metrics {
@@ -654,7 +670,7 @@ where
         };
         let remote_delivered = drain_remote_inbound(
             &mut runtime,
-            &remote_receivers,
+            &remote_wiring.receivers,
             &route_remote,
             config.remote_inbound_drain_budget,
         );
