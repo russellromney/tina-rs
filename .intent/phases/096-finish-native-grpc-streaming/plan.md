@@ -26,11 +26,12 @@
     server-streaming specimen output, tight-queue final trailer preservation,
     and explicit grpcurl proto/command ownership.
 - Still deferred in this branch:
+  - true service-level client-streaming handler API; the current client
+    streaming route still accumulates decoded request messages for the handler,
+    so 096 cannot honestly claim final client-streaming until this lands;
   - true bidirectional streaming with independent request/response lifecycles;
   - automated grpcurl interop in CI; the proto and manual commands are owned,
     but the local environment used for this PR does not ship `grpcurl`;
-  - true service-level client-streaming handler API; the current client
-    streaming route still accumulates decoded request messages for the handler;
   - tonic h2c bidi interop;
   - reflection;
   - production pooled Tina gRPC client;
@@ -125,6 +126,13 @@ Before coding, edit this plan with:
 - exact specimen shape.
 - exact bidirectional lifecycle policy: request EOF, response EOF, early
   service error, peer reset, local cancel, and final status ownership.
+- exact service-level client-streaming lifecycle policy: request `Next`,
+  request EOF, malformed frame, oversized frame, early service success, early
+  service error, local cancel/drain/reset choice, peer reset, and final status
+  ownership.
+- exact `GrpcRequestStream<T>` decoder ownership: partial 5-byte gRPC header,
+  current message byte buffer, decoded message handoff, and when HTTP/2 window
+  credit is returned for each consumed byte.
 - exact user-facing command proofs: specimen command, grpcurl command, tonic
   command or test, and what each proves.
 
@@ -132,6 +140,10 @@ Cut line:
 
 - If bidirectional streaming reveals an HTTP/2 substrate bug, stop and fix 095
   substrate rather than layering around it.
+- If true service-level client-streaming requires a new HTTP/2 request-source
+  primitive, stop and fix 095 rather than buffering inside gRPC.
+- Do not start bidirectional streaming until `GrpcRequestStream<T>` is real and
+  proven with early reject, split-frame decode, and pending-read cancellation.
 - If interop requires TLS ALPN, keep h2c interop separate and record TLS ALPN
   as a future phase.
 - If reflection grows, defer reflection; do not hold streaming hostage to it.
@@ -196,16 +208,47 @@ many request messages -> one response message -> final trailers
 
 Requirements:
 
-- request messages are decoded incrementally from the 095 HTTP/2 request
-  stream;
+- request messages are decoded incrementally from the 095 HTTP/2 request stream
+  and exposed to user code through `GrpcRequestStream<T>` or an equivalent
+  Tina-shaped pull handle;
+- keep the existing buffered helper only if renamed or documented as buffered,
+  for example `client_streaming_buffered`, so the default honest API is not
+  secretly `Vec<T>`;
+- `GrpcRequestStream<T>::next` must preserve gRPC frame decoder state across
+  HTTP/2 DATA chunk boundaries and never require the whole request body in
+  memory;
+- resident memory proof must be measurable: use a route-side high-water
+  counter, body/stream metrics, or a tiny resident cap that fails if messages
+  accumulate with total stream length;
+- the only unbounded-by-count state allowed in the request decoder is the
+  current message buffer up to `max_message_bytes` plus one bounded HTTP/2
+  chunk; completed messages must be handed to the user or dropped before the
+  next completed message is admitted;
 - per-message cap fires before allocating the protobuf body;
 - malformed frame maps to `InvalidArgument`;
 - request message too large maps to `ResourceExhausted`;
 - service can finish with one response plus status;
-- service can reject early and cancel/drain the remaining request stream
-  explicitly;
+- service can reject early before request EOF and the implementation has a
+  pinned policy: either drain with bounded credit or reset/cancel the HTTP/2
+  request stream visibly;
+- service success before request EOF has a pinned policy and does not leave a
+  request-body pull stranded; tests must prove the peer sees exactly one final
+  status and unread request DATA cannot grow without bound;
 - peer reset cancels the request stream and accepted service call;
 - timeout/deadline maps to `DeadlineExceeded`.
+- user code can distinguish clean EOF, peer cancel, malformed frame,
+  oversized message, source full/closed, and timeout.
+- live tests prove:
+  - a handler reads one message and returns an error while the client is still
+    sending;
+  - a handler reads one message and returns success while the client is still
+    sending;
+  - a handler sums many messages without resident memory growing with message
+    count, proven by a high-water/cap assertion rather than just completion;
+  - a protobuf frame split across multiple HTTP/2 DATA frames decodes once;
+  - malformed and oversized messages fail before invoking the user handler for
+    that message;
+  - peer reset while `next` is pending wakes the handler with cancel truth.
 
 ## Rock 4: Bidirectional Streaming
 
@@ -213,6 +256,8 @@ Implement full-duplex gRPC streaming only on top of the 095 substrate.
 
 Requirements:
 
+- depends on Rock 3's `GrpcRequestStream<T>`; do not build a second inbound
+  message-stream abstraction for bidi;
 - request and response streams make independent progress;
 - one TCP reader and one TCP writer remain owned by HTTP/2 connection;
 - service owns explicit request stream and response sink handles;

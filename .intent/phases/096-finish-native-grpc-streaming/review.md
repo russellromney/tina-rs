@@ -94,6 +94,52 @@ collects decoded messages into a `Vec<T>` before invoking the user handler.
 That is not the final service-level streaming API for unbounded streams, early
 application reject, or request/response overlap.
 
+### Fixed In Plan: Client-Streaming Is Now A Bidi Prerequisite
+
+The plan now makes `GrpcRequestStream<T>` or an equivalent Tina-shaped pull
+handle a required Rock 3 deliverable before bidirectional streaming. This is
+important because bidi must reuse the same inbound message stream instead of
+inventing a parallel decoder or hiding another buffered `Vec<T>` path.
+
+### Hostile Review: Client-Streaming Plan Still Needs Ownership Precision
+
+The updated plan is better, but implementation must freeze exact ownership
+before coding:
+
+- who owns the partial five-byte gRPC frame header;
+- who owns partially accumulated protobuf bytes for the current message;
+- when HTTP/2 window credit is returned for bytes that have been framed but not
+  decoded;
+- whether early success drains or resets unread request DATA;
+- how pending `next` calls wake on peer reset, service return, and local
+  deadline.
+
+If any of these are left implicit, the first "streaming" API will either leak
+memory, over-credit flow control, or leave a caller parked forever.
+
+### Fixed In Plan: Buffered Helper Must Be Named As Buffered
+
+The plan now says the existing `Vec<T>` behavior may survive only as an
+explicit buffered helper such as `client_streaming_buffered`. Keeping it under
+the default `client_streaming` name would teach users the wrong mental model
+and make later real streaming a breaking semantic surprise.
+
+### Hostile Review: Memory Proof Must Measure The Right Thing
+
+The plan asks for "many messages without resident memory growing with message
+count." That must not be a hand-wavy assertion. The test should use either a
+route-side high-water counter, runtime/body metrics, or a deliberately tiny
+resident cap that would fail if the router buffered all messages. A test that
+sends 10,000 tiny messages and merely completes is not proof.
+
+### Hostile Review: Early Success Is As Dangerous As Early Error
+
+Most people remember to test early error. Early success is worse: it can return
+OK while the peer continues sending request DATA. The plan now requires a
+pinned success-before-EOF policy. Implementation must prove the connection does
+not accept unbounded unread DATA, silently reuse the stream id, or lose final
+status.
+
 ### Still Risky: Server-Streaming API Is Too Raw
 
 `GrpcServerStreamingResponse` currently asks handlers to provide a
@@ -109,10 +155,12 @@ Before claiming 096 complete, add tests that:
 1. Run grpcurl against the specimen with an explicit proto/descriptor in CI.
 2. Run a tonic client against bidi routes.
 3. Add the service-level client-streaming API and prove early application
-   reject before request EOF.
-4. Interleave bidi request/response messages while one direction is
+   reject and early success before request EOF.
+4. Prove client-streaming resident memory is bounded by current message/chunk,
+   not total message count.
+5. Interleave bidi request/response messages while one direction is
    flow-control blocked.
-5. Start/stop the specimen repeatedly on random ports and run copy-paste
+6. Start/stop the specimen repeatedly on random ports and run copy-paste
    documented commands, not private helper clients.
 
 ### Production Client Is Conditional
@@ -190,9 +238,10 @@ the pressure truth produced by 095. If gRPC wraps every flow-control outcome as
 Implement after 095 in this order:
 
 1. Server-streaming.
-2. Client-streaming.
-3. Bidirectional streaming.
-4. User-facing specimen command proof.
-5. h2c tonic/grpcurl interop for shipped server modes.
-6. Production client only if the native HTTP/2 client state machine is already
+2. True service-level client-streaming via `GrpcRequestStream<T>`.
+3. Rename or clearly preserve the buffered client-streaming helper as buffered.
+4. Bidirectional streaming reusing `GrpcRequestStream<T>`.
+5. User-facing specimen command proof.
+6. h2c tonic/grpcurl interop for shipped server modes.
+7. Production client only if the native HTTP/2 client state machine is already
    real; otherwise create the client phase next.
