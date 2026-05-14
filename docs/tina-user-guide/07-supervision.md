@@ -31,7 +31,7 @@ enum ParentMsg {
 }
 
 spawn_observed(ChildDefinition::new(Child::default(), 16))
-    .reply(ParentMsg::ChildStarted)
+    .then(ParentMsg::ChildStarted)
 ```
 
 The result is delivered as an ordinary later parent message. `ChildRef` carries

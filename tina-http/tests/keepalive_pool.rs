@@ -33,7 +33,7 @@ use tina_http::{
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-    ThreadedRuntimeConfig, call, call_with_handle, cancel_call,
+    ThreadedRuntimeConfig, call, call_cancelable, cancel_call,
 };
 
 use common::TestShard;
@@ -415,10 +415,10 @@ impl Isolate for Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Acquire { id, timeout } => call(self.pool, WorkerPoolMsg::Acquire, timeout)
-                .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome }),
+                .then(move |outcome| DriverMsg::AcquireReturned { id, outcome }),
             DriverMsg::AcquireWithHandle { id, timeout } => {
-                let (effect, handle) = call_with_handle(self.pool, WorkerPoolMsg::Acquire, timeout)
-                    .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome });
+                let (effect, handle) = call_cancelable(self.pool, WorkerPoolMsg::Acquire, timeout)
+                    .then(move |outcome| DriverMsg::AcquireReturned { id, outcome });
                 self.state.lock().expect("state").handles.push((id, handle));
                 effect
             }
@@ -428,7 +428,7 @@ impl Isolate for Driver {
                 if let Some(pos) = pos {
                     let (_, handle) = st.handles.remove(pos);
                     drop(st);
-                    cancel_call(handle).reply(DriverMsg::CancelReturned)
+                    cancel_call(handle).then(DriverMsg::CancelReturned)
                 } else {
                     noop()
                 }
@@ -452,7 +452,7 @@ impl Isolate for Driver {
                     KeepaliveConnectionMsg::request(request, request_timeout),
                     call_timeout,
                 )
-                .reply(move |outcome| DriverMsg::RequestReturned { id, outcome })
+                .then(move |outcome| DriverMsg::RequestReturned { id, outcome })
             }
             DriverMsg::Stop {
                 id,
@@ -473,7 +473,7 @@ impl Isolate for Driver {
                     addr
                 };
                 call(addr, KeepaliveConnectionMsg::Stop, timeout)
-                    .reply(move |outcome| DriverMsg::StopReturned { id, outcome })
+                    .then(move |outcome| DriverMsg::StopReturned { id, outcome })
             }
             DriverMsg::Release { id, disposition } => {
                 let mut st = self.state.lock().expect("state");
@@ -493,11 +493,11 @@ impl Isolate for Driver {
                 )
             }
             DriverMsg::Close { mode, timeout } => {
-                call(self.pool, WorkerPoolMsg::Close(mode), timeout).reply(DriverMsg::CloseReturned)
+                call(self.pool, WorkerPoolMsg::Close(mode), timeout).then(DriverMsg::CloseReturned)
             }
             DriverMsg::Pressure { timeout } => {
                 call(self.pool, WorkerPoolMsg::PressureReport, timeout)
-                    .reply(DriverMsg::PressureReturned)
+                    .then(DriverMsg::PressureReturned)
             }
             DriverMsg::PressureReturned(outcome) => {
                 let report = match outcome {

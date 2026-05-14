@@ -195,7 +195,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     self.identity.certificate_chain_der.clone(),
                     self.identity.private_key_der.clone(),
                 )
-                .reply(HttpsListenerMsg::Bound)
+                .then(HttpsListenerMsg::Bound)
             }
 
             HttpsListenerMsg::Bound(Ok((listener, local_addr))) => {
@@ -204,8 +204,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // Stop arrived while bind was in flight. Close
                     // the just-bound listener; fail any pending startup call.
                     let listener = self.listener.take().expect("set just above");
-                    let close =
-                        tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed);
+                    let close = tls_close_listener(listener).then(HttpsListenerMsg::ListenerClosed);
                     return match self.pending_start_reply.take() {
                         Some(request) => batch(vec![
                             reply_to_request(request, Err(HttpsStartupError::AlreadyStarted)),
@@ -220,7 +219,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     None => reply(ready),
                 };
                 let accept_effect: Effect<Self> =
-                    tls_accept(listener, self.tls_accept_timeout).reply(HttpsListenerMsg::Accepted);
+                    tls_accept(listener, self.tls_accept_timeout).then(HttpsListenerMsg::Accepted);
                 batch(vec![ready_effect, accept_effect])
             }
             HttpsListenerMsg::Bound(Err(source)) => {
@@ -236,18 +235,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 if self.stopping {
                     // Orphan-close the just-accepted stream.
                     return tls_close(stream, self.tls_io_timeout)
-                        .reply(HttpsListenerMsg::StreamClosed);
+                        .then(HttpsListenerMsg::StreamClosed);
                 }
                 let Some(listener) = self.listener else {
                     // Defensive: invariant says listener=Some when
                     // !stopping. If violated, orphan-close.
                     return tls_close(stream, self.tls_io_timeout)
-                        .reply(HttpsListenerMsg::StreamClosed);
+                        .then(HttpsListenerMsg::StreamClosed);
                 };
                 let child = self.build_connection_child(stream);
                 batch(vec![
                     spawn(child),
-                    tls_accept(listener, self.tls_accept_timeout).reply(HttpsListenerMsg::Accepted),
+                    tls_accept(listener, self.tls_accept_timeout).then(HttpsListenerMsg::Accepted),
                 ])
             }
             HttpsListenerMsg::Accepted(Err(error)) => {
@@ -266,12 +265,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 match error {
                     CallError::Timeout | CallError::TlsHandshake => {
                         tls_accept(listener, self.tls_accept_timeout)
-                            .reply(HttpsListenerMsg::Accepted)
+                            .then(HttpsListenerMsg::Accepted)
                     }
                     _ => {
                         self.stopping = true;
                         if let Some(listener) = self.listener.take() {
-                            tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed)
+                            tls_close_listener(listener).then(HttpsListenerMsg::ListenerClosed)
                         } else {
                             stop()
                         }
@@ -285,7 +284,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 }
                 self.stopping = true;
                 if let Some(listener) = self.listener.take() {
-                    tls_close_listener(listener).reply(HttpsListenerMsg::ListenerClosed)
+                    tls_close_listener(listener).then(HttpsListenerMsg::ListenerClosed)
                 } else {
                     stop()
                 }
@@ -309,7 +308,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     self.identity.certificate_chain_der.clone(),
                     self.identity.private_key_der.clone(),
                 )
-                .reply(HttpsListenerMsg::Bound)
+                .then(HttpsListenerMsg::Bound)
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }

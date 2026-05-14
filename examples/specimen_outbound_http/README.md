@@ -76,7 +76,7 @@ What feels better:
   the script finishes.
 - **No Driver isolate for host scripts.** `call_blocking` is the
   copied host-test shape. Real services still use
-  `call(...).reply(...)` inside their handlers.
+  `call(...).then(...)` inside their handlers.
 - **`HttpServerConfig::dev()` / `HttpClientConfig::dev()`.**
   Roomy presets for examples; `pressure()` is the cap-matters
   variant (per the checklist entry on HTTP server / client

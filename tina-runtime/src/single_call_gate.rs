@@ -1,10 +1,10 @@
 //! Single-in-flight gate for timer-driven workers (Phase 062 Rock 5).
 //!
 //! The pattern in `specimen_rate_limited_worker` and any
-//! `sleep(window).reply(Tick)` rate-limited isolate is:
+//! `sleep(window).then(Tick)` rate-limited isolate is:
 //!
 //! - on submit: bump a `pending` counter; if it *was* zero, schedule
-//!   `sleep(window).reply(Tick)`; else no-op.
+//!   `sleep(window).then(Tick)`; else no-op.
 //! - on tick: decrement `pending`; if more work remains, schedule
 //!   another sleep; else no-op.
 //!
@@ -12,7 +12,7 @@
 //! timer/call in flight" is structural rather than five lines repeated
 //! at each isolate. The gate is plain data — it does not own the
 //! timer, the trace, or the message; the caller still writes
-//! `sleep(...).reply(...)` itself. The runtime continues to record one
+//! `sleep(...).then(...)` itself. The runtime continues to record one
 //! `Sleep` event per scheduled timer.
 //!
 //! No hidden timer, no hidden queue. Just a counter with a name.

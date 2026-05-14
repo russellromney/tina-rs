@@ -108,7 +108,7 @@ impl Isolate for Caller {
     ) -> Effect<Self> {
         match msg {
             CallerMsg::RunExec { sql, params } => {
-                execute_call(self.bridge, sql, params, self.timeout).reply(CallerMsg::DoneExec)
+                execute_call(self.bridge, sql, params, self.timeout).then(CallerMsg::DoneExec)
             }
             CallerMsg::DoneExec(outcome) => {
                 self.sink.put(outcome);
@@ -198,7 +198,7 @@ impl Isolate for QueryCaller {
                 params,
                 max_rows,
             } => query_call(self.bridge, sql, params, max_rows, self.timeout)
-                .reply(QueryCallerMsg::Done),
+                .then(QueryCallerMsg::Done),
             QueryCallerMsg::Done(outcome) => {
                 self.sink.put(outcome);
                 stop()

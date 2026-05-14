@@ -100,10 +100,8 @@ impl Binder {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            BindMsg::Start => tcp_bind(self.addr).reply(BindMsg::Bound),
-            BindMsg::Bound(Ok((listener, _))) => {
-                tcp_close_listener(listener).reply(BindMsg::Closed)
-            }
+            BindMsg::Start => tcp_bind(self.addr).then(BindMsg::Bound),
+            BindMsg::Bound(Ok((listener, _))) => tcp_close_listener(listener).then(BindMsg::Closed),
             BindMsg::Bound(Err(_)) | BindMsg::Closed(_) => stop(),
         }
     }
@@ -301,7 +299,7 @@ impl Sleeper {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            SleeperMsg::Start => sleep(self.nap).reply(|_| SleeperMsg::SleepDone),
+            SleeperMsg::Start => sleep(self.nap).then(|_| SleeperMsg::SleepDone),
             SleeperMsg::SleepDone => stop(),
         }
     }

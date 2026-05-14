@@ -4,7 +4,7 @@
 //! still build and return the visible Tina effects:
 //!
 //! - reserve a [`CallGroupToken`] for each branch;
-//! - start each branch with [`crate::call_with_handle`];
+//! - start each branch with [`crate::call_cancelable`];
 //! - store the returned [`tina::CallHandle`] with a user key;
 //! - route each reply continuation back with the returned
 //!   [`CallGroupToken`];
@@ -122,7 +122,7 @@ pub enum CallGroupInsertError<K, R> {
 
 /// A loser that should be cancelled by user code.
 #[derive(Debug)]
-#[must_use = "turn this into cancel_call(handle).reply(...) or handle it visibly"]
+#[must_use = "turn this into cancel_call(handle).then(...) or handle it visibly"]
 pub struct CallGroupCancelRequest<K, R> {
     key: K,
     token: CallGroupToken,

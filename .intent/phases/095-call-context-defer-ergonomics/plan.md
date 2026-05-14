@@ -10,6 +10,20 @@
 - One PR if the trait shape stays small; split if ordinary continuation
   vocabulary migration grows beyond docs and a few specimens.
 - Hostile review pass incorporated; see `review.md`.
+- Implementation chosen shape:
+  - `tina::CallContext::defer(work)` delegates through the public
+    `tina::DeferThrough` trait, with runtime builders implementing the trait in
+    `tina-runtime`;
+  - ordinary runtime continuations now have `then(...)` and
+    `then_with_request(...)` names, while existing ordinary `reply(...)` /
+    `reply_with_request(...)` remain deprecated compatibility aliases;
+  - `ReplyAbandoned` exposes a diagnostic hint that points call-handler users
+    toward `call_ctx.reply(...)`, `call_ctx.reject(...)`, or
+    `call_ctx.defer(work).reply(...)`;
+  - docs and specimens teach `call_ctx.defer(work).reply(...)` for caller
+    authority and keep one expanded `into_request_context()` form visible;
+  - first migrated specimens are `specimen_multi_turn_request_context` and
+    `mini_saas_api`.
 
 ## Grug Truth
 
@@ -185,7 +199,11 @@ wrapper if it is genuinely simpler.
 Required builder families:
 
 - isolate call: `call(addr, msg, timeout)`;
+<<<<<<< HEAD
+- cancelable isolate call: `call_cancelable(addr, msg, timeout)`;
+=======
 - isolate call with handle: `call_with_handle(addr, msg, timeout)`;
+>>>>>>> origin/main
 - observed send: `send_observed(addr, msg)`;
 - typed runtime call: `sleep`, TCP/TLS/file/process/DNS/etc. typed calls.
 
@@ -205,20 +223,39 @@ Where `Msg::Done` receives:
 - the work outcome (`CallOutcome<R>`, `SendOutcome`, `Result<T, CallError>`,
   or `CancelOutcome` only if cancel-call support is intentionally included).
 
-For `call_with_handle`, preserve the existing handle shape:
+For cancelable calls, keep the caller authority and the cancel handle together
+in a visible pending token:
 
 ```rust
-let (effect, handle) = call_ctx
-    .defer(call_with_handle(worker, WorkerMsg::Run, timeout))
-    .reply(ServiceMsg::WorkerDone);
+let (pending, effect) = call_ctx
+    .defer_cancelable(call_cancelable(worker, WorkerMsg::Run, timeout))
+    .reply(id, ServiceMsg::WorkerDone);
+self.pending.insert(id, pending);
+effect
 ```
+
+If bounded storage can fail, decide that before returning `effect`. Do not
+dispatch the child effect if you did not store the pending token. Use
+`pending.into_request_context()` to answer the original caller on the admission
+failure path.
 
 Do not allocate a second request context. The builder must be sugar for:
 
 ```rust
 let req = call_ctx.into_request_context();
-work.then_with_request(req, Msg::Done)
+PendingCancelableCall {
+    key,
+    request: req,
+    handle,
+}
 ```
+
+Do not support `call_ctx.defer(call_cancelable(...))`. A cancelable call can
+complete on either the worker-return path or the cancel-return path; hiding
+caller authority only in the worker continuation strands the original caller
+when user code cancels the child wait. `call_with_handle(...)` remains as a
+deprecated compatibility spelling for `call_cancelable(...)`, and a future
+cleanup should scrub the compatibility name after downstream code has migrated.
 
 ## Rock 3: Ordinary Continuation Vocabulary
 
@@ -284,7 +321,13 @@ Add focused runtime tests from a user's point of view:
 - plain `work.then(...)` inside `handle_call` still produces
   `ReplyAbandoned` if `CallContext` is not consumed, while the ordinary
   continuation still runs;
+<<<<<<< HEAD
+- `call_ctx.defer_cancelable(call_cancelable(...)).reply(...)` returns a
+  pending token plus effect, replies on worker return, and still answers the
+  original caller on explicit cancel;
+=======
 - `call_with_handle` returns the handle and preserves request context;
+>>>>>>> origin/main
 - `send_observed` accepted and full paths preserve request context;
 - typed runtime-call success and typed `CallError` paths preserve request
   context;
@@ -318,7 +361,11 @@ Migrate one small and one real-ish specimen:
 
 Optional:
 
+<<<<<<< HEAD
+- `specimen_cancellation_chain` if `call_cancelable` or typed sleep
+=======
 - `specimen_cancellation_chain` if `call_with_handle` or typed sleep
+>>>>>>> origin/main
   coverage benefits from a real cancellation example.
 
 Do not migrate every `.reply(...)` in examples. The goal is vocabulary proof,

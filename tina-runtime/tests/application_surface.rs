@@ -267,7 +267,7 @@ impl Connection {
         _ctx: &mut Context<'_, LocalShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ConnectionMsg::Begin => tcp_read(self.stream, 256).reply(|result| match result {
+            ConnectionMsg::Begin => tcp_read(self.stream, 256).then(|result| match result {
                 Ok(bytes) => ConnectionMsg::Read(bytes),
                 Err(_) => ConnectionMsg::Failed,
             }),
@@ -280,7 +280,7 @@ impl Connection {
                         WorkerMsg::Echo(body.to_vec()),
                         Duration::from_millis(250),
                     )
-                    .reply(ConnectionMsg::WorkerReturned)
+                    .then(ConnectionMsg::WorkerReturned)
                 }
                 (RequestMode::Full, _) => {
                     self.mode = Some(RequestMode::Full);
@@ -290,19 +290,19 @@ impl Connection {
                             WorkerMsg::Echo(b"accepted-before-full".to_vec()),
                             Duration::from_millis(250),
                         )
-                        .reply(ConnectionMsg::WorkerReturned),
+                        .then(ConnectionMsg::WorkerReturned),
                         call(
                             self.worker,
                             WorkerMsg::Echo(b"must-reject".to_vec()),
                             Duration::from_millis(250),
                         )
-                        .reply(ConnectionMsg::WorkerReturned),
+                        .then(ConnectionMsg::WorkerReturned),
                     ])
                 }
                 (RequestMode::Timeout, _) => {
                     self.mode = Some(RequestMode::Timeout);
                     call(self.worker, WorkerMsg::NoReply, Duration::from_millis(20))
-                        .reply(ConnectionMsg::WorkerReturned)
+                        .then(ConnectionMsg::WorkerReturned)
                 }
             },
             ConnectionMsg::WorkerReturned(outcome) => {
@@ -372,14 +372,14 @@ fn parse_request(bytes: &[u8]) -> (RequestMode, &[u8]) {
 }
 
 fn write_pending(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
-    tcp_write(stream, bytes).reply(|result| match result {
+    tcp_write(stream, bytes).then(|result| match result {
         Ok(count) => ConnectionMsg::Wrote(count),
         Err(_) => ConnectionMsg::Failed,
     })
 }
 
 fn close_stream(stream: StreamId) -> Effect<Connection> {
-    tcp_close_stream(stream).reply(|result| match result {
+    tcp_close_stream(stream).then(|result| match result {
         Ok(()) => ConnectionMsg::Closed,
         Err(_) => ConnectionMsg::Failed,
     })
@@ -428,7 +428,7 @@ impl Listener {
         match msg {
             ListenerMsg::Start => {
                 let bind_addr = self.bind_addr;
-                tcp_bind(bind_addr).reply(|result| match result {
+                tcp_bind(bind_addr).then(|result| match result {
                     Ok((listener, addr)) => ListenerMsg::Bound { listener, addr },
                     Err(_) => ListenerMsg::Failed,
                 })
@@ -466,7 +466,7 @@ impl Listener {
             }
             ListenerMsg::Close => {
                 let listener = self.listener.expect("listener stored before close");
-                tcp_close_listener(listener).reply(|result| match result {
+                tcp_close_listener(listener).then(|result| match result {
                     Ok(()) => ListenerMsg::Closed,
                     Err(_) => ListenerMsg::Failed,
                 })
@@ -477,7 +477,7 @@ impl Listener {
 }
 
 fn accept(listener: ListenerId) -> Effect<Listener> {
-    tcp_accept(listener).reply(|result| match result {
+    tcp_accept(listener).then(|result| match result {
         Ok((stream, _peer_addr)) => ListenerMsg::Accepted { stream },
         Err(_) => ListenerMsg::Failed,
     })
@@ -504,9 +504,9 @@ impl LongWork {
     ) -> Effect<Self> {
         match msg {
             LongWorkMsg::Start { worker } => batch([
-                sleep(Duration::from_secs(60)).reply(|_| LongWorkMsg::Slept),
+                sleep(Duration::from_secs(60)).then(|_| LongWorkMsg::Slept),
                 call(worker, WorkerMsg::NoReply, Duration::from_secs(60))
-                    .reply(|_| LongWorkMsg::WorkerReturned),
+                    .then(|_| LongWorkMsg::WorkerReturned),
             ]),
             LongWorkMsg::Slept | LongWorkMsg::WorkerReturned => noop(),
         }
@@ -534,7 +534,7 @@ impl StaleProbe {
         match msg {
             StaleProbeMsg::Probe(target) => {
                 send_observed(target, WorkerMsg::Echo(b"stale".to_vec()))
-                    .reply(StaleProbeMsg::Observed)
+                    .then(StaleProbeMsg::Observed)
             }
             StaleProbeMsg::Observed(SendOutcome::Closed) => {
                 self.observations
@@ -576,13 +576,13 @@ impl Router {
                     WorkerMsg::Echo(b"first".to_vec()),
                     Duration::from_millis(250),
                 )
-                .reply(RouterMsg::WorkerReturned),
+                .then(RouterMsg::WorkerReturned),
                 call(
                     self.worker,
                     WorkerMsg::Echo(b"second".to_vec()),
                     Duration::from_millis(250),
                 )
-                .reply(RouterMsg::WorkerReturned),
+                .then(RouterMsg::WorkerReturned),
             ]),
             RouterMsg::WorkerReturned(outcome) => {
                 self.outcomes.lock().expect("outcomes mutex").push(outcome);

@@ -60,7 +60,7 @@ Three isolates, each owns one thing:
   Closed`. Each command is one `call(self.store, ..., timeout)`.
 - **`Listener`** — `tcp_bind` → `tcp_accept` → `spawn(Connection)`.
 
-`call(addr, msg, timeout).reply(continuation)` is how each command
+`call(addr, msg, timeout).then(continuation)` is how each command
 crosses into the store and back. The continuation is just another
 message variant.
 
@@ -77,7 +77,7 @@ What feels better:
   someone needs to share the map with another task; the Tina version
   cannot.
 - **Request/reply at a boundary reads honestly.** `call(addr, msg,
-  timeout).reply(map_outcome)` is verbose vs `await`, but it's also
+  timeout).then(map_outcome)` is verbose vs `await`, but it's also
   one message in, one message out, no hidden state machine, no
   implicit cancellation point.
 - **The connection state machine is one match.** `Begin → Read →

@@ -462,7 +462,7 @@ impl Isolate for StreamingConsumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply_with_request(request, StreamMsg::ChunkArrived)
+                    .then_with_request(request, StreamMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     self.pending_source = None;
@@ -497,7 +497,7 @@ impl Isolate for StreamingConsumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply_with_request(request, StreamMsg::ChunkArrived)
+                    .then_with_request(request, StreamMsg::ChunkArrived)
                 }
                 HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
                 HttpRequestBody::Buffered(b) => {

@@ -254,7 +254,7 @@ impl PingClient {
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Start => {
-                call(self.worker, PingMsg::Ping, Duration::from_secs(1)).reply(ClientMsg::Done)
+                call(self.worker, PingMsg::Ping, Duration::from_secs(1)).then(ClientMsg::Done)
             }
             ClientMsg::Done(CallOutcome::Replied(PingReply::Pong)) => {
                 self.count.fetch_add(1, Ordering::Relaxed);
@@ -297,62 +297,61 @@ impl TcpCostService {
         _ctx: &mut Context<'_, CostShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TcpCostMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("tcp cost bind addr"))
-                .reply(TcpCostMsg::Bound),
+            TcpCostMsg::Start => {
+                tcp_bind("127.0.0.1:0".parse().expect("tcp cost bind addr")).then(TcpCostMsg::Bound)
+            }
             TcpCostMsg::Bound(Ok((listener, addr))) => {
                 self.listener = Some(listener);
                 *self.published.lock().expect("tcp cost published lock") = Some(addr);
-                tcp_accept(listener).reply(TcpCostMsg::Accepted)
+                tcp_accept(listener).then(TcpCostMsg::Accepted)
             }
             TcpCostMsg::Bound(Err(error)) => self.fail(format!("tcp-bind:{error:?}")),
             TcpCostMsg::Accepted(Ok((stream, _peer))) => {
                 self.buffer.clear();
-                tcp_read(stream, 2).reply(move |result| TcpCostMsg::Read(result, stream))
+                tcp_read(stream, 2).then(move |result| TcpCostMsg::Read(result, stream))
             }
             TcpCostMsg::Accepted(Err(error)) => self.fail(format!("tcp-accept:{error:?}")),
             TcpCostMsg::Read(Ok(bytes), stream) if bytes.is_empty() => {
                 self.record_failure("tcp-eof-before-ping");
-                tcp_close_stream(stream).reply(TcpCostMsg::StreamClosed)
+                tcp_close_stream(stream).then(TcpCostMsg::StreamClosed)
             }
             TcpCostMsg::Read(Ok(bytes), stream) => {
                 self.buffer.extend_from_slice(&bytes);
                 match self.buffer.len().cmp(&4) {
                     std::cmp::Ordering::Less => {
-                        tcp_read(stream, 2).reply(move |result| TcpCostMsg::Read(result, stream))
+                        tcp_read(stream, 2).then(move |result| TcpCostMsg::Read(result, stream))
                     }
                     std::cmp::Ordering::Equal if self.buffer == b"ping" => {
                         tcp_write(stream, self.buffer.clone())
-                            .reply(move |result| TcpCostMsg::Wrote(result, stream))
+                            .then(move |result| TcpCostMsg::Wrote(result, stream))
                     }
                     _ => {
                         self.record_failure(format!("tcp-read-shape:{:?}", self.buffer));
-                        tcp_close_stream(stream).reply(TcpCostMsg::StreamClosed)
+                        tcp_close_stream(stream).then(TcpCostMsg::StreamClosed)
                     }
                 }
             }
             TcpCostMsg::Read(Err(error), stream) => {
                 self.record_failure(format!("tcp-read:{error:?}"));
-                tcp_close_stream(stream).reply(TcpCostMsg::StreamClosed)
+                tcp_close_stream(stream).then(TcpCostMsg::StreamClosed)
             }
             TcpCostMsg::Wrote(Ok(4), stream) => {
-                tcp_close_stream(stream).reply(TcpCostMsg::StreamClosed)
+                tcp_close_stream(stream).then(TcpCostMsg::StreamClosed)
             }
             TcpCostMsg::Wrote(Ok(written), stream) => {
                 self.record_failure(format!("tcp-short-write:{written}"));
-                tcp_close_stream(stream).reply(TcpCostMsg::StreamClosed)
+                tcp_close_stream(stream).then(TcpCostMsg::StreamClosed)
             }
             TcpCostMsg::Wrote(Err(error), stream) => {
                 self.record_failure(format!("tcp-write:{error:?}"));
-                tcp_close_stream(stream).reply(TcpCostMsg::StreamClosed)
+                tcp_close_stream(stream).then(TcpCostMsg::StreamClosed)
             }
             TcpCostMsg::StreamClosed(result) => {
                 if let Err(error) = result {
                     self.record_failure(format!("tcp-close-stream:{error:?}"));
                 }
                 match self.listener.take() {
-                    Some(listener) => {
-                        tcp_close_listener(listener).reply(TcpCostMsg::ListenerClosed)
-                    }
+                    Some(listener) => tcp_close_listener(listener).then(TcpCostMsg::ListenerClosed),
                     None => self.fail("tcp-listener-missing"),
                 }
             }

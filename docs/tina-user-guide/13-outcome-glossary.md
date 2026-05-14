@@ -100,7 +100,7 @@ Runtime-owned I/O calls return `Result<T, CallError>`.
 Examples:
 
 ```rust
-tcp_read(stream, 4096).reply(ConnMsg::Read)
+tcp_read(stream, 4096).then(ConnMsg::Read)
 ```
 
 The continuation sees:

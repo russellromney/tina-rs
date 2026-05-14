@@ -69,10 +69,10 @@ struct Listener {
 impl Listener {
     fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
+            ListenerMsg::Start => tcp_bind(self.bind_addr).then(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {
                 self.listener_id = Some(listener);
-                tcp_accept(listener).reply(ListenerMsg::Accepted)
+                tcp_accept(listener).then(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
                 let listener = self.listener_id.expect("listener set after bind");
@@ -85,7 +85,7 @@ impl Listener {
                         ChildDefinition::new(connection, 64)
                             .with_initial_message(ConnectionMsg::Begin),
                     ),
-                    tcp_close_listener(listener).reply(ListenerMsg::ListenerClosed),
+                    tcp_close_listener(listener).then(ListenerMsg::ListenerClosed),
                 ])
             }
             ListenerMsg::ListenerClosed(Ok(())) => stop(),

@@ -489,7 +489,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     crate::Http2ConnectionMsg::body_next(stream_id),
                     REQUEST_BODY_PULL_TIMEOUT,
                 )
-                .reply(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
+                .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
             }
         }
     }
@@ -521,7 +521,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     crate::Http2ConnectionMsg::body_next(stream_id),
                     REQUEST_BODY_PULL_TIMEOUT,
                 )
-                .reply(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
+                .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
             }
             CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof)) => {
                 pending.request.body = HttpRequestBody::Buffered(pending.body);

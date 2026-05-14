@@ -82,14 +82,14 @@ struct Connection {
 impl Connection {
     fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            ConnectionMsg::Begin => tcp_read(self.stream, 32).reply(ConnectionMsg::Read),
+            ConnectionMsg::Begin => tcp_read(self.stream, 32).then(ConnectionMsg::Read),
             ConnectionMsg::Read(Ok(bytes)) => {
                 self.counts.burst = parse_burst(&bytes);
                 batch(
                     (0..self.counts.burst)
                         .map(|index| {
                             send_observed(self.slow_client, DeliverMsg(index))
-                                .reply(ConnectionMsg::Observed)
+                                .then(ConnectionMsg::Observed)
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -111,10 +111,10 @@ impl Connection {
                     self.counts.accepted, self.counts.full, self.counts.closed,
                 )
                 .into_bytes();
-                tcp_write(self.stream, response).reply(ConnectionMsg::Wrote)
+                tcp_write(self.stream, response).then(ConnectionMsg::Wrote)
             }
             ConnectionMsg::Wrote(Ok(_)) => {
-                tcp_close_stream(self.stream).reply(ConnectionMsg::Closed)
+                tcp_close_stream(self.stream).then(ConnectionMsg::Closed)
             }
             ConnectionMsg::Closed(Ok(())) => stop(),
             ConnectionMsg::Read(Err(_))
@@ -150,10 +150,10 @@ struct Listener {
 impl Listener {
     fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
+            ListenerMsg::Start => tcp_bind(self.bind_addr).then(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {
                 self.listener = Some(listener);
-                tcp_accept(listener).reply(ListenerMsg::Accepted)
+                tcp_accept(listener).then(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
                 let listener = self.listener.expect("listener set after bind");
@@ -169,7 +169,7 @@ impl Listener {
                         )
                         .with_initial_message(ConnectionMsg::Begin),
                     ),
-                    tcp_close_listener(listener).reply(ListenerMsg::ListenerClosed),
+                    tcp_close_listener(listener).then(ListenerMsg::ListenerClosed),
                 ])
             }
             ListenerMsg::ListenerClosed(Ok(())) => stop(),

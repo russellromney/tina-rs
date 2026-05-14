@@ -41,7 +41,7 @@ resource.
 Close should be explicit:
 
 ```rust
-tcp_close_stream(stream).reply(ConnMsg::Closed)
+tcp_close_stream(stream).then(ConnMsg::Closed)
 ```
 
 If close cancels pending work, the runtime should report that as resource-close
@@ -177,7 +177,7 @@ no "kill this worker."
 
 ### Examples
 
-**Isolate call cancel.** Call with `call_with_handle` so the caller
+**Isolate call cancel.** Call with `call_cancelable` so the caller
 owns a [`CallHandle`]. Later, `cancel_call(handle)` reclaims the
 waiter slot and records `CallCancelled` in the trace. If the callee
 already accepted the work, the late reply becomes

@@ -188,7 +188,7 @@ impl Isolate for ObservedParent {
                 },
                 4,
             ))
-            .reply(ObservedParentEvent::ChildStarted),
+            .then(ObservedParentEvent::ChildStarted),
             ObservedParentEvent::StartInvalidChild => spawn_observed(ChildDefinition::new(
                 Child {
                     seen: Rc::clone(&self.child_seen),
@@ -196,7 +196,7 @@ impl Isolate for ObservedParent {
                 },
                 0,
             ))
-            .reply(ObservedParentEvent::ChildStarted),
+            .then(ObservedParentEvent::ChildStarted),
             ObservedParentEvent::ChildStarted(Ok(child)) => {
                 *self.child_ref.borrow_mut() = Some(child);
                 send(child.address, ChildEvent::Data(42))
@@ -240,7 +240,7 @@ impl Isolate for FullParent {
                     },
                     4,
                 ))
-                .reply(FullParentEvent::ChildStarted),
+                .then(FullParentEvent::ChildStarted),
             ]),
             FullParentEvent::Fill => noop(),
             FullParentEvent::ChildStarted(result) => {

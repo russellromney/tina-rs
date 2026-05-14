@@ -90,7 +90,7 @@ impl Isolate for App {
                 }),
                 Duration::from_secs(10),
             )
-            .reply(AppMsg::PutDone),
+            .then(AppMsg::PutDone),
             AppMsg::PutDone(outcome) => {
                 match outcome {
                     CallOutcome::Replied(Ok(S3Response::PutObject(ok))) => {

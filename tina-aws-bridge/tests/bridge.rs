@@ -87,7 +87,7 @@ impl Isolate for CallerIsolate {
     ) -> Effect<Self> {
         match msg {
             CallerMsg::Run(request) => {
-                send_s3(self.worker, request, self.timeout).reply(CallerMsg::Done)
+                send_s3(self.worker, request, self.timeout).then(CallerMsg::Done)
             }
             CallerMsg::Done(outcome) => {
                 self.sink.put(outcome);

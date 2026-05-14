@@ -73,7 +73,7 @@ match msg {
             let decision = self.interval.next_delay(ctx.now());
             let tick = decision.tick_number();
             self.pending_tick = Some(tick);
-            sleep(decision.delay()).reply(move |reply| BatcherMsg::Tick(tick, reply))
+            sleep(decision.delay()).then(move |reply| BatcherMsg::Tick(tick, reply))
         } else {
             noop()
         }

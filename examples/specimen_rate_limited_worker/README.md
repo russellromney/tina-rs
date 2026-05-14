@@ -55,7 +55,7 @@ holds it together.
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
 limit lives in the worker's own state machine: each `Submit` returns
-`sleep(RATE_WINDOW).reply(Tick)`. A `SingleCallGate` (Phase-062 Rock 5)
+`sleep(RATE_WINDOW).then(Tick)`. A `SingleCallGate` (Phase-062 Rock 5)
 keeps at most one `sleep` in flight; the matching `Tick` increments
 `processed`. The host closes the burst with a normal Tina message:
 `BurstClosed(admitted)`.
@@ -63,14 +63,14 @@ keeps at most one `sleep` in flight; the matching `Tick` increments
 ```rust
 WorkerMsg::Submit(_) => {
     self.report.jobs_admitted += 1;
-    if self.gate.submit() { sleep(self.rate_window).reply(WorkerMsg::Tick) }
+    if self.gate.submit() { sleep(self.rate_window).then(WorkerMsg::Tick) }
     else { noop() }
 }
 WorkerMsg::Tick(_) => {
     self.processed += 1;
     let more_work = self.gate.complete();
     if self.is_done() { stop_with(self.report) }
-    else if more_work { sleep(self.rate_window).reply(WorkerMsg::Tick) }
+    else if more_work { sleep(self.rate_window).then(WorkerMsg::Tick) }
     else { noop() }
 }
 WorkerMsg::BurstClosed(admitted) => {
@@ -126,5 +126,5 @@ What feels worse:
 
 - **Two messages per job feels heavy.** Each job is one `Submit` and
   one `Tick`; reading `WorkerMsg`'s enum, the rate-limit shape isn't
-  obvious until you see the `sleep(...).reply(Tick)` line. With
+  obvious until you see the `sleep(...).then(Tick)` line. With
   Tokio, `recv().await; sleep().await` is the rate limit textually.

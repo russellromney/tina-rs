@@ -121,7 +121,7 @@ mutable state. This is a real property the type system enforces, not a
 convention. Every comparison so far has reinforced that this is the model's
 core strength.
 
-### `call(addr, msg, timeout).reply(map_outcome)` is honest
+### `call(addr, msg, timeout).then(map_outcome)` is honest
 *Surfaced by:* `specimen_mini_keyspace`.
 
 Request/reply at an isolate boundary reads like what it is: send a message,
@@ -206,7 +206,7 @@ every other comparison can in principle be replayed under seeded faults.
 ### Tina-as-client and Tina-as-server are the same Tina
 *Surfaced by:* `specimen_outbound_fetch`.
 
-`tcp_connect(addr).reply(...)` reads the same as `tcp_bind` and
+`tcp_connect(addr).then(...)` reads the same as `tcp_bind` and
 `tcp_accept` from server comparisons. The `Connected` reply also returns
 both endpoints (`local`, `peer`), where `tokio::net::TcpStream::connect`
 returns just the stream and forces a separate `.local_addr()` call.
@@ -214,7 +214,7 @@ returns just the stream and forces a separate `.local_addr()` call.
 ### `signal_wait` is the whole signal story at the user-code surface
 *Surfaced by:* `specimen_graceful_shutdown`.
 
-`signal_wait("sigint", timeout).reply(SignalMsg::Received)` is one
+`signal_wait("sigint", timeout).then(SignalMsg::Received)` is one
 runtime call. The reply carries the signal name, so a single watcher
 can distinguish "sigint" (graceful) from "sigterm" (forced). The
 shutdown *trigger* is decoupled from the shutdown *effect* — the
@@ -322,7 +322,7 @@ own variant:
   is still app data.
 - `specimen_outbound_http`: per-request `std::sync::mpsc` channel +
   short-lived `Driver` isolate that does `call(client, ...,
-  timeout).reply(Returned)` and forwards the result. The pattern is
+  timeout).then(Returned)` and forwards the result. The pattern is
   the documented bridge between sync host code and isolate-driven
   `call(...)`; small but recurs at every sync-host call site.
 - `specimen_graceful_shutdown`: `Arc<Telemetry>` with four atomics
@@ -419,15 +419,15 @@ We pick 16 because other tests pick 16. Pick 4 and the run silently breaks
 — no compile-time hint, no warning, just dropped messages or deadlock.
 
 `specimen_real_io_chat` exposes the specific *cause* that makes capacities
-load-bearing: every `send_observed(...).reply(...)` outcome comes back
+load-bearing: every `send_observed(...).then(...)` outcome comes back
 through the *requester's* mailbox. A connection isolate that fans out a
 burst of 64 admissions has to absorb 64 reply messages before it can
 finish writing its response. The first draft of that example sized the
 connection mailbox at the obvious "one per concurrent operation" value
 and could not collect enough observed outcomes to make progress; the
 fix was sizing the connection mailbox separately to account for replies.
-This is not unique to `send_observed` — every `call(...).reply(...)`
-and `tcp_*(...).reply(...)` consumes one slot in the requester's
+This is not unique to `send_observed` — every `call(...).then(...)`
+and `tcp_*(...).then(...)` consumes one slot in the requester's
 mailbox when it lands. Mailbox capacity is therefore a function of
 both incoming traffic *and* outstanding outbound continuations, and
 that relationship is implicit.
@@ -452,8 +452,8 @@ match arms for failure modes that effectively never fire.
   store isolate that always replies, the `Timeout` / `Closed` arms
   are unreachable but still have to be matched on every call site
   (`specimen_mini_keyspace`).
-- **`Result<(), CallError>` on `sleep(...).reply(...)`.** Every Tina
-  handler that uses `sleep(...).reply(...)` ends up with a
+- **`Result<(), CallError>` on `sleep(...).then(...)`.** Every Tina
+  handler that uses `sleep(...).then(...)` ends up with a
   `TimerFired(_, Result<(), CallError>)` continuation whose `Err`
   arm is dead code on healthy systems (`specimen_graceful_shutdown`).
   The same will apply to other "rarely fail" runtime calls.
@@ -599,7 +599,7 @@ runtime call" enums.
 [`docs/tina-user-guide/11-ergonomics-checklist.md`](../docs/tina-user-guide/11-ergonomics-checklist.md)
 entry "Continuation messages for runtime calls" pins the canonical
 shape — `Read(Result<Vec<u8>, CallError>)` carrying the runtime-call
-result directly, `.reply(Variant::Read)` passing the variant
+result directly, `.then(Variant::Read)` passing the variant
 constructor, error arms collapsed into one `stop()`. Every specimen
 rewrite uses it.
 
@@ -808,7 +808,7 @@ One line. Cancellation, backpressure, the state machine, and the
 connection lifecycle all live behind `await`.
 
 The Tina side is `call(client, HttpClientMsg::call(target, request),
-timeout).reply(DriverMsg::Returned)` plus the matching arm. The reply
+timeout).then(DriverMsg::Returned)` plus the matching arm. The reply
 arrives as a typed `CallOutcome::{Replied, Full, Closed, Timeout}`,
 so connection-busy and timeout are not silent — they are arms in the
 caller's `match`. Verbose vs. async/await, and that is the trade. The
@@ -841,12 +841,12 @@ reflect the current state, with style-only resolutions noted where
    recursion. **Style resolved:** the
    [ergonomics checklist](../docs/tina-user-guide/11-ergonomics-checklist.md)
    pins `Result<T, CallError>` variants + variant-constructor
-   `.reply(...)`. **Primitive open:** typed continuation aliases
+   `.then(...)`. **Primitive open:** typed continuation aliases
    or a "linear pipeline" combinator that hides the per-step
    variant.
 
 3. **Reply-slot accounting in mailbox sizing.** *Two comparisons.*
-   Every `call(...).reply(...)` and observed send consumes one
+   Every `call(...).then(...)` and observed send consumes one
    slot in the *requester's* mailbox; the chat example wedged on
    this in its first draft. **Partly resolved:** documented in
    `docs/mailbox-capacity.md` with role-based sizing guidance.

@@ -13,7 +13,7 @@ cargo test --manifest-path examples/specimen_pool_cancel_reclaim/Cargo.toml
 
 ## Tina shape
 
-Driver fans out `WAITERS` parallel `call_with_handle(pool, Acquire,
+Driver fans out `WAITERS` parallel `call_cancelable(pool, Acquire,
 ...)`, stores each `CallHandle`, then on `CancelAll` emits
 `cancel_call(handle)` for every parked waiter. The pool's lazy sweep
 on the next handler turn reclaims every closed deferred slot. A

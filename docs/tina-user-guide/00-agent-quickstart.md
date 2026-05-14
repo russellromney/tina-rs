@@ -48,7 +48,7 @@ struct Worker;
 impl Worker {
     fn handle(&mut self, msg: Msg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            Msg::Start => sleep(Duration::from_millis(10)).reply(Msg::Done),
+            Msg::Start => sleep(Duration::from_millis(10)).then(Msg::Done),
             Msg::Done(Ok(())) => noop(),
             Msg::Done(Err(_)) => stop(),
         }
@@ -84,7 +84,7 @@ Caller:
 
 ```rust
 call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
-    .reply(ClientMsg::WorkerReturned)
+    .then(ClientMsg::WorkerReturned)
 ```
 
 Worker:
@@ -109,8 +109,8 @@ Map:
 | `tokio::spawn` | child isolate |
 | `mpsc` | bounded mailbox |
 | socket read/write | runtime call effect |
-| `sleep().await` | `sleep(...).reply(...)` |
-| request then await answer | `call(..., timeout).reply(...)` |
+| `sleep().await` | `sleep(...).then(...)` |
+| request then await answer | `call(..., timeout).then(...)` |
 | `tokio::time::timeout` budget through a chain | `Deadline` value, `ctx.deadline_after(d)` |
 | `JoinSet::abort_all` | `PendingCallSet` + drain + `cancel_call` per handle |
 

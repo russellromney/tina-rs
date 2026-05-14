@@ -7,8 +7,8 @@ the host asks for cancellation before any worker has finished.
 ## What this teaches
 
 Tina's first-form external cancellation primitive is
-`call_with_handle(addr, msg, t).reply(...)` which returns a
-caller-owned `CallHandle`, plus `cancel_call(handle).reply(...)`
+`call_cancelable(addr, msg, t).then(...)` which returns a
+caller-owned `CallHandle`, plus `cancel_call(handle).then(...)`
 which closes the wait. The handle is move-only and not `Clone`: one
 handle, one cancel.
 
@@ -63,4 +63,4 @@ contract is now spelled out in the type rather than buried in a
 ## Findings touched
 
 - See FINDINGS finding 8 (external cancellation API) — Tina now ships
-  the first-form primitive (`call_with_handle` + `cancel_call`).
+  the first-form primitive (`call_cancelable` + `cancel_call`).

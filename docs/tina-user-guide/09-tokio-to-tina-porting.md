@@ -15,10 +15,10 @@ queueing component.
 | `mpsc::channel` | bounded mailbox |
 | unbounded channel | usually a bug or explicit adapter |
 | `select!` | state machine plus runtime call replies |
-| `sleep().await` | `sleep(...).reply(...)` |
-| `tokio::time::interval` | `TimerInterval` state plus `sleep(delay).reply(...)` |
+| `sleep().await` | `sleep(...).then(...)` |
+| `tokio::time::interval` | `TimerInterval` state plus `sleep(delay).then(...)` |
 | socket read/write | `tcp_read` / `tcp_write` effects |
-| request task then await answer | `call(..., timeout).reply(...)` |
+| request task then await answer | `call(..., timeout).then(...)` |
 | retry loop | message state plus `Backoff` and timer |
 | task panic | supervised child stop/restart |
 
@@ -59,8 +59,8 @@ enum ConnMsg {
 impl Conn {
     fn handle(&mut self, msg: ConnMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ConnMsg::Begin => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
-            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).reply(ConnMsg::Wrote),
+            ConnMsg::Begin => tcp_read(self.stream, 4096).then(ConnMsg::Read),
+            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).then(ConnMsg::Wrote),
             ConnMsg::Read(Err(_)) => stop(),
             ConnMsg::Wrote(_) => stop(),
         }
@@ -89,7 +89,7 @@ In Tina, name that policy as state:
 
 ```rust
 let decision = self.interval.next_delay(ctx.now());
-sleep(decision.delay()).reply(move |reply| Msg::Tick(decision.tick_number(), reply))
+sleep(decision.delay()).then(move |reply| Msg::Tick(decision.tick_number(), reply))
 ```
 
 For retries:
@@ -97,7 +97,7 @@ For retries:
 ```rust
 match self.backoff.next_delay_until(ctx.now(), self.deadline) {
     TimerDecision::Sleep(delay) => {
-        sleep(delay.delay()).reply(move |reply| Msg::Retry(delay.attempt(), reply))
+        sleep(delay.delay()).then(move |reply| Msg::Retry(delay.attempt(), reply))
     }
     TimerDecision::DeadlineElapsed | TimerDecision::Exhausted => reply(Failed),
 }

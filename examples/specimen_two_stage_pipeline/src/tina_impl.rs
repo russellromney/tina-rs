@@ -128,7 +128,7 @@ impl Pipeline {
                 self.next_qid += 1;
                 match self.pending.try_capture(ctx, qid) {
                     Ok(()) => call(self.parse, ParseInput(input), STAGE_TIMEOUT)
-                        .reply(move |outcome| PipelineMsg::Parsed(qid, outcome)),
+                        .then(move |outcome| PipelineMsg::Parsed(qid, outcome)),
                     Err(PendingRepliesTryCaptureError::Full) => reply(PipelineReply::Failed),
                     Err(other) => panic!("try_capture: {other:?}"),
                 }
@@ -136,7 +136,7 @@ impl Pipeline {
             PipelineMsg::Parsed(qid, outcome) => match outcome {
                 CallOutcome::Replied(ParseReply::Ok(v)) => {
                     call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
-                        .reply(move |outcome| PipelineMsg::Validated(qid, outcome))
+                        .then(move |outcome| PipelineMsg::Validated(qid, outcome))
                 }
                 CallOutcome::Replied(ParseReply::Failed) => {
                     self.bail(qid, PipelineReply::ParseFailed)
@@ -146,7 +146,7 @@ impl Pipeline {
             PipelineMsg::Validated(qid, outcome) => match outcome {
                 CallOutcome::Replied(ValidateReply::Ok(v)) => {
                     call(self.execute, ExecuteInput(v), STAGE_TIMEOUT)
-                        .reply(move |outcome| PipelineMsg::Executed(qid, outcome))
+                        .then(move |outcome| PipelineMsg::Executed(qid, outcome))
                 }
                 CallOutcome::Replied(ValidateReply::Failed) => {
                     self.bail(qid, PipelineReply::ValidateFailed)
@@ -205,7 +205,7 @@ impl Driver {
                 let calls: Vec<_> = (0..REQUESTS)
                     .map(|i| {
                         call(pipeline, PipelineMsg::Submit(i), STAGE_TIMEOUT)
-                            .reply(DriverMsg::Returned)
+                            .then(DriverMsg::Returned)
                     })
                     .collect();
                 Effect::Batch(calls)

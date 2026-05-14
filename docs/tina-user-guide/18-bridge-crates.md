@@ -160,7 +160,7 @@ publish_svc.call(PublishMsg).await?;
 ### `tina-reqwest-bridge` — Tina → outbound HTTP
 
 A bounded outbound HTTP worker. Tina services call it through the
-normal `call(...).reply(...)` path:
+normal `call(...).then(...)` path:
 
 ```rust
 use tina_reqwest_bridge::{ReqwestAddress, ReqwestCallOutcome, ReqwestRequest, send_request};
@@ -182,7 +182,7 @@ impl Isolate for App {
                 ReqwestRequest::get("https://example.com/"),
                 Duration::from_secs(2),
             )
-            .reply(AppMsg::HttpReturned),
+            .then(AppMsg::HttpReturned),
 
             AppMsg::HttpReturned(outcome) => match outcome {
                 CallOutcome::Replied(Ok(response)) => { /* success */ }
@@ -258,7 +258,7 @@ let bridge = PgWorker::<SingleShard>::install(&runtime, cfg)?;
 // In a handler:
 execute_call(self.db, "INSERT INTO t (k, v) VALUES ($1, $2)",
     vec![1.into(), "hello".into()], Duration::from_secs(2))
-    .reply(AppMsg::Inserted);
+    .then(AppMsg::Inserted);
 ```
 
 Runtime-checked SQLx (`sqlx::query(...)`). No `query!` macros, no
@@ -384,7 +384,7 @@ send_s3(
     }),
     Duration::from_secs(2),
 )
-.reply(AppMsg::S3PutDone);
+.then(AppMsg::S3PutDone);
 ```
 
 The copied raw call shape is:
@@ -400,7 +400,7 @@ call(
     })),
     Duration::from_secs(2),
 )
-.reply(AppMsg::S3PutDone)
+.then(AppMsg::S3PutDone)
 ```
 
 **Operations.**
@@ -482,7 +482,7 @@ send_sqs(
     }),
     Duration::from_secs(2),
 )
-.reply(AppMsg::SqsSendDone);
+.then(AppMsg::SqsSendDone);
 ```
 
 SQS receive names visibility timeout explicitly and never auto-deletes:

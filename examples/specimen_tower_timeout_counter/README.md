@@ -44,7 +44,7 @@ eight requests in parallel via `JoinSet`.
 Service is a registered Tina isolate behind `TinaTowerService`. Each
 request is admitted to the isolate's mailbox; the handler stores the
 `BridgeResponder<BrushReply>` in a `VecDeque` and schedules
-`sleep(SLOW_HANDLER_MS).reply(Done)`. On `Done`, the handler pops the
+`sleep(SLOW_HANDLER_MS).then(Done)`. On `Done`, the handler pops the
 front responder, increments the counter, responds, and either chains
 another `sleep` or goes idle.
 

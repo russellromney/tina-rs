@@ -10,8 +10,8 @@
 //!   attempts via `tokio::time::sleep`.
 //! - Tina: [`tina_reqwest_bridge::ReqwestWorker`] with
 //!   [`tina_reqwest_bridge::RetryPolicy::None`] — no hidden retry — and
-//!   a small `Caller` isolate that drives retry with `sleep(...).reply(...)`
-//!   and `call(...).reply(...)`. Every attempt is one trace event.
+//!   a small `Caller` isolate that drives retry with `sleep(...).then(...)`
+//!   and `call(...).then(...)`. Every attempt is one trace event.
 //!
 //! Both sides produce the same [`Report`].
 //!

@@ -82,7 +82,7 @@ impl Worker {
             WorkerMsg::Work(request) => {
                 let req = call.into_request_context();
                 send_observed(self.audit, AuditMsg::Record(request.key))
-                    .reply(move |outcome| WorkerMsg::AuditedForCall(req, outcome, request))
+                    .then(move |outcome| WorkerMsg::AuditedForCall(req, outcome, request))
             }
             WorkerMsg::Audited(_, _)
             | WorkerMsg::AuditedForCall(_, _, _)
@@ -100,7 +100,7 @@ impl Worker {
     ) -> Effect<Self> {
         match msg {
             WorkerMsg::Work(request) => send_observed(self.audit, AuditMsg::Record(request.key))
-                .reply(move |outcome| WorkerMsg::Audited(outcome, request)),
+                .then(move |outcome| WorkerMsg::Audited(outcome, request)),
             WorkerMsg::Audited(SendOutcome::Accepted, request) => {
                 let index = self.next_index;
                 journal_append(
@@ -108,7 +108,7 @@ impl Worker {
                     index,
                     format!("{}:{}", request.key, request.body).into_bytes(),
                 )
-                .reply(move |result| WorkerMsg::Durable(result, request, index))
+                .then(move |result| WorkerMsg::Durable(result, request, index))
             }
             WorkerMsg::Audited(SendOutcome::Full, _) => {
                 reply(WorkerReply::DurableFailure(CallError::TargetFull))
@@ -123,7 +123,7 @@ impl Worker {
                     index,
                     format!("{}:{}", request.key, request.body).into_bytes(),
                 )
-                .reply(move |result| WorkerMsg::DurableForCall(req, result, request, index))
+                .then(move |result| WorkerMsg::DurableForCall(req, result, request, index))
             }
             WorkerMsg::AuditedForCall(req, SendOutcome::Full, _) => {
                 tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetFull))
@@ -213,7 +213,7 @@ impl Router {
                     WorkerMsg::Work(request.clone()),
                     Duration::from_millis(10),
                 )
-                .reply(move |outcome| RouterMsg::Returned(request, outcome))
+                .then(move |outcome| RouterMsg::Returned(request, outcome))
             }
             RouterMsg::Returned(request, outcome) => {
                 match outcome {

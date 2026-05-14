@@ -80,7 +80,7 @@ impl Isolate for BackgroundDriver {
                 request,
                 timeout,
             } => call(client, HttpClientMsg::call(target, request), timeout)
-                .reply(BackgroundDriverMsg::Returned),
+                .then(BackgroundDriverMsg::Returned),
             BackgroundDriverMsg::Returned(outcome) => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,

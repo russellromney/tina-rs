@@ -30,14 +30,14 @@
 //! The set deliberately does *not* know how to build a [`crate::Effect`]
 //! itself — that would force this crate to depend on the runtime's
 //! `cancel_call`. Instead, drain the set in user code and pair each
-//! handle with a `cancel_call(handle).reply(...)` effect (defined in
+//! handle with a `cancel_call(handle).then(...)` effect (defined in
 //! `tina_runtime`, which this crate cannot import). The shape is:
 //!
 //! ```text
 //! // Inside a handler:
 //! let mut effects = Vec::with_capacity(self.calls.len());
 //! for (_, handle) in self.calls.drain() {
-//!     effects.push(cancel_call(handle).reply(|_| Msg::Cancelled));
+//!     effects.push(cancel_call(handle).then(|_| Msg::Cancelled));
 //! }
 //! batch(effects)
 //! ```
@@ -56,7 +56,7 @@
 //!
 //! fn make_handle<R: 'static>() -> CallHandle<R> {
 //!     // Runtime-internal mint; ordinary user code receives handles
-//!     // from `tina_runtime::call_with_handle(...).reply(...)`.
+//!     // from `tina_runtime::call_cancelable(...).then(...)`.
 //!     let shared = Arc::new(CallHandleShared::new(TypeId::of::<R>()));
 //!     runtime_internal::call_handle_from_shared::<R>(shared)
 //! }
@@ -71,7 +71,7 @@
 //! assert_eq!(calls.len(), 1);
 //!
 //! // Cancel-all path: `drain` empties the set; the user pairs each
-//! // handle with a `cancel_call(...).reply(...)` effect.
+//! // handle with a `cancel_call(...).then(...)` effect.
 //! let drained: Vec<_> = calls.drain().collect();
 //! assert_eq!(drained.len(), 1);
 //! assert!(calls.is_empty());
@@ -245,7 +245,7 @@ where
     /// Empties the set, returning every stored `(key, handle)`.
     ///
     /// The blessed cancel-all pattern: drain the set, then build one
-    /// `cancel_call(handle).reply(...)` effect per entry in user code.
+    /// `cancel_call(handle).then(...)` effect per entry in user code.
     /// The set is empty after this call regardless of how the caller
     /// uses the returned iterator.
     pub fn drain(&mut self) -> std::vec::Drain<'_, (K, CallHandle<R>)> {

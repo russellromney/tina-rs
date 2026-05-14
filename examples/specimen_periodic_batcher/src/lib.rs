@@ -16,7 +16,7 @@
 //!   canonical "wake on either" shape; rearming the timer after each
 //!   flush is one extra line.
 //! - **Tina**: a single isolate. Items arrive as `Submit(item)`
-//!   messages; the timer is a `sleep(...).reply(Tick)` continuation.
+//!   messages; the timer is a `sleep(...).then(Tick)` continuation.
 //!   Cancellation, rearming, and "is a timer in flight?" are all
 //!   handler-local state — no `select!`, no future to drop.
 //!

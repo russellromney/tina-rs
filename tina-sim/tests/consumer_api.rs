@@ -372,8 +372,9 @@ impl Isolate for ObservedSender {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ObservedSenderMsg::Start(target) => send_observed(target, ObservedTargetMsg::Work)
-                .reply(ObservedSenderMsg::SendFinished),
+            ObservedSenderMsg::Start(target) => {
+                send_observed(target, ObservedTargetMsg::Work).then(ObservedSenderMsg::SendFinished)
+            }
             ObservedSenderMsg::SendFinished(outcome) => {
                 self.outcomes
                     .lock()
@@ -523,7 +524,7 @@ impl Isolate for CallerWorker {
     ) -> Effect<Self> {
         match msg {
             CallerMsg::Start(target, request, timeout) => {
-                call(target, request, timeout).reply(CallerMsg::Returned)
+                call(target, request, timeout).then(CallerMsg::Returned)
             }
             CallerMsg::StartAndStop(target) => Effect::Batch(vec![
                 call(
@@ -531,7 +532,7 @@ impl Isolate for CallerWorker {
                     WorkerRequest::ReplyNow,
                     std::time::Duration::from_millis(5),
                 )
-                .reply(CallerMsg::Returned),
+                .then(CallerMsg::Returned),
                 Effect::Stop,
             ]),
             CallerMsg::Filler => Effect::Noop,

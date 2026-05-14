@@ -41,7 +41,7 @@ impl Caller {
             Msg::Begin => {
                 let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.fanout as usize);
                 for _ in 0..self.fanout {
-                    effects.push(sleep(Duration::ZERO).reply(|_| Msg::SleepDone));
+                    effects.push(sleep(Duration::ZERO).then(|_| Msg::SleepDone));
                 }
                 batch(effects)
             }

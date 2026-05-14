@@ -4068,7 +4068,7 @@ where
             tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
             tina::CallHandleState::Pending => {
                 let raw_call_id = handle_shared.call_id().expect(
-                    "cancel_call dispatched before its call_with_handle's effect ran. \
+                    "cancel_call dispatched before its call_cancelable's effect ran. \
                      Issue cancel from a separate handler, or store the handle and \
                      cancel later.",
                 );
@@ -5613,14 +5613,14 @@ mod tests {
                     },
                     4,
                 ))
-                .reply(SimObservedParentMsg::ChildStarted),
+                .then(SimObservedParentMsg::ChildStarted),
                 SimObservedParentMsg::StartInvalid => spawn_observed(ChildDefinition::new(
                     SimObservedChild {
                         seen: Rc::clone(&self.seen),
                     },
                     0,
                 ))
-                .reply(SimObservedParentMsg::ChildStarted),
+                .then(SimObservedParentMsg::ChildStarted),
                 SimObservedParentMsg::ChildStarted(Ok(child)) => {
                     *self.child_ref.borrow_mut() = Some(child);
                     send(child.address, SimObservedChildMsg::Record(7))

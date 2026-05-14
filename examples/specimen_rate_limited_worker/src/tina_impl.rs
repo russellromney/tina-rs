@@ -13,7 +13,7 @@
 //!
 //! - **Bounded mailbox is the data plane.** No internal `VecDeque`
 //!   for queued submits; the runtime mailbox holds them.
-//! - **Rate window via timer continuation.** `sleep(...).reply(Tick)`
+//! - **Rate window via timer continuation.** `sleep(...).then(Tick)`
 //!   is one trace event per processed job. No hidden interval timer.
 //! - **One in-flight Tick at a time.** A `pending` counter inside
 //!   the isolate serializes submits over the rate window — without
@@ -87,7 +87,7 @@ impl Worker {
                 // very first piece of work and false while a Tick is
                 // still racing the rate window.
                 if self.gate.submit() {
-                    sleep(self.rate_window).reply(WorkerMsg::Tick)
+                    sleep(self.rate_window).then(WorkerMsg::Tick)
                 } else {
                     noop()
                 }
@@ -107,7 +107,7 @@ impl Worker {
                     self.report.exit_clean = true;
                     stop_with(self.report)
                 } else if more_work {
-                    sleep(self.rate_window).reply(WorkerMsg::Tick)
+                    sleep(self.rate_window).then(WorkerMsg::Tick)
                 } else {
                     noop()
                 }

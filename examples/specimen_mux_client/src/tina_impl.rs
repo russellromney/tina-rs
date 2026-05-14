@@ -47,18 +47,18 @@ struct MuxClient {
 impl MuxClient {
     fn handle(&mut self, msg: MuxMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            MuxMsg::Begin => tcp_connect(self.target).reply(MuxMsg::Connected),
+            MuxMsg::Begin => tcp_connect(self.target).then(MuxMsg::Connected),
             MuxMsg::Connected(Ok((stream, _local, _peer))) => {
                 self.state.stream = Some(stream);
                 let mut payload = Vec::new();
                 for &id in &REQUEST_IDS {
                     payload.extend_from_slice(format!("REQ {id}\n").as_bytes());
                 }
-                tcp_write(stream, payload).reply(MuxMsg::Wrote)
+                tcp_write(stream, payload).then(MuxMsg::Wrote)
             }
             MuxMsg::Wrote(Ok(_)) => {
                 let stream = self.state.stream.expect("stream set after connect");
-                tcp_read(stream, 4096).reply(MuxMsg::Read)
+                tcp_read(stream, 4096).then(MuxMsg::Read)
             }
             MuxMsg::Read(Ok(bytes)) => {
                 self.state.read_buf.extend_from_slice(&bytes);
@@ -74,9 +74,9 @@ impl MuxClient {
                 }
                 let stream = self.state.stream.expect("stream set after connect");
                 if self.state.arrivals.len() >= self.expected {
-                    tcp_close_stream(stream).reply(MuxMsg::Closed)
+                    tcp_close_stream(stream).then(MuxMsg::Closed)
                 } else {
-                    tcp_read(stream, 4096).reply(MuxMsg::Read)
+                    tcp_read(stream, 4096).then(MuxMsg::Read)
                 }
             }
             MuxMsg::Closed(Ok(())) => stop_with(std::mem::take(&mut self.state.arrivals)),

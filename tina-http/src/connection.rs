@@ -581,7 +581,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         self.head_deadline_armed = true;
         let generation = self.request_generation;
         let deadline_effect: Effect<Self> = sleep(deadline)
-            .reply(move |result| HttpConnectionMsg::HeaderDeadline { generation, result });
+            .then(move |result| HttpConnectionMsg::HeaderDeadline { generation, result });
         let read_effect: Effect<Self> = self.read_more();
         batch(vec![read_effect, deadline_effect])
     }
@@ -622,10 +622,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn read_more(&mut self) -> Effect<Self> {
         match self.transport {
             HttpTransport::Tcp(stream) => {
-                tcp_read(stream, READ_CHUNK).reply(HttpConnectionMsg::Read)
+                tcp_read(stream, READ_CHUNK).then(HttpConnectionMsg::Read)
             }
             HttpTransport::Tls(stream) => {
-                tls_read(stream, READ_CHUNK, self.tls_io_timeout).reply(HttpConnectionMsg::Read)
+                tls_read(stream, READ_CHUNK, self.tls_io_timeout).then(HttpConnectionMsg::Read)
             }
         }
     }
@@ -859,7 +859,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             }
         };
         call(self.service, M::from(request), self.service_call_timeout)
-            .reply(HttpConnectionMsg::ServiceReturned)
+            .then(HttpConnectionMsg::ServiceReturned)
     }
 
     /// Returns the shard id for self. The dispatch path needs this to
@@ -885,7 +885,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     ///   from the socket, issue a `tcp_read` and let the
     ///   `BodyChunkRead` continuation answer the service. The outer
     ///   call context (this `RequestBodyNext` call) propagates through
-    ///   the `.reply(...)` chain, so a later `Effect::Reply` reaches
+    ///   the `.then(...)` chain, so a later `Effect::Reply` reaches
     ///   this caller.
     /// - If the buffer is empty and the full body has been delivered,
     ///   reply `Eof`.
@@ -929,10 +929,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
         match self.transport {
             HttpTransport::Tcp(stream) => {
-                tcp_read(stream, want).reply(HttpConnectionMsg::BodyChunkRead)
+                tcp_read(stream, want).then(HttpConnectionMsg::BodyChunkRead)
             }
             HttpTransport::Tls(stream) => {
-                tls_read(stream, want, self.tls_io_timeout).reply(HttpConnectionMsg::BodyChunkRead)
+                tls_read(stream, want, self.tls_io_timeout).then(HttpConnectionMsg::BodyChunkRead)
             }
         }
     }
@@ -1007,11 +1007,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         }
                         return match self.transport {
                             HttpTransport::Tcp(stream) => {
-                                tcp_read(stream, next_want).reply(HttpConnectionMsg::BodyChunkRead)
+                                tcp_read(stream, next_want).then(HttpConnectionMsg::BodyChunkRead)
                             }
                             HttpTransport::Tls(stream) => {
                                 tls_read(stream, next_want, self.tls_io_timeout)
-                                    .reply(HttpConnectionMsg::BodyChunkRead)
+                                    .then(HttpConnectionMsg::BodyChunkRead)
                             }
                         };
                     }
@@ -1124,9 +1124,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn write_pending(&mut self) -> Effect<Self> {
         let bytes = self.pending_response.clone();
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).reply(HttpConnectionMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).then(HttpConnectionMsg::Wrote),
             HttpTransport::Tls(stream) => {
-                tls_write(stream, bytes, self.tls_io_timeout).reply(HttpConnectionMsg::Wrote)
+                tls_write(stream, bytes, self.tls_io_timeout).then(HttpConnectionMsg::Wrote)
             }
         }
     }
@@ -1230,12 +1230,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
     }
 
-    /// Issues a `call(source, Next, t).reply(StreamChunk)` to pull the
+    /// Issues a `call(source, Next, t).then(StreamChunk)` to pull the
     /// next chunk of a streamed response.
     fn pull_next_chunk(&mut self) -> Effect<Self> {
         let source = self.stream_source.expect("stream source set");
         call(source, ResponseChunkMsg::Next, self.stream_call_timeout)
-            .reply(HttpConnectionMsg::StreamChunk)
+            .then(HttpConnectionMsg::StreamChunk)
     }
 
     fn handle_stream_chunk(&mut self, outcome: CallOutcome<ResponseChunkReply>) -> Effect<Self> {
@@ -1395,7 +1395,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 // connection can stop without leaking the call.
                 Duration::from_millis(1),
             )
-            .reply(HttpConnectionMsg::StreamSourceCancelDone),
+            .then(HttpConnectionMsg::StreamSourceCancelDone),
         )
     }
 
@@ -1410,9 +1410,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         // specific error path; duplicating here is harmless.
         let cancel = self.cancel_stream_source();
         let close = match self.transport {
-            HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpConnectionMsg::Closed),
+            HttpTransport::Tcp(stream) => tcp_close_stream(stream).then(HttpConnectionMsg::Closed),
             HttpTransport::Tls(stream) => {
-                tls_close(stream, self.tls_io_timeout).reply(HttpConnectionMsg::Closed)
+                tls_close(stream, self.tls_io_timeout).then(HttpConnectionMsg::Closed)
             }
         };
         match cancel {
@@ -1432,9 +1432,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             return self.websocket_protocol_close(WebSocketError::ReadBufferTooLarge);
         }
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_read(stream, max).reply(HttpConnectionMsg::Read),
+            HttpTransport::Tcp(stream) => tcp_read(stream, max).then(HttpConnectionMsg::Read),
             HttpTransport::Tls(stream) => {
-                tls_read(stream, max, self.tls_io_timeout).reply(HttpConnectionMsg::Read)
+                tls_read(stream, max, self.tls_io_timeout).then(HttpConnectionMsg::Read)
             }
         }
     }
@@ -1674,7 +1674,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let Some(ws) = self.websocket.as_ref() else {
             return self.begin_close();
         };
-        call(ws.app, msg, self.service_call_timeout).reply(HttpConnectionMsg::WebSocketAppReturned)
+        call(ws.app, msg, self.service_call_timeout).then(HttpConnectionMsg::WebSocketAppReturned)
     }
 
     fn call_websocket_app_many(&mut self, mut msgs: Vec<WebSocketSessionMsg>) -> Effect<Self> {
@@ -1941,9 +1941,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         };
         let bytes = ws.pending_write.clone();
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).reply(HttpConnectionMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).then(HttpConnectionMsg::Wrote),
             HttpTransport::Tls(stream) => {
-                tls_write(stream, bytes, self.tls_io_timeout).reply(HttpConnectionMsg::Wrote)
+                tls_write(stream, bytes, self.tls_io_timeout).then(HttpConnectionMsg::Wrote)
             }
         }
     }
@@ -2000,7 +2000,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         ws.close_generation = ws.close_generation.saturating_add(1);
         let generation = ws.close_generation;
         sleep(ws.limits.close_handshake_timeout)
-            .reply(move |result| HttpConnectionMsg::WebSocketCloseDeadline { generation, result })
+            .then(move |result| HttpConnectionMsg::WebSocketCloseDeadline { generation, result })
     }
 
     fn arm_websocket_pong_deadline(&mut self) -> Effect<Self> {
@@ -2011,7 +2011,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let generation = ws.ping_generation;
         ws.awaiting_pong_generation = Some(generation);
         sleep(ws.limits.ping_pong_timeout)
-            .reply(move |result| HttpConnectionMsg::WebSocketPongDeadline { generation, result })
+            .then(move |result| HttpConnectionMsg::WebSocketPongDeadline { generation, result })
     }
 
     fn handle_websocket_close_deadline(&mut self, generation: u64) -> Effect<Self> {

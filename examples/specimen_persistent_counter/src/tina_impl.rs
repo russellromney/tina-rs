@@ -88,7 +88,7 @@ impl Counter {
     fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             CounterMsg::Recover { op } => snapshot_load(self.snapshot_path.clone())
-                .reply(move |result| CounterMsg::SnapshotLoaded { op, result }),
+                .then(move |result| CounterMsg::SnapshotLoaded { op, result }),
             CounterMsg::SnapshotLoaded {
                 op,
                 result: Ok(Some(snapshot)),
@@ -96,13 +96,13 @@ impl Counter {
                 self.state.value = decode_u64(&snapshot.bytes);
                 self.state.last_journal_index = snapshot.last_journal_index;
                 journal_replay(self.journal_path.clone())
-                    .reply(move |result| CounterMsg::JournalLoaded { op, result })
+                    .then(move |result| CounterMsg::JournalLoaded { op, result })
             }
             CounterMsg::SnapshotLoaded {
                 op,
                 result: Ok(None),
             } => journal_replay(self.journal_path.clone())
-                .reply(move |result| CounterMsg::JournalLoaded { op, result }),
+                .then(move |result| CounterMsg::JournalLoaded { op, result }),
             CounterMsg::JournalLoaded {
                 op,
                 result: Ok(replay),
@@ -124,7 +124,7 @@ impl Counter {
                     next_index,
                     encode_u64(next_value),
                 )
-                .reply(move |result| CounterMsg::AppendDurable {
+                .then(move |result| CounterMsg::AppendDurable {
                     op,
                     index: next_index,
                     value: next_value,
@@ -149,7 +149,7 @@ impl Counter {
                 let last_index = self.state.last_journal_index;
                 let value = self.state.value;
                 snapshot_commit(self.snapshot_path.clone(), encode_u64(value), last_index)
-                    .reply(move |result| CounterMsg::SnapshotCommitted { op, result })
+                    .then(move |result| CounterMsg::SnapshotCommitted { op, result })
             }
             CounterMsg::SnapshotCommitted { op, result: Ok(()) } => {
                 self.publish(op);

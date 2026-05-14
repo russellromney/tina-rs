@@ -195,12 +195,10 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Fire(sink) => send(sink, SinkMsg::Hit),
-            DriverMsg::Observe(sink) => {
-                send_observed(sink, SinkMsg::Hit).reply(DriverMsg::Observed)
-            }
+            DriverMsg::Observe(sink) => send_observed(sink, SinkMsg::Hit).then(DriverMsg::Observed),
             DriverMsg::ObserveTwice(sink) => batch(vec![
-                send_observed(sink, SinkMsg::Hit).reply(DriverMsg::Observed),
-                send_observed(sink, SinkMsg::Hit).reply(DriverMsg::Observed),
+                send_observed(sink, SinkMsg::Hit).then(DriverMsg::Observed),
+                send_observed(sink, SinkMsg::Hit).then(DriverMsg::Observed),
             ]),
             DriverMsg::Observed(outcome) => {
                 let event = if outcome.is_accepted() {
@@ -283,10 +281,10 @@ impl Client {
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Ask(worker, request, timeout) => {
-                call(worker, request, timeout).reply(ClientMsg::Returned)
+                call(worker, request, timeout).then(ClientMsg::Returned)
             }
             ClientMsg::AskThenStop(worker) => batch(vec![
-                call(worker, WorkReq::Reply, Duration::from_millis(10)).reply(ClientMsg::Returned),
+                call(worker, WorkReq::Reply, Duration::from_millis(10)).then(ClientMsg::Returned),
                 stop(),
             ]),
             ClientMsg::Fill => noop(),
@@ -534,9 +532,9 @@ impl ChatRoom {
         match msg {
             ChatRoomMsg::Burst(client) => batch(vec![
                 send_observed(client, ChatClientMsg::Deliver("delivered"))
-                    .reply(ChatRoomMsg::Delivered),
+                    .then(ChatRoomMsg::Delivered),
                 send_observed(client, ChatClientMsg::Deliver("overflow"))
-                    .reply(ChatRoomMsg::Delivered),
+                    .then(ChatRoomMsg::Delivered),
             ]),
             ChatRoomMsg::Delivered(outcome) => {
                 let event = if outcome.is_accepted() {

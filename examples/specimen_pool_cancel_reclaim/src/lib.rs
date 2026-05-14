@@ -4,7 +4,7 @@
 //! Capacity 1, max_waiters 4. The driver:
 //!
 //! 1. Acquires once (gets the resource).
-//! 2. Fires `WAITERS` more acquires with `call_with_handle` — they
+//! 2. Fires `WAITERS` more acquires with `call_cancelable` — they
 //!    park.
 //! 3. Sends `CancelAll` — fires `cancel_call(handle)` for every
 //!    parked waiter.

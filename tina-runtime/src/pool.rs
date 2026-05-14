@@ -1,7 +1,7 @@
 //! Bounded worker pool isolate.
 //!
-//! Caller acquires with `call_with_handle(pool, WorkerPoolMsg::Acquire,
-//! timeout).reply(...)` and stores the [`tina::CallHandle`] to be able
+//! Caller acquires with `call_cancelable(pool, WorkerPoolMsg::Acquire,
+//! timeout).then(...)` and stores the [`tina::CallHandle`] to be able
 //! to cancel the wait. `cancel_call(handle)` closes the caller-side
 //! wait and marks the pool's deferred slot `Closed`. The pool sweeps
 //! closed waiter slots on every incoming message; cancelled / timed-out
@@ -612,7 +612,7 @@ where
 
 /// Build an [`Effect`] that acquires a resource from the pool.
 ///
-/// Sugar over `call(pool, WorkerPoolMsg::Acquire, timeout).reply(...)`.
+/// Sugar over `call(pool, WorkerPoolMsg::Acquire, timeout).then(...)`.
 /// The translator receives the raw
 /// `CallOutcome<WorkerPoolReply<H>>` so callers can inspect both the
 /// transport layer (`Full` / `Closed` / `Timeout` from the runtime)
@@ -634,7 +634,7 @@ where
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
-    crate::call::call(pool, WorkerPoolMsg::Acquire, timeout).reply(translator)
+    crate::call::call(pool, WorkerPoolMsg::Acquire, timeout).then(translator)
 }
 
 /// Build an [`Effect`] that acquires a resource and folds the
@@ -681,12 +681,12 @@ where
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
-    crate::call::call_with_handle(pool, WorkerPoolMsg::Acquire, timeout).reply(translator)
+    crate::call::call_cancelable(pool, WorkerPoolMsg::Acquire, timeout).then(translator)
 }
 
 /// Build an [`Effect`] that releases a lease back to the pool.
 ///
-/// Sugar over `call(pool, WorkerPoolMsg::Release { ... }, timeout).reply(...)`.
+/// Sugar over `call(pool, WorkerPoolMsg::Release { ... }, timeout).then(...)`.
 /// The translator receives the raw
 /// `CallOutcome<WorkerPoolReply<H>>`. No drop-magic, no hidden
 /// retry. Pool address and disposition are visible at the call site.
@@ -706,8 +706,7 @@ where
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
-    crate::call::call(pool, WorkerPoolMsg::Release { lease, disposition }, timeout)
-        .reply(translator)
+    crate::call::call(pool, WorkerPoolMsg::Release { lease, disposition }, timeout).then(translator)
 }
 
 /// Build an [`Effect`] that releases a lease and folds the layered
@@ -740,7 +739,7 @@ where
     })
 }
 
-/// Sugar for `call(pool, WorkerPoolMsg::PressureReport, timeout).reply(...)`.
+/// Sugar for `call(pool, WorkerPoolMsg::PressureReport, timeout).then(...)`.
 pub fn pressure_effect<I, H, F, M>(
     pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
     timeout: std::time::Duration,
@@ -752,7 +751,7 @@ where
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
-    crate::call::call(pool, WorkerPoolMsg::PressureReport, timeout).reply(translator)
+    crate::call::call(pool, WorkerPoolMsg::PressureReport, timeout).then(translator)
 }
 
 /// Fold a pool acquire reply into `Result<PoolLease<H>, AcquireFailure>`.
@@ -823,7 +822,7 @@ where
     }
 }
 
-/// Sugar for `call(pool, WorkerPoolMsg::Close(mode), timeout).reply(...)`.
+/// Sugar for `call(pool, WorkerPoolMsg::Close(mode), timeout).then(...)`.
 pub fn close_effect<I, H, F, M>(
     pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
     mode: CloseMode,
@@ -836,7 +835,7 @@ where
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
-    crate::call::call(pool, WorkerPoolMsg::Close(mode), timeout).reply(translator)
+    crate::call::call(pool, WorkerPoolMsg::Close(mode), timeout).then(translator)
 }
 
 // Manual Isolate impl: message and reply types are generic over H,

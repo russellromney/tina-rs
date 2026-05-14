@@ -165,7 +165,7 @@ where
                 target,
                 message,
                 timeout,
-            } => call(target, message, timeout).reply(HostCallMsg::Returned),
+            } => call(target, message, timeout).then(HostCallMsg::Returned),
             HostCallMsg::Returned(outcome) => {
                 let _ = self.sender.send(outcome);
                 tina::stop()
@@ -900,7 +900,7 @@ where
     ///
     /// This is a host convenience for tests, specimens, and setup code that
     /// would otherwise need a one-off driver isolate just to issue
-    /// `call(address, message, timeout).reply(...)`. It still uses the normal
+    /// `call(address, message, timeout).then(...)`. It still uses the normal
     /// Tina call path internally: `Full`, `Closed`, and `Timeout` stay visible
     /// as [`CallOutcome`] values, and accepted work is not cancelled by
     /// dropping the host-side wait.
@@ -913,7 +913,7 @@ where
     ///   message before handing control to a larger system.
     ///
     /// **Do not call from inside an isolate handler.** Handlers must stay
-    /// synchronous and non-blocking; use `call(...).reply(...)` instead.
+    /// synchronous and non-blocking; use `call(...).then(...)` instead.
     ///
     /// # Example
     ///

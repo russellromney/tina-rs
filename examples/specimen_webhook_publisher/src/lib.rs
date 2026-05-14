@@ -3,7 +3,7 @@
 //! `tina-reqwest-bridge` and demonstrates three call-site shapes
 //! side-by-side:
 //!
-//! 1. `send_request(...).reply(...)` — the polished helper.
+//! 1. `send_request(...).then(...)` — the polished helper.
 //! 2. literal `call(addr, ReqwestMsg::Send(...), ...)` — the raw
 //!    layered form, retained so the underlying contract is exercised.
 //! 3. `flatten_outcome(...)` inside the reply translator — the

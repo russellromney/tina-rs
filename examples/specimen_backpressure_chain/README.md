@@ -56,12 +56,12 @@ their own `now`:
 let deadline = ctx.deadline_after(self.budget);
 call(self.b_addr, BMsg::Forward { iteration, deadline },
      self.budget + Duration::from_millis(50))     // outer slack
-    .reply(AMsg::BDone)
+    .then(AMsg::BDone)
 
 // B → C, with whatever budget remains at B's now
 let timeout = deadline.remaining_or_zero(ctx.now());
 call(self.c_addr, CMsg::Compute { iteration }, timeout)
-    .reply(BMsg::CDone)
+    .then(BMsg::CDone)
 ```
 
 When C is too slow, B's `IsolateCall` to C resolves as

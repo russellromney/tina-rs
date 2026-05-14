@@ -74,7 +74,7 @@ impl Isolate for SlowIsolate {
             SlowMsg::Request(req) => {
                 let (value, responder) = req.into_parts();
                 let delay = self.delay;
-                tina_runtime::sleep(delay).reply(move |_| SlowMsg::Done(value, responder))
+                tina_runtime::sleep(delay).then(move |_| SlowMsg::Done(value, responder))
             }
             SlowMsg::Done(value, responder) => {
                 let _ = responder.respond(value * 2);

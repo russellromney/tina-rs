@@ -9,7 +9,7 @@
 //! - **Tokio**: the service is `tower::service_fn` calling an
 //!   in-process `Arc<Mutex<Counter>>`; sleep is `tokio::sleep`.
 //! - **Tina**: the service is a registered Tina isolate behind
-//!   `TinaTowerService`. The slow work is `sleep(...).reply(Done)`
+//!   `TinaTowerService`. The slow work is `sleep(...).then(Done)`
 //!   inside the isolate; admission backpressure surfaces as
 //!   `BridgeError::Full`, drain truth as `BridgeError::Closed`.
 //!

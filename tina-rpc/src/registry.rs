@@ -321,7 +321,7 @@ where
             ServiceCall { method, payload },
             self.config.service_call_timeout,
         )
-        .reply(RegistryMsg::ServiceResult)
+        .then(RegistryMsg::ServiceResult)
     }
 
     fn finish(&mut self, outcome: CallOutcome<ServiceReply>) -> Effect<Self> {

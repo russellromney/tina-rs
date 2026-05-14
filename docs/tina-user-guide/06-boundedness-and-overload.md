@@ -94,7 +94,7 @@ impl Producer {
                 (0..n)
                     .map(|i| {
                         send_observed(self.consumer, ConsumerMsg::Item(i))
-                            .reply(ProducerMsg::Sent)
+                            .then(ProducerMsg::Sent)
                     })
                     .collect(),
             ),
@@ -141,7 +141,7 @@ Request/reply uses timeout:
 
 ```rust
 call(worker, WorkerMsg::Run(job), Duration::from_millis(20))
-    .reply(ClientMsg::Done)
+    .then(ClientMsg::Done)
 ```
 
 Handle timeout as normal behavior.

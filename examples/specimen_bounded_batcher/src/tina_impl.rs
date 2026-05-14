@@ -63,7 +63,7 @@ impl Batcher {
                             let g = self.timer_gen;
                             self.pending_timer_gen = Some(g);
                             return sleep(self.interval)
-                                .reply(move |reply| BatcherMsg::Tick(g, reply));
+                                .then(move |reply| BatcherMsg::Tick(g, reply));
                         }
                         noop()
                     }
@@ -139,7 +139,7 @@ impl Driver {
                     .enumerate()
                     .map(|(i, item)| {
                         call(batcher, BatcherMsg::Submit(item), CALL_TIMEOUT)
-                            .reply(move |outcome| DriverMsg::Returned(i, outcome))
+                            .then(move |outcome| DriverMsg::Returned(i, outcome))
                     })
                     .collect();
                 Effect::Batch(calls)

@@ -56,10 +56,9 @@ impl Isolate for Probe {
 
     fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            ProbeMsg::Request => {
-                let req = call.into_request_context();
-                sleep(Duration::from_millis(self.delay_ms)).reply(move |_| ProbeMsg::SleepDone(req))
-            }
+            ProbeMsg::Request => call
+                .defer(sleep(Duration::from_millis(self.delay_ms)))
+                .reply(|req, _| ProbeMsg::SleepDone(req)),
             ProbeMsg::SleepDone(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
@@ -103,10 +102,9 @@ impl Isolate for Db {
 
     fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            DbMsg::Request => {
-                let req = call.into_request_context();
-                sleep(Duration::from_millis(self.delay_ms)).reply(move |_| DbMsg::SleepDone(req))
-            }
+            DbMsg::Request => call
+                .defer(sleep(Duration::from_millis(self.delay_ms)))
+                .reply(|req, _| DbMsg::SleepDone(req)),
             DbMsg::SleepDone(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
@@ -149,7 +147,7 @@ impl Isolate for Service {
             ServiceMsg::Start => noop(),
             ServiceMsg::ProbeResult(req, CallOutcome::Replied(_)) => {
                 call(self.db, DbMsg::Request, Duration::from_millis(50))
-                    .reply_with_request(req, ServiceMsg::DbResult)
+                    .then_with_request(req, ServiceMsg::DbResult)
             }
             ServiceMsg::ProbeResult(req, _) => reply_to_request(req, ServiceReply::NotReady),
             ServiceMsg::DbResult(req, CallOutcome::Replied(_)) => {
@@ -161,11 +159,13 @@ impl Isolate for Service {
 
     fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            ServiceMsg::Start => {
-                let req = call_ctx.into_request_context();
-                call(self.probe, ProbeMsg::Request, Duration::from_millis(50))
-                    .reply_with_request(req, ServiceMsg::ProbeResult)
-            }
+            ServiceMsg::Start => call_ctx
+                .defer(call(
+                    self.probe,
+                    ProbeMsg::Request,
+                    Duration::from_millis(50),
+                ))
+                .reply(ServiceMsg::ProbeResult),
             ServiceMsg::ProbeResult(_, _) | ServiceMsg::DbResult(_, _) => {
                 call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
@@ -204,7 +204,7 @@ impl Isolate for Client {
         match msg {
             ClientMsg::Start(svc) => {
                 call(svc, ServiceMsg::Start, Duration::from_millis(100))
-                    .reply(ClientMsg::Returned)
+                    .then(ClientMsg::Returned)
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::Ready)) => {
                 self.replies.borrow_mut().push(String::from("ready"));

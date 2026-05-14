@@ -399,7 +399,7 @@ impl Isolate for HelperIntervalSleeper {
                         fired: false,
                     });
                 sleep(decision.delay())
-                    .reply(move |reply| HelperIntervalMsg::Tick(tick_number, reply))
+                    .then(move |reply| HelperIntervalMsg::Tick(tick_number, reply))
             }
             HelperIntervalMsg::Tick(tick_number, reply) => {
                 reply.expect("sim sleep should fire");

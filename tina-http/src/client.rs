@@ -5,7 +5,7 @@
 //!
 //! ```rust,ignore
 //! call(http_client, HttpClientMsg::call(target, request), timeout)
-//!     .reply(MyMsg::HttpReturned)
+//!     .then(MyMsg::HttpReturned)
 //! ```
 //!
 //! One request at a time. A new `Call` while busy replies
@@ -138,7 +138,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
             HttpClientMsg::Connected(Ok((stream, _local, _peer))) => {
                 let Some(state) = self.state.as_mut() else {
                     // Previous call already ended; close the dangling stream.
-                    return tcp_close_stream(stream).reply(HttpClientMsg::Closed);
+                    return tcp_close_stream(stream).then(HttpClientMsg::Closed);
                 };
                 state.transport = Some(HttpTransport::Tcp(stream));
                 state.pending_write = state.request_bytes.clone();
@@ -149,7 +149,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
             HttpClientMsg::TlsConnected(Ok(stream)) => {
                 let Some(state) = self.state.as_mut() else {
                     return tls_close(stream, self.config.request_timeout)
-                        .reply(HttpClientMsg::Closed);
+                        .then(HttpClientMsg::Closed);
                 };
                 state.transport = Some(HttpTransport::Tls(stream));
                 state.pending_write = state.request_bytes.clone();
@@ -235,7 +235,7 @@ impl<S: Shard + 'static> HttpClient<S> {
             reply_to,
         });
         let connect_effect: Effect<Self> = match target {
-            HttpTarget::Http { addr, .. } => tcp_connect(addr).reply(HttpClientMsg::Connected),
+            HttpTarget::Http { addr, .. } => tcp_connect(addr).then(HttpClientMsg::Connected),
             HttpTarget::Https {
                 addr,
                 server_name,
@@ -247,10 +247,10 @@ impl<S: Shard + 'static> HttpClient<S> {
                 trust_roots.root_certificates_der,
                 self.config.request_timeout,
             )
-            .reply(HttpClientMsg::TlsConnected),
+            .then(HttpClientMsg::TlsConnected),
         };
         let deadline_effect: Effect<Self> =
-            sleep(self.config.request_timeout).reply(HttpClientMsg::Deadline);
+            sleep(self.config.request_timeout).then(HttpClientMsg::Deadline);
         batch(vec![connect_effect, deadline_effect])
     }
 
@@ -273,9 +273,9 @@ impl<S: Shard + 'static> HttpClient<S> {
         let transport = state.transport.expect("transport set before write");
         let bytes = state.pending_write.clone();
         match transport {
-            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).reply(HttpClientMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).then(HttpClientMsg::Wrote),
             HttpTransport::Tls(stream) => {
-                tls_write(stream, bytes, self.config.request_timeout).reply(HttpClientMsg::Wrote)
+                tls_write(stream, bytes, self.config.request_timeout).then(HttpClientMsg::Wrote)
             }
         }
     }
@@ -300,9 +300,9 @@ impl<S: Shard + 'static> HttpClient<S> {
         let state = self.state.as_ref().expect("state present during read");
         let transport = state.transport.expect("transport set before read");
         match transport {
-            HttpTransport::Tcp(stream) => tcp_read(stream, READ_CHUNK).reply(HttpClientMsg::Read),
+            HttpTransport::Tcp(stream) => tcp_read(stream, READ_CHUNK).then(HttpClientMsg::Read),
             HttpTransport::Tls(stream) => {
-                tls_read(stream, READ_CHUNK, self.config.request_timeout).reply(HttpClientMsg::Read)
+                tls_read(stream, READ_CHUNK, self.config.request_timeout).then(HttpClientMsg::Read)
             }
         }
     }
@@ -410,9 +410,9 @@ impl<S: Shard + 'static> HttpClient<S> {
             return reply_effect;
         };
         let close_effect: Effect<Self> = match transport {
-            HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpClientMsg::Closed),
+            HttpTransport::Tcp(stream) => tcp_close_stream(stream).then(HttpClientMsg::Closed),
             HttpTransport::Tls(stream) => {
-                tls_close(stream, self.config.request_timeout).reply(HttpClientMsg::Closed)
+                tls_close(stream, self.config.request_timeout).then(HttpClientMsg::Closed)
             }
         };
         batch(vec![reply_effect, close_effect])

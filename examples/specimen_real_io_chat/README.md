@@ -83,14 +83,14 @@ What feels better:
 What feels worse:
 
 - **Tina's setup has more pieces.** Three isolates (SlowClient,
-  Connection, Listener) plus the `send_observed(...).reply(...)`
+  Connection, Listener) plus the `send_observed(...).then(...)`
   fanout pattern. Tokio is one async block with a `for` loop and a
   channel. Each Tina piece is small (047 retired the mailbox-factory
   and per-shard-type boilerplate, and `runtime.observe_next_bound()`
   retired the `Arc<Mutex<Option<SocketAddr>>>` side channel) but
   there are more of them.
 - **The `send_observed` ceremony.** Fanout that wants admission
-  outcomes is `batch((0..N).map(|i| send_observed(...).reply(...)).collect())`
+  outcomes is `batch((0..N).map(|i| send_observed(...).then(...)).collect())`
   plus a per-message `Observed(SendOutcome)` arm in the Connection.
   Clear, but verbose for a "broadcast to subscribers" shape.
 - **The connection mailbox sizing rule.** Each `send_observed` reply

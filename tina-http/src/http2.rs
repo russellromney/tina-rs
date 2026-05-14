@@ -14,7 +14,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 use tina::prelude::*;
 use tina::reply_to_request;
 use tina_runtime::{
-    CallError, CallOutcome, ListenerId, StreamId, call, call_with_handle, cancel_call, tcp_accept,
+    CallError, CallOutcome, ListenerId, StreamId, call, call_cancelable, cancel_call, tcp_accept,
     tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
@@ -671,7 +671,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
     fn read_more(&mut self) -> Effect<Self> {
-        tcp_read(self.stream, READ_CHUNK).reply(Http2ConnectionMsg::Read)
+        tcp_read(self.stream, READ_CHUNK).then(Http2ConnectionMsg::Read)
     }
 
     fn write_more(&mut self) -> Effect<Self> {
@@ -686,11 +686,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             return noop();
         }
-        tcp_write(self.stream, self.pending_write.clone()).reply(Http2ConnectionMsg::Wrote)
+        tcp_write(self.stream, self.pending_write.clone()).then(Http2ConnectionMsg::Wrote)
     }
 
     fn close_now(&mut self) -> Effect<Self> {
-        tcp_close_stream(self.stream).reply(Http2ConnectionMsg::Closed)
+        tcp_close_stream(self.stream).then(Http2ConnectionMsg::Closed)
     }
 
     fn begin_goaway_shutdown(&mut self) -> Effect<Self> {
@@ -1005,7 +1005,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             if let Some(handle) = stream.pending_call.take() {
                 let stream_id = frame.stream_id;
-                effects.push(cancel_call(handle).reply(move |outcome| {
+                effects.push(cancel_call(handle).then(move |outcome| {
                     Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
                 }));
             }
@@ -1017,7 +1017,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                         ResponseChunkMsg::Cancel,
                         self.limits.response_stream_call_timeout,
                     )
-                    .reply(move |outcome| {
+                    .then(move |outcome| {
                         Http2ConnectionMsg::StreamSourceCancelDone { stream_id, outcome }
                     }),
                 );
@@ -1064,8 +1064,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(window_update_frame(stream_id, consumed as u32))?;
         }
         let (effect, handle) =
-            call_with_handle(self.service, M::from(request), self.service_call_timeout)
-                .reply(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
+            call_cancelable(self.service, M::from(request), self.service_call_timeout)
+                .then(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
         if let Some(idx) = self.find_stream(stream_id) {
             self.streams[idx].pending_call = Some(handle);
         }
@@ -1113,8 +1113,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }),
         };
         let (effect, handle) =
-            call_with_handle(self.service, M::from(request), self.service_call_timeout)
-                .reply(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
+            call_cancelable(self.service, M::from(request), self.service_call_timeout)
+                .then(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
         if let Some(idx) = self.find_stream(stream_id) {
             self.streams[idx].pending_call = Some(handle);
         }
@@ -1330,7 +1330,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             ResponseChunkMsg::Next,
             self.limits.response_stream_call_timeout,
         )
-        .reply(move |outcome| Http2ConnectionMsg::StreamChunk { stream_id, outcome })
+        .then(move |outcome| Http2ConnectionMsg::StreamChunk { stream_id, outcome })
     }
 
     fn flush_pending_responses(&mut self) -> Result<(), Http2ProtocolError> {
@@ -1524,7 +1524,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 ));
             }
             if let Some(handle) = stream.pending_call.take() {
-                effects.push(cancel_call(handle).reply(move |outcome| {
+                effects.push(cancel_call(handle).then(move |outcome| {
                     Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
                 }));
             }
@@ -1535,7 +1535,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                         ResponseChunkMsg::Cancel,
                         self.limits.response_stream_call_timeout,
                     )
-                    .reply(move |outcome| {
+                    .then(move |outcome| {
                         Http2ConnectionMsg::StreamSourceCancelDone { stream_id, outcome }
                     }),
                 );
@@ -1768,23 +1768,23 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     return noop();
                 }
                 self.started = true;
-                tcp_bind(self.bind_addr).reply(Http2ListenerMsg::Bound)
+                tcp_bind(self.bind_addr).then(Http2ListenerMsg::Bound)
             }
             Http2ListenerMsg::Bound(Ok((listener, _addr))) => {
                 self.listener = Some(listener);
                 if self.stopping {
                     let listener = self.listener.take().expect("listener just set");
-                    return tcp_close_listener(listener).reply(Http2ListenerMsg::ListenerClosed);
+                    return tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed);
                 }
-                tcp_accept(listener).reply(Http2ListenerMsg::Accepted)
+                tcp_accept(listener).then(Http2ListenerMsg::Accepted)
             }
             Http2ListenerMsg::Bound(Err(_)) => stop(),
             Http2ListenerMsg::Accepted(Ok((stream, _peer))) => {
                 if self.stopping {
-                    return tcp_close_stream(stream).reply(Http2ListenerMsg::StreamClosed);
+                    return tcp_close_stream(stream).then(Http2ListenerMsg::StreamClosed);
                 }
                 let Some(listener) = self.listener else {
-                    return tcp_close_stream(stream).reply(Http2ListenerMsg::StreamClosed);
+                    return tcp_close_stream(stream).then(Http2ListenerMsg::StreamClosed);
                 };
                 batch(vec![
                     spawn(
@@ -1799,12 +1799,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                         )
                         .with_initial_message(Http2ConnectionMsg::Begin),
                     ),
-                    tcp_accept(listener).reply(Http2ListenerMsg::Accepted),
+                    tcp_accept(listener).then(Http2ListenerMsg::Accepted),
                 ])
             }
             Http2ListenerMsg::Accepted(Err(_)) => {
                 if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).reply(Http2ListenerMsg::ListenerClosed)
+                    tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed)
                 } else {
                     stop()
                 }
@@ -1812,7 +1812,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             Http2ListenerMsg::Stop => {
                 self.stopping = true;
                 if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).reply(Http2ListenerMsg::ListenerClosed)
+                    tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed)
                 } else {
                     stop()
                 }

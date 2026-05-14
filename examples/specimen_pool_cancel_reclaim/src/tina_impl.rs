@@ -1,4 +1,4 @@
-//! Tina side. The driver uses `call_with_handle` to retain a
+//! Tina side. The driver uses `call_cancelable` to retain a
 //! `CallHandle` per parked waiter — stored in a bounded
 //! [`PendingCallSet`] keyed by waiter index — fires `cancel_call` on
 //! each, and confirms via the pool's `PressureReport` that the cancels
@@ -125,7 +125,7 @@ impl Driver {
                 // explicit so a stray park-handle could not silently
                 // outlive its `(idx)` key.
                 for (_idx, handle) in self.park_handles.drain() {
-                    effects.push(cancel_call(handle).reply(|_| DriverMsg::CancelReturned));
+                    effects.push(cancel_call(handle).then(|_| DriverMsg::CancelReturned));
                 }
                 batch(effects)
             }

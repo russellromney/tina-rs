@@ -21,8 +21,8 @@ second call, because the first is still pending in the stream-write lane.
 ```rust,ignore
 // WRONG — second tcp_write returns ResourceBusy
 batch(vec![
-    tcp_write(stream, request_a).reply(MyMsg::Wrote),
-    tcp_write(stream, request_b).reply(MyMsg::WroteAgain),  // ResourceBusy
+    tcp_write(stream, request_a).then(MyMsg::Wrote),
+    tcp_write(stream, request_b).then(MyMsg::WroteAgain),  // ResourceBusy
 ])
 ```
 
@@ -30,12 +30,12 @@ batch(vec![
 // RIGHT — chain the second write through a continuation message
 match msg {
     MyMsg::WroteA(Ok(count)) if count >= request_a.len() => {
-        tcp_write(stream, request_b).reply(MyMsg::WroteB)
+        tcp_write(stream, request_b).then(MyMsg::WroteB)
     }
     MyMsg::WroteA(Ok(count)) => {
         let mut remaining = request_a.clone();
         remaining.drain(..count);
-        tcp_write(stream, remaining).reply(MyMsg::WroteA)
+        tcp_write(stream, remaining).then(MyMsg::WroteA)
     }
     // ...
 }
@@ -49,7 +49,7 @@ match msg {
         // Begin: track the buffer in self so partial writes can resume.
         self.pending_write = bytes;
         tcp_write(self.stream, self.pending_write.clone())
-            .reply(Msg::WroteChunk)
+            .then(Msg::WroteChunk)
     }
     Msg::WroteChunk(Ok(count)) => {
         if count >= self.pending_write.len() {
@@ -60,7 +60,7 @@ match msg {
             // Partial write: drain the consumed prefix and re-arm.
             self.pending_write.drain(..count);
             tcp_write(self.stream, self.pending_write.clone())
-                .reply(Msg::WroteChunk)
+                .then(Msg::WroteChunk)
         }
     }
     Msg::WroteChunk(Err(error)) => {
@@ -85,7 +85,7 @@ Two properties keep this honest:
 match msg {
     Msg::ReadAll => {
         self.response_buf.clear();
-        tcp_read(self.stream, self.max_chunk).reply(Msg::ReadChunk)
+        tcp_read(self.stream, self.max_chunk).then(Msg::ReadChunk)
     }
     Msg::ReadChunk(Ok(bytes)) => {
         if bytes.is_empty() {
@@ -98,7 +98,7 @@ match msg {
             if self.response_buf.len() > self.max_total {
                 return self.fail_oversize();
             }
-            tcp_read(self.stream, self.max_chunk).reply(Msg::ReadChunk)
+            tcp_read(self.stream, self.max_chunk).then(Msg::ReadChunk)
         }
     }
     Msg::ReadChunk(Err(error)) => self.fail(error),

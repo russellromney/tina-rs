@@ -59,7 +59,7 @@ impl Checker {
                 self.deadline = Some(deadline);
                 self.report.remaining_before_budget_ok =
                     deadline.remaining_or_zero(now) >= Duration::from_millis(70);
-                sleep(Duration::from_millis(150)).reply(CheckerMsg::SecondTick)
+                sleep(Duration::from_millis(150)).then(CheckerMsg::SecondTick)
             }
             CheckerMsg::SecondTick(Ok(())) => {
                 let now = ctx.now();

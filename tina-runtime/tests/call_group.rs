@@ -13,7 +13,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime, call_with_handle,
+    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime, call_cancelable,
     cancel_call, sleep,
 };
 
@@ -55,7 +55,7 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(self.delay).reply(WorkerMsg::Done),
+            WorkerMsg::Do => sleep(self.delay).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply { score: self.score }),
             WorkerMsg::Done(Err(_)) => stop(),
             WorkerMsg::DoneForCall(request, Ok(())) => {
@@ -68,7 +68,7 @@ impl Worker {
     fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             WorkerMsg::Do => sleep(self.delay)
-                .reply_with_request(call.into_request_context(), WorkerMsg::DoneForCall),
+                .then_with_request(call.into_request_context(), WorkerMsg::DoneForCall),
             WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
@@ -124,7 +124,7 @@ impl Svc {
                 let mut effects = Vec::with_capacity(step.cancel_losers.len());
                 for request in step.cancel_losers {
                     let (worker, token, handle) = request.into_parts();
-                    effects.push(cancel_call(handle).reply(move |outcome| SvcMsg::Cancelled {
+                    effects.push(cancel_call(handle).then(move |outcome| SvcMsg::Cancelled {
                         worker,
                         token,
                         outcome,
@@ -171,8 +171,8 @@ impl Svc {
         for (idx, worker) in self.workers.iter().enumerate() {
             let key = idx as u32;
             let token = group.reserve_token().expect("group sized to workers");
-            let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, Duration::from_secs(2))
-                .reply(move |outcome| SvcMsg::Returned {
+            let (effect, handle) = call_cancelable(*worker, WorkerMsg::Do, Duration::from_secs(2))
+                .then(move |outcome| SvcMsg::Returned {
                     worker: key,
                     token,
                     outcome,
@@ -216,7 +216,7 @@ impl Client {
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Start(svc) => tina_runtime::call(svc, SvcMsg::Start, Duration::from_secs(3))
-                .reply(ClientMsg::Returned),
+                .then(ClientMsg::Returned),
             ClientMsg::Returned(outcome) => {
                 self.out.lock().expect("out lock").push(outcome);
                 noop()
@@ -365,7 +365,7 @@ impl OwnerDriver {
                     let key = idx as u32;
                     let token = self.group.reserve_token().expect("group sized to workers");
                     let (effect, handle) =
-                        call_with_handle(*worker, WorkerMsg::Do, Duration::from_secs(2)).reply(
+                        call_cancelable(*worker, WorkerMsg::Do, Duration::from_secs(2)).then(
                             move |outcome| OwnerMsg::Returned {
                                 worker: key,
                                 token,
@@ -385,7 +385,7 @@ impl OwnerDriver {
                 for request in requests {
                     let (worker, token, handle) = request.into_parts();
                     effects.push(
-                        cancel_call(handle).reply(move |outcome| OwnerMsg::Cancelled {
+                        cancel_call(handle).then(move |outcome| OwnerMsg::Cancelled {
                             worker,
                             token,
                             outcome,

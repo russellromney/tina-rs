@@ -194,7 +194,7 @@ impl Isolate for TimerWorker {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerEvent::Begin => sleep(Duration::from_millis(5)).reply(TimerEvent::DelayFinished),
+            TimerEvent::Begin => sleep(Duration::from_millis(5)).then(TimerEvent::DelayFinished),
             TimerEvent::DelayFinished(Ok(())) => {
                 self.observations.borrow_mut().push("slept");
                 stop()
@@ -284,7 +284,7 @@ impl Isolate for ObservedSender {
     ) -> Effect<Self> {
         match msg {
             ObservedSenderEvent::Start(target) => send_observed(target, ObservedTargetEvent::Work)
-                .reply(ObservedSenderEvent::SendFinished),
+                .then(ObservedSenderEvent::SendFinished),
             ObservedSenderEvent::SendFinished(outcome) => {
                 self.outcomes.borrow_mut().push(outcome);
                 noop()
@@ -413,11 +413,11 @@ impl Isolate for CallerWorker {
     ) -> Effect<Self> {
         match msg {
             CallerEvent::Start(target, request, timeout) => {
-                call(target, request, timeout).reply(CallerEvent::Returned)
+                call(target, request, timeout).then(CallerEvent::Returned)
             }
             CallerEvent::StartAndStop(target) => batch(vec![
                 call(target, WorkerRequest::ReplyNow, Duration::from_millis(10))
-                    .reply(CallerEvent::Returned),
+                    .then(CallerEvent::Returned),
                 stop(),
             ]),
             CallerEvent::Filler => noop(),

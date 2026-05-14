@@ -11,8 +11,7 @@ use tina::pool::{
 use tina::prelude::*;
 use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call, call_with_handle,
-    cancel_call,
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call, call_cancelable, cancel_call,
 };
 
 type Resource = u32;
@@ -129,11 +128,11 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::BeginAcquire { id } => call(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
-                .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome }),
+                .then(move |outcome| DriverMsg::AcquireReturned { id, outcome }),
             DriverMsg::BeginAcquireWithHandle { id } => {
                 let (effect, handle) =
-                    call_with_handle(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
-                        .reply(move |outcome| DriverMsg::AcquireReturned { id, outcome });
+                    call_cancelable(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT)
+                        .then(move |outcome| DriverMsg::AcquireReturned { id, outcome });
                 self.handles.push((id, handle));
                 effect
             }
@@ -214,7 +213,7 @@ impl Driver {
                     .position(|(hid, _)| *hid == id)
                     .expect("handle for id");
                 let (_, handle) = self.handles.remove(pos);
-                cancel_call(handle).reply(DriverMsg::CancelReturned)
+                cancel_call(handle).then(DriverMsg::CancelReturned)
             }
             DriverMsg::CancelReturned(outcome) => {
                 let ack = match outcome {
@@ -228,7 +227,7 @@ impl Driver {
             }
             DriverMsg::BeginPressure => {
                 call(self.pool, WorkerPoolMsg::PressureReport, CALL_TIMEOUT)
-                    .reply(DriverMsg::PressureReturned)
+                    .then(DriverMsg::PressureReturned)
             }
             DriverMsg::PressureReturned(outcome) => {
                 if let CallOutcome::Replied(WorkerPoolReply::Pressure(report)) = outcome {
@@ -238,7 +237,7 @@ impl Driver {
             }
             DriverMsg::BeginClose(mode) => {
                 call(self.pool, WorkerPoolMsg::Close(mode), CALL_TIMEOUT)
-                    .reply(DriverMsg::CloseReturned)
+                    .then(DriverMsg::CloseReturned)
             }
             DriverMsg::CloseReturned(outcome) => {
                 if matches!(outcome, CallOutcome::Replied(WorkerPoolReply::Closed)) {
@@ -941,7 +940,7 @@ fn retire_disposition_drops_handle() {
         ) -> Effect<Self> {
             match msg {
                 CanaryMsg::Begin => {
-                    call(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT).reply(CanaryMsg::Got)
+                    call(self.pool, WorkerPoolMsg::Acquire, CALL_TIMEOUT).then(CanaryMsg::Got)
                 }
                 CanaryMsg::Got(outcome) => {
                     if let CallOutcome::Replied(WorkerPoolReply::Acquire(

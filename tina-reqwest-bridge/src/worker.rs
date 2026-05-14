@@ -416,7 +416,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         let _ = method;
         self.metrics.note_in_flight(in_flight);
 
-        sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
+        sleep(self.config.poll_interval).then(move |_| ReqwestMsg::Poll(id))
     }
 
     fn schedule_retry(
@@ -464,7 +464,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         let in_flight = self.in_flight.len() as u64;
         self.metrics.set_in_flight(in_flight);
         self.metrics.note_in_flight(in_flight);
-        sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
+        sleep(self.config.poll_interval).then(move |_| ReqwestMsg::Poll(id))
     }
 
     fn poll(&mut self, id: u64) -> Effect<Self> {
@@ -553,7 +553,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             method,
                         },
                     );
-                    sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
+                    sleep(self.config.poll_interval).then(move |_| ReqwestMsg::Poll(id))
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     let err = ReqwestError::Reqwest("reqwest task ended without result".into());
@@ -626,7 +626,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             method,
                         },
                     );
-                    sleep(self.config.poll_interval).reply(move |_| ReqwestMsg::Poll(id))
+                    sleep(self.config.poll_interval).then(move |_| ReqwestMsg::Poll(id))
                 }
             }
         }

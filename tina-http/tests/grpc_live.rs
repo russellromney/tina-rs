@@ -285,7 +285,7 @@ impl Isolate for HangingGrpc {
         match msg {
             HangingMsg::Request => {
                 let request = call.into_request_context();
-                sleep(Duration::from_millis(250)).reply(move |_| HangingMsg::Done(request))
+                sleep(Duration::from_millis(250)).then(move |_| HangingMsg::Done(request))
             }
             HangingMsg::Done(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }

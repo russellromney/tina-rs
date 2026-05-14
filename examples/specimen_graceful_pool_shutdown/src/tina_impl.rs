@@ -48,7 +48,7 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(self.work).reply(WorkerMsg::Done),
+            WorkerMsg::Do => sleep(self.work).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
         }
@@ -122,7 +122,7 @@ impl Driver {
                     let worker = *lease.handle();
                     self.jobs.insert(job, JobState::Working { lease });
                     tina_runtime::call(worker, WorkerMsg::Do, CALL_TIMEOUT)
-                        .reply(move |outcome| DriverMsg::WorkerReturned { job, outcome })
+                        .then(move |outcome| DriverMsg::WorkerReturned { job, outcome })
                 }
                 Err(AcquireFailure::Closed) | Err(AcquireFailure::Full) => {
                     self.jobs.remove(&job);

@@ -3,7 +3,7 @@
 //! Connection is configured with `inbound_stream_chunk_size = Some(N)`.
 //! A multi-turn service receives `HttpRequest::Stream { source, ... }`,
 //! pulls chunks via `call(source, HttpConnectionMsg::RequestBodyNext,
-//! t).reply(MyMsg::ChunkArrived)` until `Eof`, accumulates a hash, and
+//! t).then(MyMsg::ChunkArrived)` until `Eof`, accumulates a hash, and
 //! replies with the byte count + checksum.
 
 mod common;
@@ -86,7 +86,7 @@ impl Isolate for Consumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply_with_request(request, ConsumerMsg::ChunkArrived)
+                    .then_with_request(request, ConsumerMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     let total = self.accumulated.len();
@@ -131,7 +131,7 @@ impl Isolate for Consumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply_with_request(request, ConsumerMsg::ChunkArrived)
+                    .then_with_request(request, ConsumerMsg::ChunkArrived)
                 }
                 HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
             },
@@ -571,7 +571,7 @@ impl Isolate for NotifyingConsumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply_with_request(request, NotifyingMsg::ChunkArrived)
+                    .then_with_request(request, NotifyingMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     let total = self.accumulated.len();
@@ -615,7 +615,7 @@ impl Isolate for NotifyingConsumer {
                             HttpConnectionMsg::body_next(),
                             self.chunk_call_timeout,
                         )
-                        .reply_with_request(request, NotifyingMsg::ChunkArrived)
+                        .then_with_request(request, NotifyingMsg::ChunkArrived)
                     }
                     HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
                 }

@@ -36,7 +36,7 @@ let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
 
 // Driver routes keyed requests through the table:
 call(table.address_for_str(&key), StoreMsg::Set { key, value }, timeout)
-    .reply(DriverMsg::StoreReturned)
+    .then(DriverMsg::StoreReturned)
 ```
 
 Each shard is a real `Store` isolate that owns its own `BTreeMap`. Owner

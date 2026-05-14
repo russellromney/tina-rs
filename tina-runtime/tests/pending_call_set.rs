@@ -20,7 +20,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEventKind, SleepReply,
-    ThreadedRuntime, call_with_handle, cancel_call, sleep,
+    ThreadedRuntime, call_cancelable, cancel_call, sleep,
 };
 
 /// Polls `cond` until it returns true or `total` elapses. Same shape
@@ -91,7 +91,7 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(Duration::from_millis(WORK_MS)).reply(WorkerMsg::Done),
+            WorkerMsg::Do => sleep(Duration::from_millis(WORK_MS)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
             WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
@@ -103,8 +103,7 @@ impl Worker {
         match msg {
             WorkerMsg::Do => {
                 let req = call.into_request_context();
-                sleep(Duration::from_millis(WORK_MS))
-                    .reply_with_request(req, WorkerMsg::DoneForCall)
+                sleep(Duration::from_millis(WORK_MS)).then_with_request(req, WorkerMsg::DoneForCall)
             }
             WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
@@ -151,7 +150,7 @@ impl Driver {
             DriverMsg::CancelAll => {
                 let mut effects = Vec::with_capacity(self.pending.len());
                 for (_, handle) in self.pending.drain() {
-                    effects.push(cancel_call(handle).reply(DriverMsg::Cancelled));
+                    effects.push(cancel_call(handle).then(DriverMsg::Cancelled));
                 }
                 Effect::Batch(effects)
             }
@@ -189,7 +188,7 @@ impl Driver {
         for (idx, worker) in self.workers.iter().enumerate() {
             let key = idx as u32;
             let (effect, handle) =
-                call_with_handle(*worker, WorkerMsg::Do, CALL_TIMEOUT).reply(move |outcome| {
+                call_cancelable(*worker, WorkerMsg::Do, CALL_TIMEOUT).then(move |outcome| {
                     DriverMsg::Returned {
                         batch,
                         worker: key,
@@ -365,7 +364,7 @@ impl SlowWorker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(Duration::from_millis(SLOW_WORK_MS)).reply(WorkerMsg::Done),
+            WorkerMsg::Do => sleep(Duration::from_millis(SLOW_WORK_MS)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
             WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
@@ -378,7 +377,7 @@ impl SlowWorker {
             WorkerMsg::Do => {
                 let req = call.into_request_context();
                 sleep(Duration::from_millis(SLOW_WORK_MS))
-                    .reply_with_request(req, WorkerMsg::DoneForCall)
+                    .then_with_request(req, WorkerMsg::DoneForCall)
             }
             WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
@@ -397,7 +396,7 @@ impl FastWorker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(Duration::from_millis(5)).reply(WorkerMsg::Done),
+            WorkerMsg::Do => sleep(Duration::from_millis(5)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
             WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
@@ -409,7 +408,7 @@ impl FastWorker {
         match msg {
             WorkerMsg::Do => {
                 let req = call.into_request_context();
-                sleep(Duration::from_millis(5)).reply_with_request(req, WorkerMsg::DoneForCall)
+                sleep(Duration::from_millis(5)).then_with_request(req, WorkerMsg::DoneForCall)
             }
             WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
@@ -437,12 +436,12 @@ impl TimeoutDriver {
                 let mut effects = Vec::with_capacity(PENDING_CAPACITY);
                 for (idx, worker) in self.slow_workers.iter().enumerate() {
                     let key = idx as u32;
-                    let (effect, handle) = call_with_handle(
+                    let (effect, handle) = call_cancelable(
                         *worker,
                         WorkerMsg::Do,
                         Duration::from_millis(TIMEOUT_BUDGET_MS),
                     )
-                    .reply(move |outcome| TimeoutDriverMsg::Returned {
+                    .then(move |outcome| TimeoutDriverMsg::Returned {
                         batch: 1,
                         worker: key,
                         outcome,
@@ -457,8 +456,8 @@ impl TimeoutDriver {
                 let mut effects = Vec::with_capacity(PENDING_CAPACITY);
                 for (idx, worker) in self.fast_workers.iter().enumerate() {
                     let key = idx as u32;
-                    let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, CALL_TIMEOUT)
-                        .reply(move |outcome| TimeoutDriverMsg::Returned {
+                    let (effect, handle) = call_cancelable(*worker, WorkerMsg::Do, CALL_TIMEOUT)
+                        .then(move |outcome| TimeoutDriverMsg::Returned {
                             batch: 2,
                             worker: key,
                             outcome,
@@ -659,8 +658,8 @@ impl AbaDriver {
         match msg {
             AbaDriverMsg::InsertA => {
                 let (effect, handle) =
-                    call_with_handle(self.slow_worker, WorkerMsg::Do, Duration::from_millis(50))
-                        .reply(move |outcome| AbaDriverMsg::AReturned {
+                    call_cancelable(self.slow_worker, WorkerMsg::Do, Duration::from_millis(50))
+                        .then(move |outcome| AbaDriverMsg::AReturned {
                             worker: 42,
                             outcome,
                         });
@@ -676,8 +675,8 @@ impl AbaDriver {
                 // must refuse loudly, even though A's handle has
                 // settled.
                 let (effect_b, handle_b): (Effect<Self>, _) =
-                    call_with_handle(self.slow_worker, WorkerMsg::Do, CALL_TIMEOUT)
-                        .reply(AbaDriverMsg::BReturned);
+                    call_cancelable(self.slow_worker, WorkerMsg::Do, CALL_TIMEOUT)
+                        .then(AbaDriverMsg::BReturned);
                 match self.pending.insert(42, handle_b) {
                     Err(tina::PendingCallSetInsertError::DuplicateKey { key, handle: _ }) => {
                         assert_eq!(key, 42);
