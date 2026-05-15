@@ -240,7 +240,13 @@ Proof:
 
 ## Rock 4: Optional Type Rails
 
-Do these only if Rock 0 finds a copied, common, cheap-to-prevent mistake.
+Phase 101 and Phase 102 own the broad versions of this work.
+
+Do not minimize those follow-ups. They are important.
+
+In this phase, only do config/protocol type rails if they are needed to make
+the service split land cleanly or if Rock 0 finds a copied, common,
+cheap-to-prevent mistake.
 
 Config builder typestate candidates:
 
@@ -259,7 +265,8 @@ Private protocol typestate candidates:
 
 Default: private only. Do not leak protocol typestate into user service code.
 
-This rock must not block the main callable/send-only win.
+This rock must not block the main callable/send-only win. Record any deferred
+work against 101 or 102, not as vague future polish.
 
 ## Rock 5: User Proof Matrix
 
