@@ -98,31 +98,60 @@ What felt good:
 - `Stop` is a single deferred reply: stash the `RequestContext`, let the
   drain `FlushDone` answer it. No new primitive required.
 
-What felt rough:
+What felt rough (with the planned roadmap row that already names the fix):
 - Tick token bookkeeping is hand-rolled. Three independent paths must
   agree to invalidate `armed_tick`: a size-triggered flush, a drain
-  flush, and the `FlushDone` path that may re-arm. The
-  `SingleCallGate` named pattern hints at the right primitive but does
-  not yet encode "tick is stale because a different flush already
-  fired." `ergonomics_playground::debounced_batch` gets away with a
-  plain `timer_armed: bool` because its only non-timer state change
-  (`Drain`) clears the buffer, so a stale fire harmlessly flushes
-  nothing; this specimen has size-triggered flushes that leave a
-  non-empty buffer, so the token is load-bearing. A `TimerToken` or
-  `BatchClock` shape might capture this.
+  flush, and the `FlushDone` path that may re-arm. The token is
+  load-bearing here in a way it is not in
+  `ergonomics_playground::debounced_batch`, because that probe's only
+  non-timer state change clears the buffer, so a stale fire harmlessly
+  flushes nothing; size-triggered flushes leave a non-empty buffer, so
+  a stale fire would double-flush without the token.
+  - Planned fix: ROADMAP.md `Runtime-owned recurring work` (cron/
+    periodic patterns with **missed-tick policy**) and `Timer
+    vocabulary` (periodic service patterns beyond the current debounce/
+    throttle helper state). This specimen's hand-rolled token *is* a
+    missed-tick policy.
 - The single-flight flush is implemented as `flush_in_flight: bool`. It
   is a one-bit `PendingReplies`. If another system also wants "one
   outstanding call to a fixed peer," that should grow a helper rather
   than living as a field on each isolate.
+  - Planned fix: the bounded-lanes admission vocabulary in ROADMAP.md
+    `Mailbox-first devex polish sketch`
+    (`try_admit` / `permit` / `snapshot` / typed `Busy`). Specializes
+    cleanly to N=1 and replaces the bool with a counter-shaped report.
+- `Sink` needs three message shapes (`Flush` call, `Complete`
+  continuation, `Stats` call) only because the slow sink wants a
+  `defer(sleep)` path that produces an internal message variant.
+  - Planned fix: ROADMAP.md `Mailbox-first devex polish sketch`
+    proposes `call.reply_after(work).to_self(|reply, result| ...)` as
+    the blessed sugar over `ctx.take_request_context().unwrap()`
+    plus `reply_with_request`. The continuation message still exists
+    (no hidden state mutation), but the call site collapses to one
+    fluent line and `into_request_context` stops being a discoverability
+    cliff.
 - "Events lost on flush" is real but feels too cheap. A real shipper
   would want to re-enqueue the batch on a `Full` or `Closed` sink and
   retry once. The specimen punts on retry because it is out of scope,
   but the typed counter makes the gap visible.
-- `Sink` needs three message shapes (`Flush` call, `Complete`
-  continuation, `Stats` call) only because the slow sink wants a
-  `defer(sleep)` path that produces an internal message variant. A
-  `defer(sleep).reply_to_caller(value)` shorthand would cut this in
-  half.
+  - Planned fix: ROADMAP.md `Backpressure policies` (explicit policy
+    objects for shed, bounded wait, retry with backoff, degrade, close,
+    each returning typed outcomes). Retry-once-on-`Full` is one of the
+    named policies.
+- Drain is hand-rolled choreography: set `draining = true`, stash the
+  `Stop` `RequestContext`, let the next `FlushDone` reply. Works, but
+  the order is now load-bearing across three handlers.
+  - Planned fix: ROADMAP.md `Shutdown orchestration graph` (ordered
+    helpers for stop ingress, cancel/close pools, drain in-flight work,
+    flush batchers, terminal report). This specimen's `Stop` handler
+    implements three of those five steps by hand.
+
+Not yet on the roadmap:
+- `Arc::try_unwrap(runtime)` for shutdown silently fails if any caller
+  thread still holds an Arc clone. Both reference specimens use this
+  shape. A `runtime.request_shutdown(timeout)` that did not depend on
+  no-other-owners would be friendlier and would compose with the
+  shutdown orchestration graph above.
 
 Related shapes:
 - `ergonomics_playground::debounced_batch` parks each submitter in
@@ -142,13 +171,13 @@ Tina capability pulled:
 - `reply_to_request` for deferred replies held across a continuation.
 
 Suggested follow-up:
-- Consider a tiny `TimerToken` helper if another system repeats the
-  "advance token when a non-timer path also flushes" pattern.
-- Consider a `defer(sleep).reply_to_caller(value)` shorthand so a slow
-  bridge does not need a paired internal message variant.
-- Promote a real "single-flight outbound call with re-enqueue on Full"
-  helper only after the delivery daemon or webhook relay reaches for
-  the same shape.
+- The roadmap already names the four primitives that would erase the
+  rough bits above (missed-tick policy, admission vocabulary, mailbox-
+  first defer sugar, backpressure policies, shutdown orchestration).
+  This specimen is one piece of evidence those rows are pulling on real
+  pain, not speculative ergonomics.
+- One new finding worth recording: a `request_shutdown` runtime API
+  that does not require sole `Arc` ownership.
 
 Verdict:
 - keep
