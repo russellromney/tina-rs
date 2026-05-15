@@ -14,6 +14,10 @@ Follow-up tightening: the plan now names optional rocks clearly. Config
 typestate and protocol typestate must not block the main user-facing compile
 time win.
 
+Second tightening: collapsed the plan from nine rocks to six. Diagnostics,
+callable/send-only shape, cancelable admission rail, optional type rails, user
+proof, and docs are enough. Details not needed for execution were removed.
+
 ## Finding 2 [P2] Compile-time claims can lie about runtime facts
 
 Capacity, timeout, closed peers, stale generations, and backend failures are
