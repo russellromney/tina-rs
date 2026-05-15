@@ -582,6 +582,89 @@ no fake async surface, no hidden retry, no auto-cancel that erases terminal
 facts, and no helper that implies cancellation stopped work outside Tina's owned
 wait.
 
+### Natural-key admission for cancelable pending sets
+
+`system_job_queue` exposed a generally-applicable mismatch between Tina's
+two pending-set helpers and the kinds of keys real services actually use.
+
+**The shape today.** Tina ships two bounded "I have outstanding work to
+remember" structures:
+
+- `PendingReplies<K, R>` — used by `system_cache_with_fill`. Allows
+  multiple parked callers per key (multiple browser tabs hitting the
+  same cold cache key). Removal is by `(K, slot_id)`. ABA-safe by
+  construction because each insert mints a fresh slot.
+- `PendingCancelableCallSet<K, Q, R>` (PR #92) — used by
+  `system_job_queue` v2. One entry per key. Bundles caller authority
+  (`RequestContext<Q>`) and the cancel handle (`CallHandle<R>`) so
+  cancel-while-running can answer the original caller atomically.
+  Removal is by `(K, ticket)` to defeat ABA on completion paths, but
+  *insertion* still rejects with `DuplicateKey` if the key is already
+  present.
+
+**The trap.** `try_insert`'s `DuplicateKey` is correct as a loud version
+of an ABA bug, but it forces the user to pick keys that never collide.
+`system_job_queue` works around this by minting monotonic `JobId`s
+internally — fine when the service owns id assignment. Many real
+services do not:
+
+- a session manager keyed by external `session_id`
+- a worker pool keyed by `worker_index`
+- a tenant rate limiter keyed by `tenant_id`
+- a webhook relay keyed by `subscriber_id`
+
+For those, the second concurrent operation on the same natural key
+either returns `DuplicateKey` (and the user has to invent a queueing or
+versioning layer outside the helper), or the user falls back to
+`PendingReplies` and loses the cancelable-handle pairing.
+
+**Why it matters.** This is the kind of choice that should be made by the
+type system, not by the user discovering it the hard way. The current
+shape teaches "keep your keys monotonic or fall off a cliff," which is
+exactly the kind of hidden contract Tina aims to remove.
+
+**Likely fix.** Add a third helper — call it
+`PendingCancelableCallSlab<K, Q, R>` for now — that admits the same
+caller-authority + cancel-handle bundle but allows multiple entries per
+natural key. Internal identity is by ticket; natural key is metadata
+attached to each entry. The shape:
+
+```rust
+let ticket = self.pending.try_insert(natural_key, token)?;   // always Ok modulo capacity
+```
+
+Lookup returns an iterator (or "latest") for natural keys; removal is
+strictly by `(natural_key, ticket)` like the existing set. ABA is
+impossible because nothing is keyed solely by natural key. The cost is
+that the user maintains the "natural-key → live tickets" mapping
+externally, but that mapping is what they were going to write anyway
+once they hit `DuplicateKey`.
+
+**Decision rule for users.** Ship both helpers and document the choice:
+
+- one outstanding op per key, key chosen by the service →
+  `PendingCancelableCallSet`
+- one outstanding op per key, key chosen externally →
+  `PendingCancelableCallSlab` *(this proposal)*
+- multiple parked callers per key, no cancel handle needed →
+  `PendingReplies`
+- multiple parked callers per key WITH cancel handles → we need to
+  decide whether the slab covers this too or whether
+  `PendingReplies::try_capture_cancelable_call` is a separate motion
+
+**Non-goals.** No silent ABA dedup on insert. No "automatic
+key-versioning" that hides whether a stale completion replaced a fresh
+one. The slab's value comes from the explicit (natural_key, ticket)
+discipline, not from removing it.
+
+**Surfaces this would unblock.** `system_session_auth`,
+`system_tenant_rate_limiter`, `system_webhook_relay`, `system_lock_manager`,
+and the worker-index variant of `system_job_queue` are all natural-key
+shaped and currently have to invent the workaround themselves. Promoting
+this to a real phase should wait for at least one of those specimens to
+actually run into it; today the case is one specimen (`system_job_queue`)
+that successfully sidestepped it.
+
 ## Capability layers still needed
 
 These are not planning phases. They are capability gaps to close as real

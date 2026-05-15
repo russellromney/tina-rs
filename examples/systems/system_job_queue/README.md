@@ -75,6 +75,19 @@ What felt rough:
   replaced reactively). `runtime.observe_child_restarted(parent)` exists,
   but only outside the isolate.
 
+What we sidestepped — the natural-key trap:
+- `PendingCancelableCallSet::try_insert` is single-slot per key and
+  returns a loud `DuplicateKey` if the key is already present (correct
+  ABA-safety behavior — see PR #92's docs). This specimen sidesteps the
+  trap with monotonic `JobId`s. A service whose pending entries are
+  keyed by something the *outside world* picks (worker index, session
+  id, tenant id, externally-supplied request id) cannot use monotonic
+  ids and would have to either swap to `PendingReplies` (which allows
+  multiple slots per key but loses the cancelable-handle pairing) or
+  hand-roll a `(natural_key, generation)` compound. Captured as a
+  roadmap proposal — see "Natural-key admission for cancelable pending
+  sets" in `ROADMAP.md`.
+
 Tina capability pulled:
 - `PendingCancelableCallSet` + `defer_cancelable(...).try_admit(...)` for
   one-step caller admission with typed `Full` recovery.
