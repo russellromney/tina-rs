@@ -216,7 +216,7 @@ impl Harness {
     fn start(limits: WebSocketLimits) -> Self {
         let serial_guard = websocket_live_test_lock()
             .lock()
-            .expect("websocket live test lock");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let runtime = ThreadedRuntime::with_config(
             TestShard,
             DefaultThreadedMailboxFactory,
@@ -664,6 +664,7 @@ fn websocket_bad_close_payload_rejects() {
     let mut stream = connect_ws(harness.addr);
     stream.write_all(&masked_frame(0x8, &[0x03])).unwrap();
     assert_eq!(read_server_frame(&mut stream).0, 0x8);
+    drop(stream);
 
     let mut stream = connect_ws(harness.addr);
     let mut payload = 1000u16.to_be_bytes().to_vec();
