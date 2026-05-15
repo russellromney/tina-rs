@@ -86,7 +86,7 @@ enum DriverMsg {
     ReleaseReturned {
         job: u32,
     },
-    CloseReturned,
+    CloseReturned(CallOutcome<WorkerPoolReply<WorkerHandle>>),
     Shutdown,
 }
 
@@ -95,6 +95,7 @@ struct Driver {
     outcome: DriverOutcome,
     jobs: HashMap<u32, JobState>,
     expected: usize,
+    shutdown_close_observed: bool,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -167,11 +168,12 @@ impl Driver {
                 self.maybe_finish()
             }
             DriverMsg::Shutdown => {
-                close_effect(self.pool, CloseMode::Drain, CALL_TIMEOUT, |_| {
-                    DriverMsg::CloseReturned
-                })
+                close_effect(self.pool, CloseMode::Drain, CALL_TIMEOUT, DriverMsg::CloseReturned)
             }
-            DriverMsg::CloseReturned => noop(),
+            DriverMsg::CloseReturned(outcome) => {
+                self.shutdown_close_observed = close_was_observed(&outcome);
+                self.maybe_finish()
+            }
         }
     }
 }
@@ -179,12 +181,16 @@ impl Driver {
 impl Driver {
     fn maybe_finish(&mut self) -> Effect<Self> {
         let total = self.outcome.completed + self.outcome.closed + self.outcome.failed;
-        if total >= self.expected {
+        if total >= self.expected && self.shutdown_close_observed {
             stop_with(self.outcome)
         } else {
             noop()
         }
     }
+}
+
+fn close_was_observed(outcome: &CallOutcome<WorkerPoolReply<WorkerHandle>>) -> bool {
+    matches!(outcome, CallOutcome::Replied(WorkerPoolReply::Closed))
 }
 
 pub fn run() -> anyhow::Result<Report> {
@@ -220,6 +226,7 @@ pub fn run() -> anyhow::Result<Report> {
                 outcome: DriverOutcome::default(),
                 jobs: HashMap::new(),
                 expected: CALLERS,
+                shutdown_close_observed: false,
             },
             64,
         )
@@ -243,15 +250,33 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let rt = Arc::try_unwrap(runtime)
+        .map_err(|_| anyhow::anyhow!("runtime still had outstanding references at shutdown"))?;
+    rt.shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
 
     Ok(Report {
         callers: CALLERS,
         completed: outcome.completed,
         closed: outcome.closed,
         failed: outcome.failed,
+        shutdown_close_observed: true,
         exit_clean: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_observed_requires_real_closed_reply() {
+        assert!(close_was_observed(&CallOutcome::Replied(WorkerPoolReply::Closed)));
+        assert!(!close_was_observed(&CallOutcome::Timeout));
+        assert!(!close_was_observed(&CallOutcome::Full));
+        assert!(!close_was_observed(&CallOutcome::Closed));
+        assert!(!close_was_observed(&CallOutcome::Rejected(
+            tina::CallRejectedReason::UnsupportedMessage,
+        )));
+    }
 }

@@ -24,6 +24,7 @@ pub struct RunReport {
     pub created_item: bool,
     pub read_item: bool,
     pub notified_item: bool,
+    pub notify_after_peer_close: bool,
     pub missing_404: bool,
     pub method_405: bool,
     pub bad_request_400: bool,
@@ -33,25 +34,37 @@ pub struct RunReport {
     pub ready_after_db_close_503: bool,
     pub ready_during_shutdown_503: bool,
     pub ingress_rejects_after_close: bool,
+    pub shutdown_in_flight_typed: bool,
     pub shutdown_clean: bool,
     pub multi_turn_notify: bool,
-    pub capacity_line: String,
+    pub capacity_before_shutdown_line: String,
+    pub capacity_during_shutdown_line: String,
+    pub terminal_line: String,
     pub live_replay_fact: String,
+    pub observations: Vec<UserObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserObservation {
+    pub label: &'static str,
+    pub status: u16,
+    pub body: String,
 }
 
 impl RunReport {
     pub fn summary_line(&self) -> String {
         format!(
             "system=mini_saas_api health_ok={} ready_ok={} created_item={} read_item={} \
-             notified_item={} missing_404={} method_405={} bad_request_400={} body_cap_413={} \
+             notified_item={} notify_after_peer_close={} missing_404={} method_405={} bad_request_400={} body_cap_413={} \
              db_constraint_409={} outbound_pressure_503={} ready_after_db_close_503={} \
-             ready_during_shutdown_503={} ingress_rejects_after_close={} shutdown_clean={} \
-             multi_turn_notify={}",
+             ready_during_shutdown_503={} ingress_rejects_after_close={} \
+             shutdown_in_flight_typed={} shutdown_clean={} multi_turn_notify={}",
             self.health_ok,
             self.ready_ok,
             self.created_item,
             self.read_item,
             self.notified_item,
+            self.notify_after_peer_close,
             self.missing_404,
             self.method_405,
             self.bad_request_400,
@@ -61,6 +74,7 @@ impl RunReport {
             self.ready_after_db_close_503,
             self.ready_during_shutdown_503,
             self.ingress_rejects_after_close,
+            self.shutdown_in_flight_typed,
             self.shutdown_clean,
             self.multi_turn_notify,
         )
