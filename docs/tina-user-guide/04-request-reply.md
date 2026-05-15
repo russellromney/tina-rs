@@ -213,6 +213,41 @@ single-turn call. The service just answered later.
 does not hide any timeout or reply path, and it does not produce the final
 application reply by itself.
 
+> **Cancelable deferred calls: admit before dispatch**
+>
+> `call_ctx.defer_cancelable(call_cancelable(...))` creates a pending token and
+> a child effect. Admit the token into bounded state before any child effect is
+> returned:
+>
+> ```rust
+> match call_ctx
+>     .defer_cancelable(call_cancelable(worker, WorkerMsg::Run(job), timeout))
+>     .try_admit(&mut self.pending, id, ServiceMsg::WorkerReturned)
+> {
+>     Ok(effect) => effect,
+>     Err(PendingCancelableInsertError::Full { token }) => {
+>         reply_to_request(token.into_request_context(), ServiceReply::Busy)
+>     }
+>     Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+>         reply_to_request(token.into_request_context(), ServiceReply::Duplicate)
+>     }
+> }
+> ```
+>
+> `try_admit` does not dispatch work. It only returns the child effect after
+> storage succeeds. On `Full` or duplicate, recover the caller from the
+> rejected token and answer now.
+>
+> The `id` is your domain key: useful for duplicate rejection and user-driven
+> cancel-by-id. `try_admit` also carries a `PendingCancelableTicket` into
+> `ServiceMsg::WorkerReturned`; that ticket is the exact admitted instance.
+> Remove completions with `(id, ticket)`, not `id` alone, so stale completions
+> cannot remove a newer call that reused the same key.
+>
+> On owner stop or service shutdown, drain the set and settle every token.
+> If the child call may still be in flight, cancel the token and reply from
+> the cancel continuation; do not merely drop the token or the child handle.
+
 The expanded form is still available when it is clearer:
 
 ```rust
