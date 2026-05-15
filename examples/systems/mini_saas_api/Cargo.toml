@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "mini-saas-api"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+http = { version = "1", default-features = false, features = ["std"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+tina = { path = "../../../tina" }
+tina-http = { path = "../../../tina-http" }
+tina-runtime = { path = "../../../tina-runtime" }
+tina-sim = { path = "../../../tina-sim" }
+tina-sqlite-bridge = { path = "../../../tina-sqlite-bridge" }

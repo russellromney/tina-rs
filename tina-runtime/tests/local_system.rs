@@ -144,8 +144,10 @@ enum CrossShardCallWorkerMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CrossShardCallReply(Vec<u8>);
 
-#[derive(Debug)]
-struct CrossShardCallWorker;
+#[derive(Debug, Default)]
+struct CrossShardCallWorker {
+    held: Vec<tina::RequestContext<CrossShardCallReply>>,
+}
 
 #[tina_runtime::isolate(
     message = CrossShardCallWorkerMsg,
@@ -162,6 +164,23 @@ impl CrossShardCallWorker {
             CrossShardCallWorkerMsg::Echo(bytes) => reply(CrossShardCallReply(bytes)),
             CrossShardCallWorkerMsg::NoReply => noop(),
             CrossShardCallWorkerMsg::Stop => stop(),
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: CrossShardCallWorkerMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossShardCallWorkerMsg::Echo(bytes) => call.reply(CrossShardCallReply(bytes)),
+            CrossShardCallWorkerMsg::NoReply => {
+                self.held.push(call.into_request_context());
+                noop()
+            }
+            CrossShardCallWorkerMsg::Stop => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -191,13 +210,13 @@ impl CrossShardCallClient {
                 CrossShardCallWorkerMsg::Echo(b"llama".to_vec()),
                 Duration::from_secs(2),
             )
-            .reply(CrossShardCallClientMsg::Returned),
+            .then(CrossShardCallClientMsg::Returned),
             CrossShardCallClientMsg::StartTimeout(worker) => call(
                 worker,
                 CrossShardCallWorkerMsg::NoReply,
                 Duration::from_millis(20),
             )
-            .reply(CrossShardCallClientMsg::Returned),
+            .then(CrossShardCallClientMsg::Returned),
             CrossShardCallClientMsg::Returned(outcome) => {
                 self.outcomes.lock().expect("outcomes lock").push(outcome);
                 noop()
@@ -294,7 +313,7 @@ impl TimerService {
         _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerMsg::Start => sleep(Duration::from_millis(1)).reply(TimerMsg::Finished),
+            TimerMsg::Start => sleep(Duration::from_millis(1)).then(TimerMsg::Finished),
             TimerMsg::Finished(Ok(())) => {
                 self.seen.lock().expect("timer seen lock").push("finished");
                 noop()
@@ -334,21 +353,21 @@ impl UdpLoopbackService {
     ) -> Effect<Self> {
         match msg {
             UdpLoopbackMsg::Start => udp_bind("127.0.0.1:0".parse().expect("loopback addr"))
-                .reply(UdpLoopbackMsg::ReceiverBound),
+                .then(UdpLoopbackMsg::ReceiverBound),
             UdpLoopbackMsg::ReceiverBound(Ok((socket, addr))) => {
                 self.receiver = Some(socket);
                 self.receiver_addr = Some(addr);
                 udp_bind("127.0.0.1:0".parse().expect("loopback addr"))
-                    .reply(UdpLoopbackMsg::SenderBound)
+                    .then(UdpLoopbackMsg::SenderBound)
             }
             UdpLoopbackMsg::SenderBound(Ok((socket, _addr))) => {
                 self.sender = Some(socket);
                 let receiver = self.receiver.expect("receiver socket");
                 let receiver_addr = self.receiver_addr.expect("receiver addr");
                 batch(vec![
-                    udp_recv_from(receiver, 4).reply(UdpLoopbackMsg::Received),
+                    udp_recv_from(receiver, 4).then(UdpLoopbackMsg::Received),
                     udp_send_to(socket, receiver_addr, b"llamas".to_vec())
-                        .reply(UdpLoopbackMsg::Sent),
+                        .then(UdpLoopbackMsg::Sent),
                 ])
             }
             UdpLoopbackMsg::Sent(Ok(count)) => {
@@ -356,7 +375,7 @@ impl UdpLoopbackService {
                     .lock()
                     .expect("udp observed lock")
                     .push(format!("sent:{count}"));
-                udp_close_socket(self.sender.expect("sender socket")).reply(UdpLoopbackMsg::Closed)
+                udp_close_socket(self.sender.expect("sender socket")).then(UdpLoopbackMsg::Closed)
             }
             UdpLoopbackMsg::Received(Ok((_peer, bytes, truncated))) => {
                 self.observed
@@ -367,7 +386,7 @@ impl UdpLoopbackService {
                         String::from_utf8(bytes).expect("utf8 udp payload")
                     ));
                 udp_close_socket(self.receiver.expect("receiver socket"))
-                    .reply(UdpLoopbackMsg::Closed)
+                    .then(UdpLoopbackMsg::Closed)
             }
             UdpLoopbackMsg::Closed(Ok(())) => {
                 self.observed
@@ -411,7 +430,7 @@ impl DnsLookupService {
     ) -> Effect<Self> {
         match msg {
             DnsLookupMsg::Start => {
-                dns_lookup("localhost", 80, Duration::from_secs(1)).reply(DnsLookupMsg::Done)
+                dns_lookup("localhost", 80, Duration::from_secs(1)).then(DnsLookupMsg::Done)
             }
             DnsLookupMsg::Done(Ok(addrs)) => {
                 self.observed
@@ -456,7 +475,7 @@ impl TlsClientService {
         match msg {
             TlsClientMsg::Start { addr, cert_der } => {
                 tls_connect(addr, "localhost", vec![cert_der], Duration::from_secs(2))
-                    .reply(TlsClientMsg::Connected)
+                    .then(TlsClientMsg::Connected)
             }
             TlsClientMsg::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
@@ -465,7 +484,7 @@ impl TlsClientService {
                     .expect("tls observed lock")
                     .push("connected".to_string());
                 tls_write(stream, b"ping".to_vec(), Duration::from_secs(2))
-                    .reply(TlsClientMsg::Wrote)
+                    .then(TlsClientMsg::Wrote)
             }
             TlsClientMsg::Connected(Err(error)) => {
                 self.observed
@@ -480,7 +499,7 @@ impl TlsClientService {
                     .expect("tls observed lock")
                     .push(format!("wrote:{count}"));
                 let stream = self.stream.expect("TLS stream should be remembered");
-                tls_read(stream, 4, Duration::from_secs(2)).reply(TlsClientMsg::Read)
+                tls_read(stream, 4, Duration::from_secs(2)).then(TlsClientMsg::Read)
             }
             TlsClientMsg::Wrote(Err(error)) => {
                 self.observed
@@ -495,7 +514,7 @@ impl TlsClientService {
                     .expect("tls observed lock")
                     .push(String::from_utf8(bytes).unwrap_or_else(|error| format!("utf8:{error}")));
                 let stream = self.stream.expect("TLS stream should be remembered");
-                tls_close(stream, Duration::from_secs(2)).reply(TlsClientMsg::Closed)
+                tls_close(stream, Duration::from_secs(2)).then(TlsClientMsg::Closed)
             }
             TlsClientMsg::Read(Err(error)) => {
                 self.observed
@@ -553,14 +572,14 @@ impl TlsServerService {
                 vec![self.cert_der.clone()],
                 self.key_der.clone(),
             )
-            .reply(TlsServerMsg::Bound),
+            .then(TlsServerMsg::Bound),
             TlsServerMsg::Bound(Ok((listener, local_addr))) => {
                 self.observed
                     .lock()
                     .expect("tls server observed lock")
                     .push(format!("bound:{local_addr}"));
                 tls_accept(listener, Duration::from_secs(2))
-                    .reply(move |result| TlsServerMsg::Accepted(result, listener))
+                    .then(move |result| TlsServerMsg::Accepted(result, listener))
             }
             TlsServerMsg::Accepted(Ok((stream, peer)), listener) => {
                 self.observed
@@ -568,18 +587,18 @@ impl TlsServerService {
                     .expect("tls server observed lock")
                     .push(format!("accepted:{peer}"));
                 tls_read(stream, 4, Duration::from_secs(2))
-                    .reply(move |result| TlsServerMsg::Read(result, listener, stream))
+                    .then(move |result| TlsServerMsg::Read(result, listener, stream))
             }
             TlsServerMsg::Read(Ok(bytes), listener, stream) if bytes == b"ping" => {
                 tls_write(stream, b"pong".to_vec(), Duration::from_secs(2))
-                    .reply(move |result| TlsServerMsg::Wrote(result, listener, stream))
+                    .then(move |result| TlsServerMsg::Wrote(result, listener, stream))
             }
             TlsServerMsg::Wrote(Ok(4), listener, stream) => {
                 tls_close(stream, Duration::from_secs(2))
-                    .reply(move |result| TlsServerMsg::StreamClosed(result, listener))
+                    .then(move |result| TlsServerMsg::StreamClosed(result, listener))
             }
             TlsServerMsg::StreamClosed(Ok(()), listener) => {
-                tls_close_listener(listener).reply(TlsServerMsg::ListenerClosed)
+                tls_close_listener(listener).then(TlsServerMsg::ListenerClosed)
             }
             TlsServerMsg::ListenerClosed(Ok(())) => {
                 self.observed
@@ -600,7 +619,7 @@ impl TlsServerService {
                     .lock()
                     .expect("tls server observed lock")
                     .push(format!("failed:{error:?}"));
-                tls_close_listener(listener).reply(TlsServerMsg::ListenerClosed)
+                tls_close_listener(listener).then(TlsServerMsg::ListenerClosed)
             }
             TlsServerMsg::Read(Err(error), _, _)
             | TlsServerMsg::Wrote(Err(error), _, _)
@@ -643,7 +662,7 @@ impl SignalUnsupportedService {
     ) -> Effect<Self> {
         match msg {
             SignalUnsupportedMsg::Start => {
-                signal_wait("shutdown", Duration::from_secs(60)).reply(SignalUnsupportedMsg::Done)
+                signal_wait("shutdown", Duration::from_secs(60)).then(SignalUnsupportedMsg::Done)
             }
             SignalUnsupportedMsg::Done(Ok(name)) => {
                 self.observed
@@ -690,7 +709,7 @@ impl ProcessService {
                 4,
                 16,
             )
-            .reply(ProcessMsg::Done),
+            .then(ProcessMsg::Done),
             ProcessMsg::Sleep => process_run(
                 "/bin/sleep",
                 vec!["5".to_string()],
@@ -698,7 +717,7 @@ impl ProcessService {
                 16,
                 16,
             )
-            .reply(ProcessMsg::Done),
+            .then(ProcessMsg::Done),
             ProcessMsg::Done(Ok(result)) => {
                 self.observed
                     .lock()
@@ -759,24 +778,24 @@ impl ComposedIoService {
             ComposedIoMsg::Start(path) => {
                 self.journal = Some(path);
                 udp_bind("127.0.0.1:0".parse().expect("loopback"))
-                    .reply(ComposedIoMsg::ReceiverBound)
+                    .then(ComposedIoMsg::ReceiverBound)
             }
             ComposedIoMsg::ReceiverBound(Ok((socket, addr))) => {
                 self.receiver = Some(socket);
                 self.receiver_addr = Some(addr);
-                udp_bind("127.0.0.1:0".parse().expect("loopback")).reply(ComposedIoMsg::SenderBound)
+                udp_bind("127.0.0.1:0".parse().expect("loopback")).then(ComposedIoMsg::SenderBound)
             }
             ComposedIoMsg::SenderBound(Ok((socket, _))) => {
                 self.sender = Some(socket);
                 batch(vec![
                     udp_recv_from(self.receiver.expect("receiver"), 16)
-                        .reply(ComposedIoMsg::Received),
+                        .then(ComposedIoMsg::Received),
                     udp_send_to(
                         socket,
                         self.receiver_addr.expect("receiver addr"),
                         b"llama".to_vec(),
                     )
-                    .reply(ComposedIoMsg::Sent),
+                    .then(ComposedIoMsg::Sent),
                 ])
             }
             ComposedIoMsg::Sent(Ok(count)) => {
@@ -799,17 +818,17 @@ impl ComposedIoService {
                     16,
                     16,
                 )
-                .reply(ComposedIoMsg::Processed)
+                .then(ComposedIoMsg::Processed)
             }
             ComposedIoMsg::Processed(Ok(result)) => {
                 let mut bytes = self.udp_payload.take().expect("udp before process");
                 bytes.extend_from_slice(&result.stdout);
                 journal_append(self.journal.clone().expect("journal path"), 1, bytes)
-                    .reply(ComposedIoMsg::Journaled)
+                    .then(ComposedIoMsg::Journaled)
             }
             ComposedIoMsg::Journaled(Ok(())) => batch(vec![
-                udp_close_socket(self.receiver.expect("receiver")).reply(ComposedIoMsg::Closed),
-                udp_close_socket(self.sender.expect("sender")).reply(ComposedIoMsg::Closed),
+                udp_close_socket(self.receiver.expect("receiver")).then(ComposedIoMsg::Closed),
+                udp_close_socket(self.sender.expect("sender")).then(ComposedIoMsg::Closed),
             ]),
             ComposedIoMsg::Closed(Ok(())) => {
                 self.closed += 1;
@@ -881,44 +900,45 @@ impl FileService {
     ) -> Effect<Self> {
         match msg {
             FileMsg::Start(path) => {
-                file_create(path.clone()).reply(move |result| FileMsg::Opened(result, path))
+                file_create(path.clone()).then(move |result| FileMsg::Opened(result, path))
             }
             FileMsg::Opened(Ok(file), path) => file_write(file, FILE_SERVICE_PAYLOAD.to_vec())
-                .reply(move |result| FileMsg::Wrote(result, path, file)),
+                .then(move |result| FileMsg::Wrote(result, path, file)),
             FileMsg::Wrote(Ok(count), path, file) if count == FILE_SERVICE_PAYLOAD.len() => {
-                file_fsync(file).reply(move |result| FileMsg::Synced(result, path, file))
+                file_fsync(file).then(move |result| FileMsg::Synced(result, path, file))
             }
             FileMsg::Synced(Ok(()), path, file) => {
-                file_size(file).reply(move |result| FileMsg::Sized(result, path, file))
+                file_size(file).then(move |result| FileMsg::Sized(result, path, file))
             }
-            FileMsg::Sized(Ok(size), path, file) => file_read(file, size as usize)
-                .reply(move |result| FileMsg::Read(result, path, file)),
+            FileMsg::Sized(Ok(size), path, file) => {
+                file_read(file, size as usize).then(move |result| FileMsg::Read(result, path, file))
+            }
             FileMsg::Read(Ok(bytes), path, file) => {
-                file_close(file).reply(move |result| FileMsg::Closed(result, path, bytes))
+                file_close(file).then(move |result| FileMsg::Closed(result, path, bytes))
             }
             FileMsg::Closed(Ok(()), path, bytes) => path_metadata(path.clone())
-                .reply(move |result| FileMsg::Metadata(result, path, bytes)),
+                .then(move |result| FileMsg::Metadata(result, path, bytes)),
             FileMsg::Metadata(Ok(metadata), path, bytes)
                 if metadata.kind == PathKind::File
                     && metadata.len == Some(FILE_SERVICE_PAYLOAD.len() as u64) =>
             {
                 let renamed = path.with_extension("renamed");
                 rename_replace(path, renamed.clone())
-                    .reply(move |result| FileMsg::Renamed(result, renamed, bytes))
+                    .then(move |result| FileMsg::Renamed(result, renamed, bytes))
             }
             FileMsg::Renamed(Ok(()), renamed, bytes) => {
                 let parent = renamed
                     .parent()
                     .expect("renamed file has parent")
                     .to_path_buf();
-                read_dir(parent).reply(move |result| FileMsg::DirectoryRead(result, renamed, bytes))
+                read_dir(parent).then(move |result| FileMsg::DirectoryRead(result, renamed, bytes))
             }
             FileMsg::DirectoryRead(Ok(entries), renamed, bytes) if entries.contains(&renamed) => {
                 sync_parent(renamed.clone())
-                    .reply(move |result| FileMsg::ParentSynced(result, renamed, bytes))
+                    .then(move |result| FileMsg::ParentSynced(result, renamed, bytes))
             }
             FileMsg::ParentSynced(Ok(()), renamed, bytes) => {
-                remove_file(renamed).reply(move |result| FileMsg::Removed(result, bytes))
+                remove_file(renamed).then(move |result| FileMsg::Removed(result, bytes))
             }
             FileMsg::Removed(Ok(()), bytes) => {
                 self.seen
@@ -959,7 +979,7 @@ impl HeldFileService {
         _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HeldFileMsg::Start(path) => file_create(path).reply(HeldFileMsg::Opened),
+            HeldFileMsg::Start(path) => file_create(path).then(HeldFileMsg::Opened),
             HeldFileMsg::Opened(Ok(_file)) => {
                 self.seen
                     .lock()
@@ -1005,15 +1025,15 @@ impl DurableWorker {
     ) -> Effect<Self> {
         match msg {
             DurableWorkerMsg::Recover => {
-                snapshot_load(self.snapshot_path.clone()).reply(DurableWorkerMsg::SnapshotLoaded)
+                snapshot_load(self.snapshot_path.clone()).then(DurableWorkerMsg::SnapshotLoaded)
             }
             DurableWorkerMsg::SnapshotLoaded(Ok(Some(snapshot))) => {
                 self.values = decode_durable_values(&snapshot.bytes);
                 self.last_journal_index = snapshot.last_journal_index;
-                journal_replay(self.journal_path.clone()).reply(DurableWorkerMsg::JournalLoaded)
+                journal_replay(self.journal_path.clone()).then(DurableWorkerMsg::JournalLoaded)
             }
             DurableWorkerMsg::SnapshotLoaded(Ok(None)) => {
-                journal_replay(self.journal_path.clone()).reply(DurableWorkerMsg::JournalLoaded)
+                journal_replay(self.journal_path.clone()).then(DurableWorkerMsg::JournalLoaded)
             }
             DurableWorkerMsg::SnapshotLoaded(Err(error)) => {
                 self.observed
@@ -1044,7 +1064,7 @@ impl DurableWorker {
                 let index = self.last_journal_index + 1;
                 let record = value.into_bytes();
                 journal_append(self.journal_path.clone(), index, record.clone())
-                    .reply(move |result| DurableWorkerMsg::Durable(result, index, record))
+                    .then(move |result| DurableWorkerMsg::Durable(result, index, record))
             }
             DurableWorkerMsg::Durable(Ok(()), index, record) => {
                 self.values
@@ -1145,18 +1165,18 @@ impl TcpJournalService {
         match msg {
             TcpJournalMsg::Start(journal_path) => {
                 self.journal_path = Some(journal_path);
-                tcp_bind("127.0.0.1:0".parse().expect("valid loopback")).reply(TcpJournalMsg::Bound)
+                tcp_bind("127.0.0.1:0".parse().expect("valid loopback")).then(TcpJournalMsg::Bound)
             }
             TcpJournalMsg::Bound(Ok((listener, addr))) => {
                 self.listener = Some(listener);
                 *self.published.lock().expect("published lock") = Some(addr);
-                tcp_accept(listener).reply(TcpJournalMsg::Accepted)
+                tcp_accept(listener).then(TcpJournalMsg::Accepted)
             }
             TcpJournalMsg::Accepted(Ok((stream, _peer))) => {
-                tcp_read(stream, 64).reply(move |result| TcpJournalMsg::Read(result, stream))
+                tcp_read(stream, 64).then(move |result| TcpJournalMsg::Read(result, stream))
             }
             TcpJournalMsg::Read(Ok(bytes), stream) if bytes.is_empty() => {
-                tcp_close_stream(stream).reply(TcpJournalMsg::StreamClosed)
+                tcp_close_stream(stream).then(TcpJournalMsg::StreamClosed)
             }
             TcpJournalMsg::Read(Ok(bytes), stream) => {
                 let index = self.last_journal_index + 1;
@@ -1165,7 +1185,7 @@ impl TcpJournalService {
                     .clone()
                     .expect("journal path set before read");
                 journal_append(journal_path, index, bytes.clone())
-                    .reply(move |result| TcpJournalMsg::Durable(result, stream, bytes, index))
+                    .then(move |result| TcpJournalMsg::Durable(result, stream, bytes, index))
             }
             TcpJournalMsg::Durable(Ok(()), stream, bytes, index) => {
                 self.last_journal_index = index;
@@ -1174,13 +1194,13 @@ impl TcpJournalService {
                     .expect("observed lock")
                     .push(String::from_utf8(bytes).expect("client payload utf8"));
                 tcp_write(stream, b"journaled\n".to_vec())
-                    .reply(move |result| TcpJournalMsg::Wrote(result, stream))
+                    .then(move |result| TcpJournalMsg::Wrote(result, stream))
             }
             TcpJournalMsg::Wrote(Ok(_), stream) => {
-                tcp_close_stream(stream).reply(TcpJournalMsg::StreamClosed)
+                tcp_close_stream(stream).then(TcpJournalMsg::StreamClosed)
             }
             TcpJournalMsg::StreamClosed(Ok(())) => match self.listener.take() {
-                Some(listener) => tcp_close_listener(listener).reply(TcpJournalMsg::ListenerClosed),
+                Some(listener) => tcp_close_listener(listener).then(TcpJournalMsg::ListenerClosed),
                 None => stop(),
             },
             TcpJournalMsg::ListenerClosed(Ok(())) => {
@@ -1228,8 +1248,8 @@ impl StoragePressureService {
     ) -> Effect<Self> {
         match msg {
             StoragePressureMsg::Start(path) => batch(vec![
-                journal_append(path.clone(), 1, b"first".to_vec()).reply(StoragePressureMsg::First),
-                journal_append(path, 2, b"second".to_vec()).reply(StoragePressureMsg::Second),
+                journal_append(path.clone(), 1, b"first".to_vec()).then(StoragePressureMsg::First),
+                journal_append(path, 2, b"second".to_vec()).then(StoragePressureMsg::Second),
             ]),
             StoragePressureMsg::First(result) => {
                 self.observed
@@ -1283,17 +1303,17 @@ impl CrossShardTcpFrontend {
     ) -> Effect<Self> {
         match msg {
             CrossShardTcpMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("valid loopback"))
-                .reply(CrossShardTcpMsg::Bound),
+                .then(CrossShardTcpMsg::Bound),
             CrossShardTcpMsg::Bound(Ok((listener, addr))) => {
                 self.listener = Some(listener);
                 *self.published.lock().expect("published lock") = Some(addr);
-                tcp_accept(listener).reply(CrossShardTcpMsg::Accepted)
+                tcp_accept(listener).then(CrossShardTcpMsg::Accepted)
             }
             CrossShardTcpMsg::Accepted(Ok((stream, _peer))) => {
-                tcp_read(stream, 64).reply(move |result| CrossShardTcpMsg::Read(result, stream))
+                tcp_read(stream, 64).then(move |result| CrossShardTcpMsg::Read(result, stream))
             }
             CrossShardTcpMsg::Read(Ok(bytes), stream) if bytes.is_empty() => {
-                tcp_close_stream(stream).reply(CrossShardTcpMsg::StreamClosed)
+                tcp_close_stream(stream).then(CrossShardTcpMsg::StreamClosed)
             }
             CrossShardTcpMsg::Read(Ok(bytes), stream) => {
                 self.stream = Some(stream);
@@ -1314,15 +1334,14 @@ impl CrossShardTcpFrontend {
                 let mut reply = b"persisted:".to_vec();
                 reply.extend(bytes);
                 reply.push(b'\n');
-                tcp_write(stream, reply)
-                    .reply(move |result| CrossShardTcpMsg::Wrote(result, stream))
+                tcp_write(stream, reply).then(move |result| CrossShardTcpMsg::Wrote(result, stream))
             }
             CrossShardTcpMsg::Wrote(Ok(_), stream) => {
-                tcp_close_stream(stream).reply(CrossShardTcpMsg::StreamClosed)
+                tcp_close_stream(stream).then(CrossShardTcpMsg::StreamClosed)
             }
             CrossShardTcpMsg::StreamClosed(Ok(())) => match self.listener.take() {
                 Some(listener) => {
-                    tcp_close_listener(listener).reply(CrossShardTcpMsg::ListenerClosed)
+                    tcp_close_listener(listener).then(CrossShardTcpMsg::ListenerClosed)
                 }
                 None => stop(),
             },
@@ -1384,7 +1403,7 @@ impl CrossShardPersistWorker {
         match msg {
             CrossShardPersistMsg::Persist { bytes, reply_to } => {
                 let index = self.last_journal_index + 1;
-                journal_append(self.journal_path.clone(), index, bytes.clone()).reply(
+                journal_append(self.journal_path.clone(), index, bytes.clone()).then(
                     move |result| CrossShardPersistMsg::Durable(result, bytes, reply_to, index),
                 )
             }
@@ -1822,7 +1841,7 @@ fn blue_whale_combined_e2e_core_preallocation_and_cross_shard_call() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(46),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register worker");
@@ -2867,7 +2886,7 @@ fn live_cross_shard_isolate_call_round_trips_reply_to_requester_shard() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(46),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register cross shard worker");
@@ -2939,7 +2958,7 @@ fn live_cross_shard_isolate_call_timeout_settles_on_requester_shard() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(48),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register timeout worker");
@@ -2993,7 +3012,7 @@ fn live_cross_shard_isolate_call_destination_full_returns_typed_full() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(50),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             0,
         )
         .expect("register full worker");
@@ -3046,7 +3065,7 @@ fn live_cross_shard_isolate_call_destination_closed_returns_typed_closed() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(52),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register closable worker");
@@ -3269,7 +3288,7 @@ fn failed_shard_cross_shard_call_returns_one_closed_outcome() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(84),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register worker before shard failure");
@@ -3323,7 +3342,7 @@ fn timeout_before_later_shard_failure_keeps_timeout_outcome() {
     let worker = app
         .register_root_on::<CrossShardCallWorker, Infallible>(
             ShardId::new(86),
-            CrossShardCallWorker,
+            CrossShardCallWorker::default(),
             8,
         )
         .expect("register no-reply worker");

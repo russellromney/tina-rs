@@ -84,6 +84,7 @@ struct InFlight {
     started_at: Instant,
     receiver: oneshot::Receiver<PgResult>,
     abandoned: Arc<AtomicBool>,
+    reply_to: tina::RequestContext<PgResult>,
     /// `Some` when DB-side cancel is enabled. The spawned task
     /// stores `pg_backend_pid()` here right after it acquires a
     /// connection and clears it back to 0 after the user's query
@@ -244,7 +245,11 @@ impl<S: Shard + 'static> PgWorker<S> {
         (worker, metrics_handle)
     }
 
-    fn admit(&mut self, request: PgRequest) -> Effect<Self> {
+    fn admit(
+        &mut self,
+        request: PgRequest,
+        reply_to: tina::RequestContext<PgResult>,
+    ) -> Effect<Self> {
         let request_kind = request_kind_name(&request);
 
         if self.closed.load(Ordering::Acquire) {
@@ -257,7 +262,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 reason = "Closed",
                 request_kind,
             );
-            return reply::<Self>(Err(PgError::Closed));
+            return tina::reply_to_request(reply_to, Err(PgError::Closed));
         }
 
         if let Err(err) = validate_request(&request, &self.config) {
@@ -271,7 +276,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 request_kind,
                 detail = %err,
             );
-            return reply::<Self>(Err(err));
+            return tina::reply_to_request(reply_to, Err(err));
         }
 
         if self.in_flight.len() >= self.config.max_in_flight {
@@ -284,7 +289,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 reason = "Full",
                 request_kind,
             );
-            return reply::<Self>(Err(PgError::Full));
+            return tina::reply_to_request(reply_to, Err(PgError::Full));
         }
 
         let id = self.next_id;
@@ -325,6 +330,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 started_at: Instant::now(),
                 receiver: rx,
                 abandoned,
+                reply_to,
                 pid_slot,
                 request_kind,
             },
@@ -343,7 +349,7 @@ impl<S: Shard + 'static> PgWorker<S> {
             in_flight,
         );
 
-        sleep(self.config.poll_interval).reply(move |_| PgMsg::Poll(id))
+        sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id))
     }
 
     fn poll(&mut self, id: u64) -> Effect<Self> {
@@ -359,7 +365,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 emit_replied(&result, request_kind);
                 #[cfg(not(feature = "tracing"))]
                 let _ = request_kind;
-                reply::<Self>(result)
+                tina::reply_to_request(in_flight.reply_to, result)
             }
             Err(oneshot::error::TryRecvError::Empty) => {
                 if in_flight.started_at.elapsed() >= self.config.default_timeout {
@@ -425,10 +431,10 @@ impl<S: Shard + 'static> PgWorker<S> {
                         request_kind,
                         elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
                     );
-                    return reply::<Self>(Err(PgError::Timeout));
+                    return tina::reply_to_request(in_flight.reply_to, Err(PgError::Timeout));
                 }
                 self.in_flight.insert(id, in_flight);
-                sleep(self.config.poll_interval).reply(move |_| PgMsg::Poll(id))
+                sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id))
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.note_terminal();
@@ -441,9 +447,12 @@ impl<S: Shard + 'static> PgWorker<S> {
                     request_kind,
                     detail = "spawned task ended without result",
                 );
-                reply::<Self>(Err(PgError::Internal(
-                    "spawned task ended without result".into(),
-                )))
+                tina::reply_to_request(
+                    in_flight.reply_to,
+                    Err(PgError::Internal(
+                        "spawned task ended without result".into(),
+                    )),
+                )
             }
         }
     }
@@ -665,9 +674,16 @@ impl<S: Shard + 'static> Isolate for PgWorker<S> {
         shard: S,
     }
 
+    fn handle_call(&mut self, msg: PgMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            PgMsg::Send(request) => self.admit(request, call.into_request_context()),
+            PgMsg::Poll(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(&mut self, msg: PgMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
-            PgMsg::Send(request) => self.admit(request),
+            PgMsg::Send(_) => noop(),
             PgMsg::Poll(id) => self.poll(id),
         }
     }

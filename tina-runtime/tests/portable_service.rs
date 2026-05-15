@@ -97,10 +97,16 @@ struct ServiceRequest {
     body: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum WorkerMsg {
     Work(ServiceRequest),
     Journaled(Result<(), CallError>, ServiceRequest, u64),
+    JournaledForCall(
+        tina::RequestContext<WorkerReply>,
+        Result<(), CallError>,
+        ServiceRequest,
+        u64,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +142,7 @@ impl DurableWorker {
                     index,
                     format!("{}:{}", request.key, request.body).into_bytes(),
                 )
-                .reply(move |result| WorkerMsg::Journaled(result, request, index))
+                .then(move |result| WorkerMsg::Journaled(result, request, index))
             }
             WorkerMsg::Journaled(Ok(()), request, index) => {
                 self.next_index = index + 1;
@@ -150,6 +156,41 @@ impl DurableWorker {
                 })
             }
             WorkerMsg::Journaled(Err(error), _, _) => reply(WorkerReply::DurableFailure(error)),
+            WorkerMsg::JournaledForCall(req, Ok(()), request, index) => {
+                self.next_index = index + 1;
+                self.observed
+                    .lock()
+                    .expect("worker observed lock")
+                    .push(ServiceObservation::WorkerStored(request.key));
+                tina::reply_to_request(
+                    req,
+                    WorkerReply::Stored {
+                        key: request.key,
+                        body: request.body,
+                    },
+                )
+            }
+            WorkerMsg::JournaledForCall(req, Err(error), _, _) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(error))
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Work(request) => {
+                let req = call.into_request_context();
+                let index = self.next_index;
+                journal_append(
+                    self.journal_path.clone(),
+                    index,
+                    format!("{}:{}", request.key, request.body).into_bytes(),
+                )
+                .then(move |result| WorkerMsg::JournaledForCall(req, result, request, index))
+            }
+            WorkerMsg::Journaled(_, _, _) | WorkerMsg::JournaledForCall(_, _, _, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -241,6 +282,15 @@ impl Router {
                     );
                     noop()
                 }
+                CallOutcome::Rejected(reason) => {
+                    self.observed.lock().expect("router observed lock").push(
+                        ServiceObservation::Rejected {
+                            key: request.key,
+                            reason: format!("rejected:{reason:?}"),
+                        },
+                    );
+                    noop()
+                }
                 CallOutcome::Timeout => {
                     self.observed.lock().expect("router observed lock").push(
                         ServiceObservation::Rejected {
@@ -267,7 +317,7 @@ impl Router {
                         WorkerMsg::Work(request.clone()),
                         Duration::from_secs(1),
                     )
-                    .reply(move |outcome| RouterMsg::Routed(request, 0, outcome))
+                    .then(move |outcome| RouterMsg::Routed(request, 0, outcome))
                 }
             }
         }
@@ -282,7 +332,7 @@ impl Router {
             WorkerMsg::Work(request.clone()),
             Duration::from_secs(1),
         )
-        .reply(move |outcome| RouterMsg::Routed(request, attempt, outcome))
+        .then(move |outcome| RouterMsg::Routed(request, attempt, outcome))
     }
 
     fn expected_worker(&self, key: u64) -> Address<WorkerMsg, WorkerReply> {
@@ -351,11 +401,11 @@ impl ReadinessService {
     ) -> Effect<Self> {
         match msg {
             ReadinessMsg::Start => tcp_bind("127.0.0.1:0".parse().expect("readiness bind addr"))
-                .reply(ReadinessMsg::TcpBound),
+                .then(ReadinessMsg::TcpBound),
             ReadinessMsg::TcpBound(Ok((listener, addr))) => {
                 self.listener = Some(listener);
                 *self.published.lock().expect("readiness published lock") = Some(addr);
-                tcp_accept(listener).reply(ReadinessMsg::TcpAccepted)
+                tcp_accept(listener).then(ReadinessMsg::TcpAccepted)
             }
             ReadinessMsg::TcpBound(Err(error)) => {
                 self.record_rejection(50, format!("tcp-bind:{error:?}"));
@@ -363,7 +413,7 @@ impl ReadinessService {
             }
             ReadinessMsg::TcpAccepted(Ok((stream, _peer))) => {
                 self.tcp_buffer.clear();
-                tcp_read(stream, 4).reply(move |result| ReadinessMsg::TcpRead(result, stream))
+                tcp_read(stream, 4).then(move |result| ReadinessMsg::TcpRead(result, stream))
             }
             ReadinessMsg::TcpAccepted(Err(error)) => {
                 self.record_rejection(50, format!("tcp-accept:{error:?}"));
@@ -371,7 +421,7 @@ impl ReadinessService {
             }
             ReadinessMsg::TcpRead(Ok(bytes), stream) if bytes.is_empty() => {
                 self.record_rejection(50, "tcp-eof-before-frame");
-                tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+                tcp_close_stream(stream).then(ReadinessMsg::TcpAbortStreamClosed)
             }
             ReadinessMsg::TcpRead(Ok(bytes), stream) => {
                 self.tcp_buffer.extend_from_slice(&bytes);
@@ -381,34 +431,34 @@ impl ReadinessService {
                             && &self.tcp_buffer[..newline] == b"baobab-ready" =>
                     {
                         tcp_write(stream, b"readiness-ok\n".to_vec())
-                            .reply(move |result| ReadinessMsg::TcpWrote(result, stream))
+                            .then(move |result| ReadinessMsg::TcpWrote(result, stream))
                     }
                     Some(_) => {
                         self.record_rejection(50, "tcp-frame");
-                        tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+                        tcp_close_stream(stream).then(ReadinessMsg::TcpAbortStreamClosed)
                     }
                     None if self.tcp_buffer.len() > READINESS_MAX_FRAME => {
                         self.record_rejection(50, "tcp-frame-too-large");
-                        tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+                        tcp_close_stream(stream).then(ReadinessMsg::TcpAbortStreamClosed)
                     }
                     None => tcp_read(stream, 4)
-                        .reply(move |result| ReadinessMsg::TcpRead(result, stream)),
+                        .then(move |result| ReadinessMsg::TcpRead(result, stream)),
                 }
             }
             ReadinessMsg::TcpRead(Err(error), stream) => {
                 self.record_rejection(50, format!("tcp-read:{error:?}"));
-                tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+                tcp_close_stream(stream).then(ReadinessMsg::TcpAbortStreamClosed)
             }
             ReadinessMsg::TcpWrote(Ok(_), stream) => {
-                tcp_close_stream(stream).reply(ReadinessMsg::TcpStreamClosed)
+                tcp_close_stream(stream).then(ReadinessMsg::TcpStreamClosed)
             }
             ReadinessMsg::TcpWrote(Err(error), stream) => {
                 self.record_rejection(50, format!("tcp-write:{error:?}"));
-                tcp_close_stream(stream).reply(ReadinessMsg::TcpAbortStreamClosed)
+                tcp_close_stream(stream).then(ReadinessMsg::TcpAbortStreamClosed)
             }
             ReadinessMsg::TcpStreamClosed(Ok(())) => match self.listener.take() {
                 Some(listener) => {
-                    tcp_close_listener(listener).reply(ReadinessMsg::TcpListenerClosed)
+                    tcp_close_listener(listener).then(ReadinessMsg::TcpListenerClosed)
                 }
                 None => {
                     self.record_rejection(50, "tcp-listener-missing");
@@ -419,7 +469,7 @@ impl ReadinessService {
                 self.record_rejection(50, format!("tcp-close-stream:{error:?}"));
                 match self.listener.take() {
                     Some(listener) => {
-                        tcp_close_listener(listener).reply(ReadinessMsg::TcpAbortListenerClosed)
+                        tcp_close_listener(listener).then(ReadinessMsg::TcpAbortListenerClosed)
                     }
                     None => noop(),
                 }
@@ -437,7 +487,7 @@ impl ReadinessService {
                 }
                 match self.listener.take() {
                     Some(listener) => {
-                        tcp_close_listener(listener).reply(ReadinessMsg::TcpAbortListenerClosed)
+                        tcp_close_listener(listener).then(ReadinessMsg::TcpAbortListenerClosed)
                     }
                     None => noop(),
                 }
@@ -449,7 +499,7 @@ impl ReadinessService {
                 noop()
             }
             ReadinessMsg::TimerReady => {
-                dns_lookup("localhost", 80, Duration::from_secs(1)).reply(ReadinessMsg::Dns)
+                dns_lookup("localhost", 80, Duration::from_secs(1)).then(ReadinessMsg::Dns)
             }
             ReadinessMsg::Dns(Ok(addresses)) if !addresses.is_empty() => process_run(
                 "/bin/echo",
@@ -458,7 +508,7 @@ impl ReadinessService {
                 128,
                 128,
             )
-            .reply(ReadinessMsg::Process),
+            .then(ReadinessMsg::Process),
             ReadinessMsg::Dns(Ok(_)) => {
                 self.record_rejection(50, "dns-empty");
                 noop()
@@ -470,7 +520,7 @@ impl ReadinessService {
             ReadinessMsg::Process(Ok(result))
                 if result.status.code == Some(0) && result.stdout.starts_with(b"baobab-ready") =>
             {
-                file_create(self.file_path.clone()).reply(ReadinessMsg::FileOpened)
+                file_create(self.file_path.clone()).then(ReadinessMsg::FileOpened)
             }
             ReadinessMsg::Process(Ok(_)) => {
                 self.record_rejection(50, "process-output");
@@ -481,13 +531,13 @@ impl ReadinessService {
                 noop()
             }
             ReadinessMsg::FileOpened(Ok(file)) => file_write(file, b"baobab".to_vec())
-                .reply(move |result| ReadinessMsg::FileWritten(file, result)),
+                .then(move |result| ReadinessMsg::FileWritten(file, result)),
             ReadinessMsg::FileOpened(Err(error)) => {
                 self.record_rejection(50, format!("file-open:{error:?}"));
                 noop()
             }
             ReadinessMsg::FileWritten(file, Ok(6)) => {
-                file_read(file, 6).reply(ReadinessMsg::FileRead)
+                file_read(file, 6).then(ReadinessMsg::FileRead)
             }
             ReadinessMsg::FileWritten(_, Ok(_)) => {
                 self.record_rejection(50, "short-write");
@@ -498,7 +548,7 @@ impl ReadinessService {
                 noop()
             }
             ReadinessMsg::FileRead(Ok(bytes)) if bytes == b"baobab" => {
-                journal_append(self.journal_path.clone(), 1, bytes).reply(ReadinessMsg::Journaled)
+                journal_append(self.journal_path.clone(), 1, bytes).then(ReadinessMsg::Journaled)
             }
             ReadinessMsg::FileRead(Ok(_)) => {
                 self.record_rejection(50, "file-read");
@@ -516,7 +566,7 @@ impl ReadinessService {
                 }),
                 Duration::from_secs(1),
             )
-            .reply(ReadinessMsg::Worker),
+            .then(ReadinessMsg::Worker),
             ReadinessMsg::Journaled(Err(error)) => {
                 self.record_rejection(50, format!("journal:{error:?}"));
                 noop()
@@ -540,6 +590,10 @@ impl ReadinessService {
             }
             ReadinessMsg::Worker(CallOutcome::Closed) => {
                 self.record_rejection(50, "worker-closed");
+                noop()
+            }
+            ReadinessMsg::Worker(CallOutcome::Rejected(reason)) => {
+                self.record_rejection(50, format!("worker-rejected:{reason:?}"));
                 noop()
             }
             ReadinessMsg::Worker(CallOutcome::Timeout) => {
@@ -591,10 +645,15 @@ impl AuditSink {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum AuditedWorkerMsg {
     Work(ServiceRequest),
     AuditResult(ServiceRequest, SendOutcome),
+    AuditResultForCall(
+        tina::RequestContext<WorkerReply>,
+        ServiceRequest,
+        SendOutcome,
+    ),
 }
 
 #[derive(Debug)]
@@ -618,7 +677,7 @@ impl AuditedWorker {
         match msg {
             AuditedWorkerMsg::Work(request) => {
                 send_observed(self.audit, AuditMsg::Record(request.key))
-                    .reply(move |outcome| AuditedWorkerMsg::AuditResult(request, outcome))
+                    .then(move |outcome| AuditedWorkerMsg::AuditResult(request, outcome))
             }
             AuditedWorkerMsg::AuditResult(request, SendOutcome::Accepted) => {
                 self.observed
@@ -635,6 +694,43 @@ impl AuditedWorker {
             }
             AuditedWorkerMsg::AuditResult(_, SendOutcome::Closed) => {
                 reply(WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
+            AuditedWorkerMsg::AuditResultForCall(req, request, SendOutcome::Accepted) => {
+                self.observed
+                    .lock()
+                    .expect("audited worker observed lock")
+                    .push(ServiceObservation::WorkerStored(request.key));
+                tina::reply_to_request(
+                    req,
+                    WorkerReply::Stored {
+                        key: request.key,
+                        body: request.body,
+                    },
+                )
+            }
+            AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Full) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetFull))
+            }
+            AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Closed) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: AuditedWorkerMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            AuditedWorkerMsg::Work(request) => {
+                let req = call.into_request_context();
+                send_observed(self.audit, AuditMsg::Record(request.key)).then(move |outcome| {
+                    AuditedWorkerMsg::AuditResultForCall(req, request, outcome)
+                })
+            }
+            AuditedWorkerMsg::AuditResult(_, _) | AuditedWorkerMsg::AuditResultForCall(_, _, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -669,7 +765,7 @@ impl AuditedClient {
                 AuditedWorkerMsg::Work(request.clone()),
                 Duration::from_secs(1),
             )
-            .reply(move |outcome| AuditedClientMsg::Returned(request, outcome)),
+            .then(move |outcome| AuditedClientMsg::Returned(request, outcome)),
             AuditedClientMsg::Returned(request, outcome) => {
                 let observation = match outcome {
                     CallOutcome::Replied(WorkerReply::Stored { body, .. }) => {
@@ -691,6 +787,10 @@ impl AuditedClient {
                     CallOutcome::Closed => ServiceObservation::Rejected {
                         key: request.key,
                         reason: "worker-closed".to_string(),
+                    },
+                    CallOutcome::Rejected(reason) => ServiceObservation::Rejected {
+                        key: request.key,
+                        reason: format!("worker-rejected:{reason:?}"),
                     },
                     CallOutcome::Timeout => ServiceObservation::Rejected {
                         key: request.key,

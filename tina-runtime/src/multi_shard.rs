@@ -15,7 +15,7 @@ use crate::clock::MonotonicClock;
 use crate::mailbox::MailboxFactory;
 use crate::sharded::ReplyAdapter;
 use crate::trace::{RuntimeEvent, SendRejectedReason};
-use crate::{IdSource, IntoErasedSpawn, QueuedRemoteEnvelope, Runtime};
+use crate::{IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, QueuedRemoteEnvelope, Runtime};
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
 type RemoteQueues = Vec<VecDeque<QueuedRemoteEnvelope>>;
@@ -159,6 +159,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
@@ -181,6 +182,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {

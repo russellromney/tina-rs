@@ -14,7 +14,7 @@ Tina shape:
 
 ```rust
 call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
-    .reply(ClientMsg::WorkerReturned)
+    .then(ClientMsg::WorkerReturned)
 ```
 
 Full shape:
@@ -48,7 +48,7 @@ impl Client {
                 WorkerMsg::Run(job),
                 Duration::from_millis(50),
             )
-            .reply(ClientMsg::WorkerReturned),
+            .then(ClientMsg::WorkerReturned),
 
             ClientMsg::WorkerReturned(CallOutcome::Replied(reply)) => {
                 self.use_reply(reply);
@@ -74,17 +74,19 @@ caller handles timeout
 
 > **Multi-turn reply rule**
 >
-> `call(...).reply(...)` creates a continuation message. It does not create
+> `call(...).then(...)` creates a continuation message. It does not create
 > a hidden async stack, and it does not automatically carry the original caller
 > into later handler turns.
 >
-> If a service must call something else before answering its caller, capture the
-> caller first:
+> If a service must call something else before answering its caller, consume the
+> call authority by deferring through that visible work:
 >
 > ```rust
-> let request = ctx.take_request_context().expect("message came from call");
-> call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
->     .reply_with_request(request, ServiceMsg::WorkerReturned)
+> fn handle_call(&mut self, msg: ServiceMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+>     call_ctx
+>         .defer(call(worker, WorkerMsg::Run(job), Duration::from_millis(50)))
+>         .then(ServiceMsg::WorkerReturned)
+> }
 > ```
 >
 > Then consume that request context in the final turn:
@@ -95,9 +97,10 @@ caller handles timeout
 > }
 > ```
 >
-> If the handler just returns a runtime call and later does `reply(...)` from
-> the continuation message, the original caller is not there. The caller will
-> wait until timeout, and Tina will emit a diagnostic abandoned-call trace event.
+> If a call handler ignores its `CallContext`, Tina immediately completes the
+> caller with `CallOutcome::Rejected(CallRejectedReason::ReplyAbandoned)`.
+> The handler's returned effect still runs; it just no longer has caller
+> authority.
 
 ## Deferred Reply
 
@@ -106,7 +109,7 @@ A service can reply after more than one handler turn.
 Common shape:
 
 ```rust
-use tina::{RequestContext, reply_to_request};
+use tina::{CallContext, CallRejectedReason, RequestContext, noop, reply_to_request};
 
 #[derive(Debug, Clone)]
 enum ServiceMsg {
@@ -116,15 +119,9 @@ enum ServiceMsg {
 
 #[tina_runtime::isolate(message = ServiceMsg, reply = StoreReply, shard = AppShard)]
 impl StoreService {
-    fn handle(&mut self, msg: ServiceMsg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: ServiceMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ServiceMsg::Store(req) => {
-                let request = ctx.take_request_context().expect("Store is call-shaped");
-                journal_append(self.journal.clone(), req.bytes.clone())
-                    .reply_with_request(request, |request, result| {
-                        ServiceMsg::Journaled(request, result, req)
-                    })
-            }
+            ServiceMsg::Store(_) => noop(),
 
             ServiceMsg::Journaled(request, Ok(()), req) => {
                 self.apply(req);
@@ -136,6 +133,17 @@ impl StoreService {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: ServiceMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ServiceMsg::Store(req) => call_ctx
+                .defer(journal_append(self.journal.clone(), req.bytes.clone()))
+                .then(|request, result| ServiceMsg::Journaled(request, result, req)),
+            ServiceMsg::Journaled(_, _, _) => {
+                call_ctx.reject(CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
 }
 ```
 
@@ -143,7 +151,7 @@ The caller wrote one call:
 
 ```rust
 call(store, ServiceMsg::Store(req), Duration::from_millis(50))
-    .reply(ClientMsg::Stored)
+    .then(ClientMsg::Stored)
 ```
 
 The service did a runtime call before replying. Tina did not keep hidden
@@ -162,7 +170,7 @@ It is the same primitive as `DeferredReply` but the type name tells readers
 what to expect.
 
 ```rust
-use tina::{Context, Effect, Isolate, noop, reply_to_request};
+use tina::{CallContext, CallRejectedReason, Context, Effect, Isolate, noop, reply_to_request};
 use tina_runtime::{call, CallOutcome};
 
 #[derive(Debug, Clone)]
@@ -175,13 +183,9 @@ enum SvcMsg {
 # impl Isolate for Svc {
 #   type Message = SvcMsg;
 #   type Reply = SvcReply;
-#   fn handle(&mut self, msg: SvcMsg, ctx: &mut Context) -> Effect<Self> {
+#   fn handle(&mut self, msg: SvcMsg, _ctx: &mut Context) -> Effect<Self> {
 #     match msg {
-#       SvcMsg::Start => {
-#         let req = ctx.take_request_context().unwrap();
-#         call(self.probe, ProbeMsg, Duration::from_millis(50))
-#             .reply_with_request(req, SvcMsg::ProbeResult)
-#       }
+#       SvcMsg::Start => noop(),
 #       SvcMsg::ProbeResult(req, outcome) => {
 #         match outcome {
 #           CallOutcome::Replied(ProbeReply(v)) if v >= 10 => reply_to_request(req, SvcReply::Ready),
@@ -190,15 +194,37 @@ enum SvcMsg {
 #       }
 #     }
 #   }
+#   fn handle_call(&mut self, msg: SvcMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+#     match msg {
+#       SvcMsg::Start => call_ctx
+#         .defer(call(self.probe, ProbeMsg, Duration::from_millis(50)))
+#         .reply(SvcMsg::ProbeResult),
+#       SvcMsg::ProbeResult(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
+#     }
+#   }
 # }
 ```
 
 The caller sees the same timeout and `Full`/`Closed`/`Timeout` outcomes as a
 single-turn call. The service just answered later.
 
-`reply_with_request` is a convenience on any call builder. It boxes a
-translator that carries the `RequestContext` into the continuation message.
-It does not hide any timeout or reply path.
+`CallContext::defer(work).reply(...)` consumes caller authority, converts it to
+`RequestContext`, and carries that context into the continuation message. It
+does not hide any timeout or reply path, and it does not produce the final
+application reply by itself.
+
+The expanded form is still available when it is clearer:
+
+```rust
+let req = call_ctx.into_request_context();
+call(self.probe, ProbeMsg, Duration::from_millis(50))
+    .then_with_request(req, SvcMsg::ProbeResult)
+```
+
+Use `then(...)` for ordinary continuations that do not carry caller authority.
+If a call handler returns `then(...)` without consuming its `CallContext`, Tina
+rejects the caller with `ReplyAbandoned` immediately while the ordinary
+continuation still runs.
 
 `RequestContext` is a real newtype over `DeferredReply`; `reply_to_request`
 consumes it and delegates to `reply_to`. There is no hidden caller context

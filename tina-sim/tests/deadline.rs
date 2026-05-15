@@ -63,7 +63,7 @@ impl Checker {
                     let mut r = self.report.lock().expect("report lock");
                     r.remaining_at_begin_ms = deadline.remaining_or_zero(now).as_millis() as u64;
                 }
-                sleep(Duration::from_millis(150)).reply(CheckerMsg::SecondTick)
+                sleep(Duration::from_millis(150)).then(CheckerMsg::SecondTick)
             }
             CheckerMsg::SecondTick(Ok(())) => {
                 let now = ctx.now();

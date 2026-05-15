@@ -333,15 +333,18 @@ pub fn encode_response_head(
     // Framing: `Content-Length` when known, `Transfer-Encoding:
     // chunked` when not. The connection writer follows the same
     // branch when it frames each chunk on the wire.
-    match response.body.declared_length() {
-        Some(length) => {
-            out.extend_from_slice(b"Content-Length: ");
-            out.extend_from_slice(length.to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        None => {
-            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-        }
+    match &response.body {
+        crate::types::HttpResponseBody::WebSocket(_) => {}
+        _ => match response.body.declared_length() {
+            Some(length) => {
+                out.extend_from_slice(b"Content-Length: ");
+                out.extend_from_slice(length.to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+            None => {
+                out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            }
+        },
     }
     if connection_close && !wrote_connection {
         out.extend_from_slice(b"Connection: close\r\n");
@@ -361,8 +364,9 @@ pub fn encode_response(response: &crate::types::HttpResponse, connection_close: 
     match &response.body {
         crate::types::HttpResponseBody::Buffered(bytes) => out.extend_from_slice(bytes),
         crate::types::HttpResponseBody::Stream(_)
-        | crate::types::HttpResponseBody::ChunkedStream(_) => {
-            panic!("encode_response cannot serialise a streaming body; use encode_response_head")
+        | crate::types::HttpResponseBody::ChunkedStream(_)
+        | crate::types::HttpResponseBody::WebSocket(_) => {
+            panic!("encode_response cannot serialise this body; use encode_response_head")
         }
     }
     out
@@ -391,6 +395,9 @@ fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec
         crate::types::HttpRequestBody::Buffered(bytes) => bytes,
         crate::types::HttpRequestBody::Stream(_) => {
             panic!("encode_request cannot serialise a streaming body")
+        }
+        crate::types::HttpRequestBody::Http2Stream(_) => {
+            panic!("encode_request cannot serialise an HTTP/2 streaming body")
         }
     };
     let mut out = Vec::with_capacity(128 + body_bytes.len());

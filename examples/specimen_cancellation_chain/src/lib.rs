@@ -6,7 +6,7 @@
 //! runtime surfaces "the requester gave up" to the workers and to
 //! whatever was holding caller state.
 //!
-//! Tina ships first-form cancel: `call_with_handle(...).reply(...)`
+//! Tina ships first-form cancel: `call_cancelable(...).then(...)`
 //! returns a caller-owned `CallHandle`, and `cancel_call(handle)`
 //! closes the wait. Workers that already accepted their request still
 //! finish; their replies become typed `CallReplyRejected` /

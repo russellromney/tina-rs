@@ -398,13 +398,14 @@ where
 
 impl<I> Isolate for BridgeGuard<I>
 where
-    I: Isolate,
+    I: Isolate<SpawnObserved = Infallible>,
     I::Message: BridgeMessage,
 {
     type Message = I::Message;
     type Reply = I::Reply;
     type Send = I::Send;
     type Spawn = I::Spawn;
+    type SpawnObserved = std::convert::Infallible;
     type Call = I::Call;
     type Shard = I::Shard;
 
@@ -423,14 +424,16 @@ where
 
 fn remap_effect<I>(effect: tina::Effect<I>) -> tina::Effect<BridgeGuard<I>>
 where
-    I: Isolate,
+    I: Isolate<SpawnObserved = Infallible>,
     I::Message: BridgeMessage,
 {
     match effect {
         tina::Effect::Noop => tina::Effect::Noop,
         tina::Effect::Reply(reply) => tina::Effect::Reply(reply),
+        tina::Effect::Reject(reason) => tina::Effect::Reject(reason),
         tina::Effect::Send(send) => tina::Effect::Send(send),
         tina::Effect::Spawn(spawn) => tina::Effect::Spawn(spawn),
+        tina::Effect::SpawnObserved(spawn) => match spawn {},
         tina::Effect::Stop => tina::Effect::Stop,
         tina::Effect::StopWith(result) => tina::Effect::StopWith(result),
         tina::Effect::RestartChildren => tina::Effect::RestartChildren,
@@ -641,7 +644,13 @@ where
         timeout: Duration,
     ) -> Result<RegisteredBridgeHandle<M, R, S, F, I>, ThreadedRuntimeError>
     where
-        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>, Spawn = Infallible> + Send + 'static,
+        I: Isolate<
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Spawn = Infallible,
+                SpawnObserved = Infallible,
+            > + Send
+            + 'static,
         I::Message: BridgeMessage + From<BridgeRequest<M, R>> + Send + 'static,
         I::Reply: Send + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,

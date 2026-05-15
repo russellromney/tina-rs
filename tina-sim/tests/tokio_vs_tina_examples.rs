@@ -195,12 +195,10 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Fire(sink) => send(sink, SinkMsg::Hit),
-            DriverMsg::Observe(sink) => {
-                send_observed(sink, SinkMsg::Hit).reply(DriverMsg::Observed)
-            }
+            DriverMsg::Observe(sink) => send_observed(sink, SinkMsg::Hit).then(DriverMsg::Observed),
             DriverMsg::ObserveTwice(sink) => batch(vec![
-                send_observed(sink, SinkMsg::Hit).reply(DriverMsg::Observed),
-                send_observed(sink, SinkMsg::Hit).reply(DriverMsg::Observed),
+                send_observed(sink, SinkMsg::Hit).then(DriverMsg::Observed),
+                send_observed(sink, SinkMsg::Hit).then(DriverMsg::Observed),
             ]),
             DriverMsg::Observed(outcome) => {
                 let event = if outcome.is_accepted() {
@@ -235,20 +233,27 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkReq, reply = WorkReply, shard = ComparisonShard)]
 impl Worker {
+    fn handle_call(&mut self, msg: WorkReq, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkReq::Reply => call.reply(WorkReply("pong")),
+            WorkReq::NoReply => {
+                // Hold explicit request authority so the call stays
+                // pending until timeout. Uncaptured call authority is
+                // rejected immediately under the 086 contract.
+                self.held = Some(call.into_request_context().into_deferred());
+                noop()
+            }
+            WorkReq::Stop => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(
         &mut self,
         msg: WorkReq,
-        ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
+        _ctx: &mut Context<'_, ComparisonShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkReq::Reply => reply(WorkReply("pong")),
-            WorkReq::NoReply => {
-                // Hold the reply slot so the call stays pending until
-                // timeout. The abandoned-caller guard closes uncaptured
-                // callers immediately.
-                self.held = Some(ctx.take_reply_slot().unwrap());
-                noop()
-            }
+            WorkReq::Reply | WorkReq::NoReply => noop(),
             WorkReq::Stop => stop(),
         }
     }
@@ -276,10 +281,10 @@ impl Client {
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Ask(worker, request, timeout) => {
-                call(worker, request, timeout).reply(ClientMsg::Returned)
+                call(worker, request, timeout).then(ClientMsg::Returned)
             }
             ClientMsg::AskThenStop(worker) => batch(vec![
-                call(worker, WorkReq::Reply, Duration::from_millis(10)).reply(ClientMsg::Returned),
+                call(worker, WorkReq::Reply, Duration::from_millis(10)).then(ClientMsg::Returned),
                 stop(),
             ]),
             ClientMsg::Fill => noop(),
@@ -310,7 +315,8 @@ impl Client {
                         | CallError::TlsHandshake
                         | CallError::ProcessFull
                         | CallError::ProcessClosed
-                        | CallError::KillUncertain,
+                        | CallError::KillUncertain
+                        | CallError::Rejected(_),
                     ) => push(&self.events, "unexpected_call_error"),
                 }
                 noop()
@@ -526,9 +532,9 @@ impl ChatRoom {
         match msg {
             ChatRoomMsg::Burst(client) => batch(vec![
                 send_observed(client, ChatClientMsg::Deliver("delivered"))
-                    .reply(ChatRoomMsg::Delivered),
+                    .then(ChatRoomMsg::Delivered),
                 send_observed(client, ChatClientMsg::Deliver("overflow"))
-                    .reply(ChatRoomMsg::Delivered),
+                    .then(ChatRoomMsg::Delivered),
             ]),
             ChatRoomMsg::Delivered(outcome) => {
                 let event = if outcome.is_accepted() {

@@ -8,7 +8,7 @@
 //! - **Response streaming** (service produces). The service registers
 //!   a chunk-source isolate whose `Message = ResponseChunkMsg` and
 //!   `Reply = ResponseChunkReply`. The connection pulls with
-//!   `call(stream.source, ResponseChunkMsg::Next, t).reply(...)`.
+//!   `call(stream.source, ResponseChunkMsg::Next, t).then(...)`.
 //!   For the common iterator-style source, [`IterBodySource`] turns
 //!   any `Iterator<Item = Vec<u8>>` into a chunk source without a
 //!   custom `Isolate` impl.
@@ -16,7 +16,7 @@
 //! - **Request streaming** (service consumes). The connection isolate
 //!   itself is the chunk source; its `Message = HttpConnectionMsg`,
 //!   `Reply = RequestChunkReply`. The service pulls with
-//!   `call(stream.source, HttpConnectionMsg::body_next(), t).reply(...)`.
+//!   `call(stream.source, HttpConnectionMsg::body_next(), t).then(...)`.
 //!   This asymmetry exists because the connection has to fold the
 //!   chunk-request variant into its existing message type to keep the
 //!   socket and chunk pulls on a single mailbox.
@@ -51,8 +51,8 @@
 use std::convert::Infallible;
 use std::marker::PhantomData;
 
-use tina::Address;
 use tina::prelude::*;
+use tina::{Address, CallContext};
 
 /// Pulled by the consumer from a chunk source.
 #[derive(Debug, Clone)]
@@ -120,6 +120,10 @@ pub enum RequestChunkReply {
     /// Read failed mid-body. Distinct from `Eof` so the service
     /// can tell clean short delivery from truncation.
     Error(tina_runtime::CallError),
+    /// Reply to a call-shaped WebSocket session-handle send.
+    WebSocketSend(crate::websocket::WebSocketSendOutcome),
+    /// Reply to a call-shaped WebSocket session report request.
+    WebSocketReport(crate::websocket::WebSocketSessionReportOutcome),
 }
 
 /// A streaming request body: declared length plus a source isolate.
@@ -131,7 +135,7 @@ pub enum RequestChunkReply {
 /// ```rust,ignore
 /// use tina_http::HttpConnectionMsg;
 /// call(stream.source, HttpConnectionMsg::body_next(), timeout)
-///     .reply(MyMsg::ChunkArrived)
+///     .then(MyMsg::ChunkArrived)
 /// ```
 ///
 /// `HttpConnectionMsg::body_next()` is a convenience constructor for
@@ -150,6 +154,21 @@ pub struct RequestStream {
     pub chunked: bool,
     /// Chunk source — the connection isolate.
     pub source: Address<crate::HttpConnectionMsg, RequestChunkReply>,
+}
+
+/// HTTP/2 streaming request body source.
+///
+/// The HTTP/2 connection isolate owns the socket and flow-control windows.
+/// Services pull chunks through this handle; the connection returns stream and
+/// connection window credit only after a chunk is delivered or discarded.
+#[derive(Debug, Clone)]
+pub struct Http2RequestStream {
+    /// HTTP/2 stream id.
+    pub stream_id: u32,
+    /// Declared `Content-Length` if one arrived. HTTP/2 does not require it.
+    pub content_length: Option<usize>,
+    /// Chunk source — the HTTP/2 connection isolate.
+    pub source: Address<crate::Http2ConnectionMsg, crate::Http2ConnectionReply>,
 }
 
 /// Iterator-backed chunk source for the response side. Wraps any
@@ -268,13 +287,29 @@ impl<S: Shard + 'static> Isolate for IterBodySource<S> {
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
+            ResponseChunkMsg::Cancel => stop(),
+            _ => reply(self.next_reply(msg)),
+        }
+    }
+
+    fn handle_call(&mut self, msg: ResponseChunkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => stop(),
+            _ => call.reply(self.next_reply(msg)),
+        }
+    }
+}
+
+impl<S: Shard + 'static> IterBodySource<S> {
+    fn next_reply(&mut self, msg: ResponseChunkMsg) -> ResponseChunkReply {
+        match msg {
             ResponseChunkMsg::Next => match self.iter.next() {
-                Some(bytes) if !bytes.is_empty() => reply(ResponseChunkReply::Chunk(bytes)),
+                Some(bytes) if !bytes.is_empty() => ResponseChunkReply::Chunk(bytes),
                 // Empty `Vec<u8>` is treated as `Eof` so the iterator
                 // can signal end-of-stream without an explicit option.
-                _ => reply(ResponseChunkReply::Eof),
+                _ => ResponseChunkReply::Eof,
             },
-            ResponseChunkMsg::Cancel => stop(),
+            ResponseChunkMsg::Cancel => ResponseChunkReply::Eof,
         }
     }
 }

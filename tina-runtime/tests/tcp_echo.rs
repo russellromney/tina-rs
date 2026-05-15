@@ -171,21 +171,21 @@ impl Isolate for Connection {
 }
 
 fn read_call(stream: StreamId, max_len: usize) -> Effect<Connection> {
-    tcp_read(stream, max_len).reply(|result| match result {
+    tcp_read(stream, max_len).then(|result| match result {
         Ok(bytes) => ConnectionEvent::Read(bytes),
         Err(_) => ConnectionEvent::IoFailed,
     })
 }
 
 fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
-    tcp_write(stream, bytes).reply(|result| match result {
+    tcp_write(stream, bytes).then(|result| match result {
         Ok(count) => ConnectionEvent::Wrote(count),
         Err(_) => ConnectionEvent::IoFailed,
     })
 }
 
 fn close_call(stream: StreamId) -> Effect<Connection> {
-    tcp_close_stream(stream).reply(|result| match result {
+    tcp_close_stream(stream).then(|result| match result {
         Ok(()) => ConnectionEvent::Closed,
         Err(_) => ConnectionEvent::IoFailed,
     })
@@ -229,27 +229,27 @@ impl Isolate for OutboundClient {
     ) -> Effect<Self> {
         match msg {
             OutboundClientEvent::Start(addr) => {
-                tcp_connect(addr).reply(OutboundClientEvent::Connected)
+                tcp_connect(addr).then(OutboundClientEvent::Connected)
             }
             OutboundClientEvent::Connected(Ok((stream, _local_addr, _peer_addr))) => {
                 self.stream = Some(stream);
                 self.pending_write = self.payload.clone();
-                tcp_write(stream, self.pending_write.clone()).reply(OutboundClientEvent::Wrote)
+                tcp_write(stream, self.pending_write.clone()).then(OutboundClientEvent::Wrote)
             }
             OutboundClientEvent::Wrote(Ok(count)) => {
                 let stream = self.stream.expect("stream set after connect");
                 if count >= self.pending_write.len() {
                     self.pending_write.clear();
-                    tcp_read(stream, 4).reply(OutboundClientEvent::Read)
+                    tcp_read(stream, 4).then(OutboundClientEvent::Read)
                 } else {
                     self.pending_write.drain(..count);
-                    tcp_write(stream, self.pending_write.clone()).reply(OutboundClientEvent::Wrote)
+                    tcp_write(stream, self.pending_write.clone()).then(OutboundClientEvent::Wrote)
                 }
             }
             OutboundClientEvent::Read(Ok(bytes)) => {
                 *self.observed.lock().expect("observed mutex") = Some(bytes);
                 let stream = self.stream.expect("stream set after connect");
-                tcp_close_stream(stream).reply(OutboundClientEvent::Closed)
+                tcp_close_stream(stream).then(OutboundClientEvent::Closed)
             }
             OutboundClientEvent::Closed(Ok(())) => stop(),
             OutboundClientEvent::Connected(Err(_))
@@ -301,33 +301,33 @@ impl Isolate for FileClient {
     ) -> Effect<Self> {
         match msg {
             FileClientEvent::Start { dir, path } => {
-                mkdir(dir, 0o755).reply(move |result| FileClientEvent::DirectoryMade(result, path))
+                mkdir(dir, 0o755).then(move |result| FileClientEvent::DirectoryMade(result, path))
             }
             FileClientEvent::DirectoryMade(Ok(()), path) => {
-                file_create(path).reply(FileClientEvent::Opened)
+                file_create(path).then(FileClientEvent::Opened)
             }
             FileClientEvent::Opened(Ok(file)) => {
                 self.file = Some(file);
-                file_write(file, self.payload.clone()).reply(FileClientEvent::Wrote)
+                file_write(file, self.payload.clone()).then(FileClientEvent::Wrote)
             }
             FileClientEvent::Wrote(Ok(_)) => {
                 let file = self.file.expect("file set after open");
-                file_fsync(file).reply(FileClientEvent::Synced)
+                file_fsync(file).then(FileClientEvent::Synced)
             }
             FileClientEvent::Synced(Ok(())) => {
                 let file = self.file.expect("file set after open");
-                file_size(file).reply(FileClientEvent::Sized)
+                file_size(file).then(FileClientEvent::Sized)
             }
             FileClientEvent::Sized(Ok(size)) => {
                 self.size = Some(size);
                 let file = self.file.expect("file set after open");
-                file_read(file, size as usize).reply(FileClientEvent::Read)
+                file_read(file, size as usize).then(FileClientEvent::Read)
             }
             FileClientEvent::Read(Ok(bytes)) => {
                 let size = self.size.expect("size set before read");
                 *self.observed.lock().expect("file observed mutex") = Some((size, bytes));
                 let file = self.file.expect("file set after open");
-                file_close(file).reply(FileClientEvent::Closed)
+                file_close(file).then(FileClientEvent::Closed)
             }
             FileClientEvent::Closed(Ok(())) => stop(),
             FileClientEvent::DirectoryMade(Err(_), _)
@@ -391,7 +391,7 @@ impl Isolate for Listener {
         match msg {
             ListenerEvent::Start => {
                 let addr = self.bind_addr;
-                tcp_bind(addr).reply(move |result| match result {
+                tcp_bind(addr).then(move |result| match result {
                     Ok((listener, local_addr)) => ListenerEvent::Bound {
                         listener,
                         addr: local_addr,
@@ -405,14 +405,14 @@ impl Isolate for Listener {
                     .bound_addr_slot
                     .lock()
                     .expect("bound addr mutex never poisoned") = Some(addr);
-                tcp_accept(listener).reply(|result| match result {
+                tcp_accept(listener).then(|result| match result {
                     Ok((stream, _peer_addr)) => ListenerEvent::Accepted { stream },
                     Err(_) => ListenerEvent::IoFailed,
                 })
             }
             ListenerEvent::AcceptNext => {
                 let listener = self.listener.expect("listener stored before re-arm");
-                tcp_accept(listener).reply(|result| match result {
+                tcp_accept(listener).then(|result| match result {
                     Ok((stream, _peer_addr)) => ListenerEvent::Accepted { stream },
                     Err(_) => ListenerEvent::IoFailed,
                 })
@@ -440,7 +440,7 @@ impl Isolate for Listener {
             }
             ListenerEvent::Close => {
                 let listener = self.listener.expect("listener stored before close");
-                tcp_close_listener(listener).reply(|result| match result {
+                tcp_close_listener(listener).then(|result| match result {
                     Ok(()) => ListenerEvent::Closed,
                     Err(_) => ListenerEvent::IoFailed,
                 })

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_http::{
     BodyMetrics, HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest,
     HttpRequestBody, HttpResponse, RequestChunkReply, ResponseChunkMsg, ResponseChunkReply,
@@ -47,11 +48,21 @@ impl Isolate for EchoLen {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(Self::response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(Self::response_for(request))
+    }
+}
+
+impl EchoLen {
+    fn response_for(request: HttpRequest) -> HttpResponse {
         let n = match request.body {
             HttpRequestBody::Buffered(b) => b.len(),
-            HttpRequestBody::Stream(_) => 0,
+            HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => 0,
         };
-        reply(HttpResponse::with_text(StatusCode::OK, n.to_string()))
+        HttpResponse::with_text(StatusCode::OK, n.to_string())
     }
 }
 
@@ -200,12 +211,207 @@ fn oversized_request_increments_body_full_count() {
     );
 }
 
+#[test]
+fn weighted_request_cap_rejects_live_http_before_service_dispatch() {
+    let metrics = BodyMetrics::with_body_capacity("http.bodies", 1024, 16 * 1024);
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let svc = runtime
+        .register_with_capacity::<EchoLen, Infallible>(EchoLen, 16)
+        .expect("register service");
+
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let limits = HttpLimits {
+        max_body_bytes: 4096,
+        ..HttpLimits::default()
+    };
+    let listener_isolate =
+        HttpListener::<TestShard>::new(bind, svc, limits, Duration::from_secs(2), 16)
+            .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let body = vec![b'x'; 2048];
+    let mut request = format!(
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(&request).unwrap();
+    stream.flush().unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = std::str::from_utf8(&response).unwrap();
+    assert!(
+        text.starts_with("HTTP/1.1 413"),
+        "weighted body cap should map to 413 before dispatch; got {text:?}"
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.request_weight_full_count, 1);
+    assert_eq!(
+        snap.body_full_count, 0,
+        "parser max_body_bytes did not fill; the weighted cap did"
+    );
+    assert!(
+        snap.drained(),
+        "rejected request must not leak charge: {snap:?}"
+    );
+    let report = snap
+        .request_capacity_report("http.request", tina::capacity::CapacityMode::Fixed)
+        .expect("weighted request report");
+    assert_eq!(report.weight_full_count, 1);
+    assert_eq!(report.shared_scope.as_deref(), Some("http.bodies"));
+}
+
+#[derive(Debug)]
+struct BigBufferedResponse {
+    bytes: usize,
+}
+
+impl Isolate for BigBufferedResponse {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        _request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        self.big_response()
+    }
+
+    fn handle_call(&mut self, _request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(HttpResponse::with_body(
+            StatusCode::OK,
+            vec![b'z'; self.bytes],
+        ))
+    }
+}
+
+impl BigBufferedResponse {
+    fn big_response(&self) -> Effect<Self> {
+        reply(HttpResponse::with_body(
+            StatusCode::OK,
+            vec![b'z'; self.bytes],
+        ))
+    }
+}
+
+#[test]
+fn weighted_response_cap_truncates_live_http_and_reports_weight_full() {
+    let metrics = BodyMetrics::with_body_capacity("http.bodies", 1024, 16 * 1024);
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let svc = runtime
+        .register_with_capacity::<BigBufferedResponse, Infallible>(
+            BigBufferedResponse { bytes: 2048 },
+            16,
+        )
+        .expect("register service");
+
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener_isolate = HttpListener::<TestShard>::new(
+        bind,
+        svc,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    )
+    .with_metrics(metrics.clone());
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register listener");
+    let bound = runtime.observe_next_bound();
+    runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
+    let addr = bound.wait(Duration::from_secs(2)).expect("bound");
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    stream.flush().unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = std::str::from_utf8(&response).unwrap();
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "head may already be on the wire before response weight fills; got {text:?}"
+    );
+    let body_start = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|idx| idx + 4)
+        .unwrap_or(response.len());
+    assert_eq!(
+        response.len() - body_start,
+        0,
+        "weighted response cap should close before writing oversized body"
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.response_weight_full_count, 1);
+    assert_eq!(
+        snap.body_io_error_count, 1,
+        "client saw a truncated response body"
+    );
+    assert!(
+        snap.drained(),
+        "rejected response must not leak charge: {snap:?}"
+    );
+    let report = snap
+        .response_capacity_report("http.response", tina::capacity::CapacityMode::Fixed)
+        .expect("weighted response report");
+    assert_eq!(report.weight_full_count, 1);
+}
+
 /// Streaming consumer that pulls every chunk and replies with the
 /// total length. Reused for the streaming-metrics test.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum StreamMsg {
     Inbound(HttpRequest),
-    ChunkArrived(CallOutcome<RequestChunkReply>),
+    ChunkArrived(RequestContext<HttpResponse>, CallOutcome<RequestChunkReply>),
 }
 
 impl From<HttpRequest> for StreamMsg {
@@ -240,18 +446,14 @@ impl Isolate for StreamingConsumer {
                 HttpRequestBody::Stream(stream) => {
                     self.total = 0;
                     self.pending_source = Some(stream.source);
-                    call(
-                        stream.source,
-                        HttpConnectionMsg::body_next(),
-                        self.chunk_call_timeout,
-                    )
-                    .reply(StreamMsg::ChunkArrived)
+                    reply(HttpResponse::internal_error())
                 }
+                HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
                 HttpRequestBody::Buffered(b) => {
                     reply(HttpResponse::with_text(StatusCode::OK, b.len().to_string()))
                 }
             },
-            StreamMsg::ChunkArrived(outcome) => match outcome {
+            StreamMsg::ChunkArrived(request, outcome) => match outcome {
                 CallOutcome::Replied(RequestChunkReply::Chunk(bytes)) => {
                     self.total += bytes.len();
                     let source = self.pending_source.expect("source set");
@@ -260,23 +462,51 @@ impl Isolate for StreamingConsumer {
                         HttpConnectionMsg::body_next(),
                         self.chunk_call_timeout,
                     )
-                    .reply(StreamMsg::ChunkArrived)
+                    .then_with_request(request, StreamMsg::ChunkArrived)
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     self.pending_source = None;
-                    reply(HttpResponse::with_text(
-                        StatusCode::OK,
-                        self.total.to_string(),
-                    ))
+                    reply_to_request(
+                        request,
+                        HttpResponse::with_text(StatusCode::OK, self.total.to_string()),
+                    )
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
+                | CallOutcome::Replied(RequestChunkReply::WebSocketReport(_))
                 | CallOutcome::Full
                 | CallOutcome::Closed
+                | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply(HttpResponse::internal_error())
+                    reply_to_request(request, HttpResponse::internal_error())
                 }
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: StreamMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            StreamMsg::Inbound(req) => match req.body {
+                HttpRequestBody::Stream(stream) => {
+                    self.total = 0;
+                    self.pending_source = Some(stream.source);
+                    let request = call_ctx.into_request_context();
+                    call(
+                        stream.source,
+                        HttpConnectionMsg::body_next(),
+                        self.chunk_call_timeout,
+                    )
+                    .then_with_request(request, StreamMsg::ChunkArrived)
+                }
+                HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
+                HttpRequestBody::Buffered(b) => {
+                    call_ctx.reply(HttpResponse::with_text(StatusCode::OK, b.len().to_string()))
+                }
+            },
+            StreamMsg::ChunkArrived(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -491,18 +721,25 @@ impl Isolate for ChunkProducer {
 
     fn handle(
         &mut self,
-        _msg: ResponseChunkMsg,
+        msg: ResponseChunkMsg,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(self.next_chunk(msg))
+    }
+
+    fn handle_call(&mut self, msg: ResponseChunkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.next_chunk(msg))
+    }
+}
+
+impl ChunkProducer {
+    fn next_chunk(&mut self, _msg: ResponseChunkMsg) -> ResponseChunkReply {
         if self.yielded >= self.total_chunks {
-            return reply(ResponseChunkReply::Eof);
+            return ResponseChunkReply::Eof;
         }
         let i = self.yielded;
         self.yielded += 1;
-        reply(ResponseChunkReply::Chunk(vec![
-            (i % 251) as u8;
-            self.chunk_size
-        ]))
+        ResponseChunkReply::Chunk(vec![(i % 251) as u8; self.chunk_size])
     }
 }
 
@@ -526,7 +763,17 @@ impl Isolate for StreamingService {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = if request.path == "/big" {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl StreamingService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        if request.path == "/big" {
             HttpResponse::with_stream(
                 StatusCode::OK,
                 ResponseStream {
@@ -536,8 +783,7 @@ impl Isolate for StreamingService {
             )
         } else {
             HttpResponse::not_found()
-        };
-        reply(response)
+        }
     }
 }
 

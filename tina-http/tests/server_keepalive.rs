@@ -15,13 +15,19 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use http::StatusCode;
+use tina::capacity::CapacityMode;
 use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, ReleaseDisposition, ReleaseOutcome};
 use tina_http::{
-    HttpClientConfig, HttpLimits, HttpRequest, HttpTarget, KeepaliveConnAddr,
-    KeepaliveConnectionMsg, KeepaliveOutcome, build_keepalive_pool,
+    BodyMetrics, HttpClientConfig, HttpLimits, HttpRequest, HttpTarget, KeepaliveConnAddr,
+    KeepaliveConnectionMsg, KeepaliveOutcome, KeepalivePoolCloseOutcome, KeepalivePoolDrainOutcome,
+    build_keepalive_pool, shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{CallKind, CallOutcome, RuntimeEventKind};
+use tina_sim::dst::{
+    CapturedReplayChange, LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayConfig,
+    TraceProjection,
+};
 
 use common::{HarnessConfig, TestHarness};
 
@@ -30,6 +36,12 @@ use common::{HarnessConfig, TestHarness};
 // ---------------------------------------------------------------------
 
 const KEEPALIVE_IDLE: Duration = Duration::from_millis(800);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HttpReplayOp {
+    FirstPostFits,
+    SecondPostExceedsBodyCap,
+}
 
 fn keepalive_harness() -> TestHarness {
     TestHarness::start_with_config(HarnessConfig {
@@ -479,6 +491,104 @@ fn body_cap_still_enforced_on_subsequent_keepalive_request() {
 }
 
 #[test]
+fn live_replay_capture_records_http1_keepalive_body_pressure_fact() {
+    let metrics = BodyMetrics::with_body_capacity("http1.keepalive.bodies", 16, 16);
+    let harness = TestHarness::start_with_config(HarnessConfig {
+        limits: HttpLimits {
+            max_body_bytes: 16,
+            keepalive_idle_timeout: Some(KEEPALIVE_IDLE),
+            ..HttpLimits::default()
+        },
+        body_metrics: Some(metrics.clone()),
+        ..HarnessConfig::default()
+    });
+    let mut stream = open_stream(&harness);
+
+    let resp = round_trip(
+        &mut stream,
+        b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+    );
+    assert_status(&resp, "200");
+
+    let resp = round_trip(
+        &mut stream,
+        b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 999\r\n\r\n",
+    );
+    assert_status(&resp, "413");
+    let (_extra, closed) = read_until_close(&mut stream, Duration::from_millis(500));
+    assert!(closed, "server should close after parse-error response");
+
+    let trace = harness.shutdown();
+    let pressure = metrics.snapshot();
+    let request_surface = pressure
+        .request_capacity_report("http1.keepalive.request_body", CapacityMode::Fixed)
+        .expect("body capacity metrics configured");
+    assert_eq!(request_surface.high_water_weight, Some(5));
+    assert_eq!(request_surface.current_weight, Some(0));
+    assert_eq!(
+        pressure.body_full_count, 1,
+        "second keepalive request should record one max_body_bytes rejection",
+    );
+    let max_body_surface = tina::capacity::CapacitySurfaceReport::weighted(
+        "http1.keepalive.max_body_bytes",
+        CapacityMode::Fixed,
+        16,
+        0,
+        request_surface
+            .high_water_weight
+            .expect("request high-water"),
+        pressure.body_full_count,
+        "bytes",
+    );
+
+    let facts = vec![
+        LiveReplayFact::capacity_surface(&request_surface),
+        LiveReplayFact::capacity_surface(&max_body_surface),
+    ];
+    let ops = vec![
+        HttpReplayOp::FirstPostFits,
+        HttpReplayOp::SecondPostExceedsBodyCap,
+    ];
+    let capture = LiveReplayCapture::from_events_with_options(
+        "http1 keepalive body pressure live capture",
+        93,
+        ReplayConfig::new().with_mailbox("http-listener", 8),
+        "live HTTP/1 keepalive request followed by an over-cap body on the same socket",
+        ops,
+        "request body capacity high-water is captured as a typed fact",
+        "tina-http ThreadedRuntime keepalive test",
+        &trace,
+        TraceProjection::Exact,
+        Vec::new(),
+    )
+    .expect("exact projection accepts runtime trace")
+    .with_live_facts(facts.clone());
+    assert_eq!(
+        capture.history.operations(),
+        &[
+            HttpReplayOp::FirstPostFits,
+            HttpReplayOp::SecondPostExceedsBodyCap,
+        ],
+        "HTTP app operations must be recorded explicitly, not inferred from trace",
+    );
+    let replay_case = capture.to_replay_case();
+
+    let missing = tina_sim::dst::check_captured_replay(&capture, &replay_case, |case| {
+        LiveReplayReport::from_case_and_events(case, &trace, (), capture.projection.clone())
+    })
+    .expect_err("unsupported omission of a typed HTTP body fact must fail closed");
+    assert!(missing.includes(CapturedReplayChange::LiveFact));
+
+    tina_sim::dst::check_captured_replay(&capture, &replay_case, |case| {
+        Ok(
+            LiveReplayReport::from_case_and_events(case, &trace, (), capture.projection.clone())?
+                .with_live_facts(facts.clone()),
+        )
+    })
+    .expect("matching typed HTTP body-pressure fact replays");
+}
+
+#[test]
 fn keepalive_serves_mixed_get_and_post_with_bodies() {
     // GETs interleaved with POSTs (with bodies) on the same socket.
     // Proves the per-request reset (read_buf, parsed_head, head_len)
@@ -552,25 +662,21 @@ fn keepalive_pool_reuses_native_listener_connection_across_requests() {
     );
 
     release_keepalive_connection(&harness, handles.pool, lease);
-    match harness
-        .runtime_handle()
-        .call_blocking(
-            handles.pool,
-            WorkerPoolMsg::Close(CloseMode::Drain),
-            Duration::from_secs(2),
-        )
-        .expect("close pool")
-    {
-        CallOutcome::Replied(WorkerPoolReply::Closed) => {}
-        other => panic!("expected pool closed ack, got {other:?}"),
-    }
-    for conn in handles.connections {
-        let _ = harness.runtime_handle().call_blocking(
-            conn,
-            KeepaliveConnectionMsg::Stop,
-            Duration::from_secs(2),
-        );
-    }
+    let report = shutdown_keepalive_pool(
+        harness.runtime_handle(),
+        &handles,
+        CloseMode::Drain,
+        Duration::from_secs(2),
+    )
+    .expect("shutdown keepalive pool");
+    assert_eq!(report.pool_close, KeepalivePoolCloseOutcome::Closed);
+    assert_eq!(report.drain, KeepalivePoolDrainOutcome::Drained);
+    assert_eq!(report.requested, 1);
+    assert_eq!(report.stopped, 1);
+    assert_eq!(report.timed_out, 0);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.already_closed, 0);
+    assert!(report.connection_failures.is_empty());
 
     // Let the listener process any peer EOF caused by stopping the
     // client-side keepalive connection before we inspect the trace.

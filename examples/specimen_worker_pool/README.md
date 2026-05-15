@@ -36,7 +36,7 @@ worker each client mapped to.
 ## What feels worse
 
 - The frontend has to thread `qid` through a closure passed to
-  `call(worker, ..., timeout).reply(move |outcome| FrontendMsg::WorkerDone(qid, outcome))`.
+  `call(worker, ..., timeout).then(move |outcome| FrontendMsg::WorkerDone(qid, outcome))`.
   The closure-form `.reply` is the price for stuffing a correlator
   into the continuation message.
 - `Frontend::Submit / WorkerDone` enum still carries the message

@@ -82,7 +82,7 @@ impl Counter {
                     noop()
                 } else {
                     self.busy = true;
-                    sleep(self.slow).reply(CounterMsg::Done)
+                    sleep(self.slow).then(CounterMsg::Done)
                 }
             }
             CounterMsg::Done(reply) => {
@@ -102,7 +102,7 @@ impl Counter {
                     self.busy = false;
                     noop()
                 } else {
-                    sleep(self.slow).reply(CounterMsg::Done)
+                    sleep(self.slow).then(CounterMsg::Done)
                 }
             }
         }

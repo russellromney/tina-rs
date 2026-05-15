@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallKind, CallOutcome, RuntimeEventKind, SleepReply, call_with_handle, cancel_call, sleep,
+    CallKind, CallOutcome, RuntimeEventKind, SleepReply, call_cancelable, cancel_call, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -67,6 +67,7 @@ const WORK_BUDGET_MS: u64 = 200;
 enum WorkerMsg {
     Do,
     Done(SleepReply),
+    DoneForCall(tina::RequestContext<WorkerReply>, SleepReply),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,15 +79,30 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply, shard = SimShard)]
 impl Worker {
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Do => {
+                let req = call.into_request_context();
+                sleep(Duration::from_millis(self.sleep_ms))
+                    .then_with_request(req, WorkerMsg::DoneForCall)
+            }
+            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
+
     fn handle(
         &mut self,
         msg: WorkerMsg,
         _ctx: &mut Context<'_, SimShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(Duration::from_millis(self.sleep_ms)).reply(WorkerMsg::Done),
+            WorkerMsg::Do => sleep(Duration::from_millis(self.sleep_ms)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
     }
 }
@@ -139,7 +155,7 @@ impl Driver {
             DriverMsg::CancelAll => {
                 let mut effects = Vec::with_capacity(self.pending.len());
                 for (_, handle) in self.pending.drain() {
-                    effects.push(cancel_call(handle).reply(DriverMsg::Cancelled));
+                    effects.push(cancel_call(handle).then(DriverMsg::Cancelled));
                 }
                 Effect::Batch(effects)
             }
@@ -153,8 +169,8 @@ impl Driver {
             DriverMsg::AttemptDuplicateInsert => {
                 let target = self.workers[0];
                 let (effect_b, handle_b): (Effect<Self>, _) =
-                    call_with_handle(target, WorkerMsg::Do, self.call_timeout)
-                        .reply(DriverMsg::BReturned);
+                    call_cancelable(target, WorkerMsg::Do, self.call_timeout)
+                        .then(DriverMsg::BReturned);
                 match self.pending.insert(0, handle_b) {
                     Err(tina::PendingCallSetInsertError::DuplicateKey { key, handle: _ }) => {
                         assert_eq!(key, 0);
@@ -196,11 +212,13 @@ impl Driver {
         let mut effects = Vec::with_capacity(CAPACITY);
         for (idx, worker) in self.workers.iter().enumerate() {
             let key = idx as u32;
-            let (effect, handle) = call_with_handle(*worker, WorkerMsg::Do, self.call_timeout)
-                .reply(move |outcome| DriverMsg::Returned {
-                    batch,
-                    worker: key,
-                    outcome,
+            let (effect, handle) =
+                call_cancelable(*worker, WorkerMsg::Do, self.call_timeout).then(move |outcome| {
+                    DriverMsg::Returned {
+                        batch,
+                        worker: key,
+                        outcome,
+                    }
                 });
             self.pending
                 .insert(key, handle)

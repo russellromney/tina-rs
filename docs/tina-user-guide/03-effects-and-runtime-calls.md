@@ -29,7 +29,7 @@ Runtime isolates usually use this macro:
 impl MyIsolate {
     fn handle(&mut self, msg: Msg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            Msg::Start => sleep(Duration::from_millis(10)).reply(|result| match result {
+            Msg::Start => sleep(Duration::from_millis(10)).then(|result| match result {
                 Ok(()) => Msg::TimerDone,
                 Err(err) => Msg::TimerFailed(err),
             }),
@@ -51,61 +51,45 @@ runtime sends Msg::TimerDone or Msg::TimerFailed
 
 The continuation is a normal message.
 
-## Continuation Carries Call Context
+## Ordinary Continuations
 
 Important grug truth:
 
-`reply(...)` is not only for the first handler turn.
+Runtime calls produce ordinary continuation messages.
 
-If an isolate is handling a request/reply call, and it returns a runtime call
-with `.reply(...)`, Tina carries the original reply context through that
-continuation chain.
-
-That means a service can do this:
-
-```text
-caller calls store
-store starts journal_append runtime call
-runtime later sends store Journaled
-store replies to original caller
-```
-
-Shape:
+Use `then(...)` when you want work to complete and send one later message back
+to the same isolate:
 
 ```rust
-match msg {
-    StoreMsg::Store(request) => {
-        journal_append(self.path.clone(), request.bytes.clone())
-            .reply(|result| StoreMsg::Journaled(result, request))
-    }
-    StoreMsg::Journaled(Ok(()), request) => {
-        self.apply(request);
-        reply(StoreReply::Stored)
-    }
-    StoreMsg::Journaled(Err(_), _request) => {
-        reply(StoreReply::Failed)
-    }
-}
+journal_append(self.path.clone(), request.bytes.clone())
+    .then(|result| StoreMsg::Journaled(result, request))
 ```
 
-This is why service-shaped clients work:
+`then(...)` does not reply to a caller and does not preserve caller authority.
+It is the ordinary message-continuation vocabulary. The older `.then(...)`
+builder spelling remains as a compatibility alias, but new docs should prefer
+`then(...)` when no caller is being answered.
+
+When a call handler must answer its caller after visible work, root the
+expression at `CallContext`:
 
 ```rust
-call(http_client, OutboundCall { target, request }, timeout)
-    .reply(MyMsg::HttpReturned)
+call_ctx
+    .defer(journal_append(self.path.clone(), request.bytes.clone()))
+    .then(StoreMsg::Journaled)
 ```
 
-The `http_client` isolate may need many TCP turns before it answers. That is
-fine if those turns are built as runtime-call continuations. The original caller
-still receives the final reply or the call times out.
+The continuation message still carries `RequestContext<StoreReply>`, and the
+later handler turn must consume it with `reply_to_request(...)`. Tina does not
+create a hidden async stack or a hidden final reply.
 
 Grug warning:
 
-- Context is carried by Tina continuation machinery.
-- Do not stash arbitrary reply handles in side channels.
-- Do not spawn a separate child just to route one reply back unless topology
-  really needs that.
-- Always keep the caller timeout honest.
+- `then(...)` is ordinary continuation only.
+- `call_ctx.defer(...).reply(...)` consumes caller authority into a visible
+  `RequestContext`.
+- If `handle_call` returns `then(...)` without consuming `CallContext`, the
+  caller gets `ReplyAbandoned`; the ordinary continuation still runs.
 
 ## TCP Read Example
 
@@ -125,8 +109,8 @@ struct Conn {
 impl Conn {
     fn handle(&mut self, msg: ConnMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ConnMsg::Begin => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
-            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).reply(ConnMsg::Wrote),
+            ConnMsg::Begin => tcp_read(self.stream, 4096).then(ConnMsg::Read),
+            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).then(ConnMsg::Wrote),
             ConnMsg::Read(Err(_)) => stop(),
             ConnMsg::Wrote(_) => stop(),
         }
@@ -146,12 +130,57 @@ Use `batch` when one message wants many effects:
 ```rust
 batch(vec![
     send(log, LogMsg::Started),
-    sleep(Duration::from_secs(1)).reply(|_| Msg::Tick),
+    sleep(Duration::from_secs(1)).then(|_| Msg::Tick),
 ])
 ```
 
 Batch is useful. Batch can also make ergonomics feel clunky when many effect
 types are involved. When that happens, write it down as a Tina paper cut.
+
+## Timer Helpers
+
+`sleep(delay).then(...)` is still the runtime truth. The small helpers in
+`tina::time` only decide the delay and report visible state such as missed
+ticks, retry attempt number, deadline caps, and exhausted attempts.
+
+Pattern:
+
+```text
+helper decides delay
+user returns sleep(delay).then(...)
+continuation handles the result and records any user-visible outcome
+```
+
+Interval shape:
+
+```rust
+use tina::prelude::*;
+use tina_runtime::sleep;
+
+match self.interval.next_delay_until(ctx.now(), self.deadline) {
+    TimerDecision::Sleep(delay) => {
+        let tick = delay.tick_number();
+        sleep(delay.delay()).then(move |reply| Msg::Tick(tick, reply))
+    }
+    TimerDecision::DeadlineElapsed => stop(),
+    TimerDecision::Exhausted => unreachable!("interval has no attempt budget"),
+}
+```
+
+Backoff shape:
+
+```rust
+match self.backoff.next_delay_until(ctx.now(), self.deadline) {
+    TimerDecision::Sleep(delay) => {
+        sleep(delay.delay()).then(move |reply| Msg::Retry(delay.attempt(), reply))
+    }
+    TimerDecision::DeadlineElapsed | TimerDecision::Exhausted => reply(Msg::Failed),
+}
+```
+
+No helper retries user work. No helper samples `Instant::now()`. If a deadline
+matters, build it from runtime time with `ctx.deadline_after(...)` or
+`Deadline::from_instant(ctx.now(), ...)`.
 
 ## No Async In Handler
 

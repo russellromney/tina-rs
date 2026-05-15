@@ -141,6 +141,7 @@ struct InFlight {
     response_rx: Receiver<SqliteResult>,
     started_at: Instant,
     abandoned: Arc<AtomicBool>,
+    reply_to: tina::RequestContext<SqliteResult>,
     /// Stable name of the original request for tracing field reuse.
     /// `"execute"` or `"query"`. Carried even when the `tracing`
     /// feature is off so the field stays cheap and the type does
@@ -291,7 +292,11 @@ impl<S: Shard + 'static> SqliteWorker<S> {
         }
     }
 
-    fn admit(&mut self, request: SqliteRequest) -> Effect<Self> {
+    fn admit(
+        &mut self,
+        request: SqliteRequest,
+        reply_to: tina::RequestContext<SqliteResult>,
+    ) -> Effect<Self> {
         let request_kind = request_kind_name(&request);
 
         if self.closed.load(Ordering::Acquire) {
@@ -304,7 +309,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 reason = "Closed",
                 request_kind,
             );
-            return reply::<Self>(Err(SqliteError::Closed));
+            return tina::reply_to_request(reply_to, Err(SqliteError::Closed));
         }
 
         if let Err(err) = validate_request(&request, &self.config) {
@@ -318,7 +323,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 request_kind,
                 detail = %err,
             );
-            return reply::<Self>(Err(err));
+            return tina::reply_to_request(reply_to, Err(err));
         }
 
         if self.in_flight.is_some() {
@@ -331,7 +336,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 reason = "Full",
                 request_kind,
             );
-            return reply::<Self>(Err(SqliteError::Full));
+            return tina::reply_to_request(reply_to, Err(SqliteError::Full));
         }
 
         let max_rows_for_request = match &request {
@@ -361,15 +366,17 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 request_kind,
                 detail = "worker thread unavailable",
             );
-            return reply::<Self>(Err(SqliteError::Internal(
-                "worker thread unavailable".into(),
-            )));
+            return tina::reply_to_request(
+                reply_to,
+                Err(SqliteError::Internal("worker thread unavailable".into())),
+            );
         }
 
         self.in_flight = Some(InFlight {
             response_rx,
             started_at: Instant::now(),
             abandoned,
+            reply_to,
             request_kind,
         });
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
@@ -384,7 +391,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
             request_kind,
         );
 
-        sleep(self.config.poll_interval).reply(|_| SqliteMsg::Poll)
+        sleep(self.config.poll_interval).then(|_| SqliteMsg::Poll)
     }
 
     fn poll(&mut self) -> Effect<Self> {
@@ -402,7 +409,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 emit_replied(&result, request_kind);
                 #[cfg(not(feature = "tracing"))]
                 let _ = request_kind;
-                reply::<Self>(result)
+                tina::reply_to_request(in_flight.reply_to, result)
             }
             Err(mpsc::TryRecvError::Empty) => {
                 if in_flight.started_at.elapsed() >= self.config.default_timeout {
@@ -421,10 +428,10 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                         request_kind,
                         elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
                     );
-                    return reply::<Self>(Err(SqliteError::Timeout));
+                    return tina::reply_to_request(in_flight.reply_to, Err(SqliteError::Timeout));
                 }
                 self.in_flight = Some(in_flight);
-                sleep(self.config.poll_interval).reply(|_| SqliteMsg::Poll)
+                sleep(self.config.poll_interval).then(|_| SqliteMsg::Poll)
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.metrics.set_in_flight(0);
@@ -437,9 +444,12 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                     request_kind,
                     detail = "worker thread terminated mid-request",
                 );
-                reply::<Self>(Err(SqliteError::Internal(
-                    "worker thread terminated mid-request".into(),
-                )))
+                tina::reply_to_request(
+                    in_flight.reply_to,
+                    Err(SqliteError::Internal(
+                        "worker thread terminated mid-request".into(),
+                    )),
+                )
             }
         }
     }
@@ -479,9 +489,16 @@ impl<S: Shard + 'static> Isolate for SqliteWorker<S> {
         shard: S,
     }
 
+    fn handle_call(&mut self, msg: SqliteMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SqliteMsg::Request(request) => self.admit(request, call.into_request_context()),
+            SqliteMsg::Poll => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(&mut self, msg: SqliteMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
-            SqliteMsg::Request(request) => self.admit(request),
+            SqliteMsg::Request(_) => noop(),
             SqliteMsg::Poll => self.poll(),
         }
     }

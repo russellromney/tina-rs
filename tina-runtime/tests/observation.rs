@@ -16,8 +16,9 @@ use std::time::Duration;
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina::{RestartBudget, RestartPolicy};
 use tina_runtime::{
-    CallError, CallKind, ListenerId, MailboxFactory, ResultWaitError, ThreadedRuntime,
-    ThreadedRuntimeConfig, WaitError, sleep, tcp_bind, tcp_close_listener,
+    CallError, CallKind, ListenerId, MailboxFactory, ResultWaitError, RuntimeEventKind,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError, WaitError, sleep, tcp_bind,
+    tcp_close_listener,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -99,10 +100,8 @@ impl Binder {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            BindMsg::Start => tcp_bind(self.addr).reply(BindMsg::Bound),
-            BindMsg::Bound(Ok((listener, _))) => {
-                tcp_close_listener(listener).reply(BindMsg::Closed)
-            }
+            BindMsg::Start => tcp_bind(self.addr).then(BindMsg::Bound),
+            BindMsg::Bound(Ok((listener, _))) => tcp_close_listener(listener).then(BindMsg::Closed),
             BindMsg::Bound(Err(_)) | BindMsg::Closed(_) => stop(),
         }
     }
@@ -300,7 +299,7 @@ impl Sleeper {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            SleeperMsg::Start => sleep(self.nap).reply(|_| SleeperMsg::SleepDone),
+            SleeperMsg::Start => sleep(self.nap).then(|_| SleeperMsg::SleepDone),
             SleeperMsg::SleepDone => stop(),
         }
     }
@@ -500,6 +499,21 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         .wait(Duration::from_secs(3))
         .expect("restart event resolves");
     assert_eq!(restarted.child_ordinal, 0);
+    let old_child = runtime
+        .trace()
+        .events()
+        .iter()
+        .find_map(|event| match event.kind() {
+            RuntimeEventKind::Spawned { child_isolate } => Some(child_isolate),
+            _ => None,
+        })
+        .expect("initial child spawn traced");
+    assert_ne!(old_child, restarted.new_isolate);
+    let stale = Address::<CrashMsg>::new(parent.shard(), old_child);
+    assert!(matches!(
+        runtime.send_and_observe(stale, CrashMsg::Boom),
+        Err(ThreadedSendObservedError::MailboxClosed)
+    ));
     // The child has crashed at least once. The replacement carries a
     // fresh incarnation id (and generation policy is owned by the runtime,
     // not by this test), so just check that the runtime saw the panic.

@@ -150,7 +150,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     return noop();
                 }
                 self.started = true;
-                tcp_bind(self.bind_addr).reply(HttpListenerMsg::Bound)
+                tcp_bind(self.bind_addr).then(HttpListenerMsg::Bound)
             }
 
             HttpListenerMsg::Bound(Ok((listener, local_addr))) => {
@@ -162,9 +162,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // than starting the accept loop, otherwise the
                     // listener would leak until full shutdown.
                     let listener = self.listener.take().expect("set just above");
-                    return tcp_close_listener(listener).reply(HttpListenerMsg::ListenerClosed);
+                    return tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed);
                 }
-                tcp_accept(listener).reply(HttpListenerMsg::Accepted)
+                tcp_accept(listener).then(HttpListenerMsg::Accepted)
             }
             HttpListenerMsg::Bound(Err(_)) => stop(),
 
@@ -176,24 +176,24 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // queued a connection for us before our close took
                     // effect. We close the orphan stream and do not
                     // touch the listener again.
-                    return tcp_close_stream(stream).reply(HttpListenerMsg::StreamClosed);
+                    return tcp_close_stream(stream).then(HttpListenerMsg::StreamClosed);
                 }
                 let Some(listener) = self.listener else {
                     // Defensive: invariant says listener=Some when
                     // !stopping. If violated, orphan-close.
-                    return tcp_close_stream(stream).reply(HttpListenerMsg::StreamClosed);
+                    return tcp_close_stream(stream).then(HttpListenerMsg::StreamClosed);
                 };
                 let child = self.build_connection_child(stream);
                 batch(vec![
                     spawn(child),
-                    tcp_accept(listener).reply(HttpListenerMsg::Accepted),
+                    tcp_accept(listener).then(HttpListenerMsg::Accepted),
                 ])
             }
             HttpListenerMsg::Accepted(Err(_)) => {
                 // Accept failed (likely listener was closed). Drop into
                 // close path if still open, else stop.
                 if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).reply(HttpListenerMsg::ListenerClosed)
+                    tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed)
                 } else {
                     stop()
                 }
@@ -202,7 +202,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpListenerMsg::Stop => {
                 self.stopping = true;
                 if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).reply(HttpListenerMsg::ListenerClosed)
+                    tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed)
                 } else {
                     stop()
                 }

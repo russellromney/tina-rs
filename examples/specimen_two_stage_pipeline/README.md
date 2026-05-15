@@ -63,7 +63,7 @@ What feels worse:
 A pipeline DSL that compresses the four variants into one was
 considered and rejected. Every shape short enough to pay for the
 helper hides one of: the named stage in the variant; the
-trace-visible suspension at each `call(...).reply(...)`; the
+trace-visible suspension at each `call(...).then(...)`; the
 per-stage `Full` / `Closed` / `Timeout` outcome; or partial
 progress data when a middle stage fails. The raw match-state-
 machine form is the semantic truth on purpose.

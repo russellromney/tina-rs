@@ -51,9 +51,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tina::{
-    Address, AddressGeneration, CallRouting, ChildDefinition, ChildRelation, DeferredReplyHandle,
-    DeferredSlotRegistry, Isolate, IsolateId, MessageCaller, Outbound as TinaOutbound,
-    RestartableChildDefinition, Shard, ShardId, TrySendError,
+    Address, AddressGeneration, CallRejectedReason, CallRouting, ChildDefinition, ChildRef,
+    ChildRelation, DeferredReplyHandle, DeferredSlotRegistry, Isolate, IsolateId, MessageCaller,
+    Outbound as TinaOutbound, RestartableChildDefinition, Shard, ShardId, SpawnObservedError,
+    TrySendError,
 };
 #[cfg(test)]
 use tina::{Context, Effect};
@@ -271,6 +272,7 @@ where
             > + 'static,
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -304,6 +306,7 @@ where
             > + 'static,
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -487,13 +490,27 @@ where
                 RuntimeEventKind::HandlerStarted,
             );
 
-            let caller = self.build_message_caller(message.call_context, isolate_id);
+            let incoming_call_context = message.call_context;
+            let caller = self.build_message_caller(incoming_call_context, isolate_id);
             let now = self.virtual_anchor + self.virtual_now;
 
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
-                catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller, now)
+                catch_unwind(AssertUnwindSafe(|| match caller {
+                    Some(caller) => handler.handle_call_boxed(
+                        message.message,
+                        &mut self.shard,
+                        isolate_id,
+                        caller,
+                        now,
+                    ),
+                    None => handler.handle_boxed(
+                        message.message,
+                        &mut self.shard,
+                        isolate_id,
+                        None,
+                        now,
+                    ),
                 }))
             };
 
@@ -505,7 +522,18 @@ where
                         Some(handler_started.into()),
                         RuntimeEventKind::HandlerPanicked,
                     );
-                    self.drop_pending_deferred_captures(panicked.into());
+                    let captured_any = self.drop_pending_deferred_captures(panicked.into());
+                    if !captured_any {
+                        if let Some(context) = incoming_call_context {
+                            self.reject_call_context(
+                                isolate_id,
+                                panicked.into(),
+                                context,
+                                CallRejectedReason::HandlerPanicked,
+                                route_remote,
+                            );
+                        }
+                    }
                     self.stop_entry(index, isolate_id, panicked.into());
                     self.supervise_panic(
                         RegisteredAddress {
@@ -531,23 +559,23 @@ where
 
             let captured_any = self.promote_captures(isolate_id, handler_finished.into());
 
-            // Skip the guard when the effect is a runtime call or batch:
-            // the handler may be delegating to a continuation that will
-            // reply later. This keeps the guard conservative.
-            let may_reply_later = matches!(
-                effect_kind,
-                tina_runtime::EffectKind::Call | tina_runtime::EffectKind::Batch
-            );
-            let abandoned_call_id = if !captured_any && !may_reply_later {
-                message.call_context.as_ref().map(|ctx| match *ctx {
-                    MessageCallContext::Local { call_id } => call_id,
-                    MessageCallContext::Remote { call_id, .. } => call_id,
-                })
+            let consumed_by_effect = effect.consumes_call_context();
+            let abandoned_context = if !captured_any && !consumed_by_effect {
+                message.call_context
             } else {
                 None
             };
+            if let Some(context) = abandoned_context {
+                self.reject_call_context(
+                    isolate_id,
+                    handler_finished.into(),
+                    context,
+                    CallRejectedReason::ReplyAbandoned,
+                    route_remote,
+                );
+            }
 
-            let effective_context = if captured_any {
+            let effective_context = if captured_any || abandoned_context.is_some() {
                 None
             } else {
                 message.call_context
@@ -561,20 +589,6 @@ where
                 &mut round_messages,
                 route_remote,
             );
-
-            if let Some(call_id) = abandoned_call_id {
-                if self
-                    .pending_isolate_calls
-                    .iter()
-                    .any(|p| p.call_id == call_id)
-                {
-                    self.push_event(
-                        isolate_id,
-                        Some(handler_finished.into()),
-                        RuntimeEventKind::CallReplyAbandoned { call_id },
-                    );
-                }
-            }
         }
 
         round_messages.clear();
@@ -771,6 +785,70 @@ where
                 }
                 false
             }
+            ErasedEffect::SpawnObserved(spawn) => {
+                let mut outcome = spawn.spawn_observed(self, isolate_id);
+                let continuation = outcome.continuation.take();
+                let continuation_cause = if let Some(mut spawn_outcome) = outcome.spawn.take() {
+                    let child_isolate = spawn_outcome.child.isolate;
+                    let child = spawn_outcome.child;
+                    let bootstrap_message = spawn_outcome.bootstrap_message.take();
+                    self.record_child(isolate_id, spawn_outcome);
+                    let spawned = self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::Spawned { child_isolate },
+                    );
+                    if let Some(message) = bootstrap_message {
+                        self.enqueue_bootstrap_message(child, message, spawned.into());
+                    }
+                    spawned.into()
+                } else {
+                    cause
+                };
+                if let Some(message) = continuation {
+                    let send = ErasedSend {
+                        target_shard: self.shard.id(),
+                        target_isolate: isolate_id,
+                        target_generation: self.entries[index].generation,
+                        message,
+                    };
+                    let attempted = self.push_event(
+                        isolate_id,
+                        Some(continuation_cause),
+                        RuntimeEventKind::SendDispatchAttempted {
+                            target_shard: send.target_shard,
+                            target_isolate: send.target_isolate,
+                            target_generation: send.target_generation,
+                        },
+                    );
+                    match self.dispatch_local_send(send) {
+                        Ok(()) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendAccepted {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                },
+                            );
+                        }
+                        Err(reason) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendRejected {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                    reason,
+                                },
+                            );
+                        }
+                    }
+                }
+                false
+            }
             ErasedEffect::Call(call) => {
                 let requester = RegisteredAddress {
                     shard: self.shard.id(),
@@ -814,6 +892,7 @@ where
                             call_id,
                             requester,
                             cause: call_cause,
+                            ..
                         } => {
                             let remote_reply = RemoteCallReply {
                                 call_id,
@@ -852,21 +931,40 @@ where
                 }
                 false
             }
+            ErasedEffect::Reject(reason) => {
+                if let Some(context) = call_context {
+                    self.reject_call_context(isolate_id, cause, context, reason, route_remote);
+                } else {
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::EffectObserved {
+                            effect: EffectKind::Reject,
+                        },
+                    );
+                }
+                false
+            }
             ErasedEffect::RestartChildren => {
                 self.restart_children(isolate_id, cause, round_messages);
                 false
             }
             ErasedEffect::Batch(effects) => {
+                let mut batch_context = call_context;
                 for subeffect in effects {
+                    let consumes_context = subeffect.consumes_call_context();
                     if self.execute_effect(
                         index,
                         cause,
                         subeffect,
-                        call_context,
+                        batch_context,
                         round_messages,
                         route_remote,
                     ) {
                         return true;
+                    }
+                    if consumes_context {
+                        batch_context = None;
                     }
                 }
                 false
@@ -876,6 +974,76 @@ where
                 false
             }
         }
+    }
+
+    fn reject_call_context(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+        context: MessageCallContext,
+        reason: CallRejectedReason,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        match context {
+            MessageCallContext::Local { call_id } => {
+                self.push_call_rejected_event(isolate_id, cause, call_id, reason);
+                if !self.complete_isolate_call(call_id, cause, CallOutcome::Rejected(reason)) {
+                    let reason = match self.recently_cancelled_cause(call_id) {
+                        Some(c) => tina_runtime::call_reply_reason_for_cause(c),
+                        None => CallReplyRejectedReason::NoPendingCall,
+                    };
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::CallReplyRejected { call_id, reason },
+                    );
+                }
+            }
+            MessageCallContext::Remote {
+                call_id,
+                requester,
+                cause: call_cause,
+                ..
+            } => {
+                self.push_call_rejected_event(isolate_id, cause, call_id, reason);
+                let remote_reply = RemoteCallReply {
+                    call_id,
+                    requester,
+                    reply: RemoteCallOutcome::Rejected(reason),
+                    cause: call_cause,
+                };
+                if let Err(rejected) = route_remote(
+                    self.shard.id(),
+                    QueuedRemoteEnvelope::CallReply(remote_reply),
+                ) {
+                    let reason = match rejected {
+                        SendRejectedReason::Full => CallReplyRejectedReason::ReplyPathFull,
+                        SendRejectedReason::Closed => CallReplyRejectedReason::RequesterShardClosed,
+                    };
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::CallReplyRejected { call_id, reason },
+                    );
+                }
+            }
+        }
+    }
+
+    fn push_call_rejected_event(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+        call_id: CallId,
+        reason: CallRejectedReason,
+    ) {
+        let kind = match reason {
+            CallRejectedReason::ReplyAbandoned => RuntimeEventKind::CallReplyAbandoned { call_id },
+            CallRejectedReason::HandlerPanicked | CallRejectedReason::UnsupportedMessage => {
+                RuntimeEventKind::CallRejected { call_id, reason }
+            }
+        };
+        self.push_event(isolate_id, Some(cause), kind);
     }
 
     fn execute_reply_to(
@@ -1002,6 +1170,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -1044,6 +1213,7 @@ where
                 Call = RuntimeCall<Msg>,
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         Msg: 'static,
         Outbound: 'static,
@@ -1639,6 +1809,7 @@ where
                 call_id: context.call_id,
                 requester: context.requester,
                 cause: context.cause,
+                expected_reply_type_id,
             };
             match route_remote(
                 self.shard.id(),
@@ -3897,7 +4068,7 @@ where
             tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
             tina::CallHandleState::Pending => {
                 let raw_call_id = handle_shared.call_id().expect(
-                    "cancel_call dispatched before its call_with_handle's effect ran. \
+                    "cancel_call dispatched before its call_cancelable's effect ran. \
                      Issue cancel from a separate handler, or store the handle and \
                      cancel later.",
                 );
@@ -4014,12 +4185,13 @@ where
         isolate_id: IsolateId,
     ) -> Option<MessageCaller> {
         let ctx = call_context?;
-        let (call_id, routing) = match ctx {
-            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local),
+        let (call_id, routing, remote_expected_reply_type_id) = match ctx {
+            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local, None),
             MessageCallContext::Remote {
                 call_id,
                 requester,
                 cause,
+                expected_reply_type_id,
             } => (
                 call_id,
                 CallRouting::Remote {
@@ -4028,6 +4200,7 @@ where
                     requester_generation: requester.generation,
                     cause: cause.event().get(),
                 },
+                Some(expected_reply_type_id),
             ),
         };
         let expected_reply_type_id = match routing {
@@ -4037,7 +4210,8 @@ where
                 .find(|p| p.call_id == call_id)
                 .map(|p| p.expected_reply_type_id)
                 .unwrap_or_else(std::any::TypeId::of::<()>),
-            CallRouting::Remote { .. } => std::any::TypeId::of::<()>(),
+            CallRouting::Remote { .. } => remote_expected_reply_type_id
+                .expect("remote call context carries the expected reply type"),
         };
         Some(MessageCaller::new(
             std::rc::Rc::clone(&self.deferred_registry),
@@ -4095,8 +4269,10 @@ where
         }
     }
 
-    fn drop_pending_deferred_captures(&mut self, cause: tina_runtime::CauseId) {
-        for capture in self.deferred_registry.drain_pending() {
+    fn drop_pending_deferred_captures(&mut self, cause: tina_runtime::CauseId) -> bool {
+        let captures = self.deferred_registry.drain_pending();
+        let captured_any = !captures.is_empty();
+        for capture in captures {
             capture.shared.set_state(tina::DeferredSlotState::Closed);
             let slot_id = tina_runtime::DeferredSlotId::new(capture.slot_id);
             let call_id = CallId::new(capture.call_id);
@@ -4112,6 +4288,7 @@ where
             );
             self.complete_isolate_call(call_id, dropped.into(), CallOutcome::Closed);
         }
+        captured_any
     }
 
     fn drop_promoted_deferred_slot(
@@ -4261,6 +4438,7 @@ where
             CallOutcome::Full => Some(CallError::TargetFull),
             CallOutcome::Closed => Some(CallError::TargetClosed),
             CallOutcome::Timeout => Some(CallError::Timeout),
+            CallOutcome::Rejected(reason) => Some(CallError::Rejected(*reason)),
         };
 
         if let Some(reason) = failure_reason {
@@ -4657,6 +4835,7 @@ where
             RemoteCallOutcome::Replied(reply) => CallOutcome::Replied(reply),
             RemoteCallOutcome::Full => CallOutcome::Full,
             RemoteCallOutcome::Closed => CallOutcome::Closed,
+            RemoteCallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
         };
         if !self.complete_isolate_call(reply.call_id, reply.cause, outcome) {
             let reason = match self.recently_cancelled_cause(reply.call_id) {
@@ -4981,6 +5160,72 @@ where
     }
 }
 
+impl<S, ParentMessage> IntoErasedSpawnObserved<S, ParentMessage> for Infallible
+where
+    S: Shard,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S>> {
+        match self {}
+    }
+}
+
+struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
+    inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S> ErasedSpawnObserved<S>
+    for SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S> {
+        let (spawn, continuation) = self.inner.into_parts();
+        match spawn.into_erased_spawn().try_spawn_observed(sim, parent) {
+            Ok(outcome) => {
+                let child_address = Address::<ChildMessage, ChildReply>::new_with_generation(
+                    outcome.child.shard,
+                    outcome.child.isolate,
+                    outcome.child.generation,
+                );
+                let message = continuation(Ok(ChildRef::new(child_address)));
+                SpawnObservedOutcome {
+                    spawn: Some(outcome),
+                    continuation: Some(Box::new(message)),
+                }
+            }
+            Err(error) => {
+                let message = continuation(Err(error));
+                SpawnObservedOutcome {
+                    spawn: None,
+                    continuation: Some(Box::new(message)),
+                }
+            }
+        }
+    }
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S> IntoErasedSpawnObserved<S, ParentMessage>
+    for tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S>> {
+        Box::new(SpawnObservedAdapter { inner: self })
+    }
+}
+
 struct SpawnAdapter<I, Outbound>
 where
     I: Isolate,
@@ -4996,6 +5241,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5009,6 +5255,17 @@ where
             self.bootstrap_message,
         )
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(sim, parent))
+    }
 }
 
 impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for ChildDefinition<I>
@@ -5016,6 +5273,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5047,6 +5305,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5066,6 +5325,17 @@ where
         outcome.restart_recipe = Some(adapter);
         outcome
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(sim, parent))
+    }
 }
 
 impl<I, S, Msg, Outbound> ErasedRestartRecipe<S> for RestartableSpawnAdapter<I, Outbound>
@@ -5073,6 +5343,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5095,6 +5366,7 @@ where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     Msg: 'static,
     Outbound: 'static,
@@ -5114,8 +5386,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::convert::Infallible;
-    use tina::{Outbound, batch, noop, send, spawn, stop};
+    use std::rc::Rc;
+    use tina::{
+        ChildDefinition, ChildRef, Outbound, SpawnObservedError, batch, noop, send, spawn,
+        spawn_observed, stop,
+    };
 
     #[test]
     fn round_message_scratch_reserve_covers_more_than_initial_capacity() {
@@ -5125,6 +5402,77 @@ mod tests {
         assert!(
             scratch.capacity() >= INITIAL_ENTRY_CAPACITY + 4,
             "scratch reserve must cover the entry count before push-time growth"
+        );
+    }
+
+    #[test]
+    fn simulator_spawn_observed_delivers_child_ref_and_parent_uses_address() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let child_ref = Rc::new(RefCell::new(None));
+        let spawn_error = Rc::new(RefCell::new(None));
+        let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
+        let parent = sim.register_with_mailbox_capacity::<
+            SimObservedParent,
+            SimObservedParentMsg,
+            SimObservedChildMsg,
+        >(
+            SimObservedParent {
+                seen: Rc::clone(&seen),
+                child_ref: Rc::clone(&child_ref),
+                spawn_error,
+            },
+            8,
+        );
+
+        assert!(sim.try_send(parent, SimObservedParentMsg::Start).is_ok());
+        assert_eq!(sim.step(), 1);
+        assert!(child_ref.borrow().is_none());
+
+        assert_eq!(sim.step(), 1);
+        let child = (*child_ref.borrow()).expect("child ref delivered to parent");
+        assert_eq!(child.address.shard(), ShardId::new(9));
+        assert_eq!(child.generation, child.address.generation());
+
+        assert_eq!(sim.step(), 1);
+        assert_eq!(&*seen.borrow(), &[7]);
+    }
+
+    #[test]
+    fn simulator_spawn_observed_reports_zero_capacity_without_spawning_child() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let child_ref = Rc::new(RefCell::new(None));
+        let spawn_error = Rc::new(RefCell::new(None));
+        let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
+        let parent = sim.register_with_mailbox_capacity::<
+            SimObservedParent,
+            SimObservedParentMsg,
+            SimObservedChildMsg,
+        >(
+            SimObservedParent {
+                seen,
+                child_ref: Rc::clone(&child_ref),
+                spawn_error: Rc::clone(&spawn_error),
+            },
+            8,
+        );
+
+        assert!(
+            sim.try_send(parent, SimObservedParentMsg::StartInvalid)
+                .is_ok()
+        );
+        assert_eq!(sim.step(), 1);
+        assert!(child_ref.borrow().is_none());
+        assert!(spawn_error.borrow().is_none());
+        assert!(
+            !sim.trace()
+                .iter()
+                .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        );
+
+        assert_eq!(sim.step(), 1);
+        assert_eq!(
+            *spawn_error.borrow(),
+            Some(SpawnObservedError::ZeroMailboxCapacity)
         );
     }
 
@@ -5196,6 +5544,95 @@ mod tests {
         marker: PhantomData<S>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimObservedChildMsg {
+        Record(u8),
+    }
+
+    #[derive(Debug)]
+    enum SimObservedParentMsg {
+        Start,
+        StartInvalid,
+        ChildStarted(Result<ChildRef<SimObservedChildMsg>, SpawnObservedError>),
+    }
+
+    #[derive(Debug)]
+    struct SimObservedChild {
+        seen: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl Isolate for SimObservedChild {
+        type Message = SimObservedChildMsg;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type SpawnObserved = Infallible;
+        type Call = RuntimeCall<Self::Message>;
+        type Shard = NumberedShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SimObservedChildMsg::Record(value) => {
+                    self.seen.borrow_mut().push(value);
+                    noop()
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SimObservedParent {
+        seen: Rc<RefCell<Vec<u8>>>,
+        child_ref: Rc<RefCell<Option<ChildRef<SimObservedChildMsg>>>>,
+        spawn_error: Rc<RefCell<Option<SpawnObservedError>>>,
+    }
+
+    impl Isolate for SimObservedParent {
+        type Message = SimObservedParentMsg;
+        type Reply = ();
+        type Send = Outbound<SimObservedChildMsg>;
+        type Spawn = ChildDefinition<SimObservedChild>;
+        type SpawnObserved =
+            tina::SpawnObserved<Self::Spawn, Self::Message, SimObservedChildMsg, ()>;
+        type Call = RuntimeCall<Self::Message>;
+        type Shard = NumberedShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SimObservedParentMsg::Start => spawn_observed(ChildDefinition::new(
+                    SimObservedChild {
+                        seen: Rc::clone(&self.seen),
+                    },
+                    4,
+                ))
+                .then(SimObservedParentMsg::ChildStarted),
+                SimObservedParentMsg::StartInvalid => spawn_observed(ChildDefinition::new(
+                    SimObservedChild {
+                        seen: Rc::clone(&self.seen),
+                    },
+                    0,
+                ))
+                .then(SimObservedParentMsg::ChildStarted),
+                SimObservedParentMsg::ChildStarted(Ok(child)) => {
+                    *self.child_ref.borrow_mut() = Some(child);
+                    send(child.address, SimObservedChildMsg::Record(7))
+                }
+                SimObservedParentMsg::ChildStarted(Err(error)) => {
+                    *self.spawn_error.borrow_mut() = Some(error);
+                    noop()
+                }
+            }
+        }
+    }
+
     impl<S> Isolate for SimSleeper<S>
     where
         S: Shard + 'static,
@@ -5204,6 +5641,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimTimerMsg>;
         type Shard = S;
 
@@ -5233,6 +5671,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimStepEvent>;
         type Shard = S;
 
@@ -5255,6 +5694,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<SimRemoteEvent>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimRemoteEvent>;
         type Shard = S;
 
@@ -5288,6 +5728,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimRemoteEvent>;
         type Shard = S;
 
@@ -5314,6 +5755,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = tina::RestartableChildDefinition<SimShardLocalChild<S>>;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
         type Shard = S;
 
@@ -5347,6 +5789,7 @@ mod tests {
         type Reply = ();
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
         type Shard = S;
 

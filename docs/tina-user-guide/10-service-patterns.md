@@ -46,7 +46,7 @@ Caller:
 
 ```rust
 call(counter, CounterMsg::Add(1), Duration::from_millis(20))
-    .reply(ClientMsg::CounterReturned)
+    .then(ClientMsg::CounterReturned)
 ```
 
 ## Service That Does I/O
@@ -71,6 +71,46 @@ This is the right shape for:
 
 Do not turn these into spawn-and-route-back helpers just because the answer is
 not immediate. Tina can carry the reply context through continuation chains.
+
+## Production Service Skeleton
+
+The copyable service skeleton lives in
+`examples/systems/mini_saas_api`.
+
+It assembles the blessed local-service layers:
+
+| Layer | Skeleton choice |
+| --- | --- |
+| inbound HTTP | native `tina_http::HttpListener` |
+| routing | direct method/path match in the controller isolate |
+| domain state | controller isolate fields, not `Arc<Mutex<AppState>>` |
+| DB | `tina-sqlite-bridge::SqliteWorker` as the documented one-lane pool shape |
+| outbound HTTP | native `tina_http::build_keepalive_pool` |
+| readiness | `GET /ready` probes DB and outbound pool state |
+| capacity | `GET /debug/capacity` reports body, controller, DB, and outbound surfaces |
+| shutdown | mark ingress closed, prove readiness reasons, close DB, drain keepalive pool, stop listeners, shutdown runtime |
+| replay hook | materialized `live_replay_fact` for the body-cap pressure case |
+
+Route table:
+
+| Route | Turns before reply |
+| --- | --- |
+| `GET /health` | one |
+| `GET /ready` | DB turn, outbound-pool turn |
+| `POST /items` | DB insert turn |
+| `GET /items/{id}` | DB query turn |
+| `POST /items/{id}/notify` | DB query, pool acquire, keepalive request, pool release |
+| `GET /debug/capacity` | outbound-pool pressure turn |
+
+Run it:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+```
+
+This is a skeleton, not a framework. It deliberately keeps route parsing,
+small response helpers, and scenario glue specimen-local.
 
 ## Topology Shapes
 
@@ -193,7 +233,7 @@ Tina (`ShardPlacement` + `ShardServiceTable::try_from_placement(...)` +
 per-shard `Store` isolates with `placement.require_owner_str(...)`)
 implementation that runs the same `SET / GET / DEL / SUM / QUIT` script
 and produces the same `Report`. The Tina side uses
-`call(addr, msg, timeout).reply(continuation)` for keyed access and a
+`call(addr, msg, timeout).then(continuation)` for keyed access and a
 sequential per-shard fanout for `SUM`. The richer parallel
 scatter/gather form (with `send_observed` and a `ReplyAdapter`) is
 proven in `tina-runtime/tests/sharded_primitives.rs`.
@@ -242,7 +282,7 @@ logs and metrics.
 
 ## Deferred Replies
 
-`call(svc, msg, timeout).reply(...)` works when the service answers in
+`call(svc, msg, timeout).then(...)` works when the service answers in
 one handler turn. Some shapes need to answer later:
 
 - pool frontend, reply arrives from one of N workers
@@ -319,15 +359,33 @@ When the reply is intentionally multi-turn, use `RequestContext<R>` instead of
 `DeferredReply`. The name signals intent to readers.
 
 ```rust
-let req: RequestContext<MyReply> = ctx.take_request_context()?;
-call(probe, ProbeMsg, timeout)
-    .reply_with_request(req, MyMsg::ProbeResult)
+call_ctx
+    .defer(call(probe, ProbeMsg, timeout))
+    .reply(MyMsg::ProbeResult)
 ```
 
-`reply_with_request` boxes a translator that carries the context into the
-continuation message. The caller timeout still governs. The service still
-answers later with `reply_to_request(req, MyReply)`. There is no hidden
-state preservation and no async-looking sugar.
+The continuation message still carries `RequestContext<MyReply>`, so the
+message enum stays honest:
+
+```rust
+ProbeResult(RequestContext<MyReply>, CallOutcome<ProbeReply>)
+```
+
+The caller timeout still governs. The service still answers later with
+`reply_to_request(req, MyReply)`. There is no hidden state preservation and no
+async-looking sugar.
+
+When the expanded authority move reads better, spell it out:
+
+```rust
+let req: RequestContext<MyReply> = call_ctx.into_request_context();
+call(probe, ProbeMsg, timeout)
+    .then_with_request(req, MyMsg::ProbeResult)
+```
+
+Use `then(...)` for ordinary continuations that do not carry caller authority.
+Do not use ordinary `then(...)` as the default in `handle_call` unless you also
+reply, reject, or defer the `CallContext`.
 
 `RequestContext` is a real newtype over `DeferredReply`; it exists so that
 a handler signature can say "I carry the promise across turns" instead of

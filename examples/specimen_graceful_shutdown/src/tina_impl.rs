@@ -44,7 +44,7 @@ struct Consumer {
 impl Consumer {
     fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            ConsumerMsg::Item(_) => sleep(Duration::from_millis(1)).reply(ConsumerMsg::Done),
+            ConsumerMsg::Item(_) => sleep(Duration::from_millis(1)).then(ConsumerMsg::Done),
             ConsumerMsg::Done(Ok(())) => {
                 self.telemetry.processed.fetch_add(1, Ordering::Relaxed);
                 noop()
@@ -82,7 +82,7 @@ impl Producer {
                     return noop();
                 }
                 sleep(Duration::from_millis(ITEM_INTERVAL_MS))
-                    .reply(move |result| ProducerMsg::TimerFired(n, result))
+                    .then(move |result| ProducerMsg::TimerFired(n, result))
             }
             ProducerMsg::TimerFired(n, Ok(())) => {
                 if self.stopped || n >= self.target {
@@ -93,7 +93,7 @@ impl Producer {
                 batch(vec![
                     send(self.consumer, ConsumerMsg::Item(n)),
                     sleep(Duration::from_millis(ITEM_INTERVAL_MS))
-                        .reply(move |result| ProducerMsg::TimerFired(next, result)),
+                        .then(move |result| ProducerMsg::TimerFired(next, result)),
                 ])
             }
             ProducerMsg::TimerFired(_, Err(_)) => noop(),
@@ -129,7 +129,7 @@ impl SignalWatcher {
     fn handle(&mut self, msg: SignalMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             SignalMsg::Begin => {
-                signal_wait("sigint", Duration::from_secs(10)).reply(SignalMsg::Received)
+                signal_wait("sigint", Duration::from_secs(10)).then(SignalMsg::Received)
             }
             SignalMsg::Received(Ok(_)) => {
                 self.telemetry

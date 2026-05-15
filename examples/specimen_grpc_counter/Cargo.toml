@@ -1,0 +1,25 @@
+[package]
+name = "specimen_grpc_counter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+tina = { path = "../../tina" }
+tina-http = { path = "../../tina-http" }
+tina-runtime = { path = "../../tina-runtime" }
+prost = { version = "0.13", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+http = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["transport"] }
+
+[[bin]]
+name = "specimen_grpc_counter"
+path = "src/main.rs"

@@ -46,17 +46,17 @@ struct Listener {
 impl Listener {
     fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ListenerMsg::Start => tcp_bind(self.bind_addr).reply(ListenerMsg::Bound),
+            ListenerMsg::Start => tcp_bind(self.bind_addr).then(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _addr))) => {
                 self.listener = Some(listener);
-                tcp_accept(listener).reply(ListenerMsg::Accepted)
+                tcp_accept(listener).then(ListenerMsg::Accepted)
             }
             ListenerMsg::Bound(Err(_)) => stop(),
             ListenerMsg::Accepted(Ok((stream, _peer))) => {
                 let listener = self.listener.expect("bound before accept");
                 batch(vec![
                     spawn(ChildDefinition::new(Connection { stream }, 16)),
-                    tcp_accept(listener).reply(ListenerMsg::Accepted),
+                    tcp_accept(listener).then(ListenerMsg::Accepted),
                 ])
             }
             ListenerMsg::Accepted(Err(_)) => stop(),
@@ -86,10 +86,10 @@ struct Connection {
 impl Connection {
     fn handle(&mut self, msg: ConnMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ConnMsg::Begin => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
-            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).reply(ConnMsg::Wrote),
+            ConnMsg::Begin => tcp_read(self.stream, 4096).then(ConnMsg::Read),
+            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).then(ConnMsg::Wrote),
             ConnMsg::Read(Err(_)) => stop(),
-            ConnMsg::Wrote(_) => tcp_close_stream(self.stream).reply(ConnMsg::Closed),
+            ConnMsg::Wrote(_) => tcp_close_stream(self.stream).then(ConnMsg::Closed),
             ConnMsg::Closed(_) => stop(),
         }
     }

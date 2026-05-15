@@ -15,7 +15,7 @@ use betelgeuse::{
     AcceptCompletion, AcceptOp, ConnectCompletion, IO, IOFile, IOLoop, IOLoopHandle, IOSocket,
     OpenOptions, Operation, RecvCompletion, SendCompletion, io::simulated::SimulatedIO,
 };
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::{CallContext, Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallCompletionRejectedReason, CallInput, CallKind, CallOutcome, CallOutput,
     DriverRuntimeRequirement, ListenerId, MailboxFactory, RuntimeCall, RuntimeEvent,
@@ -253,7 +253,7 @@ impl Isolate for RetryWorker {
                         .lock()
                         .expect("observations mutex")
                         .push(RetryObservation::Failed(self.attempts));
-                    sleep(self.backoff).reply(|_| RetryMsg::RetryNow)
+                    sleep(self.backoff).then(|_| RetryMsg::RetryNow)
                 } else {
                     self.observations
                         .lock()
@@ -392,7 +392,7 @@ impl Isolate for LongTimer {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            LongTimerMsg::Start => sleep(Duration::from_secs(60)).reply(|_| LongTimerMsg::Finished),
+            LongTimerMsg::Start => sleep(Duration::from_secs(60)).then(|_| LongTimerMsg::Finished),
             LongTimerMsg::Finished => noop(),
         }
     }
@@ -1428,6 +1428,15 @@ impl Isolate for CallTarget {
             }
         }
     }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            CallTargetMsg::Ask => {
+                *self.hits.lock().expect("hits mutex") += 1;
+                call.reply(CallReply)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1441,6 +1450,7 @@ enum CallObservation {
     Replied,
     Full,
     Closed,
+    Rejected,
     Timeout,
 }
 
@@ -1467,12 +1477,13 @@ impl Isolate for CallClient {
     ) -> Effect<Self> {
         match msg {
             CallClientMsg::Start => call(self.target, CallTargetMsg::Ask, Duration::from_secs(1))
-                .reply(CallClientMsg::Returned),
+                .then(CallClientMsg::Returned),
             CallClientMsg::Returned(outcome) => {
                 let observation = match outcome {
                     CallOutcome::Replied(_) => CallObservation::Replied,
                     CallOutcome::Full => CallObservation::Full,
                     CallOutcome::Closed => CallObservation::Closed,
+                    CallOutcome::Rejected(_) => CallObservation::Rejected,
                     CallOutcome::Timeout => CallObservation::Timeout,
                 };
                 self.observations

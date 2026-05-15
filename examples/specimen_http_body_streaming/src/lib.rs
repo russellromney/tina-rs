@@ -41,7 +41,7 @@ pub const CLIENT_READ_BYTES: usize = 1024;
 /// outbound buffer to flush slowly.
 pub const CLIENT_INTER_READ_PAUSE: Duration = Duration::from_millis(2);
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
     pub bytes_received: usize,
     pub status_ok: bool,
@@ -68,6 +68,9 @@ pub struct Report {
     /// before decoding (raw chunked-framed bytes). Always larger
     /// than `tina_chunked_decoded_bytes` by the framing overhead.
     pub tina_chunked_wire_bytes: Option<usize>,
+    /// Tina side only. Capacity discovery line for the fixed
+    /// response-body weighted surface, showing measured high water.
+    pub tina_capacity_discovery_line: Option<String>,
 }
 
 /// Connects to `addr`, requests `path`, and reads the response in

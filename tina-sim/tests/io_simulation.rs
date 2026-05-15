@@ -62,6 +62,7 @@ impl Isolate for Connection {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ConnectionMsg>;
     type Shard = TestShard;
 
@@ -116,6 +117,7 @@ impl Isolate for Client {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = TestShard;
 
@@ -225,6 +227,7 @@ impl Isolate for FileClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<FileClientMsg>;
     type Shard = TestShard;
 
@@ -363,6 +366,7 @@ impl Isolate for UdpClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<UdpClientMsg>;
     type Shard = TestShard;
 
@@ -372,30 +376,29 @@ impl Isolate for UdpClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            UdpClientMsg::Start => udp_bind(self.receiver_addr).reply(UdpClientMsg::BoundReceiver),
+            UdpClientMsg::Start => udp_bind(self.receiver_addr).then(UdpClientMsg::BoundReceiver),
             UdpClientMsg::BoundReceiver(Ok((socket, _addr))) => {
                 self.receiver = Some(socket);
-                udp_bind(self.sender_addr).reply(UdpClientMsg::BoundSender)
+                udp_bind(self.sender_addr).then(UdpClientMsg::BoundSender)
             }
             UdpClientMsg::BoundSender(Ok((socket, _addr))) => {
                 self.sender = Some(socket);
                 batch([
-                    udp_recv_from(self.receiver.expect("receiver"), 4)
-                        .reply(UdpClientMsg::Received),
+                    udp_recv_from(self.receiver.expect("receiver"), 4).then(UdpClientMsg::Received),
                     udp_send_to(socket, self.receiver_addr, b"alpaca".to_vec())
-                        .reply(UdpClientMsg::Sent),
+                        .then(UdpClientMsg::Sent),
                 ])
             }
             UdpClientMsg::Sent(Ok(count)) => {
                 self.observed.borrow_mut().push(format!("sent:{count}"));
-                udp_close_socket(self.sender.expect("sender")).reply(UdpClientMsg::Closed)
+                udp_close_socket(self.sender.expect("sender")).then(UdpClientMsg::Closed)
             }
             UdpClientMsg::Received(Ok((_peer, bytes, truncated))) => {
                 self.observed.borrow_mut().push(format!(
                     "recv:{}:{truncated}",
                     String::from_utf8(bytes).expect("utf8")
                 ));
-                udp_close_socket(self.receiver.expect("receiver")).reply(UdpClientMsg::Closed)
+                udp_close_socket(self.receiver.expect("receiver")).then(UdpClientMsg::Closed)
             }
             UdpClientMsg::Closed(Ok(())) => {
                 self.observed.borrow_mut().push("closed".to_string());
@@ -445,6 +448,7 @@ impl Isolate for DnsProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<DnsProbeMsg>;
     type Shard = TestShard;
 
@@ -458,7 +462,7 @@ impl Isolate for DnsProbe {
                 host,
                 port,
                 timeout,
-            } => dns_lookup(host, port, timeout).reply(DnsProbeMsg::Done),
+            } => dns_lookup(host, port, timeout).then(DnsProbeMsg::Done),
             DnsProbeMsg::Done(Ok(addrs)) => {
                 self.observed.borrow_mut().push(format!(
                     "resolved:{}",
@@ -504,6 +508,7 @@ impl Isolate for TlsProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TlsProbeMsg>;
     type Shard = TestShard;
 
@@ -517,12 +522,12 @@ impl Isolate for TlsProbe {
                 addr,
                 server_name,
                 timeout,
-            } => tls_connect(addr, server_name, Vec::new(), timeout).reply(TlsProbeMsg::Connected),
+            } => tls_connect(addr, server_name, Vec::new(), timeout).then(TlsProbeMsg::Connected),
             TlsProbeMsg::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
                 self.observed.borrow_mut().push("tls-connected".to_string());
                 tls_write(stream, b"ping".to_vec(), Duration::from_millis(50))
-                    .reply(TlsProbeMsg::Wrote)
+                    .then(TlsProbeMsg::Wrote)
             }
             TlsProbeMsg::Connected(Err(error)) => {
                 self.observed
@@ -535,7 +540,7 @@ impl Isolate for TlsProbe {
                     .borrow_mut()
                     .push(format!("tls-wrote:{count}"));
                 let stream = self.stream.expect("TLS stream should be remembered");
-                tls_read(stream, 16, Duration::from_millis(50)).reply(TlsProbeMsg::ReadDone)
+                tls_read(stream, 16, Duration::from_millis(50)).then(TlsProbeMsg::ReadDone)
             }
             TlsProbeMsg::Wrote(Err(error)) => {
                 self.observed
@@ -548,7 +553,7 @@ impl Isolate for TlsProbe {
                     .borrow_mut()
                     .push(format!("tls-read:{}", String::from_utf8_lossy(&bytes)));
                 let stream = self.stream.expect("TLS stream should be remembered");
-                tls_close(stream, Duration::from_millis(50)).reply(TlsProbeMsg::Closed)
+                tls_close(stream, Duration::from_millis(50)).then(TlsProbeMsg::Closed)
             }
             TlsProbeMsg::ReadDone(Err(error)) => {
                 self.observed
@@ -589,6 +594,7 @@ impl Isolate for TlsServerProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TlsServerProbeMsg>;
     type Shard = TestShard;
 
@@ -599,20 +605,20 @@ impl Isolate for TlsServerProbe {
     ) -> Effect<Self> {
         match msg {
             TlsServerProbeMsg::Bind => {
-                tls_bind(local_addr(0), Vec::new(), Vec::new()).reply(TlsServerProbeMsg::Bound)
+                tls_bind(local_addr(0), Vec::new(), Vec::new()).then(TlsServerProbeMsg::Bound)
             }
             TlsServerProbeMsg::Bound(Ok((listener, addr))) => {
                 self.observed.borrow_mut().push(format!("bound:{addr}"));
                 tls_accept(listener, Duration::from_millis(50))
-                    .reply(move |result| TlsServerProbeMsg::Accepted(result, listener))
+                    .then(move |result| TlsServerProbeMsg::Accepted(result, listener))
             }
             TlsServerProbeMsg::Accepted(Ok((stream, _peer)), listener) => {
                 self.observed.borrow_mut().push("accepted".to_string());
                 tls_close(stream, Duration::from_millis(50))
-                    .reply(move |result| TlsServerProbeMsg::ClosedStream(result, listener))
+                    .then(move |result| TlsServerProbeMsg::ClosedStream(result, listener))
             }
             TlsServerProbeMsg::ClosedStream(Ok(()), listener) => {
-                tls_close_listener(listener).reply(TlsServerProbeMsg::ClosedListener)
+                tls_close_listener(listener).then(TlsServerProbeMsg::ClosedListener)
             }
             TlsServerProbeMsg::ClosedListener(Ok(())) => {
                 self.observed.borrow_mut().push("closed".to_string());
@@ -661,6 +667,7 @@ impl Isolate for PathProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PathProbeMsg>;
     type Shard = TestShard;
 
@@ -671,36 +678,36 @@ impl Isolate for PathProbe {
     ) -> Effect<Self> {
         match msg {
             PathProbeMsg::Start { dir, path, renamed } => mkdir(dir, 0o755)
-                .reply(move |result| PathProbeMsg::DirectoryMade(result, path, renamed)),
+                .then(move |result| PathProbeMsg::DirectoryMade(result, path, renamed)),
             PathProbeMsg::DirectoryMade(Ok(()), path, renamed) => file_create(path.clone())
-                .reply(move |result| PathProbeMsg::Opened(result, path, renamed)),
+                .then(move |result| PathProbeMsg::Opened(result, path, renamed)),
             PathProbeMsg::Opened(Ok(file), path, renamed) => file_write(file, b"hay".to_vec())
-                .reply(move |result| PathProbeMsg::Wrote(result, file, path, renamed)),
+                .then(move |result| PathProbeMsg::Wrote(result, file, path, renamed)),
             PathProbeMsg::Wrote(Ok(3), file, path, renamed) => {
-                file_close(file).reply(move |result| PathProbeMsg::Closed(result, path, renamed))
+                file_close(file).then(move |result| PathProbeMsg::Closed(result, path, renamed))
             }
             PathProbeMsg::Closed(Ok(()), path, renamed) => path_metadata(path.clone())
-                .reply(move |result| PathProbeMsg::Metadata(result, path, renamed)),
+                .then(move |result| PathProbeMsg::Metadata(result, path, renamed)),
             PathProbeMsg::Metadata(Ok(metadata), path, renamed)
                 if metadata.kind == PathKind::File && metadata.len == Some(3) =>
             {
                 let listed = renamed.clone();
                 rename_replace(path, renamed.clone())
-                    .reply(move |result| PathProbeMsg::Renamed(result, listed, renamed))
+                    .then(move |result| PathProbeMsg::Renamed(result, listed, renamed))
             }
             PathProbeMsg::Renamed(Ok(()), listed, renamed) => {
                 let dir = listed
                     .parent()
                     .expect("renamed path has parent")
                     .to_path_buf();
-                read_dir(dir).reply(move |result| PathProbeMsg::Listed(result, renamed))
+                read_dir(dir).then(move |result| PathProbeMsg::Listed(result, renamed))
             }
             PathProbeMsg::Listed(Ok(entries), renamed) if entries.contains(&renamed) => {
                 sync_parent(renamed.clone())
-                    .reply(move |result| PathProbeMsg::ParentSynced(result, renamed))
+                    .then(move |result| PathProbeMsg::ParentSynced(result, renamed))
             }
             PathProbeMsg::ParentSynced(Ok(()), renamed) => {
-                remove_file(renamed).reply(PathProbeMsg::Removed)
+                remove_file(renamed).then(PathProbeMsg::Removed)
             }
             PathProbeMsg::Removed(Ok(())) => {
                 self.observed.borrow_mut().push("path-ok".to_string());
@@ -749,6 +756,7 @@ impl Isolate for SignalProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SignalProbeMsg>;
     type Shard = TestShard;
 
@@ -759,7 +767,7 @@ impl Isolate for SignalProbe {
     ) -> Effect<Self> {
         match msg {
             SignalProbeMsg::Wait { name, timeout } => {
-                signal_wait(name, timeout).reply(SignalProbeMsg::Done)
+                signal_wait(name, timeout).then(SignalProbeMsg::Done)
             }
             SignalProbeMsg::Done(Ok(name)) => {
                 self.observed.borrow_mut().push(format!("signal:{name}"));
@@ -798,6 +806,7 @@ impl Isolate for ProcessProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProcessProbeMsg>;
     type Shard = TestShard;
 
@@ -814,7 +823,7 @@ impl Isolate for ProcessProbe {
                 stdout_limit,
                 stderr_limit,
             } => process_run(command, args, timeout, stdout_limit, stderr_limit)
-                .reply(ProcessProbeMsg::Done),
+                .then(ProcessProbeMsg::Done),
             ProcessProbeMsg::Done(Ok(result)) => {
                 self.observed.borrow_mut().push(format!(
                     "process:{:?}:{}:{}:{}",
@@ -846,6 +855,7 @@ impl Isolate for UdpProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<UdpProbeMsg>;
     type Shard = TestShard;
 
@@ -855,19 +865,19 @@ impl Isolate for UdpProbe {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            UdpProbeMsg::Bind => udp_bind(self.bind_addr).reply(UdpProbeMsg::Bound),
+            UdpProbeMsg::Bind => udp_bind(self.bind_addr).then(UdpProbeMsg::Bound),
             UdpProbeMsg::Bound(Ok((socket, _))) => {
                 self.observed
                     .borrow_mut()
                     .push(format!("bound:{}", socket.get()));
                 Effect::Noop
             }
-            UdpProbeMsg::RecvOne(socket) => udp_recv_from(socket, 8).reply(UdpProbeMsg::Done),
+            UdpProbeMsg::RecvOne(socket) => udp_recv_from(socket, 8).then(UdpProbeMsg::Done),
             UdpProbeMsg::RecvTwo(socket) => batch([
-                udp_recv_from(socket, 8).reply(UdpProbeMsg::Done),
-                udp_recv_from(socket, 8).reply(UdpProbeMsg::Done),
+                udp_recv_from(socket, 8).then(UdpProbeMsg::Done),
+                udp_recv_from(socket, 8).then(UdpProbeMsg::Done),
             ]),
-            UdpProbeMsg::Close(socket) => udp_close_socket(socket).reply(UdpProbeMsg::Closed),
+            UdpProbeMsg::Close(socket) => udp_close_socket(socket).then(UdpProbeMsg::Closed),
             UdpProbeMsg::Done(Ok((_peer, bytes, truncated))) => {
                 self.observed.borrow_mut().push(format!(
                     "recv:{}:{truncated}",
@@ -967,6 +977,7 @@ impl Isolate for Listener {
     type Reply = ();
     type Send = Outbound<ListenerMsg>;
     type Spawn = RestartableChildDefinition<Connection>;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ListenerMsg>;
     type Shard = TestShard;
 
@@ -1080,6 +1091,7 @@ impl Isolate for Binder {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BinderMsg>;
     type Shard = TestShard;
 
@@ -1133,6 +1145,7 @@ impl Isolate for Probe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = TestShard;
 
@@ -1214,6 +1227,7 @@ impl Isolate for Waiter {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WaiterMsg>;
     type Shard = TestShard;
 
@@ -1269,6 +1283,7 @@ impl Isolate for PeerAwareAcceptor {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PeerAwareAcceptMsg>;
     type Shard = TestShard;
 
@@ -1320,6 +1335,7 @@ impl Isolate for ReadProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ReadProbeMsg>;
     type Shard = TestShard;
 
@@ -1375,6 +1391,7 @@ impl Isolate for WriteProbe {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WriteProbeMsg>;
     type Shard = TestShard;
 
@@ -1427,6 +1444,7 @@ impl Isolate for ListenerCloser {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 
@@ -1464,6 +1482,7 @@ impl Isolate for StreamCloser {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CloserMsg>;
     type Shard = TestShard;
 

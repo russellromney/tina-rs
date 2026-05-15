@@ -3,10 +3,10 @@ use std::convert::Infallible;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId};
+use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId, time::TimerInterval};
 use tina_runtime::{
     CallCompletionRejectedReason, CallInput, CallKind, CallOutput, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind,
+    RuntimeEventKind, SleepReply, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -42,6 +42,7 @@ impl Isolate for Sleeper {
     type Reply = ();
     type Send = Outbound<TimerMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
     type Shard = TestShard;
 
@@ -94,6 +95,7 @@ impl Isolate for OrderingSleeper {
     type Reply = ();
     type Send = Outbound<OrderingMsg>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<OrderingMsg>;
     type Shard = TestShard;
 
@@ -347,4 +349,108 @@ fn same_config_reproduces_same_event_record() {
     }
 
     assert_eq!(run(1234), run(1234));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperIntervalMsg {
+    Start,
+    Tick(u64, SleepReply),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelperIntervalObservation {
+    tick_number: u64,
+    scheduled_after: Duration,
+    fired: bool,
+}
+
+#[derive(Debug)]
+struct HelperIntervalSleeper {
+    interval: TimerInterval,
+    observations: Rc<RefCell<Vec<HelperIntervalObservation>>>,
+}
+
+impl Isolate for HelperIntervalSleeper {
+    type Message = HelperIntervalMsg;
+    type Reply = ();
+    type Send = Outbound<HelperIntervalMsg>;
+    type Spawn = Infallible;
+    type SpawnObserved = Infallible;
+    type Call = RuntimeCall<HelperIntervalMsg>;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            HelperIntervalMsg::Start => {
+                let now = ctx.now();
+                let decision = self.interval.next_delay(now);
+                let tick_number = decision.tick_number();
+                self.observations
+                    .borrow_mut()
+                    .push(HelperIntervalObservation {
+                        tick_number,
+                        scheduled_after: decision
+                            .scheduled_at()
+                            .saturating_duration_since(decision.observed_at()),
+                        fired: false,
+                    });
+                sleep(decision.delay())
+                    .then(move |reply| HelperIntervalMsg::Tick(tick_number, reply))
+            }
+            HelperIntervalMsg::Tick(tick_number, reply) => {
+                reply.expect("sim sleep should fire");
+                self.observations
+                    .borrow_mut()
+                    .push(HelperIntervalObservation {
+                        tick_number,
+                        scheduled_after: Duration::ZERO,
+                        fired: true,
+                    });
+                Effect::Noop
+            }
+        }
+    }
+}
+
+#[test]
+fn timer_interval_helper_runs_through_sim_sleep_path() {
+    let observations = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 91,
+            ..Default::default()
+        },
+    );
+    let sleeper = sim.register(HelperIntervalSleeper {
+        interval: TimerInterval::every(Duration::from_millis(10)).unwrap(),
+        observations: Rc::clone(&observations),
+    });
+
+    sim.try_send(sleeper, HelperIntervalMsg::Start).unwrap();
+    assert_eq!(sim.step(), 1);
+    assert_eq!(
+        observations.borrow().as_slice(),
+        [HelperIntervalObservation {
+            tick_number: 1,
+            scheduled_after: Duration::from_millis(10),
+            fired: false,
+        }]
+    );
+
+    sim.advance_time(Duration::from_millis(10));
+    assert_eq!(sim.step(), 1);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::Sleep), 1);
+    assert_eq!(
+        observations.borrow()[1],
+        HelperIntervalObservation {
+            tick_number: 1,
+            scheduled_after: Duration::ZERO,
+            fired: true,
+        }
+    );
 }

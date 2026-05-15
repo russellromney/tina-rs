@@ -442,11 +442,11 @@ where
         // Clamp to >= 1; see Connection::read_effect for rationale (a
         // zero-length read is interpreted as peer EOF).
         let max_len = self.config.read_chunk.max(1);
-        tcp_read(stream, max_len).reply(ClientMsg::Read)
+        tcp_read(stream, max_len).then(ClientMsg::Read)
     }
 
     fn write_effect(bytes: Vec<u8>, stream: StreamId) -> Effect<Self> {
-        tcp_write(stream, bytes).reply(ClientMsg::Wrote)
+        tcp_write(stream, bytes).then(ClientMsg::Wrote)
     }
 
     fn idle_arm_effect(&self) -> Effect<Self> {
@@ -539,7 +539,7 @@ where
         // no resource to close at the runtime; finalize synchronously.
         match self.established_stream() {
             Some(stream) => {
-                effects.push(tcp_close_stream(stream).reply(ClientMsg::StreamClosed));
+                effects.push(tcp_close_stream(stream).then(ClientMsg::StreamClosed));
                 Effect::Batch(effects)
             }
             None => {
@@ -569,7 +569,7 @@ where
             return self.begin_close(ClientResult::IoError(CallError::InvalidResource));
         };
         self.connect_dispatched = true;
-        tcp_connect(addr).reply(|res| match res {
+        tcp_connect(addr).then(|res| match res {
             Ok((stream, _local, _peer)) => ClientMsg::Connected(Ok(stream)),
             Err(err) => ClientMsg::Connected(Err(err)),
         })
@@ -819,6 +819,7 @@ where
     type Reply = ();
     type Send = Outbound<ClientResultMsg>;
     type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = S;
 

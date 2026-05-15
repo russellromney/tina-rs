@@ -221,6 +221,7 @@ macro_rules! isolate_types {
         reply: $reply:ty,
         send: $send:ty,
         spawn: $spawn:ty,
+        spawn_observed: $spawn_observed:ty,
         call: $call:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -228,8 +229,27 @@ macro_rules! isolate_types {
         type Reply = $reply;
         type Send = $send;
         type Spawn = $spawn;
+        type SpawnObserved = $spawn_observed;
         type Call = $call;
         type Shard = $shard;
+    };
+    (
+        message: $message:ty,
+        reply: $reply:ty,
+        send: $send:ty,
+        spawn: $spawn:ty,
+        call: $call:ty,
+        shard: $shard:ty $(,)?
+    ) => {
+        $crate::isolate_types! {
+            message: $message,
+            reply: $reply,
+            send: $send,
+            spawn: $spawn,
+            spawn_observed: ::std::convert::Infallible,
+            call: $call,
+            shard: $shard,
+        }
     };
 }
 
@@ -260,6 +280,9 @@ pub trait Isolate: Sized {
     /// that a runtime may restart later.
     type Spawn;
 
+    /// The payload produced by [`Effect::SpawnObserved`].
+    type SpawnObserved;
+
     /// The payload produced by [`Effect::Call`].
     ///
     /// A call describes one runtime-owned external operation (TCP I/O,
@@ -282,6 +305,20 @@ pub trait Isolate: Sized {
         msg: Self::Message,
         ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self>;
+
+    /// Handles one inbound call message and returns the next runtime effect.
+    ///
+    /// Plain sends enter [`handle`](Self::handle). Calls enter this method
+    /// with an explicit [`CallContext`], which must be consumed by replying,
+    /// rejecting, or promoting it into a [`RequestContext`]. The default
+    /// rejects callable traffic so a missing implementation never leaves the
+    /// caller waiting for a timeout.
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self>
+    where
+        Self::Reply: 'static,
+    {
+        call.reject(CallRejectedReason::UnsupportedMessage)
+    }
 }
 
 /// A closed set of actions that an [`Isolate`] may request from the runtime.
@@ -301,11 +338,18 @@ where
     /// Return a response to the current caller.
     Reply(I::Reply),
 
+    /// Reject the current call without an application reply.
+    Reject(CallRejectedReason),
+
     /// Deliver a typed message to another isolate.
     Send(I::Send),
 
     /// Start a new isolate instance.
     Spawn(I::Spawn),
+
+    /// Start a new isolate instance and report the typed child reference back
+    /// to the parent as an ordinary later message.
+    SpawnObserved(I::SpawnObserved),
 
     /// Stop the current isolate.
     Stop,
@@ -350,7 +394,7 @@ where
     /// returns `CallError::ResourceBusy` because the first is still pending.
     /// For "do these writes one after another" semantics, fold the loop
     /// through the isolate's own continuation messages (one
-    /// `tcp_write(...).reply(...)`, then another from the next handler turn).
+    /// `tcp_write(...).then(...)`, then another from the next handler turn).
     /// See `docs/tcp-loops.md` for canonical patterns.
     Batch(Vec<Effect<I>>),
 
@@ -378,6 +422,14 @@ where
     Effect::Reply(value)
 }
 
+/// Returns an effect that rejects the current call.
+pub fn reject<I>(reason: CallRejectedReason) -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Reject(reason)
+}
+
 /// Returns an effect that sends one typed message to another isolate.
 pub fn send<I, M, R>(destination: Address<M, R>, message: M) -> Effect<I>
 where
@@ -392,6 +444,23 @@ where
     I: Isolate,
 {
     Effect::Spawn(child)
+}
+
+/// Returns a builder for a spawn request that reports the typed child
+/// reference back to the spawning parent as an ordinary later message.
+///
+/// Spawn construction rejections that can be known before a child exists are
+/// delivered through the continuation as [`SpawnObservedError`]. Delivery
+/// rejection for the continuation itself is traced like any other send
+/// rejection; the runtime does not create a hidden queue or bypass the
+/// parent's bounded mailbox to force that message through.
+pub fn spawn_observed<S>(
+    child: S,
+) -> SpawnObservedBuilder<S, <S as SpawnAddress>::Message, <S as SpawnAddress>::Reply>
+where
+    S: SpawnAddress,
+{
+    SpawnObservedBuilder::new(child)
 }
 
 /// Returns an effect that stops the current isolate.
@@ -447,6 +516,7 @@ where
 /// #     type Message = (); type Reply = u32;
 /// #     type Send = Outbound<std::convert::Infallible>;
 /// #     type Spawn = std::convert::Infallible;
+/// #     type SpawnObserved = std::convert::Infallible;
 /// #     type Call = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
 /// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
@@ -794,6 +864,7 @@ where
 {
     shard: &'a mut S,
     current_isolate: IsolateId,
+    current_generation: AddressGeneration,
     caller: Option<MessageCaller>,
     /// Runtime/sim-stamped current time. `None` for hand-built contexts
     /// in tests that do not exercise time. Calls to [`Context::now`] or
@@ -827,10 +898,18 @@ where
         Self {
             shard,
             current_isolate,
+            current_generation: AddressGeneration::new(0),
             caller: None,
             now: None,
             _reply: PhantomData,
         }
+    }
+
+    /// Attach the current isolate generation. Runtime-only constructor.
+    #[doc(hidden)]
+    pub fn with_current_generation(mut self, generation: AddressGeneration) -> Self {
+        self.current_generation = generation;
+        self
     }
 
     /// Attach the current message's caller. Runtime-only constructor.
@@ -869,10 +948,6 @@ where
     ///
     /// - [`TakeReplySlotError::NoCaller`]: the current message was a
     ///   plain send, or the slot was already taken on this turn.
-    /// - [`TakeReplySlotError::CrossShardUnsupported`]: the current
-    ///   call came from another shard. First-form deferred reply
-    ///   slots only support same-shard callers because caller-liveness
-    ///   sweep depends on the local pending-isolate-call table.
     ///
     /// Capturing is irreversible: once taken, the runtime will not also
     /// honor an [`Effect::Reply`] for the same call. Returning
@@ -902,13 +977,8 @@ where
     where
         R: 'static,
     {
-        // Peek routing first so a Remote refusal does not consume the caller.
-        match self.caller.as_ref().map(|c| c.routing()) {
-            None => return Err(TakeReplySlotError::NoCaller),
-            Some(CallRouting::Remote { .. }) => {
-                return Err(TakeReplySlotError::CrossShardUnsupported);
-            }
-            Some(CallRouting::Local) => {}
+        if self.caller.is_none() {
+            return Err(TakeReplySlotError::NoCaller);
         }
         let caller = self.caller.take().expect("checked above");
         let handle = caller.capture();
@@ -1007,7 +1077,11 @@ where
 
     /// Builds an [`Address`] for the currently executing isolate.
     pub fn me<M>(&self) -> Address<M> {
-        Address::new(self.shard_id(), self.current_isolate)
+        Address::new_with_generation(
+            self.shard_id(),
+            self.current_isolate,
+            self.current_generation,
+        )
     }
 
     /// Returns an effect that sends one message back to the current isolate.
@@ -1016,6 +1090,170 @@ where
         I: Isolate<Shard = S, Message = M, Send = Outbound<M>>,
     {
         Effect::Send(Outbound::new(self.me(), message))
+    }
+}
+
+/// The explicit reply authority for one call handler turn.
+///
+/// A send handler receives only [`Context`]. A call handler receives a
+/// `CallContext`, making the caller authority visible at the type boundary.
+/// Consume it with [`reply`](Self::reply), [`reject`](Self::reject), or
+/// [`into_request_context`](Self::into_request_context).
+#[must_use = "a CallContext must be replied, rejected, or promoted into RequestContext"]
+#[derive(Debug)]
+pub struct CallContext<'a, I>
+where
+    I: Isolate,
+{
+    ctx: Context<'a, I::Shard, I::Reply>,
+    _isolate: PhantomData<fn(I) -> I>,
+}
+
+impl<'a, I> CallContext<'a, I>
+where
+    I: Isolate,
+{
+    /// Runtime-only constructor.
+    #[doc(hidden)]
+    pub fn new(ctx: Context<'a, I::Shard, I::Reply>) -> Self {
+        Self {
+            ctx,
+            _isolate: PhantomData,
+        }
+    }
+
+    /// Replies to the caller.
+    pub fn reply(self, value: I::Reply) -> Effect<I> {
+        Effect::Reply(value)
+    }
+
+    /// Rejects the caller with a runtime-level reason.
+    pub fn reject(self, reason: CallRejectedReason) -> Effect<I> {
+        Effect::Reject(reason)
+    }
+
+    /// Defers this caller reply through one visible runtime-owned work item.
+    ///
+    /// The returned builder is supplied by the runtime crate that owns `work`.
+    /// It must carry a [`RequestContext`] into an ordinary continuation message;
+    /// it does not auto-reply to the caller and it does not make caller
+    /// authority ambient.
+    pub fn defer<W>(self, work: W) -> W::Deferred
+    where
+        W: DeferThrough<I>,
+        I::Reply: 'static,
+    {
+        work.defer_through(self)
+    }
+
+    /// Defers this caller reply through one visible runtime-owned work item
+    /// that also exposes explicit cancellation control.
+    ///
+    /// Cancelable work must return a visible pending token instead of hiding
+    /// caller authority inside the worker continuation. That token owns the
+    /// [`RequestContext`] and the runtime cancel handle together, so both
+    /// worker-return and cancel-return paths can explicitly answer the caller.
+    pub fn defer_cancelable<W>(self, work: W) -> W::DeferredCancelable
+    where
+        W: DeferCancelableThrough<I>,
+        I::Reply: 'static,
+    {
+        work.defer_cancelable_through(self)
+    }
+
+    /// Carries the caller authority into a later handler turn.
+    pub fn into_request_context(mut self) -> RequestContext<I::Reply>
+    where
+        I::Reply: 'static,
+    {
+        self.ctx
+            .take_request_context()
+            .expect("CallContext always carries a caller authority")
+    }
+
+    /// Returns the identifier of the shard currently executing the handler.
+    pub fn shard_id(&self) -> ShardId {
+        self.ctx.shard_id()
+    }
+
+    /// Builds an [`Address`] for the currently executing isolate.
+    pub fn me(&self) -> Address<I::Message, I::Reply> {
+        Address::<I::Message, I::Reply>::new_with_generation(
+            self.shard_id(),
+            self.ctx.isolate_id(),
+            self.ctx.current_generation,
+        )
+    }
+
+    /// Returns an effect that sends one message back to the current isolate.
+    pub fn send_self<M>(&self, message: M) -> Effect<I>
+    where
+        I: Isolate<Message = M, Send = Outbound<M>>,
+    {
+        Effect::Send(Outbound::new(self.me(), message))
+    }
+}
+
+/// Runtime-provided support for [`CallContext::defer`].
+///
+/// `tina` owns caller authority vocabulary but not concrete runtime work
+/// builders. Runtime crates implement this trait for their own prepared work
+/// types so user code can write `call_ctx.defer(work).reply(Msg::Done)`
+/// without `tina` depending on those runtime crates.
+///
+/// Implementations must be only sugar for consuming the [`CallContext`] into a
+/// [`RequestContext`] and carrying that context into a continuation message.
+/// They must not create hidden state, hidden retries, or hidden final replies.
+pub trait DeferThrough<I>
+where
+    I: Isolate,
+{
+    /// Builder returned after caller authority has been captured.
+    type Deferred;
+
+    /// Consumes caller authority and prepares the deferred continuation.
+    fn defer_through(self, call: CallContext<'_, I>) -> Self::Deferred;
+}
+
+/// Runtime-provided support for [`CallContext::defer_cancelable`].
+///
+/// Implementations must consume the caller authority into a visible pending
+/// token that user code stores in isolate state. They must not hide the
+/// [`RequestContext`] solely inside a worker-return continuation, because a
+/// cancellation path must still be able to answer the original caller.
+pub trait DeferCancelableThrough<I>
+where
+    I: Isolate,
+{
+    /// Builder returned after caller authority has been captured.
+    type DeferredCancelable;
+
+    /// Consumes caller authority and prepares the cancelable deferred work.
+    fn defer_cancelable_through(self, call: CallContext<'_, I>) -> Self::DeferredCancelable;
+}
+
+/// Runtime-level reason a call was rejected without an application reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallRejectedReason {
+    /// The callee returned without consuming the call authority.
+    ReplyAbandoned,
+    /// The callee panicked before consuming the call authority.
+    HandlerPanicked,
+    /// The callee has no call handler for this message shape.
+    UnsupportedMessage,
+}
+
+impl CallRejectedReason {
+    /// Human-facing diagnostic hint for this rejection, when one is useful.
+    pub const fn diagnostic_hint(self) -> Option<&'static str> {
+        match self {
+            Self::ReplyAbandoned => Some(
+                "call handler returned without consuming CallContext; use \
+                 call_ctx.reply(...), call_ctx.reject(...), or \
+                 call_ctx.defer(work).reply(...)",
+            ),
+            Self::HandlerPanicked | Self::UnsupportedMessage => None,
+        }
     }
 }
 
@@ -1201,6 +1439,145 @@ where
     }
 }
 
+/// Typed reference to one child incarnation.
+///
+/// A `ChildRef` is not a liveness promise. It names the address and generation
+/// the runtime created for one child spawn. If the child restarts, this value is
+/// stale and sends through the old address close/reject like any stale address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChildRef<M, R = ()> {
+    /// Typed address for this child incarnation.
+    pub address: Address<M, R>,
+    /// Address generation for this child incarnation.
+    pub generation: AddressGeneration,
+}
+
+impl<M, R> ChildRef<M, R> {
+    /// Creates a child reference from a runtime-issued address.
+    pub const fn new(address: Address<M, R>) -> Self {
+        Self {
+            address,
+            generation: address.generation(),
+        }
+    }
+}
+
+/// Spawn-construction error delivered to a
+/// `spawn_observed(...).then(...)` continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SpawnObservedError {
+    /// The child requested a zero-capacity mailbox.
+    ///
+    /// Plain [`spawn`] keeps its existing panic-on-zero behavior. The observed
+    /// form can report the rejection through its continuation before any child
+    /// is recorded.
+    ZeroMailboxCapacity,
+}
+
+/// Type-level child address information carried by supported spawn requests.
+pub trait SpawnAddress {
+    /// Child message type accepted by the spawned isolate.
+    type Message;
+    /// Child reply type produced by the spawned isolate.
+    type Reply;
+}
+
+impl SpawnAddress for std::convert::Infallible {
+    type Message = std::convert::Infallible;
+    type Reply = ();
+}
+
+impl<I> SpawnAddress for ChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}
+
+/// Result delivered by `spawn_observed(...).then(...)`.
+pub type SpawnObservedResult<M, R = ()> = Result<ChildRef<M, R>, SpawnObservedError>;
+
+/// Continuation invoked by the runtime after an observed spawn is processed.
+pub type SpawnObservedContinuation<P, M, R = ()> = Box<dyn FnOnce(SpawnObservedResult<M, R>) -> P>;
+
+/// Parts consumed by runtime adapters that understand observed spawn.
+pub type SpawnObservedParts<S, P, M, R = ()> = (S, SpawnObservedContinuation<P, M, R>);
+
+type SpawnObservedMarker<M, R> = PhantomData<fn() -> (M, R)>;
+
+/// Builder returned by [`spawn_observed`].
+#[must_use = "a spawn_observed request has no effect until returned as an Effect"]
+#[derive(Debug)]
+pub struct SpawnObservedBuilder<S, M, R = ()> {
+    spawn: S,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, M, R> SpawnObservedBuilder<S, M, R> {
+    const fn new(spawn: S) -> Self {
+        Self {
+            spawn,
+            marker: PhantomData,
+        }
+    }
+
+    /// Maps the runtime's later child-start result into a parent message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
+    )]
+    pub fn reply<I, P, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+    {
+        self.then(continuation)
+    }
+
+    /// Maps the runtime's later child-start result into an ordinary parent
+    /// continuation message.
+    pub fn then<I, P, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+    {
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(continuation),
+            marker: PhantomData,
+        })
+    }
+}
+
+/// Spawn request plus continuation for delivering a typed child reference.
+#[must_use = "a spawn_observed request has no effect until returned as an Effect"]
+pub struct SpawnObserved<S, P, M, R = ()> {
+    spawn: S,
+    continuation: SpawnObservedContinuation<P, M, R>,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, P, M, R> std::fmt::Debug for SpawnObserved<S, P, M, R>
+where
+    S: std::fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnObserved")
+            .field("spawn", &self.spawn)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, P, M, R> SpawnObserved<S, P, M, R> {
+    /// Consumes this request into its spawn payload and continuation.
+    pub fn into_parts(self) -> SpawnObservedParts<S, P, M, R> {
+        (self.spawn, self.continuation)
+    }
+}
+
 /// A restartable spawn request backed by a repeatable isolate factory.
 ///
 /// Use [`ChildDefinition`] when a child only needs to be created once. Use
@@ -1278,6 +1655,14 @@ pub type RestartableChildParts<I> = (
     usize,
     Option<Box<dyn Fn() -> <I as Isolate>::Message>>,
 );
+
+impl<I> SpawnAddress for RestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}
 
 /// Logical identifier for a shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1396,8 +1781,7 @@ impl<R> DeferredReply<R> {
 /// or keep using [`Context::take_reply_slot`] for the same underlying
 /// slot. Both return the same primitive; the name signals intent.
 ///
-/// Cross-shard request context is unsupported in the first form; see
-/// [`TakeReplySlotError::CrossShardUnsupported`].
+#[must_use = "a RequestContext must eventually be replied to or intentionally dropped"]
 #[derive(Debug)]
 pub struct RequestContext<R>(DeferredReply<R>);
 
@@ -1536,7 +1920,7 @@ pub enum DeferredSlotState {
 
 /// Caller-owned handle for one in-flight isolate call.
 ///
-/// Built by `tina_runtime::call_with_handle(addr, msg, t).reply(...)`.
+/// Built by `tina_runtime::call_cancelable(addr, msg, t).then(...)`.
 /// Pass to `cancel_call(handle)` to close the wait. Move-only and
 /// `!Clone`: one handle, one cancel.
 ///
@@ -1564,6 +1948,7 @@ pub enum DeferredSlotState {
 /// #     type Message = (); type Reply = u32;
 /// #     type Send = Outbound<std::convert::Infallible>;
 /// #     type Spawn = std::convert::Infallible;
+/// #     type SpawnObserved = std::convert::Infallible;
 /// #     type Call = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
 /// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
@@ -1918,10 +2303,8 @@ pub enum TakeReplySlotError {
     /// The current message has no caller, or the slot was already taken
     /// on this turn.
     NoCaller,
-    /// The current call came from a different shard. First-form
-    /// deferred reply slots only support same-shard callers because
-    /// caller-liveness sweep depends on the local pending-isolate-call
-    /// table.
+    /// Reserved for runtimes that cannot carry a remote caller as a
+    /// deferred reply slot.
     CrossShardUnsupported,
 }
 
@@ -1963,8 +2346,7 @@ impl MessageCaller {
         }
     }
 
-    /// Returns the current call's routing kind. Used by
-    /// [`Context::take_reply_slot`] to refuse cross-shard captures.
+    /// Returns the current call's routing kind.
     pub fn routing(&self) -> CallRouting {
         self.routing
     }
@@ -2181,15 +2563,21 @@ pub mod runtime_internal {
 /// Common imports for ordinary Tina application code.
 pub mod prelude {
     pub use crate::{
-        Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition, Context,
-        Deadline, DeferredReply, Effect, Isolate, IsolateId, Outbound, PendingCallSet,
-        PendingCallSetInsertError, RequestContext, RestartableChildDefinition, Shard, ShardId,
-        SingleShard, batch, isolate, isolate_types, noop, reply, reply_to, reply_to_request,
-        restart_children, send, sequence, spawn, stop, stop_with,
+        Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition,
+        ChildRef, Context, Deadline, DeferCancelableThrough, DeferThrough, DeferredReply, Effect,
+        Isolate, IsolateId, Outbound, PendingCallSet, PendingCallSetInsertError, RequestContext,
+        RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch,
+        isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
+        sequence, spawn, spawn_observed, stop, stop_with,
+        time::{
+            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, TimerConfigError,
+            TimerDecision, TimerInterval,
+        },
     };
 }
 
 pub mod capacity;
 mod pending_call_set;
 pub mod pool;
+pub mod time;
 pub use pending_call_set::{PendingCallSet, PendingCallSetInsertError};

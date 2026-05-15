@@ -35,7 +35,10 @@ use crate::mailbox::MailboxFactory;
 use crate::observation::{self, BoundAddressWaiter};
 use crate::observer::TraceObserver;
 use crate::trace::{CallKind, RuntimeEvent};
-use crate::{IdSource, IntoErasedSpawn, PreallocationConfig, Runtime, TraceRetention};
+use crate::{
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, PreallocationConfig, Runtime,
+    TraceRetention,
+};
 
 /// Configuration for [`ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +165,7 @@ where
                 target,
                 message,
                 timeout,
-            } => call(target, message, timeout).reply(HostCallMsg::Returned),
+            } => call(target, message, timeout).then(HostCallMsg::Returned),
             HostCallMsg::Returned(outcome) => {
                 let _ = self.sender.send(outcome);
                 tina::stop()
@@ -326,6 +329,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -352,6 +356,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
@@ -895,7 +900,7 @@ where
     ///
     /// This is a host convenience for tests, specimens, and setup code that
     /// would otherwise need a one-off driver isolate just to issue
-    /// `call(address, message, timeout).reply(...)`. It still uses the normal
+    /// `call(address, message, timeout).then(...)`. It still uses the normal
     /// Tina call path internally: `Full`, `Closed`, and `Timeout` stay visible
     /// as [`CallOutcome`] values, and accepted work is not cancelled by
     /// dropping the host-side wait.
@@ -908,7 +913,7 @@ where
     ///   message before handing control to a larger system.
     ///
     /// **Do not call from inside an isolate handler.** Handlers must stay
-    /// synchronous and non-blocking; use `call(...).reply(...)` instead.
+    /// synchronous and non-blocking; use `call(...).then(...)` instead.
     ///
     /// # Example
     ///
@@ -926,6 +931,7 @@ where
     ///     Ok(CallOutcome::Full) => { /* target mailbox was full */ }
     ///     Ok(CallOutcome::Closed) => { /* target isolate had stopped */ }
     ///     Ok(CallOutcome::Timeout) => { /* call deadline fired */ }
+    ///     Ok(CallOutcome::Rejected(_)) => { /* target rejected this call shape */ }
     ///     Err(_) => { /* worker thread stopped or command queue was full */ }
     /// }
     /// # }

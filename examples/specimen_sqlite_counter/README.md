@@ -85,7 +85,7 @@ let cfg = SqliteConfig::path(&path)
 let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg)?;
 
 // From the host thread. Service isolates should still use
-// execute_call(...).reply(...) when they want a continuation message.
+// execute_call(...).then(...) when they want a continuation message.
 let outcome = runtime.call_blocking(
     bridge.address,
     SqliteMsg::Request(SqliteRequest::execute(
@@ -101,7 +101,7 @@ assert!(matches!(
 
 The service-isolate helpers `execute_call(...)` and `query_call(...)`
 are still the copied path when you are already inside `handle()` and
-want to continue through `.reply(...)`. The host-side specimen uses
+want to continue through `.then(...)`. The host-side specimen uses
 `call_blocking` because it is a script, not a long-lived app isolate.
 
 Under the hood the bridge owns one std-thread blocking worker that

@@ -455,7 +455,7 @@ impl Isolate for CallClient {
                 CallRequest::Ask,
                 std::time::Duration::from_millis(10),
             )
-            .reply(CallClientMsg::Returned),
+            .then(CallClientMsg::Returned),
             CallClientMsg::Returned(_) => noop(),
         }
     }

@@ -3,8 +3,9 @@
 ## Status
 
 - Done: plan.
-- Open: implement, migrate runtime/sim/tests/docs/specimens.
-- Shape: one PR if sane, two PRs max.
+- Done: runtime/sim/API implementation, bridge migration, tests, docs,
+  specimens, review fixes, and merge.
+- Deferred: small RequestContext helper polish only.
 
 ## Goal
 

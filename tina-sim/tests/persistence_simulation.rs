@@ -105,15 +105,15 @@ impl PersistService {
     ) -> Effect<Self> {
         match msg {
             PersistMsg::Recover => {
-                snapshot_load(self.snapshot_path.clone()).reply(PersistMsg::SnapshotLoaded)
+                snapshot_load(self.snapshot_path.clone()).then(PersistMsg::SnapshotLoaded)
             }
             PersistMsg::SnapshotLoaded(Ok(Some(snapshot))) => {
                 self.values = decode_values(&snapshot.bytes);
                 self.last_journal_index = snapshot.last_journal_index;
-                journal_replay(self.journal_path.clone()).reply(PersistMsg::JournalLoaded)
+                journal_replay(self.journal_path.clone()).then(PersistMsg::JournalLoaded)
             }
             PersistMsg::SnapshotLoaded(Ok(None)) => {
-                journal_replay(self.journal_path.clone()).reply(PersistMsg::JournalLoaded)
+                journal_replay(self.journal_path.clone()).then(PersistMsg::JournalLoaded)
             }
             PersistMsg::SnapshotLoaded(Err(error)) => {
                 self.observed
@@ -150,12 +150,12 @@ impl PersistService {
                 let index = self.last_journal_index + 1;
                 let record = value.into_bytes();
                 journal_append(self.journal_path.clone(), index, record.clone())
-                    .reply(move |result| PersistMsg::MutationDurable(result, index, record))
+                    .then(move |result| PersistMsg::MutationDurable(result, index, record))
             }
             PersistMsg::AppendAt(index, value) => {
                 let record = value.into_bytes();
                 journal_append(self.journal_path.clone(), index, record.clone())
-                    .reply(move |result| PersistMsg::MutationDurable(result, index, record))
+                    .then(move |result| PersistMsg::MutationDurable(result, index, record))
             }
             PersistMsg::MutationDurable(Ok(()), index, record) => {
                 self.values
@@ -176,7 +176,7 @@ impl PersistService {
                 encode_values(&self.values),
                 self.last_journal_index,
             )
-            .reply(PersistMsg::SnapshotCommitted),
+            .then(PersistMsg::SnapshotCommitted),
             PersistMsg::SnapshotCommitted(Ok(())) => {
                 self.observed
                     .lock()
@@ -196,7 +196,7 @@ impl PersistService {
                 let record = value.into_bytes();
                 batch([
                     journal_append(self.journal_path.clone(), index, record.clone())
-                        .reply(move |result| PersistMsg::MutationDurable(result, index, record)),
+                        .then(move |result| PersistMsg::MutationDurable(result, index, record)),
                     Effect::Send(Outbound::new(ctx.me(), PersistMsg::RecoverThenPanic)),
                 ])
             }

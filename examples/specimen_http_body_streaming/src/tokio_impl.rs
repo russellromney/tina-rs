@@ -79,5 +79,6 @@ pub fn run() -> anyhow::Result<Report> {
         tina_response_high_water: None,
         tina_chunked_decoded_bytes: None,
         tina_chunked_wire_bytes: None,
+        tina_capacity_discovery_line: None,
     })
 }

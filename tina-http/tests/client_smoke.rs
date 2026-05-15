@@ -80,13 +80,14 @@ impl Isolate for BackgroundDriver {
                 request,
                 timeout,
             } => call(client, HttpClientMsg::call(target, request), timeout)
-                .reply(BackgroundDriverMsg::Returned),
+                .then(BackgroundDriverMsg::Returned),
             BackgroundDriverMsg::Returned(outcome) => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                    CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
                 let _ = self.sender.send(result);
                 stop()
@@ -128,6 +129,7 @@ fn run_one_request(canned_response: Vec<u8>) -> Result<HttpResponse, HttpClientE
         CallOutcome::Full => Err(HttpClientError::Busy),
         CallOutcome::Closed => Err(HttpClientError::Closed),
         CallOutcome::Timeout => Err(HttpClientError::Timeout),
+        CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
     };
 
     let _ = runtime.shutdown();

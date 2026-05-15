@@ -48,7 +48,7 @@ struct Worker;
 impl Worker {
     fn handle(&mut self, msg: Msg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            Msg::Start => sleep(Duration::from_millis(10)).reply(Msg::Done),
+            Msg::Start => sleep(Duration::from_millis(10)).then(Msg::Done),
             Msg::Done(Ok(())) => noop(),
             Msg::Done(Err(_)) => stop(),
         }
@@ -56,13 +56,35 @@ impl Worker {
 }
 ```
 
+## First Service To Copy
+
+For an HTTP service with state, DB work, outbound HTTP, readiness, shutdown,
+capacity, and a live-replay fact, copy:
+
+```text
+examples/systems/mini_saas_api
+```
+
+Run it from the repo root:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+```
+
+The route to study first is `POST /items/{id}/notify`: it captures
+`CallContext` as `RequestContext`, does SQLite work, acquires a native
+keepalive pool lease, calls an upstream HTTP service, releases the lease, and
+only then replies to the original HTTP caller.
+
 ## Request Reply Shape
 
 Caller:
 
 ```rust
 call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
-    .reply(ClientMsg::WorkerReturned)
+    .then(ClientMsg::WorkerReturned)
 ```
 
 Worker:
@@ -87,8 +109,8 @@ Map:
 | `tokio::spawn` | child isolate |
 | `mpsc` | bounded mailbox |
 | socket read/write | runtime call effect |
-| `sleep().await` | `sleep(...).reply(...)` |
-| request then await answer | `call(..., timeout).reply(...)` |
+| `sleep().await` | `sleep(...).then(...)` |
+| request then await answer | `call(..., timeout).then(...)` |
 | `tokio::time::timeout` budget through a chain | `Deadline` value, `ctx.deadline_after(d)` |
 | `JoinSet::abort_all` | `PendingCallSet` + drain + `cancel_call` per handle |
 

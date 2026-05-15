@@ -41,15 +41,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::{
-    Address, AddressGeneration, CallRouting, ChildRelation, Context, DeferredReplyHandle,
-    DeferredSlotRegistry, DeferredSlotState, Effect, Isolate, IsolateId, Mailbox, MessageCaller,
-    Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId, StopResult, TrySendError,
+    Address, AddressGeneration, CallContext, CallRejectedReason, CallRouting, ChildRef,
+    ChildRelation, Context, DeferredReplyHandle, DeferredSlotRegistry, DeferredSlotState, Effect,
+    Isolate, IsolateId, Mailbox, MessageCaller, Outbound as TinaOutbound, RestartBudgetState,
+    Shard, ShardId, SpawnObservedError, StopResult, TrySendError,
 };
 use tina_supervisor::SupervisorConfig;
 
 use betelgeuse::IOLoopHandle;
 
 mod call;
+mod call_group;
 mod capabilities;
 pub mod capacity;
 mod clock;
@@ -108,26 +110,34 @@ pub use mailbox::{DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxF
 pub use crate::persistence::{
     LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
 };
+#[allow(deprecated)]
 pub use call::{
-    CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply, DnsLookupReply, ErasedCall,
-    FileCloseReply, FileFsyncReply, FileId, FileOpenOptions, FileOpenReply, FileReadReply,
-    FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall, JournalAppendReply, JournalRecord,
-    JournalReplay, JournalReplayReply, JournalReplayWarning, ListenerId, MkdirReply, PathKind,
-    PathMetadata, PathMetadataReply, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult,
-    ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply, RuntimeCall,
-    RuntimeCallParts, RuntimeCallable, SendOutcome, SignalWaitReply, SleepReply,
-    SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId, SyncParentReply,
-    TcpAcceptReply, TcpBindReply, TcpConnectReply, TcpListenerCloseReply, TcpReadReply,
-    TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
-    TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
-    TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, call_handle_call_id, call_with_handle, cancel_call, dns_lookup, file_close,
-    file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
-    file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir,
-    remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit,
-    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
-    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply, CancelableCall,
+    DeferredCancelableCall, DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall,
+    DnsLookupReply, ErasedCall, FileCloseReply, FileFsyncReply, FileId, FileOpenOptions,
+    FileOpenReply, FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall,
+    IsolateCallWithHandle, JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply,
+    JournalReplayWarning, ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply,
+    PendingCancelableCall, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult, ProcessStatus,
+    ReadDirReply, RemoveFileReply, RenameReplaceReply, RuntimeCall, RuntimeCallParts,
+    RuntimeCallable, SendOutcome, SignalWaitReply, SleepReply, SnapshotCommitReply, SnapshotImage,
+    SnapshotLoadReply, StreamId, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
+    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply,
+    TlsBindReply, TlsCloseReply, TlsConnectReply, TlsListenerCloseReply, TlsListenerId,
+    TlsReadReply, TlsStreamId, TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply,
+    UdpRecvFromReply, UdpSendToReply, UdpSocketId, call, call_cancelable, call_handle_call_id,
+    call_with_handle, cancel_call, dns_lookup, file_close, file_create, file_fsync, file_open,
+    file_read, file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay,
+    mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed,
+    signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept,
+    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept,
+    tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind,
+    udp_close_socket, udp_recv_from, udp_send_to,
+};
+pub use call_group::{
+    CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
+    CallGroupInsertError, CallGroupRecordCancelError, CallGroupRecordReplyError,
+    CallGroupReplyStep, CallGroupReport, CallGroupReserveError, CallGroupToken,
 };
 pub use capacity::{
     CapacityAssertError, CapacityNameError, CapacitySummary, SurfaceAssertion,
@@ -169,6 +179,7 @@ enum MessageCallContext {
         call_id: CallId,
         requester: RegisteredAddress,
         cause: CauseId,
+        expected_reply_type_id: std::any::TypeId,
     },
 }
 
@@ -807,6 +818,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
@@ -835,6 +847,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -883,6 +896,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
@@ -1108,13 +1122,29 @@ where
                 RuntimeEventKind::HandlerStarted,
             );
 
-            let caller = self.build_message_caller(message.call_context, isolate_id);
+            let incoming_call_context = message.call_context;
+            let caller = self.build_message_caller(incoming_call_context, isolate_id);
             let now = self.clock.now();
 
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
-                catch_unwind(AssertUnwindSafe(|| {
-                    handler.handle_boxed(message.message, &mut self.shard, isolate_id, caller, now)
+                catch_unwind(AssertUnwindSafe(|| match caller {
+                    Some(caller) => handler.handle_call_boxed(
+                        message.message,
+                        &mut self.shard,
+                        isolate_id,
+                        self.entries[index].generation,
+                        caller,
+                        now,
+                    ),
+                    None => handler.handle_boxed(
+                        message.message,
+                        &mut self.shard,
+                        isolate_id,
+                        self.entries[index].generation,
+                        None,
+                        now,
+                    ),
                 }))
             };
 
@@ -1126,7 +1156,18 @@ where
                         Some(handler_started.into()),
                         RuntimeEventKind::HandlerPanicked,
                     );
-                    self.drop_pending_deferred_captures(handler_panicked.into());
+                    let captured_any = self.drop_pending_deferred_captures(handler_panicked.into());
+                    if !captured_any {
+                        if let Some(context) = incoming_call_context {
+                            self.reject_call_context(
+                                isolate_id,
+                                handler_panicked.into(),
+                                context,
+                                CallRejectedReason::HandlerPanicked,
+                                route_remote,
+                            );
+                        }
+                    }
                     self.stop_entry(index, isolate_id, handler_panicked.into());
                     self.supervise_panic(
                         RegisteredAddress {
@@ -1156,28 +1197,23 @@ where
             // call.
             let captured_any = self.promote_captures(isolate_id, handler_finished.into());
 
-            // If the handler had a caller but did not capture it and
-            // does not reply in this turn, the caller is abandoned.
-            // Remember the call id so we can warn after the effect runs
-            // if the call is still pending (the effect may batch a
-            // nested reply). The warning does not settle the call; the
-            // caller's normal timeout/lifecycle path remains the truth.
-            //
-            // Skip the guard when the effect is a runtime call or batch:
-            // the handler may be delegating to a continuation that will
-            // reply later. This keeps the guard conservative — it only
-            // fires when the handler clearly does nothing with the caller.
-            let may_reply_later = matches!(effect_kind, EffectKind::Call | EffectKind::Batch);
-            let abandoned_call_id = if !captured_any && !may_reply_later {
-                message.call_context.as_ref().map(|ctx| match *ctx {
-                    MessageCallContext::Local { call_id } => call_id,
-                    MessageCallContext::Remote { call_id, .. } => call_id,
-                })
+            let consumed_by_effect = effect.consumes_call_context();
+            let abandoned_context = if !captured_any && !consumed_by_effect {
+                message.call_context
             } else {
                 None
             };
+            if let Some(context) = abandoned_context {
+                self.reject_call_context(
+                    isolate_id,
+                    handler_finished.into(),
+                    context,
+                    CallRejectedReason::ReplyAbandoned,
+                    route_remote,
+                );
+            }
 
-            let effective_context = if captured_any {
+            let effective_context = if captured_any || abandoned_context.is_some() {
                 None
             } else {
                 message.call_context
@@ -1191,25 +1227,6 @@ where
                 &mut round_messages,
                 route_remote,
             );
-
-            // If the call is still pending after the effect, the handler
-            // returned without replying and without capturing. Emit a
-            // trace warning so observers can detect the mistake, but let
-            // the call time out normally — we cannot distinguish "forgot
-            // to reply" from "intentionally not replying" at runtime.
-            if let Some(call_id) = abandoned_call_id {
-                if self
-                    .pending_isolate_calls
-                    .iter()
-                    .any(|p| p.call_id == call_id)
-                {
-                    self.push_event(
-                        isolate_id,
-                        Some(handler_finished.into()),
-                        RuntimeEventKind::CallReplyAbandoned { call_id },
-                    );
-                }
-            }
         }
 
         round_messages.clear();
@@ -1226,12 +1243,13 @@ where
         isolate_id: IsolateId,
     ) -> Option<MessageCaller> {
         let ctx = call_context?;
-        let (call_id, routing) = match ctx {
-            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local),
+        let (call_id, routing, remote_expected_reply_type_id) = match ctx {
+            MessageCallContext::Local { call_id } => (call_id, CallRouting::Local, None),
             MessageCallContext::Remote {
                 call_id,
                 requester,
                 cause,
+                expected_reply_type_id,
             } => (
                 call_id,
                 CallRouting::Remote {
@@ -1240,13 +1258,9 @@ where
                     requester_generation: requester.generation,
                     cause: cause.event().get(),
                 },
+                Some(expected_reply_type_id),
             ),
         };
-        // For Local routes, look up the original caller's expected
-        // reply TypeId from the pending isolate call. Cross-shard
-        // callers are refused at capture time, so the placeholder
-        // here is unreachable in practice; we still pick a stable
-        // sentinel TypeId so the constructor signature is total.
         let expected_reply_type_id = match routing {
             CallRouting::Local => self
                 .pending_isolate_calls
@@ -1254,7 +1268,8 @@ where
                 .find(|p| p.call_id == call_id)
                 .map(|p| p.expected_reply_type_id)
                 .unwrap_or_else(std::any::TypeId::of::<()>),
-            CallRouting::Remote { .. } => std::any::TypeId::of::<()>(),
+            CallRouting::Remote { .. } => remote_expected_reply_type_id
+                .expect("remote call context carries the expected reply type"),
         };
         Some(MessageCaller::new(
             Rc::clone(&self.deferred_registry),
@@ -1313,8 +1328,10 @@ where
         }
     }
 
-    fn drop_pending_deferred_captures(&mut self, cause: CauseId) {
-        for capture in self.deferred_registry.drain_pending() {
+    fn drop_pending_deferred_captures(&mut self, cause: CauseId) -> bool {
+        let captures = self.deferred_registry.drain_pending();
+        let captured_any = !captures.is_empty();
+        for capture in captures {
             capture.shared.set_state(DeferredSlotState::Closed);
             let slot_id = DeferredSlotId::new(capture.slot_id);
             let call_id = CallId::new(capture.call_id);
@@ -1330,6 +1347,7 @@ where
             );
             self.complete_isolate_call(call_id, dropped.into(), CallOutcome::Closed);
         }
+        captured_any
     }
 
     fn drop_promoted_deferred_slot(
@@ -1441,6 +1459,70 @@ where
                 }
                 false
             }
+            ErasedEffect::SpawnObserved(spawn) => {
+                let mut outcome = spawn.spawn_observed(self, isolate_id);
+                let continuation = outcome.continuation.take();
+                let continuation_cause = if let Some(mut spawn_outcome) = outcome.spawn.take() {
+                    let child_isolate = spawn_outcome.child.isolate;
+                    let child = spawn_outcome.child;
+                    let bootstrap_message = spawn_outcome.bootstrap_message.take();
+                    self.record_child(isolate_id, spawn_outcome);
+                    let spawned = self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::Spawned { child_isolate },
+                    );
+                    if let Some(message) = bootstrap_message {
+                        self.enqueue_bootstrap_message(child, message, spawned.into());
+                    }
+                    spawned.into()
+                } else {
+                    cause
+                };
+                if let Some(message) = continuation {
+                    let send = ErasedSend {
+                        target_shard: self.shard.id(),
+                        target_isolate: isolate_id,
+                        target_generation: self.entries[index].generation,
+                        message,
+                    };
+                    let attempted = self.push_event(
+                        isolate_id,
+                        Some(continuation_cause),
+                        RuntimeEventKind::SendDispatchAttempted {
+                            target_shard: send.target_shard,
+                            target_isolate: send.target_isolate,
+                            target_generation: send.target_generation,
+                        },
+                    );
+                    match self.dispatch_local_send(send) {
+                        Ok(()) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendAccepted {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                },
+                            );
+                        }
+                        Err(reason) => {
+                            self.push_event(
+                                isolate_id,
+                                Some(attempted.into()),
+                                RuntimeEventKind::SendRejected {
+                                    target_shard: self.shard.id(),
+                                    target_isolate: isolate_id,
+                                    target_generation: self.entries[index].generation,
+                                    reason,
+                                },
+                            );
+                        }
+                    }
+                }
+                false
+            }
             ErasedEffect::RestartChildren => {
                 self.restart_children(isolate_id, cause, round_messages);
                 false
@@ -1488,6 +1570,7 @@ where
                             call_id,
                             requester,
                             cause: request_cause,
+                            ..
                         } => {
                             let reply = RemoteCallReply {
                                 call_id,
@@ -1526,17 +1609,36 @@ where
                 }
                 false
             }
+            ErasedEffect::Reject(reason) => {
+                if let Some(context) = call_context {
+                    self.reject_call_context(isolate_id, cause, context, reason, route_remote);
+                } else {
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::EffectObserved {
+                            effect: EffectKind::Reject,
+                        },
+                    );
+                }
+                false
+            }
             ErasedEffect::Batch(effects) => {
+                let mut batch_context = call_context;
                 for subeffect in effects {
+                    let consumes_context = subeffect.consumes_call_context();
                     if self.execute_effect(
                         index,
                         cause,
                         subeffect,
-                        call_context,
+                        batch_context,
                         round_messages,
                         route_remote,
                     ) {
                         return true;
+                    }
+                    if consumes_context {
+                        batch_context = None;
                     }
                 }
                 false
@@ -1546,6 +1648,75 @@ where
                 false
             }
         }
+    }
+
+    fn reject_call_context(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        context: MessageCallContext,
+        reason: CallRejectedReason,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        match context {
+            MessageCallContext::Local { call_id } => {
+                self.push_call_rejected_event(isolate_id, cause, call_id, reason);
+                if !self.complete_isolate_call(call_id, cause, CallOutcome::Rejected(reason)) {
+                    let reason = match self.recently_cancelled_cause(call_id) {
+                        Some(c) => call_reply_reason_for_cause(c),
+                        None => CallReplyRejectedReason::NoPendingCall,
+                    };
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::CallReplyRejected { call_id, reason },
+                    );
+                }
+            }
+            MessageCallContext::Remote {
+                call_id,
+                requester,
+                cause: request_cause,
+                ..
+            } => {
+                self.push_call_rejected_event(isolate_id, cause, call_id, reason);
+                let reply = RemoteCallReply {
+                    call_id,
+                    requester,
+                    cause: request_cause,
+                    outcome: RemoteCallOutcome::Rejected(reason),
+                };
+                if let Err(rejected) =
+                    route_remote(self.shard.id(), QueuedRemoteEnvelope::CallReply(reply))
+                {
+                    let reason = match rejected {
+                        SendRejectedReason::Full => CallReplyRejectedReason::ReplyPathFull,
+                        SendRejectedReason::Closed => CallReplyRejectedReason::RequesterShardClosed,
+                    };
+                    self.push_event(
+                        isolate_id,
+                        Some(cause),
+                        RuntimeEventKind::CallReplyRejected { call_id, reason },
+                    );
+                }
+            }
+        }
+    }
+
+    fn push_call_rejected_event(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        call_id: CallId,
+        reason: CallRejectedReason,
+    ) {
+        let kind = match reason {
+            CallRejectedReason::ReplyAbandoned => RuntimeEventKind::CallReplyAbandoned { call_id },
+            CallRejectedReason::HandlerPanicked | CallRejectedReason::UnsupportedMessage => {
+                RuntimeEventKind::CallRejected { call_id, reason }
+            }
+        };
+        self.push_event(isolate_id, Some(cause), kind);
     }
 
     fn execute_reply_to(
@@ -1988,6 +2159,7 @@ where
                 call_id: context.call_id,
                 requester: context.requester,
                 cause: context.cause,
+                expected_reply_type_id,
             }
         };
 
@@ -2080,7 +2252,7 @@ where
             tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
             tina::CallHandleState::Pending => {
                 let raw_call_id = handle_shared.call_id().expect(
-                    "cancel_call dispatched before its call_with_handle's effect ran. \
+                    "cancel_call dispatched before its call_cancelable effect ran. \
                      Within one isolate handler, batched effects dispatch in order, so \
                      this means cancel was emitted before the call effect — issue cancel \
                      from a separate handler, or store the handle and cancel later.",
@@ -2371,6 +2543,7 @@ where
             CallOutcome::Full => Some(CallError::TargetFull),
             CallOutcome::Closed => Some(CallError::TargetClosed),
             CallOutcome::Timeout => Some(CallError::Timeout),
+            CallOutcome::Rejected(reason) => Some(CallError::Rejected(*reason)),
         };
 
         if let Some(reason) = failure_reason {
@@ -3237,6 +3410,9 @@ where
             RemoteCallOutcome::Closed => {
                 self.complete_remote_isolate_call(reply, CallOutcome::Closed);
             }
+            RemoteCallOutcome::Rejected(reason) => {
+                self.complete_remote_isolate_call(reply, CallOutcome::Rejected(reason));
+            }
         }
     }
 
@@ -3314,6 +3490,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -3352,6 +3529,7 @@ where
         I::Message: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
     {
@@ -3379,6 +3557,7 @@ where
         I::Message: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: Send + 'static,
     {
@@ -3419,6 +3598,7 @@ where
         I::Message: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         Outbound: 'static,
     {
@@ -3582,6 +3762,15 @@ where
     bootstrap_message: Option<Box<dyn Any>>,
 }
 
+struct SpawnObservedOutcome<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    spawn: Option<SpawnOutcome<S, F>>,
+    continuation: Option<ErasedMessage>,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 struct ChildRecord<S, F>
 where
@@ -3631,7 +3820,18 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: Option<MessageCaller>,
+        now: std::time::Instant,
+    ) -> ErasedEffect<S, F>;
+
+    fn handle_call_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+        generation: AddressGeneration,
+        caller: MessageCaller,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F>;
 }
@@ -3643,6 +3843,14 @@ where
 {
     fn spawn(self: Box<Self>, runtime: &mut Runtime<S, F>, parent: IsolateId)
     -> SpawnOutcome<S, F>;
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S, F>, SpawnObservedError> {
+        Ok(self.spawn(runtime, parent))
+    }
 }
 
 trait ErasedRestartRecipe<S, F>
@@ -3661,6 +3869,26 @@ where
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>>;
 }
 
+trait ErasedSpawnObserved<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S, F>;
+}
+
+trait IntoErasedSpawnObserved<S, F, ParentMessage>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S, F>>;
+}
+
 struct HandlerAdapter<I, Outbound>
 where
     I: Isolate,
@@ -3675,6 +3903,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -3685,6 +3914,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: Option<MessageCaller>,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
@@ -3693,11 +3923,37 @@ where
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
+                .with_now(now);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }
             self.isolate.handle(*message, &mut ctx)
+        };
+
+        erase_effect::<I, S, F, Outbound>(effect)
+    }
+
+    fn handle_call_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+        generation: AddressGeneration,
+        caller: MessageCaller,
+        now: std::time::Instant,
+    ) -> ErasedEffect<S, F> {
+        let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
+            panic!("runtime attempted to deliver a call handler message with the wrong type")
+        });
+
+        let effect = {
+            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
+                .with_now(now)
+                .with_caller(caller);
+            self.isolate.handle_call(*message, CallContext::new(ctx))
         };
 
         erase_effect::<I, S, F, Outbound>(effect)
@@ -3718,6 +3974,7 @@ where
     I::Message: 'static,
     I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: Send + 'static,
     S: Shard,
@@ -3728,6 +3985,7 @@ where
         message: Box<dyn Any>,
         shard: &mut S,
         isolate_id: IsolateId,
+        generation: AddressGeneration,
         caller: Option<MessageCaller>,
         now: std::time::Instant,
     ) -> ErasedEffect<S, F> {
@@ -3736,11 +3994,37 @@ where
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
+                .with_now(now);
             if let Some(caller) = caller {
                 ctx = ctx.with_caller(caller);
             }
             self.isolate.handle(*message, &mut ctx)
+        };
+
+        erase_effect_sendable::<I, S, F, Outbound>(effect)
+    }
+
+    fn handle_call_boxed(
+        &mut self,
+        message: Box<dyn Any>,
+        shard: &mut S,
+        isolate_id: IsolateId,
+        generation: AddressGeneration,
+        caller: MessageCaller,
+        now: std::time::Instant,
+    ) -> ErasedEffect<S, F> {
+        let message = message.downcast::<I::Message>().unwrap_or_else(|_| {
+            panic!("runtime attempted to deliver a call handler message with the wrong type")
+        });
+
+        let effect = {
+            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_current_generation(generation)
+                .with_now(now)
+                .with_caller(caller);
+            self.isolate.handle_call(*message, CallContext::new(ctx))
         };
 
         erase_effect_sendable::<I, S, F, Outbound>(effect)
@@ -3753,6 +4037,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -3761,6 +4046,7 @@ where
     match effect {
         Effect::Noop => ErasedEffect::Noop,
         Effect::Reply(reply) => ErasedEffect::Reply(ErasedMessage::Local(Box::new(reply))),
+        Effect::Reject(reason) => ErasedEffect::Reject(reason),
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
@@ -3771,6 +4057,9 @@ where
             })
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::SpawnObserved(spawn) => {
+            ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
@@ -3794,6 +4083,7 @@ where
     I::Message: 'static,
     I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: Send + 'static,
     S: Shard,
@@ -3802,6 +4092,7 @@ where
     match effect {
         Effect::Noop => ErasedEffect::Noop,
         Effect::Reply(reply) => ErasedEffect::Reply(ErasedMessage::Sendable(Box::new(reply))),
+        Effect::Reject(reason) => ErasedEffect::Reject(reason),
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
@@ -3812,6 +4103,9 @@ where
             })
         }
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
+        Effect::SpawnObserved(spawn) => {
+            ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
@@ -3852,8 +4146,10 @@ where
 {
     Noop,
     Reply(ErasedMessage),
+    Reject(CallRejectedReason),
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S, F>>),
+    SpawnObserved(Box<dyn ErasedSpawnObserved<S, F>>),
     Stop,
     StopWith(StopResult),
     RestartChildren,
@@ -3874,14 +4170,53 @@ where
         match self {
             Self::Noop => EffectKind::Noop,
             Self::Reply(_) => EffectKind::Reply,
+            Self::Reject(_) => EffectKind::Reject,
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
+            Self::SpawnObserved(_) => EffectKind::SpawnObserved,
             Self::Stop => EffectKind::Stop,
             Self::StopWith(_) => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
+        }
+    }
+
+    fn consumes_call_context(&self) -> bool {
+        match self {
+            Self::Reply(_) | Self::Reject(_) => true,
+            Self::Batch(effects) => {
+                for effect in effects {
+                    if effect.consumes_call_context() {
+                        return true;
+                    }
+                    if effect.stops_before_consuming_call_context() {
+                        return false;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn stops_before_consuming_call_context(&self) -> bool {
+        match self {
+            Self::Stop | Self::StopWith(_) => true,
+            Self::Reply(_) | Self::Reject(_) => false,
+            Self::Batch(effects) => {
+                for effect in effects {
+                    if effect.consumes_call_context() {
+                        return false;
+                    }
+                    if effect.stops_before_consuming_call_context() {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 }
@@ -3915,6 +4250,7 @@ fn remote_call_outcome_envelope(
         call_id,
         requester,
         cause,
+        ..
     }) = context
     else {
         return None;
@@ -4008,6 +4344,7 @@ enum RemoteCallOutcome {
     Replied(ErasedMessage),
     Full,
     Closed,
+    Rejected(CallRejectedReason),
 }
 
 struct SendableRemoteCallReply {
@@ -4038,6 +4375,12 @@ impl SendableRemoteCallReply {
                 cause: reply.cause,
                 outcome: SendableRemoteCallOutcome::Closed,
             },
+            RemoteCallOutcome::Rejected(reason) => Self {
+                call_id: reply.call_id,
+                requester: reply.requester,
+                cause: reply.cause,
+                outcome: SendableRemoteCallOutcome::Rejected(reason),
+            },
         }
     }
 
@@ -4048,6 +4391,7 @@ impl SendableRemoteCallReply {
             }
             SendableRemoteCallOutcome::Full => RemoteCallOutcome::Full,
             SendableRemoteCallOutcome::Closed => RemoteCallOutcome::Closed,
+            SendableRemoteCallOutcome::Rejected(reason) => RemoteCallOutcome::Rejected(reason),
         };
         RemoteCallReply {
             call_id: self.call_id,
@@ -4062,6 +4406,7 @@ enum SendableRemoteCallOutcome {
     Replied(Box<dyn Any + Send>),
     Full,
     Closed,
+    Rejected(CallRejectedReason),
 }
 
 pub(crate) enum ErasedMessage {
@@ -4104,6 +4449,80 @@ where
     }
 }
 
+impl<S, F, ParentMessage> IntoErasedSpawnObserved<S, F, ParentMessage> for std::convert::Infallible
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S, F>> {
+        match self {}
+    }
+}
+
+struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
+    inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S, F> ErasedSpawnObserved<S, F>
+    for SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S, F> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> SpawnObservedOutcome<S, F> {
+        let (spawn, continuation) = self.inner.into_parts();
+        match spawn
+            .into_erased_spawn()
+            .try_spawn_observed(runtime, parent)
+        {
+            Ok(outcome) => {
+                let child_address = Address::<ChildMessage, ChildReply>::new_with_generation(
+                    outcome.child.shard,
+                    outcome.child.isolate,
+                    outcome.child.generation,
+                );
+                let child_ref = ChildRef::new(child_address);
+                let message = continuation(Ok(child_ref));
+                SpawnObservedOutcome {
+                    spawn: Some(outcome),
+                    continuation: Some(ErasedMessage::Local(Box::new(message))),
+                }
+            }
+            Err(error) => {
+                let message = continuation(Err(error));
+                SpawnObservedOutcome {
+                    spawn: None,
+                    continuation: Some(ErasedMessage::Local(Box::new(message))),
+                }
+            }
+        }
+    }
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S, F>
+    IntoErasedSpawnObserved<S, F, ParentMessage>
+    for tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoErasedSpawn<S, F> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S, F>> {
+        Box::new(SpawnObservedAdapter { inner: self })
+    }
+}
+
 struct SpawnAdapter<I, Outbound>
 where
     I: Isolate,
@@ -4120,6 +4539,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -4137,6 +4557,17 @@ where
             self.bootstrap_message,
         )
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S, F>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(runtime, parent))
+    }
 }
 
 impl<I, S, F, OutboundMsg> IntoErasedSpawn<S, F> for tina::ChildDefinition<I>
@@ -4145,6 +4576,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     OutboundMsg: 'static,
     S: Shard,
@@ -4177,6 +4609,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -4200,6 +4633,17 @@ where
         outcome.restart_recipe = Some(adapter);
         outcome
     }
+
+    fn try_spawn_observed(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        parent: IsolateId,
+    ) -> Result<SpawnOutcome<S, F>, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(self.spawn(runtime, parent))
+    }
 }
 
 impl<I, S, F, Outbound> ErasedRestartRecipe<S, F> for RestartableSpawnAdapter<I, Outbound>
@@ -4208,6 +4652,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     Outbound: 'static,
     S: Shard,
@@ -4231,6 +4676,7 @@ where
     I::Message: 'static,
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     OutboundMsg: 'static,
     S: Shard,

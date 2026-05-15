@@ -50,11 +50,11 @@ enum CallerMsg {
 
 The handler is one match per variant:
 
-- `Begin` and `BackoffElapsed(Ok(()))` both call `send_request(...).reply(HttpReturned)`.
+- `Begin` and `BackoffElapsed(Ok(()))` both call `send_request(...).then(HttpReturned)`.
 - `BackoffElapsed(Err(_))` (sleep cancelled) finishes immediately —
   matched separately so `SleepReply` is bound and read deliberately.
 - `HttpReturned` classifies the outcome. Transient (any `5xx`,
-  bridge timeout, reqwest transport) -> `sleep(BACKOFF).reply(BackoffElapsed)`
+  bridge timeout, reqwest transport) -> `sleep(BACKOFF).then(BackoffElapsed)`
   if the budget is left, otherwise finish.
 - Everything else is fatal: finish immediately.
 

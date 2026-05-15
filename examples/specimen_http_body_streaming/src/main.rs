@@ -32,7 +32,7 @@ fn print_side(side: &str, report: Report) {
         "comparison=specimen_http_body_streaming side={} bytes_received={} status_ok={} \
          wall_clock_ms={} exit_clean={} tokio_response_alloc_floor={} \
          tina_response_high_water={} tina_chunked_wire_bytes={} \
-         tina_chunked_decoded_bytes={}",
+         tina_chunked_decoded_bytes={} tina_capacity_discovery_line={:?}",
         side,
         report.bytes_received,
         report.status_ok,
@@ -42,5 +42,6 @@ fn print_side(side: &str, report: Report) {
         opt(report.tina_response_high_water),
         opt(report.tina_chunked_wire_bytes),
         opt(report.tina_chunked_decoded_bytes),
+        report.tina_capacity_discovery_line,
     );
 }

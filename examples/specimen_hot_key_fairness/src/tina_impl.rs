@@ -40,7 +40,7 @@ impl Store {
         match msg {
             StoreMsg::Set => {
                 if self.gate.submit() {
-                    sleep(self.work).reply(StoreMsg::Tick)
+                    sleep(self.work).then(StoreMsg::Tick)
                 } else {
                     noop()
                 }
@@ -55,7 +55,7 @@ impl Store {
                 if self.is_done() {
                     stop()
                 } else if more {
-                    sleep(self.work).reply(StoreMsg::Tick)
+                    sleep(self.work).then(StoreMsg::Tick)
                 } else {
                     noop()
                 }

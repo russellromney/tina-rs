@@ -61,7 +61,7 @@ impl Worker {
                 self.last_index = Some(index);
                 self.report.items_admitted += 1;
                 if self.gate.submit() {
-                    sleep(self.work).reply(WorkerMsg::Tick)
+                    sleep(self.work).then(WorkerMsg::Tick)
                 } else {
                     noop()
                 }
@@ -79,7 +79,7 @@ impl Worker {
                     self.report.exit_clean = true;
                     stop_with(self.report)
                 } else if more {
-                    sleep(self.work).reply(WorkerMsg::Tick)
+                    sleep(self.work).then(WorkerMsg::Tick)
                 } else {
                     noop()
                 }

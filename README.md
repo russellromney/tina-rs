@@ -38,6 +38,22 @@ queues bounded, and execution replayable.
 > Tina is experimental and in active development. The model is now strong
 > enough to write specimen services against; the public API is still moving.
 
+## Copyable Service Skeleton
+
+The current production-shaped service skeleton is
+[`examples/systems/mini_saas_api`](examples/systems/mini_saas_api/). It uses
+native `tina-http`, a controller isolate, `tina-sqlite-bridge`, a native
+outbound keepalive pool, health/readiness, graceful shutdown, capacity
+reporting, and a live-replay fact.
+
+Run it from the repo root:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+```
+
 Tina is aimed at services where these properties matter more than linear
 `async fn` syntax:
 
@@ -87,14 +103,14 @@ struct Connection {
 impl Connection {
     fn handle(&mut self, msg: ConnMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
         match msg {
-            ConnMsg::Begin => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
+            ConnMsg::Begin => tcp_read(self.stream, 4096).then(ConnMsg::Read),
             ConnMsg::Read(Ok(bytes)) if bytes.is_empty() => {
-                tcp_close_stream(self.stream).reply(ConnMsg::Closed)
+                tcp_close_stream(self.stream).then(ConnMsg::Closed)
             }
-            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).reply(ConnMsg::Wrote),
-            ConnMsg::Wrote(Ok(_)) => tcp_read(self.stream, 4096).reply(ConnMsg::Read),
+            ConnMsg::Read(Ok(bytes)) => tcp_write(self.stream, bytes).then(ConnMsg::Wrote),
+            ConnMsg::Wrote(Ok(_)) => tcp_read(self.stream, 4096).then(ConnMsg::Read),
             ConnMsg::Read(Err(_)) | ConnMsg::Wrote(Err(_)) => {
-                tcp_close_stream(self.stream).reply(ConnMsg::Closed)
+                tcp_close_stream(self.stream).then(ConnMsg::Closed)
             }
             ConnMsg::Closed(_) => stop(),
         }
@@ -177,6 +193,7 @@ The repository is a Cargo workspace:
 | [`tina-rpc-tokio`](tina-rpc-tokio/) | Tokio async facade over native Tina RPC for ecosystem-edge callers. |
 | [`tina-tokio-bridge`](tina-tokio-bridge/) | Bounded ingress from a host Tokio runtime into a Tina service, for axum/Tower/Hyper integration. |
 | [`tina-sqlite-bridge`](tina-sqlite-bridge/) | First-form SQLite worker around `rusqlite`. One connection, one blocking thread, autocommit only, named caps for mailbox / in-flight / pool / pending replies. |
+| [`tina-aws-bridge`](tina-aws-bridge/) | First-form AWS SDK bridge for S3 and SQS. Service-shaped requests, explicit config, bounded admission/in-flight work, body/message caps, typed errors, metrics, and honest late-result/close-drain semantics. |
 
 End consumers depend on `tina` plus one runtime or simulator crate.
 
@@ -202,6 +219,21 @@ where timeout lives, or what message comes next.
 
 That matters for humans, and it matters for LLMs. Copyable local patterns are
 safer than clever APIs whose important rules live somewhere else.
+
+### Current ergonomics gap: cancelable deferred calls
+
+`CallContext::defer(work).reply(...)` is the blessed helper for ordinary
+multi-turn replies. Cancelable work is intentionally more explicit:
+`call_ctx.defer_cancelable(call_cancelable(...)).reply(key, Msg::Done)`
+returns both the effect to dispatch and a `PendingCancelableCall` token that
+holds the original `RequestContext` plus the cancel handle.
+
+The caller-authority token must be stored before the child effect is returned.
+If bounded storage is full or the key is a duplicate, the service must not
+dispatch the child effect; it should answer or reject the original caller via
+`pending.into_request_context()`. A future helper should probably provide a
+bounded `PendingCancelableCallSet` so this "store-or-do-not-dispatch" rule is
+copyable instead of hand-rolled.
 
 ## Deterministic simulation testing
 

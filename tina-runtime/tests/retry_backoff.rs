@@ -3,7 +3,7 @@
 //! This complements the crate-local timer semantics tests in `src/tests.rs`
 //! with a black-box integration test that drives the shipped runtime surface:
 //!
-//! - an isolate issues `sleep(..).reply(..)`
+//! - an isolate issues `sleep(..).then(..)`
 //! - the runtime delays wake delivery through its normal call-completion path
 //! - the translated wake message causes a real second attempt on a later turn
 //! - the second attempt succeeds

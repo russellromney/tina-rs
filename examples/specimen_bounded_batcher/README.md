@@ -14,7 +14,7 @@ replies to all of them with the batch total when either:
   caller as a deferred slot.
 - `take(qid)` + `reply_to(slot, BatcherReply::Batched(total))` —
   flush the batch in one effect batch.
-- `sleep(interval).reply(move |_| Tick(gen))` with a generation
+- `sleep(interval).then(move |_| Tick(gen))` with a generation
   counter — invalidate the timer when a size-flush beats it.
 
 ## Run
@@ -29,7 +29,7 @@ cargo test --manifest-path examples/specimen_bounded_batcher/Cargo.toml
   caller. The batcher does not have to track addresses, type
   parameters, or correlation — `PendingReplies` owns it.
 - Caller timeout is the runtime's job. If a caller's
-  `call(...).reply(...)` deadline fires first, the slot becomes
+  `call(...).then(...)` deadline fires first, the slot becomes
   `Closed`; the next `pending.sweep()` (called inside `try_capture`)
   reclaims it.
 

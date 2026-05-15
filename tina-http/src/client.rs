@@ -5,7 +5,7 @@
 //!
 //! ```rust,ignore
 //! call(http_client, HttpClientMsg::call(target, request), timeout)
-//!     .reply(MyMsg::HttpReturned)
+//!     .then(MyMsg::HttpReturned)
 //! ```
 //!
 //! One request at a time. A new `Call` while busy replies
@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use http::HeaderValue;
 use http::header::HOST;
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
     CallError, StreamId, TlsStreamId, sleep, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
     tls_close, tls_connect, tls_read, tls_write,
@@ -89,6 +90,7 @@ struct ActiveCall {
     head_len: usize,
     chunked_decoder: Option<crate::chunked_decoder::ChunkedDecoder>,
     body_buf: Vec<u8>,
+    reply_to: Option<RequestContext<Result<HttpResponse, HttpClientError>>>,
 }
 
 enum Decision {
@@ -131,12 +133,12 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HttpClientMsg::Call(call) => self.handle_call(*call),
+            HttpClientMsg::Call(call) => self.handle_outbound_call(*call, None),
 
             HttpClientMsg::Connected(Ok((stream, _local, _peer))) => {
                 let Some(state) = self.state.as_mut() else {
                     // Previous call already ended; close the dangling stream.
-                    return tcp_close_stream(stream).reply(HttpClientMsg::Closed);
+                    return tcp_close_stream(stream).then(HttpClientMsg::Closed);
                 };
                 state.transport = Some(HttpTransport::Tcp(stream));
                 state.pending_write = state.request_bytes.clone();
@@ -147,7 +149,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
             HttpClientMsg::TlsConnected(Ok(stream)) => {
                 let Some(state) = self.state.as_mut() else {
                     return tls_close(stream, self.config.request_timeout)
-                        .reply(HttpClientMsg::Closed);
+                        .then(HttpClientMsg::Closed);
                 };
                 state.transport = Some(HttpTransport::Tls(stream));
                 state.pending_write = state.request_bytes.clone();
@@ -186,17 +188,39 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
             HttpClientMsg::Closed(_) => noop(),
         }
     }
+
+    fn handle_call(&mut self, msg: HttpClientMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            HttpClientMsg::Call(outbound) => {
+                let reply_to = call.into_request_context();
+                self.handle_outbound_call(*outbound, Some(reply_to))
+            }
+            _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
 }
 
 impl<S: Shard + 'static> HttpClient<S> {
-    fn handle_call(&mut self, call: OutboundCall) -> Effect<Self> {
+    fn handle_outbound_call(
+        &mut self,
+        call: OutboundCall,
+        reply_to: Option<RequestContext<Result<HttpResponse, HttpClientError>>>,
+    ) -> Effect<Self> {
         if self.state.is_some() {
-            return reply(Err(HttpClientError::Busy));
+            return match reply_to {
+                Some(request) => reply_to_request(request, Err(HttpClientError::Busy)),
+                None => reply(Err(HttpClientError::Busy)),
+            };
         }
         let OutboundCall { target, request } = call;
         let request = match apply_host_policy(request, &target) {
             Ok(request) => request,
-            Err(error) => return reply(Err(error)),
+            Err(error) => {
+                return match reply_to {
+                    Some(request) => reply_to_request(request, Err(error)),
+                    None => reply(Err(error)),
+                };
+            }
         };
         let request_bytes = encode_request(&request);
         self.state = Some(ActiveCall {
@@ -208,9 +232,10 @@ impl<S: Shard + 'static> HttpClient<S> {
             head_len: 0,
             chunked_decoder: None,
             body_buf: Vec::new(),
+            reply_to,
         });
         let connect_effect: Effect<Self> = match target {
-            HttpTarget::Http { addr, .. } => tcp_connect(addr).reply(HttpClientMsg::Connected),
+            HttpTarget::Http { addr, .. } => tcp_connect(addr).then(HttpClientMsg::Connected),
             HttpTarget::Https {
                 addr,
                 server_name,
@@ -222,10 +247,10 @@ impl<S: Shard + 'static> HttpClient<S> {
                 trust_roots.root_certificates_der,
                 self.config.request_timeout,
             )
-            .reply(HttpClientMsg::TlsConnected),
+            .then(HttpClientMsg::TlsConnected),
         };
         let deadline_effect: Effect<Self> =
-            sleep(self.config.request_timeout).reply(HttpClientMsg::Deadline);
+            sleep(self.config.request_timeout).then(HttpClientMsg::Deadline);
         batch(vec![connect_effect, deadline_effect])
     }
 
@@ -248,9 +273,9 @@ impl<S: Shard + 'static> HttpClient<S> {
         let transport = state.transport.expect("transport set before write");
         let bytes = state.pending_write.clone();
         match transport {
-            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).reply(HttpClientMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).then(HttpClientMsg::Wrote),
             HttpTransport::Tls(stream) => {
-                tls_write(stream, bytes, self.config.request_timeout).reply(HttpClientMsg::Wrote)
+                tls_write(stream, bytes, self.config.request_timeout).then(HttpClientMsg::Wrote)
             }
         }
     }
@@ -275,9 +300,9 @@ impl<S: Shard + 'static> HttpClient<S> {
         let state = self.state.as_ref().expect("state present during read");
         let transport = state.transport.expect("transport set before read");
         match transport {
-            HttpTransport::Tcp(stream) => tcp_read(stream, READ_CHUNK).reply(HttpClientMsg::Read),
+            HttpTransport::Tcp(stream) => tcp_read(stream, READ_CHUNK).then(HttpClientMsg::Read),
             HttpTransport::Tls(stream) => {
-                tls_read(stream, READ_CHUNK, self.config.request_timeout).reply(HttpClientMsg::Read)
+                tls_read(stream, READ_CHUNK, self.config.request_timeout).then(HttpClientMsg::Read)
             }
         }
     }
@@ -358,12 +383,16 @@ impl<S: Shard + 'static> HttpClient<S> {
             headers: head.headers,
             body: crate::HttpResponseBody::Buffered(body),
         };
-        self.finish(Ok(response), state.transport)
+        self.finish(Ok(response), state.transport, state.reply_to)
     }
 
     fn fail(&mut self, error: HttpClientError) -> Effect<Self> {
-        let transport = self.state.take().and_then(|s| s.transport);
-        self.finish(Err(error), transport)
+        let (transport, reply_to) = self
+            .state
+            .take()
+            .map(|s| (s.transport, s.reply_to))
+            .unwrap_or((None, None));
+        self.finish(Err(error), transport, reply_to)
     }
 
     /// Replies the result and closes the underlying transport, if any.
@@ -371,15 +400,19 @@ impl<S: Shard + 'static> HttpClient<S> {
         &mut self,
         result: Result<HttpResponse, HttpClientError>,
         transport: Option<HttpTransport>,
+        reply_to: Option<RequestContext<Result<HttpResponse, HttpClientError>>>,
     ) -> Effect<Self> {
-        let reply_effect: Effect<Self> = reply(result);
+        let reply_effect: Effect<Self> = match reply_to {
+            Some(request) => reply_to_request(request, result),
+            None => reply(result),
+        };
         let Some(transport) = transport else {
             return reply_effect;
         };
         let close_effect: Effect<Self> = match transport {
-            HttpTransport::Tcp(stream) => tcp_close_stream(stream).reply(HttpClientMsg::Closed),
+            HttpTransport::Tcp(stream) => tcp_close_stream(stream).then(HttpClientMsg::Closed),
             HttpTransport::Tls(stream) => {
-                tls_close(stream, self.config.request_timeout).reply(HttpClientMsg::Closed)
+                tls_close(stream, self.config.request_timeout).then(HttpClientMsg::Closed)
             }
         };
         batch(vec![reply_effect, close_effect])

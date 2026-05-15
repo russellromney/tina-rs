@@ -21,10 +21,10 @@ For an isolate `A` with mailbox capacity `cap`:
 
 1. **Direct sends to `A`.** Every `send(addr_A, ...)` from any other
    isolate consumes one slot until `A` handles it.
-2. **Calls `A` issued via `call(...).reply(...)`.** When the callee replies
+2. **Calls `A` issued via `call(...).then(...)`.** When the callee replies
    (or the call times out / fails), the runtime delivers the translated
    message into `A`'s mailbox. That message uses one slot.
-3. **Observed sends `A` issued via `send_observed(...).reply(...)`.** Same
+3. **Observed sends `A` issued via `send_observed(...).then(...)`.** Same
    shape: the outcome (`Accepted` / `Full` / `Closed`) lands in `A`'s
    mailbox as a message.
 4. **Runtime calls `A` issued (TCP, sleep, persistence, signals, etc.).**
@@ -81,7 +81,7 @@ rejection appears.
 
 `examples/specimen_real_io_chat`'s first draft sized its connection mailbox
 at the obvious "one slot per concurrent operation" value. Each connection
-issued a burst of 64 `send_observed(...).reply(...)` calls into a fanout.
+issued a burst of 64 `send_observed(...).then(...)` calls into a fanout.
 The isolate could not absorb 64 reply messages before it could finish
 writing its response, so the fanout reply path saw `MailboxFull`
 rejections in the trace. The fix was to size the connection mailbox at

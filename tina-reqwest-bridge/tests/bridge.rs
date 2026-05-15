@@ -86,7 +86,7 @@ impl Isolate for CallerIsolate {
     ) -> Effect<Self> {
         match msg {
             CallerMsg::Run(request) => {
-                send_request(self.worker, request, self.timeout).reply(CallerMsg::Done)
+                send_request(self.worker, request, self.timeout).then(CallerMsg::Done)
             }
             CallerMsg::Done(outcome) => {
                 self.sink.put(outcome);
@@ -1095,7 +1095,7 @@ impl Isolate for RawCallerIsolate {
         match msg {
             RawCallerMsg::Run(request) => {
                 // Deliberately the literal raw form, not `send_request`.
-                call(self.worker, ReqwestMsg::Send(request), self.timeout).reply(RawCallerMsg::Done)
+                call(self.worker, ReqwestMsg::Send(request), self.timeout).then(RawCallerMsg::Done)
             }
             RawCallerMsg::Done(outcome) => {
                 self.sink.put(outcome);

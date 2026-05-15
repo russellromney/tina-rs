@@ -15,8 +15,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use http::{Method, StatusCode};
+use tina::CallContext;
 use tina::prelude::*;
-use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse};
+use tina_http::{
+    BodyMetrics, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
+};
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
     ThreadedRuntimeConfig,
@@ -57,7 +60,17 @@ impl Isolate for Counter {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = match (request.method.clone(), request.path.as_str()) {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl Counter {
+    fn response_for(&mut self, request: HttpRequest) -> HttpResponse {
+        match (request.method.clone(), request.path.as_str()) {
             (Method::GET, "/counter") => HttpResponse::text(self.value.to_string()),
             (Method::POST, "/counter") => {
                 self.value += 1;
@@ -66,25 +79,26 @@ impl Isolate for Counter {
             (Method::POST, "/echo") => {
                 let body_bytes = match request.body {
                     tina_http::HttpRequestBody::Buffered(b) => b,
-                    tina_http::HttpRequestBody::Stream(_) => Vec::new(),
+                    tina_http::HttpRequestBody::Stream(_)
+                    | tina_http::HttpRequestBody::Http2Stream(_) => Vec::new(),
                 };
                 HttpResponse::with_body(StatusCode::OK, body_bytes)
             }
             _ => HttpResponse::with_status(StatusCode::NOT_FOUND),
-        };
-        reply(response)
+        }
     }
 }
 
 /// One configurable knob: the service isolate's mailbox capacity. Tests
 /// that exercise overload set this to 1; everyone else uses a generous
 /// default.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HarnessConfig {
     pub service_mailbox_capacity: usize,
     pub connection_mailbox_capacity: usize,
     pub service_call_timeout: Duration,
     pub limits: HttpLimits,
+    pub body_metrics: Option<BodyMetrics>,
 }
 
 impl Default for HarnessConfig {
@@ -94,6 +108,7 @@ impl Default for HarnessConfig {
             connection_mailbox_capacity: 16,
             service_call_timeout: Duration::from_secs(2),
             limits: HttpLimits::default(),
+            body_metrics: None,
         }
     }
 }
@@ -132,13 +147,16 @@ impl TestHarness {
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
 
-        let listener_isolate = HttpListener::<TestShard>::new(
+        let mut listener_isolate = HttpListener::<TestShard>::new(
             bind_addr,
             counter,
             config.limits,
             config.service_call_timeout,
             config.connection_mailbox_capacity,
         );
+        if let Some(metrics) = config.body_metrics.clone() {
+            listener_isolate = listener_isolate.with_metrics(metrics);
+        }
         let listener = runtime
             .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
             .expect("register listener");

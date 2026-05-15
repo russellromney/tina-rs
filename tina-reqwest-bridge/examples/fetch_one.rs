@@ -1,5 +1,5 @@
 //! Small Tina service that fetches one URL through the reqwest bridge
-//! and prints the outcome. The shape mirrors `call(...).reply(...)`
+//! and prints the outcome. The shape mirrors `call(...).then(...)`
 //! from the plan.
 //!
 //! Run with:
@@ -79,7 +79,7 @@ impl Isolate for App {
             AppMsg::Start(url) => {
                 println!("fetching {url}");
                 send_request(self.http, ReqwestRequest::get(&url), Duration::from_secs(5))
-                    .reply(AppMsg::HttpReturned)
+                    .then(AppMsg::HttpReturned)
             }
             AppMsg::HttpReturned(outcome) => {
                 // Layered match — the recommended shape. Bridge-layer
@@ -97,6 +97,7 @@ impl Isolate for App {
                     }
                     CallOutcome::Full => println!("err bridge full"),
                     CallOutcome::Closed => println!("err bridge closed"),
+                    CallOutcome::Rejected(reason) => println!("err bridge rejected: {reason:?}"),
                     CallOutcome::Timeout => println!("err call timeout"),
                 }
                 // Or, with the opt-in flatten helper:

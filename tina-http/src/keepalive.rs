@@ -40,9 +40,12 @@
 //! [`tina::pool::CloseMode::Drain`] or `Force`, the isolates keep
 //! running with their open transports until you stop them. Use the
 //! [`KeepaliveConnAddr`] handles returned from
-//! [`build_keepalive_pool`] to send [`KeepaliveConnectionMsg::Stop`]
-//! to each isolate; the isolate closes its transport (if any) and
-//! exits.
+//! [`build_keepalive_pool`] to call [`KeepaliveConnectionMsg::Stop`]
+//! on each isolate and check for [`KeepaliveOutcome::Stopped`]; the
+//! isolate closes its transport (if any) and exits. For host-side
+//! shutdown, [`shutdown_keepalive_pool`] performs the pool close,
+//! waits for `Drain` leases to return, then performs per-connection
+//! stop calls once and returns a counted report.
 //!
 //! # Origin keying
 //!
@@ -72,16 +75,18 @@
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use http::HeaderValue;
 use http::header::HOST;
-use tina::pool::PoolConfig;
+use tina::pool::{CloseMode, PoolConfig};
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallError, ThreadedRuntime, ThreadedRuntimeError, sleep, tcp_close_stream, tcp_connect,
-    tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write,
+    CallError, CallOutcome, ThreadedRuntime, ThreadedRuntimeError, sleep, tcp_close_stream,
+    tcp_connect, tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write,
 };
 
 use crate::parse::{
@@ -268,6 +273,7 @@ struct InFlight {
     read_buf: Vec<u8>,
     parsed_head: Option<HttpResponseHead>,
     head_len: usize,
+    reply_to: Option<RequestContext<KeepaliveOutcome>>,
 }
 
 impl<S: Shard + 'static> KeepaliveConnection<S> {
@@ -318,13 +324,13 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             KeepaliveConnectionMsg::Request {
                 request,
                 request_timeout,
-            } => self.handle_request(*request, request_timeout),
+            } => self.handle_request(*request, request_timeout, None),
 
-            KeepaliveConnectionMsg::Stop => self.handle_stop(),
+            KeepaliveConnectionMsg::Stop => self.handle_stop(None),
 
             KeepaliveConnectionMsg::Connected(Ok((stream, _local, _peer))) => {
                 if self.in_flight.is_none() {
-                    return tcp_close_stream(stream).reply(KeepaliveConnectionMsg::Closed);
+                    return tcp_close_stream(stream).then(KeepaliveConnectionMsg::Closed);
                 }
                 self.transport = Some(HttpTransport::Tcp(stream));
                 let bytes = self
@@ -344,7 +350,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             KeepaliveConnectionMsg::TlsConnected(Ok(stream)) => {
                 if self.in_flight.is_none() {
                     return tls_close(stream, self.config.request_timeout)
-                        .reply(KeepaliveConnectionMsg::Closed);
+                        .then(KeepaliveConnectionMsg::Closed);
                 }
                 self.transport = Some(HttpTransport::Tls(stream));
                 let bytes = self
@@ -399,26 +405,58 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             KeepaliveConnectionMsg::Closed(_) => noop(),
         }
     }
+
+    fn handle_call(
+        &mut self,
+        msg: KeepaliveConnectionMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            KeepaliveConnectionMsg::Request {
+                request,
+                request_timeout,
+            } => {
+                let reply_to = call.into_request_context();
+                self.handle_request(*request, request_timeout, Some(reply_to))
+            }
+            KeepaliveConnectionMsg::Stop => {
+                let reply_to = call.into_request_context();
+                self.handle_stop(Some(reply_to))
+            }
+            _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
 }
 
 impl<S: Shard + 'static> KeepaliveConnection<S> {
-    fn handle_request(&mut self, request: HttpRequest, request_timeout: Duration) -> Effect<Self> {
+    fn handle_request(
+        &mut self,
+        request: HttpRequest,
+        request_timeout: Duration,
+        reply_to: Option<RequestContext<KeepaliveOutcome>>,
+    ) -> Effect<Self> {
         if self.in_flight.is_some() {
-            return reply(KeepaliveOutcome::Request {
-                result: Err(HttpClientError::Busy),
-                // Busy is a programming error on the caller side, not
-                // a transport-health signal. The transport itself is
-                // fine; the pool slot is the thing that's busy.
-                must_retire: false,
-            });
+            return reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Request {
+                    result: Err(HttpClientError::Busy),
+                    // Busy is a programming error on the caller side, not
+                    // a transport-health signal. The transport itself is
+                    // fine; the pool slot is the thing that's busy.
+                    must_retire: false,
+                },
+            );
         }
         let request = match apply_host_policy(request, &self.target) {
             Ok(request) => request,
             Err(error) => {
-                return reply(KeepaliveOutcome::Request {
-                    result: Err(error),
-                    must_retire: false,
-                });
+                return reply_keepalive_outcome(
+                    reply_to,
+                    KeepaliveOutcome::Request {
+                        result: Err(error),
+                        must_retire: false,
+                    },
+                );
             }
         };
         let request_bytes = encode_keepalive_request(&request);
@@ -439,10 +477,11 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             read_buf: Vec::new(),
             parsed_head: None,
             head_len: 0,
+            reply_to,
         });
 
         let deadline_effect: Effect<Self> = sleep(request_timeout)
-            .reply(move |result| KeepaliveConnectionMsg::Deadline { generation, result });
+            .then(move |result| KeepaliveConnectionMsg::Deadline { generation, result });
 
         if self.transport.is_some() {
             // Reuse path: skip connect, queue the write directly.
@@ -457,7 +496,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             self.pending_connect_bytes = Some(request_bytes);
             let connect_effect: Effect<Self> = match &self.target {
                 HttpTarget::Http { addr, .. } => {
-                    tcp_connect(*addr).reply(KeepaliveConnectionMsg::Connected)
+                    tcp_connect(*addr).then(KeepaliveConnectionMsg::Connected)
                 }
                 HttpTarget::Https {
                     addr,
@@ -470,24 +509,28 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
                     trust_roots.root_certificates_der.clone(),
                     request_timeout,
                 )
-                .reply(KeepaliveConnectionMsg::TlsConnected),
+                .then(KeepaliveConnectionMsg::TlsConnected),
             };
             batch(vec![connect_effect, deadline_effect])
         }
     }
 
-    fn handle_stop(&mut self) -> Effect<Self> {
+    fn handle_stop(&mut self, reply_to: Option<RequestContext<KeepaliveOutcome>>) -> Effect<Self> {
         // Drop any in-flight state; the consumer may have been
         // waiting on a Request reply, but Stop wins.
         let _ = self.in_flight.take();
         let _ = self.pending_connect_bytes.take();
         let close_effect = self.close_transport_fire_and_forget();
-        let reply_effect: Effect<Self> = reply(KeepaliveOutcome::Stopped);
+        let reply_effect: Effect<Self> =
+            reply_keepalive_outcome(reply_to, KeepaliveOutcome::Stopped);
         let stop_effect: Effect<Self> = stop();
-        match close_effect {
-            Some(close) => batch(vec![reply_effect, close, stop_effect]),
-            None => batch(vec![reply_effect, stop_effect]),
+        let mut effects = Vec::with_capacity(3);
+        if let Some(close) = close_effect {
+            effects.push(close);
         }
+        effects.push(reply_effect);
+        effects.push(stop_effect);
+        batch(effects)
     }
 
     fn transport_or_flat_error(
@@ -508,10 +551,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let bytes = in_flight.pending_write.clone();
         match transport {
             HttpTransport::Tcp(stream) => {
-                tcp_write(stream, bytes).reply(KeepaliveConnectionMsg::Wrote)
+                tcp_write(stream, bytes).then(KeepaliveConnectionMsg::Wrote)
             }
             HttpTransport::Tls(stream) => tls_write(stream, bytes, self.config.request_timeout)
-                .reply(KeepaliveConnectionMsg::Wrote),
+                .then(KeepaliveConnectionMsg::Wrote),
         }
     }
 
@@ -535,10 +578,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let transport = self.transport.expect("transport set before read");
         match transport {
             HttpTransport::Tcp(stream) => {
-                tcp_read(stream, READ_CHUNK).reply(KeepaliveConnectionMsg::Read)
+                tcp_read(stream, READ_CHUNK).then(KeepaliveConnectionMsg::Read)
             }
             HttpTransport::Tls(stream) => tls_read(stream, READ_CHUNK, self.config.request_timeout)
-                .reply(KeepaliveConnectionMsg::Read),
+                .then(KeepaliveConnectionMsg::Read),
         }
     }
 
@@ -583,7 +626,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
     }
 
     fn deliver_success(&mut self, must_retire: bool) -> Effect<Self> {
-        let in_flight = self
+        let mut in_flight = self
             .in_flight
             .take()
             .expect("in_flight present at delivery");
@@ -596,24 +639,31 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             headers: head.headers,
             body: crate::HttpResponseBody::Buffered(body),
         };
+        let reply_to = in_flight.reply_to.take();
         if must_retire {
             // Drop the transport now; the next request on this slot
             // will reconnect. Issue a fire-and-forget close so the
             // FD is released; the Closed continuation no-ops.
             let close_effect = self.close_transport_fire_and_forget();
-            let reply_effect: Effect<Self> = reply(KeepaliveOutcome::Request {
-                result: Ok(response),
-                must_retire,
-            });
+            let reply_effect: Effect<Self> = reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Request {
+                    result: Ok(response),
+                    must_retire,
+                },
+            );
             match close_effect {
                 Some(close) => batch(vec![reply_effect, close]),
                 None => reply_effect,
             }
         } else {
-            reply(KeepaliveOutcome::Request {
-                result: Ok(response),
-                must_retire,
-            })
+            reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Request {
+                    result: Ok(response),
+                    must_retire,
+                },
+            )
         }
     }
 
@@ -621,17 +671,23 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         // Take in_flight first so a duplicate continuation can't
         // re-fire delivery. Also clear pending_connect_bytes — if we
         // failed during the cold-connect path, the bytes are stale.
-        let _ = self.in_flight.take();
+        let reply_to = self
+            .in_flight
+            .take()
+            .and_then(|in_flight| in_flight.reply_to);
         let _ = self.pending_connect_bytes.take();
         let close_effect = if must_retire {
             self.close_transport_fire_and_forget()
         } else {
             None
         };
-        let reply_effect: Effect<Self> = reply(KeepaliveOutcome::Request {
-            result: Err(error),
-            must_retire,
-        });
+        let reply_effect: Effect<Self> = reply_keepalive_outcome(
+            reply_to,
+            KeepaliveOutcome::Request {
+                result: Err(error),
+                must_retire,
+            },
+        );
         match close_effect {
             Some(close) => batch(vec![reply_effect, close]),
             None => reply_effect,
@@ -644,10 +700,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let transport = self.transport.take()?;
         let effect: Effect<Self> = match transport {
             HttpTransport::Tcp(stream) => {
-                tcp_close_stream(stream).reply(KeepaliveConnectionMsg::Closed)
+                tcp_close_stream(stream).then(KeepaliveConnectionMsg::Closed)
             }
             HttpTransport::Tls(stream) => {
-                tls_close(stream, self.config.request_timeout).reply(KeepaliveConnectionMsg::Closed)
+                tls_close(stream, self.config.request_timeout).then(KeepaliveConnectionMsg::Closed)
             }
         };
         Some(effect)
@@ -660,6 +716,16 @@ fn body_complete(state: &InFlight) -> bool {
     };
     let needed = state.head_len + head.content_length;
     state.read_buf.len() >= needed
+}
+
+fn reply_keepalive_outcome<S: Shard + 'static>(
+    reply_to: Option<RequestContext<KeepaliveOutcome>>,
+    outcome: KeepaliveOutcome,
+) -> Effect<KeepaliveConnection<S>> {
+    match reply_to {
+        Some(request) => reply_to_request(request, outcome),
+        None => reply(outcome),
+    }
 }
 
 fn response_says_close(state: &InFlight) -> bool {
@@ -730,14 +796,158 @@ pub type KeepaliveConnAddr = Address<KeepaliveConnectionMsg, KeepaliveOutcome>;
 /// Hold on to `connections` for shutdown — `WorkerPool` does not
 /// own connection-isolate lifetime, and dropping the pool address
 /// alone leaves the isolates running with their open transports.
-/// Send [`KeepaliveConnectionMsg::Stop`] to each address after the
-/// pool itself has closed (Drain or Force).
+/// Call [`KeepaliveConnectionMsg::Stop`] on each address after the
+/// pool itself has closed (Drain or Force), or use
+/// [`shutdown_keepalive_pool`] for the small host-side shutdown
+/// helper/report.
 #[derive(Debug, Clone)]
 pub struct KeepalivePoolHandles {
     /// The pool address. Use with `WorkerPoolMsg::Acquire` etc.
     pub pool: Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>,
-    /// One address per pool slot. Send `Stop` to each on shutdown.
+    /// One address per pool slot. Call `Stop` on each on shutdown.
     pub connections: Vec<KeepaliveConnAddr>,
+}
+
+/// Host-side result for closing the pool's admission surface.
+///
+/// This is deliberately separate from per-connection `Stop` counts:
+/// closing the [`WorkerPool`] prevents new leases, but it does not own
+/// or stop the connection isolates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepalivePoolCloseOutcome {
+    /// The pool accepted the close request and replied `Closed`.
+    Closed,
+    /// The close call timed out.
+    TimedOut,
+    /// The pool mailbox was full when the close call was attempted.
+    MailboxFull,
+    /// The pool address was already closed.
+    AlreadyClosed,
+    /// The pool rejected the close call.
+    Rejected(tina::CallRejectedReason),
+    /// The pool replied with a different `WorkerPoolReply` variant.
+    UnexpectedReply,
+}
+
+/// Drain result before a keepalive shutdown helper stops connection
+/// isolates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepalivePoolDrainOutcome {
+    /// `CloseMode::Force` does not wait for leases to return.
+    NotRequested,
+    /// `CloseMode::Drain` observed no remaining pool leases.
+    Drained,
+    /// Admission did not close, so draining was not attempted.
+    SkippedAdmissionNotClosed,
+    /// The pool address was already closed before remaining leases
+    /// could be observed. The helper will not stop connections under
+    /// `Drain` without lease truth.
+    PoolAlreadyClosed,
+    /// The pressure report needed to prove drain completion was not
+    /// available.
+    PressureUnavailable,
+    /// Drain deadline fired while leases remained.
+    TimedOut { leased: usize },
+}
+
+/// Per-connection result when a shutdown helper asks a slot to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveConnectionStopOutcome {
+    /// The connection replied `KeepaliveOutcome::Stopped`.
+    Stopped,
+    /// The stop call timed out.
+    TimedOut,
+    /// The connection mailbox was full when the stop call was attempted.
+    MailboxFull,
+    /// The connection address was already closed.
+    AlreadyClosed,
+    /// The connection rejected the stop call.
+    Rejected(tina::CallRejectedReason),
+    /// The connection replied with a non-`Stopped` payload.
+    UnexpectedReply,
+}
+
+/// Names one pool slot whose connection did not newly stop during
+/// shutdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepaliveConnectionStopFailure {
+    /// Index in [`KeepalivePoolHandles::connections`].
+    pub index: usize,
+    /// Terminal stop outcome for that slot.
+    pub outcome: KeepaliveConnectionStopOutcome,
+}
+
+/// Boring shutdown accounting for a keepalive pool.
+///
+/// `requested` is the number of connection isolates that were asked
+/// to stop. Every requested connection lands in exactly one terminal
+/// bucket. If pool admission did not close, or `Drain` could not
+/// observe all leases returned before the deadline, `requested` is
+/// zero and the connections are left alone. The helper performs one
+/// pool-close call and one stop call per requested connection; it does
+/// not retry `Stop` or claim a graceful transport drain beyond the
+/// checked `KeepaliveOutcome::Stopped` reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepalivePoolShutdownReport {
+    /// Admission close result for the pool itself.
+    pub pool_close: KeepalivePoolCloseOutcome,
+    /// Drain result before connection isolates were stopped.
+    pub drain: KeepalivePoolDrainOutcome,
+    /// Number of connection isolates asked to stop.
+    pub requested: usize,
+    /// Stop calls that replied `KeepaliveOutcome::Stopped`.
+    pub stopped: usize,
+    /// Stop calls that timed out.
+    pub timed_out: usize,
+    /// Stop calls that were rejected, mailbox-full, or replied with
+    /// an unexpected payload.
+    pub rejected: usize,
+    /// Stop calls made after the connection address was already closed.
+    pub already_closed: usize,
+    /// Per-slot outcomes for connections that did not newly stop.
+    pub connection_failures: Vec<KeepaliveConnectionStopFailure>,
+}
+
+impl KeepalivePoolShutdownReport {
+    fn new(pool_close: KeepalivePoolCloseOutcome) -> Self {
+        Self {
+            pool_close,
+            drain: KeepalivePoolDrainOutcome::NotRequested,
+            requested: 0,
+            stopped: 0,
+            timed_out: 0,
+            rejected: 0,
+            already_closed: 0,
+            connection_failures: Vec::new(),
+        }
+    }
+
+    fn begin_connection_stops(&mut self, requested: usize) {
+        self.requested = requested;
+    }
+
+    fn record_connection(&mut self, index: usize, outcome: KeepaliveConnectionStopOutcome) {
+        match outcome {
+            KeepaliveConnectionStopOutcome::Stopped => self.stopped += 1,
+            KeepaliveConnectionStopOutcome::TimedOut => {
+                self.timed_out += 1;
+                self.connection_failures
+                    .push(KeepaliveConnectionStopFailure { index, outcome });
+            }
+            KeepaliveConnectionStopOutcome::AlreadyClosed => {
+                self.already_closed += 1;
+                self.connection_failures
+                    .push(KeepaliveConnectionStopFailure { index, outcome });
+            }
+            KeepaliveConnectionStopOutcome::MailboxFull
+            | KeepaliveConnectionStopOutcome::Rejected(_)
+            | KeepaliveConnectionStopOutcome::UnexpectedReply => {
+                self.rejected += 1;
+                self.connection_failures
+                    .push(KeepaliveConnectionStopFailure { index, outcome });
+            }
+        }
+    }
 }
 
 /// Builds and registers a keepalive pool plus its connection
@@ -785,4 +995,128 @@ where
         pool: pool_address,
         connections,
     })
+}
+
+/// Closes pool admission and stops every keepalive connection isolate
+/// once the selected close mode permits it.
+///
+/// This is a small copied shutdown shape for callers that build pools
+/// with [`build_keepalive_pool`]. It keeps the two truths separate:
+/// the pool close only controls future admission, `Drain` waits for
+/// outstanding leases to return, then each connection is stopped with
+/// its own checked call outcome. It does not retry `Stop` and does
+/// not claim a graceful close beyond the typed
+/// `KeepaliveOutcome::Stopped` reply. If admission close fails, or
+/// `Drain` cannot prove leases settled before the deadline, no
+/// connection isolates are stopped.
+pub fn shutdown_keepalive_pool<S>(
+    runtime: &ThreadedRuntime<S, tina_runtime::DefaultThreadedMailboxFactory>,
+    handles: &KeepalivePoolHandles,
+    mode: CloseMode,
+    timeout: Duration,
+) -> Result<KeepalivePoolShutdownReport, ThreadedRuntimeError>
+where
+    S: Shard + Send + 'static,
+{
+    let pool_close =
+        match runtime.call_blocking(handles.pool, WorkerPoolMsg::Close(mode), timeout)? {
+            CallOutcome::Replied(WorkerPoolReply::Closed) => KeepalivePoolCloseOutcome::Closed,
+            CallOutcome::Replied(_) => KeepalivePoolCloseOutcome::UnexpectedReply,
+            CallOutcome::Timeout => KeepalivePoolCloseOutcome::TimedOut,
+            CallOutcome::Full => KeepalivePoolCloseOutcome::MailboxFull,
+            CallOutcome::Closed => KeepalivePoolCloseOutcome::AlreadyClosed,
+            CallOutcome::Rejected(reason) => KeepalivePoolCloseOutcome::Rejected(reason),
+        };
+
+    let mut report = KeepalivePoolShutdownReport::new(pool_close);
+
+    if !matches!(
+        pool_close,
+        KeepalivePoolCloseOutcome::Closed | KeepalivePoolCloseOutcome::AlreadyClosed
+    ) {
+        report.drain = KeepalivePoolDrainOutcome::SkippedAdmissionNotClosed;
+        return Ok(report);
+    }
+
+    report.drain = match mode {
+        CloseMode::Force => KeepalivePoolDrainOutcome::NotRequested,
+        CloseMode::Drain if matches!(pool_close, KeepalivePoolCloseOutcome::AlreadyClosed) => {
+            KeepalivePoolDrainOutcome::PoolAlreadyClosed
+        }
+        CloseMode::Drain => wait_keepalive_pool_drain(runtime, handles, timeout)?,
+    };
+
+    let can_stop_connections = match mode {
+        CloseMode::Force => true,
+        CloseMode::Drain => matches!(report.drain, KeepalivePoolDrainOutcome::Drained),
+    };
+    if !can_stop_connections {
+        return Ok(report);
+    }
+
+    report.begin_connection_stops(handles.connections.len());
+
+    for (index, conn) in handles.connections.iter().copied().enumerate() {
+        let outcome = match runtime.call_blocking(conn, KeepaliveConnectionMsg::Stop, timeout)? {
+            CallOutcome::Replied(KeepaliveOutcome::Stopped) => {
+                KeepaliveConnectionStopOutcome::Stopped
+            }
+            CallOutcome::Replied(_) => KeepaliveConnectionStopOutcome::UnexpectedReply,
+            CallOutcome::Timeout => KeepaliveConnectionStopOutcome::TimedOut,
+            CallOutcome::Closed => KeepaliveConnectionStopOutcome::AlreadyClosed,
+            CallOutcome::Full => KeepaliveConnectionStopOutcome::MailboxFull,
+            CallOutcome::Rejected(reason) => KeepaliveConnectionStopOutcome::Rejected(reason),
+        };
+        report.record_connection(index, outcome);
+    }
+
+    Ok(report)
+}
+
+fn wait_keepalive_pool_drain<S>(
+    runtime: &ThreadedRuntime<S, tina_runtime::DefaultThreadedMailboxFactory>,
+    handles: &KeepalivePoolHandles,
+    timeout: Duration,
+) -> Result<KeepalivePoolDrainOutcome, ThreadedRuntimeError>
+where
+    S: Shard + Send + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last_leased = handles.connections.len();
+
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(KeepalivePoolDrainOutcome::TimedOut {
+                leased: last_leased,
+            });
+        };
+        if remaining.is_zero() {
+            return Ok(KeepalivePoolDrainOutcome::TimedOut {
+                leased: last_leased,
+            });
+        }
+
+        match runtime.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining)? {
+            CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
+                last_leased = report.leased;
+                if report.leased == 0 {
+                    return Ok(KeepalivePoolDrainOutcome::Drained);
+                }
+            }
+            CallOutcome::Replied(_) => return Ok(KeepalivePoolDrainOutcome::PressureUnavailable),
+            CallOutcome::Timeout => {
+                return Ok(KeepalivePoolDrainOutcome::TimedOut {
+                    leased: last_leased,
+                });
+            }
+            CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
+                return Ok(KeepalivePoolDrainOutcome::PressureUnavailable);
+            }
+        }
+
+        let nap = remaining.min(Duration::from_millis(10));
+        if !nap.is_zero() {
+            thread::sleep(nap);
+        }
+    }
 }

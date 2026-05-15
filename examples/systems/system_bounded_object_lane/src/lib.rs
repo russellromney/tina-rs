@@ -101,36 +101,10 @@ impl ObjectLane {
     fn handle(
         &mut self,
         msg: LaneMsg,
-        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            LaneMsg::Put { key } => {
-                if self.in_flight >= self.max_in_flight {
-                    self.busy += 1;
-                    return reply(LaneReply::Busy {
-                        in_flight: self.in_flight,
-                        cap: self.max_in_flight,
-                    });
-                }
-
-                let Ok(request) = ctx.take_request_context() else {
-                    return reply(LaneReply::Failed("put arrived without caller".into()));
-                };
-
-                self.in_flight += 1;
-                self.accepted += 1;
-                match &self.backend {
-                    WorkBackend::FakeSleep { work } => {
-                        sleep(*work).reply_with_request(request, move |request, result| {
-                            LaneMsg::PutFinished {
-                                request,
-                                key,
-                                result: sleep_to_work_result(result),
-                            }
-                        })
-                    }
-                }
-            }
+            LaneMsg::Put { .. } | LaneMsg::Stats => noop(),
             LaneMsg::PutFinished {
                 request,
                 key,
@@ -142,17 +116,42 @@ impl ObjectLane {
                         self.completed += 1;
                         reply_to_request(request, LaneReply::Stored(key))
                     }
-                    Err(error) => {
-                        reply_to_request(request, LaneReply::Failed(format!("{error:?}")))
-                    }
+                    Err(error) => reply_to_request(request, LaneReply::Failed(format!("{error:?}"))),
                 }
             }
-            LaneMsg::Stats => reply(LaneReply::Stats(LaneStats {
+        }
+    }
+
+    fn handle_call(&mut self, msg: LaneMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            LaneMsg::Put { key } => {
+                if self.in_flight >= self.max_in_flight {
+                    self.busy += 1;
+                    return call.reply(LaneReply::Busy {
+                        in_flight: self.in_flight,
+                        cap: self.max_in_flight,
+                    });
+                }
+
+                self.in_flight += 1;
+                self.accepted += 1;
+                match &self.backend {
+                    WorkBackend::FakeSleep { work } => call.defer(sleep(*work)).reply(
+                        move |request, result| LaneMsg::PutFinished {
+                            request,
+                            key,
+                            result: sleep_to_work_result(result),
+                        },
+                    ),
+                }
+            }
+            LaneMsg::Stats => call.reply(LaneReply::Stats(LaneStats {
                 accepted: self.accepted,
                 busy: self.busy,
                 completed: self.completed,
                 in_flight: self.in_flight,
             })),
+            LaneMsg::PutFinished { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }

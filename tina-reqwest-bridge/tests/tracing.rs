@@ -177,7 +177,7 @@ impl Isolate for Caller {
     ) -> Effect<Self> {
         match msg {
             CallerMsg::Run(request) => {
-                send_request(self.bridge, request, Duration::from_secs(2)).reply(CallerMsg::Done)
+                send_request(self.bridge, request, Duration::from_secs(2)).then(CallerMsg::Done)
             }
             CallerMsg::Done(outcome) => {
                 self.sink.put(outcome);

@@ -9,9 +9,26 @@ The rule:
 > Tokio may speak ecosystem. Tina owns state. Bridge shows pressure.
 > Bridge may adapt. Bridge may not lie.
 
-If you can use a native Tina crate, do. Native HTTPS/1.1 lives in
-`tina-http`'s `HttpsListener` and `HttpClient` — explicit DER cert
-config, typed startup, matchable TLS errors. For repeated outbound
+If you can use a native Tina crate, do. Native WebSocket server
+upgrade now lives in `tina-http`: HTTP/1.1 `GET` upgrade validation,
+Tina-owned TCP/TLS rails after handoff, bounded frame/message/queue
+limits, visible ping/pong and close messages, client masking
+validation, and unmasked server frames. It is not HTTP/2 WebSocket,
+permessage-deflate, a browser session framework, or a broad client
+crate. For the bounded room/fanout copy path, see
+[Native WebSocket Server](20-native-websocket-server.md). Native HTTP/2 now has a
+server-first h2c path in `tina-http::Http2Listener`: cleartext
+prior-knowledge transport, bounded stream table, explicit
+connection/stream flow-control windows, ordinary `HttpRequest` /
+`HttpResponse` service dispatch, streamed response DATA from Tina chunk
+sources, and gRPC request-body pull sources. Native gRPC now layers unary plus
+first server-streaming/client-streaming `prost` messages on that h2c path
+through `tina_http::GrpcRouter`: typed `GrpcStatus` trailers, message caps, no
+compression, and service timeout mapped to `DeadlineExceeded`. It is not tonic
+parity, not true bidirectional streaming, not HTTPS/2 ALPN, and not a broad
+client. Native HTTPS/1.1 lives in `tina-http`'s
+`HttpsListener` and `HttpClient` — explicit DER cert config, typed
+startup, matchable TLS errors. For repeated outbound
 requests against the same origin, `tina_http::build_keepalive_pool`
 hands you a `KeepalivePoolHandles { pool, connections }`: one TCP
 (or TLS) connection per pool slot serves many requests, with
@@ -22,11 +39,17 @@ roots themselves — so cross-origin reuse cannot happen at the
 connection-isolate level. The recommended consumer pattern is
 always release `Reuse`; the connection self-heals on
 `must_retire = true` (drops the bad transport, reconnects on the
-next request). Send `KeepaliveConnectionMsg::Stop` to each
-address in `handles.connections` on shutdown so transports close
-promptly. Reach for a bridge when you need HTTP/2, ALPN, system
-trust roots, redirects/cookies, an existing Axum app, or a
-third-party SDK that only ships a Tokio client.
+next request). On shutdown, call `shutdown_keepalive_pool(...)`
+or close the pool and call `KeepaliveConnectionMsg::Stop` on each
+address in `handles.connections`, checking for
+`KeepaliveOutcome::Stopped`; closing the pool alone only closes
+lease admission. With `CloseMode::Drain`, the helper waits for
+leased connections to return before stopping connection isolates;
+if that deadline fires, the report names the remaining leased count
+and leaves connections running. Reach for a bridge when you need
+outbound HTTP/2 client behavior, HTTPS/2 ALPN, system trust roots,
+redirects/cookies, an existing Axum app, or a third-party SDK that only
+ships a Tokio client.
 
 ## What ships today
 
@@ -34,9 +57,10 @@ third-party SDK that only ships a Tokio client.
 | --- | --- | --- |
 | `tina-tokio-bridge` | Tokio caller → Tina isolate | A Tokio handler needs a bounded request/reply path into a Tina service. |
 | `tina-tower-bridge` | `tower::Service` over a Tina bridge | An Axum/Hyper/Tower stack wants to call a Tina service through normal Tower middleware. |
-| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; reqwest covers everything else. |
+| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; native HTTP/2 is server-side h2c first form only; reqwest covers everything else. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
 | `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
+| `tina-aws-bridge` | Tina caller → AWS SDK S3/SQS | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. Ships S3 (`PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`) and SQS (`SendMessage`, `ReceiveMessage`, `DeleteMessage`). The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
 
 Each crate is small, opt-in, and bounded. Native Tina crates
 (`tina-http`, etc.) do not depend on any bridge; bridges do not leak
@@ -136,7 +160,7 @@ publish_svc.call(PublishMsg).await?;
 ### `tina-reqwest-bridge` — Tina → outbound HTTP
 
 A bounded outbound HTTP worker. Tina services call it through the
-normal `call(...).reply(...)` path:
+normal `call(...).then(...)` path:
 
 ```rust
 use tina_reqwest_bridge::{ReqwestAddress, ReqwestCallOutcome, ReqwestRequest, send_request};
@@ -158,7 +182,7 @@ impl Isolate for App {
                 ReqwestRequest::get("https://example.com/"),
                 Duration::from_secs(2),
             )
-            .reply(AppMsg::HttpReturned),
+            .then(AppMsg::HttpReturned),
 
             AppMsg::HttpReturned(outcome) => match outcome {
                 CallOutcome::Replied(Ok(response)) => { /* success */ }
@@ -193,6 +217,18 @@ The Postgres SQLx bridge follows it too, with two install paths
 (`install` builds a pool from config; `install_with_pool` wraps a
 caller-supplied `sqlx::PgPool` whose SQLx settings stay caller-owned).
 
+The production-shaped copy path for SQLite plus native outbound HTTP is
+`examples/systems/mini_saas_api`:
+
+```sh
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+```
+
+It uses `SqliteWorker` as the honest one-lane pool shape and
+`build_keepalive_pool` for outbound notifications. The route code keeps
+bridge-layer `Full` / `Closed` / `Timeout` distinct from worker or upstream
+failures.
+
 `flatten_outcome(outcome)` is available when the call site does not
 need to distinguish bridge-layer from worker-layer failures.
 
@@ -222,7 +258,7 @@ let bridge = PgWorker::<SingleShard>::install(&runtime, cfg)?;
 // In a handler:
 execute_call(self.db, "INSERT INTO t (k, v) VALUES ($1, $2)",
     vec![1.into(), "hello".into()], Duration::from_secs(2))
-    .reply(AppMsg::Inserted);
+    .then(AppMsg::Inserted);
 ```
 
 Runtime-checked SQLx (`sqlx::query(...)`). No `query!` macros, no
@@ -318,6 +354,164 @@ in `PgValue::Null` regardless of how the NULL was bound.
 Non-goals: generic `sqlx::Database`, ORM, migrations, struct
 mapping, a transaction *handle* (vs. atomic script). See the
 phase plan for the why.
+
+### `tina-aws-bridge` — Tina → AWS SDK S3/SQS
+
+Adoption bridge. The AWS Rust SDK owns AWS protocol behavior; Tina
+owns bounded admission, body/message caps, per-operation timeout truth,
+typed outcomes, and metrics.
+
+```rust
+use tina_aws_bridge::{
+    S3Config, S3Credentials, S3Request, S3PutObject, install_s3, send_s3,
+};
+
+let cfg = S3Config::new()
+    .with_region("us-east-1")
+    .with_credentials(S3Credentials::new("access-key-id", "secret-access-key"))
+    .with_max_in_flight(8)
+    .with_default_timeout(Duration::from_secs(2));
+let bridge = install_s3(&runtime, cfg)?;
+
+// In a handler:
+send_s3(
+    self.aws,
+    S3Request::PutObject(S3PutObject {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        body: b"hello".to_vec(),
+        content_type: Some("text/plain".into()),
+    }),
+    Duration::from_secs(2),
+)
+.then(AppMsg::S3PutDone);
+```
+
+The copied raw call shape is:
+
+```rust
+call(
+    aws,
+    S3Msg::Send(S3Request::PutObject(S3PutObject {
+        bucket,
+        key,
+        body,
+        content_type: None,
+    })),
+    Duration::from_secs(2),
+)
+.then(AppMsg::S3PutDone)
+```
+
+**Operations.**
+
+| Request | Returns | Notes |
+| --- | --- | --- |
+| `PutObject` | `S3PutObjectOk` | Full buffered request body; capped by `request_body_limit`. |
+| `GetObject { max_bytes }` | `S3Object` | Reads SDK stream chunk by chunk; fails with `ResponseTooLarge` once the request/config cap would be crossed. |
+| `HeadObject` | `S3ObjectHead` | Object metadata without buffering a body. |
+| `DeleteObject` | `S3DeletedObject` | Object delete only; no batch/delete framework. |
+
+**Pressure and retry truth.**
+
+```text
+mailbox full        -> CallError::TargetFull / CallOutcome::Full
+max_in_flight       -> S3Error::Full
+request body cap    -> S3Error::RequestTooLarge
+response body cap   -> S3Error::ResponseTooLarge
+per-operation clock -> S3Error::Timeout
+SDK failure         -> S3Error::Sdk(detail)
+worker closed       -> S3Error::Closed
+```
+
+`S3Config` disables AWS SDK retries by default. If you opt into
+`SdkRetryPolicy::Standard { max_attempts }`, one admitted bridge
+operation may perform multiple SDK HTTP attempts internally. The
+bridge exposes the configured `sdk_max_attempts` in metrics; it does
+not claim to observe every internal retry attempt. If you wrap a
+caller-supplied `aws_sdk_s3::Client`, SDK retry policy is entirely
+caller-owned and `sdk_max_attempts` is reported as `0` (unknown).
+
+`install` builds an S3 client from explicit bridge config. First form
+supports static credentials only (`S3Credentials`). Use
+`with_supplied_client` when you need the AWS default provider chain,
+assume-role, SSO, custom HTTP connector, custom TLS, proxy policy, or
+any other SDK-owned client setup.
+
+No unbounded request/result buffer is part of the bridge: callers are
+bounded by the Tina mailbox, SDK work is bounded by `max_in_flight`,
+and the bridge does not queue waiters behind saturated in-flight
+slots.
+
+**Cancellation.** `S3Closer::close()` stops Tina-side admission.
+`S3Closer::close_and_drain(timeout)` closes admission and waits a
+bounded time for already accepted SDK work to leave the bridge's
+in-flight set. If the deadline fires, `S3DrainReport` names the
+remaining operation kinds and count. On bridge timeout, the caller can
+stop waiting; the spawned SDK future is left alive because task abort
+does not prove AWS/Hyper cancelled bytes already accepted for IO. That
+late SDK future continues to occupy `max_in_flight` capacity until it
+reports terminal truth; then worker-terminal metrics are tallied and
+`late_results` increments.
+
+Owned install builds a private Tokio runtime for SDK work and drops it
+with the worker. The supplied-client path uses the caller's Tokio
+runtime handle and never shuts it down.
+
+SQS follows the same lifecycle vocabulary with SQS-shaped types:
+
+```rust
+use tina_aws_bridge::{
+    SqsConfig, SqsCredentials, SqsRequest, SqsSendMessage, install_sqs, send_sqs,
+};
+
+let cfg = SqsConfig::new()
+    .with_region("us-east-1")
+    .with_credentials(SqsCredentials::new("access-key-id", "secret-access-key"))
+    .with_message_body_limit(64 * 1024)
+    .with_max_receive_messages(10);
+let bridge = install_sqs(&runtime, cfg)?;
+
+send_sqs(
+    self.sqs,
+    SqsRequest::SendMessage(SqsSendMessage {
+        queue_url,
+        body: "hello".into(),
+        message_group_id: None,
+        message_deduplication_id: None,
+    }),
+    Duration::from_secs(2),
+)
+.then(AppMsg::SqsSendDone);
+```
+
+SQS receive names visibility timeout explicitly and never auto-deletes:
+
+```rust
+SqsRequest::ReceiveMessage(SqsReceiveMessage {
+    queue_url,
+    max_messages: 5,
+    visibility_timeout_seconds: 30,
+    wait_time_seconds: 0,
+})
+```
+
+`SqsResponse::ReceivedMessages` may contain an empty vector; that is a
+successful empty receive, not an error. Each returned `SqsMessage`
+carries the `receipt_handle` the caller must pass to
+`SqsRequest::DeleteMessage` if the message should be deleted. The
+bridge does not retry sends or deletes and does not infer idempotency
+from FIFO deduplication fields; retry budget, backoff, and idempotency
+keys remain caller-owned.
+
+`SqsCloser::close()` stops new Tina-side admission.
+`SqsCloser::close_and_drain(timeout)` reports any accepted SQS work
+still in flight by operation kind, just like S3. If a bridge timeout
+fires after SDK acceptance, Tina stops waiting but SQS has not rolled
+back the send, receive visibility change, or delete. The SDK future is
+left to finish so late-result metrics and in-flight capacity remain
+honest. The supplied-client path uses the caller's Tokio runtime handle
+and never shuts it down.
 
 ## What bridges preserve and weaken
 

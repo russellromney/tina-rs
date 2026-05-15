@@ -6,7 +6,7 @@ loop. The Tina side runs through `tina-reqwest-bridge` and
 deliberately uses **three different call-site shapes** in the same
 file so they can be read side-by-side:
 
-1. **`send_request(...).reply(...)`** — the polished helper. The
+1. **`send_request(...).then(...)`** — the polished helper. The
    recommended default.
 2. **literal `call(addr, ReqwestMsg::Send(req), timeout)`** — the raw
    layered form. Same outcome, more boilerplate. Kept in a real call
@@ -69,23 +69,23 @@ side=tina  bodies=["1", "2", "3"]
 
 ### How the three shapes feel
 
-**Shape 1 — `send_request(...).reply(...)`:**
+**Shape 1 — `send_request(...).then(...)`:**
 
 ```rust
 send_request(self.http, request, self.timeout)
-    .reply(DriverMsg::PostedViaSendRequest)
+    .then(DriverMsg::PostedViaSendRequest)
 ```
 
 This is what users should reach for. Three positional args plus a
 function-pointer translator. Reads exactly like
-`tcp_read(...).reply(...)` and the other native runtime calls. No
+`tcp_read(...).then(...)` and the other native runtime calls. No
 mystery; no `ReqwestMsg::Send(...)` wrapping at the call site.
 
 **Shape 2 — raw `call(addr, ReqwestMsg::Send(req), timeout)`:**
 
 ```rust
 call(self.http, ReqwestMsg::Send(request), self.timeout)
-    .reply(DriverMsg::PostedViaRawCall)
+    .then(DriverMsg::PostedViaRawCall)
 ```
 
 Functionally identical. One extra layer (`ReqwestMsg::Send(...)`)
@@ -99,7 +99,7 @@ unit tests.
 
 ```rust
 send_request(self.http, request, self.timeout)
-    .reply(|outcome| DriverMsg::PostedFlattened(flatten_outcome(outcome)))
+    .then(|outcome| DriverMsg::PostedFlattened(flatten_outcome(outcome)))
 ```
 
 The call-site delta is small but the consumer-side delta is real.
@@ -145,9 +145,9 @@ What worked:
   three arms beats five.
 
 What felt awkward:
-- The reply-translator syntax for shape 3 is genuinely denser than
-  shapes 1 and 2. `.reply(DriverMsg::PostedViaSendRequest)` is a
-  bare function pointer. `.reply(|outcome|
+- The continuation-translator syntax for shape 3 is genuinely denser than
+  shapes 1 and 2. `.then(DriverMsg::PostedViaSendRequest)` is a
+  bare function pointer. `.then(|outcome|
   DriverMsg::PostedFlattened(flatten_outcome(outcome)))` is a
   closure with an inline transformation. A first-time reader will
   look at it twice.

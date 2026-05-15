@@ -10,11 +10,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, Context, Effect, Isolate, Outbound, RequestContext, Shard, noop, reply,
+    Address, CallContext, Context, Effect, Isolate, Outbound, RequestContext, Shard, batch, noop,
     reply_to_request,
 };
 use tina_runtime::{CallOutcome, RuntimeCall, RuntimeEventKind};
-use tina_sim::{Simulator, SimulatorConfig};
+use tina_sim::{MultiShardSimulator, MultiShardSimulatorConfig, Simulator, SimulatorConfig};
 
 fn step_to_idle<S: Shard>(sim: &mut Simulator<S>) {
     while sim.step() > 0 {}
@@ -30,7 +30,7 @@ impl tina::Shard for DefShard {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-turn through RequestContext + reply_with_request
+// Multi-turn through RequestContext + then_with_request
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +47,7 @@ impl Isolate for Probe {
     type Reply = ProbeReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
     type Shard = DefShard;
 
@@ -55,7 +56,11 @@ impl Isolate for Probe {
         _msg: Self::Message,
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
-        reply(ProbeReply(42))
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(ProbeReply(42))
     }
 }
 
@@ -81,26 +86,36 @@ impl Isolate for Svc {
     type Reply = SvcReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SvcMsg>;
     type Shard = DefShard;
 
     fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            SvcMsg::Start => {
-                let req = ctx.take_request_context().unwrap();
-                tina_runtime::call(self.probe, ProbeMsg, Duration::from_millis(50))
-                    .reply_with_request(req, SvcMsg::ProbeResult)
-            }
+            SvcMsg::Start => noop(),
             SvcMsg::ProbeResult(req, outcome) => match outcome {
                 CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
                     reply_to_request(req, SvcReply::Ready)
                 }
                 _ => reply_to_request(req, SvcReply::NotReady),
             },
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SvcMsg::Start => {
+                let req = call_ctx.into_request_context();
+                tina_runtime::call(self.probe, ProbeMsg, Duration::from_millis(50))
+                    .then_with_request(req, SvcMsg::ProbeResult)
+            }
+            SvcMsg::ProbeResult(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -121,6 +136,7 @@ impl Isolate for Client {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
     type Shard = DefShard;
 
@@ -205,6 +221,7 @@ impl Isolate for AbandonSvc {
     type Reply = AbandonReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AbandonMsg>;
     type Shard = DefShard;
 
@@ -213,6 +230,10 @@ impl Isolate for AbandonSvc {
         _msg: Self::Message,
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, _call: CallContext<'_, Self>) -> Effect<Self> {
         noop()
     }
 }
@@ -233,6 +254,7 @@ impl Isolate for AbandonClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AbandonClientMsg>;
     type Shard = DefShard;
 
@@ -257,7 +279,7 @@ impl Isolate for AbandonClient {
 }
 
 #[test]
-fn sim_abandoned_caller_traces_warning_but_times_out() {
+fn sim_abandoned_caller_rejects_immediately() {
     let mut sim = Simulator::new(DefShard, SimulatorConfig::default());
     let svc = sim.register(AbandonSvc);
     let out = Rc::new(RefCell::new(Vec::new()));
@@ -268,7 +290,6 @@ fn sim_abandoned_caller_traces_warning_but_times_out() {
     sim.try_send(caller, AbandonClientMsg::Start(svc)).unwrap();
     step_to_idle(&mut sim);
 
-    // Guard emitted trace warning but did not close the call.
     assert_eq!(
         count_kind(sim.trace(), |k| matches!(
             k,
@@ -277,11 +298,12 @@ fn sim_abandoned_caller_traces_warning_but_times_out() {
         1
     );
 
-    // Advance virtual time past timeout to trigger the timeout.
-    sim.advance_time(Duration::from_secs(61));
-    step_to_idle(&mut sim);
-
-    assert_eq!(out.borrow().as_slice(), [CallOutcome::Timeout]);
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Rejected(
+            tina::CallRejectedReason::ReplyAbandoned
+        )]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +328,7 @@ impl Isolate for ImmSvc {
     type Reply = ImmReply;
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ImmMsg>;
     type Shard = DefShard;
 
@@ -314,7 +337,11 @@ impl Isolate for ImmSvc {
         _msg: Self::Message,
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
-        reply(ImmReply::Pong)
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(ImmReply::Pong)
     }
 }
 
@@ -334,6 +361,7 @@ impl Isolate for ImmClient {
     type Reply = ();
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ImmClientMsg>;
     type Shard = DefShard;
 
@@ -376,6 +404,520 @@ fn sim_immediate_reply_is_not_falsely_flagged_abandoned() {
 
     assert_eq!(
         count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::CallReplyAbandoned { .. }
+        )),
+        0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batched reply and abandoned-context returned effects in sim
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct AuditMsg(&'static str);
+
+#[derive(Debug)]
+struct Audit {
+    seen: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl Isolate for Audit {
+    type Message = AuditMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<AuditMsg>;
+    type Shard = DefShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        self.seen.borrow_mut().push(msg.0);
+        noop()
+    }
+}
+
+#[derive(Debug)]
+enum BatchMsg {
+    BatchedReply,
+    AbandonButSend,
+    ExplicitReject,
+    ReplyThenReject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchReply {
+    Ok,
+}
+
+#[derive(Debug)]
+struct BatchSvc {
+    audit: Address<AuditMsg>,
+}
+
+impl Isolate for BatchSvc {
+    type Message = BatchMsg;
+    type Reply = BatchReply;
+    type Send = Outbound<AuditMsg>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<BatchMsg>;
+    type Shard = DefShard;
+
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            BatchMsg::BatchedReply => batch([
+                call.reply(BatchReply::Ok),
+                tina::send(self.audit, AuditMsg("batched")),
+            ]),
+            BatchMsg::AbandonButSend => tina::send(self.audit, AuditMsg("abandoned")),
+            BatchMsg::ExplicitReject => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            BatchMsg::ReplyThenReject => batch([
+                call.reply(BatchReply::Ok),
+                tina::reject(tina::CallRejectedReason::UnsupportedMessage),
+            ]),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BatchClientMsg {
+    Start(Address<BatchMsg, BatchReply>, BatchMsg),
+    Returned(CallOutcome<BatchReply>),
+}
+
+#[derive(Debug)]
+struct BatchClient {
+    out: Rc<RefCell<Vec<CallOutcome<BatchReply>>>>,
+}
+
+impl Isolate for BatchClient {
+    type Message = BatchClientMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<BatchClientMsg>;
+    type Shard = DefShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            BatchClientMsg::Start(svc, request) => Effect::Call(RuntimeCall::isolate_call(
+                svc,
+                request,
+                Duration::from_secs(60),
+                BatchClientMsg::Returned,
+            )),
+            BatchClientMsg::Returned(outcome) => {
+                self.out.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn sim_batched_reply_consumes_call_authority_and_runs_later_effects() {
+    let mut sim = Simulator::new(DefShard, SimulatorConfig::default());
+    let audit_seen = Rc::new(RefCell::new(Vec::new()));
+    let audit = sim.register(Audit {
+        seen: Rc::clone(&audit_seen),
+    });
+    let svc = sim.register(BatchSvc { audit });
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register(BatchClient {
+        out: Rc::clone(&out),
+    });
+
+    sim.try_send(caller, BatchClientMsg::Start(svc, BatchMsg::BatchedReply))
+        .unwrap();
+    step_to_idle(&mut sim);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Replied(BatchReply::Ok)]
+    );
+    assert_eq!(audit_seen.borrow().as_slice(), ["batched"]);
+    assert_eq!(
+        count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::CallReplyAbandoned { .. }
+        )),
+        0
+    );
+}
+
+#[test]
+fn sim_unused_call_authority_rejects_but_returned_effect_still_runs() {
+    let mut sim = Simulator::new(DefShard, SimulatorConfig::default());
+    let audit_seen = Rc::new(RefCell::new(Vec::new()));
+    let audit = sim.register(Audit {
+        seen: Rc::clone(&audit_seen),
+    });
+    let svc = sim.register(BatchSvc { audit });
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register(BatchClient {
+        out: Rc::clone(&out),
+    });
+
+    sim.try_send(caller, BatchClientMsg::Start(svc, BatchMsg::AbandonButSend))
+        .unwrap();
+    step_to_idle(&mut sim);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Rejected(
+            tina::CallRejectedReason::ReplyAbandoned
+        )]
+    );
+    assert_eq!(audit_seen.borrow().as_slice(), ["abandoned"]);
+}
+
+#[test]
+fn sim_explicit_reject_uses_rejected_trace_vocabulary() {
+    let mut sim = Simulator::new(DefShard, SimulatorConfig::default());
+    let audit = sim.register(Audit {
+        seen: Rc::new(RefCell::new(Vec::new())),
+    });
+    let svc = sim.register(BatchSvc { audit });
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register(BatchClient {
+        out: Rc::clone(&out),
+    });
+
+    sim.try_send(caller, BatchClientMsg::Start(svc, BatchMsg::ExplicitReject))
+        .unwrap();
+    step_to_idle(&mut sim);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Rejected(
+            tina::CallRejectedReason::UnsupportedMessage
+        )]
+    );
+    assert_eq!(
+        count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::CallReplyAbandoned { .. }
+        )),
+        0
+    );
+    assert_eq!(
+        count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::CallRejected {
+                reason: tina::CallRejectedReason::UnsupportedMessage,
+                ..
+            }
+        )),
+        1
+    );
+}
+
+#[test]
+fn sim_batch_reply_consumes_authority_before_later_reject() {
+    let mut sim = Simulator::new(DefShard, SimulatorConfig::default());
+    let audit = sim.register(Audit {
+        seen: Rc::new(RefCell::new(Vec::new())),
+    });
+    let svc = sim.register(BatchSvc { audit });
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register(BatchClient {
+        out: Rc::clone(&out),
+    });
+
+    sim.try_send(
+        caller,
+        BatchClientMsg::Start(svc, BatchMsg::ReplyThenReject),
+    )
+    .unwrap();
+    step_to_idle(&mut sim);
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Replied(BatchReply::Ok)]
+    );
+    assert_eq!(
+        count_kind(sim.trace(), |k| matches!(
+            k,
+            RuntimeEventKind::CallReplyRejected { .. }
+                | RuntimeEventKind::CallRejected { .. }
+                | RuntimeEventKind::CallReplyAbandoned { .. }
+        )),
+        0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-shard request context promotion
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct NumberedShard(u32);
+
+impl tina::Shard for NumberedShard {
+    fn id(&self) -> tina::ShardId {
+        tina::ShardId::new(self.0)
+    }
+}
+
+#[derive(Debug)]
+struct CrossProbeMsg;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrossProbeReply(u64);
+
+#[derive(Debug)]
+struct CrossProbe;
+
+impl Isolate for CrossProbe {
+    type Message = CrossProbeMsg;
+    type Reply = CrossProbeReply;
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<CrossProbeMsg>;
+    type Shard = NumberedShard;
+
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(CrossProbeReply(42))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrossSvcReply {
+    Ready,
+}
+
+#[derive(Debug)]
+enum CrossSvcMsg {
+    Start,
+    RejectNow,
+    ProbeResult(RequestContext<CrossSvcReply>, CallOutcome<CrossProbeReply>),
+}
+
+#[derive(Debug)]
+struct CrossSvc {
+    probe: Address<CrossProbeMsg, CrossProbeReply>,
+}
+
+impl Isolate for CrossSvc {
+    type Message = CrossSvcMsg;
+    type Reply = CrossSvcReply;
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<CrossSvcMsg>;
+    type Shard = NumberedShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossSvcMsg::Start => noop(),
+            CrossSvcMsg::RejectNow => noop(),
+            CrossSvcMsg::ProbeResult(req, CallOutcome::Replied(CrossProbeReply(42))) => {
+                reply_to_request(req, CrossSvcReply::Ready)
+            }
+            CrossSvcMsg::ProbeResult(req, _) => reply_to_request(req, CrossSvcReply::Ready),
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            CrossSvcMsg::Start => {
+                let req = call.into_request_context();
+                tina_runtime::call(self.probe, CrossProbeMsg, Duration::from_millis(50))
+                    .then_with_request(req, CrossSvcMsg::ProbeResult)
+            }
+            CrossSvcMsg::RejectNow => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            CrossSvcMsg::ProbeResult(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CrossClientMsg {
+    Start(Address<CrossSvcMsg, CrossSvcReply>),
+    StartWith(Address<CrossSvcMsg, CrossSvcReply>, CrossSvcMsg),
+    Returned(CallOutcome<CrossSvcReply>),
+}
+
+#[derive(Debug)]
+struct CrossClient {
+    out: Rc<RefCell<Vec<CallOutcome<CrossSvcReply>>>>,
+}
+
+impl Isolate for CrossClient {
+    type Message = CrossClientMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<CrossClientMsg>;
+    type Shard = NumberedShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                svc,
+                CrossSvcMsg::Start,
+                Duration::from_millis(100),
+                CrossClientMsg::Returned,
+            )),
+            CrossClientMsg::StartWith(svc, request) => Effect::Call(RuntimeCall::isolate_call(
+                svc,
+                request,
+                Duration::from_millis(100),
+                CrossClientMsg::Returned,
+            )),
+            CrossClientMsg::Returned(outcome) => {
+                self.out.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn sim_cross_shard_call_can_promote_into_request_context_and_reply_later() {
+    let mut sim = MultiShardSimulator::with_config(
+        [NumberedShard(71), NumberedShard(72)],
+        SimulatorConfig::default(),
+        MultiShardSimulatorConfig::default(),
+    );
+    let probe = sim
+        .register_with_capacity_on::<CrossProbe, CrossProbeMsg, Infallible>(
+            tina::ShardId::new(72),
+            CrossProbe,
+            4,
+        )
+        .with_reply::<CrossProbeReply>();
+    let svc = sim.register_with_capacity_on::<CrossSvc, CrossSvcMsg, Infallible>(
+        tina::ShardId::new(72),
+        CrossSvc { probe },
+        8,
+    );
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register_with_capacity_on::<CrossClient, CrossClientMsg, Infallible>(
+        tina::ShardId::new(71),
+        CrossClient {
+            out: Rc::clone(&out),
+        },
+        8,
+    );
+
+    sim.try_send(caller, CrossClientMsg::Start(svc)).unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Replied(CrossSvcReply::Ready)]
+    );
+    let trace = sim.trace();
+    assert_eq!(
+        count_kind(&trace, |k| matches!(
+            k,
+            RuntimeEventKind::CallReplyAbandoned { .. } | RuntimeEventKind::CallRejected { .. }
+        )),
+        0
+    );
+    assert_eq!(
+        count_kind(&trace, |k| matches!(
+            k,
+            RuntimeEventKind::DeferredReplyCaptured { .. }
+        )),
+        1
+    );
+}
+
+#[test]
+fn sim_cross_shard_rejected_reason_is_preserved() {
+    let mut sim = MultiShardSimulator::with_config(
+        [NumberedShard(81), NumberedShard(82)],
+        SimulatorConfig::default(),
+        MultiShardSimulatorConfig::default(),
+    );
+    let probe = sim
+        .register_with_capacity_on::<CrossProbe, CrossProbeMsg, Infallible>(
+            tina::ShardId::new(82),
+            CrossProbe,
+            4,
+        )
+        .with_reply::<CrossProbeReply>();
+    let svc = sim.register_with_capacity_on::<CrossSvc, CrossSvcMsg, Infallible>(
+        tina::ShardId::new(82),
+        CrossSvc { probe },
+        8,
+    );
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = sim.register_with_capacity_on::<CrossClient, CrossClientMsg, Infallible>(
+        tina::ShardId::new(81),
+        CrossClient {
+            out: Rc::clone(&out),
+        },
+        8,
+    );
+
+    sim.try_send(
+        caller,
+        CrossClientMsg::StartWith(svc, CrossSvcMsg::RejectNow),
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        out.borrow().as_slice(),
+        [CallOutcome::Rejected(
+            tina::CallRejectedReason::UnsupportedMessage
+        )]
+    );
+    let trace = sim.trace();
+    assert_eq!(
+        count_kind(&trace, |k| matches!(
+            k,
+            RuntimeEventKind::CallRejected {
+                reason: tina::CallRejectedReason::UnsupportedMessage,
+                ..
+            }
+        )),
+        1
+    );
+    assert_eq!(
+        count_kind(&trace, |k| matches!(
             k,
             RuntimeEventKind::CallReplyAbandoned { .. }
         )),

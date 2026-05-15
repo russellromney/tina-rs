@@ -105,7 +105,7 @@ impl TcpWriteAll {
         if self.pending.is_empty() {
             None
         } else {
-            Some(tcp_write(self.stream, self.pending.clone()).reply(on_progress))
+            Some(tcp_write(self.stream, self.pending.clone()).then(on_progress))
         }
     }
 
@@ -133,7 +133,7 @@ impl TcpWriteAll {
                     LoopStep::Done(self.written)
                 } else {
                     LoopStep::Pending(
-                        tcp_write(self.stream, self.pending.clone()).reply(on_progress),
+                        tcp_write(self.stream, self.pending.clone()).then(on_progress),
                     )
                 }
             }
@@ -184,7 +184,7 @@ impl TcpReadExact {
         if self.buffer.len() >= self.target_len {
             None
         } else {
-            Some(tcp_read(self.stream, self.target_len - self.buffer.len()).reply(on_progress))
+            Some(tcp_read(self.stream, self.target_len - self.buffer.len()).then(on_progress))
         }
     }
 
@@ -211,7 +211,7 @@ impl TcpReadExact {
                 } else {
                     ReadExactStep::Pending(
                         tcp_read(self.stream, self.target_len - self.buffer.len())
-                            .reply(on_progress),
+                            .then(on_progress),
                     )
                 }
             }
@@ -272,7 +272,7 @@ impl TcpReadToEof {
             None
         } else {
             let budget = (self.max - self.buffer.len()).min(self.chunk);
-            Some(tcp_read(self.stream, budget).reply(on_progress))
+            Some(tcp_read(self.stream, budget).then(on_progress))
         }
     }
 
@@ -294,7 +294,7 @@ impl TcpReadToEof {
                     LoopStep::Done(std::mem::take(&mut self.buffer))
                 } else {
                     let budget = (self.max - self.buffer.len()).min(self.chunk);
-                    LoopStep::Pending(tcp_read(self.stream, budget).reply(on_progress))
+                    LoopStep::Pending(tcp_read(self.stream, budget).then(on_progress))
                 }
             }
             Err(error) => LoopStep::Failed(error),
@@ -324,6 +324,7 @@ mod tests {
         type Reply = ();
         type Send = ();
         type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<Msg>;
         type Shard = tina::SingleShard;
 

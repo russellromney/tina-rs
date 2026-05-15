@@ -140,7 +140,7 @@ impl PersistService {
                 let (message, responder) = request.into_parts();
                 match message {
                     PersistRequest::Recover => snapshot_load(self.snapshot_path.clone())
-                        .reply(move |result| PersistBridgeMsg::SnapshotLoaded(result, responder)),
+                        .then(move |result| PersistBridgeMsg::SnapshotLoaded(result, responder)),
                     PersistRequest::Add(value) => {
                         if self.mutation_in_flight {
                             self.pending_mutations.push_back((value, responder));
@@ -161,11 +161,11 @@ impl PersistService {
                 self.values = decode_values(&snapshot.bytes);
                 self.last_journal_index = snapshot.last_journal_index;
                 journal_replay(self.journal_path.clone())
-                    .reply(move |result| PersistBridgeMsg::JournalLoaded(result, responder))
+                    .then(move |result| PersistBridgeMsg::JournalLoaded(result, responder))
             }
             PersistBridgeMsg::SnapshotLoaded(Ok(None), responder) => {
                 journal_replay(self.journal_path.clone())
-                    .reply(move |result| PersistBridgeMsg::JournalLoaded(result, responder))
+                    .then(move |result| PersistBridgeMsg::JournalLoaded(result, responder))
             }
             PersistBridgeMsg::SnapshotLoaded(Err(_), responder) => {
                 let _ = responder.respond(PersistReply { values: Vec::new() });
@@ -229,9 +229,8 @@ impl PersistService {
         let index = self.last_journal_index + 1;
         let record = value.into_bytes();
         self.mutation_in_flight = true;
-        journal_append(self.journal_path.clone(), index, record.clone()).reply(move |result| {
-            PersistBridgeMsg::MutationDurable(result, index, record, responder)
-        })
+        journal_append(self.journal_path.clone(), index, record.clone())
+            .then(move |result| PersistBridgeMsg::MutationDurable(result, index, record, responder))
     }
 
     fn append_next_pending(&mut self) -> Effect<Self> {

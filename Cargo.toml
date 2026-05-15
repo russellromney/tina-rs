@@ -16,6 +16,7 @@ members = [
     "tina-tokio-bridge",
     "tina-tower-bridge",
     "tina-tracing",
+    "tina-aws-bridge",
 ]
 exclude = [
     "examples/specimen_real_io_chat",
@@ -55,6 +56,7 @@ exclude = [
     "examples/specimen_two_stage_pipeline",
     "examples/specimen_graceful_pool_shutdown",
     "examples/specimen_pool_cancel_reclaim",
+    "examples/specimen_websocket_room",
 ]
 resolver = "2"
 

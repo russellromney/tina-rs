@@ -1,6 +1,6 @@
 //! Tina side. Three isolates — A, B, C — each is its own service.
 //!
-//! - C does the slow work via `sleep(work).reply(Done)`. When `Done`
+//! - C does the slow work via `sleep(work).then(Done)`. When `Done`
 //!   fires it returns `reply(())`, completing the `IsolateCall` that
 //!   B made.
 //! - B receives the request from A. The request carries a
@@ -55,7 +55,7 @@ impl ServiceC {
                 } else {
                     Duration::from_millis(FAST_C_MS)
                 };
-                sleep(work).reply(CMsg::Done)
+                sleep(work).then(CMsg::Done)
             }
             // The sleep is plain time; pattern-match on the canonical
             // reply alias so a cancelled timer (runtime shutdown)
@@ -99,7 +99,7 @@ impl ServiceB {
                 // is left. Expired deadline -> `Duration::ZERO`, which
                 // surfaces as `CallOutcome::Timeout`.
                 let timeout = deadline.remaining_or_zero(ctx.now());
-                call(self.c_addr, CMsg::Compute { iteration }, timeout).reply(BMsg::CDone)
+                call(self.c_addr, CMsg::Compute { iteration }, timeout).then(BMsg::CDone)
             }
             BMsg::CDone(outcome) => match outcome {
                 CallOutcome::Replied(()) => reply(BReply::Ok),
@@ -152,7 +152,7 @@ impl ServiceA {
                     // specimen exists to teach.
                     self.budget + Duration::from_millis(50),
                 )
-                .reply(AMsg::BDone)
+                .then(AMsg::BDone)
             }
             AMsg::BDone(outcome) => match outcome {
                 CallOutcome::Replied(BReply::Ok) => reply(AReply::Success),
@@ -219,7 +219,7 @@ impl Driver {
             },
             self.deadline + Duration::from_millis(50),
         )
-        .reply(DriverMsg::ADone)
+        .then(DriverMsg::ADone)
     }
 }
 

@@ -58,13 +58,14 @@ impl Isolate for Driver {
                 pool,
                 outbound,
                 timeout,
-            } => call(pool, HttpPoolMsg::Submit(outbound), timeout).reply(DriverMsg::Returned),
+            } => call(pool, HttpPoolMsg::Submit(outbound), timeout).then(DriverMsg::Returned),
             DriverMsg::Returned(outcome) => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                    CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
                 let _ = self.sender.send(result);
                 stop()

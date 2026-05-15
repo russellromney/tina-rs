@@ -13,15 +13,30 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
-use tina_runtime::{RuntimeEventKind, SendRejectedReason};
+use tina::{IsolateId, ShardId};
+use tina_runtime::{EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
 use tina_sim::dst::{
-    ReplayCase, ReplayConfig, ReplayReport, assert_replay_case, check_replay_case,
+    LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport,
+    RuntimeEventKindName, ShrinkConfig, TraceProjection, assert_replay_case, check_captured_replay,
+    check_replay_case, discover_constants, read_saved_replay_case, shrink_replay_case,
+    write_saved_replay_case,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
 const SOURCE_ROLE: &str = "source";
 const SINK_ROLE: &str = "sink";
+
+fn fake_event(id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
+    RuntimeEvent::new(
+        EventId::new(id),
+        None,
+        ShardId::new(0),
+        IsolateId::new(1),
+        kind,
+    )
+}
 
 /// Operation alphabet for the burst-overflow case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +45,25 @@ enum Op {
     Burst { size: u32 },
     /// Drain the simulator one step.
     Step,
+}
+
+fn encode_op(op: &Op) -> String {
+    match op {
+        Op::Burst { size } => format!("burst:{size}"),
+        Op::Step => "step".to_owned(),
+    }
+}
+
+fn decode_op(text: &str) -> Result<Op, String> {
+    if text == "step" {
+        return Ok(Op::Step);
+    }
+    let Some(size) = text.strip_prefix("burst:") else {
+        return Err(format!("unknown op {text:?}"));
+    };
+    Ok(Op::Burst {
+        size: size.parse::<u32>().map_err(|error| error.to_string())?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +186,25 @@ fn run_burst_overflow_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
     ReplayReport::from_case_and_events(case, trace, output)
 }
 
+fn run_burst_overflow_live_replay(
+    case: &ReplayCase<Op>,
+) -> Result<LiveReplayReport<Output>, tina_sim::dst::TraceProjectionError> {
+    let report = run_burst_overflow_case(case);
+    let fact = http1_keepalive_body_pressure_fact(&report.output);
+    Ok(LiveReplayReport::exact(report).with_live_fact(fact))
+}
+
+fn http1_keepalive_body_pressure_fact(output: &Output) -> LiveReplayFact {
+    LiveReplayFact::capacity_surface(&CapacitySurfaceReport::count(
+        "http1.keepalive.body-pressure.sink-mailbox",
+        CapacityMode::Fixed,
+        2,
+        0,
+        2,
+        output.full_rejections as u64,
+    ))
+}
+
 /// Two bursts of 4 messages into a sink with capacity 2 produce
 /// deterministic `SendRejected::Full` events. With 1-in-2 local-send
 /// delay perturbing delivery rounds, the trace has a stable shape but
@@ -168,12 +221,12 @@ fn burst_overflow_case() -> ReplayCase<Op> {
         .with_mailbox(SOURCE_ROLE, 8)
         .with_mailbox(SINK_ROLE, 2);
     ReplayCase::new(
-        "burst overflow under local-send delay",
+        "http1 keepalive body pressure under local-send delay",
         7,
         config,
-        "two bursts of 4 sends into a capacity-2 sink under seeded local-send delay",
+        "HTTP/1 keepalive/body-pressure shaped run: two explicit app bursts into a capacity-2 sink under seeded local-send delay",
         vec![Op::Burst { size: 4 }, Op::Step, Op::Burst { size: 4 }],
-        "mailbox full produces SendRejected{ reason: Full } that the trace records",
+        "body-pressure capture records capacity high-water/full facts and SendRejected{ reason: Full }",
     )
     .expecting(BURST_OVERFLOW_EVENT_COUNT, BURST_OVERFLOW_TRACE_HASH)
 }
@@ -237,6 +290,247 @@ fn check_replay_case_reports_drift_when_constants_are_stale() {
     assert!(mismatch.count_diverged());
     assert!(mismatch.hash_diverged());
     let rendered = mismatch.to_string();
-    assert!(rendered.contains("burst overflow"));
+    assert!(rendered.contains("http1 keepalive body pressure"));
     assert!(rendered.contains("next step"));
+}
+
+fn capture_burst_overflow() -> LiveReplayCapture<Op> {
+    let case = burst_overflow_case();
+    let report = run_burst_overflow_case(&case);
+    let fact = http1_keepalive_body_pressure_fact(&report.output);
+    LiveReplayCapture::from_case_and_report(
+        &case,
+        "HTTP/1 keepalive/body pressure live-shaped capture",
+        &report,
+    )
+    .with_live_fact(fact)
+}
+
+#[test]
+fn captured_pressure_case_replays_in_simulator() {
+    let capture = capture_burst_overflow();
+    let case = capture.to_replay_case();
+    let report = check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
+        .expect("captured pressure facts replay in sim");
+    assert_eq!(
+        report.replay.output.full_rejections,
+        BURST_OVERFLOW_FULL_REJECTIONS
+    );
+    assert_eq!(report.replay.event_count, capture.expected.event_count);
+    assert_eq!(report.replay.trace_hash, capture.expected.trace_hash);
+}
+
+#[test]
+fn changed_config_invalidates_captured_pressure_replay() {
+    let capture = capture_burst_overflow();
+    let mut changed = capture.to_replay_case();
+    changed.config = changed.config.clone().with_mailbox(SINK_ROLE, 3);
+
+    let mismatch = check_captured_replay(&capture, &changed, run_burst_overflow_live_replay)
+        .expect_err("changed mailbox capacity must invalidate captured replay");
+    let rendered = mismatch.to_string();
+    assert!(rendered.contains("config"));
+    assert!(rendered.contains("events:"));
+    assert!(rendered.contains("hash:"));
+    assert!(rendered.contains("invariant:"));
+}
+
+#[test]
+fn captured_http1_body_pressure_case_saves_and_converts() {
+    let capture = capture_burst_overflow();
+    let path = std::env::temp_dir().join(format!(
+        "tina-http1-body-pressure-{}-{}.case",
+        std::process::id(),
+        capture.expected.trace_hash
+    ));
+
+    write_saved_replay_case(&path, &capture, encode_op).expect("write saved replay case");
+    let saved = read_saved_replay_case(&path, decode_op).expect("read saved replay case");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(saved.name, capture.name);
+    assert_eq!(saved.history, capture.history.operations());
+    assert_eq!(saved.live_facts.len(), capture.live_facts.len());
+    assert!(
+        saved
+            .live_facts
+            .iter()
+            .any(|fact| fact.contains("http1.keepalive.body-pressure"))
+    );
+
+    let case = saved
+        .to_replay_case(
+            capture.name,
+            capture.config.clone(),
+            capture.scenario,
+            capture.invariant,
+        )
+        .expect("saved config hash matches typed config");
+    check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
+        .expect("saved captured case converts back to replay");
+}
+
+#[test]
+fn discover_constants_prints_multiple_pressure_cases() {
+    let baseline = burst_overflow_case();
+    let mut changed_seed = ReplayCase::new(
+        baseline.name,
+        baseline.seed + 1,
+        baseline.config.clone(),
+        baseline.scenario,
+        baseline.history.operations().to_vec(),
+        baseline.invariant,
+    );
+    changed_seed.expected_event_count = 0;
+    changed_seed.expected_trace_hash = 0;
+
+    let rows = discover_constants(
+        [
+            ("burst_overflow_seed_7", baseline),
+            ("burst_overflow_seed_8", changed_seed),
+        ],
+        run_burst_overflow_case,
+    );
+
+    assert_eq!(rows.len(), 2);
+    let printed = rows
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert!(printed.contains("// burst_overflow_seed_7"));
+    assert!(printed.contains("// burst_overflow_seed_8"));
+    assert!(printed.matches("expected_event_count:").count() == 2);
+    assert!(printed.matches("expected_trace_hash:").count() == 2);
+}
+
+#[test]
+fn live_replay_capture_includes_config_topology_and_mailboxes() {
+    let capture = capture_burst_overflow();
+    assert_eq!(capture.config.mailbox(SOURCE_ROLE), 8);
+    assert_eq!(capture.config.mailbox(SINK_ROLE), 2);
+    assert!(capture.topology_roles.contains(&SOURCE_ROLE));
+    assert!(capture.topology_roles.contains(&SINK_ROLE));
+}
+
+#[test]
+fn live_replay_same_capture_converts_to_same_case_twice() {
+    let capture = capture_burst_overflow();
+    let first = capture.to_replay_case();
+    let second = capture.to_replay_case();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn live_replay_unsupported_fact_is_reported_fail_closed() {
+    let capture = capture_burst_overflow().with_unsupported_fact(
+        "reqwest completion body bytes",
+        "bridge did not materialize the body as a replay op",
+    );
+    let case = capture.to_replay_case();
+    let mismatch = check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
+        .expect_err("unsupported live facts must fail closed");
+    let rendered = mismatch.to_string();
+    assert!(rendered.contains("unsupported fact"));
+    assert!(rendered.contains("reqwest completion body bytes"));
+}
+
+#[test]
+fn live_replay_unknown_event_kind_fails_closed_when_not_named_by_projection() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event(1, RuntimeEventKind::HandlerStarted),
+        fake_event(
+            2,
+            RuntimeEventKind::SendRejected {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(2),
+                target_generation: tina::AddressGeneration::new(0),
+                reason: SendRejectedReason::Full,
+            },
+        ),
+    ];
+    let projection = TraceProjection::Projected {
+        included: vec![RuntimeEventKindName::SendRejected],
+        ignored: Vec::new(),
+    };
+
+    let err = LiveReplayCapture::from_events_with_options(
+        case.name,
+        case.seed,
+        case.config.clone(),
+        case.scenario,
+        case.history.operations().to_vec(),
+        case.invariant,
+        "live trace with unnamed event",
+        &events,
+        projection,
+        Vec::new(),
+    )
+    .expect_err("HandlerStarted was not named by projection");
+    assert!(err.to_string().contains("not named as included or ignored"));
+}
+
+#[test]
+fn live_replay_projected_comparison_names_ignored_event_kinds() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event(1, RuntimeEventKind::HandlerStarted),
+        fake_event(
+            2,
+            RuntimeEventKind::SendRejected {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(2),
+                target_generation: tina::AddressGeneration::new(0),
+                reason: SendRejectedReason::Full,
+            },
+        ),
+    ];
+    let projection = TraceProjection::Projected {
+        included: vec![RuntimeEventKindName::SendRejected],
+        ignored: vec![RuntimeEventKindName::HandlerStarted],
+    };
+    let capture = LiveReplayCapture::from_events_with_options(
+        case.name,
+        case.seed,
+        case.config.clone(),
+        case.scenario,
+        case.history.operations().to_vec(),
+        case.invariant,
+        "projected live trace",
+        &events,
+        projection.clone(),
+        Vec::new(),
+    )
+    .expect("projection names every event kind");
+    let replay_case = capture.to_replay_case();
+    let report = check_captured_replay(&capture, &replay_case, |_| {
+        LiveReplayReport::from_case_and_events(&replay_case, &events, (), projection.clone())
+    })
+    .expect("projected replay matches");
+    assert_eq!(
+        report.projection.ignored(),
+        &[RuntimeEventKindName::HandlerStarted]
+    );
+}
+
+#[test]
+fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
+    let capture = capture_burst_overflow();
+    let case = capture.to_replay_case();
+    let report = shrink_replay_case(
+        &case,
+        ShrinkConfig::default(),
+        "at least one full rejection remains",
+        run_burst_overflow_case,
+        |report| report.output.full_rejections >= 1,
+    );
+    assert_eq!(
+        report.shrunk_case.expected_event_count,
+        report.shrunk_report.event_count
+    );
+    assert_eq!(
+        report.shrunk_case.expected_trace_hash,
+        report.shrunk_report.trace_hash
+    );
 }

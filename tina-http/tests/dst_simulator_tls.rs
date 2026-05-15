@@ -70,13 +70,14 @@ impl Isolate for Driver {
                 request,
                 timeout,
             } => call(client, HttpClientMsg::call(target, request), timeout)
-                .reply(DriverMsg::Returned),
+                .then(DriverMsg::Returned),
             DriverMsg::Returned(outcome) => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                    CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
                 *self.observed.borrow_mut() = Some(result);
                 stop()
@@ -192,7 +193,9 @@ fn https_client_replays_through_scripted_tls() {
     assert_eq!(response.status, StatusCode::OK);
     let body = match &response.body {
         HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_) | HttpResponseBody::ChunkedStream(_) => Vec::new(),
+        HttpResponseBody::Stream(_)
+        | HttpResponseBody::ChunkedStream(_)
+        | HttpResponseBody::WebSocket(_) => Vec::new(),
     };
     assert_eq!(body, b"hello");
 }

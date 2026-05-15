@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use http::StatusCode;
+use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
     BodyMetrics, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
@@ -49,11 +50,21 @@ impl Isolate for SlowChunkProducer {
 
     fn handle(
         &mut self,
-        _msg: ResponseChunkMsg,
+        msg: ResponseChunkMsg,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(self.next_chunk(msg))
+    }
+
+    fn handle_call(&mut self, msg: ResponseChunkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.next_chunk(msg))
+    }
+}
+
+impl SlowChunkProducer {
+    fn next_chunk(&mut self, _msg: ResponseChunkMsg) -> ResponseChunkReply {
         if self.yielded >= self.total_chunks {
-            return reply(ResponseChunkReply::Eof);
+            return ResponseChunkReply::Eof;
         }
         // Mark progress so the test knows streaming actually began.
         self.saw_progress.store(true, Ordering::Release);
@@ -63,16 +74,29 @@ impl Isolate for SlowChunkProducer {
         // runtime's chunked write loop pauses while this thread
         // sleeps. Real backpressure would race a sleep call.
         std::thread::sleep(self.inter_chunk_pause);
-        reply(ResponseChunkReply::Chunk(vec![
-            (i % 251) as u8;
-            self.chunk_size
-        ]))
+        ResponseChunkReply::Chunk(vec![(i % 251) as u8; self.chunk_size])
     }
 }
 
 struct StreamingService {
     producer: Address<ResponseChunkMsg, ResponseChunkReply>,
     content_length: usize,
+}
+
+impl StreamingService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        if request.path == "/big" {
+            HttpResponse::with_stream(
+                StatusCode::OK,
+                ResponseStream {
+                    content_length: self.content_length,
+                    source: self.producer,
+                },
+            )
+        } else {
+            HttpResponse::not_found()
+        }
+    }
 }
 
 impl Isolate for StreamingService {
@@ -90,18 +114,11 @@ impl Isolate for StreamingService {
         request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = if request.path == "/big" {
-            HttpResponse::with_stream(
-                StatusCode::OK,
-                ResponseStream {
-                    content_length: self.content_length,
-                    source: self.producer,
-                },
-            )
-        } else {
-            HttpResponse::not_found()
-        };
-        reply(response)
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
     }
 }
 

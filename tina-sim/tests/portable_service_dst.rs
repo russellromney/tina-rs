@@ -41,11 +41,18 @@ struct Request {
     body: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum WorkerMsg {
     Work(Request),
     Audited(SendOutcome, Request),
+    AuditedForCall(tina::RequestContext<WorkerReply>, SendOutcome, Request),
     Durable(Result<(), CallError>, Request, u64),
+    DurableForCall(
+        tina::RequestContext<WorkerReply>,
+        Result<(), CallError>,
+        Request,
+        u64,
+    ),
     Stop,
     Panic,
 }
@@ -70,6 +77,22 @@ struct Worker {
     shard = DstShard
 )]
 impl Worker {
+    fn handle_call(&mut self, msg: WorkerMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            WorkerMsg::Work(request) => {
+                let req = call.into_request_context();
+                send_observed(self.audit, AuditMsg::Record(request.key))
+                    .then(move |outcome| WorkerMsg::AuditedForCall(req, outcome, request))
+            }
+            WorkerMsg::Audited(_, _)
+            | WorkerMsg::AuditedForCall(_, _, _)
+            | WorkerMsg::Durable(_, _, _)
+            | WorkerMsg::DurableForCall(_, _, _, _)
+            | WorkerMsg::Stop
+            | WorkerMsg::Panic => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(
         &mut self,
         msg: WorkerMsg,
@@ -77,7 +100,7 @@ impl Worker {
     ) -> Effect<Self> {
         match msg {
             WorkerMsg::Work(request) => send_observed(self.audit, AuditMsg::Record(request.key))
-                .reply(move |outcome| WorkerMsg::Audited(outcome, request)),
+                .then(move |outcome| WorkerMsg::Audited(outcome, request)),
             WorkerMsg::Audited(SendOutcome::Accepted, request) => {
                 let index = self.next_index;
                 journal_append(
@@ -85,7 +108,7 @@ impl Worker {
                     index,
                     format!("{}:{}", request.key, request.body).into_bytes(),
                 )
-                .reply(move |result| WorkerMsg::Durable(result, request, index))
+                .then(move |result| WorkerMsg::Durable(result, request, index))
             }
             WorkerMsg::Audited(SendOutcome::Full, _) => {
                 reply(WorkerReply::DurableFailure(CallError::TargetFull))
@@ -93,11 +116,33 @@ impl Worker {
             WorkerMsg::Audited(SendOutcome::Closed, _) => {
                 reply(WorkerReply::DurableFailure(CallError::TargetClosed))
             }
+            WorkerMsg::AuditedForCall(req, SendOutcome::Accepted, request) => {
+                let index = self.next_index;
+                journal_append(
+                    self.journal_path.clone(),
+                    index,
+                    format!("{}:{}", request.key, request.body).into_bytes(),
+                )
+                .then(move |result| WorkerMsg::DurableForCall(req, result, request, index))
+            }
+            WorkerMsg::AuditedForCall(req, SendOutcome::Full, _) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetFull))
+            }
+            WorkerMsg::AuditedForCall(req, SendOutcome::Closed, _) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
             WorkerMsg::Durable(Ok(()), request, index) => {
                 self.next_index = index + 1;
                 reply(WorkerReply::Stored(request.key))
             }
             WorkerMsg::Durable(Err(error), _, _) => reply(WorkerReply::DurableFailure(error)),
+            WorkerMsg::DurableForCall(req, Ok(()), request, index) => {
+                self.next_index = index + 1;
+                tina::reply_to_request(req, WorkerReply::Stored(request.key))
+            }
+            WorkerMsg::DurableForCall(req, Err(error), _, _) => {
+                tina::reply_to_request(req, WorkerReply::DurableFailure(error))
+            }
             WorkerMsg::Stop => stop(),
             WorkerMsg::Panic => panic!("baobab dst worker panic"),
         }
@@ -168,7 +213,7 @@ impl Router {
                     WorkerMsg::Work(request.clone()),
                     Duration::from_millis(10),
                 )
-                .reply(move |outcome| RouterMsg::Returned(request, outcome))
+                .then(move |outcome| RouterMsg::Returned(request, outcome))
             }
             RouterMsg::Returned(request, outcome) => {
                 match outcome {
@@ -181,6 +226,7 @@ impl Router {
                     }
                     CallOutcome::Full => self.rejected.borrow_mut().push("full"),
                     CallOutcome::Closed => self.rejected.borrow_mut().push("closed"),
+                    CallOutcome::Rejected(_) => self.rejected.borrow_mut().push("rejected"),
                     CallOutcome::Timeout => self.rejected.borrow_mut().push("timeout"),
                 }
                 noop()
@@ -461,14 +507,14 @@ fn shard_failure_case() -> ReplayCase<ServiceOp> {
 }
 
 // Saved constants. Refresh only after a conscious trace-shape review.
-const PORTABLE_SERVICE_EVENT_COUNT: usize = 128;
-const PORTABLE_SERVICE_TRACE_HASH: u64 = 0x3d79_b063_5b08_cc75;
-const AUDIT_FULL_EVENT_COUNT: usize = 22;
-const AUDIT_FULL_TRACE_HASH: u64 = 0x73e4_304f_3390_e1bd;
-const REQUESTER_STOP_EVENT_COUNT: usize = 33;
-const REQUESTER_STOP_TRACE_HASH: u64 = 0x6691_d195_3fe8_1bab;
-const SHARD_FAILURE_EVENT_COUNT: usize = 48;
-const SHARD_FAILURE_TRACE_HASH: u64 = 0x390e_3a0f_ef2f_1cdc;
+const PORTABLE_SERVICE_EVENT_COUNT: usize = 134;
+const PORTABLE_SERVICE_TRACE_HASH: u64 = 0x1beb_eb26_d1a1_69a3;
+const AUDIT_FULL_EVENT_COUNT: usize = 24;
+const AUDIT_FULL_TRACE_HASH: u64 = 0x7cfb_6039_e836_ca0e;
+const REQUESTER_STOP_EVENT_COUNT: usize = 35;
+const REQUESTER_STOP_TRACE_HASH: u64 = 0xa24d_9463_adea_9ba8;
+const SHARD_FAILURE_EVENT_COUNT: usize = 50;
+const SHARD_FAILURE_TRACE_HASH: u64 = 0x6467_a615_675e_37e0;
 
 #[test]
 fn portable_service_dst_replays_whole_service_history() {

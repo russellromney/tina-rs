@@ -111,7 +111,7 @@ impl TimerDriver {
     ) -> Effect<Self> {
         match msg {
             TimerMsg::After(value) => sleep(Duration::from_millis(1 + u64::from(value % 5)))
-                .reply(move |_| TimerMsg::Elapsed(value)),
+                .then(move |_| TimerMsg::Elapsed(value)),
             TimerMsg::Elapsed(value) => send(self.target, TargetMsg::Data(value)),
         }
     }
@@ -320,7 +320,9 @@ enum CrossCallWorkerMsg {
 }
 
 #[derive(Debug)]
-struct CrossCallWorker;
+struct CrossCallWorker {
+    held: Vec<tina::DeferredReply<CrossCallReply>>,
+}
 
 #[tina_runtime::isolate(
     message = CrossCallWorkerMsg,
@@ -328,14 +330,28 @@ struct CrossCallWorker;
     shard = RandomShard
 )]
 impl CrossCallWorker {
+    fn handle_call(
+        &mut self,
+        msg: CrossCallWorkerMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            CrossCallWorkerMsg::Reply(value) => call.reply(CrossCallReply(value.wrapping_add(1))),
+            CrossCallWorkerMsg::NoReply => {
+                self.held.push(call.into_request_context().into_deferred());
+                noop()
+            }
+            CrossCallWorkerMsg::Stop => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(
         &mut self,
         msg: CrossCallWorkerMsg,
         _ctx: &mut Context<'_, RandomShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            CrossCallWorkerMsg::Reply(value) => reply(CrossCallReply(value.wrapping_add(1))),
-            CrossCallWorkerMsg::NoReply => noop(),
+            CrossCallWorkerMsg::Reply(_) | CrossCallWorkerMsg::NoReply => noop(),
             CrossCallWorkerMsg::Stop => stop(),
         }
     }
@@ -373,27 +389,27 @@ impl CrossCallClient {
                 CrossCallWorkerMsg::Reply(value),
                 Duration::from_millis(8),
             )
-            .reply(CrossCallClientMsg::Returned),
+            .then(CrossCallClientMsg::Returned),
             CrossCallClientMsg::Burst(value) => batch([
                 call(
                     self.worker,
                     CrossCallWorkerMsg::Reply(value),
                     Duration::from_millis(8),
                 )
-                .reply(CrossCallClientMsg::Returned),
+                .then(CrossCallClientMsg::Returned),
                 call(
                     self.worker,
                     CrossCallWorkerMsg::Reply(value.wrapping_add(1)),
                     Duration::from_millis(8),
                 )
-                .reply(CrossCallClientMsg::Returned),
+                .then(CrossCallClientMsg::Returned),
             ]),
             CrossCallClientMsg::NoReply(value) => call(
                 self.worker,
                 CrossCallWorkerMsg::NoReply,
                 Duration::from_millis(1 + u64::from(value % 3)),
             )
-            .reply(CrossCallClientMsg::Returned),
+            .then(CrossCallClientMsg::Returned),
             CrossCallClientMsg::StopWorker => send(self.worker, CrossCallWorkerMsg::Stop),
             CrossCallClientMsg::Returned(outcome) => {
                 self.outcomes.borrow_mut().push(outcome);
@@ -577,7 +593,7 @@ fn run_random_cross_shard_call_history(
     let worker = sim
         .register_with_capacity_on::<CrossCallWorker, CrossCallWorkerMsg, Infallible>(
             ShardId::new(374),
-            CrossCallWorker,
+            CrossCallWorker { held: Vec::new() },
             2,
         )
         .with_reply::<CrossCallReply>();
@@ -796,6 +812,7 @@ fn seeded_random_cross_shard_call_histories_replay_and_cover_reply_paths() {
                 CallOutcome::Timeout => saw_timeout = true,
                 CallOutcome::Full => saw_full = true,
                 CallOutcome::Closed => saw_closed = true,
+                CallOutcome::Rejected(_) => saw_closed = true,
             }
         }
 

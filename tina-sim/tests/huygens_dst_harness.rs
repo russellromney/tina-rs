@@ -74,7 +74,7 @@ impl Isolate for Parent {
                 if self.observations.borrow().len() == 1 {
                     send(child, ChildMsg::PanicOnce)
                 } else {
-                    sleep(Duration::from_millis(5)).reply(|_| ParentMsg::RetryElapsed)
+                    sleep(Duration::from_millis(5)).then(|_| ParentMsg::RetryElapsed)
                 }
             }
             ParentMsg::RetryElapsed => {

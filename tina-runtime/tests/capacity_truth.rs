@@ -45,7 +45,7 @@ impl Caller {
             CallerMsg::Begin => {
                 let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.fanout as usize);
                 for _ in 0..self.fanout {
-                    effects.push(sleep(Duration::ZERO).reply(|_| CallerMsg::SleepDone));
+                    effects.push(sleep(Duration::ZERO).then(|_| CallerMsg::SleepDone));
                 }
                 batch(effects)
             }
@@ -154,7 +154,7 @@ impl ObsCaller {
                 let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.burst as usize);
                 for n in 0..self.burst {
                     effects.push(
-                        send_observed(self.fanout, NoiseMsg::Tick(n)).reply(|_| ObsMsg::Outcome),
+                        send_observed(self.fanout, NoiseMsg::Tick(n)).then(|_| ObsMsg::Outcome),
                     );
                 }
                 batch(effects)

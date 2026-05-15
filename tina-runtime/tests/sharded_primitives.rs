@@ -1225,7 +1225,7 @@ impl Isolate for ScatterCoordObs {
                         Ok(address) => {
                             self.pending_replies.push(shard);
                             effects.push(
-                                send_observed(address, CounterMsg::Get { reply_to: bridge }).reply(
+                                send_observed(address, CounterMsg::Get { reply_to: bridge }).then(
                                     move |outcome| ScatterCoordObsMsg::SendOutcome {
                                         shard,
                                         outcome,

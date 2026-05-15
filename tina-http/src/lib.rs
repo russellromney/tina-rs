@@ -1,5 +1,6 @@
-//! Native HTTP/1.1 and HTTPS/1.1 for tina-rs. No Tokio edge. No
-//! pipelining, no `Expect: 100-continue`.
+//! Native HTTP/1.1, HTTPS/1.1, and a first-form cleartext HTTP/2
+//! server for tina-rs. No Tokio edge. No HTTP/1 pipelining, no
+//! `Expect: 100-continue`.
 //!
 //! # Body model
 //!
@@ -42,7 +43,10 @@
 //! Attach a [`BodyMetrics`] to either listener via
 //! `with_metrics(metrics.clone())` to record request/response
 //! bytes resident, peak high-water, body-cap full counts, and
-//! body IO/timeout error counts.
+//! body IO/timeout error counts. `BodyMetrics::with_body_capacity`
+//! additionally enables two weighted capacity surfaces
+//! (`request` and `response` body bytes) charged to one
+//! shard-local shared scope.
 //! [`BodyPressureReport::drained`] is the "no-leak" terminal
 //! assertion. A shared capacity-report shape lives in a separate
 //! slice; this report folds into it when that ships.
@@ -67,9 +71,46 @@
 //! concurrency — see [`HttpsServerConfig`] for the lane-yield
 //! trade-off.
 //!
-//! Out of scope: HTTP/2, ALPN, ACME, mTLS, SNI routing, system roots,
-//! certificate reload, redirects, cookies. For mature outbound
-//! web-client behaviour use the `tina-reqwest-bridge` crate.
+//! HTTP/2: [`Http2Listener`] is a prior-knowledge cleartext h2c
+//! server first form. It owns the TCP stream, frame parsing, bounded
+//! stream table, connection/stream flow-control windows, reset/close
+//! outcomes, and service dispatch to the same [`HttpRequest`] /
+//! [`HttpResponse`] shape where honest. Request and response bodies are
+//! buffered under explicit byte caps for ordinary unary services.
+//! gRPC requests can be exposed through an HTTP/2 pull source, and
+//! responses can stream from Tina chunk sources with DATA flow-control
+//! and real trailers. It is not an HTTPS/2 or ALPN claim, not a full
+//! client, and not a full RFC feature clone.
+//!
+//! gRPC: [`GrpcRouter`] layers unary plus first server-streaming and
+//! client-streaming `prost` messages with typed [`GrpcStatus`] trailers
+//! on that HTTP/2 h2c server. It rejects compression, caps message
+//! bytes before protobuf decode, maps service call timeout to
+//! `DeadlineExceeded`, and keeps bidirectional streaming, interceptors,
+//! reflection, production pooled clients, and TLS ALPN out of this
+//! first form.
+//!
+//! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
+//! upgrades for [`HttpListener`] and [`HttpsListener`]. After the
+//! `101 Switching Protocols` response, the same connection isolate owns
+//! the upgraded TCP/TLS stream. The 087 echo path remains:
+//! handle `WebSocketSessionMsg::Text` and reply with
+//! `WebSocketSessionOutcome::Text`. Room/fanout code can instead store
+//! the `WebSocketSessionHandle` from `WebSocketSessionMsg::SessionOpen`
+//! and route bounded sends back through the session owner with
+//! `handle.text_effect::<Room>("...", timeout)`. Room/admin code can send
+//! `WebSocketSessionMsg::Shutdown` to close stored handles through the same
+//! bounded owner path. Upgrade code can inspect
+//! `WebSocketUpgradeRequest::offered_subprotocols()` and select a protocol
+//! with `accept_subprotocol(...)`. Data fragmentation is reassembled under
+//! `max_message_bytes`, with control frames allowed between fragments. There is
+//! no permessage-deflate compression or native broad client in this slice;
+//! extension offers are visible and ignored unless a future slice explicitly
+//! negotiates one.
+//!
+//! Still out of scope: HTTP/2 TLS ALPN, ACME, mTLS, SNI routing,
+//! system roots, certificate reload, redirects, cookies. For mature
+//! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -77,6 +118,8 @@ pub mod body_metrics;
 pub mod chunked_decoder;
 pub mod client;
 pub mod connection;
+pub mod grpc;
+pub mod http2;
 pub mod keepalive;
 pub mod listener;
 pub mod listener_tls;
@@ -88,13 +131,26 @@ pub mod streaming;
 pub mod target;
 pub mod transport;
 pub mod types;
+pub mod websocket;
 
-pub use body_metrics::{BodyMetrics, BodyPressureReport};
+pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
+pub use grpc::{
+    GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
+    GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
+    decode_streaming_request, decode_unary_request, encode_grpc_message, grpc_unary_call_h2c,
+};
+pub use http2::{
+    Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
+    Http2Listener, Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig,
+    Http2StreamReport, Http2StreamState,
+};
 pub use keepalive::{
-    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveOutcome,
-    KeepalivePoolHandles, OriginKey, build_keepalive_pool,
+    KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,
+    KeepaliveConnectionStopOutcome, KeepaliveOutcome, KeepalivePoolCloseOutcome,
+    KeepalivePoolDrainOutcome, KeepalivePoolHandles, KeepalivePoolShutdownReport, OriginKey,
+    build_keepalive_pool, shutdown_keepalive_pool,
 };
 pub use listener::{HttpListener, HttpListenerMsg};
 pub use listener_tls::{
@@ -118,8 +174,8 @@ pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
 // need a public name since there is no `with_chunked_stream`
 // equivalent — `stream_chunked` is the only constructor.
 pub use streaming::{
-    IterBodySource, RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply,
-    ResponseStream,
+    Http2RequestStream, IterBodySource, RequestChunkReply, RequestStream, ResponseChunkMsg,
+    ResponseChunkReply, ResponseStream,
 };
 pub use target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
 pub use transport::HttpTransport;
@@ -127,6 +183,13 @@ pub use types::{
     HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody, HttpResponse,
     HttpResponseBody, HttpServerConfig, HttpTransportPhase, PoolConfig, RequestParseError,
     ResponseParseError,
+};
+pub use websocket::{
+    WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketLimits, WebSocketMessage,
+    WebSocketOutboundQueue, WebSocketReportRequest, WebSocketSend, WebSocketSendError,
+    WebSocketSendOutcome, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
+    WebSocketSessionOutcome, WebSocketSessionReport, WebSocketSessionReportOutcome,
+    WebSocketUpgradeRequest, websocket_upgrade,
 };
 
 // Re-exports from the `http` crate for convenient `tina_http::Method`,

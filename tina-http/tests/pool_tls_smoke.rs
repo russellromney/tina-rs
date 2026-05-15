@@ -113,13 +113,14 @@ impl Isolate for Driver {
                 pool,
                 outbound,
                 timeout,
-            } => call(pool, HttpPoolMsg::Submit(outbound), timeout).reply(DriverMsg::Returned),
+            } => call(pool, HttpPoolMsg::Submit(outbound), timeout).then(DriverMsg::Returned),
             DriverMsg::Returned(outcome) => {
                 let result = match outcome {
                     CallOutcome::Replied(inner) => inner,
                     CallOutcome::Full => Err(HttpClientError::Busy),
                     CallOutcome::Closed => Err(HttpClientError::Closed),
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
+                    CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
                 let _ = self.sender.send(result);
                 stop()
@@ -305,7 +306,9 @@ fn pool_serial_admission_works_with_https_target() {
     assert_eq!(result.status, StatusCode::OK);
     let body = match &result.body {
         HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_) | HttpResponseBody::ChunkedStream(_) => Vec::new(),
+        HttpResponseBody::Stream(_)
+        | HttpResponseBody::ChunkedStream(_)
+        | HttpResponseBody::WebSocket(_) => Vec::new(),
     };
     assert_eq!(body, b"pool-ok");
 

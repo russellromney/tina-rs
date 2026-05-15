@@ -81,7 +81,7 @@ impl Isolate for Driver {
                 KeepaliveConnectionMsg::request(request, timeout),
                 timeout,
             )
-            .reply(DriverMsg::Returned),
+            .then(DriverMsg::Returned),
             DriverMsg::Returned(outcome) => {
                 if let CallOutcome::Replied(outcome) = outcome {
                     *self.observed.borrow_mut() = Some(outcome);
@@ -184,6 +184,7 @@ fn keepalive_connection_replays_byte_identical() {
                 HttpResponseBody::Buffered(b) => b,
                 HttpResponseBody::Stream(_) => Vec::new(),
                 HttpResponseBody::ChunkedStream(_) => Vec::new(),
+                HttpResponseBody::WebSocket(_) => Vec::new(),
             };
             assert_eq!(body, b"hello");
         }

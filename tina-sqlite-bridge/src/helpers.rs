@@ -156,7 +156,7 @@ pub fn send_request(
 // Typed shorthands: request shape known at the call site.
 // ---------------------------------------------------------------------------
 
-/// Prepared `Execute` call. Use [`Self::reply`] to fold it into a
+/// Prepared `Execute` call. Use [`Self::then`] to fold it into a
 /// continuation message of your isolate's message type.
 pub struct ExecuteCall {
     inner: IsolateCall<SqliteMsg, SqliteResult>,
@@ -170,14 +170,25 @@ impl std::fmt::Debug for ExecuteCall {
 
 impl ExecuteCall {
     /// Turn this prepared call into one continuation message.
+    #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
         I: Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(SqliteExecutedOutcome) -> M + 'static,
         M: 'static,
     {
+        self.then(translator)
+    }
+
+    /// Turn this prepared call into one continuation message.
+    pub fn then<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(SqliteExecutedOutcome) -> M + 'static,
+        M: 'static,
+    {
         self.inner
-            .reply(move |raw| translator(project_executed(raw)))
+            .then(move |raw| translator(project_executed(raw)))
     }
 }
 
@@ -194,13 +205,24 @@ impl std::fmt::Debug for QueryCall {
 
 impl QueryCall {
     /// Turn this prepared call into one continuation message.
+    #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
         I: Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(SqliteRowsOutcome) -> M + 'static,
         M: 'static,
     {
-        self.inner.reply(move |raw| translator(project_rows(raw)))
+        self.then(translator)
+    }
+
+    /// Turn this prepared call into one continuation message.
+    pub fn then<I, F, M>(self, translator: F) -> Effect<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(SqliteRowsOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.inner.then(move |raw| translator(project_rows(raw)))
     }
 }
 
@@ -215,7 +237,7 @@ impl QueryCall {
 ///     vec![self.id.into()],
 ///     Duration::from_secs(2),
 /// )
-/// .reply(AppMsg::Updated),
+/// .then(AppMsg::Updated),
 ///
 /// AppMsg::Updated(outcome) => match outcome {
 ///     CallOutcome::Replied(Ok(rows_changed)) => { ... }
@@ -280,6 +302,7 @@ fn project_executed(outcome: SqliteCallOutcome) -> SqliteExecutedOutcome {
         CallOutcome::Full => CallOutcome::Full,
         CallOutcome::Closed => CallOutcome::Closed,
         CallOutcome::Timeout => CallOutcome::Timeout,
+        CallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
     }
 }
 
@@ -296,6 +319,7 @@ fn project_rows(outcome: SqliteCallOutcome) -> SqliteRowsOutcome {
         CallOutcome::Full => CallOutcome::Full,
         CallOutcome::Closed => CallOutcome::Closed,
         CallOutcome::Timeout => CallOutcome::Timeout,
+        CallOutcome::Rejected(reason) => CallOutcome::Rejected(reason),
     }
 }
 
@@ -441,5 +465,8 @@ fn classify_inner<R, T>(
         CallOutcome::Timeout => SqliteOutcomeClass::Transient(SqliteTransientReason::BridgeTimeout),
         CallOutcome::Full => SqliteOutcomeClass::Fatal(SqliteFatalReason::BridgeFull),
         CallOutcome::Closed => SqliteOutcomeClass::Fatal(SqliteFatalReason::BridgeClosed),
+        CallOutcome::Rejected(reason) => SqliteOutcomeClass::Fatal(SqliteFatalReason::Internal(
+            format!("bridge call rejected: {reason:?}"),
+        )),
     }
 }

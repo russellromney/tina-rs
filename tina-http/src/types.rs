@@ -41,8 +41,11 @@ pub enum HttpRequestBody {
     Buffered(Vec<u8>),
     /// Streaming source: the service pulls chunks via
     /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
-    /// .reply(...)` until `RequestChunkReply::Eof`.
+    /// .then(...)` until `RequestChunkReply::Eof`.
     Stream(crate::streaming::RequestStream),
+    /// HTTP/2 streaming source. Services pull chunks via
+    /// `call(stream.source, crate::Http2ConnectionMsg::body_next(), t)`.
+    Http2Stream(crate::streaming::Http2RequestStream),
 }
 
 impl HttpRequestBody {
@@ -50,7 +53,7 @@ impl HttpRequestBody {
     pub fn as_buffered(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(bytes) => Some(bytes),
-            Self::Stream(_) => None,
+            Self::Stream(_) | Self::Http2Stream(_) => None,
         }
     }
 
@@ -66,6 +69,7 @@ impl HttpRequestBody {
                     Some(s.content_length)
                 }
             }
+            Self::Http2Stream(s) => s.content_length,
         }
     }
 
@@ -73,6 +77,7 @@ impl HttpRequestBody {
         match self {
             Self::Buffered(bytes) => !bytes.is_empty(),
             Self::Stream(s) => s.chunked || s.content_length > 0,
+            Self::Http2Stream(s) => s.content_length != Some(0),
         }
     }
 }
@@ -95,7 +100,7 @@ impl PartialEq<[u8]> for HttpRequestBody {
     fn eq(&self, other: &[u8]) -> bool {
         match self {
             Self::Buffered(bytes) => bytes == other,
-            Self::Stream(_) => false,
+            Self::Stream(_) | Self::Http2Stream(_) => false,
         }
     }
 }
@@ -160,12 +165,17 @@ pub enum HttpResponseBody {
     Buffered(Vec<u8>),
     /// Streaming source with declared length. The connection isolate
     /// pulls chunks via `call(stream.source, ResponseChunkMsg::Next,
-    /// t).reply(...)` until `ResponseChunkReply::Eof`.
+    /// t).then(...)` until `ResponseChunkReply::Eof`.
     Stream(crate::streaming::ResponseStream),
     /// Streaming source with no declared length. Wire framing is
     /// `Transfer-Encoding: chunked`. Same `Next`/`Chunk`/`Eof`
     /// exchange as `Stream`; only the framing differs.
     ChunkedStream(crate::streaming::ChunkedResponseStream),
+    /// HTTP/1.1 upgrade to a Tina-owned WebSocket session. The
+    /// connection writes the `101 Switching Protocols` response and
+    /// then stops HTTP request handling; the same isolate owns the
+    /// upgraded stream as a WebSocket session.
+    WebSocket(Box<crate::websocket::WebSocketAccept>),
 }
 
 impl HttpResponseBody {
@@ -173,7 +183,7 @@ impl HttpResponseBody {
     pub fn as_buffered(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(bytes) => Some(bytes),
-            Self::Stream(_) | Self::ChunkedStream(_) => None,
+            Self::Stream(_) | Self::ChunkedStream(_) | Self::WebSocket(_) => None,
         }
     }
 
@@ -191,7 +201,7 @@ impl HttpResponseBody {
         match self {
             Self::Buffered(bytes) => Some(bytes.len()),
             Self::Stream(s) => Some(s.content_length),
-            Self::ChunkedStream(_) => None,
+            Self::ChunkedStream(_) | Self::WebSocket(_) => None,
         }
     }
 }
@@ -214,7 +224,7 @@ impl PartialEq<[u8]> for HttpResponseBody {
     fn eq(&self, other: &[u8]) -> bool {
         match self {
             Self::Buffered(bytes) => bytes == other,
-            Self::Stream(_) | Self::ChunkedStream(_) => false,
+            Self::Stream(_) | Self::ChunkedStream(_) | Self::WebSocket(_) => false,
         }
     }
 }
@@ -328,6 +338,36 @@ impl HttpResponse {
         let mut response = Self::with_status(status);
         response.body =
             HttpResponseBody::ChunkedStream(crate::streaming::ChunkedResponseStream { source });
+        response
+    }
+
+    /// Builds a `101 Switching Protocols` response that hands the
+    /// connection into the native WebSocket session loop after the
+    /// upgrade head drains.
+    pub fn websocket(accept: crate::websocket::WebSocketAccept) -> Self {
+        let mut response = Self::with_status(StatusCode::SWITCHING_PROTOCOLS);
+        response.version = Version::HTTP_11;
+        response.headers.insert(
+            http::header::UPGRADE,
+            http::HeaderValue::from_static("websocket"),
+        );
+        response.headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("Upgrade"),
+        );
+        response.headers.insert(
+            http::HeaderName::from_static("sec-websocket-accept"),
+            http::HeaderValue::from_str(accept.accept_key())
+                .expect("computed websocket accept key is header-safe"),
+        );
+        if let Some(protocol) = accept.selected_subprotocol() {
+            response.headers.insert(
+                http::HeaderName::from_static("sec-websocket-protocol"),
+                http::HeaderValue::from_str(protocol)
+                    .expect("validated websocket subprotocol is header-safe"),
+            );
+        }
+        response.body = HttpResponseBody::WebSocket(Box::new(accept));
         response
     }
 
@@ -498,7 +538,7 @@ pub struct HttpLimits {
     /// source as soon as the head parses, then pulls body bytes from
     /// the socket on demand. The service drives the pull with
     /// `call(stream.source, crate::HttpConnectionMsg::body_next(), t)
-    /// .reply(...)`; each call returns a chunk of up to `chunk_size`
+    /// .then(...)`; each call returns a chunk of up to `chunk_size`
     /// bytes (or `Eof`). The connection only issues `tcp_read` when
     /// the buffer is empty and more body is owed, so a slow service
     /// applies real backpressure to TCP reads.

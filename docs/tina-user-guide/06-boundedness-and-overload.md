@@ -94,7 +94,7 @@ impl Producer {
                 (0..n)
                     .map(|i| {
                         send_observed(self.consumer, ConsumerMsg::Item(i))
-                            .reply(ProducerMsg::Sent)
+                            .then(ProducerMsg::Sent)
                     })
                     .collect(),
             ),
@@ -141,7 +141,7 @@ Request/reply uses timeout:
 
 ```rust
 call(worker, WorkerMsg::Run(job), Duration::from_millis(20))
-    .reply(ClientMsg::Done)
+    .then(ClientMsg::Done)
 ```
 
 Handle timeout as normal behavior.
@@ -189,10 +189,22 @@ unknown -> measured -> fixed
 - `CapacityMode::Fixed` — measured cap. Use in production.
 - `CapacityMode::Tuning` — discovery cap. Still hard. The flag
   surfaces high water loudly.
-- `CapacityPolicy::{Development, Test, Production}` — placeholder
-  for which modes pass validation. Today all pass.
+- `CapacityMode::UnboundedForNow { reason, expires_at }` —
+  temporary unbounded mode. The helper
+  `CapacityMode::unbounded_for_now(reason)` expires in one hour.
+  Production rejects it.
+- `CapacityMode::unbounded_without_expiry_i_know_this_is_bad(reason)`
+  — ugly escape hatch, development-only by default.
+- `CapacityPolicy::{Development, Test, Production}` — validates
+  which modes pass.
 - `CapacitySurfaceReport` — one snapshot per bounded surface:
-  name, mode, cap, current, high water, full count.
+  name, mode, count cap/current/high/full, optional weight
+  cap/current/high/full, and optional shard-local shared-scope
+  weight fields.
+
+Count is number of things. Weight is user-declared cost. Tina does
+not infer heap memory, and discovery lines should not be read as
+exact allocator claims.
 
 `tina-runtime`:
 
@@ -294,6 +306,25 @@ The `suggest=` hint is advice. Read it, decide, freeze.
 configure pool with `Tuning`, drive load, pull `PressureReport`,
 project to a capacity surface, format a discovery line, assert
 on it.
+
+`examples/specimen_http_body_streaming` shows the weighted form on
+HTTP response bodies:
+
+```text
+unknown: pick a body-byte cap and run the slow-reader workload
+measured: read high_weight=4096 from the discovery line
+fixed: keep the cap near one chunk for this streaming route
+```
+
+Its Tina side emits a weighted line like:
+
+```text
+capacity surface=specimen_http_body_streaming.response_body mode=fixed max=- cur=0 high=0 full=0 suggest="weighted cap fits" weight_unit=bytes max_weight=4096 cur_weight=0 high_weight=4096 weight_full=0 shared_scope=http.bodies shared_max_weight=262144 shared_cur_weight=0 shared_high_weight=4096 shared_weight_full=0
+```
+
+Request and response body reports can share the same `http.bodies`
+scope, but that scope is shard-local: one `BodyMetrics` instance
+threaded through one listener and its connection isolates.
 
 ## What Counts As Failure
 

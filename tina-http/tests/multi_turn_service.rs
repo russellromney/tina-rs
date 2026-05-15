@@ -17,6 +17,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpLimits, HttpListener,
     HttpListenerMsg, HttpRequest, HttpResponse,
@@ -31,10 +32,13 @@ use common::{TestShard, assert_status_starts_with, scripted_request};
 /// Service messages: `Inbound` is the user-callable variant the
 /// connection isolate constructs from `HttpRequest`; `ClientReturned`
 /// is the continuation from the outbound `HttpClient` call.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ProxyMsg {
     Inbound(HttpRequest),
-    ClientReturned(CallOutcome<Result<HttpResponse, HttpClientError>>),
+    ClientReturned(
+        RequestContext<HttpResponse>,
+        CallOutcome<Result<HttpResponse, HttpClientError>>,
+    ),
 }
 
 impl From<HttpRequest> for ProxyMsg {
@@ -69,40 +73,65 @@ impl Isolate for Proxy {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
+            ProxyMsg::Inbound(_) => reply(HttpResponse::internal_error()),
+            ProxyMsg::ClientReturned(request, outcome) => {
+                reply_to_request(request, Self::response_for_client_outcome(outcome))
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: ProxyMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
             ProxyMsg::Inbound(req) => {
-                // Forward the inbound path/method/body to upstream.
-                // Build a fresh outbound request — the inbound's
-                // `Connection` and `Host` headers are stripped by the
-                // outbound encoder.
-                let body_bytes = req.body.as_buffered().unwrap_or(&[]).to_vec();
-                let outbound = HttpRequest::builder(req.method, req.path)
-                    .header("Host", "upstream")
-                    .body(body_bytes)
-                    .build();
-                call(
-                    self.client,
-                    HttpClientMsg::call(self.upstream, outbound),
-                    self.client_call_timeout,
-                )
-                .reply(ProxyMsg::ClientReturned)
+                let request = call_ctx.into_request_context();
+                self.forward_request(req, request)
             }
-            ProxyMsg::ClientReturned(outcome) => {
-                let response = match outcome {
-                    CallOutcome::Replied(Ok(r)) => r,
-                    // Client refused because it was already in flight,
-                    // or pool admission refused — map to 503.
-                    CallOutcome::Replied(Err(HttpClientError::Busy))
-                    | CallOutcome::Replied(Err(HttpClientError::PoolFull)) => {
-                        HttpResponse::service_unavailable()
-                    }
-                    // Client-side errors that aren't admission-flavoured.
-                    CallOutcome::Replied(Err(_)) => HttpResponse::bad_gateway(),
-                    CallOutcome::Full => HttpResponse::service_unavailable(),
-                    CallOutcome::Closed => HttpResponse::internal_error(),
-                    CallOutcome::Timeout => HttpResponse::gateway_timeout(),
-                };
-                reply(response)
+            ProxyMsg::ClientReturned(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
+        }
+    }
+}
+
+impl Proxy {
+    fn forward_request(
+        &self,
+        req: HttpRequest,
+        request: RequestContext<HttpResponse>,
+    ) -> Effect<Self> {
+        // Forward the inbound path/method/body to upstream. Build a
+        // fresh outbound request — the inbound's `Connection` and
+        // `Host` headers are stripped by the outbound encoder.
+        let body_bytes = req.body.as_buffered().unwrap_or(&[]).to_vec();
+        let outbound = HttpRequest::builder(req.method, req.path)
+            .header("Host", "upstream")
+            .body(body_bytes)
+            .build();
+        call(
+            self.client,
+            HttpClientMsg::call(self.upstream, outbound),
+            self.client_call_timeout,
+        )
+        .then_with_request(request, ProxyMsg::ClientReturned)
+    }
+
+    fn response_for_client_outcome(
+        outcome: CallOutcome<Result<HttpResponse, HttpClientError>>,
+    ) -> HttpResponse {
+        match outcome {
+            CallOutcome::Replied(Ok(r)) => r,
+            // Client refused because it was already in flight,
+            // or pool admission refused — map to 503.
+            CallOutcome::Replied(Err(HttpClientError::Busy))
+            | CallOutcome::Replied(Err(HttpClientError::PoolFull)) => {
+                HttpResponse::service_unavailable()
+            }
+            // Client-side errors that aren't admission-flavoured.
+            CallOutcome::Replied(Err(_)) => HttpResponse::bad_gateway(),
+            CallOutcome::Full => HttpResponse::service_unavailable(),
+            CallOutcome::Closed => HttpResponse::internal_error(),
+            CallOutcome::Rejected(_) => HttpResponse::internal_error(),
+            CallOutcome::Timeout => HttpResponse::gateway_timeout(),
         }
     }
 }

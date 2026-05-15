@@ -64,6 +64,7 @@ where
         CallOutcome::Full => translator(CallOutcome::Full),
         CallOutcome::Closed => translator(CallOutcome::Closed),
         CallOutcome::Timeout => translator(CallOutcome::Timeout),
+        CallOutcome::Rejected(reason) => translator(CallOutcome::Rejected(reason)),
     })
 }
 
@@ -1030,6 +1031,9 @@ pub enum CallError {
     /// The target isolate did not reply before the caller's timeout elapsed.
     Timeout,
 
+    /// The target isolate rejected the call without an application reply.
+    Rejected(tina::CallRejectedReason),
+
     /// The bounded DNS lane was full when the runtime tried to submit a lookup.
     DnsFull,
 
@@ -1103,6 +1107,9 @@ pub enum CallOutcome<T> {
 
     /// The target isolate did not reply before the timeout elapsed.
     Timeout,
+
+    /// The target isolate rejected the call without an application reply.
+    Rejected(tina::CallRejectedReason),
 }
 
 impl SendOutcome {
@@ -1188,7 +1195,7 @@ enum RuntimeCallKind<M> {
         translator: IsolateCallTranslator<M>,
         expected_reply_type_id: std::any::TypeId,
         /// Optional caller-owned cancellation cell. Present when the
-        /// effect was built via [`call_with_handle`]; the runtime stamps
+        /// effect was built via [`call_cancelable`]; the runtime stamps
         /// the assigned `CallId` here on dispatch and updates state on
         /// completion or cancellation.
         handle_shared: Option<Arc<CallHandleShared>>,
@@ -1471,7 +1478,7 @@ pub enum RuntimeCallParts<M> {
         /// `TypeId::of::<R>()` for the dispatching `Address<_, R>`.
         expected_reply_type_id: std::any::TypeId,
         /// Optional caller-owned cancellation cell. Set by
-        /// [`call_with_handle`].
+        /// [`call_cancelable`].
         handle_shared: Option<Arc<CallHandleShared>>,
     },
     /// Cancel-call request: close one pending isolate call's wait.
@@ -2051,6 +2058,13 @@ pub struct ObservedSend<T> {
     message: T,
 }
 
+/// Prepared observed-send continuation after caller authority was captured.
+#[doc(hidden)]
+pub struct DeferredObservedSend<T, Q> {
+    inner: ObservedSend<T>,
+    request: tina::RequestContext<Q>,
+}
+
 /// Prepared isolate-call helper returned by [`call`].
 #[doc(hidden)]
 pub struct IsolateCall<T, R> {
@@ -2058,6 +2072,21 @@ pub struct IsolateCall<T, R> {
     message: T,
     timeout: Duration,
     marker: std::marker::PhantomData<fn() -> R>,
+}
+
+/// Prepared isolate-call continuation after caller authority was captured.
+#[doc(hidden)]
+pub struct DeferredIsolateCall<T, R, Q> {
+    inner: IsolateCall<T, R>,
+    request: tina::RequestContext<Q>,
+}
+
+/// Prepared typed runtime-call continuation after caller authority was
+/// captured.
+#[doc(hidden)]
+pub struct DeferredTypedCall<T, Q> {
+    inner: TypedCall<T>,
+    request: tina::RequestContext<Q>,
 }
 
 impl<T> ObservedSend<T>
@@ -2072,7 +2101,21 @@ where
     }
 
     /// Turns this prepared observed send into one ordinary later message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
+    )]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(SendOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.then(translator)
+    }
+
+    /// Turns this prepared observed send into one ordinary later message.
+    pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(SendOutcome) -> M + 'static,
@@ -2089,7 +2132,27 @@ where
     /// [`RequestContext`] into the continuation message so a multi-turn
     /// service can still answer the original caller after the observed
     /// send resolves.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then_with_request(...)`; use `call_ctx.defer(work).reply(...)` when starting from CallContext"
+    )]
     pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        self.then_with_request(req, translator)
+    }
+
+    /// Alias for [`reply_with_request`](Self::reply_with_request) using the
+    /// ordinary-continuation vocabulary.
+    pub fn then_with_request<I, F, M, Q>(
         self,
         req: tina::RequestContext<Q>,
         translator: F,
@@ -2105,6 +2168,42 @@ where
             self.message,
             move |outcome| translator(req, outcome),
         ))
+    }
+}
+
+impl<T, Q> DeferredObservedSend<T, Q>
+where
+    T: Send + 'static,
+    Q: 'static,
+{
+    /// Builds the continuation that carries the captured caller request.
+    ///
+    /// This does not reply to the caller by itself. The generated message must
+    /// later consume the [`RequestContext`](tina::RequestContext) with
+    /// `reply_to_request`.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.inner.then_with_request(self.request, translator)
+    }
+}
+
+impl<T, I> tina::DeferThrough<I> for ObservedSend<T>
+where
+    T: Send + 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type Deferred = DeferredObservedSend<T, I::Reply>;
+
+    fn defer_through(self, call: tina::CallContext<'_, I>) -> Self::Deferred {
+        DeferredObservedSend {
+            inner: self,
+            request: call.into_request_context(),
+        }
     }
 }
 
@@ -2137,7 +2236,21 @@ where
     }
 
     /// Turns this prepared call into one ordinary later message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
+    )]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(CallOutcome<R>) -> M + 'static,
+        M: 'static,
+    {
+        self.then(translator)
+    }
+
+    /// Turns this prepared call into one ordinary later message.
+    pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(CallOutcome<R>) -> M + 'static,
@@ -2155,7 +2268,27 @@ where
     /// [`RequestContext`] into the continuation message so a multi-turn
     /// service can still answer the original caller after the child call
     /// resolves.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then_with_request(...)`; use `call_ctx.defer(work).reply(...)` when starting from CallContext"
+    )]
     pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        self.then_with_request(req, translator)
+    }
+
+    /// Alias for [`reply_with_request`](Self::reply_with_request) using the
+    /// ordinary-continuation vocabulary.
+    pub fn then_with_request<I, F, M, Q>(
         self,
         req: tina::RequestContext<Q>,
         translator: F,
@@ -2175,17 +2308,79 @@ where
     }
 }
 
+impl<T, R, Q> DeferredIsolateCall<T, R, Q>
+where
+    T: Send + 'static,
+    R: 'static,
+    Q: 'static,
+{
+    /// Builds the continuation that carries the captured caller request.
+    ///
+    /// This does not reply to the caller by itself. The generated message must
+    /// later consume the [`RequestContext`](tina::RequestContext) with
+    /// `reply_to_request`.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        M: 'static,
+    {
+        self.inner.then_with_request(self.request, translator)
+    }
+}
+
+impl<T, R, I> tina::DeferThrough<I> for IsolateCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type Deferred = DeferredIsolateCall<T, R, I::Reply>;
+
+    fn defer_through(self, call: tina::CallContext<'_, I>) -> Self::Deferred {
+        DeferredIsolateCall {
+            inner: self,
+            request: call.into_request_context(),
+        }
+    }
+}
+
 /// Prepared isolate-call helper that also produces a caller-owned
-/// [`CallHandle`] for cancellation, returned by [`call_with_handle`].
+/// [`CallHandle`] for cancellation, returned by [`call_cancelable`].
 #[doc(hidden)]
-pub struct IsolateCallWithHandle<T, R> {
+pub struct CancelableCall<T, R> {
     destination: Address<T, R>,
     message: T,
     timeout: Duration,
     marker: std::marker::PhantomData<fn() -> R>,
 }
 
-impl<T, R> IsolateCallWithHandle<T, R>
+/// Compatibility alias for the old cancelable-call builder name.
+#[deprecated(since = "0.1.0", note = "use CancelableCall")]
+pub type IsolateCallWithHandle<T, R> = CancelableCall<T, R>;
+
+/// Prepared cancelable continuation after caller authority was captured.
+#[doc(hidden)]
+pub struct DeferredCancelableCall<T, R, Q> {
+    inner: CancelableCall<T, R>,
+    request: tina::RequestContext<Q>,
+}
+
+/// Visible pending caller obligation for cancelable deferred work.
+///
+/// Store this in isolate state until the worker returns or the operation is
+/// cancelled. The token owns both the caller request and the cancel handle so
+/// neither branch loses the authority needed to answer the original caller.
+#[must_use = "store this pending token, then complete or cancel it"]
+#[derive(Debug)]
+pub struct PendingCancelableCall<K, Q, R> {
+    key: K,
+    request: tina::RequestContext<Q>,
+    handle: tina::CallHandle<R>,
+}
+
+impl<T, R> CancelableCall<T, R>
 where
     T: Send + 'static,
     R: 'static,
@@ -2201,7 +2396,23 @@ where
 
     /// Returns `(effect, handle)`. Store the handle in isolate state
     /// and return the effect; runtime stamps `CallId` on dispatch.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
+    )]
     pub fn reply<I, F, M>(self, translator: F) -> (tina::Effect<I>, tina::CallHandle<R>)
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(CallOutcome<R>) -> M + 'static,
+        M: 'static,
+    {
+        self.then(translator)
+    }
+
+    /// Returns `(effect, handle)` for one ordinary continuation. Store the
+    /// handle in isolate state and return the effect; runtime stamps `CallId`
+    /// on dispatch.
+    pub fn then<I, F, M>(self, translator: F) -> (tina::Effect<I>, tina::CallHandle<R>)
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(CallOutcome<R>) -> M + 'static,
@@ -2221,7 +2432,50 @@ where
 
     /// Like [`reply`](Self::reply), but also carries the caller's
     /// [`RequestContext`] into the continuation message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `call_ctx.defer_cancelable(call_cancelable(...)).reply(...)` when preserving caller authority; hiding RequestContext in a cancelable continuation can strand the caller"
+    )]
     pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> (tina::Effect<I>, tina::CallHandle<R>)
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        self.then_with_request_inner(req, translator)
+    }
+
+    /// Carries a request context into the worker-return continuation.
+    ///
+    /// Prefer [`CallContext::defer_cancelable`](tina::CallContext::defer_cancelable)
+    /// when starting from `handle_call`. A cancelable call can settle via a
+    /// cancel acknowledgement instead of the worker-return continuation; the
+    /// deferred helper keeps the request context in a visible pending token so
+    /// either path can answer the caller.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `call_ctx.defer_cancelable(call_cancelable(...)).reply(...)` when preserving caller authority; hiding RequestContext in a cancelable continuation can strand the caller"
+    )]
+    pub fn then_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> (tina::Effect<I>, tina::CallHandle<R>)
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        self.then_with_request_inner(req, translator)
+    }
+
+    fn then_with_request_inner<I, F, M, Q>(
         self,
         req: tina::RequestContext<Q>,
         translator: F,
@@ -2245,6 +2499,83 @@ where
     }
 }
 
+impl<T, R, Q> DeferredCancelableCall<T, R, Q>
+where
+    T: Send + 'static,
+    R: 'static,
+    Q: 'static,
+{
+    /// Builds the worker-return continuation and the pending token that must be
+    /// stored by the service while the child call is in flight.
+    pub fn reply<I, F, M, K>(
+        self,
+        key: K,
+        translator: F,
+    ) -> (PendingCancelableCall<K, Q, R>, tina::Effect<I>)
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(K, CallOutcome<R>) -> M + 'static,
+        K: Clone + 'static,
+        M: 'static,
+    {
+        let continuation_key = key.clone();
+        let (effect, handle) = self
+            .inner
+            .then(move |outcome| translator(continuation_key, outcome));
+        let pending = PendingCancelableCall {
+            key,
+            request: self.request,
+            handle,
+        };
+        (pending, effect)
+    }
+}
+
+impl<T, R, I> tina::DeferCancelableThrough<I> for CancelableCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type DeferredCancelable = DeferredCancelableCall<T, R, I::Reply>;
+
+    fn defer_cancelable_through(self, call: tina::CallContext<'_, I>) -> Self::DeferredCancelable {
+        DeferredCancelableCall {
+            inner: self,
+            request: call.into_request_context(),
+        }
+    }
+}
+
+impl<K, Q, R> PendingCancelableCall<K, Q, R>
+where
+    K: 'static,
+    Q: 'static,
+    R: 'static,
+{
+    /// Returns the user key associated with this pending operation.
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Consumes the pending token and returns its request context.
+    pub fn into_request_context(self) -> tina::RequestContext<Q> {
+        self.request
+    }
+
+    /// Cancels the child wait and carries the request context into the cancel
+    /// continuation so the service can explicitly answer its caller.
+    pub fn cancel<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(K, tina::RequestContext<Q>, CancelOutcome) -> M + 'static,
+        M: 'static,
+    {
+        cancel_call(self.handle).then(move |outcome| translator(self.key, self.request, outcome))
+    }
+}
+
 /// Builder returned by [`cancel_call`].
 #[doc(hidden)]
 pub struct CancelCallBuilder {
@@ -2258,7 +2589,19 @@ impl CancelCallBuilder {
 
     /// Returns the cancel effect; the [`CancelOutcome`] arrives back
     /// as `translator(outcome)`.
+    #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(CancelOutcome) -> M + 'static,
+        M: 'static,
+    {
+        self.then(translator)
+    }
+
+    /// Returns the cancel effect; the [`CancelOutcome`] arrives back as one
+    /// ordinary continuation message.
+    pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(CancelOutcome) -> M + 'static,
@@ -2269,19 +2612,33 @@ impl CancelCallBuilder {
     }
 }
 
-/// Like [`call`], but `.reply(...)` also produces a caller-owned
+/// Like [`call`], but `.then(...)` also produces a caller-owned
 /// [`tina::CallHandle`]. Pair with [`cancel_call`] to close the wait
 /// later. Move-only handle: one cancel per call.
-pub fn call_with_handle<T, R>(
+pub fn call_cancelable<T, R>(
     destination: Address<T, R>,
     message: T,
     timeout: Duration,
-) -> IsolateCallWithHandle<T, R>
+) -> CancelableCall<T, R>
 where
     T: Send + 'static,
     R: 'static,
 {
-    IsolateCallWithHandle::new(destination, message, timeout)
+    CancelableCall::new(destination, message, timeout)
+}
+
+/// Compatibility spelling for [`call_cancelable`].
+#[deprecated(since = "0.1.0", note = "use call_cancelable")]
+pub fn call_with_handle<T, R>(
+    destination: Address<T, R>,
+    message: T,
+    timeout: Duration,
+) -> CancelableCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+{
+    call_cancelable(destination, message, timeout)
 }
 
 /// Closes the caller-side wait of one pending isolate call.
@@ -2314,7 +2671,7 @@ pub fn call_handle_call_id<R>(handle: &CallHandle<R>) -> Option<CallId> {
 ///
 /// Same-shard calls complete inside one shard runtime. Live local multi-shard
 /// systems route cross-shard requests and replies through bounded shard-pair
-/// paths. Keep the `.reply(...)` translator pure: it may run even when the
+/// paths. Keep the `.then(...)` translator pure: it may run even when the
 /// translated message is later rejected by the requester's mailbox.
 ///
 /// ```compile_fail
@@ -2350,7 +2707,7 @@ where
     I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
     M: 'static,
 {
-    sleep(after).reply(move |_| message)
+    sleep(after).then(move |_| message)
 }
 
 impl<T> CallOutcome<T> {
@@ -2361,6 +2718,7 @@ impl<T> CallOutcome<T> {
             Self::Full => Err(CallError::TargetFull),
             Self::Closed => Err(CallError::TargetClosed),
             Self::Timeout => Err(CallError::Timeout),
+            Self::Rejected(reason) => Err(CallError::Rejected(reason)),
         }
     }
 }
@@ -2388,7 +2746,21 @@ impl<T> TypedCall<T> {
     }
 
     /// Turns this prepared runtime-owned call into one ordinary later message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
+    )]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(Result<T, CallError>) -> M + 'static,
+        T: 'static,
+    {
+        self.then(translator)
+    }
+
+    /// Turns this prepared runtime-owned call into one ordinary later message.
+    pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
         F: FnOnce(Result<T, CallError>) -> M + 'static,
@@ -2402,7 +2774,28 @@ impl<T> TypedCall<T> {
 
     /// Like [`reply`](Self::reply), but also carries the caller's
     /// [`RequestContext`] into the continuation message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then_with_request(...)`; use `call_ctx.defer(work).reply(...)` when starting from CallContext"
+    )]
     pub fn reply_with_request<I, F, M, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        T: 'static,
+        M: 'static,
+        Q: 'static,
+    {
+        self.then_with_request(req, translator)
+    }
+
+    /// Alias for [`reply_with_request`](Self::reply_with_request) using the
+    /// ordinary-continuation vocabulary.
+    pub fn then_with_request<I, F, M, Q>(
         self,
         req: tina::RequestContext<Q>,
         translator: F,
@@ -2418,6 +2811,42 @@ impl<T> TypedCall<T> {
         tina::Effect::Call(RuntimeCall::new(self.request, move |output| {
             translator(req, decode(output))
         }))
+    }
+}
+
+impl<T, Q> DeferredTypedCall<T, Q>
+where
+    T: 'static,
+    Q: 'static,
+{
+    /// Builds the continuation that carries the captured caller request.
+    ///
+    /// This does not reply to the caller by itself. The generated message must
+    /// later consume the [`RequestContext`](tina::RequestContext) with
+    /// `reply_to_request`.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        M: 'static,
+    {
+        self.inner.then_with_request(self.request, translator)
+    }
+}
+
+impl<T, I> tina::DeferThrough<I> for TypedCall<T>
+where
+    T: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type Deferred = DeferredTypedCall<T, I::Reply>;
+
+    fn defer_through(self, call: tina::CallContext<'_, I>) -> Self::Deferred {
+        DeferredTypedCall {
+            inner: self,
+            request: call.into_request_context(),
+        }
     }
 }
 

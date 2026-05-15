@@ -22,7 +22,7 @@ use tina_http::{
     BodyMetrics, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig,
     IterBodySource, ResponseChunkMsg, ResponseChunkReply,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, format_discovery_line};
 
 use crate::{
     CHUNK_BYTES, RESPONSE_BODY_BYTES, Report, decode_chunked, slow_reader_client,
@@ -82,7 +82,8 @@ fn body_chunks() -> impl Iterator<Item = Vec<u8>> + Send + 'static {
 pub fn run() -> anyhow::Result<Report> {
     let runtime: ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory> =
         ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
-    let metrics = BodyMetrics::new();
+    let metrics =
+        BodyMetrics::with_body_capacity("http.bodies", CHUNK_BYTES, RESPONSE_BODY_BYTES);
 
     // `IterBodySource::register` wraps the iterator and registers
     // the source isolate in one step — no turbofish, no
@@ -136,6 +137,12 @@ pub fn run() -> anyhow::Result<Report> {
     let _ = runtime.shutdown();
 
     let snap = metrics.snapshot();
+    let capacity_discovery_line = snap
+        .response_capacity_report(
+            "specimen_http_body_streaming.response_body",
+            tina::capacity::CapacityMode::Fixed,
+        )
+        .map(|report| format_discovery_line(&report));
     Ok(Report {
         bytes_received: known_bytes,
         status_ok: known_ok && chunked_ok,
@@ -145,6 +152,7 @@ pub fn run() -> anyhow::Result<Report> {
         tina_response_high_water: Some(snap.response_body_high_water),
         tina_chunked_wire_bytes: Some(chunked_wire_bytes),
         tina_chunked_decoded_bytes: Some(chunked_decoded_len),
+        tina_capacity_discovery_line: capacity_discovery_line,
     })
 }
 
