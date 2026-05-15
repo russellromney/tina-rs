@@ -250,6 +250,7 @@ framework before public release-story work.
 |---|---|
 | **081 bridge convention audit** | We now have enough bridges (`tokio`, `tower`, `reqwest`, `sqlite`, `sqlx`, `rpc-tokio`, `aws`) to audit install/config/closer/metrics/tracing/late-result naming. Output should be boring: conventions, docs, maybe tiny shared helpers. Do not build a bridge framework unless three repeated shapes demand the same code. |
 | **097 cancelable deferred admission** | Make `call_ctx.defer_cancelable(...)` safe to copy. Prove one real caller with local bounded storage, then extract `PendingCancelableCallSet` if the shape holds. The hard rule: store the pending token before returning the child effect; on `Full`/duplicate, recover the caller and do not dispatch child work. Plan: `.intent/phases/097-cancelable-deferred-admission/plan.md`. |
+| **Visible race and call-capture ergonomics** | Future helper phase, not numbered until ready to execute. Small helpers for repeated service patterns found by `examples/systems/ergonomics_playground`: a `CallGroup` start helper that removes token/handle insertion ceremony without hiding `Returned`/`Cancelled`/`report_ready`, and a `PendingReplies::try_capture_call(...)`-style helper that either captures a `CallContext` under a key or returns the unconsumed caller authority so the service can reply/reject explicitly. Example target: `self.race.start(key, addr, msg, timeout, Msg::Returned)?` should replace `reserve_token` + `call_cancelable` + `insert_reserved`, while the later handler still calls `record_reply`, returns explicit `cancel_call` effects for losers, records cancel outcomes, and replies to the original `RequestContext` exactly once. For pending replies, `match pending.try_capture_call(call, qid)` should replace manual capacity pre-check + `call.into_request_context().into_deferred()` while preserving the rule that failed admission leaves the caller answerable. Do not build a race DSL, hidden scheduler, fake async surface, auto-retry, or helper that implies cancellation stopped external work. |
 | **098 HTTP/2 and gRPC streaming finish** | Close the remaining server-side streaming gap: HTTP/2 full-duplex pressure proof, bidirectional gRPC, final-status ownership, peer-reset cancellation, and tonic/grpcurl interop for claimed modes. Production pooled Tina gRPC client and TLS ALPN stay separate unless deliberately shipped. Plan: `.intent/phases/098-http2-grpc-streaming-finish/plan.md`. |
 | **099 production service skeleton refresh** | Refresh `examples/systems/mini_saas_api` after Phase 095 so the copied service path uses `call_ctx.defer(...)`, current pressure/capacity reports, and current shutdown vocabulary. This is not a framework; it is the one real service shape cheap models should copy. Plan: `.intent/phases/099-production-service-skeleton-refresh/plan.md`. |
 | **100 compile-time safety rails** | Move common silent failures left by changing the default service model: public call messages and internal continuation messages split into separate capabilities/handles, callable handlers are required/diagnosed, trait/macro errors get user-facing diagnostics, and cancelable deferred admission gets a safer copied shape or explicit handoff to 097. Runtime still owns `Full`/`Closed`/`Timeout` truth. Plan: `.intent/phases/100-compile-time-safety-rails/plan.md`. |
@@ -258,6 +259,87 @@ framework before public release-story work.
 | **WebSocket replacement follow-up** | After 097, close the broader replacement claims that are harness-heavy or product-choice-heavy: Autobahn classification, live trace to simulator replay for WebSocket facts, Tina-native WebSocket client if external clients are not enough, extracting a small `tina-websocket-room`-style helper crate if repeated apps need the specimen's room registry/admission/fanout/slow-peer policies, and bounded `permessage-deflate` only if compression becomes a real requirement. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
+
+### Visible race and call-capture ergonomics
+
+The rule for Phase 100 is:
+
+```text
+smooth mechanical repetition
+do not flatten semantic truth
+```
+
+`examples/systems/ergonomics_playground` is the evidence. It now has five small
+probes:
+
+- first-success quote race: reply to the original caller once, cancel the loser,
+  and keep loser-cancel settlement visible
+- no-winner quote race: both providers reply unavailable, so the gateway waits
+  for all branch outcomes before answering `Unavailable`
+- late cancelled reply: the cancelled loser eventually replies and the trace
+  records `CallerCancelled` rejected truth instead of delivering a normal
+  gateway message
+- debounced batch drain: callers parked in `PendingReplies` are all replied
+  `Closed` when admission is drained
+- single-flight cache fill: five callers miss the same key, one upstream fill
+  runs, three admitted callers share the result, and two overflow callers get
+  `Full`
+
+These cases show what must remain visible in any helper:
+
+- caller authority: the original `RequestContext` is replied exactly once
+- bounded storage: pending waiters live in a named fixed-capacity container
+- branch identity: each race branch has a key/token and a terminal outcome
+- cancellation truth: loser waits are explicitly cancelled and cancel outcomes
+  are recorded
+- late-result truth: cancellation means "Tina stopped waiting," not "external
+  work stopped"; late replies still become rejected trace facts
+- aggregate failure: no-winner races wait for all relevant branch outcomes
+  instead of treating first reply as success
+- overload: rejected admission is `Full`/`Closed`/`Timeout` vocabulary, not
+  hidden buffering
+
+The intended helper shape is therefore modest. A `CallGroup` helper may replace
+the repeated:
+
+```rust
+let token = group.reserve_token()?;
+let (effect, handle) = call_cancelable(addr, msg, timeout).then(...);
+group.insert_reserved(key, token, handle)?;
+```
+
+with a start helper such as:
+
+```rust
+self.race.start(key, addr, msg, timeout, Msg::Returned)?;
+```
+
+but the later handler must still explicitly call `record_reply`, return
+`cancel_call(...)` effects for losers, feed continuations into `record_cancel`,
+check `report_ready`, and answer the parked `RequestContext`.
+
+Likewise, a `PendingReplies::try_capture_call(...)` helper may replace manual
+capacity pre-check plus:
+
+```rust
+pending.try_insert(qid, call.into_request_context().into_deferred())?;
+```
+
+but failed admission must return the unconsumed `CallContext` so the service can
+reply or reject deliberately:
+
+```rust
+match pending.try_capture_call(call, qid) {
+    Ok(()) => { /* start or join visible work */ }
+    Err(CaptureCallError::Full(call)) => call.reply(Reply::Full),
+    Err(CaptureCallError::DuplicateKey(call, _)) => call.reject(...),
+}
+```
+
+Non-goals stay explicit: no `select!` clone, no race DSL, no hidden scheduler,
+no fake async surface, no hidden retry, no auto-cancel that erases terminal
+facts, and no helper that implies cancellation stopped work outside Tina's owned
+wait.
 
 ## Capability layers still needed
 
