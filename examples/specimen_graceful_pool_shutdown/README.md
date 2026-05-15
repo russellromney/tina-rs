@@ -34,7 +34,9 @@ turns every release into a retire) so capacity is honestly accounted.
 The tokio side keeps the original `mpsc::channel` worker pool: a
 buffered job channel, oneshot reply per submission, `JoinSet::abort_all`
 plus an explicit `drop(rx)` on shutdown. The two sides converge at
-the same `Report { completed, closed, failed }` shape.
+the same `Report { completed, closed, failed, shutdown_close_observed }`
+shape, so the test proves shutdown was not merely inferred from
+callers settling.
 
 ## Where Full / Closed / Timeout appear
 

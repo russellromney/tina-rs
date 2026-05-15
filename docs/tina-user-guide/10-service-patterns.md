@@ -88,7 +88,7 @@ It assembles the blessed local-service layers:
 | outbound HTTP | native `tina_http::build_keepalive_pool` |
 | readiness | `GET /ready` probes DB and outbound pool state |
 | capacity | `GET /debug/capacity` reports body, controller, DB, and outbound surfaces |
-| shutdown | mark ingress closed, prove readiness reasons, close DB, drain keepalive pool, stop listeners, shutdown runtime |
+| shutdown | mark ingress closed, let admitted work finish or fail visibly, prove readiness reasons, close DB, drain keepalive pool, stop listeners, shutdown runtime |
 | replay hook | materialized `live_replay_fact` for the body-cap pressure case |
 
 Route table:
@@ -107,6 +107,7 @@ Run it:
 ```sh
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
 cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
 ```
 
 This is a skeleton, not a framework. It deliberately keeps route parsing,

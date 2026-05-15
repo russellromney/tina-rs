@@ -53,8 +53,10 @@ Three first-class HTTP pieces, driven from the host:
 - **`build_keepalive_pool`** — registers one pool isolate plus one
   `KeepaliveConnection` isolate. The script acquires a `PoolLease`,
   sends every request through the leased connection, releases the
-  lease, then stops the connection isolate. The trace asserts the
-  server saw exactly one `TcpAccept` for the whole sequence.
+  lease, then calls `shutdown_keepalive_pool(...)` so close, drain,
+  and per-connection stop outcomes are asserted together. The trace
+  asserts the server saw exactly one `TcpAccept` for the whole
+  sequence.
 - **Host script** — uses `ThreadedRuntime::call_blocking` for the
   test/specimen boundary. This removes the old one-off Driver isolate
   without changing the service truth: acquire, request, release, close
@@ -84,11 +86,13 @@ What feels better:
 
 What feels worse:
 
-- **Pool lifecycle is explicit.** The host must acquire, release,
-  close the pool, and stop the connection isolate. That is more
+- **Pool lifecycle is explicit.** The host must acquire and release,
+  then call `shutdown_keepalive_pool(...)` so pool close, drain, and
+  per-connection stop buckets are all named and testable. That is more
   ceremony than `reqwest::Client`, but every resource transition is
-  named and testable.
+  visible.
 - **Configuring one runtime to host both server and client** means
   the spawn order matters (server first, then pool), and shutdown is
-  pool close + connection stop + listener stop + `runtime.shutdown()`.
+  `shutdown_keepalive_pool(...)` + listener stop + checked
+  `runtime.shutdown()`.
   Tokio's `with_graceful_shutdown` is shorter.

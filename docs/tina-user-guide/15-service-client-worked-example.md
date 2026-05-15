@@ -172,8 +172,7 @@ The key path is:
 
 ```text
 POST /items/{id}/notify
-  -> controller captures RequestContext<HttpResponse>
-  -> SQLite query through tina-sqlite-bridge
+  -> controller uses call_ctx.defer(SQLite query).reply(...)
   -> acquire native tina-http keepalive lease
   -> POST /notify upstream
   -> release lease as Reuse

@@ -64,8 +64,9 @@ impl Worker {
 
     fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            WorkerMsg::Do => sleep(self.work)
-                .then_with_request(call.into_request_context(), WorkerMsg::DoneForCall),
+            WorkerMsg::Do => call
+                .defer(sleep(self.work))
+                .reply(WorkerMsg::DoneForCall),
             WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
@@ -297,8 +298,9 @@ pub fn run() -> anyhow::Result<Report> {
     }
     report.replies_after_cancel = count_rejected(&runtime.trace());
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let rt = Arc::try_unwrap(runtime)
+        .map_err(|_| anyhow::anyhow!("runtime still had outstanding references at shutdown"))?;
+    rt.shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
     Ok(report)
 }
