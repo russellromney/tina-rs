@@ -88,7 +88,8 @@ Keep a separate system only when it finds a different class of pain.
 
 | System | Build | Pulls On |
 |---|---|---|
-| `system_mini_saas_api` | HTTPS API with routes, Postgres pool, outbound webhook, graceful shutdown, health/readiness. | `tina-http`, `tina-sqlx-bridge`, keepalive pool, cancellation docs, tracing, capacity reports, service shutdown. |
+| `system_mini_saas_api` | HTTP API with item CRUD, SQLite bridge, outbound webhook, health/readiness, and shutdown. | Host HTTP edge, `tina-sqlite-bridge`, `tina-reqwest-bridge`, multi-turn replies, bridge lifecycle. |
+| `system_bounded_object_lane` | Tiny S3-shaped object lane with concurrent callers, bounded in-flight work, typed busy replies, and optional real S3 PUTs. | Request contexts, runtime-owned time, bounded in-flight admission, pressure vocabulary, optional bridge-to-real-service probe. |
 | `system_realtime_rooms` | Chat/game rooms with join/leave, presence, ticks, durable replay-on-join, slow clients, ping/pong. | WebSocket shape, child/session lifecycle, recurring timers, slow-consumer pressure, bounded fanout, persistence. |
 | `system_job_queue` | Submit jobs, bounded workers, cancel jobs, retry, progress polling, worker panic/restart. | Supervision, child lifecycle, join-many, `PendingCallSet`, cancellation, worker pools, topology report. |
 | `system_session_auth` | Login, cookie/session state, touch session, expire idle sessions, logout. | Sharded placement, recurring timers, owned keyed state, HTTP routing, state snapshot/restore. |
