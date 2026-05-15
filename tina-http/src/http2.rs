@@ -434,18 +434,22 @@ fn encode_response_headers_with_len(response: &HttpResponse, body_len: Option<us
     block
 }
 
-fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8>> {
-    let status = response.headers.get("grpc-status")?;
+fn encode_trailers(headers: &HeaderMap) -> Option<Vec<u8>> {
+    let status = headers.get("grpc-status")?;
     let mut block = Vec::new();
     if let Ok(value) = status.to_str() {
         encode_literal_header("grpc-status", value, &mut block);
     }
-    if let Some(message) = response.headers.get("grpc-message") {
+    if let Some(message) = headers.get("grpc-message") {
         if let Ok(value) = message.to_str() {
             encode_literal_header("grpc-message", value, &mut block);
         }
     }
     Some(block)
+}
+
+fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8>> {
+    encode_trailers(&response.headers)
 }
 
 #[derive(Debug)]
@@ -1431,6 +1435,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 self.report.closed_streams += 1;
                 self.maybe_write_effect()
             }
+            CallOutcome::Replied(ResponseChunkReply::GrpcStatus(status)) => {
+                let headers = crate::grpc::grpc_status_trailers(status);
+                let trailers = encode_trailers(&headers).expect("grpc status trailers encode");
+                let _ = self.enqueue_frame(headers_frame(stream_id, true, trailers));
+                if let Some(idx) = self.find_stream(stream_id) {
+                    self.streams[idx].state = Http2StreamState::Closed;
+                }
+                self.remove_stream(stream_id);
+                self.report.closed_streams += 1;
+                self.maybe_write_effect()
+            }
             CallOutcome::Full
             | CallOutcome::Closed
             | CallOutcome::Rejected(_)
@@ -1655,8 +1670,44 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             if self.closing_after_write {
                 return self.close_now();
             }
+            self.flush_deferred_request_window_credit();
+            if !self.write_queue.is_empty() {
+                return self.write_more();
+            }
         }
         noop()
+    }
+
+    fn flush_deferred_request_window_credit(&mut self) {
+        if self.pending_recv_window_credit == 0
+            && self
+                .streams
+                .iter()
+                .all(|stream| stream.pending_recv_window_credit == 0)
+        {
+            return;
+        }
+
+        let stream_ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|stream| {
+                self.pending_recv_window_credit > 0 || stream.pending_recv_window_credit > 0
+            })
+            .map(|stream| stream.id)
+            .collect();
+        for stream_id in stream_ids {
+            if self
+                .maybe_flush_request_window_credit(stream_id, true)
+                .is_err()
+            {
+                self.report.protocol_errors += 1;
+                return;
+            }
+            if self.write_queue.len() >= self.limits.connection_outbound_queue_capacity {
+                return;
+            }
+        }
     }
 
     fn enqueue_frame(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {

@@ -5,15 +5,17 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TestShard;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
-    GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse, grpc_unary_call_h2c,
+    GrpcClientStreamingRequest, GrpcLimits, GrpcRawStreamingRequest, GrpcRawStreamingResponse,
+    GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter, GrpcServerStreamingResponse,
+    GrpcStatus, GrpcStatusCode, GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse,
+    Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse,
+    grpc_stream_finish, grpc_stream_message, grpc_unary_call_h2c,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -56,6 +58,27 @@ struct GrpcHarness {
 impl GrpcHarness {
     fn start_router(config: Http2ServerConfig, limits: GrpcLimits) -> Self {
         let runtime = runtime();
+        let streaming_sources = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..8 {
+            let stream_slot = Arc::new(Mutex::new(None));
+            let source = runtime
+                .register_with_capacity::<StreamingEchoSource, Infallible>(
+                    StreamingEchoSource {
+                        stream_slot: Arc::clone(&stream_slot),
+                        pending: None,
+                        eof: false,
+                        limits,
+                        received_cancel: Arc::new(AtomicBool::new(false)),
+                    },
+                    16,
+                )
+                .expect("register streaming source");
+            streaming_sources
+                .lock()
+                .expect("streaming sources")
+                .push((stream_slot, source));
+        }
+        let streaming_sources_for_route = Arc::clone(&streaming_sources);
         let watch_responses = Arc::new(Mutex::new(Vec::new()));
         for _ in 0..8 {
             let watch_response = GrpcServerStreamingResponse::from_messages(
@@ -120,6 +143,18 @@ impl GrpcHarness {
                         value: request.messages.iter().map(|message| message.delta).sum(),
                     }))
                 },
+            )
+            .streaming(
+                "/specimen.Counter/Chat",
+                move |request: GrpcStreamingCall<CounterRequest, CounterReply>| {
+                    let (stream_slot, source) = streaming_sources_for_route
+                        .lock()
+                        .expect("streaming sources")
+                        .pop()
+                        .ok_or_else(|| GrpcStatus::new(GrpcStatusCode::ResourceExhausted))?;
+                    *stream_slot.lock().expect("streaming stream slot") = Some(request.requests);
+                    Ok(GrpcStreamingResponse::new(source))
+                },
             );
         let service = runtime
             .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
@@ -173,6 +208,26 @@ impl GrpcHarness {
             runtime.shutdown().unwrap_or_default()
         } else {
             Vec::new()
+        }
+    }
+
+    fn wait_for_event(
+        &self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&RuntimeEventKind) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(runtime) = self.runtime.as_ref() {
+                let trace = runtime.trace();
+                if trace.events().iter().any(|event| predicate(&event.kind())) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -234,6 +289,7 @@ impl Isolate for CancelRecordingSource {
                 self.received_cancel.store(true, Ordering::Release);
                 stop()
             }
+            tina_http::ResponseChunkMsg::Http2RequestChunk(_) => noop(),
         }
     }
 
@@ -249,6 +305,152 @@ impl Isolate for CancelRecordingSource {
             tina_http::ResponseChunkMsg::Cancel => {
                 self.received_cancel.store(true, Ordering::Release);
                 stop()
+            }
+            tina_http::ResponseChunkMsg::Http2RequestChunk(_) => {
+                call.reply(tina_http::ResponseChunkReply::Eof)
+            }
+        }
+    }
+}
+
+struct StreamingEchoSource {
+    stream_slot: Arc<Mutex<Option<GrpcRequestStream<CounterRequest>>>>,
+    pending: Option<tina::RequestContext<tina_http::ResponseChunkReply>>,
+    eof: bool,
+    limits: GrpcLimits,
+    received_cancel: Arc<AtomicBool>,
+}
+
+impl StreamingEchoSource {
+    fn finish_with_status(&mut self, status: GrpcStatus) -> tina_http::ResponseChunkReply {
+        self.eof = true;
+        grpc_stream_finish(status)
+    }
+
+    fn reply_for_message(&mut self, request: CounterRequest) -> tina_http::ResponseChunkReply {
+        grpc_stream_message(
+            &CounterReply {
+                value: request.delta + 100,
+            },
+            self.limits,
+        )
+        .unwrap_or_else(|_| {
+            self.finish_with_status(GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
+        })
+    }
+
+    fn pull_request(&self) -> Effect<Self> {
+        self.stream_slot
+            .lock()
+            .expect("streaming stream slot")
+            .as_ref()
+            .expect("streaming request stream installed")
+            .pull_next_effect(Duration::from_secs(2))
+    }
+
+    fn handle_request_chunk_outcome(
+        &mut self,
+        outcome: tina_runtime::CallOutcome<tina_http::Http2ConnectionReply>,
+    ) -> Effect<Self> {
+        let Some(pending) = self.pending.take() else {
+            return noop();
+        };
+        let reply = {
+            let mut guard = self.stream_slot.lock().expect("streaming stream slot");
+            let requests = guard.as_mut().expect("streaming request stream installed");
+            requests.accept_http2_outcome(outcome)
+        };
+        self.reply_to_stream_result(pending, reply)
+    }
+
+    fn reply_to_stream_result(
+        &mut self,
+        pending: tina::RequestContext<tina_http::ResponseChunkReply>,
+        reply: GrpcStreamReply<CounterRequest>,
+    ) -> Effect<Self> {
+        match reply {
+            GrpcStreamReply::Message(request) => {
+                reply_to_request(pending, self.reply_for_message(request))
+            }
+            GrpcStreamReply::NeedMore => {
+                self.pending = Some(pending);
+                self.pull_request()
+            }
+            GrpcStreamReply::Eof => {
+                self.eof = true;
+                reply_to_request(pending, tina_http::ResponseChunkReply::Eof)
+            }
+            GrpcStreamReply::Status(status) => {
+                reply_to_request(pending, self.finish_with_status(status))
+            }
+            GrpcStreamReply::Cancelled => reply_to_request(
+                pending,
+                self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled)),
+            ),
+            GrpcStreamReply::DeadlineExceeded => reply_to_request(
+                pending,
+                self.finish_with_status(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded)),
+            ),
+        }
+    }
+}
+
+impl Isolate for StreamingEchoSource {
+    tina::isolate_types! {
+        message: tina_http::ResponseChunkMsg,
+        reply: tina_http::ResponseChunkReply,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: tina_runtime::RuntimeCall<tina_http::ResponseChunkMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: tina_http::ResponseChunkMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            tina_http::ResponseChunkMsg::Cancel => {
+                self.received_cancel.store(true, Ordering::Release);
+                stop()
+            }
+            tina_http::ResponseChunkMsg::Next => reply(tina_http::ResponseChunkReply::Eof),
+            tina_http::ResponseChunkMsg::Http2RequestChunk(outcome) => {
+                self.handle_request_chunk_outcome(outcome)
+            }
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: tina_http::ResponseChunkMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            tina_http::ResponseChunkMsg::Cancel => {
+                self.received_cancel.store(true, Ordering::Release);
+                stop()
+            }
+            tina_http::ResponseChunkMsg::Next => {
+                if self.eof {
+                    return call.reply(tina_http::ResponseChunkReply::Eof);
+                }
+                let reply = {
+                    let mut guard = self.stream_slot.lock().expect("streaming stream slot");
+                    guard
+                        .as_mut()
+                        .expect("streaming request stream installed")
+                        .next_buffered()
+                };
+                if !matches!(reply, GrpcStreamReply::NeedMore) {
+                    return self.reply_to_stream_result(call.into_request_context(), reply);
+                }
+                self.pending = Some(call.into_request_context());
+                self.pull_request()
+            }
+            tina_http::ResponseChunkMsg::Http2RequestChunk(outcome) => {
+                self.handle_request_chunk_outcome(outcome)
             }
         }
     }
@@ -535,6 +737,36 @@ fn decode_one_grpc_reply(body: &[u8]) -> CounterReply {
     replies.into_iter().next().unwrap()
 }
 
+fn read_next_data_for_stream(stream: &mut TcpStream, stream_id: u32) -> Vec<u8> {
+    for _ in 0..32 {
+        let frame = read_frame(stream);
+        match (frame.ty, frame.stream_id) {
+            (FRAME_DATA, id) if id == stream_id => return frame.payload,
+            (FRAME_HEADERS, id) if id == stream_id => {}
+            (FRAME_RST_STREAM, id) if id == stream_id => panic!("unexpected reset: {frame:?}"),
+            _ => {}
+        }
+    }
+    panic!("missing data for stream {stream_id}");
+}
+
+fn read_statuses(stream: &mut TcpStream, stream_ids: &[u32]) -> Vec<(u32, GrpcStatusCode)> {
+    let mut statuses = Vec::new();
+    for _ in 0..64 {
+        let frame = read_frame(stream);
+        if frame.ty == FRAME_HEADERS
+            && frame.flags & FLAG_END_STREAM != 0
+            && stream_ids.contains(&frame.stream_id)
+        {
+            statuses.push((frame.stream_id, decode_status(&frame.payload)));
+            if statuses.len() == stream_ids.len() {
+                return statuses;
+            }
+        }
+    }
+    panic!("missing grpc statuses for {stream_ids:?}; got {statuses:?}");
+}
+
 #[test]
 fn grpc_happy_unary_request_response() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
@@ -755,6 +987,256 @@ fn grpc_client_streaming_handles_many_small_messages() {
     let (body, status) = read_body_and_status(&mut stream, 1);
     assert_eq!(status, GrpcStatusCode::Ok);
     assert_eq!(decode_one_grpc_reply(&body).value, expected);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_sends_response_before_request_eof() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let first = grpc_body(&CounterRequest { delta: 1 });
+    let second = grpc_body(&CounterRequest { delta: 2 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Chat", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, 0, 1, &first);
+
+    let first_response = read_next_data_for_stream(&mut stream, 1);
+    assert_eq!(decode_one_grpc_reply(&first_response).value, 101);
+
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &second);
+    let (mut rest, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    if rest.is_empty() {
+        rest = read_next_data_for_stream(&mut stream, 1);
+    }
+    assert_eq!(decode_one_grpc_reply(&rest).value, 102);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_concurrent_streams_do_not_cross_talk() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+
+    for stream_id in [1, 3] {
+        write_frame(
+            &mut stream,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            stream_id,
+            &request_headers("/specimen.Counter/Chat", "application/grpc+proto"),
+        );
+    }
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        1,
+        &grpc_body(&CounterRequest { delta: 10 }),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        3,
+        &grpc_body(&CounterRequest { delta: 30 }),
+    );
+
+    let mut reply_1 = None;
+    let mut reply_3 = None;
+    for _ in 0..32 {
+        let frame = read_frame(&mut stream);
+        match (frame.ty, frame.stream_id) {
+            (FRAME_DATA, 1) => reply_1 = Some(decode_one_grpc_reply(&frame.payload).value),
+            (FRAME_DATA, 3) => reply_3 = Some(decode_one_grpc_reply(&frame.payload).value),
+            (FRAME_HEADERS, _) => {}
+            (FRAME_RST_STREAM, id) => panic!("unexpected reset for stream {id}: {frame:?}"),
+            _ => {}
+        }
+        if reply_1.is_some() && reply_3.is_some() {
+            break;
+        }
+    }
+    assert_eq!(reply_1, Some(110));
+    assert_eq!(reply_3, Some(130));
+
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &[]);
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 3, &[]);
+    let mut statuses = read_statuses(&mut stream, &[1, 3]);
+    statuses.sort_by_key(|(stream_id, _)| *stream_id);
+    assert_eq!(
+        statuses,
+        vec![(1, GrpcStatusCode::Ok), (3, GrpcStatusCode::Ok)]
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_malformed_frame_sets_final_status() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut compressed = Vec::new();
+    compressed.push(1);
+    compressed.extend_from_slice(&0_u32.to_be_bytes());
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Chat", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &compressed);
+
+    assert_eq!(read_status(&mut stream, 1), GrpcStatusCode::Unimplemented);
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_declared_message_cap_sets_resource_exhausted() {
+    let harness = GrpcHarness::start_router(
+        Http2ServerConfig::default(),
+        GrpcLimits {
+            max_message_bytes: 4,
+        },
+    );
+    let mut stream = connect_h2(harness.addr);
+    let mut malicious = Vec::new();
+    malicious.push(0);
+    malicious.extend_from_slice(&1024_u32.to_be_bytes());
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Chat", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &malicious);
+
+    assert_eq!(
+        read_status(&mut stream, 1),
+        GrpcStatusCode::ResourceExhausted
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_peer_reset_cancels_response_source() {
+    let runtime = runtime();
+    let stream_slot = Arc::new(Mutex::new(None));
+    let received_cancel = Arc::new(AtomicBool::new(false));
+    let source = runtime
+        .register_with_capacity::<StreamingEchoSource, Infallible>(
+            StreamingEchoSource {
+                stream_slot: Arc::clone(&stream_slot),
+                pending: None,
+                eof: false,
+                limits: GrpcLimits::default(),
+                received_cancel: Arc::clone(&received_cancel),
+            },
+            16,
+        )
+        .expect("register streaming source");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).streaming(
+        "/specimen.Counter/Chat",
+        move |request: GrpcStreamingCall<CounterRequest, CounterReply>| {
+            *stream_slot.lock().expect("streaming stream slot") = Some(request.requests);
+            Ok(GrpcStreamingResponse::new(source))
+        },
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/Chat", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        1,
+        &grpc_body(&CounterRequest { delta: 1 }),
+    );
+    assert_eq!(
+        decode_one_grpc_reply(&read_next_data_for_stream(&mut stream, 1)).value,
+        101
+    );
+    write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
+
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        received_cancel.load(Ordering::Acquire),
+        "peer reset must cancel streaming response source"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_streaming_raw_sends_response_before_request_eof() {
+    let runtime = runtime();
+    let stream_slot = Arc::new(Mutex::new(None));
+    let source = runtime
+        .register_with_capacity::<StreamingEchoSource, Infallible>(
+            StreamingEchoSource {
+                stream_slot: Arc::clone(&stream_slot),
+                pending: None,
+                eof: false,
+                limits: GrpcLimits::default(),
+                received_cancel: Arc::new(AtomicBool::new(false)),
+            },
+            16,
+        )
+        .expect("register raw streaming source");
+    let router = GrpcRouter::<TestShard>::new(GrpcLimits::default()).streaming_raw(
+        "/specimen.Counter/RawChat",
+        move |request: GrpcRawStreamingRequest<CounterRequest>| {
+            *stream_slot.lock().expect("streaming stream slot") = Some(GrpcRequestStream::new(
+                request.stream,
+                GrpcLimits::default(),
+            ));
+            Ok(GrpcRawStreamingResponse::new(source))
+        },
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<TestShard>, _>(router, 16)
+        .expect("register grpc router");
+    let harness = GrpcHarness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/RawChat", "application/grpc+proto"),
+    );
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        0,
+        1,
+        &grpc_body(&CounterRequest { delta: 9 }),
+    );
+    assert_eq!(
+        decode_one_grpc_reply(&read_next_data_for_stream(&mut stream, 1)).value,
+        109
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &[]);
+    assert_eq!(read_status(&mut stream, 1), GrpcStatusCode::Ok);
     harness.shutdown();
 }
 
@@ -1250,8 +1732,25 @@ fn grpc_peer_reset_cancels_accepted_service_call() {
         1,
         &grpc_body(&CounterRequest { delta: 1 }),
     );
+    assert!(
+        harness.wait_for_event(Duration::from_secs(1), |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallDispatchAttempted {
+                    call_kind: tina_runtime::CallKind::IsolateCall,
+                    ..
+                }
+            )
+        }),
+        "service call should be accepted before peer reset"
+    );
     write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
-    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        harness.wait_for_event(Duration::from_secs(1), |kind| {
+            matches!(kind, RuntimeEventKind::CallCancelled { .. })
+        }),
+        "peer reset should cancel the accepted service call"
+    );
     let events = harness.shutdown_events();
     assert!(
         events

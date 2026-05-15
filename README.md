@@ -220,20 +220,30 @@ where timeout lives, or what message comes next.
 That matters for humans, and it matters for LLMs. Copyable local patterns are
 safer than clever APIs whose important rules live somewhere else.
 
-### Current ergonomics gap: cancelable deferred calls
+### Cancelable deferred calls
 
 `CallContext::defer(work).reply(...)` is the blessed helper for ordinary
-multi-turn replies. Cancelable work is intentionally more explicit:
-`call_ctx.defer_cancelable(call_cancelable(...)).reply(key, Msg::Done)`
-returns both the effect to dispatch and a `PendingCancelableCall` token that
-holds the original `RequestContext` plus the cancel handle.
+multi-turn replies. Cancelable multi-turn replies use a bounded admission helper
+so caller authority is stored before child work can be dispatched:
 
-The caller-authority token must be stored before the child effect is returned.
-If bounded storage is full or the key is a duplicate, the service must not
-dispatch the child effect; it should answer or reject the original caller via
-`pending.into_request_context()`. A future helper should probably provide a
-bounded `PendingCancelableCallSet` so this "store-or-do-not-dispatch" rule is
-copyable instead of hand-rolled.
+```rust
+match call_ctx
+    .defer_cancelable(call_cancelable(worker, WorkerMsg::Run(job), timeout))
+    .try_admit(&mut self.pending, job_id, Msg::WorkerReturned)
+{
+    Ok(effect) => effect,
+    Err(PendingCancelableInsertError::Full { token }) => {
+        reply_to_request(token.into_request_context(), Reply::Busy)
+    }
+    Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+        reply_to_request(token.into_request_context(), Reply::Duplicate)
+    }
+}
+```
+
+The key is user vocabulary (`job_id`, `worker_slot`, `request_id`). The ticket
+carried into `Msg::WorkerReturned` is the exact admitted instance, so stale
+completions cannot remove a newer call under the same key.
 
 ## Deterministic simulation testing
 

@@ -115,6 +115,96 @@ Current future proof gaps to keep visible:
 - Real substrate peer/shard liveness, shard-restart propagation, and
   cross-shard child ownership remain future work.
 
+## Testing infrastructure roadmap
+
+Orthogonal to feature phases but necessary before public release claims.
+
+- **Miri expansion.** Current Miri coverage is narrow: `tina-mailbox-spsc` only.
+  Every crate touching `unsafe` should run under Miri in CI. `tina-runtime`
+  denies `unsafe_code` at the crate root, which is honest, but bridge crates
+  and substrate adapters may add `unsafe`. Miri gating should catch any new
+  `unsafe` block, not just the mailbox ring buffer.
+
+- **`tina-test` dev-dependency crate.** Users today hand-roll simulator setup,
+  config, and step loops. A `tina-test` crate should provide:
+  - `SimulatorBuilder` presets for common test shapes (single isolate,
+    pair, service-with-client).
+  - Assertion helpers: `assert_effect_eq`, `assert_trace_contains`,
+    `assert_mailbox_full`.
+  - A `#[tina_sim::test(seed = 42)]` proc macro that sets up a simulator,
+    runs the body, and asserts no panics / expected trace fingerprint.
+  This is the Tina equivalent of `tokio_test` and `#[tokio::test]`. The
+  simulator stays visible; the goal is removing ceremony so every user writes
+  DST tests as easily as unit tests.
+
+- **Loom expansion beyond mailbox.** Loom covers `tina-mailbox-spsc`. It should
+  also cover shard-pair queues, runtime internal task lists, and effect
+  batching atomics. These are the real concurrency hazards. If a bounded
+  multi-producer mailbox (`tina-mailbox-mpsc`) ships, it must have loom
+  coverage before the crate is usable.
+
+- **Property-based and generative testing.** `tina-sim` generates interleavings
+  from a seed, but not random message sequences, fault configurations, or
+  topology mutations. `proptest` or `quickcheck` over the simulator would let
+  us state invariants like "for any send sequence to a bounded queue, `Full`
+  outcomes never exceed capacity" and have the generator hunt for violations.
+  Fuzz targets for the HTTP parser and router are worth adding once the wire
+  format is stable.
+
+- **Soak and stress testing.** Not urgent pre-release, but needed before
+  production claims. A 10M-step simulation stress test hammering
+  `send`/`reply`/`call` across many isolates would catch trace hash drift,
+  memory leaks in simulator bookkeeping, and counter overflow. Live stress
+  tests under `ThreadedRuntime` would catch substrate resource leaks and
+  queue-pressure growth that short tests miss.
+
+- **Model checking / exhaustive exploration.** `tina-sim` is randomized
+  simulation. A second `tina-model-check` back-end could do bounded exhaustive
+  exploration of all message delivery orderings within a step limit. This is
+  research, not a release blocker. It would let us check LTL properties on
+  small bounded instances. State-space explosion is managed by capping mailbox
+  depth, active isolates, and steps.
+
+- **Testing philosophy and user-guide doc.** A `docs/tina-user-guide/16-testing.md`
+  should cover: when to use unit tests vs simulator tests vs live tests; how to
+  write a loom test for a new concurrent structure; how to choose a DST seed;
+  how to debug a failing trace fingerprint; what "same seed same failure"
+  means and what it does not mean. Keep it fresh — the philosophy should evolve
+  with user experience, not be frozen early.
+
+- **Code coverage reporting.** `cargo-llvm-cov` on the workspace would show
+  whether DST paths, fault-injection paths, and error-handling branches are
+  actually exercised. Currently we know tests pass but not which branches they
+  hit.
+
+- **CI test matrix.** `make verify` runs locally. A public framework needs this
+  in CI on at least Linux and macOS, debug and release, with loom and miri
+  gates. The matrix should also test each specimen example independently so
+  workspace-only changes cannot silently break downstream specimens.
+
+### Other gaps to keep visible
+
+- **Compile-fail / doc tests for `tina` trait crate.** The proc-macro surface
+  (`#[tina::isolate]`, `#[tina_runtime::isolate]`) should have tests that
+  assert malformed definitions fail at compile time. This is standard for
+  macro-heavy crates.
+
+- **Benchmark / performance regression framework.** The current cost-smoke
+  (`portable_runtime_cost`) is a smoke test, not a benchmark. Before
+  production claims we need a `criterion`-based regression suite with
+  historical tracking, not just one-shot local runs.
+
+- **HTTP/1 parser conformance suite.** Beyond our own DST, we should run an
+  established HTTP parser test corpus (e.g., `httparse` test vectors, or a
+  subset of `h2spec` for HTTP/1) to catch wire-format edge cases our
+  hand-authored tests miss.
+
+- **Bridge convention test harness.** The bridge crates (`tokio`, `tower`,
+  `reqwest`, `sqlx`) share setup patterns but have no shared test utilities.
+  A `tina-bridge-test` crate with mock substrate adapters would let each
+  bridge prove its bounded-outcome contract without spinning up real
+  databases or HTTP servers. This is a convenience, not a blocker.
+
 ## Roadmap discipline
 
 Completed work belongs in `CHANGELOG.md`, not as long phase bodies here.
@@ -250,6 +340,7 @@ framework before public release-story work.
 |---|---|
 | **081 bridge convention audit** | We now have enough bridges (`tokio`, `tower`, `reqwest`, `sqlite`, `sqlx`, `rpc-tokio`, `aws`) to audit install/config/closer/metrics/tracing/late-result naming. Output should be boring: conventions, docs, maybe tiny shared helpers. Do not build a bridge framework unless three repeated shapes demand the same code. |
 | **097 cancelable deferred admission** | Make `call_ctx.defer_cancelable(...)` safe to copy. Prove one real caller with local bounded storage, then extract `PendingCancelableCallSet` if the shape holds. The hard rule: store the pending token before returning the child effect; on `Full`/duplicate, recover the caller and do not dispatch child work. Plan: `.intent/phases/097-cancelable-deferred-admission/plan.md`. |
+| **Visible race and call-capture ergonomics** | Future helper phase, not numbered until ready to execute. Small helpers for repeated service patterns found by `examples/systems/ergonomics_playground`: a `CallGroup` start helper that removes token/handle insertion ceremony without hiding `Returned`/`Cancelled`/`report_ready`, and a `PendingReplies::try_capture_call(...)`-style helper that either captures a `CallContext` under a key or returns the unconsumed caller authority so the service can reply/reject explicitly. Example target: `self.race.start(key, addr, msg, timeout, Msg::Returned)?` should replace `reserve_token` + `call_cancelable` + `insert_reserved`, while the later handler still calls `record_reply`, returns explicit `cancel_call` effects for losers, records cancel outcomes, and replies to the original `RequestContext` exactly once. For pending replies, `match pending.try_capture_call(call, qid)` should replace manual capacity pre-check + `call.into_request_context().into_deferred()` while preserving the rule that failed admission leaves the caller answerable. Do not build a race DSL, hidden scheduler, fake async surface, auto-retry, or helper that implies cancellation stopped external work. |
 | **098 HTTP/2 and gRPC streaming finish** | Close the remaining server-side streaming gap: HTTP/2 full-duplex pressure proof, bidirectional gRPC, final-status ownership, peer-reset cancellation, and tonic/grpcurl interop for claimed modes. Production pooled Tina gRPC client and TLS ALPN stay separate unless deliberately shipped. Plan: `.intent/phases/098-http2-grpc-streaming-finish/plan.md`. |
 | **099 production service skeleton refresh** | Refresh `examples/systems/mini_saas_api` after Phase 095 so the copied service path uses `call_ctx.defer(...)`, current pressure/capacity reports, and current shutdown vocabulary. This is not a framework; it is the one real service shape cheap models should copy. Plan: `.intent/phases/099-production-service-skeleton-refresh/plan.md`. |
 | **100 compile-time safety rails** | Move common silent failures left by changing the default service model: public call messages and internal continuation messages split into separate capabilities/handles, callable handlers are required/diagnosed, trait/macro errors get user-facing diagnostics, and cancelable deferred admission gets a safer copied shape or explicit handoff to 097. Runtime still owns `Full`/`Closed`/`Timeout` truth. Plan: `.intent/phases/100-compile-time-safety-rails/plan.md`. |
@@ -322,6 +413,174 @@ Non-goals: no doc-only warning, no heuristic "maybe this `handle` arm should
 have been callable" lint as the final answer, and no fake async surface. The
 point is to sharpen Tina's model: events are mailbox facts; requests are
 caller-authority facts; runtime work returns as events.
+
+### Mailbox-first devex polish sketch
+
+The goal is to remove accidental ceremony from the code users and LLM coding
+agents will write most often while preserving Tina's load-bearing weirdness:
+handlers stay synchronous, all delayed work returns through a mailbox, caller
+authority is explicit, and pressure remains a typed service fact.
+
+The current raw shape is honest but easy to make visually noisy:
+
+```rust
+let request = ctx.take_request_context().unwrap();
+sleep(self.work).reply_with_request(request, move |request, result| {
+    LaneMsg::PutFinished { request, key, result }
+})
+```
+
+This future note should look for a blessed spelling closer to:
+
+```rust
+ctx.defer_reply(sleep(self.work))
+    .to_self(move |reply, result| LaneMsg::PutFinished { reply, key, result })
+```
+
+or, after 086 gives call handlers explicit reply authority:
+
+```rust
+call.reply_after(sleep(self.work))
+    .to_self(move |reply, result| LaneMsg::PutFinished { reply, key, result })
+```
+
+This helper must not run user state mutation in a hidden callback. The
+continuation still produces an ordinary message to self; the final state change
+and final reply happen in the isolate handler.
+
+The same phase should harden two other repeated footguns found by the
+system-shaped examples:
+
+- Bridge calls should become harder to misuse by construction. A health check
+  should not require remembering whether `SELECT 1` is query-shaped or
+  execute-shaped:
+
+  ```rust
+  db.probe().call(self.db_timeout)
+  db.query("SELECT 1").limit(1).call(self.db_timeout)
+  db.execute("INSERT INTO items ...").call(self.db_timeout)
+  ```
+
+- Bounded lanes should have a tiny isolate-local admission vocabulary. It
+  should be mechanism, not policy: admit, release, snapshot, reply busy. Pool
+  phases and capacity phases already cover richer reports and shared/weighted
+  capacity; this note is the small ergonomic surface for the common "cap
+  in-flight work and shed visibly" case:
+
+  ```rust
+  if let Some(permit) = self.in_flight.try_admit() {
+      call.reply_after(work).to_self(move |reply, result| {
+          LaneMsg::Finished { permit, reply, result }
+      })
+  } else {
+      call.reply(LaneReply::Busy(self.in_flight.snapshot()))
+  }
+  ```
+
+Keep the hidden-bug list explicit during review: permits must release exactly
+once on timeout, cancellation, shutdown, and late completion; reply authority
+must be impossible to reply twice or silently drop; bridge DSLs should stay
+shallow enough that compile errors do not become type-state soup; pressure
+helpers must not smuggle in retries, fairness, priority, or unbounded queues.
+
+Bridge-backed bounded lanes add one more concrete checklist. The
+`system_bounded_object_lane` specimen deliberately stays hermetic because the
+real-S3 temptation exposed the production contract a real AWS bridge must own:
+
+- completion delivery must be observed (`Full` / `Closed` / worker stopped), not
+  best-effort `try_send`, so a dropped completion cannot leak in-flight
+  accounting;
+- caller timeout, operation timeout, and late completion must be distinct typed
+  outcomes, with abandoned replies and tombstoned completions visible in trace
+  and terminal reports;
+- bridge shutdown needs explicit close/cancel/drain budget semantics, not a
+  specimen-local thread join;
+- bridge-job capacity, completion mailbox capacity, and in-flight admission cap
+  should be configured as one inspectable budget surface;
+- any SDK-backed bridge must name the weakened boundary honestly: Tina can bound
+  admission into the SDK, but SDK-internal queues/threads are not Tina-owned
+  unless the bridge proves and reports them.
+
+### Visible race and call-capture ergonomics
+
+The rule for Phase 100 is:
+
+```text
+smooth mechanical repetition
+do not flatten semantic truth
+```
+
+`examples/systems/ergonomics_playground` is the evidence. It now has five small
+probes:
+
+- first-success quote race: reply to the original caller once, cancel the loser,
+  and keep loser-cancel settlement visible
+- no-winner quote race: both providers reply unavailable, so the gateway waits
+  for all branch outcomes before answering `Unavailable`
+- late cancelled reply: the cancelled loser eventually replies and the trace
+  records `CallerCancelled` rejected truth instead of delivering a normal
+  gateway message
+- debounced batch drain: callers parked in `PendingReplies` are all replied
+  `Closed` when admission is drained
+- single-flight cache fill: five callers miss the same key, one upstream fill
+  runs, three admitted callers share the result, and two overflow callers get
+  `Full`
+
+These cases show what must remain visible in any helper:
+
+- caller authority: the original `RequestContext` is replied exactly once
+- bounded storage: pending waiters live in a named fixed-capacity container
+- branch identity: each race branch has a key/token and a terminal outcome
+- cancellation truth: loser waits are explicitly cancelled and cancel outcomes
+  are recorded
+- late-result truth: cancellation means "Tina stopped waiting," not "external
+  work stopped"; late replies still become rejected trace facts
+- aggregate failure: no-winner races wait for all relevant branch outcomes
+  instead of treating first reply as success
+- overload: rejected admission is `Full`/`Closed`/`Timeout` vocabulary, not
+  hidden buffering
+
+The intended helper shape is therefore modest. A `CallGroup` helper may replace
+the repeated:
+
+```rust
+let token = group.reserve_token()?;
+let (effect, handle) = call_cancelable(addr, msg, timeout).then(...);
+group.insert_reserved(key, token, handle)?;
+```
+
+with a start helper such as:
+
+```rust
+self.race.start(key, addr, msg, timeout, Msg::Returned)?;
+```
+
+but the later handler must still explicitly call `record_reply`, return
+`cancel_call(...)` effects for losers, feed continuations into `record_cancel`,
+check `report_ready`, and answer the parked `RequestContext`.
+
+Likewise, a `PendingReplies::try_capture_call(...)` helper may replace manual
+capacity pre-check plus:
+
+```rust
+pending.try_insert(qid, call.into_request_context().into_deferred())?;
+```
+
+but failed admission must return the unconsumed `CallContext` so the service can
+reply or reject deliberately:
+
+```rust
+match pending.try_capture_call(call, qid) {
+    Ok(()) => { /* start or join visible work */ }
+    Err(CaptureCallError::Full(call)) => call.reply(Reply::Full),
+    Err(CaptureCallError::DuplicateKey(call, _)) => call.reject(...),
+}
+```
+
+Non-goals stay explicit: no `select!` clone, no race DSL, no hidden scheduler,
+no fake async surface, no hidden retry, no auto-cancel that erases terminal
+facts, and no helper that implies cancellation stopped work outside Tina's owned
+wait.
 
 ## Capability layers still needed
 

@@ -84,9 +84,10 @@ For protocols, prefer boring sync codec crates:
 - HTTP/1 parse with `httparse`
 - HTTP/2 cleartext server first form with Tina-owned frames, bounded stream
   table, and explicit flow-control windows
-- gRPC unary plus first server-streaming/client-streaming form over Tina
-  HTTP/2 h2c with `prost`, typed `GrpcStatus` trailers, explicit message caps,
-  service-call timeout mapping, and no compression
+- gRPC unary, server-streaming, client-streaming, and first bidirectional
+  streaming form over Tina HTTP/2 h2c with `prost`, typed `GrpcStatus`
+  trailers, explicit message caps, service-call timeout mapping, and no
+  compression
 - HTTP types with `http`
 - TLS state machine with `rustls` — driven by the runtime's TLS lane
   (`tls_bind` / `tls_accept` / `tls_connect` / `tls_read` / `tls_write`
@@ -120,18 +121,24 @@ What ships:
   chunks, final gRPC status trailers;
 - first client-streaming request path: many request messages over HTTP/2 DATA,
   one response message, final gRPC status trailers;
+- first bidirectional streaming path: register it with `GrpcRouter::streaming`.
+  The handler receives a `GrpcStreamingCall` with an explicit
+  `GrpcRequestStream` pull handle and returns a Tina response chunk source, so
+  request DATA and response DATA can progress independently over the HTTP/2
+  connection owner without user code parsing gRPC frame bytes;
 - `prost::Message` payload encode/decode;
 - gRPC frame parsing (`compressed flag + u32 length + protobuf bytes`);
 - `GrpcStatus` / `GrpcStatusCode` in HTTP/2 trailers;
 - explicit per-message caps through `GrpcLimits` (`512 KiB` by default);
 - service-call timeout mapped to `DeadlineExceeded`;
 - compression rejected as `Unimplemented`.
+- tonic `0.12` h2c interop against the specimen for unary,
+  server-streaming, client-streaming, and bidirectional streaming.
 
 What does not ship yet:
 
 - TLS ALPN / HTTPS/2 gRPC;
-- true bidirectional streaming with independent request/response lifecycles;
-- tonic/grpcurl interop scripts or reflection;
+- grpcurl scripts or reflection;
 - tonic compatibility, interceptors, reflection, health, or load balancing;
 - a pooled Tina gRPC client service.
 
