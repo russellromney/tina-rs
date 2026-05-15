@@ -1267,6 +1267,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 }
                 self.finish_stream_eof()
             }
+            CallOutcome::Replied(ResponseChunkReply::GrpcStatus(_)) => self.finish_stream_eof(),
             CallOutcome::Timeout => {
                 // Source took too long to produce the next chunk.
                 // The wire is now in an incomplete state — for

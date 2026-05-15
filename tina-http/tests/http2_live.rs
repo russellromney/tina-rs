@@ -241,6 +241,7 @@ fn read_response_body(stream: &mut TcpStream, stream_id: u32) -> Vec<u8> {
                     return body;
                 }
             }
+            FRAME_WINDOW_UPDATE => {}
             FRAME_RST_STREAM => panic!("stream {stream_id} reset: {frame:?}"),
             other => panic!("unexpected response frame {other}: {frame:?}"),
         }
@@ -269,6 +270,10 @@ fn read_until_goaway(stream: &mut TcpStream) -> TestFrame {
 }
 
 struct StreamingResponseService {
+    source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
+}
+
+struct MixedResponseService {
     source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
 }
 
@@ -302,6 +307,47 @@ impl Isolate for StreamingResponseService {
             http::StatusCode::OK,
             self.source,
         ))
+    }
+}
+
+impl Isolate for MixedResponseService {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<std::convert::Infallible>,
+        spawn: std::convert::Infallible,
+        call: std::convert::Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(
+        &mut self,
+        request: HttpRequest,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl MixedResponseService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        match request.path.as_str() {
+            "/stream" => HttpResponse::stream_chunked(http::StatusCode::OK, self.source),
+            "/counter" => HttpResponse::text("0"),
+            "/echo" => HttpResponse::with_body(
+                http::StatusCode::OK,
+                request.body.as_buffered().unwrap_or_default().to_vec(),
+            ),
+            _ => HttpResponse::with_status(http::StatusCode::NOT_FOUND),
+        }
     }
 }
 
@@ -600,6 +646,110 @@ fn http2_window_update_unblocks_bounded_pending_response() {
         .expect("restore read timeout");
 
     assert_eq!(read_response_body(&mut stream, 1), body);
+    harness.shutdown();
+}
+
+#[test]
+fn http2_stream_window_blocked_response_does_not_block_unrelated_stream() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let source =
+        IterBodySource::<TestShard>::register(&runtime, vec![vec![b'x'; 80_000]].into_iter(), 16)
+            .expect("register source");
+    let service = runtime
+        .register_with_capacity::<MixedResponseService, std::convert::Infallible>(
+            MixedResponseService { source },
+            16,
+        )
+        .expect("register service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/stream"),
+    );
+
+    let mut stream_1_data = 0;
+    while stream_1_data < 65_535 {
+        let frame = read_frame(&mut stream);
+        if frame.stream_id == 1 && frame.ty == FRAME_DATA {
+            stream_1_data += frame.payload.len();
+        }
+    }
+    write_window_update(&mut stream, 0, 65_535);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        &request_headers("GET", "/counter"),
+    );
+    assert_eq!(read_response_body(&mut stream, 3), b"0");
+    harness.shutdown();
+}
+
+#[test]
+fn http2_inbound_request_chunks_continue_while_response_stream_is_blocked() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let source =
+        IterBodySource::<TestShard>::register(&runtime, vec![vec![b'x'; 80_000]].into_iter(), 16)
+            .expect("register source");
+    let service = runtime
+        .register_with_capacity::<MixedResponseService, std::convert::Infallible>(
+            MixedResponseService { source },
+            16,
+        )
+        .expect("register service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/stream"),
+    );
+    let mut stream_1_data = 0;
+    while stream_1_data < 65_535 {
+        let frame = read_frame(&mut stream);
+        if frame.stream_id == 1 && frame.ty == FRAME_DATA {
+            stream_1_data += frame.payload.len();
+        }
+    }
+    write_window_update(&mut stream, 0, 65_535);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        3,
+        &request_headers("POST", "/echo"),
+    );
+    write_frame(&mut stream, FRAME_DATA, 0, 3, b"abc");
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 3, b"def");
+
+    assert_eq!(read_response_body(&mut stream, 3), b"abcdef");
     harness.shutdown();
 }
 

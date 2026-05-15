@@ -9,6 +9,8 @@
 //!   a chunk-source isolate whose `Message = ResponseChunkMsg` and
 //!   `Reply = ResponseChunkReply`. The connection pulls with
 //!   `call(stream.source, ResponseChunkMsg::Next, t).then(...)`.
+//!   Sources normally reply `Chunk` or `Eof`; gRPC-over-HTTP/2 sources can also
+//!   reply `GrpcStatus` to finish with explicit final status trailers.
 //!   For the common iterator-style source, [`IterBodySource`] turns
 //!   any `Iterator<Item = Vec<u8>>` into a chunk source without a
 //!   custom `Isolate` impl.
@@ -54,6 +56,8 @@ use std::marker::PhantomData;
 use tina::prelude::*;
 use tina::{Address, CallContext};
 
+use crate::grpc::GrpcStatus;
+
 /// Pulled by the consumer from a chunk source.
 #[derive(Debug, Clone)]
 pub enum ResponseChunkMsg {
@@ -63,6 +67,10 @@ pub enum ResponseChunkMsg {
     /// producing and release any owned resources — files, downstream
     /// calls, pending slots. Duplicate cancels are harmless.
     Cancel,
+    /// Continuation for a response source that is also pulling an HTTP/2
+    /// request stream, such as a bidirectional gRPC source. Plain response
+    /// sources can ignore this variant.
+    Http2RequestChunk(tina_runtime::CallOutcome<crate::Http2ConnectionReply>),
 }
 
 /// Reply to [`ResponseChunkMsg::Next`].
@@ -75,6 +83,11 @@ pub enum ResponseChunkReply {
     /// End of stream. The connection isolate stops pulling and closes
     /// the response.
     Eof,
+    /// End a gRPC response stream with an explicit final status.
+    ///
+    /// HTTP/2 emits this as `grpc-status` trailers. HTTP/1 chunked response
+    /// streams currently treat it as EOF without trailer emission.
+    GrpcStatus(GrpcStatus),
 }
 
 /// A streaming response body framed by `Content-Length`. The source
@@ -309,7 +322,9 @@ impl<S: Shard + 'static> IterBodySource<S> {
                 // can signal end-of-stream without an explicit option.
                 _ => ResponseChunkReply::Eof,
             },
-            ResponseChunkMsg::Cancel => ResponseChunkReply::Eof,
+            ResponseChunkMsg::Cancel | ResponseChunkMsg::Http2RequestChunk(_) => {
+                ResponseChunkReply::Eof
+            }
         }
     }
 }

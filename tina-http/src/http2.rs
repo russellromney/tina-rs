@@ -434,18 +434,22 @@ fn encode_response_headers_with_len(response: &HttpResponse, body_len: Option<us
     block
 }
 
-fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8>> {
-    let status = response.headers.get("grpc-status")?;
+fn encode_trailers(headers: &HeaderMap) -> Option<Vec<u8>> {
+    let status = headers.get("grpc-status")?;
     let mut block = Vec::new();
     if let Ok(value) = status.to_str() {
         encode_literal_header("grpc-status", value, &mut block);
     }
-    if let Some(message) = response.headers.get("grpc-message") {
+    if let Some(message) = headers.get("grpc-message") {
         if let Ok(value) = message.to_str() {
             encode_literal_header("grpc-message", value, &mut block);
         }
     }
     Some(block)
+}
+
+fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8>> {
+    encode_trailers(&response.headers)
 }
 
 #[derive(Debug)]
@@ -1424,6 +1428,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 } else {
                     let _ = self.enqueue_frame(data_frame(stream_id, true, Vec::new()));
                 }
+                if let Some(idx) = self.find_stream(stream_id) {
+                    self.streams[idx].state = Http2StreamState::Closed;
+                }
+                self.remove_stream(stream_id);
+                self.report.closed_streams += 1;
+                self.maybe_write_effect()
+            }
+            CallOutcome::Replied(ResponseChunkReply::GrpcStatus(status)) => {
+                let headers = crate::grpc::grpc_status_trailers(status);
+                let trailers = encode_trailers(&headers).expect("grpc status trailers encode");
+                let _ = self.enqueue_frame(headers_frame(stream_id, true, trailers));
                 if let Some(idx) = self.find_stream(stream_id) {
                     self.streams[idx].state = Http2StreamState::Closed;
                 }
