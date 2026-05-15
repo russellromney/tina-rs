@@ -586,21 +586,26 @@ fn websocket_control_frame_rules_are_enforced() {
 
 #[test]
 fn websocket_malformed_fragmentation_rejects() {
-    let harness = Harness::start(WebSocketLimits::default());
-    let mut continuation_without_start = connect_ws(harness.addr);
-    continuation_without_start
-        .write_all(&masked_fragment(true, 0x0, b"bad"))
-        .unwrap();
-    assert_eq!(read_server_frame(&mut continuation_without_start).0, 0x8);
+    {
+        let harness = Harness::start(WebSocketLimits::default());
+        let mut stream = connect_ws(harness.addr);
+        stream
+            .write_all(&masked_fragment(true, 0x0, b"bad"))
+            .unwrap();
+        assert_eq!(read_server_frame(&mut stream).0, 0x8);
+    }
 
-    let mut nested_data_fragment = connect_ws(harness.addr);
-    nested_data_fragment
-        .write_all(&masked_fragment(false, 0x1, b"one"))
-        .unwrap();
-    nested_data_fragment
-        .write_all(&masked_fragment(false, 0x2, b"two"))
-        .unwrap();
-    assert_eq!(read_server_frame(&mut nested_data_fragment).0, 0x8);
+    {
+        let harness = Harness::start(WebSocketLimits::default());
+        let mut stream = connect_ws(harness.addr);
+        stream
+            .write_all(&masked_fragment(false, 0x1, b"one"))
+            .unwrap();
+        stream
+            .write_all(&masked_fragment(false, 0x2, b"two"))
+            .unwrap();
+        assert_eq!(read_server_frame(&mut stream).0, 0x8);
+    }
 }
 
 #[test]
