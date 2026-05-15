@@ -2376,8 +2376,167 @@ pub struct DeferredCancelableCall<T, R, Q> {
 #[derive(Debug)]
 pub struct PendingCancelableCall<K, Q, R> {
     key: K,
+    ticket: PendingCancelableTicket,
     request: tina::RequestContext<Q>,
     handle: tina::CallHandle<R>,
+}
+
+/// Per-token witness for a cancelable pending call.
+///
+/// The user key names the domain operation (`job_id`, `worker_slot`,
+/// `request_id`). The ticket names this exact admitted instance of that key.
+/// Pair both values when removing a stored [`PendingCancelableCall`]. This
+/// prevents an old worker-return or cancel path from removing a newer call
+/// that reused the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PendingCancelableTicket(u64);
+
+/// Bounded fixed-capacity storage for [`PendingCancelableCall`] tokens.
+///
+/// This helper is deliberately only storage. It never dispatches the child
+/// effect and never cancels child work by itself. Prefer
+/// [`DeferredCancelableCall::try_admit`] so the child effect is returned only
+/// after this set accepts the token. If insertion fails, the error returns the
+/// token so the caller can recover authority with
+/// [`PendingCancelableCall::into_request_context`] and answer immediately.
+#[derive(Debug)]
+pub struct PendingCancelableCallSet<K, Q, R> {
+    entries: Vec<PendingCancelableEntry<K, Q, R>>,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct PendingCancelableEntry<K, Q, R> {
+    ticket: PendingCancelableTicket,
+    token: PendingCancelableCall<K, Q, R>,
+}
+
+/// Reasons [`PendingCancelableCallSet::try_insert`] may reject admission.
+#[derive(Debug)]
+pub enum PendingCancelableInsertError<K, Q, R> {
+    /// The set is at its configured capacity.
+    Full {
+        /// Rejected token. Recover caller authority from this value.
+        token: PendingCancelableCall<K, Q, R>,
+    },
+    /// A pending call is already stored under this key.
+    DuplicateKey {
+        /// Rejected token. Recover caller authority from this value.
+        token: PendingCancelableCall<K, Q, R>,
+    },
+}
+
+/// Reasons [`PendingCancelableCallSet::remove`] may not find an exact entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingCancelableRemoveError {
+    /// No entry exists for the supplied key.
+    MissingKey,
+    /// The key exists, but the ticket belongs to an older or newer call.
+    StaleTicket,
+}
+
+impl<K, Q, R> PendingCancelableCallSet<K, Q, R>
+where
+    K: PartialEq,
+{
+    /// Builds an empty bounded set.
+    ///
+    /// Panics when `capacity == 0`: a zero-capacity pending table would reject
+    /// every cancelable call and usually means the service was misconfigured.
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "PendingCancelableCallSet requires capacity > 0; a zero-capacity set rejects every insert",
+        );
+        Self {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Returns the configured capacity.
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns the number of admitted pending calls.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether the set holds no pending calls.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns whether the next non-duplicate insert would be rejected as full.
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.capacity
+    }
+
+    /// Returns whether `key` is already present.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.entries.iter().any(|entry| &entry.token.key == key)
+    }
+
+    /// Returns the current ticket for `key`, if present.
+    ///
+    /// Use this for current owner decisions such as "cancel the pending
+    /// operation under this key." Completion continuations should carry the
+    /// ticket they received from [`DeferredCancelableCall::try_admit`] instead
+    /// of looking up the current ticket, so stale completions cannot remove a
+    /// newer entry.
+    pub fn ticket(&self, key: &K) -> Option<PendingCancelableTicket> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.token.key == key)
+            .map(|entry| entry.ticket)
+    }
+
+    /// Attempts to admit `token` under its own key.
+    ///
+    /// On success the returned ticket must be included in the completion or
+    /// cancel continuation. On `Full` or `DuplicateKey`, the set is unchanged
+    /// and the rejected token is returned for immediate caller settlement.
+    pub fn try_insert(
+        &mut self,
+        token: PendingCancelableCall<K, Q, R>,
+    ) -> Result<PendingCancelableTicket, PendingCancelableInsertError<K, Q, R>> {
+        if self.contains_key(&token.key) {
+            return Err(PendingCancelableInsertError::DuplicateKey { token });
+        }
+        if self.is_full() {
+            return Err(PendingCancelableInsertError::Full { token });
+        }
+
+        let ticket = token.ticket;
+        self.entries.push(PendingCancelableEntry { ticket, token });
+        Ok(ticket)
+    }
+
+    /// Removes and returns the exact pending token for `(key, ticket)`.
+    pub fn remove(
+        &mut self,
+        key: &K,
+        ticket: PendingCancelableTicket,
+    ) -> Result<PendingCancelableCall<K, Q, R>, PendingCancelableRemoveError> {
+        let Some(pos) = self
+            .entries
+            .iter()
+            .position(|entry| &entry.token.key == key)
+        else {
+            return Err(PendingCancelableRemoveError::MissingKey);
+        };
+        if self.entries[pos].ticket != ticket {
+            return Err(PendingCancelableRemoveError::StaleTicket);
+        }
+        Ok(self.entries.swap_remove(pos).token)
+    }
+
+    /// Drains every stored token, freeing all capacity.
+    pub fn drain(&mut self) -> impl Iterator<Item = PendingCancelableCall<K, Q, R>> + '_ {
+        self.entries.drain(..).map(|entry| entry.token)
+    }
 }
 
 impl<T, R> CancelableCall<T, R>
@@ -2434,7 +2593,7 @@ where
     /// [`RequestContext`] into the continuation message.
     #[deprecated(
         since = "0.1.0",
-        note = "use `call_ctx.defer_cancelable(call_cancelable(...)).reply(...)` when preserving caller authority; hiding RequestContext in a cancelable continuation can strand the caller"
+        note = "use `call_ctx.defer_cancelable(call_cancelable(...)).try_admit(...)` when preserving caller authority; hiding RequestContext in a cancelable continuation can strand the caller"
     )]
     pub fn reply_with_request<I, F, M, Q>(
         self,
@@ -2459,7 +2618,7 @@ where
     /// either path can answer the caller.
     #[deprecated(
         since = "0.1.0",
-        note = "use `call_ctx.defer_cancelable(call_cancelable(...)).reply(...)` when preserving caller authority; hiding RequestContext in a cancelable continuation can strand the caller"
+        note = "use `call_ctx.defer_cancelable(call_cancelable(...)).try_admit(...)` when preserving caller authority; hiding RequestContext in a cancelable continuation can strand the caller"
     )]
     pub fn then_with_request<I, F, M, Q>(
         self,
@@ -2506,7 +2665,14 @@ where
     Q: 'static,
 {
     /// Builds the worker-return continuation and the pending token that must be
-    /// stored by the service while the child call is in flight.
+    /// stored by the service while the child call is in flight. The
+    /// continuation receives the token ticket so stale completions can be
+    /// rejected with [`PendingCancelableCallSet::remove`].
+    ///
+    /// Prefer [`DeferredCancelableCall::try_admit`] when using
+    /// [`PendingCancelableCallSet`]. This lower-level form returns the child
+    /// effect before admission so callers must store the pending token before
+    /// returning the effect.
     pub fn reply<I, F, M, K>(
         self,
         key: K,
@@ -2514,20 +2680,68 @@ where
     ) -> (PendingCancelableCall<K, Q, R>, tina::Effect<I>)
     where
         I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
-        F: FnOnce(K, CallOutcome<R>) -> M + 'static,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
     {
+        self.reply_with_ticket(key, translator)
+    }
+
+    /// Builds the worker-return continuation and includes the pending token's
+    /// ticket in that continuation.
+    ///
+    /// Prefer [`DeferredCancelableCall::try_admit`] when using
+    /// [`PendingCancelableCallSet`]. This lower-level form is useful when
+    /// admission is intentionally hand-written, but callers must store the
+    /// pending token before returning the effect.
+    pub fn reply_with_ticket<I, F, M, K>(
+        self,
+        key: K,
+        translator: F,
+    ) -> (PendingCancelableCall<K, Q, R>, tina::Effect<I>)
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
+        K: Clone + 'static,
+        M: 'static,
+    {
+        let ticket = PendingCancelableTicket(self.request.slot_id());
         let continuation_key = key.clone();
         let (effect, handle) = self
             .inner
-            .then(move |outcome| translator(continuation_key, outcome));
+            .then(move |outcome| translator(continuation_key, ticket, outcome));
         let pending = PendingCancelableCall {
             key,
+            ticket,
             request: self.request,
             handle,
         };
         (pending, effect)
+    }
+
+    /// Admits the pending token into bounded storage and returns the child
+    /// effect only after admission succeeds.
+    ///
+    /// This is the preferred spelling when using
+    /// [`PendingCancelableCallSet`]. It keeps the storage decision explicit
+    /// while removing the easy-to-copy bug where user code returns the child
+    /// effect before storing the pending token. On `Full` or `DuplicateKey`,
+    /// the error owns the pending token so the caller can recover authority
+    /// with [`PendingCancelableCall::into_request_context`] and answer now.
+    pub fn try_admit<I, F, M, K>(
+        self,
+        pending: &mut PendingCancelableCallSet<K, Q, R>,
+        key: K,
+        translator: F,
+    ) -> Result<tina::Effect<I>, PendingCancelableInsertError<K, Q, R>>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
+        K: Clone + PartialEq + 'static,
+        M: 'static,
+    {
+        let (token, effect) = self.reply_with_ticket(key, translator);
+        pending.try_insert(token).map(|_| effect)
     }
 }
 
@@ -2557,6 +2771,11 @@ where
     /// Returns the user key associated with this pending operation.
     pub fn key(&self) -> &K {
         &self.key
+    }
+
+    /// Returns the per-token ticket that must accompany completion removal.
+    pub fn ticket(&self) -> PendingCancelableTicket {
+        self.ticket
     }
 
     /// Consumes the pending token and returns its request context.
@@ -3373,3 +3592,138 @@ pub type ReadDirReply = CallReply<Vec<PathBuf>>;
 
 /// Reply delivered by [`sync_parent`].
 pub type SyncParentReply = CallReply<()>;
+
+#[cfg(test)]
+mod pending_cancelable_call_set_tests {
+    use std::any::TypeId;
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn token<K>(key: K, slot_id: u64) -> PendingCancelableCall<K, &'static str, ()> {
+        let deferred_shared = Arc::new(tina::DeferredSlotShared::new(
+            slot_id,
+            TypeId::of::<&'static str>(),
+        ));
+        let deferred = tina::runtime_internal::deferred_from_handle(
+            tina::runtime_internal::handle_from_shared(deferred_shared),
+        );
+        let request = tina::runtime_internal::request_context_from_deferred(deferred);
+        let call_shared = Arc::new(tina::CallHandleShared::new(TypeId::of::<()>()));
+        let handle = tina::runtime_internal::call_handle_from_shared(call_shared);
+
+        PendingCancelableCall {
+            key,
+            ticket: PendingCancelableTicket(slot_id),
+            request,
+            handle,
+        }
+    }
+
+    #[test]
+    fn pending_call_set_cancelable_insert_full_duplicate() {
+        let mut set = PendingCancelableCallSet::with_capacity(2);
+        let first = set.try_insert(token(1, 1)).expect("first insert");
+        let second = set.try_insert(token(2, 2)).expect("second insert");
+
+        assert_ne!(first, second);
+        assert!(set.is_full());
+        assert_eq!(set.len(), 2);
+
+        match set.try_insert(token(1, 3)) {
+            Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+                assert_eq!(*token.key(), 1);
+                assert_eq!(token.into_request_context().slot_id(), 3);
+            }
+            _ => panic!("expected DuplicateKey"),
+        }
+
+        match set.try_insert(token(3, 4)) {
+            Err(PendingCancelableInsertError::Full { token }) => {
+                assert_eq!(*token.key(), 3);
+                assert_eq!(token.into_request_context().slot_id(), 4);
+            }
+            _ => panic!("expected Full"),
+        }
+
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn pending_call_set_cancelable_remove_requires_exact_ticket() {
+        let mut set = PendingCancelableCallSet::with_capacity(2);
+        let old_ticket = set.try_insert(token(7, 10)).expect("insert old");
+
+        assert_eq!(
+            set.remove(&99, old_ticket).unwrap_err(),
+            PendingCancelableRemoveError::MissingKey
+        );
+
+        let removed = set.remove(&7, old_ticket).expect("remove old");
+        assert_eq!(removed.into_request_context().slot_id(), 10);
+
+        let new_ticket = set.try_insert(token(7, 11)).expect("reuse key");
+        assert_ne!(old_ticket, new_ticket);
+
+        assert_eq!(
+            set.remove(&7, old_ticket).unwrap_err(),
+            PendingCancelableRemoveError::StaleTicket,
+            "old completion must not remove newer token under reused key",
+        );
+
+        let removed = set.remove(&7, new_ticket).expect("remove new");
+        assert_eq!(removed.into_request_context().slot_id(), 11);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn pending_call_set_cancelable_fill_cancel_refill_shape() {
+        let mut set = PendingCancelableCallSet::with_capacity(2);
+        let a = set.try_insert(token(1, 1)).expect("insert a");
+        let b = set.try_insert(token(2, 2)).expect("insert b");
+        assert!(set.is_full());
+
+        let _ = set.remove(&1, a).expect("cancel a");
+        let _ = set.remove(&2, b).expect("cancel b");
+        assert!(set.is_empty());
+
+        set.try_insert(token(3, 3)).expect("refill a");
+        set.try_insert(token(4, 4)).expect("refill b");
+        assert!(set.is_full());
+    }
+
+    #[test]
+    fn pending_call_set_cancelable_drain_returns_all_tokens_for_settlement() {
+        let mut set = PendingCancelableCallSet::with_capacity(3);
+        set.try_insert(token(1, 1)).expect("insert 1");
+        set.try_insert(token(2, 2)).expect("insert 2");
+
+        let slots: Vec<_> = set
+            .drain()
+            .map(|token| token.into_request_context().slot_id())
+            .collect();
+
+        assert_eq!(slots, [1, 2]);
+        assert!(set.is_empty());
+        set.try_insert(token(3, 3)).expect("refill after drain");
+    }
+
+    #[test]
+    fn pending_call_set_cancelable_key_need_not_clone() {
+        #[derive(Debug, PartialEq)]
+        struct Key(u8);
+
+        let mut set = PendingCancelableCallSet::with_capacity(1);
+        let ticket = set.try_insert(token(Key(1), 1)).expect("insert");
+        let removed = set.remove(&Key(1), ticket).expect("remove");
+
+        assert_eq!(removed.into_request_context().slot_id(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity > 0")]
+    fn pending_call_set_cancelable_zero_capacity_panics() {
+        let _set: PendingCancelableCallSet<u64, (), ()> =
+            PendingCancelableCallSet::with_capacity(0);
+    }
+}

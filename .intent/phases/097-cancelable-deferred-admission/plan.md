@@ -2,13 +2,53 @@
 
 ## Status
 
-- IDD phase.
+- Implemented on `codex/phase-097-cancelable-deferred-admission`.
 - Runs after Phase 095 call-context defer ergonomics.
 - One PR.
 - Owns cancelable multi-turn admission helpers, one specimen/system proof,
   request/reply docs, and focused runtime/helper tests.
 - Do not run beside broad `CallContext` redesign. That just landed. This phase
   only makes the copied cancelable-defer path safe.
+- Chosen proof path: `tina-runtime/src/tests/request_context.rs`
+  `HandleSvc`, a real cancelable multi-turn caller.
+- Chosen key/capacity: `u64` request key, bounded capacity `2`.
+- Key reuse policy: duplicate keys reject while an entry is pending; reuse after
+  completion/cancel/drain is allowed, guarded by `PendingCancelableTicket`.
+- Caller outcomes:
+  - `Full` => recover token with `into_request_context()` and reply `Busy`;
+  - duplicate => recover token with `into_request_context()` and reply
+    `Duplicate`;
+  - completion => remove by `(key, ticket)` and reply `Ready` / `NotReady`;
+  - cancel => remove current `(key, ticket)`, cancel child, reply `NotReady`;
+  - owner stop => drain every token and reply `Stopped`.
+- Extracted helper home: `tina-runtime/src/call.rs`, exported as
+  `PendingCancelableCallSet`, `PendingCancelableTicket`, and typed insert/remove
+  errors.
+- Specimen/system commands:
+  - `cargo test -p tina-runtime request_context -- --nocapture`
+  - `cargo test -p tina-runtime pending_call_set -- --nocapture`
+- Required verification:
+  - `cargo fmt --all --check`
+  - `cargo test -p tina-runtime request_context -- --nocapture`
+  - `cargo test -p tina-runtime pending_call_set -- --nocapture`
+  - `cargo clippy -p tina-runtime -p tina --tests -- -D warnings`
+- Hostile self-review notes:
+  - fixed API papercut where `try_insert(key, token)` could store under a key
+    different from the token's continuation key; admission now uses the token's
+    own key;
+  - removed the insert-error key payload so admission does not require `K:
+    Clone`; callers can inspect `token.key()` before recovering authority;
+  - added `DeferredCancelableCall::try_admit(...)` as the blessed copy path so
+    child effects are only returned after bounded storage accepts the token;
+  - documented the key/ticket split: key is the user/domain lookup, ticket is
+    the exact admitted instance used to reject stale completion removal;
+  - kept the helper storage-only: it returns no dispatched effect and failure
+    paths keep token recovery mandatory;
+  - kept remove keyed by `(key, PendingCancelableTicket)` so stale completions
+    cannot remove a reused key;
+  - second review fixed the specimen tail so refill keys settle, owner-stop
+    drains cancel child work before replying `Stopped`, and public docs no
+    longer describe the helper as future work.
 
 ## Grug Truth
 
@@ -18,20 +58,30 @@ Normal multi-turn reply is now boring:
 call_ctx.defer(work).reply(Msg::Done)
 ```
 
-Cancelable multi-turn reply is still sharp:
+Cancelable multi-turn reply now has one blessed admission shape:
 
 ```rust
-let (pending, effect) = call_ctx
+match call_ctx
     .defer_cancelable(call_cancelable(worker, req, timeout))
-    .reply(key, Msg::Done);
+    .try_admit(&mut self.pending, key, Msg::Done)
+{
+    Ok(effect) => effect,
+    Err(PendingCancelableInsertError::Full { token }) => {
+        reply_to_request(token.into_request_context(), Reply::Busy)
+    }
+    Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+        reply_to_request(token.into_request_context(), Reply::Duplicate)
+    }
+}
 ```
 
-`pending` owns:
+The pending token owns:
 
 - the original caller authority;
 - the cancel handle for the child call.
 
-The child `effect` must not run until `pending` is stored in bounded state.
+The child `effect` must not be returned until the token is stored in bounded
+state.
 
 If storage rejects it:
 
@@ -155,8 +205,11 @@ Candidate API:
 ```rust
 let mut pending = PendingCancelableCallSet::with_capacity(cap);
 
-match pending.try_insert(key, token) {
-    Ok(ticket) => effects.push(effect),
+match call_ctx
+    .defer_cancelable(call_cancelable(worker, req, timeout))
+    .try_admit(&mut pending, key, Msg::Done)
+{
+    Ok(effect) => effects.push(effect),
     Err(PendingCancelableInsertError::Full { token }) => {
         return reply_to_request(token.into_request_context(), Reply::Busy);
     }
@@ -166,8 +219,8 @@ match pending.try_insert(key, token) {
 }
 ```
 
-The API may return a ticket/witness. That is probably the right way to prevent
-ABA bugs.
+The lower-level API may return a ticket/witness. That is probably the right way
+to prevent ABA bugs.
 
 Rules:
 

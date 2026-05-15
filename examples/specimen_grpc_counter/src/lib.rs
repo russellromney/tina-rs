@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -5,11 +6,15 @@ use std::time::Duration;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg,
-    GrpcServerStreamingResponse, Http2Listener, Http2ListenerMsg, Http2ServerConfig,
-    grpc_unary_call_h2c,
+    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcRequestStream, GrpcResponse,
+    GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
+    GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse, Http2Listener, Http2ListenerMsg,
+    Http2ServerConfig, ResponseChunkMsg, ResponseChunkReply, grpc_stream_finish,
+    grpc_stream_message, grpc_unary_call_h2c,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
+
+const STREAMING_SOURCE_CAPACITY: usize = 16;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct CounterRequest {
@@ -61,6 +66,184 @@ impl Drop for SpecimenServer {
     }
 }
 
+struct StreamingEchoSource {
+    stream_slot: Arc<Mutex<Option<GrpcRequestStream<CounterRequest>>>>,
+    pending: Option<tina::RequestContext<ResponseChunkReply>>,
+    eof: bool,
+    limits: GrpcLimits,
+}
+
+impl StreamingEchoSource {
+    fn finish_with_status(&mut self, status: GrpcStatus) -> ResponseChunkReply {
+        self.eof = true;
+        grpc_stream_finish(status)
+    }
+
+    fn reply_for_message(&mut self, request: CounterRequest) -> ResponseChunkReply {
+        grpc_stream_message(
+            &CounterReply {
+                value: request.delta,
+            },
+            self.limits,
+        )
+        .unwrap_or_else(|_| self.finish_with_status(GrpcStatus::new(GrpcStatusCode::ResourceExhausted)))
+    }
+
+    fn pull_request(&self) -> Effect<Self> {
+        self.stream_slot
+            .lock()
+            .expect("streaming stream slot")
+            .as_ref()
+            .expect("streaming request stream installed")
+            .pull_next_effect(Duration::from_secs(2))
+    }
+
+    fn handle_request_chunk_outcome(
+        &mut self,
+        outcome: tina_runtime::CallOutcome<tina_http::Http2ConnectionReply>,
+    ) -> Effect<Self> {
+        let Some(pending) = self.pending.take() else {
+            return noop();
+        };
+        let reply = {
+            let mut guard = self.stream_slot.lock().expect("streaming stream slot");
+            let requests = guard.as_mut().expect("streaming request stream installed");
+            requests.accept_http2_outcome(outcome)
+        };
+        self.reply_to_stream_result(pending, reply)
+    }
+
+    fn reply_to_stream_result(
+        &mut self,
+        pending: tina::RequestContext<ResponseChunkReply>,
+        reply: GrpcStreamReply<CounterRequest>,
+    ) -> Effect<Self> {
+        match reply {
+            GrpcStreamReply::Message(request) => reply_to_request(pending, self.reply_for_message(request)),
+            GrpcStreamReply::NeedMore => {
+                self.pending = Some(pending);
+                self.pull_request()
+            }
+            GrpcStreamReply::Eof => {
+                self.eof = true;
+                reply_to_request(pending, ResponseChunkReply::Eof)
+            }
+            GrpcStreamReply::Status(status) => reply_to_request(pending, self.finish_with_status(status)),
+            GrpcStreamReply::Cancelled => reply_to_request(pending, self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled))),
+            GrpcStreamReply::DeadlineExceeded => reply_to_request(pending, self.finish_with_status(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded))),
+        }
+    }
+}
+
+impl Isolate for StreamingEchoSource {
+    tina::isolate_types! {
+        message: ResponseChunkMsg,
+        reply: ResponseChunkReply,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: tina_runtime::RuntimeCall<ResponseChunkMsg>,
+        shard: SpecimenShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: ResponseChunkMsg,
+        _ctx: &mut Context<'_, SpecimenShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => stop(),
+            ResponseChunkMsg::Next => reply(ResponseChunkReply::Eof),
+            ResponseChunkMsg::Http2RequestChunk(outcome) => self.handle_request_chunk_outcome(outcome),
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: ResponseChunkMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => stop(),
+            ResponseChunkMsg::Next => {
+                if self.eof {
+                    return call.reply(ResponseChunkReply::Eof);
+                }
+                let reply = {
+                    let mut guard = self.stream_slot.lock().expect("streaming stream slot");
+                    guard
+                        .as_mut()
+                        .expect("streaming request stream installed")
+                        .next_buffered()
+                };
+                if !matches!(reply, GrpcStreamReply::NeedMore) {
+                    return self.reply_to_stream_result(call.into_request_context(), reply);
+                }
+                self.pending = Some(call.into_request_context());
+                self.pull_request()
+            }
+            ResponseChunkMsg::Http2RequestChunk(outcome) => self.handle_request_chunk_outcome(outcome),
+        }
+    }
+}
+
+struct StreamingEchoSourcePool {
+    available: Mutex<
+        Vec<(
+            Arc<Mutex<Option<GrpcRequestStream<CounterRequest>>>>,
+            tina::Address<ResponseChunkMsg, ResponseChunkReply>,
+        )>,
+    >,
+}
+
+impl StreamingEchoSourcePool {
+    fn register(
+        runtime: &ThreadedRuntime<SpecimenShard, DefaultThreadedMailboxFactory>,
+        limits: GrpcLimits,
+    ) -> Result<Arc<Self>, String> {
+        let pool = Arc::new(Self {
+            available: Mutex::new(Vec::with_capacity(STREAMING_SOURCE_CAPACITY)),
+        });
+        for _ in 0..STREAMING_SOURCE_CAPACITY {
+            let stream_slot = Arc::new(Mutex::new(None));
+            let source = runtime
+                .register_with_capacity::<StreamingEchoSource, Infallible>(
+                    StreamingEchoSource {
+                        stream_slot: Arc::clone(&stream_slot),
+                        pending: None,
+                        eof: false,
+                        limits,
+                    },
+                    16,
+                )
+                .map_err(|error| format!("register streaming source: {error:?}"))?;
+            pool.available
+                .lock()
+                .expect("streaming source pool")
+                .push((stream_slot, source));
+        }
+        Ok(pool)
+    }
+
+    fn claim(
+        &self,
+        request_stream: GrpcRequestStream<CounterRequest>,
+    ) -> Result<GrpcStreamingResponse<CounterReply>, GrpcStatus> {
+        let (stream_slot, source) = self
+            .available
+            .lock()
+            .expect("streaming source pool")
+            .pop()
+            .ok_or_else(|| {
+                GrpcStatus::with_message(
+                    GrpcStatusCode::ResourceExhausted,
+                    format!("streaming source pool capacity {STREAMING_SOURCE_CAPACITY} exhausted"),
+                )
+            })?;
+        *stream_slot.lock().expect("streaming stream slot") = Some(request_stream);
+        Ok(GrpcStreamingResponse::new(source))
+    }
+}
+
 pub fn start_server() -> Result<SpecimenServer, String> {
     let runtime = ThreadedRuntime::with_config(
         SpecimenShard,
@@ -74,6 +257,13 @@ pub fn start_server() -> Result<SpecimenServer, String> {
 
     let state = Arc::new(Mutex::new(0_u64));
     let router_state = Arc::clone(&state);
+    let streaming_sources = StreamingEchoSourcePool::register(
+        &runtime,
+        GrpcLimits {
+            max_message_bytes: 1024,
+        },
+    )?;
+    let streaming_sources_for_route = Arc::clone(&streaming_sources);
     let watch_responses = Arc::new(Mutex::new(Vec::new()));
     for _ in 0..16 {
         let watch_response = GrpcServerStreamingResponse::from_messages(
@@ -120,6 +310,12 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             Ok(GrpcResponse::new(CounterReply {
                 value: request.messages.iter().map(|message| message.delta).sum(),
             }))
+        },
+    )
+    .streaming(
+        "/specimen.Counter/Chat",
+        move |request: GrpcStreamingCall<CounterRequest, CounterReply>| {
+            streaming_sources_for_route.claim(request.requests)
         },
     );
 

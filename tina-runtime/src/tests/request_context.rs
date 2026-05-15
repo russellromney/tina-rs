@@ -15,8 +15,9 @@ use tina::{
 
 use super::*;
 use crate::{
-    CallOutcome, PendingCancelableCall, RuntimeCall, RuntimeEventKind, SendOutcome, call,
-    call_cancelable, sleep,
+    CallKind, CallOutcome, PendingCancelableCallSet, PendingCancelableInsertError,
+    PendingCancelableRemoveError, PendingCancelableTicket, RuntimeCall, RuntimeEventKind,
+    SendOutcome, call, call_cancelable, sleep,
 };
 
 fn step_to_idle<S, F>(runtime: &mut Runtime<S, F>)
@@ -25,6 +26,26 @@ where
     F: MailboxFactory,
 {
     while runtime.step() > 0 {}
+}
+
+fn isolate_call_dispatches<S, F>(runtime: &Runtime<S, F>) -> usize
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    runtime
+        .trace()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind(),
+                RuntimeEventKind::CallDispatchAttempted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        })
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +91,9 @@ impl Isolate for Probe {
 enum SvcReply {
     Ready,
     NotReady,
+    Busy,
+    Duplicate,
+    Stopped,
 }
 
 #[derive(Debug)]
@@ -870,15 +894,19 @@ fn plain_then_still_does_not_preserve_caller_context() {
 #[derive(Debug)]
 struct HandleSvc {
     probe: Address<ProbeMsg, ProbeReply>,
-    pending: Option<PendingCancelableCall<(), SvcReply, ProbeReply>>,
+    pending: PendingCancelableCallSet<u64, SvcReply, ProbeReply>,
 }
 
 #[derive(Debug)]
 enum HandleSvcMsg {
     Start,
+    StartKey(u64),
     Cancel,
-    ProbeResult((), CallOutcome<ProbeReply>),
-    Cancelled((), RequestContext<SvcReply>, CancelOutcome),
+    CancelKey(u64),
+    StopOwner,
+    ProbeResult(u64, PendingCancelableTicket, CallOutcome<ProbeReply>),
+    Cancelled(RequestContext<SvcReply>, CancelOutcome),
+    OwnerStopped(RequestContext<SvcReply>, CancelOutcome),
 }
 
 impl Isolate for HandleSvc {
@@ -897,44 +925,85 @@ impl Isolate for HandleSvc {
     ) -> Effect<Self> {
         match msg {
             HandleSvcMsg::Start => noop(),
-            HandleSvcMsg::Cancel => match self.pending.take() {
-                Some(pending) => pending.cancel(HandleSvcMsg::Cancelled),
-                None => noop(),
-            },
-            HandleSvcMsg::ProbeResult((), outcome) => match self.pending.take() {
-                Some(pending) => {
-                    let req = pending.into_request_context();
-                    match outcome {
-                        CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
-                            reply_to_request(req, SvcReply::Ready)
+            HandleSvcMsg::StartKey(_) => noop(),
+            HandleSvcMsg::Cancel => self.cancel_key(0),
+            HandleSvcMsg::CancelKey(key) => self.cancel_key(key),
+            HandleSvcMsg::StopOwner => {
+                let effects: Vec<_> = self
+                    .pending
+                    .drain()
+                    .map(|pending| {
+                        pending.cancel(|_, req, outcome| HandleSvcMsg::OwnerStopped(req, outcome))
+                    })
+                    .collect();
+                batch(effects)
+            }
+            HandleSvcMsg::ProbeResult(key, ticket, outcome) => {
+                match self.pending.remove(&key, ticket) {
+                    Ok(pending) => {
+                        let req = pending.into_request_context();
+                        match outcome {
+                            CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
+                                reply_to_request(req, SvcReply::Ready)
+                            }
+                            _ => reply_to_request(req, SvcReply::NotReady),
                         }
-                        _ => reply_to_request(req, SvcReply::NotReady),
                     }
+                    Err(PendingCancelableRemoveError::MissingKey)
+                    | Err(PendingCancelableRemoveError::StaleTicket) => noop(),
                 }
-                None => noop(),
-            },
-            HandleSvcMsg::Cancelled((), req, _outcome) => reply_to_request(req, SvcReply::NotReady),
+            }
+            HandleSvcMsg::Cancelled(req, _outcome) => reply_to_request(req, SvcReply::NotReady),
+            HandleSvcMsg::OwnerStopped(req, _outcome) => reply_to_request(req, SvcReply::Stopped),
         }
     }
 
     fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            HandleSvcMsg::Start => {
-                let (pending, effect) = call_ctx
-                    .defer_cancelable(call_cancelable(
-                        self.probe,
-                        ProbeMsg,
-                        Duration::from_millis(50),
-                    ))
-                    .reply((), HandleSvcMsg::ProbeResult);
-                self.pending = Some(pending);
-                effect
-            }
+            HandleSvcMsg::Start => self.start_key(0, call_ctx),
+            HandleSvcMsg::StartKey(key) => self.start_key(key, call_ctx),
             HandleSvcMsg::Cancel
-            | HandleSvcMsg::ProbeResult(_, _)
-            | HandleSvcMsg::Cancelled(_, _, _) => {
+            | HandleSvcMsg::CancelKey(_)
+            | HandleSvcMsg::StopOwner
+            | HandleSvcMsg::ProbeResult(_, _, _)
+            | HandleSvcMsg::Cancelled(_, _)
+            | HandleSvcMsg::OwnerStopped(_, _) => {
                 call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
+        }
+    }
+}
+
+impl HandleSvc {
+    fn start_key(&mut self, key: u64, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match call_ctx
+            .defer_cancelable(call_cancelable(
+                self.probe,
+                ProbeMsg,
+                Duration::from_millis(50),
+            ))
+            .try_admit(&mut self.pending, key, HandleSvcMsg::ProbeResult)
+        {
+            Ok(effect) => effect,
+            Err(PendingCancelableInsertError::Full { token }) => {
+                let req = token.into_request_context();
+                reply_to_request(req, SvcReply::Busy)
+            }
+            Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+                let req = token.into_request_context();
+                reply_to_request(req, SvcReply::Duplicate)
+            }
+        }
+    }
+
+    fn cancel_key(&mut self, key: u64) -> Effect<Self> {
+        let Some(ticket) = self.pending.ticket(&key) else {
+            return noop();
+        };
+        match self.pending.remove(&key, ticket) {
+            Ok(pending) => pending.cancel(|_, req, outcome| HandleSvcMsg::Cancelled(req, outcome)),
+            Err(PendingCancelableRemoveError::MissingKey)
+            | Err(PendingCancelableRemoveError::StaleTicket) => noop(),
         }
     }
 }
@@ -946,7 +1015,7 @@ fn isolate_call_cancelable_defer_replies_to_original_caller() {
     let svc = runtime.register(
         HandleSvc {
             probe,
-            pending: None,
+            pending: PendingCancelableCallSet::with_capacity(2),
         },
         TestMailbox::new(8),
     );
@@ -1010,7 +1079,8 @@ fn isolate_call_cancelable_defer_replies_to_original_caller() {
 
 #[derive(Debug, Default)]
 struct CancelHoldingProbe {
-    pending: Option<RequestContext<ProbeReply>>,
+    pending: Vec<RequestContext<ProbeReply>>,
+    calls: Rc<RefCell<usize>>,
 }
 
 impl Isolate for CancelHoldingProbe {
@@ -1031,7 +1101,8 @@ impl Isolate for CancelHoldingProbe {
     }
 
     fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
-        self.pending = Some(call.into_request_context());
+        *self.calls.borrow_mut() += 1;
+        self.pending.push(call.into_request_context());
         noop()
     }
 }
@@ -1043,7 +1114,7 @@ fn isolate_call_cancelable_defer_cancel_path_answers_original_caller() {
     let svc = runtime.register(
         HandleSvc {
             probe,
-            pending: None,
+            pending: PendingCancelableCallSet::with_capacity(2),
         },
         TestMailbox::new(8),
     );
@@ -1121,6 +1192,217 @@ fn isolate_call_cancelable_defer_cancel_path_answers_original_caller() {
             .filter(|e| matches!(e.kind(), RuntimeEventKind::CallReplyAbandoned { .. }))
             .count(),
         0
+    );
+}
+
+#[test]
+fn isolate_call_cancelable_defer_admits_before_dispatch_and_drains_on_owner_stop() {
+    let (mut runtime, _clock) = new_manual_runtime();
+    let child_calls = Rc::new(RefCell::new(0));
+    let probe = runtime.register(
+        CancelHoldingProbe {
+            pending: Vec::new(),
+            calls: Rc::clone(&child_calls),
+        },
+        TestMailbox::new(8),
+    );
+    let svc = runtime.register(
+        HandleSvc {
+            probe,
+            pending: PendingCancelableCallSet::with_capacity(2),
+        },
+        TestMailbox::new(16),
+    );
+    let out = Rc::new(RefCell::new(Vec::new()));
+
+    #[derive(Debug)]
+    enum HClientMsg {
+        Start {
+            key: u64,
+            svc: Address<HandleSvcMsg, SvcReply>,
+        },
+        Returned(u64, CallOutcome<SvcReply>),
+    }
+
+    type ClientOut = Rc<RefCell<Vec<(u64, CallOutcome<SvcReply>)>>>;
+
+    #[derive(Debug)]
+    struct HClient {
+        out: ClientOut,
+    }
+
+    impl Isolate for HClient {
+        type Message = HClientMsg;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
+        type Call = RuntimeCall<HClientMsg>;
+        type Shard = TestShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                HClientMsg::Start { key, svc } => Effect::Call(RuntimeCall::isolate_call(
+                    svc,
+                    HandleSvcMsg::StartKey(key),
+                    Duration::from_millis(100),
+                    move |outcome| HClientMsg::Returned(key, outcome),
+                )),
+                HClientMsg::Returned(key, outcome) => {
+                    self.out.borrow_mut().push((key, outcome));
+                    noop()
+                }
+            }
+        }
+    }
+
+    let caller = runtime.register(
+        HClient {
+            out: Rc::clone(&out),
+        },
+        TestMailbox::new(16),
+    );
+
+    runtime
+        .try_send(caller, HClientMsg::Start { key: 1, svc })
+        .unwrap();
+    runtime
+        .try_send(caller, HClientMsg::Start { key: 2, svc })
+        .unwrap();
+    step_to_idle(&mut runtime);
+    assert!(out.borrow().is_empty());
+    assert_eq!(
+        *child_calls.borrow(),
+        2,
+        "two admitted calls reach the child"
+    );
+    let dispatches_after_admit = isolate_call_dispatches(&runtime);
+
+    runtime
+        .try_send(caller, HClientMsg::Start { key: 1, svc })
+        .unwrap();
+    runtime
+        .try_send(caller, HClientMsg::Start { key: 3, svc })
+        .unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(
+        isolate_call_dispatches(&runtime),
+        dispatches_after_admit + 2,
+        "duplicate/full admissions should dispatch only the caller->service calls, not child work",
+    );
+    assert_eq!(
+        *child_calls.borrow(),
+        2,
+        "duplicate/full admissions must not reach the child service",
+    );
+    assert_eq!(
+        out.borrow().as_slice(),
+        [
+            (1, CallOutcome::Replied(SvcReply::Duplicate)),
+            (3, CallOutcome::Replied(SvcReply::Busy)),
+        ],
+    );
+
+    runtime.try_send(svc, HandleSvcMsg::CancelKey(1)).unwrap();
+    step_to_idle(&mut runtime);
+    assert!(
+        out.borrow()
+            .contains(&(1, CallOutcome::Replied(SvcReply::NotReady))),
+        "cancel should settle the original caller",
+    );
+
+    runtime
+        .try_send(caller, HClientMsg::Start { key: 3, svc })
+        .unwrap();
+    step_to_idle(&mut runtime);
+    assert_eq!(
+        *child_calls.borrow(),
+        3,
+        "capacity reclaimed by cancel should dispatch the admitted refill",
+    );
+    assert_eq!(
+        out.borrow()
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, CallOutcome::Replied(SvcReply::Busy)))
+            .count(),
+        1,
+        "capacity reclaimed by cancel should admit the next key",
+    );
+
+    runtime.try_send(svc, HandleSvcMsg::StopOwner).unwrap();
+    step_to_idle(&mut runtime);
+    assert!(
+        out.borrow()
+            .contains(&(2, CallOutcome::Replied(SvcReply::Stopped))),
+        "owner stop should settle pending key 2",
+    );
+    assert!(
+        out.borrow()
+            .contains(&(3, CallOutcome::Replied(SvcReply::Stopped))),
+        "owner stop should settle pending key 3",
+    );
+
+    runtime
+        .try_send(caller, HClientMsg::Start { key: 4, svc })
+        .unwrap();
+    runtime
+        .try_send(caller, HClientMsg::Start { key: 5, svc })
+        .unwrap();
+    step_to_idle(&mut runtime);
+    assert_eq!(
+        *child_calls.borrow(),
+        5,
+        "owner-stop drain should free both slots for a full refill",
+    );
+    assert_eq!(
+        out.borrow()
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, CallOutcome::Replied(SvcReply::Busy)))
+            .count(),
+        1,
+        "fill -> cancel/drain -> refill should not produce a second Busy",
+    );
+
+    runtime.try_send(svc, HandleSvcMsg::StopOwner).unwrap();
+    step_to_idle(&mut runtime);
+    assert!(
+        out.borrow()
+            .contains(&(4, CallOutcome::Replied(SvcReply::Stopped))),
+        "final owner stop should settle pending key 4",
+    );
+    assert!(
+        out.borrow()
+            .contains(&(5, CallOutcome::Replied(SvcReply::Stopped))),
+        "final owner stop should settle pending key 5",
+    );
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|e| matches!(e.kind(), RuntimeEventKind::CallCancelled { .. }))
+            .count(),
+        5,
+        "direct cancel plus both owner-stop drains should cancel every admitted child wait",
+    );
+    assert!(
+        out.borrow()
+            .iter()
+            .all(|(_, outcome)| matches!(outcome, CallOutcome::Replied(_))),
+        "every settled caller should observe an application reply, not timeout/rejection",
+    );
+    assert_eq!(
+        runtime
+            .trace()
+            .iter()
+            .filter(|e| matches!(e.kind(), RuntimeEventKind::CallReplyAbandoned { .. }))
+            .count(),
+        0,
+        "no caller authority should be stranded or abandoned",
     );
 }
 

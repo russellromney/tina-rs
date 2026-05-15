@@ -74,5 +74,85 @@ async fn specimen_grpc_counter_tonic_h2c_interop() {
         .into_inner();
     assert_eq!(response.value, 42);
 
+    client.ready().await.expect("tonic ready");
+    let mut stream = client
+        .streaming(
+            Request::new(iter([
+                specimen_grpc_counter::CounterRequest { delta: 3 },
+                specimen_grpc_counter::CounterRequest { delta: 4 },
+            ])),
+            PathAndQuery::from_static("/specimen.Counter/Chat"),
+            ProstCodec::default(),
+        )
+        .await
+        .expect("tonic streaming")
+        .into_inner();
+    let first: specimen_grpc_counter::CounterReply = stream
+        .message()
+        .await
+        .expect("streaming first")
+        .expect("streaming first item");
+    let second: specimen_grpc_counter::CounterReply = stream
+        .message()
+        .await
+        .expect("streaming second")
+        .expect("streaming second item");
+    assert_eq!((first.value, second.value), (3, 4));
+    assert!(
+        stream.message().await.expect("streaming eof").is_none(),
+        "streaming RPC must end cleanly"
+    );
+
+    let addr = server.addr;
+    let first = async move {
+        let channel = Endpoint::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect first tonic h2c");
+        let mut client = Grpc::new(channel);
+        client.ready().await.expect("first tonic ready");
+        let mut stream: tonic::Streaming<specimen_grpc_counter::CounterReply> = client
+            .streaming(
+                Request::new(iter([specimen_grpc_counter::CounterRequest { delta: 11 }])),
+                PathAndQuery::from_static("/specimen.Counter/Chat"),
+                ProstCodec::default(),
+            )
+            .await
+            .expect("first tonic streaming")
+            .into_inner();
+        stream
+            .message()
+            .await
+            .expect("first streaming message")
+            .expect("first streaming item")
+            .value
+    };
+    let second = async move {
+        let channel = Endpoint::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect second tonic h2c");
+        let mut client = Grpc::new(channel);
+        client.ready().await.expect("second tonic ready");
+        let mut stream: tonic::Streaming<specimen_grpc_counter::CounterReply> = client
+            .streaming(
+                Request::new(iter([specimen_grpc_counter::CounterRequest { delta: 12 }])),
+                PathAndQuery::from_static("/specimen.Counter/Chat"),
+                ProstCodec::default(),
+            )
+            .await
+            .expect("second tonic streaming")
+            .into_inner();
+        stream
+            .message()
+            .await
+            .expect("second streaming message")
+            .expect("second streaming item")
+            .value
+    };
+    assert_eq!(tokio::join!(first, second), (11, 12));
+
     server.shutdown().expect("shutdown specimen server");
 }

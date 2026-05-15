@@ -579,6 +579,9 @@ impl Isolate for CancelRecordingSource {
                     .store(true, std::sync::atomic::Ordering::Release);
                 stop()
             }
+            tina_http::ResponseChunkMsg::Http2RequestChunk(_) => {
+                call.reply(tina_http::ResponseChunkReply::Eof)
+            }
         }
     }
 }
@@ -593,6 +596,9 @@ impl CancelRecordingSource {
                 self.received_cancel
                     .store(true, std::sync::atomic::Ordering::Release);
                 stop()
+            }
+            tina_http::ResponseChunkMsg::Http2RequestChunk(_) => {
+                reply(tina_http::ResponseChunkReply::Eof)
             }
         }
     }
