@@ -129,7 +129,7 @@ These are not lost. They are folded into bigger systems:
 
 Start with small systems that pull hard:
 
-1. `system_mini_saas_api`
+1. `mini_saas_api`
 2. `system_cache_with_fill`
 3. `system_job_queue`
 4. `system_metrics_shipper`
