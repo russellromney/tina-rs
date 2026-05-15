@@ -11,6 +11,9 @@
   boundaries, better macro errors, capability-narrow addresses, deferred
   admission ordering, and selected typestate where it catches real protocol
   bugs.
+- Must include user-style proof, not only unit tests. A cheap model should be
+  able to copy one passing service and several failing fixtures and understand
+  the rule.
 
 ## Grug Truth
 
@@ -35,8 +38,9 @@ Compile time should handle impossible-program facts:
 If a mistake can be made unrepresentable without making normal code weird,
 make it unrepresentable.
 
-If the type trick makes code clever and scary, stop and use a loud runtime
-rejection plus good diagnostics.
+If the type trick makes code clever, stop.
+
+Loud runtime rejection is still better than a clever type maze.
 
 ## Goal
 
@@ -48,7 +52,9 @@ trait soup -> useful diagnostic
 copyable footgun -> impossible or hard to write
 ```
 
-This phase should leave Tina nicer for humans and much safer for LLMs.
+This phase should leave Tina nicer for humans and safer for LLMs.
+
+The proof must look like user code, not only crate-private tests.
 
 ## Non-Goals
 
@@ -56,7 +62,7 @@ This phase should leave Tina nicer for humans and much safer for LLMs.
 - no typestate maze in ordinary user code;
 - no breaking every specimen unless the migration is small and automatic;
 - no hiding capacity/liveness as compile-time claims;
-- no custom lint crate unless the macro/trait path cannot work;
+- no custom lint crate in first form;
 - no flow language;
 - no fake exhaustiveness for dynamic runtime facts.
 
@@ -93,6 +99,10 @@ Include at least:
 - protocol state transition after EOF/trailers/close;
 - config missing/zero fields where zero is never valid.
 
+Pick the smallest set that gives one real compile-time win and one real
+diagnostic win. Record the bigger deferred items explicitly. Do not leave them
+implicit.
+
 ## Rock 1: Better Diagnostics First
 
 Add diagnostic polish before changing broad APIs.
@@ -122,6 +132,16 @@ Required proof:
 
 Do not accept a diagnostics-only phase as complete if larger compile-time
 rails are still untouched. This is Rock 1, not the whole phase.
+
+Test shape:
+
+- prefer `trybuild`-style fixtures if the repo already accepts the dependency;
+- otherwise use doctest `compile_fail`;
+- each negative fixture must be tiny and named after the user mistake;
+- each fixture must have a nearby passing version.
+
+Passing and failing pairs matter. A failing test without the copied good shape
+does not teach.
 
 ## Rock 2: Send-Only vs Callable Surface
 
@@ -166,14 +186,21 @@ Cut line:
 - If full `Address` migration is huge, ship a first-form `CallAddress<Q, R>` /
   `SendAddress<M>` adapter and docs. Do not half-migrate the runtime.
 
-Required proof:
+Required user proof:
 
 - compile-fail: `call(send_only_addr, ...)`;
 - compile-fail or macro error: callable isolate missing `handle_call`;
 - compile-fail: internal continuation sent through call address;
+- passing: same service sends internal continuation normally;
+- passing: same service calls public call message normally;
 - existing runtime call tests still pass;
-- one specimen/system migrates to split public call message from internal
+- one specimen/system migrates to split public call messages from internal
   continuation message.
+
+This is the core e2e proof of the phase. It must be user-shaped: one tiny
+service with public calls and internal continuations, exercised live through
+`ThreadedRuntime::call_blocking` or equivalent, plus compile-fail fixtures for
+the bad paths.
 
 ## Rock 3: Macro Declarations For Callability
 
@@ -211,6 +238,8 @@ Required proof:
 
 - compile-fail missing `handle_call`;
 - compile-fail contradictory `send_only` + `call = ...`;
+- passing no-reply send-only isolate with no `handle_call`;
+- passing callable isolate with explicit `handle_call`;
 - docs examples show the new copied shape.
 
 ## Rock 4: Exhaustive Public Call Handling
@@ -235,6 +264,9 @@ Proof:
 
 - at least one migrated specimen demonstrates public call enum with exhaustive
   match and internal message enum separately.
+- if macro enforcement is not shipped, add a review-rule doc and an example
+  showing the normal Rust way to get exhaustiveness: no wildcard arm for the
+  public call enum.
 
 ## Rock 5: Cancelable Deferred Admission Type Rail
 
@@ -266,6 +298,8 @@ Proof:
 - compile-time or API-shape proof that the common copied path cannot return the
   child effect before admission;
 - runtime trace proof that failed admission does not dispatch child work.
+- user-style specimen path: storage full -> caller gets reply/rejection now ->
+  child call does not appear in trace.
 
 ## Rock 6: Capability-Narrow Addresses
 
@@ -288,16 +322,18 @@ Rules:
 - child refs can expose exactly what the parent should hold;
 - compatibility conversions are explicit.
 
-Do not turn every call site into conversion soup. Migrate only one or two
-high-value surfaces first.
+Do not turn every call site into conversion soup. Migrate only one high-value
+surface first.
 
 Proof:
 
 - compile-fail calling through send-only capability;
 - compile-fail sending through call-only capability if such a type exists;
-- one service/specimen uses narrow capabilities in state fields.
+- one service/specimen uses narrow capabilities in state fields;
+- the old broad `Address` path remains documented as compatibility or low-level
+  escape hatch.
 
-## Rock 7: Config Builder Typestate Where Worth It
+## Rock 7: Config Builder Typestate Only If Worth It
 
 Some config values should never be zero or missing.
 
@@ -321,7 +357,10 @@ Proof:
 - docs say runtime validation remains the source of truth for config loaded
   from files/env.
 
-## Rock 8: Protocol Typestate Internals
+This rock is optional. Do not spend the phase here unless Rock 0 finds a config
+mistake that is common, copied, and cheap to prevent.
+
+## Rock 8: Protocol Typestate Internals Only If Worth It
 
 Use typestate inside protocol implementation only where it prevents real bugs.
 
@@ -356,6 +395,9 @@ Proof:
   records why this is not worth doing yet;
 - existing protocol tests remain green.
 
+This rock is optional. Do not let private protocol typestate block the user
+compile-time safety win.
+
 ## Rock 9: Docs And Review Rules
 
 Update docs with a short "compile-time rails" section:
@@ -371,6 +413,48 @@ Add a review checklist item for LLM-written code:
 
 - "Could this runtime rejection be a type error?"
 
+Also add one small "good / bad" box:
+
+- bad: public and internal variants in one callable enum, wildcard rejection;
+- good: public call enum, internal continuation enum, explicit public match.
+
+## Required User Proof Matrix
+
+Build one tiny proof crate/test/specimen that looks like user code. It should
+have:
+
+- a `PublicCall` enum;
+- an `InternalMsg` enum;
+- a callable service;
+- one internal continuation;
+- one host call that succeeds;
+- one send-only/internal path that succeeds;
+- one old mistake that now fails to compile.
+
+Minimum negative fixtures:
+
+| Fixture | Must fail because |
+|---|---|
+| `call_send_only.rs` | send-only address/capability cannot be called |
+| `call_internal_message.rs` | internal continuation is not callable |
+| `missing_handle_call.rs` | callable isolate forgot `handle_call` |
+| `wrong_send_effect.rs` | isolate did not declare outbound send capability |
+| `non_send_message.rs` | user message/closure is not `Send`, if pinned cleanly |
+| `cancelable_dispatch_before_admit.rs` | if Phase 097/type rail supports this |
+
+Minimum positive fixtures:
+
+| Fixture | Must pass because |
+|---|---|
+| `call_public_message.rs` | callable service handles public request |
+| `send_internal_message.rs` | internal continuation can be sent normally |
+| `send_only_isolate.rs` | no-call isolate need not implement `handle_call` |
+| `defer_multiturn_good.rs` | `call_ctx.defer(...).reply(...)` is copied shape |
+
+Prefer a checked fixture harness over fragile prose. If exact stderr pinning is
+too brittle, assert compile failure plus one stable phrase from Tina's
+diagnostic.
+
 ## Required Tests
 
 - compile-fail/ui/doctest cases for:
@@ -383,6 +467,7 @@ Add a review checklist item for LLM-written code:
 - runtime regression tests for compatibility paths;
 - one migrated specimen/system;
 - docs snippets compile where practical.
+- the user proof matrix above.
 
 Run at least:
 
@@ -390,6 +475,7 @@ Run at least:
 cargo fmt --all --check
 cargo test -p tina
 cargo test -p tina-runtime
+cargo test -p tina-macros
 cargo test -p tina-http --tests
 cargo clippy -p tina -p tina-runtime -p tina-http --tests -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
@@ -399,9 +485,11 @@ If compile-fail harness needs a new dev dependency, keep it small and justified.
 
 ## Success
 
-At least one major runtime silent failure becomes a compile error.
+At least one major runtime silent failure becomes a compile error in a
+user-style fixture.
 
-At least one ugly trait-soup error becomes a useful diagnostic.
+At least one ugly trait-soup error becomes a useful diagnostic with a pinned
+phrase.
 
 Callable public messages and internal continuation messages have a clear copied
 shape.
