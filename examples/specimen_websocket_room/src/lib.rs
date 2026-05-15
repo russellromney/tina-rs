@@ -325,7 +325,7 @@ impl Gateway {
         }
         self.idle_generation = self.idle_generation.saturating_add(1);
         let generation = self.idle_generation;
-        sleep(self.idle_room_expiry).reply(move |_| idle_deadline_request(generation))
+        sleep(self.idle_room_expiry).then(move |_| idle_deadline_request(generation))
     }
 
     fn handle_idle_deadline(&mut self, generation: u64) -> Effect<Self> {
@@ -455,7 +455,7 @@ impl Room {
         }
         self.idle_generation = self.idle_generation.saturating_add(1);
         let generation = self.idle_generation;
-        sleep(self.idle_room_expiry).reply(move |_| {
+        sleep(self.idle_room_expiry).then(move |_| {
             WebSocketSessionMsg::Text(format!("{ROOM_IDLE_EXPIRE_CONTROL}{generation}"))
         })
     }

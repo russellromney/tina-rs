@@ -85,7 +85,7 @@ caller handles timeout
 > fn handle_call(&mut self, msg: ServiceMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
 >     call_ctx
 >         .defer(call(worker, WorkerMsg::Run(job), Duration::from_millis(50)))
->         .then(ServiceMsg::WorkerReturned)
+>         .reply(ServiceMsg::WorkerReturned)
 > }
 > ```
 >
@@ -138,7 +138,7 @@ impl StoreService {
         match msg {
             ServiceMsg::Store(req) => call_ctx
                 .defer(journal_append(self.journal.clone(), req.bytes.clone()))
-                .then(|request, result| ServiceMsg::Journaled(request, result, req)),
+                .reply(|request, result| ServiceMsg::Journaled(request, result, req)),
             ServiceMsg::Journaled(_, _, _) => {
                 call_ctx.reject(CallRejectedReason::UnsupportedMessage)
             }
