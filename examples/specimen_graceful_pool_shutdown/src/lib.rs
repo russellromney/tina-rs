@@ -24,6 +24,7 @@ pub struct Report {
     pub completed: usize,
     pub closed: usize,
     pub failed: usize,
+    pub shutdown_close_observed: bool,
     pub exit_clean: bool,
 }
 
@@ -33,6 +34,10 @@ pub fn assert_report_invariants(side: &str, r: &Report) {
     assert!(
         r.closed > 0,
         "{side}: shutdown should close some, got {r:?}"
+    );
+    assert!(
+        r.shutdown_close_observed,
+        "{side}: terminal report should prove shutdown close was observed, got {r:?}"
     );
     assert!(r.exit_clean, "{side}: {r:?}");
 }

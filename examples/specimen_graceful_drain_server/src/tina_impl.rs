@@ -166,8 +166,9 @@ pub fn run() -> anyhow::Result<Report> {
         exit_clean: report.exit_clean,
     };
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let rt = Arc::try_unwrap(runtime)
+        .map_err(|_| anyhow::anyhow!("runtime still had outstanding references at shutdown"))?;
+    rt.shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
     Ok(final_report)
 }

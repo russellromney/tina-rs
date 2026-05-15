@@ -88,7 +88,7 @@ Keep a separate system only when it finds a different class of pain.
 
 | System | Build | Pulls On |
 |---|---|---|
-| `mini_saas_api` | Native HTTP API with routes, SQLite bridge pool shape, outbound keepalive webhook, graceful shutdown, health/readiness, capacity report, and live-replay fact. Run with `cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml`. | `tina-http`, `tina-sqlite-bridge`, keepalive pool, tracing, capacity reports, service shutdown. |
+| `mini_saas_api` | Native HTTP API with routes, SQLite bridge pool shape, outbound keepalive webhook, graceful shutdown with in-flight work, health/readiness, asserted capacity/pressure report, and live-replay fact. Run with `cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml`. | `tina-http`, `tina-sqlite-bridge`, keepalive pool, tracing, capacity reports, service shutdown. |
 | `ergonomics_playground` | Tiny service probes: first-success/no-winner quote races, debounced batching with drain, and single-flight cache fill. Run with `cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml`. | `CallGroup`, `RequestContext`, cancelable calls, `PendingReplies`, timers, single-flight fill, visible helper candidates. |
 | `system_realtime_rooms` | Chat/game rooms with join/leave, presence, ticks, durable replay-on-join, slow clients, ping/pong. | WebSocket shape, child/session lifecycle, recurring timers, slow-consumer pressure, bounded fanout, persistence. |
 | `system_job_queue` | Submit jobs, bounded workers, cancel jobs, retry, progress polling, worker panic/restart. | Supervision, child lifecycle, join-many, `PendingCallSet`, cancellation, worker pools, topology report. |

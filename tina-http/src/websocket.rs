@@ -244,7 +244,7 @@ impl WebSocketSessionHandle {
         timeout: Duration,
     ) -> Effect<I> {
         let session = self.session_id;
-        call(self.target, self.report(), timeout).reply(move |outcome| {
+        call(self.target, self.report(), timeout).then(move |outcome| {
             WebSocketSessionMsg::SessionReport(WebSocketSessionReportOutcome::from_connection_call(
                 session, outcome,
             ))

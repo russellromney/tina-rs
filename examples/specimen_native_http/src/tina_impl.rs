@@ -29,16 +29,24 @@ fn post_counter(state: &mut Counter, _: &HttpRequest) -> HttpResponse {
 
 #[tina::isolate(message = HttpRequest, reply = HttpResponse)]
 impl Counter {
+    fn response_for(&mut self, request: &HttpRequest) -> HttpResponse {
+        let router = StatefulRouter::<Counter>::new()
+            .get("/counter", get_counter)
+            .post("/counter", post_counter)
+            .method_not_allowed();
+        router.dispatch(self, request)
+    }
+
     fn handle(
         &mut self,
         request: HttpRequest,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        let router = StatefulRouter::<Counter>::new()
-            .get("/counter", get_counter)
-            .post("/counter", post_counter)
-            .method_not_allowed();
-        reply(router.dispatch(self, &request))
+        reply(self.response_for(&request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(&request))
     }
 }
 
@@ -74,7 +82,9 @@ pub fn run() -> anyhow::Result<Report> {
     runtime
         .try_send(listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    let _ = runtime.shutdown();
+    runtime
+        .shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
 
     Ok(report)
 }
