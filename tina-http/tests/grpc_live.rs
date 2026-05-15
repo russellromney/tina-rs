@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TestShard;
 use prost::Message;
@@ -208,6 +208,26 @@ impl GrpcHarness {
             runtime.shutdown().unwrap_or_default()
         } else {
             Vec::new()
+        }
+    }
+
+    fn wait_for_event(
+        &self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&RuntimeEventKind) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(runtime) = self.runtime.as_ref() {
+                let trace = runtime.trace();
+                if trace.events().iter().any(|event| predicate(&event.kind())) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -1712,8 +1732,25 @@ fn grpc_peer_reset_cancels_accepted_service_call() {
         1,
         &grpc_body(&CounterRequest { delta: 1 }),
     );
+    assert!(
+        harness.wait_for_event(Duration::from_secs(1), |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallDispatchAttempted {
+                    call_kind: tina_runtime::CallKind::IsolateCall,
+                    ..
+                }
+            )
+        }),
+        "service call should be accepted before peer reset"
+    );
     write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
-    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        harness.wait_for_event(Duration::from_secs(1), |kind| {
+            matches!(kind, RuntimeEventKind::CallCancelled { .. })
+        }),
+        "peer reset should cancel the accepted service call"
+    );
     let events = harness.shutdown_events();
     assert!(
         events
