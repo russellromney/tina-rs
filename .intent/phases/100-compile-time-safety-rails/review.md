@@ -18,6 +18,10 @@ Second tightening: collapsed the plan from nine rocks to six. Diagnostics,
 callable/send-only shape, cancelable admission rail, optional type rails, user
 proof, and docs are enough. Details not needed for execution were removed.
 
+Third tightening: the plan now deliberately prefers the stronger split service
+model. Avoiding heart-of-model churn is not a goal if the new default prevents
+LLM-written services from calling internal continuation messages.
+
 ## Finding 2 [P2] Compile-time claims can lie about runtime facts
 
 Capacity, timeout, closed peers, stale generations, and backend failures are
@@ -33,6 +37,10 @@ Many isolates have `Reply = ()` or never expose call addresses. Requiring
 
 Resolution: Rock 3 requires explicit `send_only` or no-call defaults. Callable
 services get the stricter check; internal send-only isolates stay boring.
+
+Follow-up: the strong model should make this prettier, not uglier. The copied
+path should be `register_service(...).call` for public calls and `.send` for
+internal events, while send-only workers remain tiny.
 
 ## Finding 4 [P2] Macro wildcard enforcement may be impossible or annoying
 
