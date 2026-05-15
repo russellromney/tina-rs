@@ -18,7 +18,7 @@ Ship in this phase:
 - add a register-and-bootstrap helper that enqueues one explicit startup
   message after registration;
 - add small explicit Full-handling policy state for shed/retry-with-backoff;
-- update docs and the two named system specimens.
+- update docs and the named specimen/system call sites below.
 
 Do not ship in this phase:
 
@@ -143,8 +143,8 @@ The helper must compute decisions only. The service still schedules the effect:
 
 ```rust
 match self.flush_tick.next(ctx.now()) {
-    RecurringDecision::Sleep(delay, token) => sleep(delay).then(Msg::FlushTick(token)),
-    RecurringDecision::Skip(report) => ...
+    RecurringTickDecision::Sleep(delay, token) => sleep(delay).then(Msg::FlushTick(token)),
+    RecurringTickDecision::Skip(report) => ...
 }
 ```
 
@@ -192,9 +192,12 @@ Helper requirements:
 - optional static name for capacity/discovery reports;
 - `Permit` is move-only and carries generation/id;
 - release/retire exactly once through the gate;
-- stale/double release is visible;
+- release/retire returns `Result<LocalPermitReport, LocalPermitReleaseError>`;
+- stale/double release returns `LocalPermitReleaseError::StaleOrUnknown` and
+  increments `invalid_release_count`;
 - report type is `LocalPermitReport`;
-- report says capacity, current, full_count, high_water, retired_count;
+- report says capacity, current, full_count, high_water, retired_count,
+  invalid_release_count;
 - `Drop` must not silently release. First form requires explicit release or
   explicit retire.
 
@@ -209,7 +212,8 @@ Proof:
 
 - fill-refuse-release-refill;
 - stale permit from before close/drain cannot release a newer generation;
-- double release is rejected or reported;
+- double release returns `LocalPermitReleaseError::StaleOrUnknown` and leaves
+  `current` unchanged;
 - shutdown/drain reports outstanding permits;
 - capacity report uses a valid token-like surface name;
 - migrate `system_bounded_object_lane`.
@@ -287,11 +291,21 @@ Mirror the helper on `Runtime`, `ThreadedRuntime`, `MultiShardRuntime`, and
 `ThreadedMultiShardRuntime` wherever the matching plain registration method
 already exists.
 
+Implementation rule:
+
+- create the bounded mailbox;
+- enqueue `bootstrap_msg` into that mailbox before inserting the isolate entry
+  into the registry;
+- insert the isolate entry only after bootstrap admission succeeds.
+
+This is the load-bearing rule. Do not implement this as "register, then
+`try_send`, then clean up if send fails." Cleanup after public registration is
+where leaked addresses and tombstone confusion live.
+
 Behavior:
 
 - register the isolate normally;
-- enqueue exactly one `bootstrap_msg` to that isolate immediately after
-  registration succeeds;
+- enqueue exactly one `bootstrap_msg` into its mailbox as part of registration;
 - return the address only after the bootstrap message is admitted;
 - bootstrap is just a normal message and normal trace-visible delivery;
 - no special lifecycle callback;
@@ -301,11 +315,17 @@ Behavior:
 Failure rules:
 
 - `mailbox_capacity == 0` is rejected by existing validation;
-- because the mailbox is empty after registration, bootstrap admission succeeds
-  for a valid capacity;
-- if admission somehow fails, remove/tombstone the just-registered isolate or
-  return a typed registration error that makes the failure loud. Do not return
-  an address for a service whose bootstrap was not admitted.
+- because the mailbox is empty before registration, bootstrap admission
+  succeeds for a valid default mailbox with capacity at least 1;
+- if a custom mailbox rejects the bootstrap prefill, return a typed
+  `RegisterBootstrapError` and do not insert the isolate entry;
+- do not allocate an observable address before bootstrap admission succeeds;
+- do not return an address for a service whose bootstrap was not admitted.
+
+Immediate-send rule:
+
+- the returned address may have a full mailbox until `Bootstrap` is delivered;
+- this is honest pressure, not a bug. Document it.
 
 Proof:
 
@@ -315,7 +335,10 @@ Proof:
 - bootstrap can spawn children using normal handler code;
 - live and sim/multishard mirrors behave the same where those registration
   surfaces exist;
-- no address is returned on forced bootstrap-admission failure.
+- custom mailbox that rejects the prefill returns `RegisterBootstrapError`;
+- failed prefill leaves no registered isolate and no returned address;
+- sending immediately after helper returns can see `Full` if capacity is 1 and
+  `Bootstrap` has not been delivered yet.
 
 Migrate:
 
@@ -346,6 +369,15 @@ Required types:
 
 Use existing `Backoff` for retry timing.
 
+`FullHandling` is plain state. It does not own the mailbox, message, address,
+or caller. It only records attempts and returns the next decision.
+
+Required methods:
+
+- `on_full(now, deadline) -> FullDecision`;
+- `record_success() -> FullHandlingReport`;
+- `reset()`.
+
 Hard rules:
 
 - no hidden resend;
@@ -361,7 +393,8 @@ Proof:
 - shed-on-Full returns one typed decision and no sleep;
 - retry-on-Full returns bounded sleep decisions and then `Exhausted`;
 - deadline elapsed returns `Exhausted` / `DeadlineElapsed` without scheduling;
-- retry success resets or completes the state explicitly;
+- `record_success()` resets attempts and records retry success if a retry
+  happened;
 - migrated specimen/report shows first-attempt Full separately from retry Full.
 
 Migrate one existing Full-retry path:
@@ -388,6 +421,8 @@ Also migrate both bootstrap specimens through Rock 5:
 
 - `system_session_auth`;
 - `system_job_queue`.
+
+Also migrate `specimen_hot_key_fairness` through Rock 6.
 
 Do not rewrite every specimen by force.
 

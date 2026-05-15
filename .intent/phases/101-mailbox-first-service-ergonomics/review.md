@@ -81,3 +81,30 @@ The previous revision dropped startup and Full-handling because they were
 dangerous when vague. That made the phase smaller, but not better. The current
 plan includes them in grug form: explicit bootstrap message admission and
 decision-only Full handling. Bigger surface, less mush.
+
+## Finding 13 [P2] Bootstrap helper still allowed cleanup-after-registration
+
+The plan said either remove/tombstone after failed bootstrap send or return an
+error. That leaves the dangerous implementation path open. The plan now pins
+the safe route: prefill the mailbox with `Bootstrap` before inserting the
+isolate entry. If custom mailbox prefill fails, return `RegisterBootstrapError`
+and no address. No public cleanup path, no leaked registered address.
+
+## Finding 14 [P3] Migration list undercounted the work
+
+The locked choices said "two named system specimens," but the plan also
+requires bootstrap migrations and a Full-handling migration. The plan now names
+all required migrations so the implementor does not stop after the first two.
+
+## Finding 15 [P3] Recurring tick example used the wrong enum name
+
+The type list said `RecurringTickDecision`, but the copied example used
+`RecurringDecision`. That is small, but phase plans are prompts for coding
+agents. The example now uses the listed type name.
+
+## Finding 16 [P2] Permit and FullHandling terminal paths were still fuzzy
+
+"Rejected or reported" and "retry success resets or completes" were too loose.
+The plan now requires `LocalPermitReleaseError::StaleOrUnknown`,
+`invalid_release_count`, and `FullHandling::record_success()` so the counters
+and terminal states are not invented per implementation.
