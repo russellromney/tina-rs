@@ -115,6 +115,96 @@ Current future proof gaps to keep visible:
 - Real substrate peer/shard liveness, shard-restart propagation, and
   cross-shard child ownership remain future work.
 
+## Testing infrastructure roadmap
+
+Orthogonal to feature phases but necessary before public release claims.
+
+- **Miri expansion.** Current Miri coverage is narrow: `tina-mailbox-spsc` only.
+  Every crate touching `unsafe` should run under Miri in CI. `tina-runtime`
+  denies `unsafe_code` at the crate root, which is honest, but bridge crates
+  and substrate adapters may add `unsafe`. Miri gating should catch any new
+  `unsafe` block, not just the mailbox ring buffer.
+
+- **`tina-test` dev-dependency crate.** Users today hand-roll simulator setup,
+  config, and step loops. A `tina-test` crate should provide:
+  - `SimulatorBuilder` presets for common test shapes (single isolate,
+    pair, service-with-client).
+  - Assertion helpers: `assert_effect_eq`, `assert_trace_contains`,
+    `assert_mailbox_full`.
+  - A `#[tina_sim::test(seed = 42)]` proc macro that sets up a simulator,
+    runs the body, and asserts no panics / expected trace fingerprint.
+  This is the Tina equivalent of `tokio_test` and `#[tokio::test]`. The
+  simulator stays visible; the goal is removing ceremony so every user writes
+  DST tests as easily as unit tests.
+
+- **Loom expansion beyond mailbox.** Loom covers `tina-mailbox-spsc`. It should
+  also cover shard-pair queues, runtime internal task lists, and effect
+  batching atomics. These are the real concurrency hazards. If a bounded
+  multi-producer mailbox (`tina-mailbox-mpsc`) ships, it must have loom
+  coverage before the crate is usable.
+
+- **Property-based and generative testing.** `tina-sim` generates interleavings
+  from a seed, but not random message sequences, fault configurations, or
+  topology mutations. `proptest` or `quickcheck` over the simulator would let
+  us state invariants like "for any send sequence to a bounded queue, `Full`
+  outcomes never exceed capacity" and have the generator hunt for violations.
+  Fuzz targets for the HTTP parser and router are worth adding once the wire
+  format is stable.
+
+- **Soak and stress testing.** Not urgent pre-release, but needed before
+  production claims. A 10M-step simulation stress test hammering
+  `send`/`reply`/`call` across many isolates would catch trace hash drift,
+  memory leaks in simulator bookkeeping, and counter overflow. Live stress
+  tests under `ThreadedRuntime` would catch substrate resource leaks and
+  queue-pressure growth that short tests miss.
+
+- **Model checking / exhaustive exploration.** `tina-sim` is randomized
+  simulation. A second `tina-model-check` back-end could do bounded exhaustive
+  exploration of all message delivery orderings within a step limit. This is
+  research, not a release blocker. It would let us check LTL properties on
+  small bounded instances. State-space explosion is managed by capping mailbox
+  depth, active isolates, and steps.
+
+- **Testing philosophy and user-guide doc.** A `docs/tina-user-guide/16-testing.md`
+  should cover: when to use unit tests vs simulator tests vs live tests; how to
+  write a loom test for a new concurrent structure; how to choose a DST seed;
+  how to debug a failing trace fingerprint; what "same seed same failure"
+  means and what it does not mean. Keep it fresh — the philosophy should evolve
+  with user experience, not be frozen early.
+
+- **Code coverage reporting.** `cargo-llvm-cov` on the workspace would show
+  whether DST paths, fault-injection paths, and error-handling branches are
+  actually exercised. Currently we know tests pass but not which branches they
+  hit.
+
+- **CI test matrix.** `make verify` runs locally. A public framework needs this
+  in CI on at least Linux and macOS, debug and release, with loom and miri
+  gates. The matrix should also test each specimen example independently so
+  workspace-only changes cannot silently break downstream specimens.
+
+### Other gaps to keep visible
+
+- **Compile-fail / doc tests for `tina` trait crate.** The proc-macro surface
+  (`#[tina::isolate]`, `#[tina_runtime::isolate]`) should have tests that
+  assert malformed definitions fail at compile time. This is standard for
+  macro-heavy crates.
+
+- **Benchmark / performance regression framework.** The current cost-smoke
+  (`portable_runtime_cost`) is a smoke test, not a benchmark. Before
+  production claims we need a `criterion`-based regression suite with
+  historical tracking, not just one-shot local runs.
+
+- **HTTP/1 parser conformance suite.** Beyond our own DST, we should run an
+  established HTTP parser test corpus (e.g., `httparse` test vectors, or a
+  subset of `h2spec` for HTTP/1) to catch wire-format edge cases our
+  hand-authored tests miss.
+
+- **Bridge convention test harness.** The bridge crates (`tokio`, `tower`,
+  `reqwest`, `sqlx`) share setup patterns but have no shared test utilities.
+  A `tina-bridge-test` crate with mock substrate adapters would let each
+  bridge prove its bounded-outcome contract without spinning up real
+  databases or HTTP servers. This is a convenience, not a blocker.
+
 ## Roadmap discipline
 
 Completed work belongs in `CHANGELOG.md`, not as long phase bodies here.
@@ -260,6 +350,92 @@ framework before public release-story work.
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
+### Mailbox-first devex polish sketch
+
+The goal is to remove accidental ceremony from the code users and LLM coding
+agents will write most often while preserving Tina's load-bearing weirdness:
+handlers stay synchronous, all delayed work returns through a mailbox, caller
+authority is explicit, and pressure remains a typed service fact.
+
+The current raw shape is honest but easy to make visually noisy:
+
+```rust
+let request = ctx.take_request_context().unwrap();
+sleep(self.work).reply_with_request(request, move |request, result| {
+    LaneMsg::PutFinished { request, key, result }
+})
+```
+
+This future note should look for a blessed spelling closer to:
+
+```rust
+ctx.defer_reply(sleep(self.work))
+    .to_self(move |reply, result| LaneMsg::PutFinished { reply, key, result })
+```
+
+or, after 086 gives call handlers explicit reply authority:
+
+```rust
+call.reply_after(sleep(self.work))
+    .to_self(move |reply, result| LaneMsg::PutFinished { reply, key, result })
+```
+
+This helper must not run user state mutation in a hidden callback. The
+continuation still produces an ordinary message to self; the final state change
+and final reply happen in the isolate handler.
+
+The same phase should harden two other repeated footguns found by the
+system-shaped examples:
+
+- Bridge calls should become harder to misuse by construction. A health check
+  should not require remembering whether `SELECT 1` is query-shaped or
+  execute-shaped:
+
+  ```rust
+  db.probe().call(self.db_timeout)
+  db.query("SELECT 1").limit(1).call(self.db_timeout)
+  db.execute("INSERT INTO items ...").call(self.db_timeout)
+  ```
+
+- Bounded lanes should have a tiny isolate-local admission vocabulary. It
+  should be mechanism, not policy: admit, release, snapshot, reply busy. Pool
+  phases and capacity phases already cover richer reports and shared/weighted
+  capacity; this note is the small ergonomic surface for the common "cap
+  in-flight work and shed visibly" case:
+
+  ```rust
+  if let Some(permit) = self.in_flight.try_admit() {
+      call.reply_after(work).to_self(move |reply, result| {
+          LaneMsg::Finished { permit, reply, result }
+      })
+  } else {
+      call.reply(LaneReply::Busy(self.in_flight.snapshot()))
+  }
+  ```
+
+Keep the hidden-bug list explicit during review: permits must release exactly
+once on timeout, cancellation, shutdown, and late completion; reply authority
+must be impossible to reply twice or silently drop; bridge DSLs should stay
+shallow enough that compile errors do not become type-state soup; pressure
+helpers must not smuggle in retries, fairness, priority, or unbounded queues.
+
+Bridge-backed bounded lanes add one more concrete checklist. The
+`system_bounded_object_lane` specimen deliberately stays hermetic because the
+real-S3 temptation exposed the production contract a real AWS bridge must own:
+
+- completion delivery must be observed (`Full` / `Closed` / worker stopped), not
+  best-effort `try_send`, so a dropped completion cannot leak in-flight
+  accounting;
+- caller timeout, operation timeout, and late completion must be distinct typed
+  outcomes, with abandoned replies and tombstoned completions visible in trace
+  and terminal reports;
+- bridge shutdown needs explicit close/cancel/drain budget semantics, not a
+  specimen-local thread join;
+- bridge-job capacity, completion mailbox capacity, and in-flight admission cap
+  should be configured as one inspectable budget surface;
+- any SDK-backed bridge must name the weakened boundary honestly: Tina can bound
+  admission into the SDK, but SDK-internal queues/threads are not Tina-owned
+  unless the bridge proves and reports them.
 ### Visible race and call-capture ergonomics
 
 The rule for Phase 100 is:
@@ -340,7 +516,6 @@ Non-goals stay explicit: no `select!` clone, no race DSL, no hidden scheduler,
 no fake async surface, no hidden retry, no auto-cancel that erases terminal
 facts, and no helper that implies cancellation stopped work outside Tina's owned
 wait.
-
 ## Capability layers still needed
 
 These are not planning phases. They are capability gaps to close as real
