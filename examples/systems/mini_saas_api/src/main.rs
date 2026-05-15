@@ -11,7 +11,9 @@ fn main() -> anyhow::Result<()> {
 
     let report = run(mode)?;
     println!("{}", report.summary_line());
-    println!("{}", report.capacity_line);
+    println!("{}", report.capacity_before_shutdown_line.trim_end());
+    println!("{}", report.capacity_during_shutdown_line.trim_end());
+    println!("{}", report.terminal_line);
     println!("live_replay_fact {}", report.live_replay_fact);
     Ok(())
 }

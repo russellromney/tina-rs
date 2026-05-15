@@ -13,9 +13,10 @@ use tina::pool::{
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_http::{
-    HttpClientConfig, HttpListener, HttpListenerMsg, HttpRequest, HttpRequestBody, HttpResponse,
-    HttpServerConfig, HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg, KeepaliveOutcome,
-    KeepalivePoolDrainOutcome, build_keepalive_pool, shutdown_keepalive_pool,
+    BodyMetrics, BodyPressureReport, HttpClientConfig, HttpListener, HttpListenerMsg, HttpRequest,
+    HttpRequestBody, HttpResponse, HttpServerConfig, HttpTarget, KeepaliveConnAddr,
+    KeepaliveConnectionMsg, KeepaliveOutcome, KeepalivePoolDrainOutcome, build_keepalive_pool,
+    shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
@@ -31,7 +32,7 @@ use tina_sqlite_bridge::{
     SqliteRequest, SqliteResponse, SqliteResult, SqliteValue, SqliteWorker, send_request,
 };
 
-use crate::{RunMode, RunReport, get, post, put};
+use crate::{RunMode, RunReport, UserObservation, get, post, put};
 
 type PoolAddr = Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>;
 
@@ -87,9 +88,15 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     )
     .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
 
+    let public_body_metrics = BodyMetrics::default();
     let controller = runtime
         .register_with_capacity::<_, Infallible>(
-            Controller::new(sqlite.address, sqlite.metrics.clone(), outbound.pool),
+            Controller::new(
+                sqlite.address,
+                sqlite.metrics.clone(),
+                outbound.pool,
+                public_body_metrics.clone(),
+            ),
             CONTROLLER_MAILBOX_CAPACITY,
         )
         .map_err(|e| anyhow::anyhow!("register controller: {e:?}"))?;
@@ -101,7 +108,8 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
                 "127.0.0.1:0".parse()?,
                 controller,
                 main_listener_config,
-            ),
+            )
+            .with_metrics(public_body_metrics),
             main_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register main listener: {e:?}"))?;
@@ -115,21 +123,53 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
 
     let mut report = drive_script(addr, mode)?;
 
+    let in_flight_addr = addr;
+    let in_flight = std::thread::spawn(move || post(in_flight_addr, "/items/1/notify", "slow"));
+    wait_for_capacity(addr, "outbound.in_flight=1", Duration::from_secs(2))?;
+
     match runtime.call_blocking(controller, ControllerMsg::CloseIngress, REQUEST_TIMEOUT)? {
         CallOutcome::Replied(response) if response.status == StatusCode::OK => {}
         other => anyhow::bail!("close ingress control call failed: {other:?}"),
     }
+    let in_flight_response = in_flight
+        .join()
+        .map_err(|_| anyhow::anyhow!("shutdown in-flight request panicked"))??;
+    report.shutdown_in_flight_typed =
+        in_flight_response.status == 200 && in_flight_response.body.contains("notified");
+    report.observations.push(observation(
+        "shutdown_in_flight_notify",
+        in_flight_response.status,
+        &in_flight_response.body,
+    ));
     let during_shutdown = get(addr, "/ready")?;
     report.ready_during_shutdown_503 =
         during_shutdown.status == 503 && during_shutdown.body.contains("ingress_stopped");
+    report.observations.push(observation(
+        "ready_during_shutdown",
+        during_shutdown.status,
+        &during_shutdown.body,
+    ));
+    let capacity_during_shutdown = get(addr, "/debug/capacity")?;
+    report.capacity_during_shutdown_line =
+        format!("capacity_during_shutdown {}", capacity_during_shutdown.body);
     let rejected_after_close = post(addr, "/items", "name=after-close")?;
     report.ingress_rejects_after_close =
         rejected_after_close.status == 503 && rejected_after_close.body.contains("ingress_stopped");
+    report.observations.push(observation(
+        "post_after_ingress_close",
+        rejected_after_close.status,
+        &rejected_after_close.body,
+    ));
 
     sqlite.closer.close();
     let after_db_close = get(addr, "/ready")?;
     report.ready_after_db_close_503 =
         after_db_close.status == 503 && after_db_close.body.contains("db_closed");
+    report.observations.push(observation(
+        "ready_after_db_close",
+        after_db_close.status,
+        &after_db_close.body,
+    ));
 
     let db_pressure = sqlite.metrics.pressure_report();
     let outbound_shutdown = shutdown_keepalive_pool(
@@ -145,21 +185,35 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     runtime
         .try_send(main_listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
-    let trace = runtime.shutdown().unwrap_or_default();
+    let trace = runtime
+        .shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
     let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
     let deferred_replies = trace
         .iter()
         .filter(|event| matches!(event.kind(), RuntimeEventKind::DeferredReplySent { .. }))
         .count();
 
-    report.shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained);
+    report.shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained)
+        && outbound_shutdown.requested == outbound_shutdown.stopped
+        && outbound_shutdown.timed_out == 0
+        && outbound_shutdown.rejected == 0
+        && outbound_shutdown.already_closed == 0
+        && outbound_shutdown.connection_failures.is_empty();
     report.multi_turn_notify = report.notified_item && deferred_replies >= 3;
-    report.capacity_line = format!(
-        "capacity {} db.capacity={} db.closed={} outbound.drain={:?} trace_pressure={}",
-        report.capacity_line.trim(),
+    report.terminal_line = format!(
+        "terminal db.capacity={} db.closed={} outbound.drain={:?} outbound.stop_requested={} \
+         outbound.stop_stopped={} outbound.stop_timed_out={} outbound.stop_rejected={} \
+         outbound.stop_already_closed={} outbound.stop_failures={} trace_pressure={}",
         db_pressure.capacity,
         db_pressure.closed_count,
         outbound_shutdown.drain,
+        outbound_shutdown.requested,
+        outbound_shutdown.stopped,
+        outbound_shutdown.timed_out,
+        outbound_shutdown.rejected,
+        outbound_shutdown.already_closed,
+        outbound_shutdown.connection_failures.len(),
         pressure
     );
 
@@ -171,25 +225,75 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
 
     let health = get(addr, "/health")?;
     report.health_ok = health.status == 200 && health.body.contains("alive");
+    report
+        .observations
+        .push(observation("health", health.status, &health.body));
 
     let ready = get(addr, "/ready")?;
     report.ready_ok = ready.status == 200 && ready.body.contains("ready");
+    report
+        .observations
+        .push(observation("ready", ready.status, &ready.body));
 
     let created = post(addr, "/items", "name=alpha")?;
     report.created_item = created.status == 201 && created.body.contains("id=1");
+    report
+        .observations
+        .push(observation("create_item", created.status, &created.body));
 
     let got = get(addr, "/items/1")?;
     report.read_item = got.status == 200 && got.body.contains("alpha");
+    report
+        .observations
+        .push(observation("read_item", got.status, &got.body));
 
     let notified = post(addr, "/items/1/notify", "")?;
     report.notified_item = notified.status == 200 && notified.body.contains("notified");
+    report
+        .observations
+        .push(observation("notify_item", notified.status, &notified.body));
 
-    report.missing_404 = get(addr, "/items/999")?.status == 404;
-    report.method_405 = put(addr, "/items/1")?.status == 405;
-    report.bad_request_400 = post(addr, "/items", "bad")?.status == 400;
+    let peer_close = post(addr, "/items/1/notify", "close")?;
+    report.observations.push(observation(
+        "notify_peer_close",
+        peer_close.status,
+        &peer_close.body,
+    ));
+    let after_peer_close = post(addr, "/items/1/notify", "")?;
+    report.notify_after_peer_close = peer_close.status == 200
+        && after_peer_close.status == 200
+        && after_peer_close.body.contains("notified");
+    report.observations.push(observation(
+        "notify_after_peer_close",
+        after_peer_close.status,
+        &after_peer_close.body,
+    ));
+
+    let missing = get(addr, "/items/999")?;
+    report.missing_404 = missing.status == 404;
+    report
+        .observations
+        .push(observation("missing_item", missing.status, &missing.body));
+    let method = put(addr, "/items/1")?;
+    report.method_405 = method.status == 405;
+    report
+        .observations
+        .push(observation("method_not_allowed", method.status, &method.body));
+    let bad_request = post(addr, "/items", "bad")?;
+    report.bad_request_400 = bad_request.status == 400;
+    report.observations.push(observation(
+        "bad_create_body",
+        bad_request.status,
+        &bad_request.body,
+    ));
     let body_cap_body = "name=abcdefghijklmnopqrstuvwxyz0123456789";
     let body_cap = post(addr, "/items", body_cap_body)?;
     report.body_cap_413 = body_cap.status == 413;
+    report.observations.push(observation(
+        "parser_body_cap",
+        body_cap.status,
+        &body_cap.body,
+    ));
     report.live_replay_fact = live_replay_fact(ReplayCase {
         name: "mini_saas_body_full",
         method: "post",
@@ -198,7 +302,13 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
         cap: BODY_CAP_BYTES,
         status: body_cap.status,
     })?;
-    report.db_constraint_409 = post(addr, "/items", "name=alpha")?.status == 409;
+    let duplicate = post(addr, "/items", "name=alpha")?;
+    report.db_constraint_409 = duplicate.status == 409;
+    report.observations.push(observation(
+        "duplicate_create",
+        duplicate.status,
+        &duplicate.body,
+    ));
 
     if matches!(mode, RunMode::Pressure) {
         let a = addr;
@@ -212,12 +322,31 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
         let r2 = t2
             .join()
             .map_err(|_| anyhow::anyhow!("second pressure request panicked"))??;
-        report.outbound_pressure_503 = [r1.status, r2.status].contains(&503);
+        report.outbound_pressure_503 =
+            [(&r1, "pressure_first"), (&r2, "pressure_second")]
+                .into_iter()
+                .any(|(response, _)| {
+                    response.status == 503 && response.body.contains("outbound_full")
+                });
+        report
+            .observations
+            .push(observation("pressure_first", r1.status, &r1.body));
+        report
+            .observations
+            .push(observation("pressure_second", r2.status, &r2.body));
     }
 
     let capacity = get(addr, "/debug/capacity")?;
-    report.capacity_line = capacity.body;
+    report.capacity_before_shutdown_line = format!("capacity_before_shutdown {}", capacity.body);
     Ok(report)
+}
+
+fn observation(label: &'static str, status: u16, body: &str) -> UserObservation {
+    UserObservation {
+        label,
+        status,
+        body: body.trim().to_owned(),
+    }
 }
 
 struct ReplayCase {
@@ -407,6 +536,15 @@ impl Isolate for NotifySink {
                     return call
                         .reply(text(StatusCode::INTERNAL_SERVER_ERROR, "upstream_failed\n"));
                 }
+                if body_text(&request).contains("close") {
+                    self.accepted += 1;
+                    let mut response = text(StatusCode::OK, "accepted\n");
+                    response.headers.insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                    return call.reply(response);
+                }
                 if body_text(&request).contains("slow") {
                     return call
                         .defer(sleep(Duration::from_millis(250)))
@@ -424,17 +562,24 @@ struct Controller {
     db: SqliteAddress,
     db_metrics: SqliteMetricsHandle,
     outbound_pool: PoolAddr,
+    body_metrics: BodyMetrics,
     next_id: i64,
     ingress_open: bool,
     live_items: HashMap<i64, String>,
 }
 
 impl Controller {
-    fn new(db: SqliteAddress, db_metrics: SqliteMetricsHandle, outbound_pool: PoolAddr) -> Self {
+    fn new(
+        db: SqliteAddress,
+        db_metrics: SqliteMetricsHandle,
+        outbound_pool: PoolAddr,
+        body_metrics: BodyMetrics,
+    ) -> Self {
         Self {
             db,
             db_metrics,
             outbound_pool,
+            body_metrics,
             next_id: 1,
             ingress_open: true,
             live_items: HashMap::new(),
@@ -607,15 +752,8 @@ impl Isolate for Controller {
                 let (ok, disposition) = match &outcome {
                     CallOutcome::Replied(KeepaliveOutcome::Request {
                         result: Ok(response),
-                        must_retire,
-                    }) => (
-                        response.status.is_success(),
-                        if *must_retire {
-                            ReleaseDisposition::Retire
-                        } else {
-                            ReleaseDisposition::Reuse
-                        },
-                    ),
+                        ..
+                    }) => (response.status.is_success(), ReleaseDisposition::Reuse),
                     _ => (false, ReleaseDisposition::Retire),
                 };
                 call(
@@ -638,12 +776,19 @@ impl Isolate for Controller {
                 _ => reply_to_request(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
             },
             ControllerMsg::CapacityPool(req, outcome) => {
+                let body = self.body_metrics.snapshot();
                 let db = self.db_metrics.pressure_report();
                 let outbound = match outcome {
                     CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => report,
                     _ => PoolPressureReport::default(),
                 };
-                reply_to_request(req, text(StatusCode::OK, capacity_body(db, outbound)))
+                reply_to_request(
+                    req,
+                    text(
+                        StatusCode::OK,
+                        capacity_body(body, db, outbound, !self.ingress_open),
+                    ),
+                )
             }
         }
     }
@@ -851,26 +996,53 @@ fn ready_reasons(ingress_stopped: bool, reason: Option<&'static str>) -> Vec<&'s
     reasons
 }
 
-fn capacity_body(db: SqlitePressureReport, outbound: PoolPressureReport) -> String {
+fn capacity_body(
+    body: BodyPressureReport,
+    db: SqlitePressureReport,
+    outbound: PoolPressureReport,
+    shutdown_started: bool,
+) -> String {
     format!(
-        "http.body_bytes={BODY_CAP_BYTES} controller.mailbox={CONTROLLER_MAILBOX_CAPACITY} \
-         db.waiters={} db.in_flight={} db.high_water={} db.full={} outbound.waiters={} \
-         outbound.in_flight={} outbound.high_water_waiters={} outbound.full={}\n",
+        "http.body_cap={BODY_CAP_BYTES} http.request_body_current={} \
+         http.request_body_high_water={} http.response_body_current={} \
+         http.response_body_high_water={} http.body_full={} http.body_timeout={} \
+         http.body_io_error={} \
+         controller.mailbox={CONTROLLER_MAILBOX_CAPACITY} shutdown.started={shutdown_started} \
+         db.capacity={} db.waiters={} db.max_waiters={} db.in_flight={} db.high_water={} \
+         db.full={} db.closed={} db.timeout={} outbound.capacity={} outbound.waiters={} \
+         outbound.max_waiters={} outbound.in_flight={} outbound.high_water_waiters={} \
+         outbound.full={} outbound.closed={} outbound.closed_count={} outbound.cancel={}\n",
+        body.request_body_current,
+        body.request_body_high_water,
+        body.response_body_current,
+        body.response_body_high_water,
+        body.body_full_count,
+        body.body_timeout_count,
+        body.body_io_error_count,
+        db.capacity,
         db.waiters,
+        db.max_waiters,
         db.leased,
         db.high_water,
         db.full_count,
+        db.closed_count,
+        db.timeout_count,
+        outbound.capacity,
         outbound.waiters,
+        outbound.max_waiters,
         outbound.leased,
         outbound.high_water_waiters,
         outbound.full_count,
+        outbound.closed,
+        outbound.closed_count,
+        outbound.cancel_count,
     )
 }
 
 fn body_text(request: &HttpRequest) -> String {
     match &request.body {
         HttpRequestBody::Buffered(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        HttpRequestBody::Stream(_) => String::new(),
+        HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => String::new(),
     }
 }
 

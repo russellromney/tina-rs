@@ -40,6 +40,11 @@ outbound connection leases. No domain state is hidden behind
 | SQLite pool shape | one in-flight connection, no waiters |
 | outbound keepalive pool | one connection, zero waiters |
 
+`GET /debug/capacity` returns a small key=value line with real HTTP body
+current/high-water/full/timeout/io counters, controller mailbox cap, shutdown
+state, DB capacity/waiters/in-flight/full/closed/timeout counts, and outbound
+keepalive capacity/waiters/leased/full/closed/cancel counts.
+
 ## Readiness
 
 `/health` is liveness. `/ready` is useful-work readiness. It returns `503` with
@@ -49,21 +54,22 @@ typed reasons such as `db_closed`, `db_full`, `db_timeout`, `outbound_full`,
 ## Shutdown Order
 
 1. Mark public ingress closed in the controller.
-2. Probe readiness over HTTP so `ingress_stopped` is visible.
-3. Close the SQLite bridge.
-4. Probe readiness so `db_closed` is visible.
-5. Drain and stop the outbound keepalive pool with `shutdown_keepalive_pool`.
-6. Stop the notification listener and public listener.
-7. Shutdown the runtime and assert the terminal report/trace facts.
+2. Let one already-admitted slow notify request finish with a typed reply.
+3. Reject new public work with `ingress_stopped`.
+4. Probe readiness over HTTP so `ingress_stopped` is visible.
+5. Close the SQLite bridge.
+6. Probe readiness so `db_closed` is visible.
+7. Drain and stop the outbound keepalive pool with `shutdown_keepalive_pool`.
+8. Stop the notification listener and public listener.
+9. Shutdown the runtime and assert the terminal report/trace facts.
 
-## Multi-Turn RequestContext
+## Multi-Turn Replies
 
-`POST /items/{id}/notify` proves the post-086 request pattern:
+`POST /items/{id}/notify` proves the current request pattern:
 
 ```text
 HTTP call -> Controller CallContext
-  -> into_request_context()
-  -> SQLite query continuation
+  -> call_ctx.defer(SQLite query).reply(...)
   -> outbound pool acquire continuation
   -> keepalive request continuation
   -> release continuation
@@ -100,11 +106,32 @@ Run the documented executable smoke:
 cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
 ```
 
+The test smoke asserts the exact user-visible status/body sequence for health,
+readiness, create, read, notify, notify-after-peer-close, missing item, wrong
+method, malformed create, parser body cap, duplicate create, in-flight shutdown
+notify, ingress-closed rejection, and DB-closed readiness. The peer-close case
+forces the upstream notification server to answer with `Connection: close`, then
+proves the one-slot keepalive pool still serves the next notification by
+releasing successful requests with `Reuse`. The parser body-cap observation has
+an empty body because `tina-http` rejects the oversized request before
+dispatching to the controller isolate. The tests parse live capacity and
+terminal shutdown reports as key=value fields, reject duplicate keys, and check
+pre-shutdown, during-shutdown, and terminal views separately.
+
 Run the pressure variant:
 
 ```sh
 cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
 ```
+
+The pressure variant holds the one outbound keepalive lease with a slow notify
+request, sends a second notify, and asserts the user sees
+`503 outbound_full` while the first notify still succeeds.
+
+This specimen keeps shutdown host-driven so the whole service shape fits in
+one copied system. Larger services can move the same order into a coordinator
+isolate and publish the terminal report with `stop_with(report)` /
+`observe_result`.
 
 ## Out Of Scope
 
@@ -115,7 +142,7 @@ claim from this small smoke.
 ## Findings
 
 What felt good:
-- `RequestContext` made the multi-turn route explicit.
+- `call_ctx.defer(...).reply(...)` makes the caller-preserving path easy to copy.
 - SQLite and keepalive pool pressure reports already had the right vocabulary.
 
 What felt rough:
@@ -128,8 +155,8 @@ Tina capability pulled:
   and trace-derived multi-turn proof.
 
 Suggested follow-up:
-- Keep `reply_with_current_request(...)` as a tiny later polish phase only if
-  more service code repeats the expanded form.
+- Keep shutdown/report formatting local until another system repeats the same
+  exact shape.
 
 Verdict:
 - keep
