@@ -65,6 +65,7 @@ pub fn run() -> anyhow::Result<Report> {
 
         let mut r = Report {
             callers: CALLERS,
+            shutdown_close_observed: true,
             ..Default::default()
         };
         while let Some(joined) = driver_set.join_next().await {

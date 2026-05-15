@@ -111,14 +111,17 @@ report what remains
 `examples/systems/mini_saas_api` has the current copyable local-service
 shutdown order:
 
-1. Stop the public `tina-http` listener so new ingress is closed.
-2. Probe `/ready` and surface `ingress_stopped`.
-3. Close the SQLite bridge admission with its closer.
-4. Probe `/ready` and surface `db_closed`.
-5. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
+1. Mark public ingress closed in the controller so new service work is rejected.
+2. Let an already-admitted notify request finish with a typed reply while
+   later public work is rejected as `ingress_stopped`.
+3. Probe `/ready` and surface `ingress_stopped`.
+4. Close the SQLite bridge admission with its closer.
+5. Probe `/ready` and surface `db_closed`.
+6. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
    pool.
-6. Stop the private notification listener.
-7. Shutdown the runtime and inspect trace/capacity facts.
+7. Stop the private notification listener.
+8. Stop the public listener, then shutdown the runtime and inspect
+   trace/capacity facts.
 
 The exact smoke command is:
 

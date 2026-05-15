@@ -11,8 +11,8 @@ use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, ReleaseDisposition, Rele
 use tina::prelude::*;
 use tina_http::{
     HttpClientConfig, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig,
-    HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg, KeepaliveOutcome, StatefulRouter,
-    build_keepalive_pool,
+    HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg, KeepaliveOutcome,
+    KeepalivePoolDrainOutcome, StatefulRouter, build_keepalive_pool, shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
@@ -46,16 +46,24 @@ fn post_counter(state: &mut Counter, _: &HttpRequest) -> HttpResponse {
 
 #[tina::isolate(message = HttpRequest, reply = HttpResponse)]
 impl Counter {
+    fn response_for(&mut self, request: &HttpRequest) -> HttpResponse {
+        let router = StatefulRouter::<Counter>::new()
+            .get("/counter", get_counter)
+            .post("/counter", post_counter)
+            .method_not_allowed();
+        router.dispatch(self, request)
+    }
+
     fn handle(
         &mut self,
         request: HttpRequest,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        let router = StatefulRouter::<Counter>::new()
-            .get("/counter", get_counter)
-            .post("/counter", post_counter)
-            .method_not_allowed();
-        reply(router.dispatch(self, &request))
+        reply(self.response_for(&request))
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(&request))
     }
 }
 
@@ -131,15 +139,24 @@ pub fn run() -> anyhow::Result<Report> {
     }
 
     release_connection(&runtime, handles.pool, lease)?;
-    close_pool(&runtime, handles.pool)?;
-    for conn in handles.connections {
-        let _ = runtime.call_blocking(conn, KeepaliveConnectionMsg::Stop, REQUEST_TIMEOUT);
-    }
+    let shutdown = shutdown_keepalive_pool(&runtime, &handles, CloseMode::Drain, REQUEST_TIMEOUT)
+        .map_err(|e| anyhow::anyhow!("shutdown keepalive pool: {e:?}"))?;
+    anyhow::ensure!(
+        matches!(shutdown.drain, KeepalivePoolDrainOutcome::Drained)
+            && shutdown.requested == shutdown.stopped
+            && shutdown.timed_out == 0
+            && shutdown.rejected == 0
+            && shutdown.already_closed == 0
+            && shutdown.connection_failures.is_empty(),
+        "keepalive shutdown was not clean: {shutdown:?}"
+    );
 
     runtime
         .try_send(listener_addr, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    let trace = runtime.shutdown().unwrap_or_default();
+    let trace = runtime
+        .shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
     let accepts = trace
         .iter()
         .filter(|event| {
@@ -182,14 +199,8 @@ fn send_request(
     )? {
         CallOutcome::Replied(KeepaliveOutcome::Request {
             result: Ok(response),
-            must_retire,
-        }) => {
-            anyhow::ensure!(
-                !must_retire,
-                "native keepalive listener unexpectedly retired the connection"
-            );
-            Ok(response)
-        }
+            ..
+        }) => Ok(response),
         other => anyhow::bail!("expected keepalive response, got {other:?}"),
     }
 }
@@ -212,13 +223,6 @@ fn release_connection(
     }
 }
 
-fn close_pool(runtime: &Runtime, pool: PoolAddr) -> anyhow::Result<()> {
-    match runtime.call_blocking(pool, WorkerPoolMsg::Close(CloseMode::Drain), REQUEST_TIMEOUT)? {
-        CallOutcome::Replied(WorkerPoolReply::Closed) => Ok(()),
-        other => anyhow::bail!("expected keepalive pool close, got {other:?}"),
-    }
-}
-
 fn record_get(report: &mut Report, response: &HttpResponse, expected_body: Option<&str>) -> anyhow::Result<()> {
     if response.status == StatusCode::OK {
         report.successful_get += 1;
@@ -226,8 +230,8 @@ fn record_get(report: &mut Report, response: &HttpResponse, expected_body: Optio
     if let Some(expected) = expected_body {
         anyhow::ensure!(
             body_text(response).trim() == expected,
-            "GET body mismatch: expected {expected:?}, got {:?}",
-            body_text(response)
+            "GET body mismatch: expected {expected:?}, got {:?}; response={response:?}",
+            body_text(response),
         );
     }
     Ok(())
